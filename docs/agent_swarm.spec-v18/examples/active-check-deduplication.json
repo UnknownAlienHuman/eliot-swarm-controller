@@ -1,0 +1,30 @@
+{
+  "_scope": "Synthetic prototype contract example; not a vendor request or live observation",
+  "cache_key": "exact-machine-inputs",
+  "cases": [
+    {
+      "attempt_ids": [
+        "A",
+        "A"
+      ],
+      "check_ids": [
+        "check-A",
+        "check-A"
+      ]
+    },
+    {
+      "attempt_ids": [
+        "A",
+        "B"
+      ],
+      "check_ids": [
+        "check-A",
+        "check-B"
+      ]
+    }
+  ],
+  "different_attempts_share_running_check": false,
+  "same_target_dir_still_one_writer": true,
+  "completed_machine_cache": "may_reuse_with_new_binding_and_requirements_check",
+  "semantic_verdict_transfer_by_sha": false
+}

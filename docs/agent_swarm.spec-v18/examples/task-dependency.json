@@ -1,0 +1,11 @@
+{
+  "task_id": "task-consumer",
+  "revision": 1,
+  "depends_on": [
+    {
+      "task_id": "task-producer",
+      "required_revision": 3,
+      "required_phase": "implementation"
+    }
+  ]
+}

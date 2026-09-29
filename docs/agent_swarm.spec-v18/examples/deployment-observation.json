@@ -1,0 +1,28 @@
+{
+  "example_only": true,
+  "binding_id": "binding-codex-demo",
+  "generation": 1,
+  "desired": {
+    "server_lifecycle": "external_attach",
+    "native_transport": "websocket_over_proxy_stdio",
+    "console_policy": "hidden_console"
+  },
+  "source_report": {
+    "kind": "operator_brief",
+    "date": "2026-09-29",
+    "server_version": "0.159.0",
+    "reported_working": true
+  },
+  "observed_here": {
+    "runtime_probe": "not_executed",
+    "server_version": null,
+    "server_pid": null,
+    "visible_window_probe": null
+  },
+  "qualification": {
+    "sdk_transport": "unverified",
+    "root_feed": "unverified",
+    "family_completeness": "unknown"
+  },
+  "connection_close_effect": "close_own_proxy_only"
+}

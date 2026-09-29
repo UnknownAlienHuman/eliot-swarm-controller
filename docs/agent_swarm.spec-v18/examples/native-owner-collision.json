@@ -1,0 +1,22 @@
+{
+  "_example": "Synthetic reference case; no SDK/runtime executed",
+  "namespace_basis": {
+    "runtime_family": "fixture-sdk",
+    "native_store_identity": "local-user-store-1"
+  },
+  "native_scope_key": "fixture-runtime/store-1",
+  "first_binding": {
+    "binding_id": "root-a",
+    "lane_id": "lane-a",
+    "route_alias": "preferred",
+    "native_root_id": "ses-1"
+  },
+  "second_binding": {
+    "binding_id": "root-b",
+    "lane_id": "lane-b",
+    "route_alias": "renamed-profile",
+    "native_root_id": "ses-1"
+  },
+  "expected": "reject second control owner while first binding is unreleased; observer reuses root-a",
+  "scope_limit": "within this prototype DB after adapter resolves native namespace; not an OS lock against other clients"
+}

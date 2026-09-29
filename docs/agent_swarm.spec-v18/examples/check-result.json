@@ -1,0 +1,19 @@
+{
+  "check_id": "check-demo-1",
+  "candidate_ref": "candidate-demo",
+  "run_status": "incomplete",
+  "exit_code": 0,
+  "coverage": {
+    "requested": [
+      "W1"
+    ],
+    "checked": [],
+    "gaps": [
+      "diagnostic_parser_error"
+    ]
+  },
+  "findings": [],
+  "artifact_ref": "check-output-demo",
+  "attempt_id": "attempt-demo",
+  "resource_disposition": "held_pending_reconciliation"
+}

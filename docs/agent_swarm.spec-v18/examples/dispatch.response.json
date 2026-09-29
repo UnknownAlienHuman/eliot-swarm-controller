@@ -1,0 +1,11 @@
+{
+  "jsonrpc": "2.0",
+  "id": "request-41",
+  "result": {
+    "operation_id": "op-dispatch-demo-1",
+    "attempt_id": "attempt-demo-1",
+    "state": "queued",
+    "admission": "durable_local",
+    "native_admission": "not_observed"
+  }
+}

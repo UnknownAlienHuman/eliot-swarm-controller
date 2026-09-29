@@ -1,0 +1,26 @@
+{
+  "_scope": "Synthetic prototype contract example; not a vendor request or live observation",
+  "operations": [
+    {
+      "id": "prepare-A",
+      "setting": "max",
+      "observed_revision": 4
+    },
+    {
+      "id": "change-B",
+      "setting": "high",
+      "observed_revision": 5
+    },
+    {
+      "id": "send-A",
+      "requires_effort": "max",
+      "prepared_revision": 4
+    }
+  ],
+  "expected": {
+    "send_A_under_high": false,
+    "action": "native_per_turn_override_or_reprepare_at_safe_boundary",
+    "barrier_scope": "one_binding_relevant_settings",
+    "global_barrier": false
+  }
+}

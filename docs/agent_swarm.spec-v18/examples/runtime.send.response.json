@@ -1,0 +1,13 @@
+{
+  "jsonrpc": "2.0",
+  "id": "wire-41",
+  "result": {
+    "operation_id": "op-dispatch-demo-1",
+    "acceptance": "accepted",
+    "native_refs": {
+      "session_id": "native-s1",
+      "turn_id": "native-t3"
+    },
+    "delivery_boundary": "new_turn"
+  }
+}

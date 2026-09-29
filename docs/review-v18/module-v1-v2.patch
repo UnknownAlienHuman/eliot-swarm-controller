@@ -1,0 +1,55 @@
+--- source-v17/agent_swarm.module-contract-v1.md
++++ agent_swarm.module-contract-v2.md
+@@ -1,6 +1,6 @@
+-# ELIOT Swarm — контракт модулей и качества интеграции v1
+-
+-**29.09.2026. Проектное уточнение к архитектуре v17; реализации и live-квалификации пока нет.**
++# ELIOT Swarm — контракт модулей и качества интеграции v2
++
++**29.09.2026. Проектное уточнение к архитектуре v18; реализации и live-квалификации пока нет.**
+ 
+ Назначение: один разработчик должен подключить очередной native harness, не изменяя scheduler, Task/Attempt и остальные adapters. Этот документ определяет нашу границу. Он не переписывает протоколы производителей и не утверждает, что все перечисленные возможности есть у каждого harness.
+ 
+@@ -104,6 +104,8 @@
+ 
+ Неприменённая обязательная настройка задерживает только запуск этой подготовляемой работы. Действующие unrelated turns не прерываются и не переводятся молча на другую модель.
+ 
++Прежнее applied остаётся историческим фактом, но не вечным условием запуска. Для конфликтующих session-wide settings модуль сохраняет effective settings revision и привязывает setup к ней. Per-turn options предпочтительны; иначе короткий prepare/admission barrier исключает interleaving `set max → set high → start Max task`. При динамическом применении settings на следующих model calls совместимость определяется native lifecycle, не названием config setter. Другие bindings и protocol replies не ждут этого barrier.
++
+ ## 7. Одна native-сессия — один control owner, независимо от aliases
+ 
+ Ключ root состоит из `native_scope_key + native_root_id`. Scope — не произвольное имя route; adapter разрешает реальное пространство native IDs: runtime/account/store namespace, при необходимости user/machine domain. Секреты в ключ не входят. Порт, PID, model, lane label и имя bridge не являются заменой устойчивого namespace.
+@@ -116,6 +118,8 @@
+ 
+ Если backend не предоставляет устойчивую identity, adapter заявляет ограничение. Batch job остаётся учтённым собственным Operation/ProcessJob; точное повторное attach без evidence не объявляется поддержанным.
+ 
++Старт новой native-сессии и начальная доставка уже claimed Task — разные idempotency scopes. Host не посылает второй initial dispatch одной Attempt лишь из-за нового client_request_id. Принятый модулем request не создаёт нового task owner. Перед отправкой host проверяет dispatch guards; module проверяет exact binding/generation/link и native preconditions. Revise после допуска не отменяет уже полученный vendor input; нужен реальный unqueue/cancel, поддержанный native контрактом, либо обычная коррекция.
++
+ ## 8. Шина без общего тормоза
+ 
+ Протокольный reader не ждёт аудитора, записи большого лога или окончания другого задания. Входящее сообщение сначала классифицируется как reply-required/control, важный факт либо telemetry. Крупное тело хранится отдельно.
+@@ -157,6 +161,8 @@
+ Разработка сначала: реализовать путь → fmt/минимальный Clippy → использовать сохранённые fixtures и короткую проверку соответствующего adapter. Не создавать отдельный load framework до готового среза. Перед рабочим допуском проверяется реальный маршрут, а не только специально написанная probe-команда.
+ 
+ Новая версия получает новые bindings; старая завершает существующие. Если vendor обновляет общий server сразу для всех, drain нашего bridge не обещает защиты от этого — режим vendor update согласуется отдельно. Откат binary не откатывает уже совершённые remote effects.
++
++Для собственных batch/check jobs результат и владение ресурсом раздельны. `failed/incomplete` не сообщает, что все дочерние процессы прекратили работу. Adapter возвращает process disposition, control host освобождает ресурс только по нему. Для `external_attach` не применяется завершение shared server. Результат проверки сохраняется даже при неудачной очистке, а повторный writer target-dir не запускается на неизвестной старой работе.
+ 
+ ## 12. Проверяемая граница качества
+ 
+@@ -172,6 +178,9 @@
+ | Сломан формат отчёта writer | Repair packaging на сохранённом candidate |
+ | Restart после пропуска отчётов | Один актуальный catch-up, не spam из старых slots |
+ | Смена profile alias | Старый binding сохраняет профиль; новые используют новую revision |
++| Task revised while input queued | Старый input не отправляется после проигранного dispatch guard; already-admitted outcome отдельно |
++| Max применён, затем настройки заменены | Прежний apply не открывает запуск на другой конфигурации |
++| Check incomplete, descendants unknown | Target-dir удерживается; соседние ресурсы свободны |
+ 
+ Это критерии реализации, не результаты выполненных runtime-тестов. Первая обязательная пара исполнителей — Muse Max и OpenCode V2; batch и shared Codex проверяют остальные особенности того же контракта по мере подключения. Нет требования одновременно дописать все семь harness до первого полезного результата.
+ 
+@@ -192,3 +201,5 @@
+ [T5] SQLite partial unique indexes: https://www.sqlite.org/partialindex.html
+ 
+ Повторная проверка всех vendor docs, сборка доноров, Windows execution, платные пробы и нагрузка не выполнялись. Пример устранённой alias-коллизии относится к reference DDL, не к уже существовавшему Rust-сервису.
++
++[T6] Уточнения v18 относятся к собственному протоколу и reference-схеме: [review](agent_swarm.design-review-v18-20260929.md), [plan-v6](agent_swarm.implementation-v6.md). Native mappings и donor pins не переаттестованы.

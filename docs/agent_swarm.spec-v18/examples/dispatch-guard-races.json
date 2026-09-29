@@ -1,0 +1,31 @@
+{
+  "_scope": "Synthetic prototype contract example; not a vendor request or live observation",
+  "cases": [
+    {
+      "order": [
+        "queue_r1",
+        "revise_r2",
+        "begin_send"
+      ],
+      "expected": "not_sent_stale_task"
+    },
+    {
+      "order": [
+        "queue_r1",
+        "commit_sending_r1",
+        "revise_r2",
+        "native_write"
+      ],
+      "expected": "already_admitted_may_apply_reconcile_or_correct"
+    },
+    {
+      "order": [
+        "queue",
+        "drain",
+        "begin_send"
+      ],
+      "expected": "not_sent_no_new_assignments"
+    }
+  ],
+  "reply_to_existing_native_request_remains_separate": true
+}

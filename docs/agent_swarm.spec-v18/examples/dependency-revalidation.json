@@ -1,0 +1,23 @@
+{
+  "_scope": "Synthetic prototype contract example; not a vendor request or live observation",
+  "consumer_attempt": "B-1",
+  "pinned_dependency": {
+    "task_id": "A",
+    "revision": 1,
+    "phase": "implementation",
+    "candidate_ref": "candidate-A1"
+  },
+  "cases": [
+    {
+      "dependency_receipt": "accepted",
+      "newer_revision_exists": true,
+      "required_pinned_revision_valid": true
+    },
+    {
+      "dependency_receipt": "revoked",
+      "accept_B_without_revalidation": false,
+      "stop_B_automatically": false,
+      "discard_B_artifacts": false
+    }
+  ]
+}

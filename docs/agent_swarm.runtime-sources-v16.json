@@ -1,0 +1,574 @@
+{
+  "schema_version": 1,
+  "purpose": "research_inventory_not_executable_policy",
+  "date": "2026-09-29",
+  "sources": [
+    {
+      "id": "OC-API",
+      "title": "OpenCode V2 HTTP API",
+      "url": "https://opencode.ai/v2/docs/api",
+      "basis": "Текущая experimental V2 reference; installed 2.0.7 не проверен",
+      "sections": [
+        "info",
+        "session create/list/active/prompt/inbox/background/env",
+        "event",
+        "location.reload",
+        "models",
+        "stats"
+      ],
+      "accessed": "2026-09-29",
+      "origin": "official_docs_or_first_party_source",
+      "runtime_verified": false
+    },
+    {
+      "id": "OC-INSTR",
+      "title": "OpenCode V2 Instructions",
+      "url": "https://opencode.ai/v2/docs/instructions",
+      "basis": "Текущая документация",
+      "sections": [
+        "AGENTS.md discovery",
+        "nested reload",
+        "instructions config"
+      ],
+      "accessed": "2026-09-29",
+      "origin": "official_docs_or_first_party_source",
+      "runtime_verified": false
+    },
+    {
+      "id": "OC-MODELS",
+      "title": "OpenCode V2 Models",
+      "url": "https://opencode.ai/v2/docs/models",
+      "basis": "Текущая документация",
+      "sections": [
+        "provider/model/variant",
+        "defaults",
+        "project availability"
+      ],
+      "accessed": "2026-09-29",
+      "origin": "official_docs_or_first_party_source",
+      "runtime_verified": false
+    },
+    {
+      "id": "OC-AGENTS",
+      "title": "OpenCode V2 Agents",
+      "url": "https://opencode.ai/v2/docs/agents",
+      "basis": "Текущая документация",
+      "sections": [
+        "native agents",
+        "tools",
+        "delegation"
+      ],
+      "accessed": "2026-09-29",
+      "origin": "official_docs_or_first_party_source",
+      "runtime_verified": false
+    },
+    {
+      "id": "OC-CONFIG",
+      "title": "OpenCode V2 Configuration",
+      "url": "https://opencode.ai/v2/docs/config",
+      "basis": "Текущая документация",
+      "sections": [
+        "configuration sources",
+        "reload"
+      ],
+      "accessed": "2026-09-29",
+      "origin": "official_docs_or_first_party_source",
+      "runtime_verified": false
+    },
+    {
+      "id": "MC-SCHEMA",
+      "title": "Muse Session Protocol v1 declarations",
+      "url": "https://github.com/meta-models/muse-code-sdk/blob/a7c10c5dd3f66be412077d29f9d11111af70317b/schema/msp/msp.d.ts",
+      "basis": "Pinned a7c10c5dd3f66be412077d29f9d11111af70317b; не версия CLI",
+      "sections": [
+        "initialize",
+        "session/view",
+        "turn/goal",
+        "subagent",
+        "approval/userInput",
+        "usage",
+        "task/background"
+      ],
+      "accessed": "2026-09-29",
+      "origin": "official_docs_or_first_party_source",
+      "runtime_verified": false
+    },
+    {
+      "id": "MC-SDK",
+      "title": "Muse SDK public repository",
+      "url": "https://github.com/meta-models/muse-code-sdk/tree/a7c10c5dd3f66be412077d29f9d11111af70317b",
+      "basis": "Pinned source, runtime не установлен",
+      "sections": [
+        "public Connection/spawn",
+        "schema provenance"
+      ],
+      "accessed": "2026-09-29",
+      "origin": "official_docs_or_first_party_source",
+      "runtime_verified": false
+    },
+    {
+      "id": "MC-EFFORT",
+      "title": "Muse SDK issue 6, maintainer correction",
+      "url": "https://github.com/meta-models/muse-code-sdk/issues/6",
+      "basis": "Исправление per-turn effort заявлено автором для 1.2.1; serve settings default отдельно",
+      "sections": [
+        "maintainer fix version",
+        "session/setReasoningEffort",
+        "settings.json caveat"
+      ],
+      "accessed": "2026-09-29",
+      "origin": "official_docs_or_first_party_source",
+      "runtime_verified": false
+    },
+    {
+      "id": "MC-PLAN",
+      "title": "Muse Code subscriptions",
+      "url": "https://dev.meta.ai/docs/muse-code/subscriptions",
+      "basis": "Текущая документация; реальная подписка не проверялась",
+      "sections": [
+        "native subscription vs API credential"
+      ],
+      "accessed": "2026-09-29",
+      "origin": "official_docs_or_first_party_source",
+      "runtime_verified": false
+    },
+    {
+      "id": "CX-API",
+      "title": "Codex App Server",
+      "url": "https://learn.chatgpt.com/docs/app-server",
+      "basis": "Текущая документация; не схема installed 0.159.0",
+      "sections": [
+        "stdio/WebSocket/Unix",
+        "thread read/list/resume",
+        "sourceKinds and ancestor filters",
+        "steer/goal",
+        "rateLimits",
+        "schema generation"
+      ],
+      "accessed": "2026-09-29",
+      "origin": "official_docs_or_first_party_source",
+      "runtime_verified": false
+    },
+    {
+      "id": "CX-SDK",
+      "title": "Codex Python client source",
+      "url": "https://github.com/openai/codex/blob/18194bfd3534ca567d886eac454028dafaa68b6c/sdk/python/src/openai_codex/client.py",
+      "basis": "Pinned 18194bfd3534ca567d886eac454028dafaa68b6c",
+      "sections": [
+        "CodexConfig",
+        "CodexClient.start",
+        "JSONL stdio transport"
+      ],
+      "accessed": "2026-09-29",
+      "origin": "official_docs_or_first_party_source",
+      "runtime_verified": false
+    },
+    {
+      "id": "CL-HEADLESS",
+      "title": "Claude Code headless",
+      "url": "https://code.claude.com/docs/en/headless",
+      "basis": "Текущая документация; live CLI не проверен",
+      "sections": [
+        "stream-json",
+        "init/capabilities/errors",
+        "api_retry",
+        "usage",
+        "resume"
+      ],
+      "accessed": "2026-09-29",
+      "origin": "official_docs_or_first_party_source",
+      "runtime_verified": false
+    },
+    {
+      "id": "CL-CLI",
+      "title": "Claude Code CLI reference",
+      "url": "https://code.claude.com/docs/en/cli-reference",
+      "basis": "Текущая документация",
+      "sections": [
+        "system-prompt snapshot",
+        "bare",
+        "background vs print",
+        "resume"
+      ],
+      "accessed": "2026-09-29",
+      "origin": "official_docs_or_first_party_source",
+      "runtime_verified": false
+    },
+    {
+      "id": "CL-STREAM",
+      "title": "Claude Agent SDK streaming output",
+      "url": "https://code.claude.com/docs/en/agent-sdk/streaming-output",
+      "basis": "Текущая документация",
+      "sections": [
+        "parent_tool_use_id",
+        "StreamEvent",
+        "assistant content blocks"
+      ],
+      "accessed": "2026-09-29",
+      "origin": "official_docs_or_first_party_source",
+      "runtime_verified": false
+    },
+    {
+      "id": "CL-INPUT",
+      "title": "Claude Agent SDK streaming input",
+      "url": "https://code.claude.com/docs/en/agent-sdk/streaming-vs-single-mode",
+      "basis": "Текущая документация",
+      "sections": [
+        "single vs streaming",
+        "input and interrupts"
+      ],
+      "accessed": "2026-09-29",
+      "origin": "official_docs_or_first_party_source",
+      "runtime_verified": false
+    },
+    {
+      "id": "CL-HOOKS",
+      "title": "Claude Code hooks reference",
+      "url": "https://code.claude.com/docs/en/hooks",
+      "basis": "Текущая матрица event/handler",
+      "sections": [
+        "SessionStart/Setup",
+        "HTTP support matrix",
+        "lifecycle events"
+      ],
+      "accessed": "2026-09-29",
+      "origin": "official_docs_or_first_party_source",
+      "runtime_verified": false
+    },
+    {
+      "id": "CL-GOAL",
+      "title": "Claude Code goal",
+      "url": "https://code.claude.com/docs/en/goal",
+      "basis": "Текущая документация; headless/interactive не равнозначны",
+      "sections": [
+        "Stop evaluation",
+        "background deferral",
+        "headless check-in"
+      ],
+      "accessed": "2026-09-29",
+      "origin": "official_docs_or_first_party_source",
+      "runtime_verified": false
+    },
+    {
+      "id": "CL-CHILDREN",
+      "title": "Claude Code subagents",
+      "url": "https://code.claude.com/docs/en/sub-agents",
+      "basis": "Текущая документация",
+      "sections": [
+        "depth/concurrency scope",
+        "tool allowlists",
+        "native children"
+      ],
+      "accessed": "2026-09-29",
+      "origin": "official_docs_or_first_party_source",
+      "runtime_verified": false
+    },
+    {
+      "id": "CL-SUPERVISOR",
+      "title": "Claude Code agent view",
+      "url": "https://code.claude.com/docs/en/agent-view",
+      "basis": "Текущий отдельный native background mode",
+      "sections": [
+        "agents --json",
+        "native supervisor",
+        "worktree policy",
+        "summaries",
+        "respawn"
+      ],
+      "accessed": "2026-09-29",
+      "origin": "official_docs_or_first_party_source",
+      "runtime_verified": false
+    },
+    {
+      "id": "CL-CHANNELS",
+      "title": "Claude Code channels",
+      "url": "https://code.claude.com/docs/en/channels",
+      "basis": "Research Preview / opt-in",
+      "sections": [
+        "MCP push extension",
+        "headless support",
+        "explicit enablement"
+      ],
+      "accessed": "2026-09-29",
+      "origin": "official_docs_or_first_party_source",
+      "runtime_verified": false
+    },
+    {
+      "id": "CL-BILLING",
+      "title": "Claude Agent SDK with Claude plan",
+      "url": "https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan",
+      "basis": "Страница 16.06.2026 с UPDATE: rollout paused 15.06; историческую часть ниже не применять как текущую",
+      "sections": [
+        "rollout pause",
+        "subscription/headless use"
+      ],
+      "accessed": "2026-09-29",
+      "origin": "official_docs_or_first_party_source",
+      "runtime_verified": false
+    },
+    {
+      "id": "CL-AUTH",
+      "title": "Using Claude Code with Pro or Max",
+      "url": "https://support.claude.com/en/articles/11145838-using-claude-code-with-your-pro-or-max-plan",
+      "basis": "Прочитанное актуальное пояснение; без чтения аккаунта",
+      "sections": [
+        "ANTHROPIC_API_KEY billing precedence"
+      ],
+      "accessed": "2026-09-29",
+      "origin": "official_docs_or_first_party_source",
+      "runtime_verified": false
+    },
+    {
+      "id": "CC-MODS",
+      "title": "Command Code Mods",
+      "url": "https://commandcode.ai/docs/mods",
+      "basis": "Experimental ModApi; installed 1.66 не квалифицирован",
+      "sections": [
+        "queueMessage",
+        "tool controls",
+        "events",
+        "mod_error",
+        "reload",
+        "turn/run commit"
+      ],
+      "accessed": "2026-09-29",
+      "origin": "official_docs_or_first_party_source",
+      "runtime_verified": false
+    },
+    {
+      "id": "CC-AGENTS",
+      "title": "Command Code custom agents",
+      "url": "https://commandcode.ai/docs/agents",
+      "basis": "Текущая документация; старые имена аргументов не считаются aliases",
+      "sections": [
+        "background",
+        "tools omitted",
+        "reload definitions",
+        "child depth",
+        "agent_output"
+      ],
+      "accessed": "2026-09-29",
+      "origin": "official_docs_or_first_party_source",
+      "runtime_verified": false
+    },
+    {
+      "id": "CC-HEADLESS",
+      "title": "Command Code headless",
+      "url": "https://commandcode.ai/docs/headless",
+      "basis": "Текущая документация",
+      "sections": [
+        "print/NDJSON",
+        "slash boundary",
+        "headless flags"
+      ],
+      "accessed": "2026-09-29",
+      "origin": "official_docs_or_first_party_source",
+      "runtime_verified": false
+    },
+    {
+      "id": "CC-CLI",
+      "title": "Command Code CLI reference",
+      "url": "https://commandcode.ai/docs/reference/cli",
+      "basis": "Текущая документация",
+      "sections": [
+        "exact resume",
+        "Windows command names",
+        "flags"
+      ],
+      "accessed": "2026-09-29",
+      "origin": "official_docs_or_first_party_source",
+      "runtime_verified": false
+    },
+    {
+      "id": "CC-SESSIONS",
+      "title": "Command Code sessions",
+      "url": "https://commandcode.ai/docs/sessions",
+      "basis": "Текущая документация",
+      "sections": [
+        "headless visibility",
+        "continue vs resume",
+        "transcript parsing"
+      ],
+      "accessed": "2026-09-29",
+      "origin": "official_docs_or_first_party_source",
+      "runtime_verified": false
+    },
+    {
+      "id": "CC-GOAL",
+      "title": "Command Code goal",
+      "url": "https://commandcode.ai/docs/goal",
+      "basis": "Документированная функция CLI, headless setter в выбранном mod не установлен",
+      "sections": [
+        "resume goal idle",
+        "roundtrip budget",
+        "headless max-turns distinction"
+      ],
+      "accessed": "2026-09-29",
+      "origin": "official_docs_or_first_party_source",
+      "runtime_verified": false
+    },
+    {
+      "id": "CC-WIN",
+      "title": "Command Code Windows",
+      "url": "https://commandcode.ai/docs/windows",
+      "basis": "Текущая документация",
+      "sections": [
+        "PowerShell selection",
+        "native shell execution"
+      ],
+      "accessed": "2026-09-29",
+      "origin": "official_docs_or_first_party_source",
+      "runtime_verified": false
+    },
+    {
+      "id": "CC-USAGE",
+      "title": "Command Code usage limits",
+      "url": "https://commandcode.ai/docs/resources/usage-limits",
+      "basis": "В прочитанной странице есть несогласованные суммы; не источник констант scheduler",
+      "sections": [
+        "plan windows",
+        "usage command",
+        "additional credits"
+      ],
+      "accessed": "2026-09-29",
+      "origin": "official_docs_or_first_party_source",
+      "runtime_verified": false
+    },
+    {
+      "id": "AG-HEADLESS",
+      "title": "Antigravity CLI headless",
+      "url": "https://antigravity.google/docs/cli/headless/",
+      "basis": "Текущая документация; installed 1.1.27 из старой карты не проверен",
+      "sections": [
+        "event envelope",
+        "warm sequential input",
+        "unsupported control messages",
+        "result and step_update",
+        "resume"
+      ],
+      "accessed": "2026-09-29",
+      "origin": "official_docs_or_first_party_source",
+      "runtime_verified": false
+    },
+    {
+      "id": "AG-CHILDREN",
+      "title": "Antigravity subagents",
+      "url": "https://antigravity.google/docs/subagents/",
+      "basis": "Текущая документация",
+      "sections": [
+        "invoke_subagent",
+        "workspace modes",
+        "peer messages",
+        "idle wake"
+      ],
+      "accessed": "2026-09-29",
+      "origin": "official_docs_or_first_party_source",
+      "runtime_verified": false
+    },
+    {
+      "id": "AG-HOOKS",
+      "title": "Antigravity hooks",
+      "url": "https://antigravity.google/docs/hooks/",
+      "basis": "Текущая документация",
+      "sections": [
+        "native events",
+        "configuration paths"
+      ],
+      "accessed": "2026-09-29",
+      "origin": "official_docs_or_first_party_source",
+      "runtime_verified": false
+    },
+    {
+      "id": "AG-USAGE",
+      "title": "Antigravity /usage",
+      "url": "https://antigravity.google/docs/cli/commands/usage/",
+      "basis": "Текущая документация",
+      "sections": [
+        "interactive refresh",
+        "quota and model config"
+      ],
+      "accessed": "2026-09-29",
+      "origin": "official_docs_or_first_party_source",
+      "runtime_verified": false
+    },
+    {
+      "id": "AG-AUTH",
+      "title": "Antigravity CLI install",
+      "url": "https://antigravity.google/docs/cli/install/",
+      "basis": "Текущая документация",
+      "sections": [
+        "native sign-in",
+        "API provider selection"
+      ],
+      "accessed": "2026-09-29",
+      "origin": "official_docs_or_first_party_source",
+      "runtime_verified": false
+    },
+    {
+      "id": "ZD-EXEC",
+      "title": "Zed eval-cli README",
+      "url": "https://github.com/zed-industries/zed/blob/7604aa3f19cef0c4d8be2bb3335c24acd788ccb1/crates/eval_cli/README.md",
+      "basis": "Pinned 7604aa3f19cef0c4d8be2bb3335c24acd788ccb1",
+      "sections": [
+        "NativeAgent/AcpThread",
+        "batch invocation",
+        "result artifacts",
+        "exit meanings"
+      ],
+      "accessed": "2026-09-29",
+      "origin": "official_docs_or_first_party_source",
+      "runtime_verified": false
+    },
+    {
+      "id": "ZD-EXTERNAL",
+      "title": "Zed external agents",
+      "url": "https://zed.dev/docs/ai/external-agents",
+      "basis": "Текущая документация",
+      "sections": [
+        "ACP client versus native executor"
+      ],
+      "accessed": "2026-09-29",
+      "origin": "official_docs_or_first_party_source",
+      "runtime_verified": false
+    },
+    {
+      "id": "ZD-PROVIDERS",
+      "title": "Zed model API access",
+      "url": "https://zed.dev/docs/ai/use-api-access",
+      "basis": "Текущая документация",
+      "sections": [
+        "OpenCode paid/free provider boundary"
+      ],
+      "accessed": "2026-09-29",
+      "origin": "official_docs_or_first_party_source",
+      "runtime_verified": false
+    },
+    {
+      "id": "DL-SETTINGS",
+      "title": "Delta settings",
+      "url": "https://delta.dev/docs/configuration/settings",
+      "basis": "Текущая документация",
+      "sections": [
+        "native.default_shell scope",
+        "agent settings"
+      ],
+      "accessed": "2026-09-29",
+      "origin": "official_docs_or_first_party_source",
+      "runtime_verified": false
+    },
+    {
+      "id": "DL-CHILDREN",
+      "title": "Delta subagents",
+      "url": "https://delta.dev/docs/agents/subagents",
+      "basis": "Текущая документация",
+      "sections": [
+        "Worker/Scout/Reviewer",
+        "isolation/sync",
+        "messaging"
+      ],
+      "accessed": "2026-09-29",
+      "origin": "official_docs_or_first_party_source",
+      "runtime_verified": false
+    }
+  ]
+}

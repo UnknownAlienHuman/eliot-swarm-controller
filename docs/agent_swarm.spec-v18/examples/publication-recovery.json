@@ -1,0 +1,28 @@
+{
+  "example_only": true,
+  "publication": {
+    "operation_id": "publish-demo-1",
+    "method": "forge.publish",
+    "state": "settled",
+    "remote_outcome": "applied",
+    "candidate_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "remote_result_ref": "artifact-demo-remote-readback"
+  },
+  "acceptance": {
+    "task_id": "task-demo",
+    "state": "pending_finalization"
+  },
+  "post_action": {
+    "operation_id": "finalize-demo-1",
+    "method": "forge.finalize",
+    "publication_operation_id": "publish-demo-1",
+    "state": "queued",
+    "reason": "previous legacy marker cleanup failed"
+  },
+  "forbidden_recovery": [
+    "repeat_writer",
+    "repeat_remote_publish_without_readback",
+    "erase_applied_fact"
+  ],
+  "note": "Illustrative persisted intent/readback split; no GitHub operation ran."
+}

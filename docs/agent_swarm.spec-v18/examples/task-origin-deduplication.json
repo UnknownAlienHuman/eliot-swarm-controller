@@ -1,0 +1,20 @@
+{
+  "_scope": "Synthetic prototype contract example; not a vendor request or live observation",
+  "origin_key": "github:github.example:Issue:9042",
+  "requests": [
+    {
+      "task_id": "one",
+      "project_alias": "main-workspace"
+    },
+    {
+      "task_id": "two",
+      "project_alias": "same-project-other-name"
+    }
+  ],
+  "expected": {
+    "canonical_task_id": "one",
+    "task_rows": 1,
+    "conflicting_import": "return_existing_or_report_project_binding_conflict",
+    "not_a_new_writer": true
+  }
+}

@@ -1,0 +1,72 @@
+--- source-v17/001_core.sql
++++ agent_swarm.spec-v18/migrations/001_core.sql
+@@ -1,5 +1,5 @@
+ -- ELIOT Swarm Prototype: NEW reference schema for C01, 2026-09-29.
+--- v17: add native_scope_key and unique live native-root ownership.
++-- v18: canonical Task origin, Attempt-scoped active check reuse, explicit resource release.
+ -- Not recovered from implementation-v1.zip. No Rust Store exists yet.
+ -- Apply only to an empty, prototype-owned DB after the host singleton is held.
+ -- Production startup verifies the bundled SQLite version and foreign_keys/WAL/FULL.
+@@ -27,6 +27,8 @@
+ CREATE TABLE tasks (
+     task_id TEXT PRIMARY KEY NOT NULL,
+     project_id TEXT NOT NULL,
++    -- Imported root work identity, resolved by the forge adapter, not a display URL.
++    origin_key TEXT CHECK (origin_key IS NULL OR length(origin_key) > 0),
+     revision INTEGER NOT NULL CHECK (revision > 0),
+     state TEXT NOT NULL CHECK (state IN ('open', 'accepted', 'archived')),
+     spec_json TEXT NOT NULL CHECK (json_valid(spec_json)),
+@@ -47,6 +49,8 @@
+     CHECK (state <> 'accepted' OR accepted_attempt_id IS NOT NULL),
+     CHECK (state <> 'open' OR accepted_attempt_id IS NULL)
+ ) STRICT;
++
++CREATE UNIQUE INDEX one_task_per_origin ON tasks(origin_key) WHERE origin_key IS NOT NULL;
+ 
+ -- A row is one native generation. Reconnecting IPC does NOT insert a generation.
+ CREATE TABLE bindings (
+@@ -82,6 +86,8 @@
+     task_revision INTEGER NOT NULL CHECK (task_revision > 0),
+     task_snapshot_json TEXT NOT NULL CHECK (json_valid(task_snapshot_json)),
+     owner_id TEXT NOT NULL,
++    -- One logical initial delivery; subsequent corrections are separate messages.
++    start_operation_id TEXT UNIQUE REFERENCES operations(operation_id),
+     binding_id TEXT,
+     binding_generation INTEGER,
+     state TEXT NOT NULL CHECK (state IN (
+@@ -167,6 +173,9 @@
+     candidate_ref TEXT NOT NULL REFERENCES artifacts(artifact_id),
+     cache_key TEXT NOT NULL,
+     resource_key TEXT NOT NULL,
++    -- Process result is not resource release; an incomplete result may retain its claim.
++    resource_claimed_at_ms INTEGER,
++    resource_released_at_ms INTEGER,
+     spec_json TEXT NOT NULL CHECK (json_valid(spec_json)),
+     state TEXT NOT NULL CHECK (state IN (
+       'queued', 'running', 'reconciling', 'passed', 'failed', 'error', 'incomplete', 'cancelled'
+@@ -180,12 +189,20 @@
+     created_at_ms INTEGER NOT NULL,
+     CHECK (state NOT IN ('passed', 'failed', 'error', 'incomplete', 'cancelled')
+         OR (finished_at_ms IS NOT NULL AND result_ref IS NOT NULL)),
+-    CHECK (state <> 'passed' OR (exit_code IS NOT NULL AND exit_code = 0))
+-) STRICT;
+-CREATE UNIQUE INDEX one_active_check ON check_runs(cache_key)
+-    WHERE state IN ('queued', 'running', 'reconciling');
++    CHECK (resource_released_at_ms IS NULL OR resource_claimed_at_ms IS NOT NULL),
++    CHECK (state <> 'queued' OR resource_claimed_at_ms IS NULL),
++    CHECK (state NOT IN ('running', 'reconciling')
++        OR (resource_claimed_at_ms IS NOT NULL AND resource_released_at_ms IS NULL)),
++    CHECK (resource_released_at_ms IS NULL
++        OR state IN ('passed', 'failed', 'error', 'incomplete', 'cancelled')),
++    CHECK (state <> 'passed' OR (exit_code IS NOT NULL AND exit_code = 0
++        AND resource_released_at_ms IS NOT NULL))
++) STRICT;
++CREATE UNIQUE INDEX one_active_check ON check_runs(attempt_id, cache_key)
++    WHERE state IN ('queued', 'running', 'reconciling')
++       OR (resource_claimed_at_ms IS NOT NULL AND resource_released_at_ms IS NULL);
+ CREATE UNIQUE INDEX one_check_writer_per_resource ON check_runs(resource_key)
+-    WHERE state IN ('running', 'reconciling');
++    WHERE resource_claimed_at_ms IS NOT NULL AND resource_released_at_ms IS NULL;
+ 
+ CREATE TABLE incidents (
+     incident_id TEXT PRIMARY KEY NOT NULL,

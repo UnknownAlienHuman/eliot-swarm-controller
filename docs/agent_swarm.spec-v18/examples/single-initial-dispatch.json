@@ -1,0 +1,18 @@
+{
+  "_scope": "Synthetic prototype contract example; not a vendor request or live observation",
+  "attempt_id": "a",
+  "start_operation_id": "start",
+  "requests": [
+    {
+      "client_request_id": "request-1",
+      "execution_operation_id": "start"
+    },
+    {
+      "client_request_id": "request-2",
+      "execution_operation_id": "start",
+      "request_disposition": "coalesced"
+    }
+  ],
+  "expected_native_initial_inputs": 1,
+  "correction_is_different_operation": true
+}

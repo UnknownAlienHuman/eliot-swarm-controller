@@ -1,0 +1,43 @@
+# Not an install lock. Paths/versions must be resolved during module installation.
+schema_version = 1
+
+[routes.muse_native_max]
+enabled = false
+module = 'runtime.muse'
+module_artifact = 'UNRESOLVED'
+entrypoint = 'serve_msp'
+account_ref = 'existing-native-login'
+billing_path = 'native_subscription'
+model = 'muse-spark-1.3-contributor'
+reasoning_effort = 'max'
+required_features = ['send', 'family', 'reply']
+# goal/steer are qualified independently for the actual binary, not inferred from the alias.
+
+[routes.opencode_native_free]
+enabled = false
+module = 'runtime.opencode_v2'
+module_artifact = 'builtin'
+entrypoint = 'existing_http_service'
+account_ref = 'existing-native-login'
+billing_path = 'native_free'
+# This is an explicit template, not a claim that a particular free model is available.
+model = 'REPLACE_WITH_ADVERTISED_MODEL_ID'
+required_features = ['send', 'family', 'reply']
+
+[routes.codex_native]
+enabled = false
+module = 'runtime.codex'
+module_artifact = 'UNRESOLVED'
+entrypoint = 'existing_shared_app_server'
+server_lifecycle = 'external_attach'
+native_transport = 'websocket_over_proxy_stdio'
+# Pinned Python SDK is JSONL-only; this route needs explicit WebSocket transport adaptation.
+# Documentation-only matrix never enables this route.
+server_executable = 'REPLACE_WITH_RESOLVED_SHARED_SERVER_BINARY'
+proxy_executable = 'REPLACE_WITH_RESOLVED_COMPATIBLE_CLIENT_BINARY'
+server_update_policy = 'external_explicit_maintenance'
+stop_shared_server_on_disconnect = false
+account_ref = 'existing-native-login'
+billing_path = 'native_subscription'
+model = 'REPLACE_WITH_ADVERTISED_MODEL_ID'
+required_features = ['send', 'family', 'reply']

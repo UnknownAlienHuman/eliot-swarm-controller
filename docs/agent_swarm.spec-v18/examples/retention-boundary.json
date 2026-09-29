@@ -1,0 +1,12 @@
+{
+  "_scope": "Synthetic prototype contract example; not a vendor request or live observation",
+  "retention": {
+    "raw_disposable_telemetry": "may_expire",
+    "completed_request_identity": "retain_for_active_project",
+    "unanswered_question": "retain",
+    "accepted_evidence": "retain",
+    "closed_tmp": "may_expire_after_writer_check"
+  },
+  "artifact_refs_inside_json": true,
+  "absence_of_sql_fk_is_not_unreferenced_proof": true
+}

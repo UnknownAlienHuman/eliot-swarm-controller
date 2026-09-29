@@ -1,0 +1,20 @@
+{
+  "_example": "Synthetic schema example; values do not describe the user account",
+  "kind": "usage_observed",
+  "binding_id": "binding-example",
+  "generation": 1,
+  "native_scope": {
+    "kind": "session",
+    "id": "native-session-example"
+  },
+  "metric": "cost_estimate",
+  "basis": "cumulative",
+  "unit": "USD",
+  "value": 1.25,
+  "observed_at_ms": 1790712000000,
+  "source_observed_at_ms": null,
+  "source_ref": "example:native-result",
+  "account_balance": null,
+  "children_included": "unknown",
+  "note": "Replace this scope snapshot; do not add it to prior cumulative snapshots or child totals."
+}

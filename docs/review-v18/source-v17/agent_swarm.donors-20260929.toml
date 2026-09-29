@@ -1,0 +1,144 @@
+schema_version = 1
+architecture = "ELIOT Swarm Prototype v12"
+as_of = "2026-09-29"
+status = "design_inventory_not_an_install_lock"
+source_downloaded_by_this_revision = false
+built_or_runtime_qualified = false
+
+[policy]
+reuse_unit = "Complete public package/crate/backend and its dependency closure; no rewrite of a state machine from snippets."
+source_layout = "vendor/<donor>; local changes are separate patches"
+versioning = "Exact source snapshot and exact launched runtime are different fields."
+runtime_default = "Installed native harness and existing authorized account."
+installation = "Project/module-local only; no global pip/npm/PATH mutations."
+qualification = "Versioned source read is not a successful Windows run."
+licensing = "Preserve upstream license, copyright, notices and applicable bundled third-party rules."
+activation = "Only one execution backend owns a session binding."
+
+[[donors]]
+id = "muse-sdk"
+selection = "primary"
+module = "runtime.muse"
+repository = "https://github.com/meta-models/muse-code-sdk"
+revision = "a7c10c5dd3f66be412077d29f9d11111af70317b"
+source_units = ["clients/sdk-ts", "clients/msp-ts", "schema/msp"]
+package = "@muse-code/sdk"
+manifest_version = "1.3.0"
+published_artifact_version_verified = false
+license_declaration = "MIT; clients/sdk-ts/package.json"
+execution = "Isolated Node SDK bridge; native muse serve owns model execution."
+upstream_runtime_dependency_count = 0
+retain = ["Generated wire types", "Protocol fixtures", "Publish provenance", "Upstream notices"]
+local_glue = ["Module v1 facade", "Task/binding identity", "Normalized observations", "Native effort readback"]
+qualification_points = ["Account billing path", "Max on actual host", "Fresh and resume", "Parent and native children", "View replay/gap", "Goal may start execution"]
+do_not_copy = ["Model inference implementation", "Global installation scripts"]
+
+[[donors]]
+id = "codex-python-sdk"
+selection = "primary_integration_candidate"
+module = "runtime.codex"
+repository = "https://github.com/openai/codex"
+revision = "18194bfd3534ca567d886eac454028dafaa68b6c"
+source_units = ["sdk/python"]
+package = "openai-codex"
+manifest_version = "0.0.0-dev"
+published_artifact_version_verified = false
+license_declaration = "Apache-2.0; sdk/python/pyproject.toml"
+execution = "Module-local Python environment; official client routing; native app-server."
+source_dependencies = ["pydantic>=2.12", "packaging>=26.2", "openai-codex-cli-bin==0.153.4"]
+retain = ["Generated models", "Reader/router implementation", "Fixtures/tests", "License"]
+local_glue = ["Module v1 facade", "Connection/profile identity", "Goal/family observation", "Exact runtime selection"]
+qualification_points = ["Owned stdio separately from shared daemon", "Existing auth/home", "Actual server version", "Concurrent requests and server requests", "Turn correlation", "Resume and goal"]
+do_not_copy = ["codex-rs/app-server-client into core: pulls core/app-server/executor dependency graph", "Legacy codex_as.py synchronous transport"]
+notes = "codex_bin selects the launched executable; it does not remove the matching-binary package dependency. Do not install a dev version by invented registry version."
+
+[[donors]]
+id = "rmcp"
+selection = "primary"
+module = "api.mcp"
+repository = "https://github.com/modelcontextprotocol/rust-sdk"
+source_manifest = "Cargo.toml"
+source_manifest_blob_sha = "4caecb897242e6c63124ca91c709319e85022f6f"
+manifest_version = "3.5.0"
+source_units = ["crates/rmcp", "crates/rmcp-macros"]
+license_declaration = "Apache-2.0; workspace.package.license"
+revision_resolution = "Resolve exact compatible release and source revision into Cargo.lock during first build; not main at runtime."
+execution = "Rust MCP facade over the same application API used by CLI."
+retain = ["Required transport and schema features", "Upstream notices"]
+qualification_points = ["GM tools discovery", "MCP disconnect does not stop host", "Async operation handles"]
+do_not_copy = ["All examples into runtime", "Every optional MCP feature by default"]
+
+[[donors]]
+id = "cccc-windows-process"
+selection = "primary_platform_candidate"
+module = "platform.process"
+repository = "https://github.com/ChesterRa/cccc"
+revision = "c270e276591879c6edb7d08af67bec7035585c7e"
+source_units = ["crates/cccc-windows-process"]
+license_declaration = "Apache-2.0; root LICENSE"
+execution = "Rust path/vendor dependency; existing suspended launch boundary."
+retain = ["Complete crate", "Error cleanup", "Required workspace metadata", "License"]
+local_glue = ["Our ProcessSpec", "Job ownership policy", "Packaging-only workspace metadata patch if needed"]
+qualification_points = ["Windows process spawn", "Flags composition", "Job attach and cleanup", "No accidental kill policy for external daemon"]
+do_not_copy = ["CCCC scheduler", "CCCC UI", "Observer-loss stop policy"]
+notes = "The crate alone is not the entire CCCC Job/process-tree subsystem; no claim of equivalent lifecycle until qualified."
+
+[[donors]]
+id = "atlas-redact"
+selection = "diagnostic_export_candidate"
+module = "artifacts.export"
+repository = "https://github.com/pacifio/atlas"
+revision = "a34a6d44bf37d26d9a6f8f6fe1fab5ce0a92d8d1"
+source_units = ["crates/atlas-redact"]
+manifest_version = "0.1.0"
+license_declaration = "Root Apache-2.0; bundled rule notices must also be retained."
+source_dependencies = ["regex", "serde_json"]
+execution = "Rust library on exported diagnostic copies; not between model and harness."
+retain = ["Complete crate", "Rule files", "Third-party notices", "Upstream fixtures"]
+qualification_points = ["No envelope corruption", "Known secret patterns", "False positives", "Throughput on bounded payloads"]
+do_not_copy = ["Atlas editor", "Atlas task/session store", "Per-tool repository snapshots"]
+
+[[donors]]
+id = "acpx"
+selection = "optional_acp_backend"
+module = "runtime.acp"
+repository = "https://github.com/openclaw/acpx"
+revision = "ee6090df63afa9d6f7fc1c091e1961e50f2f1476"
+source_units = ["Complete acpx package and retained upstream source"]
+manifest_version = "0.19.3"
+published_artifact_version_verified = false
+license_declaration = "MIT; package.json"
+execution = "Separate ACP owner backend using documented shared session/runtime interfaces."
+retain = ["Owner/queue/watch implementation", "Native registry", "Fixtures and source", "License"]
+qualification_points = ["Exact account/command/cwd/name scope", "Watch disconnect independent of execution", "Windows output behavior", "Native children coverage", "Antigravity question handling"]
+do_not_copy = ["Mandatory ACP bridge for Muse MSP/OpenCode HTTP", "Flow engine into Rust core", "UI"]
+
+[[donors]]
+id = "existing-control-bundle"
+selection = "migration_source"
+module = "runtime.command and runtime.opencode-v2"
+source_attachment = "eliot-swarm-control-20260929-2.zip"
+source_units = ["eliot-swarm-control/lanes/cc-root-inbox.ts", "eliot-swarm-control/lanes/oc_http.py", "eliot-swarm-control/lanes/Launch-CommandCode.ps1"]
+license_declaration = "User-provided source; not represented as third-party open-source."
+execution = "Retain complete native integration units; move ownership into module boundary."
+qualification_points = ["Mod ready handshake", "Direct HTTP cannot invoke CLI recovery", "No blind POST replay", "No session inferred dead by age"]
+do_not_copy = ["File CLAIM authority", "Synchronous RPC loop", "Destructive live-script overwrite", "Old polling/kill loops"]
+
+[[alternatives]]
+id = "helicon-muse-facade"
+repository = "https://github.com/HarjjotSinghh/helicon"
+revision = "80f3351e49b12a5ca21de748e2b4c3551e886d11"
+units = ["packages/daemon", "Required dependency closure"]
+decision = "Use as a whole facade instead of more own Muse glue only if it removes work; not an additional mandatory server over direct SDK."
+exclude = ["Model-based title discovery", "Desktop/web UI", "Second authoritative task store"]
+
+[[alternatives]]
+id = "atlas-acp-backend"
+repository = "https://github.com/pacifio/atlas"
+revision = "a34a6d44bf37d26d9a6f8f6fe1fab5ce0a92d8d1"
+decision = "Alternative to ACPX for an ACP binding, not a second connection to it."
+
+[[external_runtimes]]
+id = "vendor-cli"
+policy = "Use installed authorized native executors. Their binaries, subscriptions and model access are not covered by donor SDK licenses."
+claude_sdk_note = "Official TypeScript Agent SDK README uses Commercial Terms; do not label it a permissive open-source code donor without component-specific license verification."

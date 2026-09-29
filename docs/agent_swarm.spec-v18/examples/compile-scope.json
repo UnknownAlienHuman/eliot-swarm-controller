@@ -1,0 +1,17 @@
+{
+  "example_only": true,
+  "candidate_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "metadata_mode": "workspace_declarations_no_deps",
+  "resolve": null,
+  "selection_policy": "changed_plus_conservative_reverse_workspace_closure",
+  "coverage": {
+    "state": "unverified",
+    "reason": "reverse-dependency helper not supplied in latest upload"
+  },
+  "on_ambiguous_graph": "configured_workspace_lib_bin_check_or_diagnostic_only",
+  "environment": {
+    "rustc_wrapper_policy": "explicit_profile",
+    "env_applies_to": "cargo_process_not_codex_proxy"
+  },
+  "cache_policy": "same_relevant_inputs_only"
+}

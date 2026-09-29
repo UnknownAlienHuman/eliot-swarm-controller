@@ -1,0 +1,19 @@
+{
+  "_scope": "Synthetic prototype contract example; not a vendor request or live observation",
+  "check_id": "check-A",
+  "attempt_id": "attempt-A",
+  "state": "incomplete",
+  "resource_key": "fixture-target",
+  "resource_claimed_at_ms": 100,
+  "resource_released_at_ms": null,
+  "process_disposition": "unknown",
+  "expected": {
+    "new_writer_same_resource": false,
+    "other_resources_blocked": false
+  },
+  "after_owned_job_observed_empty": {
+    "resource_released_at_ms": 200,
+    "new_writer_same_resource": true
+  },
+  "no_process_executed_here": true
+}

@@ -1,0 +1,20 @@
+{
+  "_example": "Synthetic controller observation, not a captured provider response",
+  "kind": "configuration_observed",
+  "binding_id": "binding-mc",
+  "generation": 1,
+  "operation_id": "op-config-example",
+  "requested": {
+    "model": "EXACT_NATIVE_MODEL_ID",
+    "reasoning_effort": "max"
+  },
+  "observed": {
+    "model": "EXACT_NATIVE_MODEL_ID",
+    "reasoning_effort": "max"
+  },
+  "application_state": "applied",
+  "evidence_scope": "native_session_configuration",
+  "provider_request_verified": false,
+  "source_ref": "example:session-snapshot",
+  "note": "Readback proves stored session configuration, not independent verification of model inference."
+}

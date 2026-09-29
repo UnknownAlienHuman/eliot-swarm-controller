@@ -1,0 +1,71 @@
+{
+  "date": "2026-09-29",
+  "status": "documented_and_reference_checked",
+  "scope": "Own architecture v17 / implementation v5 / module contract v1 / reference DDL; not live runtime",
+  "findings": [
+    {
+      "id": "H18-01",
+      "kind": "schema_counterexample_reproduced",
+      "title": "Два Task для одной внешней Issue обходят one_owner_per_task",
+      "source": "001_core.sql tasks + attempts",
+      "fix": "Канонический origin_key импортированной корневой работы; unique по origin, не по отображаемому пути/алиасу/номеру Issue в одиночку."
+    },
+    {
+      "id": "H18-02",
+      "kind": "contract_gap",
+      "title": "Admission не защищает от устаревания queued команды до отправки",
+      "source": "implementation-v5 §5 begin_send / §6",
+      "fix": "Актуальность Task/Attempt, desired mode и полномочий на begin_send; CAS-точка допуска, после неё изменение трактуется как возможный уже начатый эффект."
+    },
+    {
+      "id": "H18-03",
+      "kind": "schema_counterexample_reproduced",
+      "title": "Terminal CheckRun снимает target-dir ownership до известного завершения процессов",
+      "source": "001_core.sql one_check_writer_per_resource",
+      "fix": "Отдельные resource_claimed/released поля и unique до explicit release, не по результату проверки."
+    },
+    {
+      "id": "H18-04",
+      "kind": "schema_contract_mismatch_reproduced",
+      "title": "Global active check dedupe не согласован с единственным attempt_id CheckRun",
+      "source": "001_core.sql check_runs / implementation-v5 check.run",
+      "fix": "Активный dedupe в прототипе только в пределах одной Attempt; cross-attempt завершённый cache с новой проверенной привязкой."
+    },
+    {
+      "id": "H18-05",
+      "kind": "contract_gap",
+      "title": "Применённый Max может быть заменён другим configure до отправки задания",
+      "source": "module-contract-v1 §6 prerequisite",
+      "fix": "Per-turn native settings предпочтительны; иначе короткий prepare/admission barrier и revision состояния settings. Не блокировать всю жизнь модели."
+    },
+    {
+      "id": "H18-06",
+      "kind": "contract_gap",
+      "title": "Изменение/опровержение предпосылки после старта зависимой работы",
+      "source": "implementation-v5 reserve_attempt / accept_task",
+      "fix": "Зафиксировать dependency acceptance identity; перед приёмкой сверить статус/историю точной зависимости, не каскадно убивать писателей."
+    },
+    {
+      "id": "H18-07",
+      "kind": "contract_gap",
+      "title": "Retention теряет идемпотентность и ссылки из JSON",
+      "source": "architecture §5 / §13",
+      "fix": "Operation dedupe records и связанные evidence не удалять обычным retention; первоначально автоочистка лишь disposable telemetry и закрытых temp."
+    },
+    {
+      "id": "H18-08",
+      "kind": "contract_gap",
+      "title": "caller_id / GM authority после reconnect определены недостаточно",
+      "source": "implementation-v5 §4 / §12",
+      "fix": "Стабильный client principal отдельно от link, явный GM binding/epoch в meta и фиксированная матрица application rights. Не security-песочница."
+    },
+    {
+      "id": "H18-09",
+      "kind": "contract_gap",
+      "title": "Два task.dispatch с разными request IDs на уже claimed Attempt",
+      "source": "implementation-v5 §4 task.dispatch; one_owner_per_task не дедуплицирует старт",
+      "fix": "Attempt.start_operation_id назначается однажды; повтор начального назначения возвращает первый handle, и begin_send допускает только указанный start op. Коррекции остаются отдельными сообщениями."
+    }
+  ],
+  "implementation_status": "not_implemented"
+}

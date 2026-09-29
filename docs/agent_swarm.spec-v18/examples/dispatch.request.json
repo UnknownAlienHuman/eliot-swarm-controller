@@ -1,0 +1,12 @@
+{
+  "jsonrpc": "2.0",
+  "id": "request-41",
+  "method": "task.dispatch",
+  "params": {
+    "client_request_id": "dispatch-demo-1",
+    "task_id": "task-demo",
+    "expected_revision": 1,
+    "binding_id": "binding-mc",
+    "generation": 1
+  }
+}

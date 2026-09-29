@@ -1,0 +1,48 @@
+# Documentation example: no executable consumes this configuration yet.
+schema_version = 1
+
+[storage]
+# Relative paths resolve against this file, NOT against a caller's cwd.
+data_dir = '../state'
+artifact_dir = '../state/artifacts'
+
+[ipc]
+transport = 'windows_named_pipe'
+# The implementation derives the final endpoint from the user SID + data-dir identity.
+name_prefix = 'eliot-swarm-prototype'
+max_frame_bytes = 1048576
+max_pending_output_bytes = 8388608
+# Native model context / vendor transport limits are NOT changed by these values.
+
+[execution]
+workspace_mode = 'main_only'
+# Never synthesize idle/dead from old timestamps; unknown outcome is reconciled.
+new_work = 'enabled'
+intervention_default = 'notify'
+continuation_owner = 'native_when_supported'
+
+[checks]
+max_concurrent = 1
+# Initial example only; target machines choose real concurrency through configuration.
+writers_run_cargo = false
+broad_tests_phase = 'after_feature_complete'
+
+[reports]
+interval_seconds = 1800
+non_destructive_reads = true
+
+[updates]
+activate_new_bindings_only = true
+install_or_update_vendor_automatically = false
+
+[windows]
+# Effective launch is qualified per executor; this is not a global flag for all descendants.
+default_console_policy = 'hidden_console'
+modify_uac_or_foreign_acl = false
+
+[schedules]
+# Planned format; these do not install cron/SCM jobs by themselves.
+reconcile_before_catch_up = true
+missed_slots = 'coalesce_latest'
+state_owner = 'host_meta_and_operations'
+# Implementation chooses interval Skip/Delay; default Burst is not a delivery policy.

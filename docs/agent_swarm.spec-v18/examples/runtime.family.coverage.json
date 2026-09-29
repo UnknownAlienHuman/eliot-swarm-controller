@@ -1,0 +1,16 @@
+{
+  "_example": "Synthetic metadata; list filters are part of coverage",
+  "kind": "family_observed",
+  "binding_id": "binding-example",
+  "generation": 1,
+  "source_query": {
+    "scope": "root_inventory",
+    "include_native_children": false
+  },
+  "enumeration_complete": true,
+  "family_completeness": "partial",
+  "active_child_count": null,
+  "absence_means_terminal": false,
+  "source_ref": "example:roots-list",
+  "note": "A complete roots enumeration does not prove that the family has zero live children."
+}

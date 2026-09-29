@@ -1,0 +1,68 @@
+{
+  "_example": "Synthetic own Operation sequence, not a vendor wire protocol",
+  "binding_id": "root-a",
+  "generation": 1,
+  "operations": [
+    {
+      "operation_id": "open-1",
+      "method": "open",
+      "contract": {
+        "completion_condition": "native_identity_observed"
+      },
+      "state": "settled",
+      "result": {
+        "outcome": "success",
+        "completion_condition_met": true
+      }
+    },
+    {
+      "operation_id": "effort-1",
+      "method": "configure",
+      "prerequisite_operation_id": "open-1",
+      "contract": {
+        "completion_condition": "native_applied"
+      },
+      "state": "native_accepted",
+      "result": {
+        "outcome": "pending",
+        "completion_condition_met": false
+      }
+    },
+    {
+      "operation_id": "start-1",
+      "method": "send",
+      "prerequisite_operation_id": "effort-1",
+      "contract": {
+        "completion_condition": "native_input_admitted"
+      },
+      "state": "queued"
+    }
+  ],
+  "before_apply": {
+    "can_begin_start": false,
+    "cause": "effort admitted, not yet observed applied"
+  },
+  "apply_fact": {
+    "operation_id": "effort-1",
+    "application_state": "applied",
+    "requested": {
+      "reasoning_effort": "max"
+    },
+    "observed": {
+      "reasoning_effort": "max"
+    },
+    "evidence_scope": "native_session_configuration",
+    "provider_request_verified": false
+  },
+  "after_apply": {
+    "can_begin_start": true,
+    "assuming": "Task/owner/admission policy and relevant effective settings remain valid at begin_send; no competing configure interleaves"
+  },
+  "negative_case": {
+    "effort_result": {
+      "state": "settled",
+      "outcome": "failed"
+    },
+    "can_begin_start": false
+  }
+}

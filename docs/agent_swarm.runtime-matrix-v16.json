@@ -1,0 +1,182 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-29",
+  "architecture": "v16",
+  "scope": "7 harness families; Delta distinguished from native Zed",
+  "status": "documentation_review_only",
+  "runtimes": [
+    {
+      "runtime_id": "opencode_v2",
+      "name": "OpenCode V2",
+      "selected_entrypoint": "existing_http_service",
+      "review_status": "official_contract_reviewed",
+      "installed_runtime_verified": false,
+      "source_ids": [
+        "OC-API",
+        "OC-INSTR",
+        "OC-MODELS",
+        "OC-AGENTS",
+        "OC-CONFIG"
+      ],
+      "coverage": {
+        "transport": "HTTP /api + volatile events; native inbox admission",
+        "sessions_family": "parentID pages plus scoped state; active drains are not full family",
+        "steer_background": "prompt delivery=steer|queue; resume=false stages without scheduling",
+        "goal": "No durable goal API established in selected reference",
+        "configuration_tools": "Explicit session variant; applied state separate from config; nested instructions have different refresh",
+        "usage_quota": "Tool/session statistics; public remaining subscription meter not established",
+        "recovery_update": "reload has location-wide effects; snapshots after gaps; no CLI recovery"
+      },
+      "admission_rule": "This documentation inventory does not enable the module or grant capabilities; runtime describes the actual entrypoint."
+    },
+    {
+      "runtime_id": "muse",
+      "name": "Meta Muse Code",
+      "selected_entrypoint": "serve_msp",
+      "review_status": "official_contract_reviewed",
+      "installed_runtime_verified": false,
+      "source_ids": [
+        "MC-SCHEMA",
+        "MC-SDK",
+        "MC-EFFORT",
+        "MC-PLAN"
+      ],
+      "coverage": {
+        "transport": "MSP v1 through pinned official Connection",
+        "sessions_family": "Parent subagent provenance; view cursor/gap; separate current item state",
+        "steer_background": "turn/steer targets native turn; task/background targets item",
+        "goal": "Native goal verbs; activation can start work",
+        "configuration_tools": "session/turn effort plus readback; approval choices are native IDs",
+        "usage_quota": "usage/read + changed; observation time, windows, counted-once basis",
+        "recovery_update": "Passive view subscribe vs session resume; preserve unknown cursor gaps"
+      },
+      "admission_rule": "This documentation inventory does not enable the module or grant capabilities; runtime describes the actual entrypoint."
+    },
+    {
+      "runtime_id": "codex",
+      "name": "Codex",
+      "selected_entrypoint": "existing_shared_app_server",
+      "review_status": "official_contract_reviewed",
+      "installed_runtime_verified": false,
+      "source_ids": [
+        "CX-API",
+        "CX-SDK"
+      ],
+      "coverage": {
+        "transport": "Selected: WebSocket over stdio proxy; pinned SDK direct JSONL is not plug-compatible",
+        "sessions_family": "thread/list sourceKinds and experimental parent/ancestor filters need installed-schema check",
+        "steer_background": "turn/steer + expectedTurnId; mutation outcome separate from transport response",
+        "goal": "Native thread goal; turn completion not campaign finish",
+        "configuration_tools": "Thread config; server executable/schema pin; no implicit account/home migration",
+        "usage_quota": "account/rateLimits read/updated; native reset unit retained",
+        "recovery_update": "thread/read passive; resume loads/subscribes; external server never owned by client"
+      },
+      "admission_rule": "This documentation inventory does not enable the module or grant capabilities; runtime describes the actual entrypoint."
+    },
+    {
+      "runtime_id": "claude",
+      "name": "Claude Code",
+      "selected_entrypoint": "native_print_stream",
+      "review_status": "official_contract_reviewed",
+      "installed_runtime_verified": false,
+      "source_ids": [
+        "CL-HEADLESS",
+        "CL-CLI",
+        "CL-STREAM",
+        "CL-INPUT",
+        "CL-HOOKS",
+        "CL-GOAL",
+        "CL-CHILDREN",
+        "CL-SUPERVISOR",
+        "CL-CHANNELS",
+        "CL-BILLING",
+        "CL-AUTH"
+      ],
+      "coverage": {
+        "transport": "Print/stream + scoped supported hooks; native background is separate entrypoint",
+        "sessions_family": "Complete messages carry child linkage; token StreamEvent does not; content blocks share message ID",
+        "steer_background": "Streaming inputs not assumed to be Codex steer; opt-in Channels can wake GM",
+        "goal": "Stop evaluator uses model; background work defers evaluation; mode-specific check-ins",
+        "configuration_tools": "System-prompt snapshot survives resume; hook transport varies by event",
+        "usage_quota": "Cumulative cost vs new usage distinguished; API key may change billing path",
+        "recovery_update": "Exact resume; native supervisor respawn/worktree/summaries are separate qualified choices"
+      },
+      "admission_rule": "This documentation inventory does not enable the module or grant capabilities; runtime describes the actual entrypoint."
+    },
+    {
+      "runtime_id": "command",
+      "name": "Command Code",
+      "selected_entrypoint": "native_mod",
+      "review_status": "official_contract_reviewed",
+      "installed_runtime_verified": false,
+      "source_ids": [
+        "CC-MODS",
+        "CC-AGENTS",
+        "CC-HEADLESS",
+        "CC-CLI",
+        "CC-SESSIONS",
+        "CC-GOAL",
+        "CC-WIN",
+        "CC-USAGE"
+      ],
+      "coverage": {
+        "transport": "Native headless NDJSON + pinned mod; mod readiness independently observed",
+        "sessions_family": "Native subagent events; current tool argument names checked, not assumed from brief",
+        "steer_background": "queueMessage returns void; steer after tool batch; followup boundary different",
+        "goal": "Native documented goal persists idle after resume; chosen headless setter not established",
+        "configuration_tools": "Definitions refresh next turn; mods reload via restart; omitted agent tools is empty",
+        "usage_quota": "Round/run totals not additive together; headless subscription balance not established",
+        "recovery_update": "Exact resume ID; mod_error does not mean native CLI exited"
+      },
+      "admission_rule": "This documentation inventory does not enable the module or grant capabilities; runtime describes the actual entrypoint."
+    },
+    {
+      "runtime_id": "antigravity",
+      "name": "Antigravity",
+      "selected_entrypoint": "native_warm_stream",
+      "review_status": "official_contract_reviewed",
+      "installed_runtime_verified": false,
+      "source_ids": [
+        "AG-HEADLESS",
+        "AG-CHILDREN",
+        "AG-HOOKS",
+        "AG-USAGE",
+        "AG-AUTH"
+      ],
+      "coverage": {
+        "transport": "Native event-based JSON envelope; warm sequential turns, EOF ends channel",
+        "sessions_family": "step_update subagent_info and native IDs; idle child can wake from message",
+        "steer_background": "Next-turn input supported; Claude control_request and slash input unsupported",
+        "goal": "Durable goal control not established for selected warm CLI entrypoint",
+        "configuration_tools": "Native init/tools and agy models; hooks/config not Claude-compatible",
+        "usage_quota": "Result usage vs interactive /usage refresh; no fabricated stable quota JSON API",
+        "recovery_update": "Exact conversation resume; SUCCESS alone not proof all tools succeeded"
+      },
+      "admission_rule": "This documentation inventory does not enable the module or grant capabilities; runtime describes the actual entrypoint."
+    },
+    {
+      "runtime_id": "zed",
+      "name": "Zed / Delta",
+      "selected_entrypoint": "eval_cli_batch",
+      "review_status": "official_contract_reviewed",
+      "installed_runtime_verified": false,
+      "source_ids": [
+        "ZD-EXEC",
+        "ZD-EXTERNAL",
+        "ZD-PROVIDERS",
+        "DL-SETTINGS",
+        "DL-CHILDREN"
+      ],
+      "coverage": {
+        "transport": "Zed native eval-cli is a batch executor; ACP editor is a different direction",
+        "sessions_family": "Batch transcript artifacts; managed external family API not established",
+        "steer_background": "No persistent steer contract established for selected eval-cli; Delta separate product",
+        "goal": "No goal contract established for this batch entrypoint",
+        "configuration_tools": "Delta native.default_shell configures interactive terminal, not executor",
+        "usage_quota": "Batch result statistics; no assumed provider subscription meter",
+        "recovery_update": "Do not drive GUI/private DB; no Windows load qualification performed"
+      },
+      "admission_rule": "This documentation inventory does not enable the module or grant capabilities; runtime describes the actual entrypoint."
+    }
+  ]
+}

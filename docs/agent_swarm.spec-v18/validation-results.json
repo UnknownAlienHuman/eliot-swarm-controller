@@ -1,0 +1,367 @@
+{
+  "date": "2026-09-29",
+  "scope": "documentation plus reference DDL/SQL and small sequential contract models; not a service test",
+  "sqlite_version": "3.46.1",
+  "sql_counterexample_cases": 10,
+  "sql_counterexamples_all_expected": true,
+  "reference_transition_checks": {
+    "passed": 16,
+    "failed": 0
+  },
+  "structure_checks": [
+    {
+      "name": "execute reference utility reproduce_sql.py",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "execute reference utility validate_transitions.py",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "JSON runtime.send.request.json",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "JSON runtime.usage.observation.json",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "JSON caller-reconnect.json",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "JSON check-resource-release.json",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "JSON compile-scope.json",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "JSON publication-recovery.json",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "JSON dispatch.request.json",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "JSON schedule-catchup.json",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "JSON retention-boundary.json",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "JSON active-check-deduplication.json",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "JSON task-dependency.json",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "JSON task-origin-deduplication.json",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "JSON single-initial-dispatch.json",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "JSON runtime.configure.observation.json",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "JSON runtime.send.response.json",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "JSON dependency-revalidation.json",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "JSON task.json",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "JSON dispatch-guard-races.json",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "JSON check-result.json",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "JSON settings-interleaving.json",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "JSON module.describe.example.json",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "JSON runtime.prepare-admission-vs-applied.json",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "JSON native-owner-collision.json",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "JSON dispatch.response.json",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "JSON observer-backpressure.json",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "JSON runtime.snapshot.json",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "JSON deployment-observation.json",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "JSON runtime.family.coverage.json",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "TOML routes.example.toml",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "TOML controller.example.toml",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "TOML agent_swarm.donors-20260929.toml",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "nine application tables",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "foreign_keys enabled",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "FK check empty",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "v18 columns tasks",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "v18 columns attempts",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "v18 columns check_runs",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "v17 native alias-owner invariant retained",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "different native namespace allowed",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "donor field unchanged policy",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "donor field unchanged schema_version",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "donor field unchanged donors",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "donor field unchanged external_runtimes",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "donor field unchanged alternatives",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "donor field unchanged built_or_runtime_qualified",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "donor field unchanged as_of",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "donor field unchanged source_downloaded_by_this_revision",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "donor field unchanged status",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "text hygiene agent_swarm.md",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "balanced fences agent_swarm.md",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "text hygiene agent_swarm.implementation-v6.md",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "balanced fences agent_swarm.implementation-v6.md",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "text hygiene agent_swarm.module-contract-v2.md",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "balanced fences agent_swarm.module-contract-v2.md",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "text hygiene agent_swarm.design-review-v18-20260929.md",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "balanced fences agent_swarm.design-review-v18-20260929.md",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "text hygiene agent_swarm.checkpoint.md",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "balanced fences agent_swarm.checkpoint.md",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "text hygiene README.md",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "balanced fences README.md",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "text hygiene README.md",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "balanced fences README.md",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "active relative links exist",
+      "passed": true,
+      "detail": "[]"
+    },
+    {
+      "name": "canonical version labels",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "start slot guard in reference SQL",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "no triggers added",
+      "passed": true,
+      "detail": ""
+    }
+  ],
+  "structure_summary": {
+    "passed": 68,
+    "failed": 0,
+    "active_relative_links": 72
+  },
+  "not_executed": [
+    "Rust service/API/Store",
+    "SDK build or install",
+    "Windows IPC/Job/concurrency",
+    "live models and quota",
+    "vendor API update qualification",
+    "product WAL/load benchmark",
+    "GitHub writes"
+  ]
+}

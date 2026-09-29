@@ -1,0 +1,51 @@
+{
+  "_example": "Fixture adapter contract; no real harness capabilities asserted",
+  "protocol_major": 1,
+  "module_id": "runtime.fixture",
+  "artifact_id": "fixture-v1",
+  "native_runtime": {
+    "version": "fixture-only",
+    "entrypoint": "fixture-server",
+    "qualified_live": false
+  },
+  "operations": {
+    "send": {
+      "implemented": true,
+      "delivery_boundaries": [
+        "next_turn"
+      ],
+      "completion_condition": "native_input_admitted",
+      "replay_policy": "after_proven_non_admission"
+    },
+    "configure": {
+      "implemented": true,
+      "application_boundaries": [
+        "next_turn"
+      ],
+      "completion_condition": "native_applied"
+    },
+    "snapshot": {
+      "implemented": true,
+      "available_scopes": [
+        "root"
+      ],
+      "family_completeness": "unknown"
+    }
+  },
+  "roles": {
+    "batch_writer": {
+      "require": [
+        "send",
+        "result"
+      ]
+    },
+    "native_manager": {
+      "require": [
+        "send",
+        "family",
+        "reply"
+      ]
+    }
+  },
+  "qualification_note": "JSON illustrates inputs for role evaluation; it does not compute supported roles or enable a live route"
+}

@@ -1,0 +1,32 @@
+{
+  "task_id": "task-demo",
+  "project_id": "demo",
+  "revision": 1,
+  "objective": "Implement the specified module.",
+  "phase": "implementation",
+  "requirements": [
+    {
+      "id": "W1",
+      "text": "Implement the named function.",
+      "verification": "source_and_scoped_clippy",
+      "required_now": true
+    }
+  ],
+  "depends_on": [],
+  "scope": {
+    "workspace_id": "demo-main",
+    "initial_paths": [
+      "src/demo.rs"
+    ],
+    "forbidden_paths": [],
+    "prerequisite_policy": "owner_module_prerequisites"
+  },
+  "sources": [
+    {
+      "kind": "inline",
+      "revision": "spec-demo-1",
+      "text": "Demonstration only; no live repository or task."
+    }
+  ],
+  "origin_key": null
+}

@@ -1,0 +1,20 @@
+{
+  "_scope": "Synthetic prototype contract example; not a vendor request or live observation",
+  "before": {
+    "client_principal": "manager-MC",
+    "link_epoch": 4
+  },
+  "after": {
+    "client_principal": "manager-MC",
+    "link_epoch": 5
+  },
+  "same_logical_request_id": "req-11",
+  "expected_native_reexecution": false,
+  "gm_rotation": {
+    "old_epoch": 7,
+    "current_epoch": 8,
+    "old_queued_gm_only_action": "stale_until_explicit_adopt_or_cancel",
+    "manager_tasks_automatically_cancelled": false
+  },
+  "same_user_shell_is_not_sandboxed": true
+}

@@ -1,0 +1,205 @@
+# ELIOT Swarm — контракт модулей и качества интеграции v2
+
+**29.09.2026. Проектное уточнение к архитектуре v18; реализации и live-квалификации пока нет.**
+
+Назначение: один разработчик должен подключить очередной native harness, не изменяя scheduler, Task/Attempt и остальные adapters. Этот документ определяет нашу границу. Он не переписывает протоколы производителей и не утверждает, что все перечисленные возможности есть у каждого harness.
+
+## 1. Универсальность — одинаковые обязательства, не одинаковые возможности
+
+Контроллер унифицирует назначение работы, адресацию, наблюдение, результаты и исходы команд. Он не унифицирует внутренние tools, model loop, billing, effort vocabulary и фоновые механизмы разных производителей.
+
+В коде одна зависимость: `api/scheduler → RuntimePort → implementation`. Ни core, ни Store не импортируют vendor SDK и не ветвятся по `if runtime == Muse/Codex/...`. Ветвление по смыслу операции и её проверенному контракту допустимо. Идентификатор runtime — открытая строка; набор собственных базовых операций — небольшой типизированный enum.
+
+`native.*` — расширение одного adapter, а не команда «исполнить произвольный JSON». Adapter регистрирует имя, input schema, область эффекта, порядок и способ подтверждения; host ведёт его как обычную Operation. Новые инструменты этого пространства не загружаются всем моделям в контекст. Справка по ним выдаётся адресно.
+
+Одного названия `supports_steer` недостаточно: важно, какой шаг можно поправить, нужна ли active turn identity и что подтверждает ответ. Поведение не выбирается угадыванием по бренду CLI.
+
+## 2. Один контракт с четырьмя реализациями подключения
+
+| Топология | Кто держит native transport | Что даёт общий RuntimePort |
+|---|---|---|
+| Native HTTP/SSE service | Внешний сервис; наш adapter — клиент | Operation, события и scoped snapshot |
+| SDK-owned bridge | Долгоживущий bridge + SDK | Те же команды по local IPC, private vendor stdio |
+| Existing shared backend | Внешний владелец server; bridge владеет клиентом/proxy | Управление только своими bindings |
+| Batch executable | ProcessJob этого запуска | Запуск и результат; live-функции только если реально существуют |
+
+Не добавляем другой coordinator для batch. Batch — ограниченный runtime-профиль. Read-only observer может читать существующий binding, но не создаёт второй control binding.
+
+Первый bridge можно запускать на одну root-линию. Контракт содержит binding IDs и не требует отдельного process на каждого child. Multiplex нескольких roots в одном bridge разрешается только если конкретный SDK его поддерживает; отдельный универсальный connection-pool заранее не пишется.
+
+Сбой adapter не равен сбою server. Если SDK владеет subprocess, его падение может оборвать соединение — это явная граница, а не обещание, которое исправляется словом «модульность».
+
+## 3. Пакет модуля
+
+```text
+modules/<name>/<artifact-version>/
+  module.toml            запуск, protocol major, возможности реализации
+  bridge / executable    готовый SDK и небольшой facade
+  vendor.lock            точные source/package/native references, без секретов
+  fixtures/              сохранённые upstream-примеры и минимальные наши mappings
+  UPDATE.md              что менять, как проверить, как активировать и откатить
+  LICENSES/              notices и лицензии взятой единицы кода
+```
+
+Это формат поставки, не шесть новых обязательных служб. Встроенный OpenCode adapter может иметь такую же логическую информацию, оставаясь Rust-модулем.
+
+`module.toml` описывает установленную реализацию. Результаты наблюдения host хранятся отдельно в существующих binding/observations. Правка manifest на `supported=true` не становится доказательством работы. Исследовательская runtime matrix — справочник, не install manifest.
+
+Три изменения разделены:
+
+| Изменение | Минимально нужная работа |
+|---|---|
+| Новая модель, уже поддержанная harness | Route alias/native model reference/options, проверка каталога и применения; без сборки ядра |
+| Новый native метод/вариант протокола | Один adapter, types/fixtures и локальный patch; core не меняется |
+| Новое общее свойство исполнения | Явное изменение RuntimePort только после двух реальных потребителей |
+
+Не требуется два потребителя для новой vendor-функции: она остаётся в `native.*`. Правило ограничивает расширение общего ядра, а не доступ к новым функциям.
+
+## 4. Восемь базовых операций
+
+| Операция | Обязательство adapter | Что ответ не означает |
+|---|---|---|
+| `describe` | Фактический entrypoint, runtime/server versions, поддержанные операции и известные ограничения | Рабочую модельную сессию или гарантированную доступность подписки |
+| `open` | Один конкретный запуск/создание, identity или явный unknown | Готовность всех settings и выполнение Task |
+| `attach` | Проверить уже существующую identity, не создавать новую вместо отсутствующей | Возобновление/новый prompt без отдельного намерения |
+| `snapshot` | Область, полнота, порядок/cursor и факты | Полную семью по root-only списку или жизнь по PID |
+| `configure` | Выбранные settings, момент/область применения, evidence | Применение только потому, что файл записан или ACK получен |
+| `send` | Точную доставку input/goal action по поддержанной границе | Исправление кода, чтение модели или принятую Issue |
+| `reply` | Ответ текущему native request со stale-guard | Право угадать смысл ответа или ответить по уже устаревшему request |
+| `shutdown` | Явный scope и реальный disposition собственного ресурса | Разрешение остановить общий server или чужих детей |
+
+Малый `OperationContract` сохраняется в `effective_request_json`: `effect_scope`, `order_scope`, `completion_condition`, `replay_policy`, `fallback_used`, `contract_revision`. Это обычные данные решения adapter, не язык выполнения произвольных workflows. Scope задаёт binding/session/turn/request либо shared service, если операция действительно глобальная.
+
+Короткая admission-фаза не держит target заблокированным до конца model run. Ожидаемый смысл результата определён методом: установка effort ждёт факта применения; доставка сообщения может закончиться на native admission, не подтверждая его использование.
+
+## 5. Готовность маршрута — по роли, а не один зелёный индикатор
+
+Различаются `implemented`, `documented`, `observed`, `unavailable`, `unknown`. Последние сведения имеют версию/entrypoint и source. Достаточно существующего JSON, отдельного сервиса сертификации не требуется.
+
+Требования задаёт выбранная роль:
+
+- Batch writer: корректное назначение, fixed inputs, результат и известная граница владения.
+- Native manager: дополнительно нужное наблюдение детей, доставка вопросов/ответов и управление текущей сессией.
+- Reviewer: выбранные read-only возможности, корректные candidate inputs и отчёт о покрытии; ОС-изоляция не выдумывается по имени роли.
+
+Отсутствие квотного API не запрещает запуск при разрешённой unknown-quota policy. Отсутствие live steer не запрещает batch task, но не скрывается при назначении manager, которому live steer необходим.
+
+Чистый readback применённого параметра — native evidence, не независимая аттестация фактического inference. Для Max сохраняется смысл: `requested` → `native_effective` → при отдельно выполненной пробе `execution_observed`. Контроллер не должен требовать packet capture для каждой обычной задачи и не должен выдавать первый уровень за третий.
+
+## 6. Подготовка без гонки ACK и запуска
+
+```text
+open admitted
+→ native session identity получена и закреплена
+→ configure model/effort/tools
+→ наблюдён нужный результат configure
+→ передано полное задание / активирован согласованный goal
+```
+
+Промежуточное `accepted` не открывает следующий шаг, если его `completion_condition=native_applied`. `record_ack` и `record_runtime_fact` не заменяют друг друга.
+
+`prerequisite_operation_id` уже есть. Проверка prerequisites читает успешный **типизированный результат нужного шага**, не только `state=settled`. `settled/rejected/cancelled` и failure не могут удовлетворить настройку по факту окончания.
+
+Для backend, где initial settings и prompt принимаются атомарно одним методом, adapter использует этот готовый путь. Не заставляем его выполнять пять лишних roundtrips. Многокомандная подготовка — только там, где native contract её требует. Возобновление после ошибки повторяет незавершённый шаг, а не успешно открывшуюся сессию.
+
+Неприменённая обязательная настройка задерживает только запуск этой подготовляемой работы. Действующие unrelated turns не прерываются и не переводятся молча на другую модель.
+
+Прежнее applied остаётся историческим фактом, но не вечным условием запуска. Для конфликтующих session-wide settings модуль сохраняет effective settings revision и привязывает setup к ней. Per-turn options предпочтительны; иначе короткий prepare/admission barrier исключает interleaving `set max → set high → start Max task`. При динамическом применении settings на следующих model calls совместимость определяется native lifecycle, не названием config setter. Другие bindings и protocol replies не ждут этого barrier.
+
+## 7. Одна native-сессия — один control owner, независимо от aliases
+
+Ключ root состоит из `native_scope_key + native_root_id`. Scope — не произвольное имя route; adapter разрешает реальное пространство native IDs: runtime/account/store namespace, при необходимости user/machine domain. Секреты в ключ не входят. Порт, PID, model, lane label и имя bridge не являются заменой устойчивого namespace.
+
+Пример: два aliases одной Codex home/shared-server session должны дать одинаковый ключ; разные независимые stores с одинаковым `ses-1` — разные. Смена модели не меняет владельца беседы.
+
+После native identity выполняется `record_native_identity` в одной Store-транзакции. Partial UNIQUE index удерживает один unreleased binding на ключ. Старая проверка `one_live_root_per_lane` остаётся: это другая коллизия. До команды `attach`, способной менять native subscription/lease, claim известной identity делается заранее; простой read-only observer использует existing binding.
+
+Внутри одного controller это устраняет alias-based двойное управление. Не блокирует чужой full-access CLI и не подменяет native session lock. При обнаружении такого конфликта фиксируется факт; контроллер не делает автоматический takeover.
+
+Если backend не предоставляет устойчивую identity, adapter заявляет ограничение. Batch job остаётся учтённым собственным Operation/ProcessJob; точное повторное attach без evidence не объявляется поддержанным.
+
+Старт новой native-сессии и начальная доставка уже claimed Task — разные idempotency scopes. Host не посылает второй initial dispatch одной Attempt лишь из-за нового client_request_id. Принятый модулем request не создаёт нового task owner. Перед отправкой host проверяет dispatch guards; module проверяет exact binding/generation/link и native preconditions. Revise после допуска не отменяет уже полученный vendor input; нужен реальный unqueue/cancel, поддержанный native контрактом, либо обычная коррекция.
+
+## 8. Шина без общего тормоза
+
+Протокольный reader не ждёт аудитора, записи большого лога или окончания другого задания. Входящее сообщение сначала классифицируется как reply-required/control, важный факт либо telemetry. Крупное тело хранится отдельно.
+
+Между core и модулями уже достаточно адресных `mpsc`, `oneshot` и `watch` [T1]. Один bounded канал со всеми payload не решает качество: `send().await` при заполнении остановит его producer. Поэтому native reader не может ждать на заполненной telemetry-очереди, пока следующее сообщение provider требует reply.
+
+Диспетчер обходит ready targets round-robin; FIFO сохраняется внутри order scope. Не удерживает global permit, ожидая quota/capacity другого runtime. Раздельные control и тяжёлые queues не требуют отдельного broker. Приоритет native reply не означает вечного голодания остальных команд: после ограниченной порции control обслуживается готовая обычная работа.
+
+`spawn_blocking` применяется к короткой ограниченной CPU/блокирующей работе. Долгий SDK reader — собственный процесс/thread; его нельзя «отменить» через `JoinHandle::abort()` и считать завершённым. Начатая blocking-задача Tokio этим не останавливается [T2].
+
+При перегрузке сначала откладываются новые starts, повторные scans и optional audit. Принятые результаты не исчезают; работающие tools не убиваются ради CPU-порога. Pending operations ограничиваются до admission. При долгом отсутствии host промежуточная telemetry может потеряться с явным gap; бесконечная история при конечной RAM без диска не обещается.
+
+## 9. Таймеры, ожидание и продолжение
+
+Отчёты/reconcile — технические ticks, не model prompts. Для Tokio interval явно выбирается `Skip` или `Delay`: по умолчанию `Burst` воспроизводит пропущенные ticks, а первый tick срабатывает немедленно [T3]. Это не заменяет сохранение slot/Operation в SQLite.
+
+Сроки хранятся как wall-clock для restart; локальное ожидание использует monotonic clock. После sleep/clock jump/restart выполняется сверка и один актуальный catch-up, не копия всех пропущенных напоминаний. Native schedule, already-admitted goal и controller timer не становятся тремя владельцами одного continuation.
+
+Когда действительно вся полезная работа зависит от результата ребёнка/CI/quota, manager может ждать события без модельного polling. При готовом diff, вопросе, разблокированной задаче или новом finding он получает одно предметное событие. Это не разрешение игнорировать готовую работу; бессмысленная занятость не считается прогрессом.
+
+## 10. Качество без проверяющей модели на каждом инструменте
+
+Детерминированно проверяем только то, что действительно доступно: ownership, exact candidate, exit/coverage, недостающий requirement, неприменённую настройку, повтор одной ошибки при тех же входах. Сложный смысл и полнота интеграции требуют адресного reviewer. Наличие символа не доказывает рабочую вертикаль.
+
+Результат проверки: `execution_status + coverage + findings`. Required checks и политика независимости принадлежат Task/профилю, не writer. Они не редактируются автоматически под текущий результат. Отсутствующий output, parse failure и unsupported verifier не превращаются в PASS.
+
+Аудитору передаётся один вопрос с относящимися sources/hunks/diagnostics. Scope расширяется по доказательной необходимости; полный transcript не становится стартовым пакетом. Исправление формата сдачи при сохранённом кандидате не запускает writer повторно. Спорный finding не становится безусловным приказом переделать всё: GM получает конкретное противоречие и исходные anchors.
+
+Очередной self-report не создаёт нового уровня доказательств. Именно эта разница отдельно сформулирована в входном исследовании harness (§2.5); его ограничения 25 ходов, UI-требования и иерархия предпочтений не переносятся на наш прототип автоматически.
+
+## 11. Обновление без слияния чужих внутренностей
+
+Берём целый SDK/crate/backend на выбранной границе. В `vendor_bridge` остаются imports, codec и version-specific mapping; core их не видит. Предпочтителен публичный API. Если его недостаточно — один помеченный private import или локальный patch на pinned source, а не неявная зависимость десятка модулей.
+
+Патчи хранятся отдельно от неизменённого upstream snapshot. Для Rust используем штатную path dependency / `[patch]`, а не свой package resolver [T4]. Node/Python остаются module-local; никаких runtime `@latest`, глобального pip/npm и auto-install при чтении статуса.
+
+Проверка совместимости ограничена используемыми операциями. Неизвестное новое native поле сохраняется/игнорируется по правилам схемы и не отключает весь backend. Изменение смысла обязательного поля делает неподтверждённой затронутую возможность. Read-only и остальные пригодные пути сохраняются. Schema fingerprint — повод сравнить, не глобальная авария.
+
+Разработка сначала: реализовать путь → fmt/минимальный Clippy → использовать сохранённые fixtures и короткую проверку соответствующего adapter. Не создавать отдельный load framework до готового среза. Перед рабочим допуском проверяется реальный маршрут, а не только специально написанная probe-команда.
+
+Новая версия получает новые bindings; старая завершает существующие. Если vendor обновляет общий server сразу для всех, drain нашего bridge не обещает защиты от этого — режим vendor update согласуется отдельно. Откат binary не откатывает уже совершённые remote effects.
+
+Для собственных batch/check jobs результат и владение ресурсом раздельны. `failed/incomplete` не сообщает, что все дочерние процессы прекратили работу. Adapter возвращает process disposition, control host освобождает ресурс только по нему. Для `external_attach` не применяется завершение shared server. Результат проверки сохраняется даже при неудачной очистке, а повторный writer target-dir не запускается на неизвестной старой работе.
+
+## 12. Проверяемая граница качества
+
+| Ситуация | Ожидаемый результат реализованного пути |
+|---|---|
+| Один native root через два aliases | Один control owner; read-only watcher допустим |
+| Effort ACK, но применения ещё нет | Новая model work не начата; ожидается apply/result |
+| Reporter перестал читать | Protocol replies и native execution продолжаются |
+| Parent idle, дети работают | Root не освобождается; готовая отдельная Task может сдаваться |
+| Timeout после возможного prompt admission | `outcome_unknown`, адресная сверка; не новый prompt |
+| Удалён необязательный usage field | Missing meter, не нулевая квота и не остановка всей линии |
+| CPU-нагрузка | Меньше новых тяжёлых jobs, не kill работающей семьи |
+| Сломан формат отчёта writer | Repair packaging на сохранённом candidate |
+| Restart после пропуска отчётов | Один актуальный catch-up, не spam из старых slots |
+| Смена profile alias | Старый binding сохраняет профиль; новые используют новую revision |
+| Task revised while input queued | Старый input не отправляется после проигранного dispatch guard; already-admitted outcome отдельно |
+| Max применён, затем настройки заменены | Прежний apply не открывает запуск на другой конфигурации |
+| Check incomplete, descendants unknown | Target-dir удерживается; соседние ресурсы свободны |
+
+Это критерии реализации, не результаты выполненных runtime-тестов. Первая обязательная пара исполнителей — Muse Max и OpenCode V2; batch и shared Codex проверяют остальные особенности того же контракта по мере подключения. Нет требования одновременно дописать все семь harness до первого полезного результата.
+
+## 13. Источники и область проверки
+
+Внутренние правила выше — проектные решения этого прохода. Native mappings — ранее сохранённый [аудит семи harness](agent_swarm.runtime-contract-audit-v16-20260929.md), не новый blanket-вердикт об их версиях. Входные наблюдения — [brief](MANAGER-BRIEF.md) и [harness intake](agent_swarm.harness-intake-20260929.md).
+
+Внешние технические источники прочитаны 29.09.2026; это не версии библиотек установленного прототипа:
+
+[T1] Tokio channels и backpressure: https://tokio.rs/tokio/tutorial/channels
+
+[T2] Tokio 1.53.1, spawn_blocking/cancellation и long-lived workloads: https://docs.rs/tokio/1.53.1/tokio/task/fn.spawn_blocking.html
+
+[T3] Tokio interval/MissedTickBehavior: https://docs.rs/tokio/1.53.1/tokio/time/enum.MissedTickBehavior.html
+
+[T4] Cargo dependency overrides: https://doc.rust-lang.org/cargo/reference/overriding-dependencies.html
+
+[T5] SQLite partial unique indexes: https://www.sqlite.org/partialindex.html
+
+Повторная проверка всех vendor docs, сборка доноров, Windows execution, платные пробы и нагрузка не выполнялись. Пример устранённой alias-коллизии относится к reference DDL, не к уже существовавшему Rust-сервису.
+
+[T6] Уточнения v18 относятся к собственному протоколу и reference-схеме: [review](agent_swarm.design-review-v18-20260929.md), [plan-v6](agent_swarm.implementation-v6.md). Native mappings и donor pins не переаттестованы.

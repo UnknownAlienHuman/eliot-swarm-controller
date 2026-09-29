@@ -1,0 +1,20 @@
+{
+  "jsonrpc": "2.0",
+  "id": "wire-41",
+  "method": "runtime.send",
+  "params": {
+    "host_epoch": 7,
+    "link_epoch": 2,
+    "operation_id": "op-dispatch-demo-1",
+    "binding_id": "binding-mc",
+    "generation": 1,
+    "kind": "assignment",
+    "delivery": "next_safe_boundary",
+    "body": {
+      "artifact_ref": "task-packet-demo"
+    },
+    "native_refs": {
+      "command_id": "0199a6d8-0000-7000-8000-000000000041"
+    }
+  }
+}

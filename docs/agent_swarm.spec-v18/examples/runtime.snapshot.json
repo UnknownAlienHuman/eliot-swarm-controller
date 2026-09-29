@@ -1,0 +1,22 @@
+{
+  "scope": {
+    "binding_id": "binding-mc",
+    "generation": 1
+  },
+  "module_instance_id": "module-muse-1",
+  "bridge_boot_id": "boot-1",
+  "module_seq_at_start": 21,
+  "module_seq_at_end": 24,
+  "completeness": "partial",
+  "native_cursor": null,
+  "state": {
+    "execution": "idle",
+    "children": [
+      {
+        "native_id": "child-1",
+        "execution": "working"
+      }
+    ]
+  },
+  "reason": "Native source provides no atomic snapshot/event cursor; a read overlapped live updates."
+}

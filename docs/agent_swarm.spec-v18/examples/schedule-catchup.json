@@ -1,0 +1,21 @@
+{
+  "example_only": true,
+  "schedule_id": "maintenance-demo",
+  "missed_slots": [
+    "slot-10",
+    "slot-11",
+    "slot-12"
+  ],
+  "catch_up": "coalesce_latest",
+  "reconciliation": "required_before_new_execution",
+  "admission_key": {
+    "caller_id": "scheduler",
+    "client_request_id": "maintenance-demo:slot-12"
+  },
+  "new_operations": 1,
+  "state_owner": [
+    "meta",
+    "operations"
+  ],
+  "model_call": "only_if_selected_maintenance_profile_requires_it"
+}

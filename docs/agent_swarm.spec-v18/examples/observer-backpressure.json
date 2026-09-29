@@ -1,0 +1,14 @@
+{
+  "_example": "Design acceptance scenario, not an executed async test",
+  "input": [
+    "telemetry producer is faster than reporter",
+    "native request requiring reply arrives"
+  ],
+  "expected": [
+    "native reader classifies request without waiting for telemetry drain",
+    "authorized reply goes through control path",
+    "telemetry coalescing is reported as gap where history is incomplete",
+    "new incompatible work is not admitted past own queue capacity"
+  ],
+  "not_promised": "lossless infinite telemetry with finite RAM during unlimited host outage"
+}
