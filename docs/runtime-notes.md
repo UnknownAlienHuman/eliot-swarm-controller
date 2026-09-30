@@ -1,8 +1,8 @@
 # Native runtime notes
 
-**Сведено 30.09.2026; сведения исследованы 29.09.2026.** Выжимка прежних материалов, не новая web/source- или Windows-квалификация. Точный entrypoint важнее названия CLI. Реализация прототипа ещё отсутствует.
+**Сведено 30.09.2026; основные сведения исследованы 29.09.2026.** §3.1 отдельно проверен по официальным страницам OpenAI 30.09.2026. Это не новая квалификация всех harness или Windows. Точный entrypoint важнее названия CLI. Локальное ядро 0.1.0 уже реализовано; текущая готовность — в [README](../README.md). Native-адаптеры ещё не подключены.
 
-[Матрица](agent_swarm.runtime-matrix-v16.json) и [реестр 40 источников](agent_swarm.runtime-sources-v16.json) сохранены без изменения. Коды вида `OC-API` ниже относятся к этому реестру. Он хранит URL, раздел и основание; движущаяся web-reference не доказывает наличие функции у установленного binary. [Пины доноров](agent_swarm.donors-20260929.toml) — source inventory, не installation lock.
+[Матрица](agent_swarm.runtime-matrix-v16.json) и [реестр 40 источников](agent_swarm.runtime-sources-v16.json) относятся к прежнему исследованию; новые SIWC-источники приведены отдельно ниже. Коды вида `OC-API` относятся к этому реестру. Он хранит URL, раздел и основание; движущаяся web-reference не доказывает наличие функции у установленного binary. [Пины доноров](agent_swarm.donors-20260929.toml) — source inventory, не installation lock.
 
 ## 1. OpenCode V2
 
@@ -35,6 +35,29 @@
 **Для C07:** `external_attach` владеет client/proxy, не общим server. Actual server/client/adapter versions, startup cwd/env, token, Job и console mode различаются. Закрытие proxy не даёт права stop shared server. Read/status не устанавливает goal, не делает resume/respawn/auto-update. Fork для вопроса — другая оплачиваемая беседа, а не ответ живого manager и не применение correction.
 
 **Provider notes из H §24:** транспорт, полноценный model catalog, GUI picker и mixed-provider native children — отдельные проверки. В source Codex 0.155.0 роль меняла model, но не независимый provider; gateway мог обойти это общим endpoint, с отдельными ограничениями v1/v2 encrypted delegation. Эти исторические ограничения не объявляются вечным контрактом новых Codex и не делают gateway обязательным для прототипа.
+
+### 3.1. ChatGPT plan usage — отдельный OAuth-маршрут
+
+**Источник, а не live-проба:** указанный владельцем [SIWC app-server guide][SIWC-APP] и связанные страницы прочитаны 30.09.2026. Номер совместимого Codex binary эта страница не фиксирует. Она описывает отдельную авторизацию OSS/local приложения для eligible Responses-запросов за счёт ChatGPT plan; доступ к разговорам ChatGPT этим не предоставляется [SIWC-OVERVIEW].
+
+**Конкретный пример OpenAI:** приложение передаёт свой OAuth `access_token` только в environment дочернего app-server (`ACCESS_TOKEN`). Provider `openai_chatgpt_plan` направлен на `https://api.openai.com/v1`, использует `env_key`, `wire_api="responses"`, `requires_openai_auth=false`, `supports_websockets=false`. Отдельный Codex login для этого примера не требуется. Управление — `--listen stdio://`, JSONL, успешный initialize → initialized → thread/start → turn/start. Сохраняется thread ID; terminal учитывается по status, не имени события. `clientInfo.name` согласуется с `agent_name_hint`, а не меняется на каждой линии [SIWC-APP].
+
+| Путь | Controller → app-server | App-server → модель / auth owner |
+|---|---|---|
+| Текущий целевой shared Codex | WebSocket через native proxy; external_attach | Существующие provider/login и внешний владелец сервера |
+| Пример SIWC | Собственный app-server, JSONL stdio | HTTP/SSE Responses с OAuth-токеном, refresh принадлежит приложению |
+
+**Не смешивать два транспорта.** `supports_websockets=false` выбирает upstream HTTP, не меняет framing control socket. Он не превращает существующий WebSocket proxy в JSONL и сам по себе не отключает `turn/steer`. Общая RPC-reference требует active `expectedTurnId`; steer не принимает model/cwd/sandbox overrides. Схемы actual binary всё равно проверяются отдельно [SIWC-LIMITS, CX-CURRENT].
+
+**Авторизация:** dynamic_agent_client нужен только для первой регистрации; сохраняется выданный client ID с проверенной identity и стабильным host ID. Нужны PKCE/state/nonce, проверка ID token и реально предоставленного `chatgpt.tokens.use.direct`. Это не чтение чужого auth.json и не выдача новых клиентов на каждый child. UUID host ID поддержан; новый PKI-механизм не требуется [SIWC-SIGNIN, SIWC-OVERVIEW].
+
+**Возможности маршрута:** account-specific `/v1/models` и app-server model/list не равнозначны: RPC может вернуть встроенный каталог. Запрос модели должен действительно завершиться; начало stream не доказывает доступ или успех [SIWC-MODELS]. Preview требует store=false/stream=true; это не удаляет локальную историю thread/resume. Локальные shell/MCP и child agents через function/custom tools разрешены. Hosted MCP, Responses tool_search и top-level multi_agent не поддержаны; отсутствие последнего поля не запрещает native детей. Проверять весь реально используемый путь, не только простой текст [SIWC-LIMITS].
+
+**Refresh и долгие сессии:** token-reference указывает access lifetime 1 час и rotating refresh lifetime 30 дней; реализация использует возвращённые expiry, а не собственный таймер жизни Task. Refresh одного renewable session сериализуется, замена token set сохраняется атомарно. Для env_key-примера OpenAI прямо требует restart app-server с новым token и thread/resume. Горячая замена токена этим guide не обещана [SIWC-TOKENS, SIWC-ACCOUNTS, SIWC-APP]. Общая RPC-reference отдельно описывает experimental chatgptAuthTokens/refresh; его совместимость с данным SIWC grant/provider не установлена и не заменяет указанную процедуру без проверки [CX-CURRENT].
+
+**Ошибки:** subscription_sharing_usage_limit_exceeded может означать лимит конкретного приложения, не исчерпание всего плана; reset time из одного кода не выводится. usage_unavailable и временный network/5xx не основание стирать credentials. Unsupported capability требует исправить точный несовместимый параметр, а не бесконечно повторять input или молча менять billing. Ошибка может прийти после начала stream; сохраняются status, код, request ID и неопределённость результата [SIWC-ERRORS, SIWC-MODELS].
+
+**Решение ELIOT:** это дополнительный явно выбираемый owned-native профиль, не замена существующего shared server и не обязательный новый OAuth-сервис перед C03/C04. Токены не идут в Task, Operation, route JSON или общий inherited env; сохраняются ссылки на protected credentials. Для включения профиля нужны фактическая авторизация и проверка refresh/resume с детьми. Restart процедуры относится только к принадлежащему профилю процессу; нельзя перезапускать общий сервер или повторять первоначальную Task. UAC/ACL/console, goal/family completion и отсутствие duplicate-send этот SIWC-пример не квалифицирует. Родные Muse/OpenCode/Antigravity маршруты и порядок разработки не меняются.
 
 ## 4. Claude Code
 
@@ -80,3 +103,17 @@
 [B]: https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/b5a437f57488f8ddcdcc3f4aaea24746a3ea1f62/docs/MANAGER-BRIEF.md
 [R15]: https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/b5a437f57488f8ddcdcc3f4aaea24746a3ea1f62/docs/agent_swarm.brief-review-v15-20260929.md
 [H]: https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/b5a437f57488f8ddcdcc3f4aaea24746a3ea1f62/docs/Harness_and_OpenCode_Go_master_2026-09-29_rev5.md
+
+## Источники дополнения SIWC
+
+Прочитано 30.09.2026: страницы без зафиксированной версии Codex. Это основание проектного профиля, не installed-version/live evidence.
+
+[SIWC-APP]: https://developers.openai.com/siwc/token-sharing-open-source/codex-app-server
+[SIWC-OVERVIEW]: https://developers.openai.com/siwc/token-sharing-open-source
+[SIWC-SIGNIN]: https://developers.openai.com/siwc/token-sharing-open-source/sign-in
+[SIWC-ACCOUNTS]: https://developers.openai.com/siwc/token-sharing-open-source/profiles-and-sessions
+[SIWC-MODELS]: https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference
+[SIWC-LIMITS]: https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations
+[SIWC-TOKENS]: https://developers.openai.com/siwc/token-sharing-open-source/token-reference
+[SIWC-ERRORS]: https://developers.openai.com/siwc/token-sharing-open-source/errors-and-recovery
+[CX-CURRENT]: https://learn.chatgpt.com/docs/app-server
