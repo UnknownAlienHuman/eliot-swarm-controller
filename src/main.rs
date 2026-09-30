@@ -13,7 +13,7 @@ use std::path::PathBuf;
 #[command(
     name = "swarm",
     version,
-    about = "Headless local task controller. Native adapters are not connected in this build."
+    about = "Headless task controller with explicitly connected native modules."
 )]
 struct Cli {
     #[arg(long, global = true)]
@@ -45,10 +45,14 @@ enum Command {
     /// Create a scoped local client credential. Run as the local operator.
     ClientCreate {
         client_id: String,
-        #[arg(long,default_value="manager",value_parser=["manager","observer"])]
+        #[arg(long,default_value="manager",value_parser=["manager","observer","module"])]
         role: String,
         #[arg(long)]
         out: PathBuf,
+        #[arg(long)]
+        binding_id: Option<String>,
+        #[arg(long)]
+        generation: Option<i64>,
     },
     Report {
         #[arg(long, default_value_t = 0)]
@@ -178,6 +182,8 @@ async fn run(cli: Cli) -> Result<()> {
             client_id,
             role,
             out,
+            binding_id,
+            generation,
         } => {
             // Save the secret first. A lost registration reply cannot strand its owner.
             // Existing files are re-used, never silently rotated on a retry.
@@ -197,7 +203,13 @@ async fn run(cli: Cli) -> Result<()> {
                 platform::write_private_new(&out, &serde_json::to_vec_pretty(&c)?)?;
                 c
             };
-            let value = json!({"client_id":client_id,"role":role,"token_hash":model::digest(new.token.as_bytes())});
+            let mut value = json!({"client_id":client_id,"role":role,"token_hash":model::digest(new.token.as_bytes())});
+            if let Some(id) = binding_id {
+                value["binding_id"] = json!(id);
+            }
+            if let Some(generation) = generation {
+                value["binding_generation"] = json!(generation);
+            }
             pending_credential = Some(out);
             ("client.register".into(), value)
         }

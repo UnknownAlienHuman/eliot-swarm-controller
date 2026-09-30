@@ -269,6 +269,19 @@ pub(super) fn release(
             "resolve already-sent effects before releasing ownership",
         ));
     }
+    if a["producers"].as_array().is_some_and(|items| {
+        items.iter().any(|item| {
+            !matches!(
+                item["disposition"].as_str(),
+                Some("completed" | "failed" | "cancelled")
+            )
+        })
+    }) {
+        return Err(Error::new(
+            "NATIVE_WORK_UNRESOLVED",
+            "the exact assigned native runs have not ended; attestation cannot override a known producer",
+        ));
+    }
     // Caller explicitly seals cooperative native work. This is not process evidence.
     tx.execute("UPDATE operations SET state='cancelled',result_json=?2,settled_at_ms=?3,updated_at_ms=?3 WHERE attempt_id=?1 AND state='queued'",params![attempt_id,model::canonical(&json!({"reason":"attempt released before delivery"}))?,now])?;
     tx.execute(

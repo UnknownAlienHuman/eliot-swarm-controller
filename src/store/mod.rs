@@ -1,5 +1,6 @@
 //! A single database owner. The async facade never holds a SQLite connection.
 mod operations;
+mod runtime;
 mod tasks;
 use crate::{
     config::Config,
@@ -10,7 +11,7 @@ use crate::{
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::{Value, json};
 use std::{fs::File, path::Path, sync::Arc, thread::JoinHandle};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 const SCHEMA: &str = include_str!("../../migrations/001_core.sql");
 const APPLICATION_ID: i64 = 0x45534331;
@@ -19,6 +20,7 @@ type Job = Box<dyn FnOnce(&mut Connection) + Send>;
 pub struct Store {
     tx: mpsc::Sender<Job>,
     config: Arc<Config>,
+    changed: watch::Sender<u64>,
 }
 pub struct StoreOwner {
     thread: JoinHandle<()>,
@@ -55,7 +57,11 @@ impl StoreOwner {
             .map_err(|_| Error::new("STORE_CLOSED", "initialization thread ended"))??;
         Ok(Self {
             thread,
-            store: Store { tx, config },
+            store: Store {
+                tx,
+                config,
+                changed: watch::channel(0).0,
+            },
         })
     }
     pub async fn close(self) -> Result<()> {
@@ -90,6 +96,7 @@ impl Store {
                 return Err(Error::new("UNAUTHORIZED", "unknown client or credential"));
             }
             Ok(Principal {
+                link_id: model::new_id(),
                 client_id: credential.client_id,
                 role: serde_json::from_value(value["role"].clone())?,
             })
@@ -97,24 +104,66 @@ impl Store {
         .await
     }
     pub async fn call(&self, principal: Principal, method: String, params: Value) -> Result<Value> {
+        if method == "module.next" {
+            model::fields(&params, &[])?;
+            let mut changed = self.changed.subscribe();
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let p = principal.clone();
+                let result = self.run(move |db| runtime::next(db, &p)).await?;
+                if !result["command"].is_null() || result.get("rejected_operation_id").is_some() {
+                    return Ok(result);
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep_until(deadline) => return Ok(result),
+                    r = changed.changed() => { if r.is_err() {return Err(Error::new("STORE_CLOSED","host stopped"));} }
+                }
+            }
+        }
+        let wake_dispatch = matches!(
+            method.as_str(),
+            "agent.open" | "task.dispatch" | "agent.send" | "agent.reply" | "host.mode"
+        );
         let config = self.config.clone();
-        self.run(move |db| {
-            let current = meta(db, &format!("client:{}", principal.client_id))?
-                .ok_or_else(|| Error::new("UNAUTHORIZED", "client no longer registered"))?;
-            if current["disabled"] == true {
-                return Err(Error::new("UNAUTHORIZED", "client disabled"));
-            }
-            let principal = Principal {
-                client_id: principal.client_id,
-                role: serde_json::from_value(current["role"].clone())?,
-            };
-            if is_read(&method) {
-                return read(db, &principal, &method, &params, &config);
-            }
-            principal.require_writer()?;
-            mutate(db, &principal, &method, &params, &config)
-        })
-        .await
+        let result = self
+            .run(move |db| {
+                let current = meta(db, &format!("client:{}", principal.client_id))?
+                    .ok_or_else(|| Error::new("UNAUTHORIZED", "client no longer registered"))?;
+                if current["disabled"] == true {
+                    return Err(Error::new("UNAUTHORIZED", "client disabled"));
+                }
+                let principal = Principal {
+                    link_id: principal.link_id,
+                    client_id: principal.client_id,
+                    role: serde_json::from_value(current["role"].clone())?,
+                };
+                if principal.role == Role::Module {
+                    return match method.as_str() {
+                        "module.hello" => runtime::hello(db, &principal, &params),
+                        "module.outcome" => runtime::outcome(db, &principal, &params),
+                        "module.observe" => runtime::observe(db, &principal, &params),
+                        _ => Err(Error::new(
+                            "FORBIDDEN",
+                            "module credentials serve only their native binding",
+                        )),
+                    };
+                }
+                if is_read(&method) {
+                    return read(db, &principal, &method, &params, &config);
+                }
+                principal.require_writer()?;
+                mutate(db, &principal, &method, &params, &config)
+            })
+            .await;
+        if result.is_ok() && wake_dispatch {
+            self.changed.send_modify(|n| *n = n.wrapping_add(1));
+        }
+        result
+    }
+    pub async fn disconnected(&self, principal: Principal) {
+        let _ = self
+            .run(move |db| runtime::disconnected(db, &principal))
+            .await;
     }
 }
 fn open_database(root: &Path, credential: &Credential) -> Result<Connection> {
@@ -188,7 +237,7 @@ fn open_database(root: &Path, credential: &Credential) -> Result<Connection> {
     set_meta(&tx, "host_epoch", &json!(epoch))?;
     tx.execute("UPDATE operations SET state='outcome_unknown', updated_at_ms=?1 WHERE state IN ('sending','native_accepted')", [model::now_ms()?])?;
     tx.execute(
-        "UPDATE bindings SET state='reconciling' WHERE state='ready' AND released_at_ms IS NULL",
+        "UPDATE bindings SET state='reconciling',state_json=json_set(state_json,'$.connection','disconnected') WHERE state='ready' AND released_at_ms IS NULL",
         [],
     )?;
     tx.commit()?;
@@ -265,7 +314,7 @@ fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config
                 |r| r.get(0),
             )?;
             Ok(
-                json!({"version":env!("CARGO_PKG_VERSION"),"controller_id":meta(db,"controller_id")?,"host_epoch":meta(db,"host_epoch")?,"sqlite":rusqlite::version(),"tasks":tasks,"unreleased_attempts":owners,"queued_operations":queued,"execution_mode":meta(db,"execution_mode")?,"native_executors_connected":0,"native_execution":"not_implemented"}),
+                json!({"version":env!("CARGO_PKG_VERSION"),"controller_id":meta(db,"controller_id")?,"host_epoch":meta(db,"host_epoch")?,"sqlite":rusqlite::version(),"tasks":tasks,"unreleased_attempts":owners,"queued_operations":queued,"execution_mode":meta(db,"execution_mode")?,"native_modules_connected":db.query_row("SELECT count(*) FROM bindings WHERE released_at_ms IS NULL AND json_extract(state_json, '$.connection')='connected'",[],|r|r.get::<_,i64>(0))?,"native_execution":"external_module_protocol"}),
             )
         }
         "task.get" => {
@@ -454,6 +503,9 @@ fn apply(
         "task.claim" => tasks::claim(tx, p, v, id, now).map(|v| (v, false)),
         "attempt.release" => tasks::release(tx, p, v, id, now).map(|v| (v, false)),
         "task.dispatch" => operations::dispatch(tx, p, v, id, now),
+        "agent.send" | "agent.reply" => {
+            runtime::user_command(tx, p, method, v, id).map(|v| (v, true))
+        }
         "agent.open" => operations::open(tx, p, v, config, id, now).map(|v| (v, true)),
         "operation.cancel" => operations::cancel(tx, p, v, id, now).map(|v| (v, false)),
         "host.mode" => {
@@ -471,7 +523,17 @@ fn apply(
         }
         "client.register" => {
             p.require_operator()?;
-            model::fields(v, &["client_request_id", "client_id", "role", "token_hash"])?;
+            model::fields(
+                v,
+                &[
+                    "client_request_id",
+                    "client_id",
+                    "role",
+                    "token_hash",
+                    "binding_id",
+                    "binding_generation",
+                ],
+            )?;
             let client = model::text(v, "client_id")?;
             let role: Role = serde_json::from_value(v["role"].clone())?;
             let hash = model::text(v, "token_hash")?;
@@ -483,11 +545,24 @@ fn apply(
                     "client already registered; no implicit credential rotation",
                 ));
             }
-            set_meta(
-                tx,
-                &format!("client:{client}"),
-                &json!({"role":role,"token_hash":hash.to_lowercase(),"disabled":false}),
-            )?;
+            let scope = if role == Role::Module {
+                runtime::register(tx, v, client)?
+            } else {
+                if v.get("binding_id").is_some() || v.get("binding_generation").is_some() {
+                    return Err(Error::invalid(
+                        "binding scope only belongs to module credentials",
+                    ));
+                }
+                json!({})
+            };
+            let mut registration =
+                json!({"role":role,"token_hash":hash.to_lowercase(),"disabled":false});
+            if let Some(fields) = scope.as_object() {
+                for (k, v) in fields {
+                    registration[k] = v.clone();
+                }
+            }
+            set_meta(tx, &format!("client:{client}"), &registration)?;
             Ok((
                 json!({"operation_id":id,"client_id":client,"role":role}),
                 false,

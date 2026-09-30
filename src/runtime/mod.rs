@@ -1,0 +1,37 @@
+//! External modules share this command boundary, not vendor request schemas.
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+#[derive(Debug, Serialize)]
+pub struct RuntimeCommand {
+    pub operation_id: String,
+    pub method: String,
+    pub created_at_ms: i64,
+    pub binding_id: String,
+    pub generation: i64,
+    pub native_root_id: Option<String>,
+    pub route: Value,
+    pub input: Value,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectOutcome {
+    Applied,
+    Rejected,
+    Unknown,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeOutcome {
+    pub operation_id: String,
+    pub outcome: EffectOutcome,
+    #[serde(default)]
+    pub native_scope_key: Option<String>,
+    #[serde(default)]
+    pub native_root_id: Option<String>,
+    #[serde(default)]
+    pub turn_id: Option<String>,
+    pub details: Value,
+}

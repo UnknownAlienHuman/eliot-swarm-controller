@@ -191,6 +191,7 @@ pub async fn serve(
     }
     // Admitted application work drains even when the client stops reading/disconnects.
     while requests.join_next().await.is_some() {}
+    store.disconnected(principal).await;
     drop(output);
     let _ = writer_task.await;
     Ok(())

@@ -66,6 +66,7 @@ pub enum Role {
     Operator,
     Manager,
     Observer,
+    Module,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -75,6 +76,8 @@ pub struct Credential {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Principal {
+    /// Ephemeral authenticated transport identity, never a durable client ID.
+    pub link_id: String,
     pub client_id: String,
     pub role: Role,
 }
@@ -246,9 +249,25 @@ pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
             "assignment_closed",
         ],
         "agent.open" => &["client_request_id", "lane_id", "route"],
+        "agent.send" => &[
+            "client_request_id",
+            "binding_id",
+            "generation",
+            "text",
+            "delivery",
+            "expected_turn_id",
+        ],
+        "agent.reply" => &["client_request_id", "binding_id", "generation", "reply"],
         "operation.cancel" => &["client_request_id", "operation_id", "reason"],
         "host.mode" => &["client_request_id", "new_work"],
-        "client.register" => &["client_request_id", "client_id", "role", "token_hash"],
+        "client.register" => &[
+            "client_request_id",
+            "client_id",
+            "role",
+            "token_hash",
+            "binding_id",
+            "binding_generation",
+        ],
         "message.send" => &["client_request_id", "recipient", "text", "in_reply_to"],
         _ => return Err(Error::new("METHOD_NOT_FOUND", method)),
     };
