@@ -6,13 +6,13 @@ This module contains executable code, not only dependency preparation. It uses t
 
 One independently started Node process owns one `muse serve` connection and its native descendants. The existing Rust host exposes `module.hello/next/outcome/observe` over authenticated local IPC. A module credential is scoped to a reserved binding/generation; it cannot call task acceptance or impersonate GM. No new listener, inference proxy or task database is added.
 
-The host commits command admission before yielding native work. Input admissions are ordered; protocol replies do not wait for a model turn. Unknown admission never creates a repeated prompt. The bridge retains outcomes until the host commits them, sends the immutable Task snapshot, passes explicit per-turn reasoning effort, and reports model readback and exact native turn IDs separately from Task acceptance.
+The host commits command admission before yielding native work. Input admissions are ordered; protocol replies do not wait for a model turn. Unknown admission is not blindly repeated on timeout or reconnect. Explicit reconciliation uses the original native command ID and exact retained payload. The bridge retains outcomes until the host commits them, sends the immutable Task snapshot, passes explicit per-turn reasoning effort, and reports model readback and exact native turn IDs separately from Task acceptance.
 
 Host disconnect does not call SDK.close. The same live bridge reconnects with its boot/native identities. A different process confronting possibly live old work requires reconciliation rather than a new implicit executor. Explicitly terminating this bridge closes its own native connection, not an unrelated service.
 
 **MSP presentation acknowledgement is not a decision.** For `approval/request` and `userInput/request`, the published `RequestReceipt` is `{}`: acknowledgement that a surface has or will present the question. The bridge retains the question and returns that receipt immediately. An actual decision is a separate `approval/decide` or `userInput/*` command carrying the current native identifiers. Generic JSON-RPC response bodies do not grant approval. The root's goal observation also excludes child goal events.
 
-Native token deltas and full transcripts stay in Muse. The bridge keeps compact state, observed children, pending questions, recent exact turn terminals and an unsummed native usage snapshot. Family completeness is **partial**. No complete-family claim follows from root idle. Automatic bridge launching, crash-time native resume, complete family reconstruction, native goal configuration, artifact retrieval, task acceptance and autonomous handoff after unknown effects remain incomplete. Do not label full C03 complete.
+Native token deltas and full transcripts stay in Muse. The bridge keeps compact state, observed children, pending questions, recent exact turn terminals and an unsummed native usage snapshot. Family completeness is **partial**. No complete-family claim follows from root idle. Automatic bridge launching, crash-time native resume, complete family reconstruction, artifact retrieval, task acceptance and autonomous handoff after unknown effects remain incomplete. Do not label full C03 complete.
 
 ## Explicit first setup
 
@@ -27,7 +27,7 @@ Native token deltas and full transcripts stay in Muse. The bridge keeps compact 
 [[routes]]
 alias = 'muse-manager'
 runtime = 'muse'
-module_artifact_id = 'muse-sdk-1.3.0-bridge.1'
+module_artifact_id = 'muse-sdk-1.3.0-bridge.2'
 enabled = true
 [routes.native_options]
 workspaceRoot = 'C:\Projects\YourRepository'
@@ -39,6 +39,28 @@ approvalMode = 'allowAll'
 These are adapter-owned camelCase fields. Model and approval mode must exist in the native runtime. Effort is explicit per turn; opening a session does not prove Max inference. Model readback mismatch is not silently accepted.
 
 `agent.send` takes binding_id/generation/text and `delivery:"next_turn"` or `delivery:"steer"` with expected_turn_id. `agent.reply` takes binding_id/generation and `reply:{"method":"approval/decide","params":{...}}` or `userInput/answer|cancel|clarify`. Supply the exact installed-schema choice, requirement, question and session IDs from the pending question. The adapter checks the observed family and delegates schema validation to the native SDK/server. It exposes no arbitrary-method passthrough and does not guess substantive answers.
+
+## Goal, configuration and reconciliation — bridge.2
+
+All commands use `swarm call METHOD --file params.json` and the normal durable request ID. A response with `state:"queued"` is local admission; inspect its Operation and `agent.state` for native progress.
+
+| Method | Params in addition to binding_id/generation | Native boundary |
+| --- | --- | --- |
+| `agent.configure` | `settings:{"reasoningEffort":"max"}` | One native setter; durable default applies to subsequent turns. Explicit input turns also carry effort. |
+| `agent.configure` | `settings:{"model":{"modelId":"...","providerId":"..."}}` | Admission remains pending until matching model readback/event. No silent provider fallback. |
+| `agent.configure` | `settings:{"approvalMode":"allowAll"}` | Effective mode from the native acknowledgement; applies to the next action, does not answer existing questions. |
+| `agent.goal` | `action:"set"` or `"edit"`, `objective:"..."` | May start native work immediately. Complete objective and necessary context must already be supplied. |
+| `agent.goal` | `action:"pause"`, `"resume"` or `"clear"` | Native continuation control, not Task acceptance or process termination. |
+| `agent.refresh` | No additional fields | Read root metadata and pending questions without loading/resuming a session or prompting the model. |
+| `agent.reconcile` | `operation_id:"unresolved-original-operation"` | Explicitly reconcile retained native work on the same live bridge; not a new Task or automatic retry loop. |
+
+Configure one native setter per Operation: this runtime exposes separate setters, not a compound atomic configuration transaction. Before `goal set/edit/resume`, configure the standing reasoning default and wait for its applied outcome; a per-turn override from an earlier prompt does not configure future goal continuations. The immutable initial route remains history; later effective settings appear in native state/outcome evidence. Do not change a live module file to activate bridge.2; new modules/routes use their own version.
+
+`host.mode` with new_work disabled prevents new goal set/edit/resume and new input at dispatch. Pause/clear remain available and cancel older *locally queued* goal starts so priority pause is not followed by a stale queued resume. Already admitted effects require native disposition; no cancellation of unseen remote work is invented.
+
+For a lost native admission reply, reconcile retains the original command ID, method and payload under the SDK's idempotency contract. Once admission is known, model configuration reconciliation only reads state. A correlated native turn event may resolve input admission without resubmission. Unresolved context lost with a bridge crash cannot be reconstructed by this first implementation: it returns an explicit unavailable/recovery result rather than starting a replacement agent. Session/start recovery is not covered by the retained command path yet.
+
+The host now accepts unknown/accepted outcome refinement without replacing a known final result. A turn terminal already stored before the dispatch ACK is applied to its exact producer when the ACK arrives. Observation sequence prevents older snapshots overwriting newer state; legacy modules without sequence retain their weaker partial path. Within refresh, live events received during a read take precedence. Refresh covers root metadata/pending requests only, not a complete-family reconstruction or replay of lost history.
 
 ## Checkpoint and next work
 

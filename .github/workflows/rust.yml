@@ -29,8 +29,7 @@ jobs:
         shell: bash
         run: |
           node --version
-          node --check modules/muse/control.mjs
-          node --check modules/muse/bridge.mjs
+          for file in modules/muse/*.mjs; do node --check "$file"; done
           cd modules/muse
           npm ci --ignore-scripts --no-audit --no-fund
           node --input-type=module -e 'import { spawnMspConnection, Connection } from "@muse-code/sdk"; if (typeof spawnMspConnection !== "function" || typeof Connection !== "function") throw new Error("SDK export mismatch");'

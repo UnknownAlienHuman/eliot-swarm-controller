@@ -73,7 +73,7 @@ pub(super) fn hello(db: &mut Connection, p: &Principal, v: &Value) -> Result<Val
     }
     let old_boot = b["observation"]["bridge_boot_id"].as_str();
     if old_boot.is_some_and(|old| old != boot) {
-        let possible:i64=tx.query_row("SELECT count(*) FROM operations WHERE binding_id=?1 AND binding_generation=?2 AND state IN ('sending','native_accepted','outcome_unknown','settled') AND method IN ('agent.open','task.dispatch','agent.send','agent.reply')",params![id,generation],|r|r.get(0))?;
+        let possible:i64=tx.query_row("SELECT count(*) FROM operations WHERE binding_id=?1 AND binding_generation=?2 AND state IN ('sending','native_accepted','outcome_unknown','settled') AND method IN ('agent.open','task.dispatch','agent.send','agent.reply','agent.configure','agent.goal')",params![id,generation],|r|r.get(0))?;
         if possible > 0 || !b["native_root_id"].is_null() {
             return Err(Error::new(
                 "RECOVERY_REQUIRED",
@@ -99,11 +99,27 @@ pub(super) fn hello(db: &mut Connection, p: &Principal, v: &Value) -> Result<Val
 pub(super) fn next(db: &mut Connection, p: &Principal) -> Result<Value> {
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let (id, generation, b) = scope(&tx, p, true)?;
-    if b["state"] != "opening" && b["state"] != "ready" {
+    if !matches!(
+        b["state"].as_str(),
+        Some("opening" | "ready" | "reconciling")
+    ) {
         return Ok(json!({"command":null}));
     }
+    // Readback, replies and continuation-stop controls stay available while an
+    // ordinary mutation awaits application. They do not spawn another executor.
     let row:Option<(String,String,String,i64)>=tx.query_row(
-        "SELECT operation_id,method,original_request_json,created_at_ms FROM operations AS candidate WHERE binding_id=?1 AND binding_generation=?2 AND state='queued' AND due_at_ms<=?3 AND method IN ('agent.open','task.dispatch','agent.send','agent.reply') AND (method='agent.reply' OR NOT EXISTS (SELECT 1 FROM operations AS pending WHERE pending.binding_id=?1 AND pending.binding_generation=?2 AND pending.state IN ('sending','native_accepted','outcome_unknown') AND pending.method IN ('agent.open','task.dispatch','agent.send'))) ORDER BY CASE WHEN method='agent.reply' THEN 0 ELSE 1 END,due_at_ms,operation_id LIMIT 1",
+        "SELECT operation_id,method,original_request_json,created_at_ms FROM operations AS candidate
+         WHERE binding_id=?1 AND binding_generation=?2 AND state='queued' AND due_at_ms<=?3
+           AND method IN ('agent.open','task.dispatch','agent.send','agent.reply','agent.configure','agent.goal','agent.refresh','agent.reconcile')
+           AND (method IN ('agent.reply','agent.refresh','agent.reconcile')
+             OR (method='agent.goal' AND json_extract(original_request_json,'$.action') IN ('pause','clear'))
+             OR NOT EXISTS (SELECT 1 FROM operations AS pending
+               WHERE pending.binding_id=?1 AND pending.binding_generation=?2
+                 AND pending.state IN ('sending','native_accepted','outcome_unknown')
+                 AND pending.method IN ('agent.open','task.dispatch','agent.send','agent.configure','agent.goal')))
+         ORDER BY CASE WHEN method='agent.reply' THEN 0
+                       WHEN method='agent.goal' AND json_extract(original_request_json,'$.action') IN ('pause','clear') THEN 1
+                       WHEN method IN ('agent.refresh','agent.reconcile') THEN 2 ELSE 3 END, due_at_ms, rowid LIMIT 1",
         params![id,generation,model::now_ms()?],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
     let Some((op, method, raw, created)) = row else {
         return Ok(json!({"command":null}));
@@ -118,7 +134,9 @@ pub(super) fn next(db: &mut Connection, p: &Principal) -> Result<Value> {
         }
         let starts_work = method == "agent.open"
             || method == "task.dispatch"
-            || (method == "agent.send" && input["delivery"] == "next_turn");
+            || (method == "agent.send" && input["delivery"] == "next_turn")
+            || (method == "agent.goal"
+                && matches!(input["action"].as_str(), Some("set" | "edit" | "resume")));
         if starts_work
             && meta(&tx, "execution_mode")?.unwrap_or(Value::Null)["new_work"] != "enabled"
         {
@@ -131,7 +149,7 @@ pub(super) fn next(db: &mut Connection, p: &Principal) -> Result<Value> {
             if b["state"] != "opening" || !b["native_root_id"].is_null() {
                 return Err(Error::conflict("root already opened or changed"));
             }
-        } else if b["state"] != "ready" {
+        } else if b["state"] != "ready" && !is_recovery_control(&method, &input, &b) {
             return Err(Error::new(
                 "BINDING_NOT_READY",
                 "binding not ready before dispatch",
@@ -214,27 +232,57 @@ pub(super) fn outcome(db: &mut Connection, p: &Principal, v: &Value) -> Result<V
             "operation belongs to another binding",
         ));
     }
-    let encoded = model::canonical(&json!(r))?;
-    let key = format!("outcome:{}", r.operation_id);
-    let previous:Option<String>=tx.query_row("SELECT payload_json FROM observations WHERE source_stream_id=?1 AND source_event_key=?2",params![format!("module:{}",p.client_id),key],|x|x.get(0)).optional()?;
-    if let Some(previous) = previous {
-        if previous != encoded {
-            return Err(Error::conflict(
-                "outcome already recorded with different evidence",
-            ));
-        }
-        return Ok(json!({"recorded":true,"replayed":true}));
-    }
-    if !matches!(
-        o["state"].as_str(),
-        Some("sending" | "native_accepted" | "outcome_unknown")
-    ) {
-        return Err(Error::conflict(
-            "operation was not admitted for native execution",
+    if o["method"] != "agent.open"
+        && (r
+            .native_root_id
+            .as_ref()
+            .is_some_and(|n| b["native_root_id"] != *n)
+            || r.native_scope_key
+                .as_ref()
+                .is_some_and(|n| b["native_scope_key"] != *n))
+    {
+        return Err(Error::new(
+            "NATIVE_IDENTITY_MISMATCH",
+            "outcome names another native root",
         ));
+    }
+    let encoded = model::canonical(&json!(r))?;
+    let stream = format!("module:{}", p.client_id);
+    let previous:bool=tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM observations WHERE source_stream_id=?1 AND operation_id=?2 AND kind='runtime.outcome' AND payload_json=?3)",
+        params![stream,r.operation_id,encoded],|x|x.get(0))?;
+    if previous {
+        return Ok(json!({"recorded":true,"replayed":true,"state":o["state"]}));
+    }
+    // A saved unknown is not immutable failure: a later native fact may resolve
+    // it. Conversely, late admission/unknown cannot roll a terminal result back.
+    let terminal = matches!(o["state"].as_str(), Some("settled" | "rejected"));
+    let superseded = (terminal
+        && matches!(r.outcome, EffectOutcome::Accepted | EffectOutcome::Unknown))
+        || (o["state"] == "native_accepted" && matches!(r.outcome, EffectOutcome::Unknown));
+    if !superseded
+        && !matches!(
+            o["state"].as_str(),
+            Some("sending" | "native_accepted" | "outcome_unknown")
+        )
+    {
+        return Err(Error::conflict(
+            "cannot replace a known native result or execute an unadmitted operation",
+        ));
+    }
+    let key = format!(
+        "outcome:{}:{}",
+        r.operation_id,
+        model::digest(encoded.as_bytes())
+    );
+    if superseded {
+        tx.execute("INSERT INTO observations(source_stream_id,source_event_key,binding_id,binding_generation,operation_id,kind,payload_json,recorded_at_ms) VALUES(?1,?2,?3,?4,?5,'runtime.outcome',?6,?7)",params![stream,key,id,generation,r.operation_id,encoded,model::now_ms()?])?;
+        tx.commit()?;
+        return Ok(json!({"recorded":true,"superseded":true,"state":o["state"]}));
     }
     let now = model::now_ms()?;
     let state = match r.outcome {
+        EffectOutcome::Accepted => "native_accepted",
         EffectOutcome::Applied => "settled",
         EffectOutcome::Rejected => "rejected",
         EffectOutcome::Unknown => "outcome_unknown",
@@ -264,37 +312,74 @@ pub(super) fn outcome(db: &mut Connection, p: &Principal, v: &Value) -> Result<V
                 .filter(|x| !x.is_empty())
                 .ok_or_else(|| Error::invalid("dispatch admission needs the native turn ID"))?;
             let attempt = model::text(&o, "attempt_id")?;
-            let producer = json!({"assignment_id":r.operation_id,"native_session_id":b["native_root_id"],"native_run_id":turn,"disposition":"admitted"});
+            let mut producer = json!({"assignment_id":r.operation_id,"native_session_id":b["native_root_id"],"native_run_id":turn,"disposition":"admitted"});
+            // A short turn can finish before its admission response arrives.
+            // Reuse already-recorded exact-run evidence instead of waiting for
+            // another notification which may never be emitted.
+            apply_turn_evidence(&mut producer, &b["observation"]["native"]["turns"]);
             tx.execute("UPDATE attempts SET state='running',producers_json=json_insert(producers_json,'$[#]',json(?2)),updated_at_ms=?3 WHERE attempt_id=?1 AND released_at_ms IS NULL",params![attempt,model::canonical(&producer)?,now])?;
         }
-    } else if o["method"] == "agent.open" {
+    } else if o["method"] == "agent.open" && !matches!(r.outcome, EffectOutcome::Accepted) {
         // A failure may follow spawn: preserve ownership and its known native identity.
         tx.execute("UPDATE bindings SET state='reconciling',native_root_id=COALESCE(?3,native_root_id),native_scope_key=COALESCE(?4,native_scope_key),state_json=json_set(state_json,'$.opening_evidence',json(?5)) WHERE binding_id=?1 AND generation=?2",params![id,generation,r.native_root_id,r.native_scope_key,model::canonical(&r.details)?])?;
     }
-    tx.execute("UPDATE operations SET state=?2,result_json=?3,native_refs_json=?4,settled_at_ms=?5,updated_at_ms=?6 WHERE operation_id=?1",params![r.operation_id,state,encoded,model::canonical(&json!({"session_id":r.native_root_id,"turn_id":r.turn_id}))?,if state=="outcome_unknown"{None}else{Some(now)},now])?;
+    tx.execute("UPDATE operations SET state=?2,result_json=?3,native_refs_json=?4,settled_at_ms=?5,updated_at_ms=?6 WHERE operation_id=?1",params![r.operation_id,state,encoded,model::canonical(&json!({"session_id":r.native_root_id,"turn_id":r.turn_id}))?,if matches!(state,"outcome_unknown"|"native_accepted"){None}else{Some(now)},now])?;
     tx.execute("INSERT INTO observations(source_stream_id,source_event_key,binding_id,binding_generation,operation_id,kind,payload_json,recorded_at_ms) VALUES(?1,?2,?3,?4,?5,'runtime.outcome',?6,?7)",params![format!("module:{}",p.client_id),key,id,generation,r.operation_id,encoded,now])?;
     tx.commit()?;
     Ok(json!({"recorded":true}))
 }
 
 pub(super) fn observe(db: &mut Connection, p: &Principal, v: &Value) -> Result<Value> {
-    model::fields(v, &["event_id", "state"])?;
+    model::fields(v, &["event_id", "sequence", "state"])?;
     let event = model::text(v, "event_id")?;
+    let sequence = v
+        .get("sequence")
+        .map(|n| {
+            n.as_i64()
+                .filter(|n| *n >= 0)
+                .ok_or_else(|| Error::invalid("sequence must be a nonnegative integer"))
+        })
+        .transpose()?;
     if !v["state"].is_object() {
         return Err(Error::invalid(
             "state must be a compact native observation object",
         ));
     }
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let (id, generation, _) = scope(&tx, p, true)?;
-    let now = model::now_ms()?;
-    let inserted=tx.execute("INSERT INTO observations(source_stream_id,source_event_key,binding_id,binding_generation,kind,payload_json,recorded_at_ms) VALUES(?1,?2,?3,?4,'runtime.state',?5,?6) ON CONFLICT DO NOTHING",params![format!("module:{}",p.client_id),event,id,generation,model::canonical(&v["state"])?,now])?;
-    if inserted == 1 {
-        tx.execute("UPDATE bindings SET state_json=json_set(state_json,'$.native',json(?3),'$.observed_at_ms',?4) WHERE binding_id=?1 AND generation=?2",params![id,generation,model::canonical(&v["state"])?,now])?;
+    let (id, generation, b) = scope(&tx, p, true)?;
+    if v["state"]["boot_id"] != b["observation"]["bridge_boot_id"] {
+        return Err(Error::new(
+            "STALE_BOOT",
+            "observation is not from the active module boot",
+        ));
     }
-    if inserted == 1
-        && let Some(turns) = v["state"]["turns"].as_array()
-    {
+    let now = model::now_ms()?;
+    let encoded = model::canonical(&v["state"])?;
+    let previous:Option<String> = tx.query_row("SELECT payload_json FROM observations WHERE source_stream_id=?1 AND source_event_key=?2",params![format!("module:{}",p.client_id),event],|r|r.get(0)).optional()?;
+    if let Some(previous) = previous {
+        if previous != encoded {
+            return Err(Error::conflict("observation ID reused for different state"));
+        }
+        return Ok(json!({"recorded":true,"replayed":true}));
+    }
+    let prior = &b["observation"]["native"];
+    let last_sequence = b["observation"]["native_sequence"].as_i64();
+    // Existing live modules may omit the additive sequence field. They retain
+    // their legacy partial observation path, never overwrite an ordered stream,
+    // and do not acquire the newer monotonic-projection guarantee.
+    let current = prior["boot_id"] != v["state"]["boot_id"]
+        || match (sequence, last_sequence) {
+            (Some(n), Some(last)) => n > last,
+            (None, Some(_)) => false,
+            (_, None) => true,
+        };
+    tx.execute("INSERT INTO observations(source_stream_id,source_event_key,binding_id,binding_generation,kind,payload_json,recorded_at_ms) VALUES(?1,?2,?3,?4,'runtime.state',?5,?6)",params![format!("module:{}",p.client_id),event,id,generation,encoded,now])?;
+    if !current {
+        tx.commit()?;
+        return Ok(json!({"recorded":true,"stale":true}));
+    }
+    tx.execute("UPDATE bindings SET state_json=json_set(state_json,'$.native',json(?3),'$.observed_at_ms',?4,'$.native_sequence',?5) WHERE binding_id=?1 AND generation=?2",params![id,generation,encoded,now,sequence])?;
+    if v["state"]["turns"].is_array() {
         let mut stmt = tx.prepare("SELECT attempt_id, producers_json FROM attempts WHERE binding_id=?1 AND binding_generation=?2 AND released_at_ms IS NULL")?;
         let rows = stmt
             .query_map(params![id, generation], |r| {
@@ -305,17 +390,7 @@ pub(super) fn observe(db: &mut Connection, p: &Principal, v: &Value) -> Result<V
         for (attempt, raw) in rows {
             let mut producers: Vec<Value> = serde_json::from_str(&raw)?;
             for producer in &mut producers {
-                for turn in turns {
-                    if producer["native_session_id"] == turn["sessionId"]
-                        && producer["native_run_id"] == turn["turnId"]
-                        && matches!(
-                            turn["terminal"].as_str(),
-                            Some("completed" | "failed" | "cancelled")
-                        )
-                    {
-                        producer["disposition"] = turn["terminal"].clone();
-                    }
-                }
+                apply_turn_evidence(producer, &v["state"]["turns"]);
             }
             tx.execute(
                 "UPDATE attempts SET producers_json=?2 WHERE attempt_id=?1",
@@ -324,7 +399,7 @@ pub(super) fn observe(db: &mut Connection, p: &Principal, v: &Value) -> Result<V
         }
     }
     tx.commit()?;
-    Ok(json!({"recorded":true,"replayed":inserted==0}))
+    Ok(json!({"recorded":true,"stale":false}))
 }
 
 pub(super) fn disconnected(db: &Connection, p: &Principal) -> Result<()> {
@@ -338,6 +413,30 @@ pub(super) fn disconnected(db: &Connection, p: &Principal) -> Result<()> {
     Ok(())
 }
 
+fn apply_turn_evidence(producer: &mut Value, turns: &Value) {
+    if let Some(turns) = turns.as_array() {
+        for turn in turns {
+            if producer["native_session_id"] == turn["sessionId"]
+                && producer["native_run_id"] == turn["turnId"]
+                && matches!(
+                    turn["terminal"].as_str(),
+                    Some("completed" | "failed" | "cancelled")
+                )
+            {
+                producer["disposition"] = turn["terminal"].clone();
+            }
+        }
+    }
+}
+
+fn is_recovery_control(method: &str, input: &Value, binding: &Value) -> bool {
+    binding["state"] == "reconciling"
+        && binding["native_root_id"].is_string()
+        && (matches!(method, "agent.refresh" | "agent.reply" | "agent.reconcile")
+            || (method == "agent.goal"
+                && matches!(input["action"].as_str(), Some("pause" | "clear"))))
+}
+
 pub(super) fn user_command(
     tx: &Connection,
     p: &Principal,
@@ -345,23 +444,11 @@ pub(super) fn user_command(
     v: &Value,
     op: &str,
 ) -> Result<Value> {
-    let allowed = if method == "agent.send" {
-        vec![
-            "client_request_id",
-            "binding_id",
-            "generation",
-            "text",
-            "delivery",
-            "expected_turn_id",
-        ]
-    } else {
-        vec!["client_request_id", "binding_id", "generation", "reply"]
-    };
-    model::fields(v, &allowed)?;
+    // Envelope shape is validated before persistence by model::validate_mutation.
     let id = model::text(v, "binding_id")?;
     let generation = model::positive(v, "generation")?;
     let b = operations::get_binding(tx, id, generation)?;
-    if b["state"] != "ready" {
+    if b["state"] != "ready" && !is_recovery_control(method, v, &b) {
         return Err(Error::new(
             "BINDING_NOT_READY",
             "native session is not ready",
@@ -382,8 +469,50 @@ pub(super) fn user_command(
             }
             _ => return Err(Error::invalid("delivery must be next_turn or steer")),
         }
-    } else if !v["reply"].is_object() {
+    } else if method == "agent.reply" && !v["reply"].is_object() {
         return Err(Error::invalid("reply object required"));
+    } else if method == "agent.configure" {
+        if v["settings"].as_object().is_none_or(|o| o.is_empty()) {
+            return Err(Error::invalid("nonempty adapter settings object required"));
+        }
+    } else if method == "agent.goal" {
+        match model::text(v, "action")? {
+            "set" | "edit" => {
+                model::text(v, "objective")?;
+            }
+            "pause" | "resume" | "clear" => {
+                if v.get("objective").is_some() {
+                    return Err(Error::invalid("objective is only valid for set/edit"));
+                }
+            }
+            _ => {
+                return Err(Error::invalid(
+                    "goal action must be set/edit/pause/resume/clear",
+                ));
+            }
+        }
+    }
+    if method == "agent.reconcile" {
+        let target = operations::get_operation(tx, model::text(v, "operation_id")?)?;
+        if target["binding_id"] != id
+            || target["binding_generation"] != generation
+            || !matches!(
+                target["state"].as_str(),
+                Some("sending" | "native_accepted" | "outcome_unknown")
+            )
+        {
+            return Err(Error::invalid(
+                "reconcile requires an unresolved operation on this exact binding",
+            ));
+        }
+    }
+    if method == "agent.goal" && matches!(v["action"].as_str(), Some("pause" | "clear")) {
+        // A pause received before dispatch also cancels old local goal starts.
+        // Otherwise priority scheduling could execute pause first and revive the
+        // goal later from its stale queued set/resume. Already-sent effects stay.
+        let now = model::now_ms()?;
+        tx.execute("UPDATE operations SET state='cancelled',result_json=?4,settled_at_ms=?3,updated_at_ms=?3 WHERE binding_id=?1 AND binding_generation=?2 AND state='queued' AND method='agent.goal' AND json_extract(original_request_json,'$.action') IN ('set','edit','resume')",
+            params![id,generation,now,model::canonical(&json!({"reason":"superseded_by_goal_stop","stop_operation_id":op}))?])?;
     }
     tx.execute("UPDATE operations SET binding_id=?2,binding_generation=?3,effective_request_json=?4 WHERE operation_id=?1",params![op,id,generation,model::canonical(&json!({"route":b["route"],"native_root_id":b["native_root_id"]}))?])?;
     Ok(json!({"operation_id":op,"state":"queued","native_admission":"not_observed"}))

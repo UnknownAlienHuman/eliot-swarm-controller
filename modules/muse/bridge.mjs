@@ -6,6 +6,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { spawnMspConnection, MspError } from '@muse-code/sdk';
 import { Control } from './control.mjs';
+import { configuration, modelMatches, goalCommand } from './settings.mjs';
 
 function required(object, key) {
   if (typeof object?.[key] !== 'string' || !object[key].trim()) throw new Error(`MISSING_${key}`);
@@ -22,7 +23,7 @@ function commandId(command) {
 function compactSession(s) {
   if (!s || typeof s.sessionId !== 'string' || typeof s.status !== 'string') throw new Error('INVALID_SESSION');
   return { sessionId:s.sessionId, status:s.status, activeTurnId:s.activeTurnId,
-    modelId:s.modelId, providerId:s.providerId, attention:s.attention, turnCount:s.turnCount };
+    modelId:s.modelId, providerId:s.providerId, approvalMode:s.approvalMode, attention:s.attention, turnCount:s.turnCount };
 }
 const argv = process.argv.slice(2);
 if (argv.length !== 2 || argv[0] !== '--config') {
@@ -42,6 +43,32 @@ let latest = { execution: 'not_started', family_completeness: 'partial', observe
 const children = new Map(), pendingRequests = new Map(), outcomes = new Map(), active = new Map();
 const routeDefaults = {};
 const turns = new Map();
+// Only unconfirmed native commands live here. Exact payload/ID is reused only
+// through explicit agent.reconcile, never through reconnect or a timeout loop.
+const nativePending = new Map();
+const sessionVersions = new Map();
+let standingEffort, refreshInFlight;
+function saveOutcome(operationId, result) {
+  const pending = nativePending.get(operationId);
+  if (pending?.resolved && !['applied','rejected'].includes(result.outcome)) return;
+  const old = outcomes.get(operationId);
+  if (old && ['applied','rejected'].includes(old.outcome)) return;
+  outcomes.set(operationId, {operation_id:operationId,...result}); changed();
+}
+function settle(entry, details, turnId) {
+  entry.resolved = true;
+  saveOutcome(entry.command.operation_id, {outcome:'applied',native_root_id:rootId,native_scope_key:nativeScope,
+    ...(turnId?{turn_id:turnId}:{}), details});
+}
+function acceptModel(entry, session, evidence) {
+  if (!entry.ack || entry.setting?.key !== 'model' || !modelMatches(session, entry.setting.desired)) return false;
+  routeDefaults.modelId = session.modelId;
+  routeDefaults.providerId = session.providerId ?? undefined;
+  latest.model = {modelId:session.modelId,providerId:session.providerId};
+  settle(entry, {native_ack:entry.ack,completion_condition:'native_configuration_applied',settings:entry.setting.desired,evidence});
+  return true;
+}
+
 function changed() { revision++; }
 function observation() {
   return { ...latest, native_root_id:rootId, native_scope_key:nativeScope,
@@ -53,6 +80,20 @@ function onNotification(n) {
   // Do not duplicate token streams, tool output or the SDK's full transcript.
   if (n.method === 'item/delta') return;
   eventsSeen++;
+  if (p.sessionId) sessionVersions.set(p.sessionId, (sessionVersions.get(p.sessionId)??0)+1);
+  // A correlated event can resolve a lost turn admission reply. It never
+  // submits another prompt and never claims that the Task was accepted.
+  const inputCommand = p.commandId ?? p.item?.commandId;
+  const observedTurn = p.turnId ?? p.item?.turnId;
+  if (inputCommand && observedTurn && p.sessionId === rootId
+      && (n.method === 'turn/started' || n.method === 'turn/completed'
+          || (n.method === 'item/completed' && p.item?.kind === 'userMessage'))) {
+    for (const entry of nativePending.values()) {
+      if (entry.id === inputCommand && entry.kind === 'input') {
+        settle(entry, {completion_condition:'native_input_admitted',evidence:{method:n.method,commandId:inputCommand,turnId:observedTurn}}, observedTurn);
+      }
+    }
+  }
   if (n.method === 'view/gap' || n.method === 'session/viewHealthChanged') {
     latest.gaps++; latest.view_health = { method:n.method, sessionId:p.sessionId, status:p.status ?? p.health ?? 'unknown' };
   }
@@ -73,7 +114,7 @@ function onNotification(n) {
     latest.execution = p.status; latest.attention = p.attention;
   }
   const item = p.item;
-  if (item?.childSessionId) {
+  if (item?.childSessionId && (p.sessionId === rootId || children.has(p.sessionId))) {
     if (children.has(item.childSessionId) || children.size < 2000) {
       const old = children.get(item.childSessionId);
       if (!old || item.itemId !== old.itemId || Number(item.revision ?? 0) >= Number(old.revision ?? 0)) {
@@ -87,9 +128,12 @@ function onNotification(n) {
     } else latest.gaps++;
   }
   if (n.method === 'session/goalChanged' && p.sessionId === rootId) latest.goal = p.goal ?? null;
-  if (n.method === 'session/reasoningEffortChanged' && p.sessionId === rootId) latest.reasoning_effort = p.reasoningEffort;
+  if (n.method === 'session/reasoningEffortChanged' && p.sessionId === rootId) { latest.reasoning_effort = p.reasoningEffort; standingEffort = p.reasoningEffort; }
   if (n.method === 'usage/changed') latest.usage = { basis:'native_snapshot', value:p };
-  if (n.method === 'session/modelChanged' && p.sessionId === rootId) latest.model = { modelId:p.modelId,providerId:p.providerId };
+  if (n.method === 'session/modelChanged' && p.sessionId === rootId) {
+    latest.model = { modelId:p.modelId,providerId:p.providerId };
+    for (const entry of nativePending.values()) acceptModel(entry, p, {method:n.method,viewCursor:p.viewCursor,sourceRange:p.sourceRange});
+  }
   if (n.method === 'approval/requested' || n.method === 'approval/updated' || n.method === 'userInput/requested') {
     const key = p.approvalId ? `approval:${p.approvalId}` : `input:${p.userInputId}`;
     pendingRequests.set(key, {view:{method:n.method,params:p}});
@@ -101,6 +145,98 @@ function onNotification(n) {
   }
   changed();
 }
+async function refreshRoot() {
+  if (refreshInFlight) return refreshInFlight;
+  refreshInFlight = (async () => {
+    if (!msp || !rootId) throw new Error('NATIVE_NOT_OPEN');
+    const before = sessionVersions.get(rootId)??0;
+    const r = await msp.connection.request('session/read', {sessionId:rootId,excludeItems:true});
+    const snapshot = compactSession(r.session);
+    if (snapshot.sessionId !== rootId) throw new Error('SNAPSHOT_IDENTITY_MISMATCH');
+    // Live events received during the read take precedence. No ordering is
+    // invented by parsing opaque native cursors.
+    const fresh = before === (sessionVersions.get(rootId)??0);
+    if (fresh) {
+      latest.session = snapshot; latest.execution = snapshot.status;
+      latest.active_turn_id = snapshot.activeTurnId;
+      for (const entry of nativePending.values()) acceptModel(entry, snapshot, {method:'session/read',viewCursor:r.viewCursor});
+    }
+    const pendingAt = sessionVersions.get(rootId)??0;
+    const pending = await msp.connection.request('approval/listPending', {sessionId:rootId});
+    if (!Array.isArray(pending.approvals) || !Array.isArray(pending.userInputs)) throw new Error('INVALID_PENDING_INVENTORY');
+    if (pendingAt === (sessionVersions.get(rootId)??0)) {
+      for (const [key, entry] of pendingRequests) if (entry.view.params?.sessionId === rootId) pendingRequests.delete(key);
+      for (const params of pending.approvals) pendingRequests.set(`approval:${required(params,'approvalId')}`, {view:{method:'approval/request',params}});
+      for (const params of pending.userInputs) pendingRequests.set(`input:${required(params,'userInputId')}`, {view:{method:'userInput/request',params}});
+    }
+    latest.last_refresh = {at_ms:Date.now(),metadata_applied:fresh,viewCursor:r.viewCursor,coverage:'root_metadata_and_pending_requests'};
+    changed();
+    return latest.last_refresh;
+  })();
+  try { return await refreshInFlight; } finally { refreshInFlight = undefined; }
+}
+
+async function completeNative(entry, ack) {
+  entry.ack = ack;
+  if (ack.status !== 'accepted') throw new Error('UNEXPECTED_ADMISSION_STATUS');
+  if (entry.kind === 'input') {
+    settle(entry, {native_ack:ack,completion_condition:'native_input_admitted',requested_reasoning_effort:entry.params.reasoningEffort}, required(ack,'turnId'));
+  } else if (entry.kind === 'configure') {
+    const setting = entry.setting;
+    if (setting.key === 'reasoningEffort') {
+      // This setter's documented ack is durable and applies to subsequently
+      // launched turns. That native guarantee differs from setModel's ack.
+      standingEffort = setting.desired; routeDefaults.reasoningEffort = setting.desired;
+      latest.reasoning_effort = setting.desired;
+      latest.reasoning_application = 'native_durable_default_ack_and_explicit_per_turn';
+      settle(entry, {native_ack:ack,completion_condition:'native_configuration_applied',boundary:'subsequent_turns',evidence_kind:'native_durable_ack',reasoningEffort:setting.desired});
+    } else if (setting.key === 'approvalMode') {
+      if (ack.effectiveMode?.mode !== setting.desired) throw new Error('APPROVAL_MODE_READBACK_MISMATCH');
+      routeDefaults.approvalMode = setting.desired; latest.approval_mode = ack.effectiveMode;
+      settle(entry, {native_ack:ack,completion_condition:'native_configuration_applied',boundary:'next_action'});
+    } else {
+      saveOutcome(entry.command.operation_id, {outcome:'accepted',native_root_id:rootId,native_scope_key:nativeScope,
+        details:{native_ack:ack,completion_condition:'native_configuration_applied',waiting_for:'model_readback',requested:setting.desired}});
+      await refreshRoot();
+      // If no matching observation exists yet, preserve accepted/pending. New
+      // model work remains serialized behind it while replies/refresh continue.
+    }
+  } else {
+    if (entry.kind === 'goal') latest.goal_admission = {action:entry.command.input.action,native_ack:ack};
+    settle(entry, {native_ack:ack,completion_condition:entry.kind==='goal'?'native_goal_admitted':'native_reply_admitted'}, ack.turnId);
+  }
+}
+
+async function submitNative(command, method, params, kind, setting) {
+  const entry = {command,id:commandId(command),method,params,kind,setting,ack:null,resolved:false};
+  nativePending.set(command.operation_id, entry);
+  const ack = await msp.connection.command(method, params, {maxAttempts:1,commandId:entry.id});
+  await completeNative(entry, ack);
+}
+
+async function reconcileNative(target) {
+  const entry = nativePending.get(target);
+  if (!entry) throw new Error('RECONCILIATION_CONTEXT_UNAVAILABLE');
+  if (active.has(target)) return {target_operation_id:target,disposition:'native_request_in_progress',resubmitted:false};
+  if (entry.resolved) return {target_operation_id:target,disposition:'awaiting_host_receipt',resubmitted:false};
+  if (entry.ack) {
+    await refreshRoot();
+    return {target_operation_id:target,disposition:entry.resolved?'resolved':'pending_application',resubmitted:false};
+  }
+  // This is an explicit reconciliation command, not a read-only healthcheck.
+  // SDK/server idempotency joins the SAME command ID with byte-equivalent params.
+  try {
+    const ack = await msp.connection.command(entry.method, entry.params, {maxAttempts:1,commandId:entry.id});
+    await completeNative(entry, ack);
+  } catch (error) {
+    const rejected = error instanceof MspError && ['invalidParams','commandRejected','overloaded','backpressured'].includes(error.kind);
+    saveOutcome(target, {outcome:entry.ack?'accepted':rejected?'rejected':'unknown',native_root_id:rootId,native_scope_key:nativeScope,
+      details:{evidence_kind:'explicit_same_command_reconciliation',native_code:error instanceof MspError?error.code:null,native_kind:error instanceof MspError?error.kind:null}});
+    throw error;
+  }
+  return {target_operation_id:target,disposition:entry.resolved?'resolved':'pending_application',resubmitted:true,native_command_id:entry.id};
+}
+
 async function followChild(id) {
   try {
     const r = await msp.connection.request('session/read', {sessionId:id});
@@ -154,7 +290,6 @@ async function startNative(command) {
     reasoning:{requested:options.reasoningEffort,application:'per_turn_at_submission'},fingerprint_warning:Boolean(msp.fingerprintWarning)}};
 }
 async function execute(command) {
-  const id=commandId(command);
   const base={operation_id:command.operation_id};
   let nativeAdmissionPossible=false;
   try {
@@ -165,15 +300,14 @@ async function execute(command) {
       const p=command.input;
       if (command.method==='task.dispatch' || command.method==='agent.send') {
         const observed=await msp.connection.request('session/read',{sessionId:rootId});
-        if(observed.session?.modelId!==routeDefaults.modelId)throw new Error('MODEL_CHANGED_BEFORE_SEND');
+        if(!modelMatches(observed.session,routeDefaults))throw new Error('MODEL_CHANGED_BEFORE_SEND');
         const steer=p.delivery==='steer';
         const input={sessionId:rootId,input:[{type:'text',text:required(p,'text')}],reasoningEffort:routeDefaults.reasoningEffort};
         if(command.method === 'task.dispatch') input.input.unshift({type:'text',text:'Task specification: '+JSON.stringify(p.task_snapshot)});
         if(steer)input.expectedTurnId=required(p,'expected_turn_id');else input.ifBusy='queue';
         nativeAdmissionPossible=true;
-        const r=await msp.connection.command(steer?'turn/steer':'turn/start',input,{maxAttempts:1,commandId:id});
-        if(r.status!=='accepted')throw new Error('UNEXPECTED_ADMISSION_STATUS');
-        result={turn_id:required(r,'turnId'),details:{native_ack:r,completion_condition:'native_input_admitted',requested_reasoning_effort:routeDefaults.reasoningEffort}};
+        await submitNative(command,steer?'turn/steer':'turn/start',input,'input');
+        return;
       } else if(command.method==='agent.reply') {
         const r=p.reply;
         const method=required(r,'method');
@@ -181,22 +315,59 @@ async function execute(command) {
         const params=r.params;
         if(!params || typeof params!=='object' || !(params.sessionId===rootId || children.has(params.sessionId)))throw new Error('REPLY_OUTSIDE_OBSERVED_FAMILY');
         nativeAdmissionPossible=true;
-        const ack=await msp.connection.command(method,params,{maxAttempts:1,commandId:id});
-        result={details:{native_ack:ack,completion_condition:'native_reply_admitted'}};
+        await submitNative(command,method,params,'reply');
+        return;
+      } else if (command.method === 'agent.configure') {
+        const setting = configuration(p.settings, rootId);
+        nativeAdmissionPossible = true;
+        await submitNative(command,setting.method,setting.params,'configure',setting);
+        return;
+      } else if (command.method === 'agent.goal') {
+        const goal = goalCommand(p,rootId);
+        if (goal.startsWork) {
+          if (standingEffort !== routeDefaults.reasoningEffort) throw new Error('CONFIGURE_STANDING_EFFORT_BEFORE_GOAL');
+          const read = await msp.connection.request('session/read',{sessionId:rootId});
+          if (!modelMatches(read.session,routeDefaults)) throw new Error('MODEL_CHANGED_BEFORE_GOAL');
+        }
+        nativeAdmissionPossible = true;
+        await submitNative(command,goal.method,goal.params,'goal');
+        return;
+      } else if (command.method === 'agent.refresh') {
+        result = {details:{completion_condition:'native_read_completed',snapshot:await refreshRoot()}};
+      } else if (command.method === 'agent.reconcile') {
+        nativeAdmissionPossible = true;
+        result = {details:await reconcileNative(required(p,'operation_id'))};
       } else throw new Error('UNSUPPORTED_OPERATION');
       result.native_root_id=rootId;result.native_scope_key=nativeScope;
     }
-    outcomes.set(command.operation_id,{...base,outcome:'applied',...result});
+    saveOutcome(command.operation_id,{outcome:'applied',...result});
   } catch(error) {
     // Only protocol rejection proves non-admission. Transport/parsing/spawn failures may have effects.
     const rejected=!nativeAdmissionPossible || error instanceof MspError && ['invalidParams','commandRejected','overloaded','backpressured'].includes(error.kind);
-    const outcome={...base,outcome:rejected?'rejected':'unknown',details:{error_type:error.name,native_kind:error instanceof MspError?error.kind:null,native_code:error instanceof MspError?error.code:null,diagnostic_code:error instanceof MspError?'NATIVE_ERROR':String(error.message).slice(0,120)}};
+    const accepted = nativePending.get(command.operation_id)?.ack;
+    const outcome={...base,outcome:accepted?'accepted':rejected?'rejected':'unknown',details:{error_type:error.name,native_kind:error instanceof MspError?error.kind:null,native_code:error instanceof MspError?error.code:null,diagnostic_code:error instanceof MspError?'NATIVE_ERROR':String(error.message).slice(0,120)}};
     if(rootId){outcome.native_root_id=rootId;outcome.native_scope_key=nativeScope;}
-    outcomes.set(command.operation_id,outcome);
-  } finally { active.delete(command.operation_id); changed(); }
+    saveOutcome(command.operation_id,outcome);
+  } finally {
+    active.delete(command.operation_id);
+    if(nativePending.get(command.operation_id)?.hostAcknowledged)nativePending.delete(command.operation_id);
+    changed();
+  }
 }
 async function report(link = control) {
-  for(const [id,outcome] of outcomes){await link.call('module.outcome',outcome);outcomes.delete(id);}
+  for(const [id,outcome] of outcomes){
+    await link.call('module.outcome',outcome);
+    // A later native event may have resolved this operation while IPC awaited.
+    // Do not erase the newer outcome with the old acknowledgement.
+    if(outcomes.get(id)===outcome){
+      outcomes.delete(id);
+      if(['applied','rejected'].includes(outcome.outcome)) {
+        const entry=nativePending.get(id);
+        if(entry)entry.hostAcknowledged=true;
+        if(!active.has(id))nativePending.delete(id);
+      }
+    }
+  }
   if(lastSentRevision!==revision){
     const at=revision;
     const state=observation();
@@ -204,7 +375,7 @@ async function report(link = control) {
       // Keep pending protocol requests and mark incomplete inventory rather than discard outcomes.
       state.observed_children=state.observed_children.slice(-100);state.gaps++;state.family_completeness='partial';
     }
-    await link.call('module.observe',{event_id:`${bootId}:${at}`,state});lastSentRevision=at;
+    await link.call('module.observe',{event_id:`${bootId}:${at}`,sequence:at,state});lastSentRevision=at;
   }
 }
 let admissionTail=Promise.resolve();
@@ -237,7 +408,7 @@ while(!stopping){
           active.set(command.operation_id,true);
           // Serialize native admission, not whole model turns. Replies bypass this
           // queue so an outstanding command cannot deadlock a native question.
-          if(command.method==='agent.reply') void execute(command);
+          if(['agent.reply','agent.refresh','agent.reconcile'].includes(command.method)) void execute(command);
           else admissionTail=admissionTail.then(()=>execute(command));
         }
       }

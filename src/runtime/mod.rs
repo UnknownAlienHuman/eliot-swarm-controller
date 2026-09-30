@@ -17,6 +17,8 @@ pub struct RuntimeCommand {
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EffectOutcome {
+    /// Native admission is known, but the required application boundary is pending.
+    Accepted,
     Applied,
     Rejected,
     Unknown,

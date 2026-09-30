@@ -258,6 +258,21 @@ pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
             "expected_turn_id",
         ],
         "agent.reply" => &["client_request_id", "binding_id", "generation", "reply"],
+        "agent.configure" => &["client_request_id", "binding_id", "generation", "settings"],
+        "agent.goal" => &[
+            "client_request_id",
+            "binding_id",
+            "generation",
+            "action",
+            "objective",
+        ],
+        "agent.refresh" => &["client_request_id", "binding_id", "generation"],
+        "agent.reconcile" => &[
+            "client_request_id",
+            "binding_id",
+            "generation",
+            "operation_id",
+        ],
         "operation.cancel" => &["client_request_id", "operation_id", "reason"],
         "host.mode" => &["client_request_id", "new_work"],
         "client.register" => &[

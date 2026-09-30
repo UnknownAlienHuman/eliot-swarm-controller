@@ -126,6 +126,10 @@ impl Store {
                 | "task.dispatch"
                 | "agent.send"
                 | "agent.reply"
+                | "agent.configure"
+                | "agent.goal"
+                | "agent.refresh"
+                | "agent.reconcile"
                 | "host.mode"
                 | "module.outcome"
         );
@@ -508,9 +512,8 @@ fn apply(
         "task.claim" => tasks::claim(tx, p, v, id, now).map(|v| (v, false)),
         "attempt.release" => tasks::release(tx, p, v, id, now).map(|v| (v, false)),
         "task.dispatch" => operations::dispatch(tx, p, v, id, now),
-        "agent.send" | "agent.reply" => {
-            runtime::user_command(tx, p, method, v, id).map(|v| (v, true))
-        }
+        "agent.send" | "agent.reply" | "agent.configure" | "agent.goal" | "agent.refresh"
+        | "agent.reconcile" => runtime::user_command(tx, p, method, v, id).map(|v| (v, true)),
         "agent.open" => operations::open(tx, p, v, config, id, now).map(|v| (v, true)),
         "operation.cancel" => operations::cancel(tx, p, v, id, now).map(|v| (v, false)),
         "host.mode" => {
