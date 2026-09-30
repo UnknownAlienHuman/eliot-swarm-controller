@@ -1,0 +1,15 @@
+{
+  "attempt_id": "REPLACE_WITH_ATTEMPT_ID",
+  "expected_revision": 1,
+  "expected_submission_ref": null,
+  "candidate_ref": "REPLACE_WITH_COMPLETE_RESULT_ARTIFACT_ID",
+  "summary": "Implemented the requested change; independent review is still required.",
+  "claims": [
+    {
+      "requirement_id": "W1",
+      "status": "met",
+      "evidence": ["src/owning_module.rs::implemented_function"],
+      "note": "Submitter assertion, not a controller-verified source-tree check."
+    }
+  ]
+}

@@ -8,6 +8,7 @@ pub use assembly::{AssemblyRequest, ResultPart};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
@@ -112,6 +113,7 @@ impl ArtifactFiles {
         let prefix = match record.kind.as_str() {
             "native_result_page" => "result-",
             "native_result" => "assembled-",
+            "task_submission" => "submission-",
             _ => return Err(Error::new("ARTIFACT_KIND", "unsupported artifact kind")),
         };
         let hex = record.artifact_id.strip_prefix(prefix).unwrap_or("");
@@ -129,7 +131,7 @@ impl ArtifactFiles {
     /// Publish atomically without overwriting. A crash before DB commit can leave
     /// an orphan file; it cannot turn a partial file into a completed artifact.
     pub fn publish(&self, record: &ArtifactRecord, bytes: &[u8]) -> Result<()> {
-        if bytes.len() > MAX_PAGE_BYTES
+        if (record.kind == "native_result_page" && bytes.len() > MAX_PAGE_BYTES)
             || record.byte_length != bytes.len() as u64
             || record.content_digest != model::digest(bytes)
         {
@@ -152,7 +154,7 @@ impl ArtifactFiles {
             match fs::hard_link(&temp, &destination) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    self.verified_bytes(record)?;
+                    self.verify(record)?;
                 }
                 Err(e) => return Err(e.into()),
             }
@@ -189,6 +191,64 @@ impl ArtifactFiles {
         }
         Ok(bytes)
     }
+    pub fn submission(operation_id: &str, document: &Value) -> Result<(ArtifactRecord, Vec<u8>)> {
+        let bytes = model::canonical(document)?.into_bytes();
+        let id = format!("submission-{}", model::digest(operation_id.as_bytes()));
+        let mut metadata = document.clone();
+        if let Some(fields) = metadata.as_object_mut() {
+            fields.remove("claims");
+            fields.remove("summary");
+        }
+        Ok((
+            ArtifactRecord {
+                kind: "task_submission".into(),
+                artifact_id: id.clone(),
+                relative_path: format!("artifacts/{id}.bin"),
+                byte_length: bytes.len() as u64,
+                content_digest: model::digest(&bytes),
+                metadata,
+            },
+            bytes,
+        ))
+    }
+    /// Stream the immutable body's hash once; no file-sized buffer or DB work.
+    pub fn verify(&self, record: &ArtifactRecord) -> Result<()> {
+        self.verified_range(record, 0, 0).map(|_| ())
+    }
+    fn verified_range(
+        &self,
+        record: &ArtifactRecord,
+        offset: u64,
+        length: usize,
+    ) -> Result<Vec<u8>> {
+        let mut file = self.open_regular(record)?;
+        let mut hash = Sha256::new();
+        let mut buffer = [0u8; MAX_PAGE_BYTES];
+        let mut position = 0u64;
+        let requested_end = record.byte_length.min(offset.saturating_add(length as u64));
+        let mut selected = Vec::with_capacity(length);
+        while position < record.byte_length {
+            let n = (record.byte_length - position).min(MAX_PAGE_BYTES as u64) as usize;
+            file.read_exact(&mut buffer[..n])?;
+            hash.update(&buffer[..n]);
+            let end = position + n as u64;
+            if end > offset && position < requested_end {
+                let from = offset.saturating_sub(position) as usize;
+                let to = (requested_end.min(end) - position) as usize;
+                selected.extend_from_slice(&buffer[from..to]);
+            }
+            position = end;
+        }
+        let mut extra = [0u8; 1];
+        if file.read(&mut extra)? != 0 || format!("{:x}", hash.finalize()) != record.content_digest
+        {
+            return Err(Error::new(
+                "ARTIFACT_DAMAGED",
+                "retained body differs from the committed digest",
+            ));
+        }
+        Ok(selected)
+    }
     pub fn read(&self, record: &ArtifactRecord, offset: u64, length: usize) -> Result<Value> {
         if length == 0 || length > MAX_PAGE_BYTES || offset > record.byte_length {
             return Err(Error::invalid(
@@ -197,6 +257,19 @@ impl ArtifactFiles {
         }
         if record.kind == "native_result" {
             return self.read_assembled(record, offset, length);
+        }
+        if record.kind == "task_submission" {
+            let bytes = self.verified_range(record, offset, length)?;
+            let (encoding, content) = match std::str::from_utf8(&bytes) {
+                Ok(s) => ("utf8", s.to_owned()),
+                Err(_) => ("base64", STANDARD.encode(&bytes)),
+            };
+            return Ok(
+                json!({"artifact_id":record.artifact_id,"offset_bytes":offset,
+                "byte_length":bytes.len(),"eof":offset + bytes.len() as u64 == record.byte_length,
+                "encoding":encoding,"content":content,"artifact_sha256":record.content_digest,
+                "metadata":record.public_metadata()}),
+            );
         }
         let bytes = self.verified_bytes(record)?;
         let start = offset as usize;

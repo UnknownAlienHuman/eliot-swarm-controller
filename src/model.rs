@@ -230,6 +230,26 @@ pub fn response(id: Value, result: Result<Value>) -> Value {
 pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
     let allowed: &[&str] = match method {
         "artifact.assemble" => &["client_request_id", "page_refs", "expected_sha256"],
+        "task.submit" => &[
+            "client_request_id",
+            "attempt_id",
+            "expected_revision",
+            "expected_submission_ref",
+            "candidate_ref",
+            "summary",
+            "claims",
+        ],
+        "task.request_changes" => &[
+            "client_request_id",
+            "attempt_id",
+            "expected_revision",
+            "submission_ref",
+            "candidate_ref",
+            "finding_id",
+            "reason",
+            "requirement_ids",
+            "evidence",
+        ],
         "task.create" => &["client_request_id", "project_id", "origin_key", "spec"],
         "task.revise" => &["client_request_id", "task_id", "expected_revision", "spec"],
         "task.claim" => &[
@@ -309,6 +329,15 @@ pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
         _ => return Err(Error::new("METHOD_NOT_FOUND", method)),
     };
     fields(params, allowed)?;
+    match method {
+        "task.submit" => {
+            crate::submission::SubmitRequest::parse(params)?;
+        }
+        "task.request_changes" => {
+            crate::submission::ChangeRequest::parse(params)?;
+        }
+        _ => {}
+    }
     text(params, "client_request_id")?;
     if matches!(method, "task.create" | "task.revise") {
         let spec: TaskSpec = serde_json::from_value(params["spec"].clone())?;

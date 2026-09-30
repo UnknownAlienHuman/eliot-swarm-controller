@@ -142,7 +142,9 @@ pub(super) fn claim(
     p.owns(owner)?;
     let profile = meta(tx, &format!("client:{owner}"))?
         .ok_or_else(|| Error::new("NOT_FOUND", "owner is not registered"))?;
-    if profile["disabled"] == true || profile["role"] == "observer" {
+    if profile["disabled"] == true
+        || !matches!(profile["role"].as_str(), Some("operator" | "manager"))
+    {
         return Err(Error::new("FORBIDDEN", "owner cannot execute work"));
     }
     let start: StartOwner = if let Some(value) = v.get("start_owner") {

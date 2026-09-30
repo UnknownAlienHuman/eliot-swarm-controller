@@ -10,7 +10,7 @@ The Muse SDK bridge opens an explicitly selected native executable, delivers Tas
 
 **Local whole-result assembly and export are implemented.** `artifact.assemble` validates a complete ordered set of retained pages, publishes a whole-result file and records provenance. `artifact.parts` pages that provenance; `artifact.read` verifies touched segments. `swarm artifact export` reuses one authenticated IPC connection, streams bytes to an explicitly chosen local file and checks the full SHA-256 before publication. It never sends the destination path to a model or the host.
 
-**Still pending:** bridge-process crash/resume, complete native family reconstruction, automatic handoff, Task submission/acceptance, CheckRunner, direct OpenCode V2 and other native adapters, MCP and automatic module/service installation. Whole-result coverage is not Task acceptance. Live Muse/Max inference and Windows native launch remain unqualified. Do not mark all C01–C03 complete.
+**Still pending:** bridge-process crash/resume, complete native family reconstruction, automatic handoff, Task acceptance, CheckRunner, direct OpenCode V2 and other native adapters, MCP and automatic module/service installation. Whole-result coverage is not Task acceptance. Live Muse/Max inference and Windows native launch remain unqualified. Do not mark all C01–C03 complete.
 
 ## Build and run
 
@@ -85,15 +85,65 @@ Original pages and source provenance remain retained. The whole result has its o
 
 The 64 KiB bound applies to byte transfers, not the total result size. Assembly keeps one content page in memory at a time plus its page descriptors. Request/manifest metadata still scales with the number of pages and must fit the existing IPC envelope. Automatic fetching of missing pages, arbitrary reference-URI downloads and semantic acceptance are not performed by this path.
 
+## Task submission and anchored feedback
+
+`task.submit` now seals a complete retained result together with the Attempt's requirement report.
+The candidate must be an assembled result or a single page that covers its complete source body.
+For a bound Attempt it must belong to that binding/generation. Its bytes are verified off the SQLite
+thread before the separate immutable submission document is published. This is a proposed result,
+**not a Git checkout snapshot, CheckRunner pass or semantic acceptance**.
+
+Use [config/submission.example.json](config/submission.example.json), replacing the sample IDs:
+
+```powershell
+swarm --data-dir C:\SwarmState --request-id submit-1 task submit --file submission.json
+# Read the returned operation_id with operation.get; result contains submission_ref.
+swarm --data-dir C:\SwarmState task submission SUBMISSION_REF --limit 50
+swarm --data-dir C:\SwarmState artifact export SUBMISSION_REF --out .\submission.json
+```
+
+`expected_submission_ref` must be explicit: null for the first submission, the previous reference
+for a replacement. Revision/owner/reference are checked again at final commit after file I/O.
+Concurrent proposals cannot overwrite each other. Submission does not release Task ownership or
+require unrelated children to finish; native turn completion does not erase a submitted/review state.
+A host restart permits retrying the identical local publication request, not replaying model input.
+Read the operation outcome even if the initial durable receipt says queued.
+
+Claims name existing requirement IDs. Omitted requirements become **unreported**, using the frozen
+Task specification, rather than silently disappearing. `met` needs an evidence reference; `not_met`
+and `deferred` need an explanation. These strings are submitter assertions, not controller-verified
+symbols. A partially reported proposal can be retained and reviewed without manufacturing a PASS.
+`task.submission` pages the immutable claims; `artifact.read/export` verifies the actual document.
+
+As the operator/decision owner, submit [config/request-changes.example.json](config/request-changes.example.json):
+
+```powershell
+swarm --data-dir C:\SwarmState --request-id review-1 task request-changes --file review.json
+# As the assigned manager, read message.read using that manager's credential.
+```
+
+Feedback names the exact Attempt, Task revision, submission, candidate and a stable finding_id.
+An applicable finding changes only that Attempt to needs_correction and atomically enters its owner's
+mailbox. Repeating the same finding does not send it again; different content under that identity
+conflicts. Stale feedback is preserved as historical evidence and does not alter or notify newer work.
+The manager can reply using message.send/in_reply_to with the feedback's message_id, then resubmit
+against the previous submission reference. No second task.dispatch, process or automatic native wake
+is involved. Acceptance/invalidation and independent CheckRunner policy remain separate unfinished work.
+
 ## API and remaining work
 
-Public methods: `host.status/mode`, `client.register/list`, `task.create/get/list/revise/claim/dispatch`, `attempt.get/release/bind_producer`, `agent.open/state/list/family/send/reply/configure/goal/refresh/reconcile/result`, `artifact.get/read/assemble/parts`, `route.list`, `operation.get/list/cancel`, `message.send/read`, `report.delta`. Module methods remain `module.hello/next/outcome/observe/result`. Export is a CLI client operation over get/read, not a remote arbitrary-file-write method.
+Public methods: `host.status/mode`, `client.register/list`, `task.create/get/list/revise/claim/dispatch/submit/submission/request_changes`, `attempt.get/release/bind_producer`, `agent.open/state/list/family/send/reply/configure/goal/refresh/reconcile/result`, `artifact.get/read/assemble/parts`, `route.list`, `operation.get/list/cancel`, `message.send/read`, `report.delta`. Module methods remain `module.hello/next/outcome/observe/result`. Export is a CLI client operation over get/read, not a remote arbitrary-file-write method.
 
 Next: implement the remaining Muse crash-recovery boundary and Task result/CheckRunner consumers; then direct OpenCode V2 on the same contract. Do not rebuild the core or reimplement result paging. Preserve the native shared-Codex and subscription targets. [SIWC notes](docs/runtime-notes.md) describe an optional OAuth route, not installed authorization. [OpenCodex Issue #1](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/1) remains after the main controller code.
 
 ## Evidence and development
 
-**Current code checkpoint: `1953ff5a5ebbe72cfdc0e605504c7f65439d0a7e`.** Assembly/export was implemented in `3631a646`; `1953ff5a` additionally checks the backing file of an empty export. On 2026-09-30, [CI run 36771097804](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/36771097804) completed successfully on Windows and Linux: formatting, warnings-denied Clippy, Muse syntax/SDK import and release build. The dependency locks, native module and nine-table migration were unchanged.
+The submission/feedback slice implements architecture §5/12 and implementation plan §4/9 using the
+existing artifact and Operation paths. No migration, dependency, native module or service was added.
+Its exact-commit compilation is recorded in CI; the previous result-assembly run below is not its
+validation. No native session or model is started by this slice.
+
+**Previous code checkpoint: `1953ff5a5ebbe72cfdc0e605504c7f65439d0a7e`.** Assembly/export was implemented in `3631a646`; `1953ff5a` additionally checks the backing file of an empty export. On 2026-09-30, [CI run 36771097804](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/36771097804) completed successfully on Windows and Linux: formatting, warnings-denied Clippy, Muse syntax/SDK import and release build. The dependency locks, native module and nine-table migration were unchanged.
 
 A short local invocation of that Linux binary sent **synthetic pages through the real authenticated module IPC**, then used actual artifact assembly/export. A three-page 153,602-byte body exported byte-for-byte with the expected SHA-256. Repeating the request returned the saved receipt; an existing output was not overwritten. An empty result exported successfully, and a subsequent export after removing only its synthetic backing file failed without publishing a destination. The isolated host exited cleanly. No Muse process, native model, user project, Windows runtime or broad test suite was involved; this does not qualify native inference or crash recovery.
 

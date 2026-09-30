@@ -123,6 +123,24 @@ enum ArtifactCommand {
 }
 #[derive(Subcommand)]
 enum TaskCommand {
+    /// Submit an immutable retained candidate and a requirement report; not acceptance.
+    Submit {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// Read a specific immutable submission, with paged requirement claims.
+    Submission {
+        submission_ref: String,
+        #[arg(long, default_value_t = 0)]
+        after: i64,
+        #[arg(long, default_value_t = 50)]
+        limit: i64,
+    },
+    /// Return one anchored finding as the decision owner; never starts another worker.
+    RequestChanges {
+        #[arg(long)]
+        file: PathBuf,
+    },
     Create {
         #[arg(long)]
         project: String,
@@ -280,6 +298,18 @@ async fn run(cli: Cli) -> Result<()> {
             ("report.delta".into(), json!({"after":after,"limit":limit}))
         }
         Command::Task { command } => match command {
+            TaskCommand::Submit { file } => ("task.submit".into(), read_json(&file)?),
+            TaskCommand::RequestChanges { file } => {
+                ("task.request_changes".into(), read_json(&file)?)
+            }
+            TaskCommand::Submission {
+                submission_ref,
+                after,
+                limit,
+            } => (
+                "task.submission".into(),
+                json!({"submission_ref":submission_ref,"after":after,"limit":limit}),
+            ),
             TaskCommand::Create {
                 project,
                 file,
@@ -375,6 +405,7 @@ async fn run(cli: Cli) -> Result<()> {
             | "artifact.get"
             | "artifact.read"
             | "artifact.parts"
+            | "task.submission"
             | "task.get"
             | "task.list"
             | "attempt.get"

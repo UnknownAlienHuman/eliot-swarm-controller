@@ -330,7 +330,7 @@ pub(super) fn outcome(db: &mut Connection, p: &Principal, v: &Value) -> Result<V
                 &b["observation"]["native"],
                 b["observation"]["native_observation_id"].as_i64(),
             );
-            tx.execute("UPDATE attempts SET state='running',producers_json=json_insert(producers_json,'$[#]',json(?2)),updated_at_ms=?3 WHERE attempt_id=?1 AND released_at_ms IS NULL",params![attempt,model::canonical(&producer)?,now])?;
+            tx.execute("UPDATE attempts SET state=CASE WHEN state='reserved' THEN 'running' ELSE state END,producers_json=json_insert(producers_json,'$[#]',json(?2)),updated_at_ms=?3 WHERE attempt_id=?1 AND released_at_ms IS NULL",params![attempt,model::canonical(&producer)?,now])?;
         }
     } else if o["method"] == "agent.open" && !matches!(r.outcome, EffectOutcome::Accepted) {
         // A failure may follow spawn: preserve ownership and its known native identity.

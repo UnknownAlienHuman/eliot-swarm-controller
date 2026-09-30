@@ -4,6 +4,7 @@ mod operations;
 mod producers;
 mod results;
 mod runtime;
+mod submissions;
 mod tasks;
 use crate::{
     artifacts::{ArtifactFiles, MAX_PAGE_BYTES, ResultPage},
@@ -113,6 +114,9 @@ impl Store {
         .await
     }
     pub async fn call(&self, principal: Principal, method: String, params: Value) -> Result<Value> {
+        if method == "task.submit" {
+            return self.submit_task(principal, params).await;
+        }
         if method == "module.result" {
             return self.persist_result(principal, params).await;
         }
@@ -230,6 +234,42 @@ impl Store {
             .await?;
         self.changed.send_modify(|n| *n = n.wrapping_add(1));
         Ok(result)
+    }
+    async fn submit_task(&self, principal: Principal, params: Value) -> Result<Value> {
+        let p = principal.clone();
+        let config = self.config.clone();
+        let receipt = self
+            .run(move |db| {
+                let p = current_principal(db, p)?;
+                if !matches!(p.role, Role::Operator | Role::Manager) {
+                    return Err(Error::new(
+                        "FORBIDDEN",
+                        "submission requires a manager or operator",
+                    ));
+                }
+                mutate(db, &p, "task.submit", &params, &config)
+            })
+            .await?;
+        let id = model::text(&receipt, "operation_id")?.to_string();
+        let start_id = id.clone();
+        let p = principal.clone();
+        if let Some((candidate, document)) = self
+            .run(move |db| submissions::begin(db, p, &start_id))
+            .await?
+        {
+            let file_id = id.clone();
+            let outcome = self
+                .file_io(move |files| {
+                    files.verify(&candidate)?;
+                    let (record, bytes) = ArtifactFiles::submission(&file_id, &document)?;
+                    files.publish(&record, &bytes)?;
+                    Ok(record)
+                })
+                .await;
+            self.run(move |db| submissions::finish(db, principal, &id, outcome))
+                .await?;
+        }
+        Ok(receipt)
     }
     async fn assemble_artifact(&self, principal: Principal, params: Value) -> Result<Value> {
         let p = principal.clone();
@@ -416,6 +456,7 @@ fn is_read(method: &str) -> bool {
         "artifact.get"
             | "artifact.parts"
             | "host.status"
+            | "task.submission"
             | "task.get"
             | "task.list"
             | "attempt.get"
@@ -468,6 +509,7 @@ fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config
             )
         }
         "agent.family" => producers::family(db, v),
+        "task.submission" => submissions::describe(db, v),
         "task.get" => {
             model::fields(v, &["task_id"])?;
             tasks::get_task(db, model::text(v, "task_id")?)
@@ -559,7 +601,7 @@ fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config
             model::fields(v, &["after", "limit"])?;
             let (limit, after) = page(v)?;
             let only_mail = method == "message.read";
-            let mut s=db.prepare("SELECT observation_id,kind,payload_json,recorded_at_ms FROM observations WHERE observation_id>?1 AND (?2=0 OR (kind='message.send' AND json_extract(payload_json,'$.recipient')=?3)) ORDER BY observation_id LIMIT ?4")?;
+            let mut s=db.prepare("SELECT observation_id,kind,payload_json,recorded_at_ms FROM observations WHERE observation_id>?1 AND (?2=0 OR (kind IN ('message.send','task.feedback') AND json_extract(payload_json,'$.recipient')=?3)) ORDER BY observation_id LIMIT ?4")?;
             let rows = s
                 .query_map(params![after, only_mail, p.client_id, limit], |r| {
                     Ok((
@@ -650,6 +692,10 @@ fn apply(
 ) -> Result<(Value, bool)> {
     match method {
         "artifact.assemble" => assembly::reserve(tx, p, v, id).map(|v| (v, true)),
+        "task.submit" => submissions::reserve(tx, p, v, id).map(|v| (v, true)),
+        "task.request_changes" => {
+            submissions::request_changes(tx, p, v, id, now).map(|v| (v, false))
+        }
         "task.create" => tasks::create(tx, p, v, id, now).map(|v| (v, false)),
         "task.revise" => tasks::revise(tx, p, v, id, now).map(|v| (v, false)),
         "task.claim" => tasks::claim(tx, p, v, id, now).map(|v| (v, false)),
@@ -734,7 +780,9 @@ fn apply(
             }
             if let Some(reply) = v.get("in_reply_to").and_then(Value::as_str) {
                 let prior = operations::get_operation(tx, reply)?;
-                if prior["method"] != "message.send"
+                if !(prior["method"] == "message.send"
+                    || (prior["method"] == "task.request_changes"
+                        && prior["result"]["applied"] == true))
                     || prior["result"]["recipient"] != p.client_id
                     || prior["result"]["sender"] != recipient
                 {

@@ -1,0 +1,10 @@
+{
+  "attempt_id": "REPLACE_WITH_ATTEMPT_ID",
+  "expected_revision": 1,
+  "submission_ref": "REPLACE_WITH_SUBMISSION_ARTIFACT_ID",
+  "candidate_ref": "REPLACE_WITH_COMPLETE_RESULT_ARTIFACT_ID",
+  "finding_id": "missing-owner-error-path",
+  "reason": "The failure branch leaves the assignment unresolved. Preserve the existing candidate and correct that branch.",
+  "requirement_ids": ["W1"],
+  "evidence": ["src/owning_module.rs::implemented_function: error return before assignment disposition"]
+}

@@ -214,7 +214,7 @@ impl ArtifactFiles {
         let _ = fs::remove_file(&temp);
         result
     }
-    fn open_regular(&self, record: &ArtifactRecord) -> Result<File> {
+    pub(super) fn open_regular(&self, record: &ArtifactRecord) -> Result<File> {
         let path = self.path(record)?;
         let m = fs::symlink_metadata(&path)?;
         if !m.is_file() || m.file_type().is_symlink() || m.len() != record.byte_length {
