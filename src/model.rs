@@ -48,7 +48,7 @@ pub fn fields(value: &Value, allowed: &[&str]) -> Result<()> {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all="snake_case")]
 pub enum Role { Operator, Manager, Observer }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Credential {
     pub client_id: String,
@@ -152,4 +152,34 @@ pub fn response(id: Value, result: Result<Value>) -> Value {
         Ok(value) => json!({"jsonrpc":"2.0","id":id,"result":value}),
         Err(e) => json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":e.message,"data":{"code":e.code}}}),
     }
+}
+
+/// Reject malformed/unknown envelopes before storing the original request. In
+/// particular, an accidental client.hello/token must never become a receipt.
+pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
+    let allowed: &[&str] = match method {
+        "task.create" => &["client_request_id", "project_id", "origin_key", "spec"],
+        "task.revise" => &["client_request_id", "task_id", "expected_revision", "spec"],
+        "task.claim" => &["client_request_id", "task_id", "expected_revision", "owner_id", "start_owner", "binding_id", "binding_generation"],
+        "task.dispatch" => &["client_request_id", "attempt_id", "text"],
+        "attempt.release" => &["client_request_id", "attempt_id", "outcome", "reason", "assignment_closed"],
+        "agent.open" => &["client_request_id", "lane_id", "route"],
+        "operation.cancel" => &["client_request_id", "operation_id", "reason"],
+        "host.mode" => &["client_request_id", "new_work"],
+        "client.register" => &["client_request_id", "client_id", "role", "token_hash"],
+        "message.send" => &["client_request_id", "recipient", "text", "in_reply_to"],
+        _ => return Err(Error::new("METHOD_NOT_FOUND", method)),
+    };
+    fields(params, allowed)?;
+    text(params, "client_request_id")?;
+    if matches!(method, "task.create" | "task.revise") {
+        let spec: TaskSpec = serde_json::from_value(params["spec"].clone())?;
+        spec.validate()?;
+    }
+    for field in ["owner_id", "origin_key", "binding_id", "in_reply_to"] {
+        if let Some(value) = params.get(field) && !value.is_null() {
+            text(params, field)?;
+        }
+    }
+    Ok(())
 }

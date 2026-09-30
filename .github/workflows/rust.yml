@@ -5,7 +5,7 @@ on:
     paths: ['src/**', 'migrations/**', 'Cargo.toml', 'Cargo.lock', '.github/workflows/rust.yml']
   workflow_dispatch:
 permissions:
-  contents: read
+  contents: write
 jobs:
   build:
     strategy:
@@ -33,13 +33,28 @@ jobs:
         run: cargo clippy --locked --lib --bins --no-deps -- -D warnings
       - name: Build
         run: cargo build --locked --release --bin swarm
+      - name: Commit initial formatting and lockfile once
+        if: success() && matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          # Bootstrap only. The read-only final workflow replaces this step.
+          # Refuse to publish on top of an independently advanced main.
+          test "$(git ls-remote origin refs/heads/main | cut -f1)" = "$GITHUB_SHA"
+          git add -- src Cargo.lock
+          if ! git diff --cached --quiet; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git switch -C main
+            git commit -m 'build: lock dependencies and format initial Rust implementation'
+            git push origin HEAD:refs/heads/main
+          fi
       - name: Record exact build inputs
         if: always()
         shell: bash
         run: |
           mkdir -p build-info
           git diff -- src > build-info/rustfmt.patch
-          printf '%s\n' "$GITHUB_SHA" > build-info/source-commit.txt
+          git rev-parse HEAD > build-info/source-commit.txt
           rustc --version > build-info/rustc.txt
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()

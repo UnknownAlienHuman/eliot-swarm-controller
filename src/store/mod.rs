@@ -27,7 +27,6 @@ impl StoreOwner {
                 }
                 Err(e) => { let _ = ready_tx.send(Err(e)); }
             }
-            // DB is closed before _lock drops, including while shutting down.
         })?;
         ready_rx.await.map_err(|_| Error::new("STORE_CLOSED", "initialization thread ended"))??;
         Ok(Self { thread, store: Store { tx, config } })
@@ -124,8 +123,14 @@ fn is_read(method: &str) -> bool {
     matches!(method,"host.status"|"task.get"|"task.list"|"attempt.get"|"operation.get"|"operation.list"|"agent.state"|"agent.list"|"route.list"|"report.delta"|"message.read"|"client.list")
 }
 fn page(params: &Value) -> Result<(i64,i64)> {
-    let limit = params.get("limit").and_then(Value::as_i64).unwrap_or(50);
-    let after = params.get("after").and_then(Value::as_i64).unwrap_or(0);
+    let integer = |name, default| -> Result<i64> {
+        match params.get(name) {
+            None => Ok(default),
+            Some(value) => value.as_i64().ok_or_else(|| Error::invalid(format!("{name} must be an integer"))),
+        }
+    };
+    let limit = integer("limit", 50)?;
+    let after = integer("after", 0)?;
     if !(1..=200).contains(&limit) || after < 0 { return Err(Error::invalid("limit must be 1..200 and after nonnegative")); }
     Ok((limit,after))
 }
@@ -186,6 +191,7 @@ fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config
 }
 
 fn mutate(db: &mut Connection, p: &Principal, method: &str, v: &Value, config: &Config) -> Result<Value> {
+    model::validate_mutation(method, v)?;
     let request_id=model::text(v,"client_request_id")?;
     let original=model::canonical(v)?;
     let tx=db.transaction_with_behavior(TransactionBehavior::Immediate)?;

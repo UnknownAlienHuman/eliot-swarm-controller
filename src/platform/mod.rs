@@ -1,5 +1,5 @@
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use crate::error::{Error, Result};
 use crate::model::{Credential, new_id};
@@ -12,9 +12,28 @@ impl DataRoot {
     pub fn acquire(path: &Path) -> Result<Self> {
         std::fs::create_dir_all(path)?;
         let path = std::fs::canonicalize(path)?;
-        private_permissions(&path, true)?;
-        let lock = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path.join("host.lock"))?;
+        let empty = std::fs::read_dir(&path)?.next().transpose()?.is_none();
+        let lock_path = path.join("host.lock");
+        // Never chmod/re-ACL an arbitrary existing folder because a caller mistyped
+        // --data-dir. The marker is coordination, not a malicious-user boundary.
+        if !empty && !lock_path.is_file() {
+            return Err(Error::new("FOREIGN_STATE_DIRECTORY", "choose an empty directory or an existing Swarm state directory"));
+        }
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).truncate(false);
+        if empty { options.create(true); }
+        let mut lock = options.open(&lock_path)?;
         lock.try_lock().map_err(|e| Error::new("HOST_ALREADY_RUNNING", e.to_string()))?;
+        let mut marker = String::new();
+        (&mut lock).take(128).read_to_string(&mut marker)?;
+        const MARKER: &str = "ELIOT_SWARM_STATE_V1\n";
+        if marker.is_empty() && empty {
+            lock.write_all(MARKER.as_bytes())?;
+            lock.sync_all()?;
+        } else if marker != MARKER {
+            return Err(Error::new("FOREIGN_STATE_DIRECTORY", "host.lock is not this prototype's ownership marker"));
+        }
+        private_permissions(&path, true)?;
         Ok(Self { path, lock })
     }
 }
