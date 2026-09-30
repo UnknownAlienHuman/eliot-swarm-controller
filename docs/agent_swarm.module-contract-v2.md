@@ -186,7 +186,7 @@ open admitted
 
 ## 13. Источники и область проверки
 
-Внутренние правила выше — проектные решения этого прохода. Native mappings — ранее сохранённый [аудит семи harness](agent_swarm.runtime-contract-audit-v16-20260929.md), не новый blanket-вердикт об их версиях. Входные наблюдения — [brief](MANAGER-BRIEF.md) и [harness intake](agent_swarm.harness-intake-20260929.md).
+Внутренние правила выше — проектные решения этого прохода. Native mappings — ранее сохранённый [аудит семи harness](runtime-notes.md), не новый blanket-вердикт об их версиях. Входные наблюдения — [lessons](lessons-learned.md) и [candidate notes](candidate-notes.md) с ссылками на исходники в Git history.
 
 Внешние технические источники прочитаны 29.09.2026; это не версии библиотек установленного прототипа:
 
@@ -202,4 +202,4 @@ open admitted
 
 Повторная проверка всех vendor docs, сборка доноров, Windows execution, платные пробы и нагрузка не выполнялись. Пример устранённой alias-коллизии относится к reference DDL, не к уже существовавшему Rust-сервису.
 
-[T6] Уточнения v18 относятся к собственному протоколу и reference-схеме: [review](agent_swarm.design-review-v18-20260929.md), [plan-v6](agent_swarm.implementation-v6.md). Native mappings и donor pins не переаттестованы.
+[T6] Уточнения v18 относятся к собственному протоколу и reference-схеме: [сохранённые контрпримеры](lessons-learned.md#3-исправленные-ошибки-собственной-спецификации), [plan-v6](agent_swarm.implementation-v6.md). Native mappings и donor pins не переаттестованы.

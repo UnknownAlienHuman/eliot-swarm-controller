@@ -29,9 +29,10 @@ RETURNING не разрешает native-send до COMMIT.
 Остальные сохранённые примеры v17 иллюстрируют собственный протокол, не команды vendor API.
 TOML остаются disabled-шаблонами, runtime capabilities не объявлены квалифицированными.
 
-[Validation](validation-results.json) разделяет SQL fixtures, последовательные модели и синтаксическую проверку документов.
-Полнота native family, реальные Windows Jobs, многопоточность Rust/SDK и модельное исполнение здесь не проверялись.
+## Граница прежней проверки
+
+[Validation 29.09.2026 в истории](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/b5a437f57488f8ddcdcc3f4aaea24746a3ea1f62/docs/agent_swarm.spec-v18/validation-results.json) разделяет SQL fixtures, последовательные модели и синтаксическую проверку документов исходного комплекта. Python SQLite 3.46.1, in-memory/single connection — не рабочий WAL-профиль. Отчёт не является результатом проверки текущей реализации; Rust-приложение ещё не написано. Полнота native family, Windows Jobs, многопоточность Rust/SDK и модельное исполнение не квалифицированы. Текущие SQL/JSON/TOML-артефакты при чистке 30.09.2026 сохранены без изменения; старые scripts/fixtures доступны в Git history.
 
 [Архитектура](../agent_swarm.md) · [план v6](../agent_swarm.implementation-v6.md) ·
-[контракт v2](../agent_swarm.module-contract-v2.md) · [review](../agent_swarm.design-review-v18-20260929.md) ·
-[checkpoint](../agent_swarm.checkpoint.md).
+[контракт v2](../agent_swarm.module-contract-v2.md) · [выводы](../lessons-learned.md#3-исправленные-ошибки-собственной-спецификации) ·
+[статус](../../README.md).

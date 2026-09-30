@@ -1,36 +1,36 @@
 # Eliot Swarm Controller
 
-Headless, modular Rust controller for native coding-agent harnesses, developed as a prototype for the Agent Execution Fabric in Eliot Memory OS.
+Headless modular Rust controller for native coding-agent harnesses; a prototype for the Agent Execution Fabric in Eliot Memory OS.
 
-**Status:** design and reference specifications only. The Rust service, SDK bridges and Windows runtime have not been implemented or qualified. The reference SQL is not a completed Store implementation.
+**Status:** documentation and reference specifications only. Rust service, SDK bridges and Windows runtime are not implemented or qualified. Reference SQL is not a completed Store.
 
-## Start here
+## Implementation entry points
 
-| Document | Purpose |
+| Document | Read for |
 | --- | --- |
-| [Architecture v18](docs/agent_swarm.md) | Responsibilities, execution model and current design decisions |
-| [Implementation plan v6](docs/agent_swarm.implementation-v6.md) | C01–C11 implementation sequence and transactional boundaries |
-| [Module contract v2](docs/agent_swarm.module-contract-v2.md) | Native adapters, capabilities, delivery and lifecycle semantics |
-| [Reference specification](docs/agent_swarm.spec-v18/README.md) | Initial SQL, configuration examples and protocol examples |
-| [Donor inventory](docs/agent_swarm.donors-20260929.toml) | Pinned candidate SDKs and reusable components; not an installation lockfile |
-| [Design review v18](docs/agent_swarm.design-review-v18-20260929.md) | Recorded counterexamples and design corrections |
+| [Architecture v18](docs/agent_swarm.md) | Responsibilities, execution and current design |
+| [Implementation plan v6](docs/agent_swarm.implementation-v6.md) | C01–C11, files and transactional boundaries |
+| [Module contract v2](docs/agent_swarm.module-contract-v2.md) | Adapter capabilities, delivery and lifecycle |
+| [Reference specification](docs/agent_swarm.spec-v18/README.md) | Current SQL, configuration and protocol examples |
+| [Donor inventory](docs/agent_swarm.donors-20260929.toml) | Source candidates and pins; not an installation lockfile |
 
-The documents above are the current implementation entry points. Other files under `docs/` preserve research and comparison evidence; historical briefs and older snapshots are not additional instructions for workers.
+Read the relevant section, not every document on each task. Work on `main`, without worktrees. Implement complete paths first, then focused formatting/Clippy. Broad runtime and load qualification follows a working slice.
 
-## Scope
+**Next:** C01 — `model/config/store`; C02 — `host/CLI/IPC`; then Muse Code Max and direct OpenCode V2. One Rust host, one SQLite, local IPC; native harnesses retain their model loops and subscription routes. General Manager uses MCP; managers use CLI and native subagents. No UI or external broker.
 
-One Rust host, one SQLite database, local IPC and replaceable native runtime modules. General Manager controls work through MCP; managers use the CLI and their harness's native subagents. No user interface, external message broker or replacement model loop.
+## Reference, not additional worker instructions
 
-Initial runtime targets are native Muse Code Max and direct OpenCode V2 HTTP. Codex, Claude Code, Command Code, Antigravity and Zed remain separate integrations with explicitly qualified capabilities.
+| Document | Content |
+| --- | --- |
+| [Lessons learned](docs/lessons-learned.md) | Operational failures, corrected design mistakes and retained evidence |
+| [Runtime notes](docs/runtime-notes.md) | Essential differences between the seven selected harnesses |
+| [Candidate notes](docs/candidate-notes.md) | Reusable ideas and limitations of optional alternatives |
+| [Runtime matrix](docs/agent_swarm.runtime-matrix-v16.json) / [sources](docs/agent_swarm.runtime-sources-v16.json) | Dated, machine-readable research; not live qualification |
 
-## Development
+## Documentation history
 
-Work on `main`, without worktrees. Implement complete paths first and run focused formatting/Clippy checks once Rust code exists. Broad runtime and load qualification follows the working slice.
+On 2026-09-30, useful findings were distilled from old briefs, research and reviews. Superseded snapshots, version patches, package metadata and duplicate reports were removed from the current tree. Design v18, implementation v6, module contract v2 and current SQL/examples are unchanged in substance.
 
-**Next implementation package:** C01 — `model/config/store`, followed by C02 — `host/CLI/IPC`. Do not mark these complete based on the presence of SQL or example payloads.
+Originals remain at commit `b5a437f57488f8ddcdcc3f4aaea24746a3ea1f62` and can be read with `git show <commit>:docs/<old-path>`. [The extraction map](docs/lessons-learned.md#4-что-удалено-и-где-осталось-существенное) points to retained conclusions. Git history was not rewritten; deleting current files does not erase previously published content from history.
 
-No donor code has been vendored, no CLI credentials or local runtime configuration are installed, and no agents are launched by this repository bootstrap.
-
-## Provenance
-
-Documentation imported from the supplied `agent_swarm.docs-v18-20260929.zip` on 2026-09-29. The supplied documentation and reference files are retained under `docs/`; Git normalizes text line endings according to `.gitattributes`. Local Windows paths appearing in historical briefs are source observations, not install defaults.
+No donor code has been vendored, credentials installed, native agents launched or runtime tests completed by this documentation cleanup. Local paths and permissions from historical briefs are not install defaults.

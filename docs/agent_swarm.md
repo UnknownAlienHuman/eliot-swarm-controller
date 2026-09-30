@@ -4,9 +4,9 @@
 
 Headless Rust-контроллер над родными executors. Назначение — устойчиво обслуживать реальный рой, а проверенные модули и результаты перенести в Eliot Memory OS. Не новый model harness и не универсальная агентная платформа.
 
-**Действующий комплект:** эта архитектура → [контракт модулей](agent_swarm.module-contract-v2.md) → [план реализации v6](agent_swarm.implementation-v6.md) → [reference DDL/примеры](agent_swarm.spec-v18/README.md). [Checkpoint](agent_swarm.checkpoint.md) фиксирует фактическую готовность. [Результаты v18](agent_swarm.design-review-v18-20260929.md) — журнал проверки, не дополнительные правила для workers.
+**Действующий комплект:** эта архитектура → [контракт модулей](agent_swarm.module-contract-v2.md) → [план реализации v6](agent_swarm.implementation-v6.md) → [reference DDL/примеры](agent_swarm.spec-v18/README.md). [README](../README.md) фиксирует фактическую готовность. [Выводы прежних проверок](lessons-learned.md) — адресная справка, не дополнительные правила для workers.
 
-Native факты из [v16](agent_swarm.runtime-contract-audit-v16-20260929.md) сохраняются с прежними источниками и границами. Последнее исследование harness принято как [отдельный источник идей](agent_swarm.harness-intake-20260929.md); его GUI/phone/лимиты не переопределяют наши требования.
+Native факты сохранены в [runtime notes](runtime-notes.md) с прежними источниками и границами. [Candidate notes](candidate-notes.md) сохраняют идеи исследования harness; его GUI/phone/лимиты не переопределяют наши требования. Редакционная чистка 30.09.2026 не меняет архитектурные решения v18.
 
 ## 1. Что делает систему универсальной
 
@@ -179,7 +179,7 @@ route → module artifact + native entrypoint + account/billing
 | agy | Собственный warm sequential stream | Claude control messages и TUI slash input совместимы |
 | Zed | Отдельный native eval-cli batch | Persistent control API Delta/editor автоматически доступен |
 
-Точные facts и sources — [аудит v16](agent_swarm.runtime-contract-audit-v16-20260929.md), не новая runtime-квалификация [S23]. Для Codex shared transport берётся готовая WS-библиотека внутри bridge, не собственный RFC 6455 и не ещё один server. Owned JSONL остаётся другим профилем.
+Точные facts и sources — [runtime notes](runtime-notes.md), не новая runtime-квалификация [S23]. Для Codex shared transport берётся готовая WS-библиотека внутри bridge, не собственный RFC 6455 и не ещё один server. Owned JSONL остаётся другим профилем.
 
 ## 10. Goal, общение и General Manager
 
@@ -292,7 +292,7 @@ Core не меняется ради очередного native метода. Л
 ## Источники и проверенная область
 
 
-[S1] Ранее изученные `MANAGER-BRIEF(1).md`, `eliot-swarm-control-20260929-2.zip`; исторические операционные случаи не являются кодом новых скриптов. Новый источник и актуализация — S17.
+[S1] [Прежний brief](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/b5a437f57488f8ddcdcc3f4aaea24746a3ea1f62/docs/MANAGER-BRIEF(1).md) и ранее изученный control bundle; исторические случаи сведены в [lessons](lessons-learned.md). Новые скрипты в этой чистке не проверялись. Поздний deployment — S17.
 
 [S2] Muse SDK snapshot `a7c10c5d…`: [public exports](https://github.com/meta-models/muse-code-sdk/blob/a7c10c5dd3f66be412077d29f9d11111af70317b/clients/sdk-ts/src/index.ts), [facade client](https://github.com/meta-models/muse-code-sdk/blob/a7c10c5dd3f66be412077d29f9d11111af70317b/clients/sdk-ts/src/facade/client.ts), [Connection и retries](https://github.com/meta-models/muse-code-sdk/blob/a7c10c5dd3f66be412077d29f9d11111af70317b/clients/sdk-ts/src/connection/connection.ts), [workspace metadata](https://github.com/meta-models/muse-code-sdk/blob/a7c10c5dd3f66be412077d29f9d11111af70317b/package.json).
 
@@ -324,7 +324,7 @@ Core не меняется ради очередного native метода. Л
 
 [S16] [SQLite Backup API](https://www.sqlite.org/backup.html), [foreign_keys вне транзакции](https://www.sqlite.org/foreignkeys.html).
 
-[S17] Новый [MANAGER-BRIEF.md](MANAGER-BRIEF.md), 795 физических строк (индекс Files: 796 с завершающей пустой строкой), snapshot SHA-256 `bd9192cdfcc5b9e1810effac315e0b377ac8b593042cf656032b8be9b9e32600`. Последние события — 29.09 до 15:33 по журналу автора; timezone в журнале не уточнялась. Это report Claude, не наша live-проба. Координаты и границы — [review v15](agent_swarm.brief-review-v15-20260929.md).
+[S17] [Brief в истории](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/b5a437f57488f8ddcdcc3f4aaea24746a3ea1f62/docs/MANAGER-BRIEF.md): последние события — 29.09 до 15:33 по журналу автора, timezone не уточнялась. Это report Claude, не наша live-проба. Сводка: [lessons](lessons-learned.md), [runtime notes](runtime-notes.md); [прежний разбор](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/b5a437f57488f8ddcdcc3f4aaea24746a3ea1f62/docs/agent_swarm.brief-review-v15-20260929.md).
 
 [S18] [Cargo metadata](https://doc.rust-lang.org/cargo/commands/cargo-metadata.html): resolve=null при --no-deps, declarations и target/features.
 
@@ -336,12 +336,12 @@ Core не меняется ради очередного native метода. Л
 
 [S22] [gh pr merge](https://cli.github.com/manual/gh_pr_merge), [git push](https://git-scm.com/docs/git-push): exact head и exact expected-ref; не атомарность всех GitHub metadata.
 
-[S23] [Контракты семи harness](agent_swarm.runtime-contract-audit-v16-20260929.md), [источники](agent_swarm.runtime-sources-v16.json), [матрица](agent_swarm.runtime-matrix-v16.json). Проверка предыдущего прохода; её native-факты в этом проходе повторно не квалифицированы.
+[S23] [Контракты семи harness](runtime-notes.md), [источники](agent_swarm.runtime-sources-v16.json), [матрица](agent_swarm.runtime-matrix-v16.json). Проверка предыдущего прохода; её native-факты в этом проходе повторно не квалифицированы.
 
 [S24] [Контракт модулей v2](agent_swarm.module-contract-v2.md) и его T1–T5: Tokio channels, spawn_blocking, missed ticks, Cargo overrides, SQLite partial indexes. Технические источники перечитаны 29.09.2026.
 
-[S25] [Входное исследование harness](Harness_and_OpenCode_Go_master_2026-09-29_rev5.md) и [его intake](agent_swarm.harness-intake-20260929.md). Источник идей, не приказ перевести рой на один harness или принять чужие лимиты.
+[S25] [Сохранённые идеи и кандидаты](candidate-notes.md) с ссылками на исходное исследование в Git history. Не приказ перевести рой на один harness или принять чужие лимиты.
 
-**Область v18:** перепроверены собственные границы v17 и reference DDL на контрпримерах. Новых vendor installs/builds, Windows/IPC-проб, model calls, GitHub-изменений и load benchmark не было. Старые source pins сохранены. Проверка артефактов описана в [validation](agent_swarm.spec-v18/validation-results.json), не является проверкой работающего сервиса.
+**Область v18:** перепроверены собственные границы v17 и reference DDL на контрпримерах. Новых vendor installs/builds, Windows/IPC-проб, model calls, GitHub-изменений и load benchmark не было. Старые source pins сохранены. Проверка артефактов описана в [границе проверки](agent_swarm.spec-v18/README.md#граница-прежней-проверки), не является проверкой работающего сервиса.
 
-[S26] Технические основания v18, прочитано 29.09.2026: [GitHub object identity](https://docs.github.com/en/graphql/guides/using-global-node-ids), [SQLite partial indexes](https://www.sqlite.org/partialindex.html), [RETURNING не commit](https://www.sqlite.org/lang_returning.html), [FK](https://www.sqlite.org/foreignkeys.html), [Microsoft Jobs](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects). Конкретные новые дефекты и отличия от уже покрытых случаев — [review v18](agent_swarm.design-review-v18-20260929.md).
+[S26] Технические основания v18, прочитано 29.09.2026: [GitHub object identity](https://docs.github.com/en/graphql/guides/using-global-node-ids), [SQLite partial indexes](https://www.sqlite.org/partialindex.html), [RETURNING не commit](https://www.sqlite.org/lang_returning.html), [FK](https://www.sqlite.org/foreignkeys.html), [Microsoft Jobs](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects). Конкретные новые дефекты и отличия от уже покрытых случаев — [сохранённые контрпримеры](lessons-learned.md#3-исправленные-ошибки-собственной-спецификации).

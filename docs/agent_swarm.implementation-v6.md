@@ -2,7 +2,7 @@
 
 **29.09.2026. Проект контрактов и последовательности работ. Rust-сервис ещё не реализован.**
 
-Заменяет implementation-v5 как действующий план. Входная v17 сохранена в review-v18/source-v17. [Контракт модулей](agent_swarm.module-contract-v2.md) — общая граница adapters; vendor mappings из v16 сохраняются. [Reference v18](agent_swarm.spec-v18/README.md) уточняет initial SQL: origin, canonical dispatch и resource release; [проверка всех семи native-контрактов](agent_swarm.runtime-contract-audit-v16-20260929.md) уточняет mappings. [Brief](MANAGER-BRIEF.md) остаётся источником reported deployment, не заменяет документацию vendor.
+Заменяет implementation-v5 как действующий план. Входная v17 доступна в [истории](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/b5a437f57488f8ddcdcc3f4aaea24746a3ea1f62/docs/review-v18/source-v17/agent_swarm.md). [Контракт модулей](agent_swarm.module-contract-v2.md) — общая граница adapters; vendor mappings из v16 сохраняются. [Reference v18](agent_swarm.spec-v18/README.md) уточняет initial SQL: origin, canonical dispatch и resource release; [сводка семи native-контрактов](runtime-notes.md) уточняет mappings. Наблюдения deployment сведены в [runtime notes](runtime-notes.md) и не заменяют документацию vendor.
 
 ## 1. Решения не открываем заново
 
@@ -264,7 +264,7 @@ Backup — SQLite backup API, не копия одного живого `.db` б
 
 ## 11. Конкретные обязанности семи runtime-модулей
 
-Норматив этой редакции — [аудит контрактов](agent_swarm.runtime-contract-audit-v16-20260929.md) и его sources. Это список нужных adapter mappings, не обязательный обход всех функций каждого CLI при старте. Scope C01–C06 и девять таблиц остаются прежними.
+Выбранные native mappings сведены в [runtime notes](runtime-notes.md) и [реестре источников](agent_swarm.runtime-sources-v16.json). Это список нужных adapter mappings, не обязательный обход всех функций каждого CLI при старте. Scope C01–C06 и девять таблиц остаются прежними.
 
 | Срез / файл | Что написать | Проверка именно этой границы |
 |---|---|---|
@@ -374,11 +374,11 @@ sccache override. Проверяется конкретный модуль пр�
 
 v18 проверяет собственные v17/plan-v5/module-v1 и конкретные reference SQL-сценарии. Не повторный общий поиск vendor-платформ. В DDL по-прежнему девять таблиц; добавлены origin_key, start_operation_id, resource claim/release. Runtime migrations отсутствуют: это изменение initial reference ещё не реализованного продукта.
 
-SQL и небольшие последовательные модели проверены отдельно; их результаты не являются тестами многопоточного Rust-host, Windows Job, native SDK или API провайдера. Нет установки доноров, модельных вызовов, изменений GitHub/текущего роя. Пины сохранены. [Review v18](agent_swarm.design-review-v18-20260929.md) содержит конкретные исходные места и воспроизведения.
+SQL и небольшие последовательные модели проверены отдельно; их результаты не являются тестами многопоточного Rust-host, Windows Job, native SDK или API провайдера. Нет установки доноров, модельных вызовов, изменений GitHub/текущего роя. Пины сохранены. [Сохранённые контрпримеры](lessons-learned.md#3-исправленные-ошибки-собственной-спецификации) ссылаются на исходные воспроизведения в Git history. Редакционная чистка 30.09.2026 не меняет этот план v6.
 
 ## Источники
 
-Исторические основания и координаты brief: [review v15](agent_swarm.brief-review-v15-20260929.md), W1–W10.
+Исторические основания и координаты brief: [review v15 в истории](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/b5a437f57488f8ddcdcc3f4aaea24746a3ea1f62/docs/agent_swarm.brief-review-v15-20260929.md), W1–W10; [сводка lessons](lessons-learned.md).
 Сохраняемые технические основания:
 
 [N1] Tokio AsyncBufReadExt: https://docs.rs/tokio/latest/tokio/io/trait.AsyncBufReadExt.html
@@ -398,8 +398,8 @@ SQL и небольшие последовательные модели пров
 Ссылки — источники контрактов, не подтверждение installed versions и не обязательное чтение всех
 материалов каждым агентом. Scope C01–C06 не расширен новой платформой; уточнены уже требуемые методы.
 
-[N8] [Контрактный аудит семи harness](agent_swarm.runtime-contract-audit-v16-20260929.md), [реестр](agent_swarm.runtime-sources-v16.json), [матрица](agent_swarm.runtime-matrix-v16.json). Новые версии UI/docs не объявляются свойствами установленного CLI.
+[N8] [Контрактный аудит семи harness](runtime-notes.md), [реестр](agent_swarm.runtime-sources-v16.json), [матрица](agent_swarm.runtime-matrix-v16.json). Новые версии UI/docs не объявляются свойствами установленного CLI.
 
-[N9] [Контракт модулей v2](agent_swarm.module-contract-v2.md), technical sources T1–T5 и [проверка v18](agent_swarm.design-review-v18-20260929.md).
+[N9] [Контракт модулей v2](agent_swarm.module-contract-v2.md), technical sources T1–T5 и [выводы v18](lessons-learned.md#3-исправленные-ошибки-собственной-спецификации).
 
 [N10] Проверенные технические основания v18: [SQLite RETURNING](https://www.sqlite.org/lang_returning.html) — строка результата ещё не commit; [Windows Jobs](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects) — process group, accounting и ограничения notifications; [SQLite FK](https://www.sqlite.org/foreignkeys.html) — отношения только объявленных columns; [GitHub node identities](https://docs.github.com/en/graphql/guides/using-global-node-ids) — object lookup, не display names. Прочитано 29.09.2026.
