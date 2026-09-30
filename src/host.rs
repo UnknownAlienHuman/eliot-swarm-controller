@@ -1,21 +1,30 @@
+use crate::{
+    config::Config,
+    error::Result,
+    ipc,
+    platform::{DataRoot, bootstrap_credential},
+    store::StoreOwner,
+};
 use std::sync::Arc;
-use tokio::{sync::{Semaphore,watch},task::JoinSet};
-use crate::{config::Config,error::Result,ipc,platform::{DataRoot,bootstrap_credential},store::StoreOwner};
+use tokio::{
+    sync::{Semaphore, watch},
+    task::JoinSet,
+};
 
-pub async fn run(config:Config)->Result<()> {
-    let root=DataRoot::acquire(&config.storage.data_dir)?;
-    let credential=bootstrap_credential(&root.path)?;
-    let root_path=root.path.clone();
-    let config=Arc::new(config);
-    let owner=StoreOwner::start(root,config.clone(),credential).await?;
-    let ipc_config=Arc::new(config.ipc.clone());
-    let mut listener=ipc::Listener::bind(&root_path)?;
-    let (shutdown,stopping)=watch::channel(false);
-    let semaphore=Arc::new(Semaphore::new(config.ipc.max_connections));
-    let mut connections=JoinSet::new();
-    eprintln!("swarm host ready: {}",listener.endpoint());
-    let exit=loop{
-        tokio::select!{
+pub async fn run(config: Config) -> Result<()> {
+    let root = DataRoot::acquire(&config.storage.data_dir)?;
+    let credential = bootstrap_credential(&root.path)?;
+    let root_path = root.path.clone();
+    let config = Arc::new(config);
+    let owner = StoreOwner::start(root, config.clone(), credential).await?;
+    let ipc_config = Arc::new(config.ipc.clone());
+    let mut listener = ipc::Listener::bind(&root_path)?;
+    let (shutdown, stopping) = watch::channel(false);
+    let semaphore = Arc::new(Semaphore::new(config.ipc.max_connections));
+    let mut connections = JoinSet::new();
+    eprintln!("swarm host ready: {}", listener.endpoint());
+    let exit = loop {
+        tokio::select! {
             signal=tokio::signal::ctrl_c()=>break signal.map_err(Into::into),
             Some(result)=connections.join_next(),if !connections.is_empty()=>{
                 if let Err(e)=result{eprintln!("IPC worker ended: {e}");}
@@ -32,8 +41,8 @@ pub async fn run(config:Config)->Result<()> {
         }
     };
     drop(listener);
-    let _=shutdown.send(true);
-    while connections.join_next().await.is_some(){}
+    let _ = shutdown.send(true);
+    while connections.join_next().await.is_some() {}
     owner.close().await?;
     exit
 }
