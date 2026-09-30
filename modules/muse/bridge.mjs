@@ -86,7 +86,7 @@ function onNotification(n) {
       }
     } else latest.gaps++;
   }
-  if (n.method === 'session/goalChanged') latest.goal = p.goal ?? null;
+  if (n.method === 'session/goalChanged' && p.sessionId === rootId) latest.goal = p.goal ?? null;
   if (n.method === 'session/reasoningEffortChanged' && p.sessionId === rootId) latest.reasoning_effort = p.reasoningEffort;
   if (n.method === 'usage/changed') latest.usage = { basis:'native_snapshot', value:p };
   if (n.method === 'session/modelChanged' && p.sessionId === rootId) latest.model = { modelId:p.modelId,providerId:p.providerId };
@@ -122,11 +122,17 @@ async function startNative(command) {
     onStderr:()=>{latest.stderr_chunks=(latest.stderr_chunks??0)+1;}});
   handshake.onNotification(onNotification);
   handshake.onProtocolError(()=>{latest.gaps++;latest.protocol_error=true;changed();});
-  handshake.onServerRequest(request=>new Promise((resolve,reject)=>{
-    const key=JSON.stringify(request.id);
-    pendingRequests.set(key,{resolve,reject,view:{request_id:request.id,method:request.method,params:request.params}});
-    changed();
-  }));
+  handshake.onServerRequest(request=>{
+    // MSP RequestReceipt is {}, not an approval decision. Retain the question
+    // for GM and acknowledge presentation immediately; commands carry answers.
+    if(!['approval/request','userInput/request'].includes(request.method)) {
+      throw new MspError({code:-32601,message:'Unsupported server request',data:{kind:'methodNotFound'}});
+    }
+    const p=request.params ?? {};
+    const key=p.approvalId?`approval:${required(p,'approvalId')}`:`input:${required(p,'userInputId')}`;
+    pendingRequests.set(key,{view:{method:request.method,params:p}}); changed();
+    return {};
+  });
   handshake.exited.then(exit=>{nativeReady=false;latest.execution='native_exited';latest.exit=exit;changed();},()=>{nativeReady=false;latest.execution='native_failed';changed();});
   msp=await handshake.initialize({clientInfo:{name:'eliot-swarm-controller',version:'0.1.0'}});
   const init=msp.initializeResult;
@@ -150,9 +156,10 @@ async function startNative(command) {
 async function execute(command) {
   const id=commandId(command);
   const base={operation_id:command.operation_id};
+  let nativeAdmissionPossible=false;
   try {
     let result;
-    if (command.method==='agent.open') result=await startNative(command);
+    if (command.method==='agent.open') { nativeAdmissionPossible=true;result=await startNative(command); }
     else {
       if (!msp || command.native_root_id!==rootId) throw new Error('NATIVE_IDENTITY_MISMATCH');
       const p=command.input;
@@ -163,31 +170,26 @@ async function execute(command) {
         const input={sessionId:rootId,input:[{type:'text',text:required(p,'text')}],reasoningEffort:routeDefaults.reasoningEffort};
         if(command.method === 'task.dispatch') input.input.unshift({type:'text',text:'Task specification: '+JSON.stringify(p.task_snapshot)});
         if(steer)input.expectedTurnId=required(p,'expected_turn_id');else input.ifBusy='queue';
+        nativeAdmissionPossible=true;
         const r=await msp.connection.command(steer?'turn/steer':'turn/start',input,{maxAttempts:1,commandId:id});
         if(r.status!=='accepted')throw new Error('UNEXPECTED_ADMISSION_STATUS');
         result={turn_id:required(r,'turnId'),details:{native_ack:r,completion_condition:'native_input_admitted',requested_reasoning_effort:routeDefaults.reasoningEffort}};
       } else if(command.method==='agent.reply') {
         const r=p.reply;
-        if(Object.hasOwn(r,'request_id')){
-          const key=JSON.stringify(r.request_id), pending=pendingRequests.get(key);
-          if(!pending?.resolve || !r.response || typeof r.response!=='object' || Array.isArray(r.response))throw new Error('STALE_OR_INVALID_NATIVE_REQUEST');
-          pending.resolve(r.response); pendingRequests.delete(key); changed();
-          result={details:{completion_condition:'server_response_submitted',request_id:r.request_id}};
-        } else {
-          const method=required(r,'method');
-          if(!['approval/decide','userInput/answer','userInput/cancel','userInput/clarify'].includes(method))throw new Error('UNSUPPORTED_REPLY_METHOD');
-          const params=r.params;
-          if(!params || typeof params!=='object' || !(params.sessionId===rootId || children.has(params.sessionId)))throw new Error('REPLY_OUTSIDE_OBSERVED_FAMILY');
-          const ack=await msp.connection.command(method,params,{maxAttempts:1,commandId:id});
-          result={details:{native_ack:ack,completion_condition:'native_reply_admitted'}};
-        }
+        const method=required(r,'method');
+        if(!['approval/decide','userInput/answer','userInput/cancel','userInput/clarify'].includes(method))throw new Error('UNSUPPORTED_REPLY_METHOD');
+        const params=r.params;
+        if(!params || typeof params!=='object' || !(params.sessionId===rootId || children.has(params.sessionId)))throw new Error('REPLY_OUTSIDE_OBSERVED_FAMILY');
+        nativeAdmissionPossible=true;
+        const ack=await msp.connection.command(method,params,{maxAttempts:1,commandId:id});
+        result={details:{native_ack:ack,completion_condition:'native_reply_admitted'}};
       } else throw new Error('UNSUPPORTED_OPERATION');
       result.native_root_id=rootId;result.native_scope_key=nativeScope;
     }
     outcomes.set(command.operation_id,{...base,outcome:'applied',...result});
   } catch(error) {
     // Only protocol rejection proves non-admission. Transport/parsing/spawn failures may have effects.
-    const rejected=error instanceof MspError && ['invalidParams','commandRejected','overloaded','backpressured'].includes(error.kind);
+    const rejected=!nativeAdmissionPossible || error instanceof MspError && ['invalidParams','commandRejected','overloaded','backpressured'].includes(error.kind);
     const outcome={...base,outcome:rejected?'rejected':'unknown',details:{error_type:error.name,native_kind:error instanceof MspError?error.kind:null,native_code:error instanceof MspError?error.code:null,diagnostic_code:error instanceof MspError?'NATIVE_ERROR':String(error.message).slice(0,120)}};
     if(rootId){outcome.native_root_id=rootId;outcome.native_scope_key=nativeScope;}
     outcomes.set(command.operation_id,outcome);
