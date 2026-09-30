@@ -229,6 +229,7 @@ pub fn response(id: Value, result: Result<Value>) -> Value {
 /// particular, an accidental client.hello/token must never become a receipt.
 pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
     let allowed: &[&str] = match method {
+        "artifact.assemble" => &["client_request_id", "page_refs", "expected_sha256"],
         "task.create" => &["client_request_id", "project_id", "origin_key", "spec"],
         "task.revise" => &["client_request_id", "task_id", "expected_revision", "spec"],
         "task.claim" => &[
@@ -312,6 +313,10 @@ pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
     if matches!(method, "task.create" | "task.revise") {
         let spec: TaskSpec = serde_json::from_value(params["spec"].clone())?;
         spec.validate()?;
+    }
+    if method == "artifact.assemble" {
+        let request: crate::artifacts::AssemblyRequest = serde_json::from_value(params.clone())?;
+        request.validate()?;
     }
     if method == "agent.result" {
         positive(params, "generation")?;

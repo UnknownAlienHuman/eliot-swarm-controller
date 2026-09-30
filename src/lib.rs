@@ -2,6 +2,7 @@
 pub mod artifacts;
 pub mod config;
 pub mod error;
+pub mod export;
 pub mod host;
 pub mod ipc;
 pub mod model;

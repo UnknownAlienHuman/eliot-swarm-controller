@@ -1,4 +1,5 @@
 //! A single database owner. The async facade never holds a SQLite connection.
+mod assembly;
 mod operations;
 mod producers;
 mod results;
@@ -115,6 +116,9 @@ impl Store {
         if method == "module.result" {
             return self.persist_result(principal, params).await;
         }
+        if method == "artifact.assemble" {
+            return self.assemble_artifact(principal, params).await;
+        }
         if method == "artifact.read" {
             return self.read_artifact(principal, params).await;
         }
@@ -226,6 +230,40 @@ impl Store {
             .await?;
         self.changed.send_modify(|n| *n = n.wrapping_add(1));
         Ok(result)
+    }
+    async fn assemble_artifact(&self, principal: Principal, params: Value) -> Result<Value> {
+        let p = principal.clone();
+        let config = self.config.clone();
+        let receipt = self
+            .run(move |db| {
+                let p = current_principal(db, p)?;
+                if !matches!(p.role, Role::Operator | Role::Manager) {
+                    return Err(Error::new(
+                        "FORBIDDEN",
+                        "assembly requires a manager or operator",
+                    ));
+                }
+                mutate(db, &p, "artifact.assemble", &params, &config)
+            })
+            .await?;
+        let id = model::text(&receipt, "operation_id")?.to_string();
+        let start_id = id.clone();
+        if let Some((request, pages)) = self
+            .run(move |db| assembly::begin(db, principal, &start_id))
+            .await?
+        {
+            let file_id = id.clone();
+            let outcome = self
+                .file_io(move |files| {
+                    files.assemble(&file_id, &pages, request.expected_sha256.as_deref())
+                })
+                .await;
+            self.run(move |db| assembly::finish(db, &id, outcome))
+                .await?;
+        }
+        // Always return the same admission receipt, including after reconnect.
+        // operation.get provides the current file-processing result.
+        Ok(receipt)
     }
     async fn read_artifact(&self, principal: Principal, params: Value) -> Result<Value> {
         model::fields(&params, &["artifact_id", "offset_bytes", "length_bytes"])?;
@@ -376,6 +414,7 @@ fn is_read(method: &str) -> bool {
     matches!(
         method,
         "artifact.get"
+            | "artifact.parts"
             | "host.status"
             | "task.get"
             | "task.list"
@@ -410,6 +449,7 @@ fn page(params: &Value) -> Result<(i64, i64)> {
 fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config) -> Result<Value> {
     match method {
         "artifact.get" => results::describe(db, p, v),
+        "artifact.parts" => assembly::parts(db, v),
         "host.status" => {
             model::fields(v, &[])?;
             let tasks: i64 = db.query_row("SELECT count(*) FROM tasks", [], |r| r.get(0))?;
@@ -609,6 +649,7 @@ fn apply(
     now: i64,
 ) -> Result<(Value, bool)> {
     match method {
+        "artifact.assemble" => assembly::reserve(tx, p, v, id).map(|v| (v, true)),
         "task.create" => tasks::create(tx, p, v, id, now).map(|v| (v, false)),
         "task.revise" => tasks::revise(tx, p, v, id, now).map(|v| (v, false)),
         "task.claim" => tasks::claim(tx, p, v, id, now).map(|v| (v, false)),

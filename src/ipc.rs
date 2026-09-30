@@ -197,46 +197,68 @@ pub async fn serve(
     Ok(())
 }
 
-/// One CLI connection. Never retries a mutation after a lost reply.
-pub async fn call(
-    root: &Path,
-    credential: &Credential,
-    method: &str,
-    params: Value,
-    config: &Ipc,
-) -> Result<Value> {
-    let stream = connect(root).await?;
-    let (read, write) = tokio::io::split(stream);
-    let mut reader = FramedRead::new(
-        read,
-        LinesCodec::new_with_max_length(config.max_frame_bytes),
-    );
-    let mut writer = FramedWrite::new(
-        write,
-        LinesCodec::new_with_max_length(config.max_frame_bytes),
-    );
-    let timeout = Duration::from_secs(config.write_timeout_seconds);
-    for (method, params) in [("client.hello", json!(credential)), (method, params)] {
+/// Sequential local client. Reuses authentication/framing during a large export.
+/// A failed transport is never reused or retried as if its outcome were known.
+pub struct Client {
+    reader: FramedRead<tokio::io::ReadHalf<Stream>, LinesCodec>,
+    writer: FramedWrite<tokio::io::WriteHalf<Stream>, LinesCodec>,
+    limit: usize,
+    write_timeout: Duration,
+    usable: bool,
+}
+impl Client {
+    pub async fn connect(root: &Path, credential: &Credential, config: &Ipc) -> Result<Self> {
+        let (read, write) = tokio::io::split(connect(root).await?);
+        let mut client = Self {
+            reader: FramedRead::new(
+                read,
+                LinesCodec::new_with_max_length(config.max_frame_bytes),
+            ),
+            writer: FramedWrite::new(
+                write,
+                LinesCodec::new_with_max_length(config.max_frame_bytes),
+            ),
+            limit: config.max_frame_bytes,
+            write_timeout: Duration::from_secs(config.write_timeout_seconds),
+            usable: true,
+        };
+        client.exchange("client.hello", json!(credential)).await?;
+        Ok(client)
+    }
+    pub async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+        if method == "client.hello" {
+            return Err(Error::invalid("client.hello is reserved for the transport"));
+        }
+        self.exchange(method, params).await
+    }
+    async fn exchange(&mut self, method: &str, params: Value) -> Result<Value> {
+        if !self.usable {
+            return Err(Error::new(
+                "DISCONNECTED",
+                "client link failed; reconnect before another request",
+            ));
+        }
         let id = model::new_id();
         let line = encode(
             &json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}),
-            config.max_frame_bytes,
+            self.limit,
         )?;
-        tokio::time::timeout(timeout, writer.send(line))
+        self.usable = false;
+        tokio::time::timeout(self.write_timeout, self.writer.send(line))
             .await
             .map_err(|_| {
                 Error::new(
                     "OUTCOME_UNKNOWN",
-                    "write timed out; retry only with the same client_request_id",
+                    "write timed out; preserve the logical request ID",
                 )
             })?
             .map_err(|e| Error::new("OUTCOME_UNKNOWN", e.to_string()))?;
-        let frame = tokio::time::timeout(Duration::from_secs(60), reader.next())
+        let frame = tokio::time::timeout(Duration::from_secs(60), self.reader.next())
             .await
             .map_err(|_| {
                 Error::new(
                     "OUTCOME_UNKNOWN",
-                    "no reply; inspect status or repeat the identical request ID",
+                    "reply missing; inspect the operation before retrying",
                 )
             })?
             .ok_or_else(|| Error::new("OUTCOME_UNKNOWN", "server closed before reply"))?
@@ -246,17 +268,31 @@ pub async fn call(
             return Err(Error::new("PROTOCOL_ERROR", "response ID/version mismatch"));
         }
         if let Some(error) = response.get("error") {
+            self.usable = true;
             return Err(Error::new(
                 error["data"]["code"].as_str().unwrap_or("RPC_ERROR"),
                 error["message"].as_str().unwrap_or("RPC error"),
             ));
         }
-        if method != "client.hello" {
-            return response
-                .get("result")
-                .cloned()
-                .ok_or_else(|| Error::new("PROTOCOL_ERROR", "missing result"));
-        }
+        let result = response
+            .get("result")
+            .cloned()
+            .ok_or_else(|| Error::new("PROTOCOL_ERROR", "missing result"))?;
+        self.usable = true;
+        Ok(result)
     }
-    Err(Error::invalid("client.hello is reserved for the transport"))
+}
+
+/// One CLI exchange; never retries a mutation after a lost reply.
+pub async fn call(
+    root: &Path,
+    credential: &Credential,
+    method: &str,
+    params: Value,
+    config: &Ipc,
+) -> Result<Value> {
+    Client::connect(root, credential, config)
+        .await?
+        .request(method, params)
+        .await
 }

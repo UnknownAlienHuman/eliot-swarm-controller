@@ -106,12 +106,13 @@ pub(super) fn record(
 }
 
 pub(super) fn get(db: &Connection, id: &str) -> Result<ArtifactRecord> {
-    let row: Option<(String,i64,String,String)> = db.query_row(
-        "SELECT relative_path,byte_length,content_digest,metadata_json FROM artifacts WHERE artifact_id=?1 AND kind='native_result_page'",
-        [id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
-    let (relative_path, byte_length, content_digest, metadata) =
+    let row: Option<(String,String,i64,String,String)> = db.query_row(
+        "SELECT kind,relative_path,byte_length,content_digest,metadata_json FROM artifacts WHERE artifact_id=?1 AND kind IN ('native_result_page','native_result')",
+        [id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
+    let (kind, relative_path, byte_length, content_digest, metadata) =
         row.ok_or_else(|| Error::new("NOT_FOUND", "result artifact is not registered"))?;
     Ok(ArtifactRecord {
+        kind,
         artifact_id: id.to_string(),
         relative_path,
         byte_length: u64::try_from(byte_length)
@@ -130,7 +131,7 @@ pub(super) fn describe(db: &Connection, p: &Principal, v: &Value) -> Result<Valu
     model::fields(v, &["artifact_id"])?;
     let a = get(db, model::text(v, "artifact_id")?)?;
     Ok(
-        json!({"artifact_id":a.artifact_id,"kind":"native_result_page","byte_length":a.byte_length,
-        "content_digest":a.content_digest,"metadata":a.metadata}),
+        json!({"artifact_id":a.artifact_id,"kind":a.kind,"byte_length":a.byte_length,
+        "content_digest":a.content_digest,"metadata":a.public_metadata()}),
     )
 }

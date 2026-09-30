@@ -1,8 +1,10 @@
-//! Bounded immutable result pages. File I/O runs outside the SQLite owner thread.
+//! Immutable result pages and whole results. File I/O stays outside the SQLite owner thread.
+mod assembly;
 use crate::{
     error::{Error, Result},
     model, platform,
 };
+pub use assembly::{AssemblyRequest, ResultPart};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -68,6 +70,7 @@ impl ResultPage {
 
 #[derive(Debug, Clone)]
 pub struct ArtifactRecord {
+    pub kind: String,
     pub artifact_id: String,
     pub relative_path: String,
     pub byte_length: u64,
@@ -97,6 +100,7 @@ impl ArtifactFiles {
     pub fn record(operation_id: &str, bytes: &[u8], metadata: Value) -> ArtifactRecord {
         let id = format!("result-{}", model::digest(operation_id.as_bytes()));
         ArtifactRecord {
+            kind: "native_result_page".into(),
             relative_path: format!("artifacts/{id}.bin"),
             artifact_id: id,
             byte_length: bytes.len() as u64,
@@ -105,7 +109,12 @@ impl ArtifactFiles {
         }
     }
     fn path(&self, record: &ArtifactRecord) -> Result<PathBuf> {
-        let hex = record.artifact_id.strip_prefix("result-").unwrap_or("");
+        let prefix = match record.kind.as_str() {
+            "native_result_page" => "result-",
+            "native_result" => "assembled-",
+            _ => return Err(Error::new("ARTIFACT_KIND", "unsupported artifact kind")),
+        };
+        let hex = record.artifact_id.strip_prefix(prefix).unwrap_or("");
         if hex.len() != 64
             || !hex.bytes().all(|c| c.is_ascii_hexdigit())
             || record.relative_path != format!("artifacts/{}.bin", record.artifact_id)
@@ -152,7 +161,7 @@ impl ArtifactFiles {
         let _ = fs::remove_file(&temp); // Only our uniquely named temporary file.
         result
     }
-    fn verified_bytes(&self, record: &ArtifactRecord) -> Result<Vec<u8>> {
+    pub(super) fn verified_bytes(&self, record: &ArtifactRecord) -> Result<Vec<u8>> {
         let path = self.path(record)?;
         let m = fs::symlink_metadata(&path)?;
         if !m.is_file()
@@ -182,7 +191,12 @@ impl ArtifactFiles {
     }
     pub fn read(&self, record: &ArtifactRecord, offset: u64, length: usize) -> Result<Value> {
         if length == 0 || length > MAX_PAGE_BYTES || offset > record.byte_length {
-            return Err(Error::invalid("artifact range is outside this page"));
+            return Err(Error::invalid(
+                "artifact range is outside the retained content",
+            ));
+        }
+        if record.kind == "native_result" {
+            return self.read_assembled(record, offset, length);
         }
         let bytes = self.verified_bytes(record)?;
         let start = offset as usize;
@@ -197,5 +211,20 @@ impl ArtifactFiles {
             "byte_length":data.len(),"eof":end==bytes.len(),"encoding":encoding,"content":content,
             "artifact_sha256":record.content_digest,"metadata":record.metadata}),
         )
+    }
+}
+
+impl ArtifactRecord {
+    /// Large provenance lists are paginated, never copied into every byte-range reply.
+    pub fn public_metadata(&self) -> Value {
+        match self.metadata.as_object() {
+            Some(map) => Value::Object(
+                map.iter()
+                    .filter(|(key, _)| key.as_str() != "parts")
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            ),
+            None => self.metadata.clone(),
+        }
     }
 }

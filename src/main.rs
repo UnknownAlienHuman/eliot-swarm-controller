@@ -91,6 +91,25 @@ enum Command {
 }
 #[derive(Subcommand)]
 enum ArtifactCommand {
+    /// Assemble an ordered list of retained native pages, without calling a model.
+    Assemble {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// Page the immutable provenance manifest of a whole result.
+    Parts {
+        artifact_id: String,
+        #[arg(long, default_value_t = 0)]
+        after: i64,
+        #[arg(long, default_value_t = 50)]
+        limit: i64,
+    },
+    /// Export all bytes, check the complete SHA-256, and publish without overwriting.
+    Export {
+        artifact_id: String,
+        #[arg(long)]
+        out: PathBuf,
+    },
     Get {
         artifact_id: String,
     },
@@ -183,6 +202,21 @@ async fn run(cli: Cli) -> Result<()> {
         &cli.credential
             .unwrap_or_else(|| config.storage.data_dir.join("operator.json")),
     )?;
+    if let Command::Artifact {
+        command: ArtifactCommand::Export { artifact_id, out },
+    } = &cli.command
+    {
+        let result = eliot_swarm_controller::export::artifact(
+            &config.storage.data_dir,
+            &credential,
+            &config.ipc,
+            artifact_id,
+            out,
+        )
+        .await?;
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
     let mut pending_credential = None;
     let (method, mut params) = match cli.command {
         Command::Host => unreachable!("host returned above"),
@@ -220,6 +254,16 @@ async fn run(cli: Cli) -> Result<()> {
                 "selector":read_json(&file)?,"offset_bytes":offset,"length_bytes":length}),
         ),
         Command::Artifact { command } => match command {
+            ArtifactCommand::Assemble { file } => ("artifact.assemble".into(), read_json(&file)?),
+            ArtifactCommand::Parts {
+                artifact_id,
+                after,
+                limit,
+            } => (
+                "artifact.parts".into(),
+                json!({"artifact_id":artifact_id,"after":after,"limit":limit}),
+            ),
+            ArtifactCommand::Export { .. } => unreachable!("export returned above"),
             ArtifactCommand::Get { artifact_id } => {
                 ("artifact.get".into(), json!({"artifact_id":artifact_id}))
             }
@@ -330,6 +374,7 @@ async fn run(cli: Cli) -> Result<()> {
         "host.status"
             | "artifact.get"
             | "artifact.read"
+            | "artifact.parts"
             | "task.get"
             | "task.list"
             | "attempt.get"
