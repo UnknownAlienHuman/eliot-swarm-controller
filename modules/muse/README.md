@@ -1,33 +1,33 @@
-# Muse SDK bridge — first native integration slice
+# Muse SDK bridge — native integration
 
-This module contains executable code, not only dependency preparation. It uses the whole published `@muse-code/sdk` **1.3.0**, locked locally, and the reviewed [MSP schema](https://github.com/meta-models/muse-code-sdk/blob/a7c10c5dd3f66be412077d29f9d11111af70317b/schema/msp/msp.d.ts). Native/Windows/model qualification is pending; syntax/import checks are not a model run.
+Executable module using the complete published `@muse-code/sdk` **1.3.0**, locked locally, and the reviewed [MSP schema](https://github.com/meta-models/muse-code-sdk/blob/a7c10c5dd3f66be412077d29f9d11111af70317b/schema/msp/msp.d.ts). Current example artifact: **`muse-sdk-1.3.0-bridge.4`**. Native/Windows/model qualification is pending; syntax/import checks are not model runs.
 
 ## Ownership and implemented path
 
-One independently started Node process owns one `muse serve` connection and its native descendants. The existing Rust host exposes `module.hello/next/outcome/observe` over authenticated local IPC. A module credential is scoped to a reserved binding/generation; it cannot call task acceptance or impersonate GM. No new listener, inference proxy or task database is added.
+One independently started Node process owns a `muse serve` connection. The Rust host exposes `module.hello/next/outcome/observe/result` over authenticated local IPC. Credentials are scoped to a reserved binding/generation; the module cannot accept Tasks or impersonate GM. No extra service, inference proxy or task database is added.
 
-The host commits command admission before yielding native work. Input admissions are ordered; protocol replies do not wait for a model turn. Unknown admission is not blindly repeated on timeout or reconnect. Explicit reconciliation uses the original native command ID and exact retained payload. The bridge retains outcomes until the host commits them, sends the immutable Task snapshot, passes explicit per-turn reasoning effort, and reports model readback and exact native turn IDs separately from Task acceptance.
+The host commits admission before yielding native commands. Input admissions are ordered; protocol replies do not wait for model completion. Unknown admission is not blindly repeated on reconnect/timeout. Explicit reconciliation uses the original native command ID and retained payload. Outcomes remain until host acknowledgement; Task snapshots, requested effort, native readback and exact turn identities are separate from Task acceptance.
 
-Host disconnect does not call SDK.close. The same live bridge reconnects with its boot/native identities. A different process confronting possibly live old work requires reconciliation rather than a new implicit executor. Explicitly terminating this bridge closes its own native connection, not an unrelated service.
+Host disconnect does not call SDK.close. The same live bridge reconnects with its boot/native identities. A new process confronting possibly live old work requires recovery rather than implicitly creating another executor. Explicitly terminating the bridge closes its native connection, not an unrelated service.
 
-**MSP presentation acknowledgement is not a decision.** For `approval/request` and `userInput/request`, the published `RequestReceipt` is `{}`: acknowledgement that a surface has or will present the question. The bridge retains the question and returns that receipt immediately. An actual decision is a separate `approval/decide` or `userInput/*` command carrying the current native identifiers. Generic JSON-RPC response bodies do not grant approval. The root's goal observation also excludes child goal events.
+**MSP presentation acknowledgement is not a decision.** `approval/request` and `userInput/request` receive the native `RequestReceipt` `{}` immediately, while the question is retained. Real answers use `approval/decide` or `userInput/*` with current IDs. Root goal observations exclude child goal events.
 
-Native token deltas and full transcripts stay in Muse. The bridge keeps compact state, observed children, pending questions, recent exact turn terminals and an unsummed native usage snapshot. Family completeness is **partial**. No complete-family claim follows from root idle. Automatic bridge launching, crash-time native resume, complete family reconstruction, artifact retrieval, task acceptance and autonomous handoff after unknown effects remain incomplete. Do not label full C03 complete.
+Token deltas/full transcripts remain native. Compact observations contain children, pending questions, recent exact turn terminals and an unsummed usage snapshot. Family completeness is partial. Automatic launching, bridge-process crash/resume, complete family reconstruction, whole-result assembly, Task acceptance and autonomous handoff remain unfinished. Do not label full C03 complete.
 
-## Explicit first setup
+## Explicit setup
 
-1. Run `npm ci --ignore-scripts` here. This installs only the locked local SDK, not Muse or global packages; no login or model call occurs.
-2. Select the installed native Muse executable and its existing auth. Windows uses `.exe`, not `.cmd`/`.bat`. Keep command and argv separate; use supported arguments for that installed binary. The module does not edit UAC or global vendor settings.
-3. Add an enabled route to a private controller TOML (below), start `swarm --config <file> host`, and call `agent.open` with `{"lane_id":"MC","route":"muse-manager"}`. Save returned binding_id/generation.
-4. As operator, run `swarm client-create muse-MC --role module --binding-id <binding> --generation 1 --out <private-credential.json>` with the same data-dir. Preserve the printed request ID for retries. Keep the credential out of model context.
-5. Copy `module.example.json` outside Git. Set the host's pipe/socket printed at startup, private credential path, actual native executable/argv and matching moduleArtifactId. Independently run `node modules/muse/bridge.mjs --config <private-module.json>`. It spawns Muse only when it receives the reserved opening operation.
-6. Read `agent.state`. To dispatch a Task, use `swarm call task.claim --file <params>` with `start_owner:"controller"`, binding_id and binding_generation, then `task.dispatch` with attempt_id/text. The short form also supports `task claim TASK --revision N --start-owner controller --binding-id BINDING --generation 1`. Readiness must come from native opening evidence, not a hand-edited DB.
+1. Run `npm ci --ignore-scripts` here. It installs the locked local SDK, not Muse/global packages; it does not log in or call a model.
+2. Select the actual installed native executable and its existing auth. Windows uses `.exe`, not `.cmd`/`.bat`. Supply executable/argv separately, using supported arguments. No UAC/global settings are edited.
+3. Enable a private controller route below, run `swarm --config <file> host`, then `agent.open` with `{"lane_id":"MC","route":"muse-manager"}`. Preserve binding_id/generation.
+4. As operator, run `swarm client-create muse-MC --role module --binding-id BINDING --generation 1 --out <private-credential.json>` with the same data-dir. Preserve the request ID; keep the credential out of model context.
+5. Copy `module.example.json` outside Git. Set the printed host endpoint, credential path, actual executable/argv and matching moduleArtifactId. Independently run `node modules/muse/bridge.mjs --config <private-module.json>`. Only the reserved opening operation starts Muse.
+6. Inspect `agent.state`. Claim a controller-start Task with `task claim TASK --revision N --start-owner controller --binding-id BINDING --generation 1`; dispatch via `task.dispatch` with attempt_id/text. Do not hand-edit DB readiness.
 
 ```toml
 [[routes]]
 alias = 'muse-manager'
 runtime = 'muse'
-module_artifact_id = 'muse-sdk-1.3.0-bridge.3'
+module_artifact_id = 'muse-sdk-1.3.0-bridge.4'
 enabled = true
 [routes.native_options]
 workspaceRoot = 'C:\Projects\YourRepository'
@@ -36,58 +36,97 @@ reasoningEffort = 'max'
 approvalMode = 'allowAll'
 ```
 
-These are adapter-owned camelCase fields. Model and approval mode must exist in the native runtime. Effort is explicit per turn; opening a session does not prove Max inference. Model readback mismatch is not silently accepted.
+These camelCase settings belong to this adapter. Model/approval options must exist in the native runtime. Max is explicit per turn; opening is not evidence of actual inference. Provider/model mismatch is not silently accepted. Use a new artifact/binding for a changed module; do not overwrite a running bridge.
 
-`agent.send` takes binding_id/generation/text and `delivery:"next_turn"` or `delivery:"steer"` with expected_turn_id. `agent.reply` takes binding_id/generation and `reply:{"method":"approval/decide","params":{...}}` or `userInput/answer|cancel|clarify`. Supply the exact installed-schema choice, requirement, question and session IDs from the pending question. The adapter checks the observed family and delegates schema validation to the native SDK/server. It exposes no arbitrary-method passthrough and does not guess substantive answers.
+## Goal, configuration and reconciliation
 
-## Goal, configuration and reconciliation — bridge.2
+Use `swarm call METHOD --file params.json` with the normal durable request ID. Queued means local admission, not native application.
 
-All commands use `swarm call METHOD --file params.json` and the normal durable request ID. A response with `state:"queued"` is local admission; inspect its Operation and `agent.state` for native progress.
-
-| Method | Params in addition to binding_id/generation | Native boundary |
+| Method | Additional parameters beyond binding_id/generation | Boundary |
 | --- | --- | --- |
-| `agent.configure` | `settings:{"reasoningEffort":"max"}` | One native setter; durable default applies to subsequent turns. Explicit input turns also carry effort. |
-| `agent.configure` | `settings:{"model":{"modelId":"...","providerId":"..."}}` | Admission remains pending until matching model readback/event. No silent provider fallback. |
-| `agent.configure` | `settings:{"approvalMode":"allowAll"}` | Effective mode from the native acknowledgement; applies to the next action, does not answer existing questions. |
-| `agent.goal` | `action:"set"` or `"edit"`, `objective:"..."` | May start native work immediately. Complete objective and necessary context must already be supplied. |
-| `agent.goal` | `action:"pause"`, `"resume"` or `"clear"` | Native continuation control, not Task acceptance or process termination. |
-| `agent.refresh` | Optional `session_id` for an observed child | Read root or selected child metadata/pending questions; child observation is resubscribed from the read cursor, without writer lease or model prompt. |
-| `agent.reconcile` | `operation_id:"unresolved-original-operation"` | Explicitly reconcile retained native work on the same live bridge; not a new Task or automatic retry loop. |
+| `agent.send` | text, delivery:next_turn | Native input admission; may queue if busy. |
+| `agent.send` | text, delivery:steer, expected_turn_id | Exact current-turn correction, not another Task. |
+| `agent.reply` | reply:{method,params} | approval/decide or userInput/answer\|cancel\|clarify; native IDs required. |
+| `agent.configure` | settings:{reasoningEffort:max} | One durable setter for subsequent turns, plus explicit per-turn input effort. |
+| `agent.configure` | settings:{model:{modelId,providerId}} | Pending until matching readback/event. |
+| `agent.configure` | settings:{approvalMode:allowAll} | Effective mode in native ACK; does not answer existing questions. |
+| `agent.goal` | action:set\|edit, objective | Can start work immediately; complete objective/context must already be supplied. |
+| `agent.goal` | action:pause\|resume\|clear | Native continuation, not acceptance or process termination. |
+| `agent.refresh` | Optional session_id of an observed child | Metadata/pending questions and child subscription, without writer lease/resume. |
+| `agent.reconcile` | operation_id of unresolved command | Explicit same-command reconciliation on the same live bridge. |
 
-Configure one native setter per Operation: this runtime exposes separate setters, not a compound atomic configuration transaction. Before `goal set/edit/resume`, configure the standing reasoning default and wait for its applied outcome; a per-turn override from an earlier prompt does not configure future goal continuations. The immutable initial route remains history; later effective settings appear in native state/outcome evidence. Do not edit a running module in place; new modules/routes use their own artifact version.
+Table values describe fields; actual requests are JSON with quoted strings. Configure one setter per Operation because native setters are separate. Before goal set/edit/resume, configure the standing effort and wait for its applied outcome. A prior per-turn override does not configure future goal continuation. Current effective settings and immutable initial route remain distinct.
 
-`host.mode` with new_work disabled prevents new goal set/edit/resume and new input at dispatch. Pause/clear remain available and cancel older *locally queued* goal starts so priority pause is not followed by a stale queued resume. Already admitted effects require native disposition; no cancellation of unseen remote work is invented.
+New work disabled prevents goal starts/new inputs at dispatch. Goal pause/clear stay available and cancel old *locally queued* goal starts. Already admitted effects still require native disposition.
 
-For a lost native admission reply, reconcile retains the original command ID, method and payload under the SDK's idempotency contract. Once admission is known, model configuration reconciliation only reads state. A correlated native turn event may resolve input admission without resubmission. Unresolved context lost with a bridge crash cannot be reconstructed by this first implementation: it returns an explicit unavailable/recovery result rather than starting a replacement agent. Session/start recovery is not covered by the retained command path yet.
+Lost native admission may be reconciled with the exact retained ID/payload. Once model-setting admission is known, reconciliation reads state instead of resending. Correlated turn evidence can settle input admission. Lost bridge memory/session-start recovery is not reconstructed by this path. Missing context produces explicit recovery/unavailable status, not a replacement model call.
 
-The host now accepts unknown/accepted outcome refinement without replacing a known final result. A turn terminal already stored before the dispatch ACK is applied to its exact producer when the ACK arrives. Observation sequence prevents older snapshots overwriting newer state; legacy modules without sequence retain their weaker partial path. Within refresh, live events received during a read take precedence. Refresh covers the selected observed session, not a complete-family reconstruction or replay of lost history.
+Late outcomes refine unknown/accepted without overwriting terminal results. Exact turn terminal observed before dispatch ACK is applied to the producer later. Ordered observations reject stale projection updates; legacy unsequenced observations have weaker guarantees. Live events received during snapshot reads take precedence. Metadata refresh does not reconstruct the complete family.
 
-## Task-specific children and stable family pages — bridge.3
+## Task-specific children and stable family pages
 
-The manager still launches its children through native tools. `attempt.bind_producer` associates an already observed **session + turn** with one of its Attempts; it sends no prompt, does not consume a child result and does not accept the Task. Controller dispatch already binds its own root turn automatically. Bind its delegated children explicitly when they are part of that same Task, or to their separately claimed Tasks.
+Managers launch native children themselves. `attempt.bind_producer` associates an already observed session/run with one Attempt, without dispatching another prompt, consuming a result or accepting the Task. Root dispatch binds its own turn; delegated children are explicitly linked to that Task or their own claimed Tasks.
 
 ```powershell
 swarm task claim TASK --revision 1 --binding-id BINDING --generation 1
 swarm family BINDING --generation 1
-# Use observation_id and the actual child session/turn from the returned evidence:
 swarm --request-id bind-worker-1 task bind ATTEMPT --assignment worker-1 --session CHILD --turn TURN --observation-id OBSERVATION
 swarm call attempt.get --file attempt.json
 ```
 
-These examples require the normal data-dir/config/credential options for your host. `task claim` defaults to native_manager; this reserves work without sending a duplicate controller start. `assignment_id` remains stable for that Task-specific activation. Another turn is another assignment; an old completion cannot release it. Do not derive turn IDs from a filename, timestamp, parent model or the child session alone.
+Supply normal data-dir/config/credential options. `task claim` defaults to native_manager, so there is no second initial controller prompt. Assignment identity remains stable for that activation; another turn is another assignment. Do not infer run IDs from filenames, timestamps, model names or session IDs alone.
 
-`agent.family` / `swarm family` read only SQLite. The first page returns `observation_id`; every later `--after` page requires that same `--observation-id`. The end of a retained list is not proof of complete native-family coverage. Missing observation is unknown, not zero children. Explicit old observations remain usable evidence even after a newer snapshot omits that turn.
+Family reads use SQLite only. Preserve observation_id for subsequent pages; the end of this retained list is not proof of full native discovery. Missing observations are unknown, not zero children. Older observations can support an exact run omitted from the latest buffer.
 
-Binding verifies owner, unreleased Attempt, exact binding/generation, native namespace, observed family membership and exact run evidence. Repeating a mapping can add later terminal evidence but cannot change its identity. Mapping late evidence is allowed while reconciling, and does not rewrite the Task snapshot after a revision change. Unresolved registered runs prevent release; unrelated Tasks on the same root keep working. Process termination and assignment acceptance remain separate operations.
+Producer binding checks owner, unreleased Attempt, binding/generation, namespace, family membership and run evidence. Repetition can add terminal evidence but cannot replace identity. Late mapping during reconciliation does not rewrite the Task snapshot. Unresolved registered runs prevent release; unrelated Tasks keep working.
 
-Bridge.3 preserves a child's snapshot/last turn when a newer parent item arrives, includes native result summary and its **parent/item/revision** source, and handles `turn/unqueued` as cancelled-before-start. `resultReady` and result summary are not Task acceptance. Per the pinned [MSP schema](https://github.com/meta-models/muse-code-sdk/blob/a7c10c5dd3f66be412077d29f9d11111af70317b/schema/msp/stable/msp.schema.json), `subagent/readResult` is state-changing; observing a summary never invokes it. Full result bodies/artifact retrieval remain pending.
+The bridge preserves child snapshots/last turns across parent item updates, records parent/item/revision provenance of result summaries, and recognizes `turn/unqueued` as cancelled-before-start. `resultReady` is not acceptance. `subagent/readResult` is state-changing in the pinned schema and is never used for observation.
 
-Native observation buffers are still bounded/partial. Lost history and unregistered task descendants are not magically reconstructed by this mapping. A new artifact version is for a new module binding; do not overwrite a running bridge in place. No native run or Windows qualification is implied by compiling this slice.
+## Result retrieval — bridge.4
 
-## Checkpoint and next work
+Implemented in `results.mjs`, `src/artifacts.rs`, `src/store/results.rs` and their host/CLI call sites. One `agent.result` requests one source page. It reads a **pinned item revision**, not the latest answer with a similar name.
 
-The earlier interrupted preparation (`0e3ccd6b`, `db45be62`) did not contain this bridge. Its recovered source/package input was Actions run 36696436986, artifact 11087808310, SHA-256 `b0e06843336290e685cd79376c709be4ac7ab79accf3cb09f9bd2beb1826ad52`. The source and lockfile now live in Git; temporary artifact retention is not a dependency authority.
+Create a Muse selector file, replacing all identifiers and revision with actual observed values:
 
-The first integration was published in b2bd0211, with admission wakeup in 21502426 and corrected presentation-receipt semantics in 58055475. Bridge.3 task-specific run mapping and family pages are in 36b4f702. See the exact-commit CI run for compilation evidence; no live native session was invoked in these edits.
+```json
+{
+  "kind": "result",
+  "session_id": "PARENT_SESSION_CONTAINING_THE_SUBAGENT_ITEM",
+  "item_id": "OBSERVED_SUBAGENT_ITEM",
+  "item_revision": 1
+}
+```
 
-Next: complete crash recovery and full result retrieval, then direct OpenCode V2 on the same host contract. Exact-run producer mapping and retained family pages are implemented; native qualification is still pending. [OpenCodex Issue #1](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/1) remains after the main controller implementation, not a prerequisite. Do not rewrite the existing core or restore historical briefs.
+| Selector kind | Selected native data |
+| --- | --- |
+| result | The subagent item's result object, including structuredData/artifactRefs/evidenceRefs, serialized as canonical JSON. |
+| message | Complete agentMessage text; a native truncated message is rejected. |
+| output | Available stored outputRef; include exact `output_ref` ID. |
+| patch | Available stored patchRef; include exact `output_ref` ID. |
+
+Optional `before_cursor` is an opaque native backward-page cursor. Optional `expected_digest` must match the reported source digest exactly; it is not the individual page hash. The session must be the root or an observed family member. Exact revision absence is an error, not permission to substitute a newer revision.
+
+```powershell
+swarm --request-id result-page-1 result BINDING --generation 1 --file selector.json --offset 0 --length 65536
+# Save operation_id; operation.json contains {"operation_id":"THE_RETURNED_ID"}:
+swarm call operation.get --file operation.json
+# Once settled with result.details.artifact_ref:
+swarm artifact get ARTIFACT_ID
+swarm artifact read ARTIFACT_ID --offset 0 --length 65536
+```
+
+Use normal host/data-dir/credential options. The queue response is not the result body. Muse reads `view/page` to identify the exact item; stored output uses `item/readOutput`. Neither path calls a model, resumes a session, consumes `subagent/readResult`, or follows arbitrary URIs/files from result references.
+
+The bridge retains each unacknowledged page while it remains alive. The host validates the decoded page length/range/EOF and SHA-256, publishes bytes under an immutable generated name without overwriting, then registers the artifact and settles the Operation. File I/O stays off the DB thread. Lost acknowledgements can replay the same retained page; different committed bytes/provenance cannot replace it.
+
+**Two offsets:** result offset addresses the native source body; artifact-read offset addresses that one local page. `result.details.next_offset_bytes` requests the following native page with a new logical request ID and the same source identity. The 64 KiB page bound is not a maximum full-result size. UTF-8 split across byte ranges is returned as base64 when necessary; use the returned encoding.
+
+Per-page hashes do not establish complete whole-result coverage. Whole-digest verification is reported only when available and the entire source fits the checked page. Automatic multi-page assembly, retrieval of arbitrary artifact/evidence reference targets and Task acceptance are not implemented. Source/output digest may be unavailable; absence is not a verified digest. Large native items can still occupy SDK memory even though our transport page is bounded. Readback describes native data, not independent verification that the worker's conclusions are correct.
+
+## Recovered checkpoint — 2026-09-30
+
+After bridge.3 (`36b4f702`, documentation `00fdce16`), the interrupted continuation committed result retrieval in **`46a216a7`** and corrected signed SQLite length conversion in **`684bc33a`**. [Run 36759367801](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/36759367801) passed Windows/Linux format, Clippy, release build and all Muse .mjs syntax/SDK-import steps for the latter exact commit.
+
+Recovery obtained its source archive from artifact `11117908898`: the reconstructed Git tree matches `7debef1ee27af1dcb44c86de133b1c1a9d3dfefb`. The code was saved; these instructions and the final progress report had lagged behind. No new unpublished implementation was found in current mounted files. Do not repeat SDK preparation or reimplement the result reader. Recovery's local invocation covered CLI help and empty-host startup/status/shutdown, not a native result call.
+
+**Next implementation:** bridge-process crash recovery with known session/process ownership, complete family/result-consumer integration, then direct OpenCode V2. Task submission/acceptance and CheckRunner are still separate unfinished paths. Live Muse/Max and Windows lifecycle remain unqualified. No broad tests or native calls were added by this recovery. [OpenCodex Issue #1](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/1) stays after the main code, not a prerequisite.

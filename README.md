@@ -4,22 +4,29 @@ Headless modular Rust controller for native coding-agent harnesses; a prototype 
 
 ## Current implementation — 0.1.0
 
-The core provides authenticated clients, tasks/revisions/claims, durable request receipts, directed mailbox, incremental reports and binding-scoped module admission. Windows uses user-restricted Named Pipes; Unix uses a private socket. No TCP control listener is opened.
+The Rust core provides authenticated clients, tasks/revisions/claims, durable request receipts, directed mailbox, incremental reports and binding-scoped module admission. Windows uses user-restricted Named Pipes; Unix uses a private socket. No TCP control listener is opened.
 
-**The first Muse SDK bridge is implemented and connected to the host API.** `modules/muse/` starts an explicitly configured native binary on a saved opening operation, sends the Task snapshot and per-turn reasoning effort, supports exact-turn steer and native question-answer commands, and reports observed children and turn identities. Bridge.2 adds native goal controls, one-setter configuration, explicit metadata refresh and same-command reconciliation. Bridge.3 adds exact-run Task/child registration, stable retained family pages, child-targeted metadata refresh and cancelled-before-start evidence. A host disconnect does not close the independently running bridge. A new bridge process cannot silently replace possibly live native work.
+**The Muse SDK bridge is connected to the host API.** It opens an explicitly configured native executable, delivers the Task snapshot and per-turn effort, supports exact-turn steer, native questions, goal/configuration controls and explicit reconciliation. Task producers are bound to observed session/run identities; family pages use a retained observation. Bridge.4 adds on-demand result pages and immutable local artifact reads. Host disconnect does not close the independently running bridge or replay model input.
 
-**Implementation is not runtime qualification.** Live Muse/Max inference and Windows native launch have not been exercised. Crash/resume, complete family reconstruction, autonomous task handoff, full result/artifact retrieval and acceptance are incomplete. OpenCode V2, Codex and other adapters, MCP, CheckRunner and automatic module/service installation remain pending. Family reports are partial; completed model turns do not accept Tasks. Do not mark the whole C01–C03 target complete.
+**Implementation is not live qualification.** Muse/Max inference and Windows native launch have not been exercised. Bridge-process crash/resume, complete family reconstruction, automatic handoff, whole-result assembly, Task submission/acceptance and CheckRunner remain unfinished. OpenCode V2, Codex and other adapters, MCP and automatic module/service installation are pending. Partial family data and completed turns do not accept Tasks. Do not mark all C01–C03 complete.
 
-### Code and build checkpoints
+### Recovery checkpoint — 2026-09-30
 
-- `c37e6bbf`: original local host/store/CLI and short Linux invocation.
-- `b2bd0211`: first Muse bridge and module channel; [run 36708933605](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/36708933605) passed formatting, Clippy and release builds on Windows/Linux on 2026-09-30.
-- `21502426`: native admission outcomes wake the existing command wait channel, without telemetry-driven polling storms.
-- `58055475`: MSP presentation receipts are acknowledged immediately; actual decisions remain separate commands. Child goal events cannot overwrite the root goal.
-- `45a5e649`: goal/configuration/refresh/reconciliation, monotonic observations and late-outcome handling. [Exact-commit CI](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/36714173055) records compilation separately from native qualification.
-- `36b4f702`: bridge.3 task-specific producer mapping, stable family pages and observed child refresh; [CI run](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/36754364752) records the checks for this code.
+The interrupted continuation after `00fdce16` did publish its code:
 
-Use CI for the exact artifact SHA; an earlier green run is not qualification of later code or live vendor behavior. The read-only workflow pins Rust 1.98.1/Cargo.lock, checks formatting and Clippy, builds the binary, and syntax-checks/imports the locked Muse SDK without starting Muse. It does not run `cargo test`, model calls, OAuth login or global installation. Binary artifacts contain their source SHA, tracked source archive and module source/configuration, not bundled vendor credentials or native runtimes.
+| Commit | Saved work |
+| --- | --- |
+| `36b4f702` | Exact-run Task/child mapping and retained family pages; earlier baseline. |
+| `46a216a7` | `agent.result`, `module.result`, Muse `results.mjs`, immutable artifact publication/read, CLI commands; pinned base64 0.22.1. |
+| `684bc33a` | Checked signed SQLite lengths; fixes the first result-slice compilation failure without changing the migration. |
+
+For **`684bc33a79eed64656e291a8fddb74108f531e5e`**, [CI run 36759367801](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/36759367801) passed formatting, warnings-denied Clippy, Muse module syntax/SDK import and release builds on Windows and Linux. These are observed completed jobs, not an assumption based on an earlier green commit.
+
+Recovery downloaded artifact `11117908898`, verified its ZIP and SHA-256 `5197475534e15980157ebbc0d8ebfa18f80891bf2e44e1e574ae422224d7255b`, and reconstructed source tree **`7debef1ee27af1dcb44c86de133b1c1a9d3dfefb`**, exactly matching that commit. No additional unpublished source files were found in the current mounted workspace. The downloaded Linux binary's result/artifact help, empty-host startup/status and orderly shutdown were invoked successfully; no native module or model was started. Recovery found documentation lagging behind the code, not a missing result implementation. These README updates do not change the compiled source.
+
+**Resume from the existing code**, not from the old bridge.3 instructions. Relevant files: `modules/muse/results.mjs`, `src/artifacts.rs`, `src/store/results.rs`, and their wired paths in `src/store/mod.rs`, `src/store/runtime.rs` and `src/main.rs`. First finish the remaining Muse recovery/result-consumer boundaries, then direct OpenCode V2 on the same host contract. Do not rewrite the core or restart the platform selection.
+
+The read-only workflow pins Rust 1.98.1/Cargo.lock, checks formatting without rewriting it and builds with `--locked`. Binary artifacts contain the exact source SHA and source archive. No `cargo test`, model calls, OAuth login or global installation is part of these checks. Windows compilation does not qualify native launch/ACL behavior on the owner's machine.
 
 ## Build and local core
 
@@ -28,7 +35,7 @@ cargo build --locked --release --bin swarm
 .\target\release\swarm.exe --data-dir C:\SwarmState host
 ```
 
-Use an initially empty dedicated local directory. The host keeps its ownership lock/marker, database and operator credential there. It refuses unrelated nonempty directories rather than changing their permissions. Global PATH, UAC and vendor settings are untouched. Read-only CLI calls do not initialize a database or launch a host.
+Use an initially empty dedicated local directory. The host keeps its ownership marker/lock, database, artifacts and operator credential there. It refuses unrelated nonempty directories rather than changing their permissions. Global PATH, UAC and vendor settings are untouched. Read-only CLI calls do not initialize a database or launch a host.
 
 In another PowerShell:
 
@@ -48,36 +55,43 @@ After a lost reply, repeat the identical method/payload and original request ID.
 
 ## Native Muse and client integration
 
-Follow [modules/muse/README.md](modules/muse/README.md): enable a private route, reserve agent.open, register a module credential for the returned binding/generation, install the locked module-local SDK, and independently start bridge.mjs with the actual native executable. The example route is disabled. A route/status query alone cannot launch Muse.
+Follow [modules/muse/README.md](modules/muse/README.md). Enable a private route, reserve `agent.open`, register its scoped module credential, install the locked module-local SDK and independently start the bridge with the actual native executable. The shipped route remains disabled. Match `moduleArtifactId` to the route; new example bindings use **`muse-sdk-1.3.0-bridge.4`**. Do not overwrite an already running bridge in place.
 
-The native executable retains its subscription and auth. Requested effort is an explicit per-turn field; readback and actual inference evidence remain distinct. No Go/API route silently substitutes for Muse Code Max. Full history remains native, not duplicated into SQLite.
+The executable retains its native subscription/auth. Requested effort, effective setting and actual inference evidence remain distinct. No Go/API route silently substitutes for Muse Code Max. Full conversation history remains native rather than duplicated into SQLite.
 
-`agent.send` uses explicit next_turn or exact-turn steer. `agent.reply` submits supported native approval/user-input commands with their actual IDs. The bridge automatically acknowledges only the MSP **presentation receipt** `{}`; this is not permission or an answer. Protocol handling does not wait for GM to make the substantive decision.
+`agent.send` supports next_turn or exact-turn steer. `agent.reply` submits native approval/user-input commands with their actual IDs. The bridge immediately acknowledges only the MSP presentation receipt `{}`; that is not approval or a substantive answer. `agent.configure/goal/refresh/reconcile` retain their different application boundaries. Goal start requires a configured standing effort; refresh is not resume. Unknown outcomes are not resolved by an automatic new prompt.
+
+### Task-specific children
+
+`task claim` accepts `--binding-id` and `--generation`. After native delegation, `swarm family BINDING --generation 1` returns retained evidence. `swarm task bind ATTEMPT --assignment NAME --session CHILD --turn TURN --observation-id ID` associates an already observed run without starting it again. Subsequent family pages use the same observation ID. Parent idle does not erase children; an old completion does not close a newer assignment.
+
+### Result pages and local artifacts
+
+`swarm result BINDING --generation 1 --file selector.json` queues one read of a pinned native item revision. The Muse-specific selector chooses a subagent result, complete agent message, stored output or patch. Read the returned Operation to obtain `result.details.artifact_ref`, then use:
 
 ```powershell
-& $swarm --data-dir C:\SwarmState --request-id register-w1 client-create W1 --role manager --out C:\SwarmState\W1.credential.json
-& $swarm --data-dir C:\SwarmState --credential C:\SwarmState\W1.credential.json task list
+swarm artifact get ARTIFACT_ID
+swarm artifact read ARTIFACT_ID --offset 0 --length 65536
 ```
 
-`message.send` accepts recipient/text and optional in_reply_to. Readers have independent cursors. This is a durable local mailbox, not yet automatic forwarding/wake for every harness. Same-user roles are cooperative controls, not OS isolation. Module credentials are separately scoped and cannot accept Tasks or impersonate GM.
+Supply the normal host/data-dir/credential options. See the module README for selector fields and paging. Artifact offsets are local to that retained page; native-result offsets refer to the source body. The 64 KiB page size limits transport buffers, not the total result size. A retained page is not proof that every page or the entire Task is accepted. No result observation calls the state-changing `subagent/readResult` or fetches arbitrary reference URLs/paths.
 
-Additional native controls: `agent.configure`, `agent.goal`, `agent.refresh`, `agent.reconcile`. See the module README for exact fields and native admission/application boundaries. Goal start requires a configured standing effort; refresh is not native resume. Unknown outcomes may be resolved by later evidence, never by an automatic new prompt.
+### Clients and mailbox
 
-Public methods: `host.status/mode`, `client.register/list`, `task.create/get/list/revise/claim/dispatch`, `attempt.get/release/bind_producer`, `agent.open/state/list/family/send/reply/configure/goal/refresh/reconcile`, `route.list`, `operation.get/list/cancel`, `message.send/read`, `report.delta`. Module methods: `module.hello/next/outcome/observe`. Release never kills a process or manufactures acceptance and refuses known unfinished assigned runs. Registered producers use exact native run evidence, not a session-wide idle flag. Task submission/acceptance and autonomous handoff remain future code; unsupported methods fail explicitly.
+```powershell
+swarm --data-dir C:\SwarmState --request-id register-w1 client-create W1 --role manager --out C:\SwarmState\W1.credential.json
+swarm --data-dir C:\SwarmState --credential C:\SwarmState\W1.credential.json task list
+```
 
-### Task-specific child evidence
+`message.send` accepts recipient/text and optional in_reply_to. Readers have independent cursors. This is a durable mailbox, not automatic wake/forwarding for every harness. Same-user roles are cooperative controls, not OS isolation. Module credentials cannot accept Tasks or impersonate GM.
 
-`swarm task claim` now accepts `--binding-id` / `--generation`. After native delegation, `swarm family BINDING --generation 1` returns a recorded observation and actual child/run identities. `swarm task bind ATTEMPT --assignment NAME --session CHILD --turn TURN --observation-id ID` links that existing run without sending another prompt. Subsequent family pages use the same observation ID. An old completion cannot close a newer assignment; parent idle does not erase registered children. See the module README for the exact boundaries. No observer consumes native results through `subagent/readResult`.
+Public methods: `host.status/mode`, `client.register/list`, `task.create/get/list/revise/claim/dispatch`, `attempt.get/release/bind_producer`, `agent.open/state/list/family/send/reply/configure/goal/refresh/reconcile/result`, `artifact.get/read`, `route.list`, `operation.get/list/cancel`, `message.send/read`, `report.delta`. Module methods: `module.hello/next/outcome/observe/result`. Release never kills a process or manufactures acceptance. Unsupported methods fail explicitly.
 
-## Next work
+## Remaining work and design
 
-This continuation implements the controls above without changing the nine-table migration, dependency locks, toolchain or introducing new services. Native application and long-run recovery still require the actual installed Muse executable and authorized model route; compilation is not that qualification.
+Complete Muse recovery/result-consumer integration, then direct OpenCode V2. Preserve the shared Codex/native-subscription targets; the [SIWC note](docs/runtime-notes.md) describes an optional OAuth route, not installed authorization.
 
-Complete and qualify Muse, then direct OpenCode V2 on the same host contract. Preserve the shared Codex/native-subscription targets. The [SIWC note](docs/runtime-notes.md) describes an optional OAuth route, not installed authorization.
-
-**[Issue #1: OpenCodex module](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/1) is scheduled after the main controller code.** Source review covers v2.73.0 / 569e3e7d and the headless Management API. It composes with native Codex as a provider-service module, not a new scheduler. No OpenCodex installation or user configuration was changed.
-
-## Design and development
+**[Issue #1: OpenCodex module](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/1) remains after the main controller code.** It composes with native Codex as a provider-service module, not a second scheduler. No OpenCodex installation or user configuration was changed.
 
 | Document | Purpose |
 | --- | --- |
@@ -88,8 +102,6 @@ Complete and qualify Muse, then direct OpenCode V2 on the same host contract. Pr
 | [Donors](docs/agent_swarm.donors-20260929.toml) | Source candidates, not installed runtimes |
 | [Lessons](docs/lessons-learned.md) / [runtime notes](docs/runtime-notes.md) / [candidates](docs/candidate-notes.md) | On-demand reference, not extra worker instructions |
 
-This README is the readiness entry point. Dated design-stage statements do not override present code. Work in main, without worktrees. Implement useful paths, then focused formatting/Clippy; do not build a broad test framework instead of the product.
+This README is the implementation-status entry point. Dated design-stage statements do not override present code. Work in main, without worktrees. Implement useful paths, then focused formatting/Clippy; do not build a broad test framework instead of the product.
 
-The nine-table runtime migration remains unchanged. Schema identity/version and initial metadata are committed atomically. Foreign/draft/newer databases and missing credentials are not silently replaced. Preserve a cleanly stopped state directory in full; never copy only a live DB without WAL.
-
-Historical briefs remain at b5a437f57488f8ddcdcc3f4aaea24746a3ea1f62 for provenance, not present installation defaults. Current code and SDK lock no longer depend on temporary Actions artifact retention.
+The nine-table runtime migration remains unchanged. Schema identity/version and initial metadata are committed atomically. Foreign/draft/newer databases and missing credentials are not silently replaced. Preserve a cleanly stopped state directory in full; never copy only a live DB without WAL. Historical briefs remain in Git history for provenance, not installation defaults. Temporary Actions retention is not dependency or source authority.
