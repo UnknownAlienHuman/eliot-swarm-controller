@@ -2,7 +2,7 @@ name: Rust
 on:
   push:
     branches: [main]
-    paths: ['src/**', 'migrations/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.github/workflows/rust.yml']
+    paths: ['src/**', 'migrations/**', 'modules/muse/**', 'config/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.github/workflows/rust.yml']
   workflow_dispatch:
 permissions:
   contents: read
@@ -25,6 +25,15 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --locked --lib --bins --no-deps -- -D warnings
+      - name: Muse bridge syntax and pinned SDK import
+        shell: bash
+        run: |
+          node --version
+          node --check modules/muse/control.mjs
+          node --check modules/muse/bridge.mjs
+          cd modules/muse
+          npm ci --ignore-scripts --no-audit --no-fund
+          node --input-type=module -e 'import { spawnMspConnection, Connection } from "@muse-code/sdk"; if (typeof spawnMspConnection !== "function" || typeof Connection !== "function") throw new Error("SDK export mismatch");'
       - name: Build
         run: cargo build --locked --release --bin swarm
       - name: Record build inputs
@@ -35,6 +44,7 @@ jobs:
           printf '%s\n' "$GITHUB_SHA" > build-info/source-commit.txt
           rustc --version > build-info/rustc.txt
           cargo --version > build-info/cargo.txt
+          node --version > build-info/node.txt
           git diff --exit-code
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: success()
@@ -46,6 +56,9 @@ jobs:
             Cargo.lock
             config/
             README.md
+            modules/muse/*.mjs
+            modules/muse/*.json
+            modules/muse/README.md
             build-info/
             target/release/swarm
             target/release/swarm.exe
