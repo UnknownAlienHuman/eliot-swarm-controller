@@ -77,9 +77,11 @@ pub(super) fn record(
         }
         return Ok(json!({"recorded":true,"replayed":true,"artifact_ref":artifact.artifact_id}));
     }
+    let sql_length = i64::try_from(artifact.byte_length)
+        .map_err(|_| Error::invalid("artifact length exceeds the SQLite integer range"))?;
     let now = model::now_ms()?;
     tx.execute("INSERT INTO artifacts(artifact_id,relative_path,kind,byte_length,content_digest,created_at_ms,metadata_json) VALUES(?1,?2,'native_result_page',?3,?4,?5,?6)",
-        params![artifact.artifact_id,artifact.relative_path,artifact.byte_length,artifact.content_digest,now,model::canonical(&artifact.metadata)?])?;
+        params![artifact.artifact_id,artifact.relative_path,sql_length,artifact.content_digest,now,model::canonical(&artifact.metadata)?])?;
     let details = json!({"completion_condition":"result_page_persisted","artifact_ref":artifact.artifact_id,
     "byte_length":artifact.byte_length,"page_sha256":artifact.content_digest,
     "source":artifact.metadata["source"],"offset_bytes":artifact.metadata["offset_bytes"],
@@ -104,7 +106,7 @@ pub(super) fn record(
 }
 
 pub(super) fn get(db: &Connection, id: &str) -> Result<ArtifactRecord> {
-    let row: Option<(String,u64,String,String)> = db.query_row(
+    let row: Option<(String,i64,String,String)> = db.query_row(
         "SELECT relative_path,byte_length,content_digest,metadata_json FROM artifacts WHERE artifact_id=?1 AND kind='native_result_page'",
         [id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
     let (relative_path, byte_length, content_digest, metadata) =
@@ -112,7 +114,8 @@ pub(super) fn get(db: &Connection, id: &str) -> Result<ArtifactRecord> {
     Ok(ArtifactRecord {
         artifact_id: id.to_string(),
         relative_path,
-        byte_length,
+        byte_length: u64::try_from(byte_length)
+            .map_err(|_| Error::new("ARTIFACT_DAMAGED", "negative stored artifact length"))?,
         content_digest,
         metadata: serde_json::from_str(&metadata)?,
     })
