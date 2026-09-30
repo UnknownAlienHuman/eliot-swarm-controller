@@ -1,6 +1,6 @@
 # ELIOT Swarm — план реализации v6 к архитектуре v18
 
-**29.09.2026. Проект контрактов и последовательности работ. Rust-сервис ещё не реализован.**
+**Уточнено 30.09.2026. Проект контрактов и последовательности работ. Rust-сервис ещё не реализован.**
 
 Заменяет implementation-v5 как действующий план. Входная v17 доступна в [истории](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/b5a437f57488f8ddcdcc3f4aaea24746a3ea1f62/docs/review-v18/source-v17/agent_swarm.md). [Контракт модулей](agent_swarm.module-contract-v2.md) — общая граница adapters; vendor mappings из v16 сохраняются. [Reference v18](agent_swarm.spec-v18/README.md) уточняет initial SQL: origin, canonical dispatch и resource release; [сводка семи native-контрактов](runtime-notes.md) уточняет mappings. Наблюдения deployment сведены в [runtime notes](runtime-notes.md) и не заменяют документацию vendor.
 
@@ -10,7 +10,7 @@
 
 Модули checks/forge/reports/doctor первоначально обычные Rust-модули. Внешняя process-граница нужна native SDK, а не каждому файлу приложения. Один manager ведёт несколько Task через native детей. Main-only без Git worktrees сохраняется. Это архитектура прототипа, а не попытка перенести весь production Governor.
 
-Изменения v18: origin-уникальность Task, однократная начальная доставка, dispatch guards, действующие настройки, resource release и ясная граница retention. Сохраняются native mappings v16 и девять таблиц. Новых scheduler/services/build frameworks нет.
+Изменения v18: origin-уникальность Task, однократная начальная доставка, dispatch guards, действующие настройки, resource release и ясная граница retention. Уточнение 30.09: выбор владельца первоначального запуска, run-scoped ProducerRef, provenance кэша и адресные отрицательные review-переходы. Сохраняются native mappings v16 и девять таблиц. Новых scheduler/services/build frameworks нет.
 
 ## 2. Файлы одного crate
 
@@ -45,9 +45,9 @@ migrations/001_core.sql
 | Сущность | Инвариант |
 |---|---|
 | Task | Одна текущая revision, phase, requirements и зависимости с требуемым результатом |
-| Attempt | Неизменяемый task snapshot; один текущий owner Task до explicit release |
+| Attempt | Неизменяемые task snapshot и start_owner; один текущий owner Task до explicit release |
 | Binding | Одна native generation root-линии; несколько Attempt; server lifecycle owner и connection owner разделены |
-| ProducerRef | Root/child, связанный с Attempt через assignment и наблюдённую native identity |
+| ProducerRef | Assignment + root/child session + конкретный native run/turn; неизвестная correlation обозначается явно |
 | Operation | Одно сохранённое намерение и известный исход его доставки/исполнения |
 | CheckRun | Один профиль на зафиксированных inputs, отдельный от worker |
 | Artifact | Завершённый файл; ссылка не является свидетельством истинности содержимого |
@@ -59,7 +59,7 @@ Attempt: `reserved → running → submitted → accepted`; после откл�
 
 `released_at_ms` — отдельное решение. SQL unique index удерживает Task даже у accepted/failed Attempt, пока release не подтверждён. Не требуется закрывать детей, работающих над другими Task того же manager.
 
-Зависимость содержит `task_id + required_revision + required_phase`; при назначении фиксируется точная использованная acceptance/candidate identity в task snapshot. Любой PR, промежуточный merge или acceptance другой фазы не удовлетворяет её молча. Изменение зависимой specification показывает необходимость перепланирования; не переписывает уже запущенный Attempt. Циклические группы GM объединяет/переформулирует, не требуется общий DAG-language.
+Зависимость содержит `task_id + required_revision + required_phase`; при назначении фиксируется `acceptance_operation_id` вместе с точной acceptance/candidate identity в task snapshot. Сам tuple revision/phase/candidate не отличает повторную приёмку от ранее отозванного решения. Любой PR, промежуточный merge или acceptance другой фазы не удовлетворяет её молча. Изменение зависимой specification показывает необходимость перепланирования; не переписывает уже запущенный Attempt. Циклические группы GM объединяет/переформулирует, не требуется общий DAG-language.
 
 TaskSpec.scope: `initial_paths`, `forbidden_paths`, `prerequisite_policy`.
 При разрешении `owner_module_prerequisites` manager может дописать необходимый контракт/producer
@@ -75,12 +75,14 @@ TaskSpec.scope: `initial_paths`, `forbidden_paths`, `prerequisite_policy`.
 | `agent.attach` | Подключает явно указанную существующую root-сессию после сверки владельца; не создаёт новую при ошибке. |
 | `task.create` | Сохраняет specification; imported root work дедуплицируется по разрешённому origin_key. Native effects отсутствуют. |
 | `task.revise` | CAS expected_revision, полная новая specification и сброс текущей acceptance; сохраняет прежний snapshot/history, не запускает нового writer. |
-| `task.claim` | Только резервирует Attempt. Менеджер может затем использовать native spawn; claim не отправляет второй prompt. |
-| `task.dispatch` | Атомарно закрепляет единственный start_operation_id Attempt. На claimed Attempt тот же owner; повтор первоначального назначения возвращает прежний start, даже с новым client_request_id. |
-| `attempt.bind_producer` | Связывает наблюдённого native child/root с Attempt; не запускает исполнение. |
+| `task.claim` | Только резервирует Attempt; `start_owner=native_manager` по умолчанию. До native spawn выбран неизменяемый путь старта; для последующего dispatch явно выбирают controller. |
+| `task.dispatch` | Создаёт controller-start Attempt либо использует уже claimed controller-start Attempt того же owner; сохраняет единственный start_operation_id. На native_manager-start возвращает START_OWNED_BY_MANAGER без отправки. |
+| `attempt.bind_producer` | Связывает assignment с наблюдённым child/root и его run/turn. Смена беседы или новая активация не перетирает старые ProducerRef. Не запускает исполнение. |
 | `agent.send/configure/reply` | Адресная команда конкретному binding; проверяется действительная native capability. |
-| `task.submit` | Сохраняет immutable submission и candidate. Не освобождает производителя автоматически. |
-| `task.accept` | CAS по revision/Attempt/candidate и требуемым checks; GM или разрешённая политика принимает phase. |
+| `task.submit` | CAS по текущему submission_ref (null для первой сдачи); сохраняет immutable submission/candidate. Не освобождает производителя. |
+| `task.accept` | CAS по revision/Attempt/submission/candidate и checks; сохраняет accepted_operation_id. GM или разрешённая политика принимает phase. |
+| `task.request_changes` | Точное замечание к текущей submission/candidate. Stale review остаётся evidence; актуальная работа не откатывается. |
+| `task.invalidate_acceptance` | Отзыв одного acceptance_operation_id с основанием. Текущая acceptance очищается только при совпадении этого ID. |
 | `attempt.release` | Завершает Task-specific ownership после disposition производителя и unresolved effects. |
 | `message.send/read/reply` | Durable directed mailbox; чтение не удаляет сообщение. |
 | `check.run` | Сохраняет запрос; возвращает одинаковый активный CheckRun только своей Attempt либо новый. Cross-attempt reuse — только завершённый machine cache с новой привязкой. |
@@ -113,10 +115,13 @@ CLI и MCP используют один API. MCP не обязан публик
 | `revise_task` | Idempotency/CAS → previous/new specification в истории → новая revision и cleared acceptance; живой Attempt не переписывается |
 | `begin_send` | CAS queued/due → sending после current Task/owner/desired mode/authority/settings guards, prerequisite outcome и start slot; native ID сохранён; отправка только после COMMIT |
 | `record_runtime_fact` | Dedupe настоящего source ID → факт + projection/operation update → commit |
-| `record_submission` | Проверка owner/revision → ссылки candidate/submission + запрошенный CheckRun |
+| `record_submission` | Owner/revision и CAS предыдущей submission → ссылки candidate/submission + запрошенный CheckRun |
 | `claim_check_resource` | Queued CheckRun + свободный resource_key → resource claim + Operation sending в одной транзакции, затем spawn |
 | `record_check_result` | Exit/coverage/result artifact → CheckRun outcome; resource release только при известном disposition собственного Job, не по verdict |
-| `accept_task` | Current revision + exact submitted candidate + актуальность dependency receipts + policy checks/decision owner → accepted reference |
+| `accept_task` | Current revision + exact submission/candidate + действительность dependency decision IDs + checks/decision owner → accepted_operation_id и references |
+| `request_changes` | Expected revision/Attempt/submission/candidate → needs_correction + один адресный feedback; stale → только исторический факт |
+| `invalidate_acceptance` | Exact acceptance Operation → durable invalidation; current pointer очищается только если всё ещё ссылается на это решение |
+| `reuse_check_result` | Пригодный исходный process CheckRun + exact inputs → новый passed/cached CheckRun своей Attempt; без resource claim/spawn |
 | `release_attempt` | Task-specific producer disposition и отсутствие нерешённых мутаций → released_at_ms |
 | `upsert_incident` | Один incident, обновление evidence/counter, не более одной совпавшей pending action |
 | `record_publication` | Exact remote result/readback + сохранённый publication intent → applied fact; bookkeeping/cleanup отдельными Operations |
@@ -130,7 +135,9 @@ Reference SQL обеспечивает cardinality/FK/shape, **но не** со�
 
 `tasks.origin_key` — optional canonical identity только корневой импортированной работы; пример синтетический: `github:github.example:Issue:9042`. Forge resolver использует серверную идентичность и сохраняет aliases отдельно, не декодирует opaque IDs и не доверяет одному URL/номеру. Для импортированной Issue поле обязательно на уровне Application. Повтор с другим project alias возвращает существующую Task/сообщает конфликт binding, не создаёт дубль. Архивирование не освобождает origin; повторное открытие меняет прежнюю Task. Внутренние подзадачи имеют собственные IDs, source reference — не root identity. Автоматически угадывать semantic duplicate произвольных текстовых задач не нужно.
 
-`attempts.start_operation_id` — единственная начальная доставка. Начальная отправка допускается только из reserved; если bind_producer уже установил native работу и running, initial dispatch отвергается, используются сообщения существующему producer. Транзакция reserve/dispatch проверяет этот slot. Первый caller создаёт start Operation и указатель, второй получает уже сохранённый start handle; его собственный request receipt — settled/coalesced и никогда не попадает к native dispatcher. Изменившийся target/payload при занятом slot — конфликт, не скрытая повторная выдача. Start slot не сбрасывается после возможного исполнения. После доказанного непринятия retry продолжает ту же Operation; после отмены/смены исполнения новый Attempt требует обычного release. Коррекции, ответы и goal controls не притворяются новым task.dispatch.
+`attempts.start_owner` выбирается при резервировании без последующей смены: controller или native_manager. `task.dispatch` без Attempt выбирает controller; `task.claim` по умолчанию native_manager. Режим задаёт **владельца начала**, а не запрещает делегирование после получения задачи. Пока менеджер ещё не записал `bind_producer`, его native_manager-claim всё равно не может получить второй старт от controller. Промежуточный crash требует адресной сверки семьи; reserved не является доказательством отсутствия native spawn.
+
+`attempts.start_operation_id` — единственная начальная доставка только controller-start. Начальная отправка допускается только из reserved; если bind_producer уже установил native работу и running, initial dispatch отвергается, используются сообщения существующему producer. Транзакция reserve/dispatch проверяет этот slot. Первый caller создаёт start Operation и указатель, второй получает уже сохранённый start handle; его собственный request receipt — settled/coalesced и никогда не попадает к native dispatcher. Изменившийся target/payload при занятом slot — конфликт, не скрытая повторная выдача. Start slot не сбрасывается после возможного исполнения. После доказанного непринятия retry продолжает ту же Operation; после отмены/смены исполнения новый Attempt требует обычного release. Коррекции, ответы и goal controls не притворяются новым task.dispatch.
 
 ## 6. Dispatch: точная граница повтора
 
@@ -153,7 +160,7 @@ Admission сохраняет запрос, но не обещает бессро
 
 Новая информация может прийти между проверкой и socket write. Обещаем точку допуска на COMMIT `queued→sending`, а не невозможную атомарность SQLite+vendor. До неё revoke/revise/drain отменяет или отклоняет queued работу с явной причиной. После неё возможный эффект учитывается как sending/unknown и, если требуется, исправляется адресной отдельной командой. Native inbox также является уже допущенным эффектом; нельзя удалить местную запись и обещать retract без native подтверждения.
 
-`UPDATE ... RETURNING` не является COMMIT. Statement вычитывается/закрывается; Transaction::commit завершается; только после этого выдаётся внутренний DispatchTicket. При commit error никакого native send нет; при неопределённом состоянии БД — recovery без повтора. Ticket — данные передачи, не ещё одна таблица. Пример SQL в spec ограничен task.dispatch; остальные methods проверяют свои scopes, не копируют его вслепую.
+`UPDATE ... RETURNING` не является COMMIT. Statement вычитывается/закрывается; Transaction::commit завершается; только после этого выдаётся внутренний DispatchTicket. При commit error никакого native send нет; при неопределённом состоянии БД — recovery без повтора. Ticket — данные передачи, не ещё одна таблица. Пример SQL в spec ограничен task.dispatch с start_owner=controller; остальные methods проверяют свои scopes, не копируют его вслепую.
 
 ### Settings, которые ещё действуют
 
@@ -212,7 +219,13 @@ Terminal того же turn не возвращается в working из ста
 
 Сдача — immutable candidate/submission. Проверки могут идти, пока manager работает над другими Issue. Принимается только candidate, соответствующий текущей task revision и нужной phase. Новая сдача создаёт новый reference, а не меняет старый artifact.
 
+`ProducerRef` хранит assignment_id, native session и доступный run/turn/child-run ID либо correlated command ID. Terminal с той же session, но от прошлого run, не закрывает новый assignment. При отсутствии native корреляции автоматический release по одному session status невозможен; явное закрытие manager-assignment остаётся cooperative evidence. Idle возобновляемой беседы не равен закрытию всех её будущих активаций.
+
 Release требует Task-specific закрытия assignment и разрешения возможных эффектов. Для child это наблюдённый terminal/cancel disposition именно его задания. Для root, ведущего несколько Task, — явное закрытие assignment менеджером плюс отсутствие относящихся pending операций; не требуем terminal всей root. Это cooperative evidence, а не OS-доказательство, что full-access агент физически не сможет позже изменить файл. При неясной связи удерживается только спорная работа/область.
+
+`task.request_changes` применяется только к непринятой сдаче: Task open, unreleased Attempt submitted/needs_correction. Сравнивает expected Task revision, Attempt, submission_ref и candidate_ref со всё ещё текущей сдачей; для accepted используется invalidate_acceptance. При совпадении owner остаётся, state=needs_correction, feedback сохраняется атомарно и доставляется без нового initial dispatch. При несовпадении — STALE_REVIEW и сохранение evidence без мутации текущей работы. Повторное замечание о той же сдаче не создаёт второго feedback; новая полезная находка имеет отдельную идентичность.
+
+`task.accept` создаёт одно решение с ID своей settled Operation и сохраняет его в tasks.accepted_operation_id. Повтор при неизменённой текущей acceptance возвращает существующее решение. `task.invalidate_acceptance` называет этот ID, причину и evidence: валидирует method/task/Attempt/revision/candidate исходной Operation и сохраняет адресный факт отзыва. Если current pointer уже другой, новое решение не очищается. Если совпадает, Task становится open и её current acceptance-поля очищаются; история остаётся. Unreleased producer сохраняет ownership и может исправлять в своей Attempt; released Attempt остаётся исторической, новый запуск проходит обычный claim. Отзыв не делает новый writer автоматически и не меняет specification revision.
 
 Acceptance dependency проверяется снова в `accept_task`, не только в reserve_attempt. Если её отозвали, результат consumer получает needs_revalidation по конкретной причине: существующий diff и check сохраняются, писатель не перезапускается автоматически. Более новая producer revision сама по себе не уничтожает старую принятую revision: допустимость pinned dependency берётся из сохранённой истории/политики Task. Результат, требующий именно новой версии, должен иметь соответствующую requirement revision. Никакого blanket cascade revoke всех уже принятых consumers. Минимальная materialized карта dependencies строится из текущих Task, не новый DAG-store.
 
@@ -230,9 +243,11 @@ complete-family. В `state_json` хранится provenance/freshness исто�
 
 ## 10. Checks, artifacts, миграции
 
-CheckSpec: explicit executable/argv/cwd/env, candidate/source manifest, toolchain, features/targets, profile revision, parser и cache policy. Сохраняется Operation до запуска процесса. Один активный check на `(attempt_id, cache_key)`; один владелец resource_key target-dir до explicit release. Отдельные Attempts не делят один исполняемый CheckRun: это убирает необходимость generic subscriber/cancel machinery. Повтор своей проверки возвращает handle, а disconnect waiter не отменяет job. Для уже законченного пригодного machine cache допускается новый собственный CheckRun с result_ref/cached_from и заново проверенными acceptance requirements. Semantic verdict чужой Task по совпадению source digest не переносится.
+CheckSpec: explicit executable/argv/cwd/env, candidate/source manifest, toolchain, features/targets, profile revision, parser и cache policy. Сохраняется Operation до запуска процесса. Один активный check на `(attempt_id, cache_key)`; один владелец resource_key target-dir до explicit release. Отдельные Attempts не делят один исполняемый CheckRun: это убирает необходимость generic subscriber/cancel machinery. Повтор своей проверки возвращает handle, а disconnect waiter не отменяет job. Для уже законченного пригодного machine cache допускается новый собственный CheckRun с result_ref/cached_from_check_id и заново проверенными acceptance requirements. Semantic verdict чужой Task по совпадению source digest не переносится.
 
-`resource_claimed_at_ms/resource_released_at_ms` независимы от state результата. Atomic claim до spawn исключает второго writer; launch-unknown оставляет claim до reconciliation. Failed/error/incomplete могут удерживать ресурс. `release_check_resource` требует known failed-before-spawn либо проверенного отсутствия owned job members; верхний PID/EOF/timeout и отсутствие уведомления Job не достаточны. Не ждём Job handle как универсальный all-processes-ended сигнал: используем accounting/process identity по Windows contract. Explicit kill-on-close для собственных checks не распространяется на native manager. `passed` разрешён только после завершения исполнения, обработки output и release. При недоступном OS evidence держим один спорный ресурс, не весь пул [N10].
+Cache hit сохраняется как отдельная completed Operation и passed CheckRun: cached_from_check_id ссылается сразу на исходный process CheckRun, result_ref совпадает с его immutable machine result. У нового record нет resource claim/release, process identity, собственного exit_code или started_at_ms; finished_at_ms — время решения о reuse, не время компиляции. Store проверяет source passed/complete/not-invalidated, совпадение существенных inputs/profile/parser и доступность evidence; FK гарантирует лишь существование строки. Нельзя кэшировать semantic verdict другой Task. Если source непригоден, выполняется обычная проверка; не синтезируется ложный PASS. DDL различает process и cached result по nullable cached_from_check_id, без новой таблицы.
+
+`resource_claimed_at_ms/resource_released_at_ms` независимы от state результата. Atomic claim до spawn исключает второго writer; launch-unknown оставляет claim до reconciliation. Failed/error/incomplete могут удерживать ресурс. `release_check_resource` требует known failed-before-spawn либо проверенного отсутствия owned job members; верхний PID/EOF/timeout и отсутствие уведомления Job не достаточны. Не ждём Job handle как универсальный all-processes-ended сигнал: используем accounting/process identity по Windows contract. Explicit kill-on-close для собственных checks не распространяется на native manager. `passed` для process-run разрешён только после завершения исполнения, обработки output и release; cache-hit использует описанную выше отдельную ветвь и не владеет ресурсом. При недоступном OS evidence держим один спорный ресурс, не весь пул [N10].
 
 Cache разрешён только для объявленных воспроизводимых проверок при совпавших существенных inputs. Наличие network/time/external state без их версии выключает cache reuse, но не запрещает запуск диагностики. Новый profile revision меняет cache key; повтор старого запроса использует старый resolved profile.
 
@@ -345,7 +360,7 @@ Operation использует устойчивый schedule+slot key. Посл�
 
 | Пакет | Результат | Проверяемая граница |
 |---|---|---|
-| C01 | model/config/Store + initial 001 schema v18 | create→origin/claim/start slot→один native dispatch; guards/reconnect/confликты ID |
+| C01 | model/config/Store + initial 001 schema v18 | create→origin/claim/start owner→одна queued Operation; guards/конфликты ID. Native-send проверяется в C03/C04, не требуется на C01. |
 | C02 | host/CLI/IPC | singleton, durable ack/status, reader/writer, disconnect клиента |
 | C03 | Muse SDK bridge | Max/setup, family, reply/steer, reconnect без SDK.close |
 | C04 | OpenCode V2 | та же API-семантика, volatile events+snapshot, без CLI observer |
@@ -374,7 +389,7 @@ sccache override. Проверяется конкретный модуль пр�
 
 v18 проверяет собственные v17/plan-v5/module-v1 и конкретные reference SQL-сценарии. Не повторный общий поиск vendor-платформ. В DDL по-прежнему девять таблиц; добавлены origin_key, start_operation_id, resource claim/release. Runtime migrations отсутствуют: это изменение initial reference ещё не реализованного продукта.
 
-SQL и небольшие последовательные модели проверены отдельно; их результаты не являются тестами многопоточного Rust-host, Windows Job, native SDK или API провайдера. Нет установки доноров, модельных вызовов, изменений GitHub/текущего роя. Пины сохранены. [Сохранённые контрпримеры](lessons-learned.md#3-исправленные-ошибки-собственной-спецификации) ссылаются на исходные воспроизведения в Git history. Редакционная чистка 30.09.2026 не меняет этот план v6.
+SQL и небольшие последовательные модели проверены отдельно; их результаты не являются тестами многопоточного Rust-host, Windows Job, native SDK или API провайдера. Нет установки доноров, модельных вызовов, изменений GitHub/текущего роя. Пины сохранены. [Сохранённые контрпримеры](lessons-learned.md#3-исправленные-ошибки-собственной-спецификации) ссылаются на исходные воспроизведения в Git history. После чистки уточнены контракты старта, cache reuse и отрицательного review. [Lessons §3.1](lessons-learned.md#31-проверка-согласованности-контрактов-30092026) отделяет DDL-контрпример от последовательных моделей. Текущие уточнения не являются реализованным Store.
 
 ## Источники
 

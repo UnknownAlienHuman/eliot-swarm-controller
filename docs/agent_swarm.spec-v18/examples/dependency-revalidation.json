@@ -5,7 +5,8 @@
     "task_id": "A",
     "revision": 1,
     "phase": "implementation",
-    "candidate_ref": "candidate-A1"
+    "candidate_ref": "candidate-A1",
+    "acceptance_operation_id": "accept-A1"
   },
   "cases": [
     {
@@ -19,5 +20,14 @@
       "stop_B_automatically": false,
       "discard_B_artifacts": false
     }
-  ]
+  ],
+  "same_candidate_accepted_again": {
+    "old_decision": "accept-A1",
+    "new_decision": "accept-A2",
+    "task_revision": 1,
+    "candidate_ref": "candidate-A1",
+    "late_invalidate": "accept-A1",
+    "expected_current_decision": "accept-A2",
+    "clear_current_acceptance": false
+  }
 }

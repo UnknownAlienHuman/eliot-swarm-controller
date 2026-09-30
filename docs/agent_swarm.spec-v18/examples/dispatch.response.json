@@ -6,6 +6,7 @@
     "attempt_id": "attempt-demo-1",
     "state": "queued",
     "admission": "durable_local",
-    "native_admission": "not_observed"
+    "native_admission": "not_observed",
+    "start_owner": "controller"
   }
 }

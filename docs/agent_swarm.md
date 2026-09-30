@@ -1,12 +1,12 @@
 # ELIOT Swarm Prototype — архитектура v18
 
-**29 сентября 2026. Проект реализации. Rust-сервис ещё не написан.**
+**Уточнено 30 сентября 2026. Проект реализации. Rust-сервис ещё не написан.**
 
 Headless Rust-контроллер над родными executors. Назначение — устойчиво обслуживать реальный рой, а проверенные модули и результаты перенести в Eliot Memory OS. Не новый model harness и не универсальная агентная платформа.
 
 **Действующий комплект:** эта архитектура → [контракт модулей](agent_swarm.module-contract-v2.md) → [план реализации v6](agent_swarm.implementation-v6.md) → [reference DDL/примеры](agent_swarm.spec-v18/README.md). [README](../README.md) фиксирует фактическую готовность. [Выводы прежних проверок](lessons-learned.md) — адресная справка, не дополнительные правила для workers.
 
-Native факты сохранены в [runtime notes](runtime-notes.md) с прежними источниками и границами. [Candidate notes](candidate-notes.md) сохраняют идеи исследования harness; его GUI/phone/лимиты не переопределяют наши требования. Редакционная чистка 30.09.2026 не меняет архитектурные решения v18.
+Native факты сохранены в [runtime notes](runtime-notes.md) с прежними источниками и границами. [Candidate notes](candidate-notes.md) сохраняют идеи исследования harness; его GUI/phone/лимиты не переопределяют наши требования. После чистки внесены адресные уточнения запуска, provenance кэша и review-переходов; история — [lessons §3.1](lessons-learned.md#31-проверка-согласованности-контрактов-30092026). Пути действующих документов сохранены.
 
 ## 1. Что делает систему универсальной
 
@@ -70,7 +70,7 @@ Core зависит от `RuntimePort`, adapter — от SDK. Vendor types, tool
 | Operation | Сохранённое намерение и наблюдённый исход |
 | CheckRun | Проверка конкретного кандидата и профиля |
 
-Manager вправе вести несколько Issue. Принятие одной не ждёт всех посторонних детей; замена самой root требует сверки её семьи и continuation. Child→Attempt связывается assignment и native identity, не названием процесса или текстовым сходством. Пока связи нет, нельзя выдумывать disposition конкретного producer.
+Manager вправе вести несколько Issue. Принятие одной не ждёт всех посторонних детей; замена самой root требует сверки её семьи и continuation. Child→Attempt связывается с конкретным assignment и native run/turn, не только с session ID. Повторно используемая беседа ребёнка — не одно вечное исполнение. Позднее completion предыдущего run не завершает новый assignment. Когда runtime не даёт нужной correlation, сохраняется unknown и используется явное закрытие assignment менеджером, а не догадка по времени или тексту.
 
 **Импортированная корневая Issue имеет один `origin_key`, независимо от project alias и локального Task ID.** Повтор импорта возвращает существующий Task, не создаёт второго writer. Ключ разрешается по идентичности объекта forge; отображаемый URL/номер без repository scope не годится. Подзадачи с другими целями создаются отдельно и ссылаются на исходную Issue, не копируют её root identity.
 
@@ -96,13 +96,13 @@ reserved → running → submitted → accepted
           ↘ recovery_pending / failed / cancelled / superseded
 ```
 
-`released_at_ms` отдельно от terminal/accepted: возможные task-specific эффекты разрешаются до передачи владения. Accepted относится к точной phase/revision/candidate, не закрывает GitHub Issue автоматически. Зависимость указывает нужную revision/phase; любой merge не удовлетворяет её молча.
+`released_at_ms` отдельно от terminal/accepted: возможные task-specific эффекты разрешаются до передачи владения. Accepted относится к точной phase/revision/candidate и отдельной acceptance Operation (`accepted_operation_id`), не закрывает GitHub Issue автоматически. Зависимость указывает нужную revision/phase; любой merge не удовлетворяет её молча.
 
-`task.claim` только закрепляет. `task.dispatch` также сохраняет доставку. `Attempt.start_operation_id` назначается один раз: новый request ID не разрешает повторить первоначальный prompt той же Attempt. Совпадающее назначение возвращает первоначальный handle; дополнение — `agent.send`, смена исполнения — новая Attempt после disposition. `agent.open/attach` готовит root отдельно. Повтор client request сравнивается с исходным нормализованным JSON **до** нового разрешения alias/defaults; возвращает прежний результат и route. Другой payload под тем же ID — conflict.
+`task.claim` только закрепляет; до начала работы фиксируется `Attempt.start_owner`: `native_manager` для родного делегирования либо `controller` для нашей доставки. `task.dispatch` разрешён только во втором режиме. Поэтому промежуток между native spawn и `bind_producer` не разрешает второй первоначальный prompt. `task.dispatch` также сохраняет доставку. `Attempt.start_operation_id` назначается один раз: новый request ID не разрешает повторить первоначальный prompt той же Attempt. Совпадающее назначение возвращает первоначальный handle; дополнение — `agent.send`, смена исполнения — новая Attempt после disposition. `agent.open/attach` готовит root отдельно. Повтор client request сравнивается с исходным нормализованным JSON **до** нового разрешения alias/defaults; возвращает прежний результат и route. Другой payload под тем же ID — conflict.
 
 Одна `rusqlite::Connection` на DB-thread; короткие reads/writes, никаких HTTP/Git/LLM в транзакции. Статус читается из общей memory projection. WAL/FULL, foreign_keys включены до transaction; выбирается bundled SQLite с требуемым исправлением WAL-reset [S7–S8, S16].
 
-Новый [reference DDL](agent_swarm.spec-v18/migrations/001_core.sql) добавляет origin identity, initial-dispatch pointer и отдельное владение ресурсом CheckRun. Active-check dedupe ограничен одной Attempt. Девять таблиц сохранены. Это поправка initial schema ещё не реализованного продукта, не миграция рабочей БД. Подробности Store/C01 — в [плане v6](agent_swarm.implementation-v6.md).
+Новый [reference DDL](agent_swarm.spec-v18/migrations/001_core.sql) добавляет origin identity, initial-dispatch pointer и отдельное владение ресурсом CheckRun. Active-check dedupe ограничен одной Attempt. Девять таблиц сохранены. Это поправка initial schema ещё не реализованного продукта, не миграция рабочей БД. Подробности Store/C01 — в [плане v6](agent_swarm.implementation-v6.md). Уточнение 30.09 добавляет только три поля в те же таблицы: `start_owner`, `accepted_operation_id`, `cached_from_check_id`; это всё ещё reference initial schema, не миграция установленного сервиса.
 
 ## 6. Шина и управление нагрузкой
 
@@ -199,7 +199,7 @@ Client principal стабилен между переподключениями 
 
 ## 11. Проверки и общая рабочая копия
 
-CheckRunner — один обычный process executor. Cargo — профиль/parser, не новая build system. CheckSpec фиксирует candidate, profile/toolchain, features/targets и существенное env. Active dedupe — `(attempt_id, check_input_key)`: разные Task не делят один mutable CheckRun. Для одинакового повторного запроса своей Attempt возвращается существующий handle. Завершённый машинный cache может переиспользоваться по exact inputs, но создаёт отдельный результат-привязку новой Attempt; её требования проверяются заново. Network/time/external inputs без версии не выдаются за воспроизводимые.
+CheckRunner — один обычный process executor. Cargo — профиль/parser, не новая build system. CheckSpec фиксирует candidate, profile/toolchain, features/targets и существенное env. Active dedupe — `(attempt_id, check_input_key)`: разные Task не делят один mutable CheckRun. Для одинакового повторного запроса своей Attempt возвращается существующий handle. Завершённый машинный cache может переиспользоваться по exact inputs, но создаёт отдельный CheckRun новой Attempt с `cached_from_check_id`; её требования проверяются заново. Cache hit не запускает процесс, не захватывает target-dir и не выдумывает собственные PID/exit code/время исполнения: они читаются из исходного process CheckRun. Store проверяет его пригодность и отсутствие отзыва. Цепочки cache→cache не нужны: ссылка сразу на исходный процесс. Network/time/external inputs без версии не выдаются за воспроизводимые.
 
 Завершение process, exit code, parser status, coverage и findings независимы. `build-finished` не конец всего `cargo run/test`; stderr и non-JSON строки не исчезают. Error/incomplete не PASS при exit 0. В output drain timeout не убивается чужая агентная семья [S9].
 
@@ -213,13 +213,15 @@ Build resources: один writer target-dir, согласованные jobs Car
 
 Писатель возвращает candidate, проверка — result, decision owner принимает phase. Сначала код и минимальный Clippy согласно кампании; broad tests после готового среза. Сборка одного пакета не выдаётся за проверку всего продукта.
 
-Для зависимости фиксируется acceptance identity (revision/phase/candidate), а не только «было ready». Перед приёмкой потребителя проверяется, не отозвана ли она и не требуется ли адресная перепроверка. Пересмотр upstream не убивает выполняющихся писателей и не уничтожает полезные artifacts. Уже принятый результат потребителя остаётся историческим фактом; новая обязательная ревизия рассматривается явно, не каскадным стиранием всей приёмки.
+Для зависимости фиксируется acceptance identity (operation ID + revision/phase/candidate), а не только «было ready». Перед приёмкой потребителя проверяется, не отозвана ли она и не требуется ли адресная перепроверка. Пересмотр upstream не убивает выполняющихся писателей и не уничтожает полезные artifacts. Уже принятый результат потребителя остаётся историческим фактом; новая обязательная ревизия рассматривается явно, не каскадным стиранием всей приёмки.
 
 ## 12. Качество без микроменеджмента
 
 Дешёвые detectors: duplicate owner, потеря наблюдения, repeated error с теми же входами, неподтверждённая обязательная настройка, пропущенный requirement, повтор CheckRun, незакрытый вопрос. Никакого LLM на каждый tool call.
 
 Каждый incident содержит evidence, scope и следующее действие. Повтор обновляет счётчик, не порождает prompt-шторм. Missing family data не превращается в «у тебя 0 детей». Не судим о полезности по росту stdout/числу edits; ожидание инструмента не считается тупостью модели.
+
+Отрицательный review тоже адресный: `task.request_changes` называет точные Attempt/submission/candidate; позднее замечание о прошлой сдаче сохраняется, но не меняет новую. `task.invalidate_acceptance` отзывает конкретную acceptance Operation, а не все решения с таким SHA. Повторная приёмка того же кандидата — другое решение; старый отзыв не отменяет его. Исправление запускает существующий владелец либо новая Attempt после обычного release.
 
 Semantic reviewer получает один вопрос и соответствующие requirements/hunks/dependencies/diagnostics, затем расширяет evidence адресно. 2–4k tokens — ориентир для micro-audit, не правило отрезать важное. Кэш зависит от проверенных inputs. Ошибка reviewer и пустые findings раздельны. Существующий candidate перепаковывается без повторного writer, если испорчен только отчёт.
 

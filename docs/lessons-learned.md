@@ -1,6 +1,6 @@
 # Выводы из прежних запусков и проверок
 
-**Сведено 30.09.2026 из материалов 26–29.09.2026.** Это справочник причин принятых решений, не ещё один brief и не новые требования к каждому worker. Действующий порядок — [архитектура](agent_swarm.md), [план реализации](agent_swarm.implementation-v6.md), [контракт модулей](agent_swarm.module-contract-v2.md).
+**Сведено 30.09.2026 из материалов 26–29.09.2026; дополнено проверкой контрактов 30.09.** Это справочник причин принятых решений, не ещё один brief и не новые требования к каждому worker. Действующий порядок — [архитектура](agent_swarm.md), [план реализации](agent_swarm.implementation-v6.md), [контракт модулей](agent_swarm.module-contract-v2.md).
 
 **Достоверность:** B — отчёт Claude о его машине, без нашей повторной runtime-пробы; R — прежний разбор документации и выбранных исходников; D — проверка проекта/SQL, не работающего сервиса. Наблюдения привязаны к указанным версиям. Здесь не проведена новая квалификация harness.
 
@@ -59,6 +59,20 @@
 
 Ранее закрытые границы сохранены в текущих контрактах: native root collision через aliases; terminal до ACK; stale/partial snapshots; reader/reply без ожидания model turn; host-link disconnect не SDK.close; одной Task не мешают посторонние дети менеджера. Исходные [D — review v18][D] и [counterexamples][SQL] доступны в истории, текущие examples и DDL остаются в дереве.
 
+### 3.1. Проверка согласованности контрактов 30.09.2026
+
+Основание — [main до правок][BASE], не новые claims о vendor. DDL-контрпример и последовательности разделены; SDK, процессы агентов и Rust-сервис не запускались.
+
+| ID | Конкретная проблема | Исправление без новой подсистемы |
+|---|---|---|
+| R19-01, DDL | План разрешал cached CheckRun без исполнения, но `state=passed` требовал resource release, а release — claim. В SQLite воспроизведён отказ вставки такого cached PASS. | `cached_from_check_id` ссылается на исходный process CheckRun. Cache hit не создаёт process/exit/resource metadata. Store проверяет source validity и inputs; SQL FK этого не заменяет. |
+| R19-02, последовательность + SQL | После claim менеджер сделал native spawn, но ещё не записал bind_producer. Старые state=reserved/start-slot guards разрешали дополнительный controller dispatch. | До начала фиксируется `start_owner`. Native-manager claim не принимает controller start; отдельная регистрация ребёнка больше не создаёт окно для нашего второго prompt. Это не sandbox против произвольного native вызова. |
+| R19-03, контракт | Повторно используемая child session может иметь поздний terminal прошлого run. Одной session identity недостаточно для release нового assignment. | ProducerRef включает assignment и доступный native run/turn/command correlation. Unknown не угадывается; явное закрытие manager остаётся cooperative. Живой child нельзя присоединить как второй independent root. |
+| R19-04, API/состояние | `needs_correction` и отзыв dependency были описаны, но отрицательный review не имел точного API-перехода. Tuple revision/phase/candidate повторяется при повторной приёмке тех же байтов. | `task.request_changes` CAS по submission; `task.invalidate_acceptance` по ID acceptance Operation. `accepted_operation_id` отличает новое решение от старого. Поздний отзыв старого решения не стирает новое. |
+| R19-05, план | C01 требовал native dispatch раньше IPC и runtime adapters C03/C04. | C01 заканчивается локальным admission и одной queued Operation. Native-send квалифицируется на реальном adapter, не на заглушке ради галочки. |
+
+Проверены 15 направленных DDL/SQL-случаев в SQLite 3.46.1 in-memory: cache contradiction/новая форма/негативные поля/FK, старое окно initial dispatch и новый guard, CAS отзыва конкретного решения. Это не интеграционные проверки будущих Store/API и не нагрузка. Примеры включены в существующие [reference files](agent_swarm.spec-v18/README.md), дополнительные архивы и владельцы состояния не добавлены. Девять таблиц остаются; добавлены три поля. Новый процесс контроля, broker и новые обязательные model calls не нужны.
+
 ## 4. Что удалено и где осталось существенное
 
 | Прежние материалы | Куда перенесено |
@@ -70,7 +84,7 @@
 | design-review-v18 и review-v18/ | §3 и текущие reference examples; предыдущие схемы, патчи и воспроизведения — Git history. |
 | checkpoint, package manifest и прежний validation report | Текущая точка входа — README/implementation. Граница прежней проверки — [spec README](agent_swarm.spec-v18/README.md) и frozen history. |
 
-Чистка меняет только документацию, ссылки и состав рабочего дерева. Runtime-контракты v18/v6/v2, source pins и текущие SQL/JSON/TOML-примеры не расширяются. Нет нового обязательного свода инструкций: этот справочник читается по соответствующему incident.
+Чистка сохраняла runtime-контракты и SQL. Последующий аудит §3.1 вносит перечисленные поправки в действующие файлы; source pins не меняются. Нет нового обязательного свода инструкций: этот справочник читается по соответствующему incident.
 
 **История до очистки:** `b5a437f57488f8ddcdcc3f4aaea24746a3ea1f62`. Исходник любого удалённого документа доступен по `git show <этот SHA>:docs/<прежний путь>`. История Git не переписывается. Это удаление из текущего дерева, не стирание ранее опубликованных сведений из истории.
 
@@ -80,3 +94,4 @@
 [H]: https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/b5a437f57488f8ddcdcc3f4aaea24746a3ea1f62/docs/Harness_and_OpenCode_Go_master_2026-09-29_rev5.md
 [D]: https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/b5a437f57488f8ddcdcc3f4aaea24746a3ea1f62/docs/agent_swarm.design-review-v18-20260929.md
 [SQL]: https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/b5a437f57488f8ddcdcc3f4aaea24746a3ea1f62/docs/review-v18/sql-counterexamples.json
+[BASE]: https://github.com/UnknownAlienHuman/eliot-swarm-controller/tree/e92fc1d5c4fb6a88810d4102c0797fed33f05432

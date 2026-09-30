@@ -12,5 +12,25 @@
   "active_child_count": null,
   "absence_means_terminal": false,
   "source_ref": "example:roots-list",
-  "note": "A complete roots enumeration does not prove that the family has zero live children."
+  "note": "A complete roots enumeration does not prove that the family has zero live children.",
+  "reused_session": {
+    "native_session_id": "child-1",
+    "assignments": [
+      {
+        "assignment_id": "assign-A",
+        "native_run_id": "run-A",
+        "task_id": "A"
+      },
+      {
+        "assignment_id": "assign-B",
+        "native_run_id": "run-B",
+        "task_id": "B"
+      }
+    ],
+    "late_terminal": {
+      "native_session_id": "child-1",
+      "native_run_id": "run-A"
+    },
+    "may_release_assignment_B": false
+  }
 }

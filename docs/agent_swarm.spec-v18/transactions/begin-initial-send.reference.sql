@@ -16,6 +16,7 @@ WHERE op.operation_id = :operation_id
     JOIN tasks AS t ON t.task_id = a.task_id
     WHERE a.attempt_id = op.attempt_id
       AND a.task_id = op.task_id
+      AND a.start_owner = 'controller'
       AND a.start_operation_id = op.operation_id
       AND a.released_at_ms IS NULL
       AND a.state = 'reserved'

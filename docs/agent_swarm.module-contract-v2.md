@@ -1,6 +1,6 @@
 # ELIOT Swarm — контракт модулей и качества интеграции v2
 
-**29.09.2026. Проектное уточнение к архитектуре v18; реализации и live-квалификации пока нет.**
+**Уточнено 30.09.2026. Контракт к архитектуре v18; реализации и live-квалификации пока нет.**
 
 Назначение: один разработчик должен подключить очередной native harness, не изменяя scheduler, Task/Attempt и остальные adapters. Этот документ определяет нашу границу. Он не переписывает протоколы производителей и не утверждает, что все перечисленные возможности есть у каждого harness.
 
@@ -23,7 +23,7 @@
 | Existing shared backend | Внешний владелец server; bridge владеет клиентом/proxy | Управление только своими bindings |
 | Batch executable | ProcessJob этого запуска | Запуск и результат; live-функции только если реально существуют |
 
-Не добавляем другой coordinator для batch. Batch — ограниченный runtime-профиль. Read-only observer может читать существующий binding, но не создаёт второй control binding.
+Не добавляем другой coordinator для batch. Batch — ограниченный runtime-профиль. Read-only observer может читать существующий binding, но не создаёт второй control binding. Подключение ребёнка как независимого root не допускается, пока он принадлежит управляемой семье: используется её binding и адрес ребёнка. Иначе разные session IDs обошли бы уникальность владельца корня.
 
 Первый bridge можно запускать на одну root-линию. Контракт содержит binding IDs и не требует отдельного process на каждого child. Multiplex нескольких roots в одном bridge разрешается только если конкретный SDK его поддерживает; отдельный универсальный connection-pool заранее не пишется.
 
@@ -69,6 +69,8 @@ modules/<name>/<artifact-version>/
 | `shutdown` | Явный scope и реальный disposition собственного ресурса | Разрешение остановить общий server или чужих детей |
 
 Малый `OperationContract` сохраняется в `effective_request_json`: `effect_scope`, `order_scope`, `completion_condition`, `replay_policy`, `fallback_used`, `contract_revision`. Это обычные данные решения adapter, не язык выполнения произвольных workflows. Scope задаёт binding/session/turn/request либо shared service, если операция действительно глобальная.
+
+Начало Task имеет одного владельца, выбранного до работы: controller либо native_manager. В первом случае start идёт через сохранённую Operation; во втором manager использует native spawn, а наш send не дублирует старт даже до bind_producer. Исполнитель, получивший controller-start, по-прежнему вправе запускать native детей.
 
 Короткая admission-фаза не держит target заблокированным до конца model run. Ожидаемый смысл результата определён методом: установка effort ждёт факта применения; доставка сообщения может закончиться на native admission, не подтверждая его использование.
 
@@ -120,6 +122,10 @@ open admitted
 
 Старт новой native-сессии и начальная доставка уже claimed Task — разные idempotency scopes. Host не посылает второй initial dispatch одной Attempt лишь из-за нового client_request_id. Принятый модулем request не создаёт нового task owner. Перед отправкой host проверяет dispatch guards; module проверяет exact binding/generation/link и native preconditions. Revise после допуска не отменяет уже полученный vendor input; нужен реальный unqueue/cancel, поддержанный native контрактом, либо обычная коррекция.
 
+### ProducerRef относится к активации, не только к беседе
+
+Каждый task-specific ProducerRef связывает assignment_id с native session и конкретным run/turn/child-run ID или иной документированной correlation. Сессия может использоваться повторно. Поздний terminal предыдущего run сохраняется в его истории и не закрывает новое задание. При неполной корреляции adapter возвращает unknown, а manager явно закрывает assignment; синтетический локальный ID сам по себе не доказывает происхождение native event. Это использует существующий producers_json, не новый task store.
+
 ## 8. Шина без общего тормоза
 
 Протокольный reader не ждёт аудитора, записи большого лога или окончания другого задания. Входящее сообщение сначала классифицируется как reply-required/control, важный факт либо telemetry. Крупное тело хранится отдельно.
@@ -144,7 +150,7 @@ open admitted
 
 Детерминированно проверяем только то, что действительно доступно: ownership, exact candidate, exit/coverage, недостающий requirement, неприменённую настройку, повтор одной ошибки при тех же входах. Сложный смысл и полнота интеграции требуют адресного reviewer. Наличие символа не доказывает рабочую вертикаль.
 
-Результат проверки: `execution_status + coverage + findings`. Required checks и политика независимости принадлежат Task/профилю, не writer. Они не редактируются автоматически под текущий результат. Отсутствующий output, parse failure и unsupported verifier не превращаются в PASS.
+Результат проверки: `execution_status + coverage + findings`. Required checks и политика независимости принадлежат Task/профилю, не writer. Они не редактируются автоматически под текущий результат. Отсутствующий output, parse failure и unsupported verifier не превращаются в PASS. Feedback привязан к exact submission, а отзыв acceptance — к operation ID решения; reviewer старой сдачи не может отменить новое решение с тем же candidate SHA. Приёмка и request_changes принадлежат decision owner, не runtime-парсеру.
 
 Аудитору передаётся один вопрос с относящимися sources/hunks/diagnostics. Scope расширяется по доказательной необходимости; полный transcript не становится стартовым пакетом. Исправление формата сдачи при сохранённом кандидате не запускает writer повторно. Спорный finding не становится безусловным приказом переделать всё: GM получает конкретное противоречие и исходные anchors.
 
@@ -162,7 +168,7 @@ open admitted
 
 Новая версия получает новые bindings; старая завершает существующие. Если vendor обновляет общий server сразу для всех, drain нашего bridge не обещает защиты от этого — режим vendor update согласуется отдельно. Откат binary не откатывает уже совершённые remote effects.
 
-Для собственных batch/check jobs результат и владение ресурсом раздельны. `failed/incomplete` не сообщает, что все дочерние процессы прекратили работу. Adapter возвращает process disposition, control host освобождает ресурс только по нему. Для `external_attach` не применяется завершение shared server. Результат проверки сохраняется даже при неудачной очистке, а повторный writer target-dir не запускается на неизвестной старой работе.
+Для собственных batch/check jobs результат и владение ресурсом раздельны. `failed/incomplete` не сообщает, что все дочерние процессы прекратили работу. Adapter возвращает process disposition, control host освобождает ресурс только по нему. Для `external_attach` не применяется завершение shared server. Результат проверки сохраняется даже при неудачной очистке, а повторный writer target-dir не запускается на неизвестной старой работе. Повторное использование законченного machine check обозначается cached_from_check_id и не выдаётся за новый process run: не создаёт PID, собственного exit code или фиктивного resource release.
 
 ## 12. Проверяемая граница качества
 
@@ -181,6 +187,10 @@ open admitted
 | Task revised while input queued | Старый input не отправляется после проигранного dispatch guard; already-admitted outcome отдельно |
 | Max применён, затем настройки заменены | Прежний apply не открывает запуск на другой конфигурации |
 | Check incomplete, descendants unknown | Target-dir удерживается; соседние ресурсы свободны |
+| Native spawn уже произошёл, bind_producer ещё нет | Native-manager claim не получает второй initial dispatch |
+| Child session повторно использована | Старое completion не закрывает новую activation |
+| Review пришёл после новой сдачи/приёмки | Исторический finding; актуальный pointer не меняется |
+| Reuse process check из cache | Собственная привязка к Task, без выдуманного process/resource lifecycle |
 
 Это критерии реализации, не результаты выполненных runtime-тестов. Первая обязательная пара исполнителей — Muse Max и OpenCode V2; batch и shared Codex проверяют остальные особенности того же контракта по мере подключения. Нет требования одновременно дописать все семь harness до первого полезного результата.
 

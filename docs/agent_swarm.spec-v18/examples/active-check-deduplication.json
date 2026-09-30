@@ -25,6 +25,18 @@
   ],
   "different_attempts_share_running_check": false,
   "same_target_dir_still_one_writer": true,
-  "completed_machine_cache": "may_reuse_with_new_binding_and_requirements_check",
+  "completed_machine_cache": {
+    "check_id": "cached-B",
+    "attempt_id": "B",
+    "cached_from_check_id": "process-A",
+    "resource_claimed_at_ms": null,
+    "resource_released_at_ms": null,
+    "process_identity": null,
+    "exit_code": null,
+    "state": "passed",
+    "eligibility": "original_process_check_passed_complete_valid_exact_inputs",
+    "resource_action": "none",
+    "original_execution_metadata": "read_from_process-A"
+  },
   "semantic_verdict_transfer_by_sha": false
 }

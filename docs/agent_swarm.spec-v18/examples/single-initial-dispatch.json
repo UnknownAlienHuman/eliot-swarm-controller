@@ -14,5 +14,16 @@
     }
   ],
   "expected_native_initial_inputs": 1,
-  "correction_is_different_operation": true
+  "correction_is_different_operation": true,
+  "start_owner": "controller",
+  "native_delegation_case": {
+    "start_owner": "native_manager",
+    "sequence": [
+      "claim",
+      "native_spawn",
+      "controller_dispatch_before_bind_producer"
+    ],
+    "expected": "START_OWNED_BY_MANAGER_no_prompt",
+    "bind_producer_required_before_start_guard": false
+  }
 }

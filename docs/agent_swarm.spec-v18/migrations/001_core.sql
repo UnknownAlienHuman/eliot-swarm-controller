@@ -33,16 +33,18 @@ CREATE TABLE tasks (
     state TEXT NOT NULL CHECK (state IN ('open', 'accepted', 'archived')),
     spec_json TEXT NOT NULL CHECK (json_valid(spec_json)),
     accepted_attempt_id TEXT REFERENCES attempts(attempt_id),
+    -- Identifies one acceptance decision, even if the same candidate is accepted again.
+    accepted_operation_id TEXT REFERENCES operations(operation_id),
     accepted_revision INTEGER,
     accepted_phase TEXT,
     accepted_candidate_ref TEXT REFERENCES artifacts(artifact_id),
     created_at_ms INTEGER NOT NULL,
     updated_at_ms INTEGER NOT NULL,
     CHECK (
-      (accepted_attempt_id IS NULL AND accepted_revision IS NULL
+      (accepted_attempt_id IS NULL AND accepted_operation_id IS NULL AND accepted_revision IS NULL
        AND accepted_phase IS NULL AND accepted_candidate_ref IS NULL)
       OR
-      (accepted_attempt_id IS NOT NULL AND accepted_revision IS NOT NULL
+      (accepted_attempt_id IS NOT NULL AND accepted_operation_id IS NOT NULL AND accepted_revision IS NOT NULL
        AND accepted_phase IS NOT NULL AND accepted_candidate_ref IS NOT NULL
        AND accepted_revision = revision)
     ),
@@ -86,6 +88,8 @@ CREATE TABLE attempts (
     task_revision INTEGER NOT NULL CHECK (task_revision > 0),
     task_snapshot_json TEXT NOT NULL CHECK (json_valid(task_snapshot_json)),
     owner_id TEXT NOT NULL,
+    -- Chosen before any start; native delegation and controller dispatch cannot race.
+    start_owner TEXT NOT NULL CHECK (start_owner IN ('controller', 'native_manager')),
     -- One logical initial delivery; subsequent corrections are separate messages.
     start_operation_id TEXT UNIQUE REFERENCES operations(operation_id),
     binding_id TEXT,
@@ -104,6 +108,7 @@ CREATE TABLE attempts (
         REFERENCES bindings(binding_id, generation),
     CHECK ((binding_id IS NULL AND binding_generation IS NULL)
         OR (binding_id IS NOT NULL AND binding_generation IS NOT NULL)),
+    CHECK (start_owner = 'controller' OR start_operation_id IS NULL),
     CHECK (state NOT IN ('submitted', 'accepted')
         OR (submission_ref IS NOT NULL AND candidate_ref IS NOT NULL)),
     CHECK (released_at_ms IS NULL
@@ -172,6 +177,8 @@ CREATE TABLE check_runs (
     attempt_id TEXT NOT NULL REFERENCES attempts(attempt_id),
     candidate_ref TEXT NOT NULL REFERENCES artifacts(artifact_id),
     cache_key TEXT NOT NULL,
+    -- Cached evidence has an origin, not a fabricated process/resource lifecycle.
+    cached_from_check_id TEXT REFERENCES check_runs(check_id),
     resource_key TEXT NOT NULL,
     -- Process result is not resource release; an incomplete result may retain its claim.
     resource_claimed_at_ms INTEGER,
@@ -195,8 +202,12 @@ CREATE TABLE check_runs (
         OR (resource_claimed_at_ms IS NOT NULL AND resource_released_at_ms IS NULL)),
     CHECK (resource_released_at_ms IS NULL
         OR state IN ('passed', 'failed', 'error', 'incomplete', 'cancelled')),
-    CHECK (state <> 'passed' OR (exit_code IS NOT NULL AND exit_code = 0
-        AND resource_released_at_ms IS NOT NULL))
+    CHECK (cached_from_check_id IS NULL OR (
+        cached_from_check_id <> check_id AND state = 'passed'
+        AND resource_claimed_at_ms IS NULL AND resource_released_at_ms IS NULL
+        AND process_identity_json IS NULL AND exit_code IS NULL AND started_at_ms IS NULL)),
+    CHECK (state <> 'passed' OR cached_from_check_id IS NOT NULL
+        OR (exit_code IS NOT NULL AND exit_code = 0 AND resource_released_at_ms IS NOT NULL))
 ) STRICT;
 CREATE UNIQUE INDEX one_active_check ON check_runs(attempt_id, cache_key)
     WHERE state IN ('queued', 'running', 'reconciling')
