@@ -6,9 +6,9 @@ Headless modular Rust controller for native coding-agent harnesses; a prototype 
 
 The core provides authenticated clients, tasks/revisions/claims, durable request receipts, directed mailbox, incremental reports and binding-scoped module admission. Windows uses user-restricted Named Pipes; Unix uses a private socket. No TCP control listener is opened.
 
-**The first Muse SDK bridge is implemented and connected to the host API.** `modules/muse/` starts an explicitly configured native binary on a saved opening operation, sends the Task snapshot and per-turn reasoning effort, supports exact-turn steer and native question-answer commands, and reports observed children and turn identities. A host disconnect does not close the independently running bridge. A new bridge process cannot silently replace possibly live native work.
+**The first Muse SDK bridge is implemented and connected to the host API.** `modules/muse/` starts an explicitly configured native binary on a saved opening operation, sends the Task snapshot and per-turn reasoning effort, supports exact-turn steer and native question-answer commands, and reports observed children and turn identities. Bridge.2 adds native goal controls, one-setter configuration, explicit metadata refresh and same-command reconciliation. A host disconnect does not close the independently running bridge. A new bridge process cannot silently replace possibly live native work.
 
-**Implementation is not runtime qualification.** Live Muse/Max inference and Windows native launch have not been exercised. Crash/resume, complete family reconstruction, goal configuration, task-specific child handoff, artifact retrieval and acceptance are incomplete. OpenCode V2, Codex and other adapters, MCP, CheckRunner and automatic module/service installation remain pending. Family reports are partial; completed model turns do not accept Tasks. Do not mark the whole C01–C03 target complete.
+**Implementation is not runtime qualification.** Live Muse/Max inference and Windows native launch have not been exercised. Crash/resume, complete family reconstruction, task-specific child handoff, artifact retrieval and acceptance are incomplete. OpenCode V2, Codex and other adapters, MCP, CheckRunner and automatic module/service installation remain pending. Family reports are partial; completed model turns do not accept Tasks. Do not mark the whole C01–C03 target complete.
 
 ### Code and build checkpoints
 
@@ -16,6 +16,7 @@ The core provides authenticated clients, tasks/revisions/claims, durable request
 - `b2bd0211`: first Muse bridge and module channel; [run 36708933605](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/36708933605) passed formatting, Clippy and release builds on Windows/Linux on 2026-09-30.
 - `21502426`: native admission outcomes wake the existing command wait channel, without telemetry-driven polling storms.
 - `58055475`: MSP presentation receipts are acknowledged immediately; actual decisions remain separate commands. Child goal events cannot overwrite the root goal.
+- `45a5e649`: goal/configuration/refresh/reconciliation, monotonic observations and late-outcome handling. [Exact-commit CI](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/36714173055) records compilation separately from native qualification.
 
 Use CI for the exact artifact SHA; an earlier green run is not qualification of later code or live vendor behavior. The read-only workflow pins Rust 1.98.1/Cargo.lock, checks formatting and Clippy, builds the binary, and syntax-checks/imports the locked Muse SDK without starting Muse. It does not run `cargo test`, model calls, OAuth login or global installation. Binary artifacts contain their source SHA and module source/configuration, not bundled vendor credentials or native runtimes.
 
@@ -59,9 +60,13 @@ The native executable retains its subscription and auth. Requested effort is an 
 
 `message.send` accepts recipient/text and optional in_reply_to. Readers have independent cursors. This is a durable local mailbox, not yet automatic forwarding/wake for every harness. Same-user roles are cooperative controls, not OS isolation. Module credentials are separately scoped and cannot accept Tasks or impersonate GM.
 
-Public methods: `host.status/mode`, `client.register/list`, `task.create/get/list/revise/claim/dispatch`, `attempt.get/release`, `agent.open/state/list/send/reply`, `route.list`, `operation.get/list/cancel`, `message.send/read`, `report.delta`. Module methods: `module.hello/next/outcome/observe`. Release never kills a process or manufactures acceptance and refuses known unfinished assigned runs. The full producer/acceptance lifecycle is still future code; unsupported methods fail explicitly.
+Additional native controls: `agent.configure`, `agent.goal`, `agent.refresh`, `agent.reconcile`. See the module README for exact fields and native admission/application boundaries. Goal start requires a configured standing effort; refresh is not native resume. Unknown outcomes may be resolved by later evidence, never by an automatic new prompt.
+
+Public methods: `host.status/mode`, `client.register/list`, `task.create/get/list/revise/claim/dispatch`, `attempt.get/release`, `agent.open/state/list/send/reply/configure/goal/refresh/reconcile`, `route.list`, `operation.get/list/cancel`, `message.send/read`, `report.delta`. Module methods: `module.hello/next/outcome/observe`. Release never kills a process or manufactures acceptance and refuses known unfinished assigned runs. The full producer/acceptance lifecycle is still future code; unsupported methods fail explicitly.
 
 ## Next work
+
+This continuation implements the controls above without changing the nine-table migration, dependency locks, toolchain or introducing new services. Native application and long-run recovery still require the actual installed Muse executable and authorized model route; compilation is not that qualification.
 
 Complete and qualify Muse, then direct OpenCode V2 on the same host contract. Preserve the shared Codex/native-subscription targets. The [SIWC note](docs/runtime-notes.md) describes an optional OAuth route, not installed authorization.
 
