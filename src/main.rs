@@ -96,12 +96,22 @@ enum TaskCommand {
 fn read_json(file: &PathBuf) -> Result<Value> {
     Ok(serde_json::from_slice(&std::fs::read(file)?)?)
 }
-#[tokio::main]
-async fn main() {
-    if let Err(e) = run(Cli::parse()).await {
+fn main() {
+    if let Err(e) = execute(Cli::parse()) {
         eprintln!("{}", json!({"error":e}));
         std::process::exit(1);
     }
+}
+fn execute(cli: Cli) -> Result<()> {
+    // Only the long-lived host needs a worker pool. CLI calls perform one local
+    // exchange and must not create a CPU-sized pool for every status request.
+    let mut builder = if matches!(&cli.command, Command::Host) {
+        tokio::runtime::Builder::new_multi_thread()
+    } else {
+        tokio::runtime::Builder::new_current_thread()
+    };
+    let runtime = builder.enable_all().build()?;
+    runtime.block_on(run(cli))
 }
 async fn run(cli: Cli) -> Result<()> {
     let config = Config::load(cli.config.as_deref(), cli.data_dir.as_deref())?;
