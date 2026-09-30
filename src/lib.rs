@@ -1,4 +1,5 @@
 //! Local task authority and IPC. Native execution is a separate integration boundary.
+pub mod artifacts;
 pub mod config;
 pub mod error;
 pub mod host;

@@ -49,12 +49,12 @@ enum Command {
         role: String,
         #[arg(long)]
         out: PathBuf,
-        #[arg(long)]
+        #[arg(long, requires = "generation")]
         binding_id: Option<String>,
-        #[arg(long)]
+        #[arg(long, requires = "binding_id")]
         generation: Option<i64>,
     },
-    /// Read a stable page of recorded native children without calling the harness.
+    /// Read a retained family observation, not a live SDK query or complete inventory claim.
     Family {
         binding_id: String,
         #[arg(long)]
@@ -66,11 +66,40 @@ enum Command {
         #[arg(long, default_value_t = 50)]
         limit: i64,
     },
+    /// Request one native result page. It performs no model call or result consumption.
+    Result {
+        binding_id: String,
+        #[arg(long)]
+        generation: i64,
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        offset: u64,
+        #[arg(long, default_value_t = 65536)]
+        length: u64,
+    },
+    Artifact {
+        #[command(subcommand)]
+        command: ArtifactCommand,
+    },
     Report {
         #[arg(long, default_value_t = 0)]
         after: i64,
         #[arg(long, default_value_t = 50)]
         limit: i64,
+    },
+}
+#[derive(Subcommand)]
+enum ArtifactCommand {
+    Get {
+        artifact_id: String,
+    },
+    Read {
+        artifact_id: String,
+        #[arg(long, default_value_t = 0)]
+        offset: u64,
+        #[arg(long, default_value_t = 65536)]
+        length: u64,
     },
 }
 #[derive(Subcommand)]
@@ -179,6 +208,30 @@ async fn run(cli: Cli) -> Result<()> {
             }
             ("agent.family".into(), value)
         }
+        Command::Result {
+            binding_id,
+            generation,
+            file,
+            offset,
+            length,
+        } => (
+            "agent.result".into(),
+            json!({"binding_id":binding_id,"generation":generation,
+                "selector":read_json(&file)?,"offset_bytes":offset,"length_bytes":length}),
+        ),
+        Command::Artifact { command } => match command {
+            ArtifactCommand::Get { artifact_id } => {
+                ("artifact.get".into(), json!({"artifact_id":artifact_id}))
+            }
+            ArtifactCommand::Read {
+                artifact_id,
+                offset,
+                length,
+            } => (
+                "artifact.read".into(),
+                json!({"artifact_id":artifact_id,"offset_bytes":offset,"length_bytes":length}),
+            ),
+        },
         Command::Report { after, limit } => {
             ("report.delta".into(), json!({"after":after,"limit":limit}))
         }
@@ -275,6 +328,8 @@ async fn run(cli: Cli) -> Result<()> {
     let is_read = matches!(
         method.as_str(),
         "host.status"
+            | "artifact.get"
+            | "artifact.read"
             | "task.get"
             | "task.list"
             | "attempt.get"

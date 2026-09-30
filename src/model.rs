@@ -265,6 +265,14 @@ pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
             "delivery",
             "expected_turn_id",
         ],
+        "agent.result" => &[
+            "client_request_id",
+            "binding_id",
+            "generation",
+            "selector",
+            "offset_bytes",
+            "length_bytes",
+        ],
         "agent.reply" => &["client_request_id", "binding_id", "generation", "reply"],
         "agent.configure" => &["client_request_id", "binding_id", "generation", "settings"],
         "agent.goal" => &[
@@ -304,6 +312,29 @@ pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
     if matches!(method, "task.create" | "task.revise") {
         let spec: TaskSpec = serde_json::from_value(params["spec"].clone())?;
         spec.validate()?;
+    }
+    if method == "agent.result" {
+        positive(params, "generation")?;
+        for field in ["offset_bytes", "length_bytes"] {
+            if let Some(value) = params.get(field) {
+                let n = value.as_u64().ok_or_else(|| {
+                    Error::invalid(format!("{field} must be a nonnegative integer"))
+                })?;
+                if field == "length_bytes"
+                    && (n == 0 || n > crate::artifacts::MAX_PAGE_BYTES as u64)
+                {
+                    return Err(Error::invalid("length_bytes must be 1..65536"));
+                }
+            }
+        }
+
+        if params["selector"].as_object().is_none_or(|o| o.is_empty())
+            || canonical(&params["selector"])?.len() > 8192
+        {
+            return Err(Error::invalid(
+                "result selector must be a compact nonempty object",
+            ));
+        }
     }
     if method == "attempt.bind_producer" {
         for field in [

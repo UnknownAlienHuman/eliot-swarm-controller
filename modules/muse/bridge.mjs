@@ -7,6 +7,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { spawnMspConnection, MspError } from '@muse-code/sdk';
 import { Control } from './control.mjs';
 import { configuration, modelMatches, goalCommand } from './settings.mjs';
+import { readResult } from './results.mjs';
 
 function required(object, key) {
   if (typeof object?.[key] !== 'string' || !object[key].trim()) throw new Error(`MISSING_${key}`);
@@ -365,6 +366,9 @@ async function execute(command) {
         nativeAdmissionPossible = true;
         await submitNative(command,goal.method,goal.params,'goal');
         return;
+      } else if (command.method === 'agent.result') {
+        const page = await readResult(msp.connection,p,id=>id===rootId || children.has(id));
+        result = {result_page:page,details:{completion_condition:'result_page_pending_persistence'}};
       } else if (command.method === 'agent.refresh') {
         const target = p.session_id===undefined?rootId:required(p,'session_id');
         result = {details:{completion_condition:'native_read_completed',snapshot:await (target===rootId?refreshRoot():refreshChild(target))}};
@@ -390,7 +394,8 @@ async function execute(command) {
 }
 async function report(link = control) {
   for(const [id,outcome] of outcomes){
-    await link.call('module.outcome',outcome);
+    if(outcome.result_page) await link.call('module.result',{operation_id:id,page:outcome.result_page});
+    else await link.call('module.outcome',outcome);
     // A later native event may have resolved this operation while IPC awaited.
     // Do not erase the newer outcome with the old acknowledgement.
     if(outcomes.get(id)===outcome){
@@ -442,7 +447,7 @@ while(!stopping){
           active.set(command.operation_id,true);
           // Serialize native admission, not whole model turns. Replies bypass this
           // queue so an outstanding command cannot deadlock a native question.
-          if(['agent.reply','agent.refresh','agent.reconcile'].includes(command.method)) void execute(command);
+          if(['agent.reply','agent.refresh','agent.reconcile','agent.result'].includes(command.method)) void execute(command);
           else admissionTail=admissionTail.then(()=>execute(command));
         }
       }

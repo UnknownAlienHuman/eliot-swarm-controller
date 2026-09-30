@@ -1,9 +1,11 @@
 //! A single database owner. The async facade never holds a SQLite connection.
 mod operations;
 mod producers;
+mod results;
 mod runtime;
 mod tasks;
 use crate::{
+    artifacts::{ArtifactFiles, MAX_PAGE_BYTES, ResultPage},
     config::Config,
     error::{Error, Result},
     model::{self, Credential, Principal, Role},
@@ -12,7 +14,7 @@ use crate::{
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::{Value, json};
 use std::{fs::File, path::Path, sync::Arc, thread::JoinHandle};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 
 const SCHEMA: &str = include_str!("../../migrations/001_core.sql");
 const APPLICATION_ID: i64 = 0x45534331;
@@ -22,6 +24,8 @@ pub struct Store {
     tx: mpsc::Sender<Job>,
     config: Arc<Config>,
     changed: watch::Sender<u64>,
+    artifacts: ArtifactFiles,
+    artifact_io: Arc<Semaphore>,
 }
 pub struct StoreOwner {
     thread: JoinHandle<()>,
@@ -34,6 +38,7 @@ impl StoreOwner {
         config: Arc<Config>,
         credential: Credential,
     ) -> Result<Self> {
+        let artifacts = ArtifactFiles::new(&root.path)?;
         let (tx, mut rx) = mpsc::channel::<Job>(config.storage.queue_capacity);
         let (ready_tx, ready_rx) = oneshot::channel();
         let thread = std::thread::Builder::new()
@@ -62,6 +67,8 @@ impl StoreOwner {
                 tx,
                 config,
                 changed: watch::channel(0).0,
+                artifacts,
+                artifact_io: Arc::new(Semaphore::new(4)),
             },
         })
     }
@@ -105,6 +112,13 @@ impl Store {
         .await
     }
     pub async fn call(&self, principal: Principal, method: String, params: Value) -> Result<Value> {
+        if method == "module.result" {
+            return self.persist_result(principal, params).await;
+        }
+        if method == "artifact.read" {
+            return self.read_artifact(principal, params).await;
+        }
+
         if method == "module.next" {
             model::fields(&params, &[])?;
             let mut changed = self.changed.subscribe();
@@ -131,22 +145,14 @@ impl Store {
                 | "agent.goal"
                 | "agent.refresh"
                 | "agent.reconcile"
+                | "agent.result"
                 | "host.mode"
                 | "module.outcome"
         );
         let config = self.config.clone();
         let result = self
             .run(move |db| {
-                let current = meta(db, &format!("client:{}", principal.client_id))?
-                    .ok_or_else(|| Error::new("UNAUTHORIZED", "client no longer registered"))?;
-                if current["disabled"] == true {
-                    return Err(Error::new("UNAUTHORIZED", "client disabled"));
-                }
-                let principal = Principal {
-                    link_id: principal.link_id,
-                    client_id: principal.client_id,
-                    role: serde_json::from_value(current["role"].clone())?,
-                };
+                let principal = current_principal(db, principal)?;
                 if principal.role == Role::Module {
                     return match method.as_str() {
                         "module.hello" => runtime::hello(db, &principal, &params),
@@ -170,11 +176,102 @@ impl Store {
         }
         result
     }
+    async fn file_io<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(ArtifactFiles) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let permit = self
+            .artifact_io
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::new("ARTIFACT_IO_CLOSED", "artifact writer stopped"))?;
+        let files = self.artifacts.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            f(files)
+        })
+        .await
+        .map_err(|e| Error::new("ARTIFACT_IO_ERROR", e.to_string()))?
+    }
+    async fn persist_result(&self, principal: Principal, params: Value) -> Result<Value> {
+        model::fields(&params, &["operation_id", "page"])?;
+        let op = model::text(&params, "operation_id")?.to_string();
+        let page: ResultPage = serde_json::from_value(params["page"].clone())?;
+        let p = principal.clone();
+        let mut metadata = self.run(move |db| results::prepare(db, &p, &op)).await?;
+        let bytes = page.decode()?;
+        if metadata["requested_offset"].as_u64() != Some(page.offset_bytes)
+            || page.byte_length > metadata["requested_length"].as_u64().unwrap_or(0)
+        {
+            return Err(Error::invalid(
+                "result page differs from the admitted byte range",
+            ));
+        }
+        if let Value::Object(fields) = page.metadata() {
+            for (key, value) in fields {
+                metadata[key] = value;
+            }
+        }
+        let record = ArtifactFiles::record(
+            model::text(&metadata, "operation_id")?,
+            &bytes,
+            metadata.clone(),
+        );
+        let saved = record.clone();
+        self.file_io(move |files| files.publish(&saved, &bytes))
+            .await?;
+        let result = self
+            .run(move |db| results::record(db, &principal, &record))
+            .await?;
+        self.changed.send_modify(|n| *n = n.wrapping_add(1));
+        Ok(result)
+    }
+    async fn read_artifact(&self, principal: Principal, params: Value) -> Result<Value> {
+        model::fields(&params, &["artifact_id", "offset_bytes", "length_bytes"])?;
+        let id = model::text(&params, "artifact_id")?.to_string();
+        let integer = |name: &str, fallback| -> Result<u64> {
+            params.get(name).map_or(Ok(fallback), |v| {
+                v.as_u64()
+                    .ok_or_else(|| Error::invalid(format!("{name} must be a nonnegative integer")))
+            })
+        };
+        let offset = integer("offset_bytes", 0)?;
+        let length = integer("length_bytes", MAX_PAGE_BYTES as u64)?;
+        if length == 0 || length > MAX_PAGE_BYTES as u64 {
+            return Err(Error::invalid("length_bytes must be 1..65536"));
+        }
+        let record = self
+            .run(move |db| {
+                let p = current_principal(db, principal)?;
+                if p.role == Role::Module {
+                    return Err(Error::new(
+                        "FORBIDDEN",
+                        "module cannot inspect other results",
+                    ));
+                }
+                results::get(db, &id)
+            })
+            .await?;
+        self.file_io(move |files| files.read(&record, offset, length as usize))
+            .await
+    }
     pub async fn disconnected(&self, principal: Principal) {
         let _ = self
             .run(move |db| runtime::disconnected(db, &principal))
             .await;
     }
+}
+fn current_principal(db: &Connection, principal: Principal) -> Result<Principal> {
+    let current = meta(db, &format!("client:{}", principal.client_id))?
+        .ok_or_else(|| Error::new("UNAUTHORIZED", "client no longer registered"))?;
+    if current["disabled"] == true {
+        return Err(Error::new("UNAUTHORIZED", "client disabled"));
+    }
+    Ok(Principal {
+        role: serde_json::from_value(current["role"].clone())?,
+        ..principal
+    })
 }
 fn open_database(root: &Path, credential: &Credential) -> Result<Connection> {
     if rusqlite::version_number() < 3_051_003 {
@@ -278,7 +375,8 @@ fn set_meta(db: &Connection, key: &str, value: &Value) -> Result<()> {
 fn is_read(method: &str) -> bool {
     matches!(
         method,
-        "host.status"
+        "artifact.get"
+            | "host.status"
             | "task.get"
             | "task.list"
             | "attempt.get"
@@ -311,6 +409,7 @@ fn page(params: &Value) -> Result<(i64, i64)> {
 }
 fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config) -> Result<Value> {
     match method {
+        "artifact.get" => results::describe(db, p, v),
         "host.status" => {
             model::fields(v, &[])?;
             let tasks: i64 = db.query_row("SELECT count(*) FROM tasks", [], |r| r.get(0))?;
@@ -517,7 +616,9 @@ fn apply(
         "attempt.release" => tasks::release(tx, p, v, id, now).map(|v| (v, false)),
         "task.dispatch" => operations::dispatch(tx, p, v, id, now),
         "agent.send" | "agent.reply" | "agent.configure" | "agent.goal" | "agent.refresh"
-        | "agent.reconcile" => runtime::user_command(tx, p, method, v, id).map(|v| (v, true)),
+        | "agent.reconcile" | "agent.result" => {
+            runtime::user_command(tx, p, method, v, id).map(|v| (v, true))
+        }
         "agent.open" => operations::open(tx, p, v, config, id, now).map(|v| (v, true)),
         "operation.cancel" => operations::cancel(tx, p, v, id, now).map(|v| (v, false)),
         "host.mode" => {

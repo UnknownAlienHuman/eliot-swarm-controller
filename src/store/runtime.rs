@@ -9,7 +9,11 @@ use crate::{
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};
 
-fn scope(db: &Connection, p: &Principal, check_link: bool) -> Result<(String, i64, Value)> {
+pub(super) fn scope(
+    db: &Connection,
+    p: &Principal,
+    check_link: bool,
+) -> Result<(String, i64, Value)> {
     if p.role != Role::Module {
         return Err(Error::new("FORBIDDEN", "module credential required"));
     }
@@ -110,8 +114,8 @@ pub(super) fn next(db: &mut Connection, p: &Principal) -> Result<Value> {
     let row:Option<(String,String,String,i64)>=tx.query_row(
         "SELECT operation_id,method,original_request_json,created_at_ms FROM operations AS candidate
          WHERE binding_id=?1 AND binding_generation=?2 AND state='queued' AND due_at_ms<=?3
-           AND method IN ('agent.open','task.dispatch','agent.send','agent.reply','agent.configure','agent.goal','agent.refresh','agent.reconcile')
-           AND (method IN ('agent.reply','agent.refresh','agent.reconcile')
+           AND method IN ('agent.open','task.dispatch','agent.send','agent.reply','agent.configure','agent.goal','agent.refresh','agent.reconcile','agent.result')
+           AND (method IN ('agent.reply','agent.refresh','agent.reconcile','agent.result')
              OR (method='agent.goal' AND json_extract(original_request_json,'$.action') IN ('pause','clear'))
              OR NOT EXISTS (SELECT 1 FROM operations AS pending
                WHERE pending.binding_id=?1 AND pending.binding_generation=?2
@@ -119,7 +123,7 @@ pub(super) fn next(db: &mut Connection, p: &Principal) -> Result<Value> {
                  AND pending.method IN ('agent.open','task.dispatch','agent.send','agent.configure','agent.goal')))
          ORDER BY CASE WHEN method='agent.reply' THEN 0
                        WHEN method='agent.goal' AND json_extract(original_request_json,'$.action') IN ('pause','clear') THEN 1
-                       WHEN method IN ('agent.refresh','agent.reconcile') THEN 2 ELSE 3 END, due_at_ms, rowid LIMIT 1",
+                       WHEN method IN ('agent.refresh','agent.reconcile','agent.result') THEN 2 ELSE 3 END, due_at_ms, rowid LIMIT 1",
         params![id,generation,model::now_ms()?],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
     let Some((op, method, raw, created)) = row else {
         return Ok(json!({"command":null}));
@@ -287,6 +291,11 @@ pub(super) fn outcome(db: &mut Connection, p: &Principal, v: &Value) -> Result<V
         EffectOutcome::Rejected => "rejected",
         EffectOutcome::Unknown => "outcome_unknown",
     };
+    if o["method"] == "agent.result" && matches!(r.outcome, EffectOutcome::Applied) {
+        return Err(Error::invalid(
+            "result pages require module.result and durable artifact publication",
+        ));
+    }
     if matches!(r.outcome, EffectOutcome::Applied) {
         if o["method"] == "agent.open" {
             let native = r
@@ -421,9 +430,11 @@ pub(super) fn disconnected(db: &Connection, p: &Principal) -> Result<()> {
 fn is_recovery_control(method: &str, input: &Value, binding: &Value) -> bool {
     binding["state"] == "reconciling"
         && binding["native_root_id"].is_string()
-        && (matches!(method, "agent.refresh" | "agent.reply" | "agent.reconcile")
-            || (method == "agent.goal"
-                && matches!(input["action"].as_str(), Some("pause" | "clear"))))
+        && (matches!(
+            method,
+            "agent.refresh" | "agent.reply" | "agent.reconcile" | "agent.result"
+        ) || (method == "agent.goal"
+            && matches!(input["action"].as_str(), Some("pause" | "clear"))))
 }
 
 pub(super) fn user_command(
@@ -448,6 +459,9 @@ pub(super) fn user_command(
         if !owns {
             return Err(Error::new("FORBIDDEN", "no assignment on this binding"));
         }
+    }
+    if method == "agent.result" && v["selector"].as_object().is_none_or(|o| o.is_empty()) {
+        return Err(Error::invalid("result selector object required"));
     }
     if method == "agent.send" {
         model::text(v, "text")?;
