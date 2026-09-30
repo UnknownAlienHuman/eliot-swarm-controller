@@ -1,25 +1,27 @@
 # Muse SDK bridge — first native integration slice
 
-This module now contains executable code, not just dependency preparation. It uses the complete published `@muse-code/sdk` **1.3.0**, pinned by package-lock.json, and the reviewed MSP schema at `meta-models/muse-code-sdk@a7c10c5dd3f66be412077d29f9d11111af70317b`. Runtime/Windows/model qualification is still pending; SDK syntax/import checks are not a completed model run.
+This module contains executable code, not only dependency preparation. It uses the whole published `@muse-code/sdk` **1.3.0**, locked locally, and the reviewed [MSP schema](https://github.com/meta-models/muse-code-sdk/blob/a7c10c5dd3f66be412077d29f9d11111af70317b/schema/msp/msp.d.ts). Native/Windows/model qualification is pending; syntax/import checks are not a model run.
 
-## Ownership and implementation
+## Ownership and implemented path
 
-One independently started Node process owns one native `muse serve` connection and its descendants. The existing Rust host exposes `module.hello/next/outcome/observe` over its authenticated local IPC. There is no new listener, model proxy or second task database. An operator-issued module credential is scoped to one reserved binding/generation and cannot call task acceptance or general manager methods.
+One independently started Node process owns one `muse serve` connection and its native descendants. The existing Rust host exposes `module.hello/next/outcome/observe` over authenticated local IPC. A module credential is scoped to a reserved binding/generation; it cannot call task acceptance or impersonate GM. No new listener, inference proxy or task database is added.
 
-The host commits `queued -> sending` before yielding a command. The bridge reports native identity/admission separately from completed turns. It keeps unacknowledged command outcomes until the host commits them, and never repeats a native command after losing a host response. `task.dispatch` includes the immutable Task snapshot. Explicit next-turn input and exact-turn steer use the native SDK. Replies remain independent of command admission and model execution.
+The host commits command admission before yielding native work. Input admissions are ordered; protocol replies do not wait for a model turn. Unknown admission never creates a repeated prompt. The bridge retains outcomes until the host commits them, sends the immutable Task snapshot, passes explicit per-turn reasoning effort, and reports model readback and exact native turn IDs separately from Task acceptance.
 
-Host disconnect does not call SDK.close. The same live bridge reconnects with its boot/native identities. A different bridge process encountering possibly live prior native work is refused for reconciliation rather than silently spawning another executor. Explicitly terminating this bridge closes its owned native connection; it must not be used to stop an unrelated shared service.
+Host disconnect does not call SDK.close. The same live bridge reconnects with its boot/native identities. A different process confronting possibly live old work requires reconciliation rather than a new implicit executor. Explicitly terminating this bridge closes its own native connection, not an unrelated service.
 
-Native token deltas and full transcripts stay in Muse. The bridge reports compact state, observed children, pending requests, exact turn terminals and an unsummed native usage snapshot. Family completeness is **partial**, not inferred from a root's idle event. This first slice does not implement automatic bridge launching, crash-time native resume, complete family reconstruction, goal configuration, artifact retrieval, task acceptance, or autonomous handoff after an unknown effect. Do not label full C03 complete.
+**MSP presentation acknowledgement is not a decision.** For `approval/request` and `userInput/request`, the published `RequestReceipt` is `{}`: acknowledgement that a surface has or will present the question. The bridge retains the question and returns that receipt immediately. An actual decision is a separate `approval/decide` or `userInput/*` command carrying the current native identifiers. Generic JSON-RPC response bodies do not grant approval. The root's goal observation also excludes child goal events.
 
-## First setup (explicit, local)
+Native token deltas and full transcripts stay in Muse. The bridge keeps compact state, observed children, pending questions, recent exact turn terminals and an unsummed native usage snapshot. Family completeness is **partial**. No complete-family claim follows from root idle. Automatic bridge launching, crash-time native resume, complete family reconstruction, native goal configuration, artifact retrieval, task acceptance and autonomous handoff after unknown effects remain incomplete. Do not label full C03 complete.
 
-1. `npm ci --ignore-scripts` in this directory. This installs only the locked local SDK; it does not install Muse, modify global packages or log in.
-2. Select the actual installed Muse executable and its existing authentication. On Windows use the native `.exe`, not a `.cmd`/`.bat` shell wrapper. Keep `command` and `args` separate. Choose the installed runtime's supported launch arguments yourself; this module does not edit UAC, permissions or global Muse settings.
-3. Add an enabled route to a private controller TOML (example below). Start `swarm --config <file> host`. Call `agent.open` with `{"lane_id":"MC","route":"muse-manager"}` using the existing `swarm call ... --file ...` interface. Save its `binding_id` and `generation`.
-4. As operator, run `swarm client-create muse-MC --role module --binding-id <binding> --generation 1 --out <private-credential.json>` with the same `--data-dir`. Save/reuse the printed request ID if a reply is lost. Do not share this credential with the model.
-5. Copy `module.example.json` outside the repository. Set the host's exact pipe/socket endpoint printed at startup, credential file, native executable and args. Then run `node modules/muse/bridge.mjs --config <private-module.json>` independently of the host. It waits for the reserved opening operation before spawning Muse.
-6. `agent.state` with binding/generation exposes the native readback. For a controller-start Task, call `task.claim` with `start_owner:"controller"`, `binding_id` and `binding_generation`, then `task.dispatch` with its `attempt_id` and `text`. The generic `call` command accepts these fields; the short task-claim CLI does not yet expose binding flags.
+## Explicit first setup
+
+1. Run `npm ci --ignore-scripts` here. This installs only the locked local SDK, not Muse or global packages; no login or model call occurs.
+2. Select the installed native Muse executable and its existing auth. Windows uses `.exe`, not `.cmd`/`.bat`. Keep command and argv separate; use supported arguments for that installed binary. The module does not edit UAC or global vendor settings.
+3. Add an enabled route to a private controller TOML (below), start `swarm --config <file> host`, and call `agent.open` with `{"lane_id":"MC","route":"muse-manager"}`. Save returned binding_id/generation.
+4. As operator, run `swarm client-create muse-MC --role module --binding-id <binding> --generation 1 --out <private-credential.json>` with the same data-dir. Preserve the printed request ID for retries. Keep the credential out of model context.
+5. Copy `module.example.json` outside Git. Set the host's pipe/socket printed at startup, private credential path, actual native executable/argv and matching moduleArtifactId. Independently run `node modules/muse/bridge.mjs --config <private-module.json>`. It spawns Muse only when it receives the reserved opening operation.
+6. Read `agent.state`. To dispatch a Task, use `swarm call task.claim --file <params>` with `start_owner:"controller"`, binding_id and binding_generation, then `task.dispatch` with attempt_id/text. The short task-claim CLI does not yet expose binding flags. Readiness must come from native opening evidence, not a hand-edited DB.
 
 ```toml
 [[routes]]
@@ -34,14 +36,14 @@ reasoningEffort = 'max'
 approvalMode = 'allowAll'
 ```
 
-These are adapter-owned camelCase fields, not the former placeholder snake_case route example. Model/approval mode must exist in the selected native runtime. Effort is sent as an explicit per-turn option; opening the session alone does not prove Max inference. A model readback mismatch is not silently accepted.
+These are adapter-owned camelCase fields. Model and approval mode must exist in the native runtime. Effort is explicit per turn; opening a session does not prove Max inference. Model readback mismatch is not silently accepted.
 
-`agent.send`: `binding_id`, `generation`, `text`, and `delivery:"next_turn"` or `delivery:"steer"` with `expected_turn_id`.
+`agent.send` takes binding_id/generation/text and `delivery:"next_turn"` or `delivery:"steer"` with expected_turn_id. `agent.reply` takes binding_id/generation and `reply:{"method":"approval/decide","params":{...}}` or `userInput/answer|cancel|clarify`. Supply the exact installed-schema choice, requirement, question and session IDs from the pending question. The adapter checks the observed family and delegates schema validation to the native SDK/server. It exposes no arbitrary-method passthrough and does not guess substantive answers.
 
-`agent.reply`: `binding_id`, `generation`, and `reply`. For a pending native server request, use its exact `request_id` plus a protocol-correct `response`. For native approval/user-input commands, use `reply.method` and `reply.params` matching the installed MSP schema; only `approval/decide` and `userInput/answer|cancel|clarify` are accepted, scoped to the observed family. No generic arbitrary-method passthrough is exposed. Full permissions do not authorize guessing an answer to a substantive question.
+## Checkpoint and next work
 
-## Recovery checkpoint and source provenance
+The earlier interrupted preparation (`0e3ccd6b`, `db45be62`) did not contain this bridge. Its recovered source/package input was Actions run 36696436986, artifact 11087808310, SHA-256 `b0e06843336290e685cd79376c709be4ac7ab79accf3cb09f9bd2beb1826ad52`. The source and lockfile now live in Git; temporary artifact retention is not a dependency authority.
 
-The prior interrupted continuation published preparation only (`0e3ccd6b`, `db45be62`). Its recovered input artifact, Actions run 36696436986 / artifact 11087808310, SHA-256 `b0e06843336290e685cd79376c709be4ac7ab79accf3cb09f9bd2beb1826ad52`, contained the SDK source/schema/fixtures/package, not this bridge. The lockfile is committed; the temporary Actions archive is not the dependency authority. No need to reconstruct or roll back the built local controller at c37e6bbf.
+The first integration was published in b2bd0211, with admission wakeup in 21502426 and corrected presentation-receipt semantics in 58055475. See the exact-commit CI run for compilation evidence; no live native session was invoked in these edits.
 
-Next native work: qualify this actual SDK path, add explicit recovery/reconciliation and task-specific child bindings, then direct OpenCode V2 against the same control contract. OpenCodex is separately deferred in [Issue #1](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/1) until the main controller code is complete.
+Next: qualify this SDK path and complete recovery and task-specific child mapping, then direct OpenCode V2 on the same host contract. [OpenCodex Issue #1](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/1) remains after the main controller implementation, not a prerequisite. Do not rewrite the existing core or restore historical briefs.
