@@ -1,0 +1,54 @@
+name: Rust
+on:
+  push:
+    branches: [main]
+    paths: ['src/**', 'migrations/**', 'Cargo.toml', 'Cargo.lock', '.github/workflows/rust.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Toolchain
+        shell: bash
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup component add rustfmt clippy
+          rustc --version
+          cargo --version
+      - name: Resolve initial dependencies
+        shell: bash
+        run: |
+          if [ ! -f Cargo.lock ]; then cargo generate-lockfile; fi
+      - name: Format sources
+        run: cargo fmt --all
+      - name: Clippy
+        run: cargo clippy --locked --lib --bins --no-deps -- -D warnings
+      - name: Build
+        run: cargo build --locked --release --bin swarm
+      - name: Record exact build inputs
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p build-info
+          git diff -- src > build-info/rustfmt.patch
+          printf '%s\n' "$GITHUB_SHA" > build-info/source-commit.txt
+          rustc --version > build-info/rustc.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: swarm-${{ matrix.os }}
+          retention-days: 7
+          path: |
+            Cargo.lock
+            src/
+            build-info/
+            target/release/swarm
+            target/release/swarm.exe

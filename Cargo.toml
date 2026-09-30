@@ -1,0 +1,35 @@
+[package]
+name = "eliot-swarm-controller"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+publish = false
+description = "Headless local controller for native coding-agent harnesses"
+
+[lib]
+name = "eliot_swarm_controller"
+path = "src/lib.rs"
+
+[[bin]]
+name = "swarm"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+futures-util = { version = "0.3", features = ["sink"] }
+rusqlite = { version = "=0.40.2", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "signal", "time"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+toml = "0.9"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading", "Win32_Storage_FileSystem"] }
+
+[profile.release]
+lto = "thin"
+strip = "debuginfo"

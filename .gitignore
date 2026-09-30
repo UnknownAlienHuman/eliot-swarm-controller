@@ -1,6 +1,8 @@
 /target/
 /dist/
 /.swarm/
+/.swarm-controller/
+/build-info/
 /.local/
 /.env
 /.env.*
@@ -17,5 +19,6 @@
 *.sqlite-wal
 *.sqlite-shm
 *.local.toml
+*.credential.json
 Thumbs.db
 .DS_Store

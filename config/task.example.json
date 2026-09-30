@@ -1,0 +1,15 @@
+{
+  "objective": "Implement the assigned controller change in main.",
+  "phase": "implementation",
+  "requirements": [
+    {"id": "W1", "statement": "Implement the requested behavior without a placeholder native executor."},
+    {"id": "A1", "statement": "Run focused formatting and Clippy; do not start the broad test phase."}
+  ],
+  "dependencies": [],
+  "scope": {
+    "initial_paths": ["src/"],
+    "forbidden_paths": [],
+    "prerequisite_policy": "owner_module_prerequisites"
+  },
+  "source_refs": ["docs/agent_swarm.implementation-v6.md"]
+}

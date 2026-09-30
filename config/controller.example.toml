@@ -1,0 +1,22 @@
+# Copy outside the repository or pass --data-dir explicitly.
+# Paths are resolved relative to this file. No vendor is installed or launched.
+schema_version = 1
+[storage]
+data_dir = '../.swarm-controller'
+queue_capacity = 256
+[ipc]
+max_frame_bytes = 1048576
+max_connections = 256
+max_inflight_per_connection = 8
+write_timeout_seconds = 15
+
+# Native execution is not implemented in 0.1.0. Enabled routes can reserve an
+# opening binding and durable operation only; they cannot fabricate readiness.
+[[routes]]
+alias = 'muse-manager'
+runtime = 'muse'
+module_artifact_id = 'pending-muse-sdk-bridge'
+enabled = false
+[routes.native_options]
+model = 'muse-spark-1.3-contributor'
+reasoning_effort = 'max'
