@@ -1,0 +1,9 @@
+{
+  "name": "@eliot/swarm-muse-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local persistent Muse SDK bridge; no global installation or model proxy",
+  "engines": { "node": ">=22" },
+  "dependencies": { "@muse-code/sdk": "1.3.0" }
+}

@@ -1,0 +1,39 @@
+name: Prepare native integration inputs
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/prepare-native.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  sources:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Fetch pinned Muse SDK source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: meta-models/muse-code-sdk
+          ref: a7c10c5dd3f66be412077d29f9d11111af70317b
+          path: .local/muse-sdk
+      - name: Resolve module-local package and collect source inputs
+        shell: bash
+        run: |
+          mkdir -p .local/inputs
+          cp -R src migrations config Cargo.toml Cargo.lock rust-toolchain.toml README.md .local/inputs/
+          mkdir -p .local/inputs/muse
+          cp -R .local/muse-sdk/clients .local/muse-sdk/schema .local/muse-sdk/package*.json .local/inputs/muse/
+          find .local/muse-sdk -maxdepth 1 -type f \( -name 'LICENSE*' -o -name 'tsconfig*' \) -exec cp '{}' .local/inputs/muse/ \;
+          npm install --ignore-scripts --prefix modules/muse
+          cp -R modules/muse .local/inputs/published-module
+          rustup toolchain install 1.98.1 --profile minimal --component rustfmt --no-self-update
+          cp "$(rustup which rustfmt)" .local/inputs/rustfmt
+          ldd .local/inputs/rustfmt > .local/inputs/rustfmt-libraries.txt || true
+          printf '%s\n' "$GITHUB_SHA" > .local/inputs/source-commit.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-integration-inputs
+          path: .local/inputs/
+          retention-days: 3
+          if-no-files-found: error
