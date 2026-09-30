@@ -17,6 +17,7 @@ jobs:
           rustup toolchain install 1.98.1 --profile minimal --component rustfmt --no-self-update
           mkdir -p .local/inputs/formatter/bin .local/inputs/formatter/lib
           git archive --format=tar HEAD > .local/inputs/source.tar
+          (cd .local/inputs && sha256sum source.tar > source.tar.sha256)
           cp "$(rustup which rustfmt)" .local/inputs/formatter/bin/
           TOOLCHAIN="$(dirname "$(dirname "$(rustup which rustfmt)")")"
           find "$TOOLCHAIN/lib" -maxdepth 1 -name '*.so*' -exec cp -L '{}' .local/inputs/formatter/lib/ \;
