@@ -8,7 +8,7 @@ The Rust core provides authenticated clients, tasks/revisions/claims, durable re
 
 The Muse SDK bridge opens an explicitly selected native executable, delivers Task snapshots with per-turn effort, handles exact-turn steer/questions/goal/configuration, and reports observed children and run identities. A live bridge reconnects without closing Muse or replaying model input. Bridge.4 reads pinned native result pages without consuming `subagent/readResult`.
 
-**This continuation completes local whole-result assembly and export.** `artifact.assemble` validates a complete ordered set of retained pages, publishes a whole-result file and records provenance. `artifact.parts` pages that provenance; `artifact.read` verifies touched segments. `swarm artifact export` reuses one authenticated IPC connection, streams bytes to an explicitly chosen local file and checks the full SHA-256 before publication. It never sends the destination path to a model or the host.
+**Local whole-result assembly and export are implemented.** `artifact.assemble` validates a complete ordered set of retained pages, publishes a whole-result file and records provenance. `artifact.parts` pages that provenance; `artifact.read` verifies touched segments. `swarm artifact export` reuses one authenticated IPC connection, streams bytes to an explicitly chosen local file and checks the full SHA-256 before publication. It never sends the destination path to a model or the host.
 
 **Still pending:** bridge-process crash/resume, complete native family reconstruction, automatic handoff, Task submission/acceptance, CheckRunner, direct OpenCode V2 and other native adapters, MCP and automatic module/service installation. Whole-result coverage is not Task acceptance. Live Muse/Max inference and Windows native launch remain unqualified. Do not mark all C01–C03 complete.
 
@@ -93,7 +93,9 @@ Next: implement the remaining Muse crash-recovery boundary and Task result/Check
 
 ## Evidence and development
 
-The previous result-reader slice `684bc33a` passed [Windows/Linux CI 36759367801](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/36759367801); its recovered source tree was `7debef1ee27af1dcb44c86de133b1c1a9d3dfefb`. Recovery documentation was `19f1447f`. Current assembly code is a separate change: use the CI run for its exact commit, not an earlier green build.
+**Current code checkpoint: `1953ff5a5ebbe72cfdc0e605504c7f65439d0a7e`.** Assembly/export was implemented in `3631a646`; `1953ff5a` additionally checks the backing file of an empty export. On 2026-09-30, [CI run 36771097804](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/36771097804) completed successfully on Windows and Linux: formatting, warnings-denied Clippy, Muse syntax/SDK import and release build. The dependency locks, native module and nine-table migration were unchanged.
+
+A short local invocation of that Linux binary sent **synthetic pages through the real authenticated module IPC**, then used actual artifact assembly/export. A three-page 153,602-byte body exported byte-for-byte with the expected SHA-256. Repeating the request returned the saved receipt; an existing output was not overwritten. An empty result exported successfully, and a subsequent export after removing only its synthetic backing file failed without publishing a destination. The isolated host exited cleanly. No Muse process, native model, user project, Windows runtime or broad test suite was involved; this does not qualify native inference or crash recovery.
 
 The read-only workflow pins Rust 1.98.1/Cargo.lock and runs formatting, warnings-denied Clippy, release builds and Muse syntax/SDK import checks. It does not run `cargo test`, vendor sessions, login or global installation. Artifacts include exact source SHA/source archive. Windows compilation is not qualification on the owner's machine.
 
