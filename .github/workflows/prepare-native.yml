@@ -11,18 +11,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-      - name: Collect the matching formatter and its runtime libraries
+      - name: Collect source and matching formatter
         shell: bash
         run: |
           rustup toolchain install 1.98.1 --profile minimal --component rustfmt --no-self-update
-          mkdir -p .local/formatter/bin .local/formatter/lib
-          cp "$(rustup which rustfmt)" .local/formatter/bin/
+          mkdir -p .local/inputs/formatter/bin .local/inputs/formatter/lib
+          git archive --format=tar HEAD > .local/inputs/source.tar
+          cp "$(rustup which rustfmt)" .local/inputs/formatter/bin/
           TOOLCHAIN="$(dirname "$(dirname "$(rustup which rustfmt)")")"
-          find "$TOOLCHAIN/lib" -maxdepth 1 -name '*.so*' -exec cp -L '{}' .local/formatter/lib/ \;
-          printf '%s\n' "$GITHUB_SHA" > .local/formatter/source-commit.txt
+          find "$TOOLCHAIN/lib" -maxdepth 1 -name '*.so*' -exec cp -L '{}' .local/inputs/formatter/lib/ \;
+          printf '%s\n' "$GITHUB_SHA" > .local/inputs/source-commit.txt
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: native-formatter
-          path: .local/formatter/
-          retention-days: 1
+          name: native-development-inputs
+          path: .local/inputs/
+          retention-days: 3
           if-no-files-found: error
