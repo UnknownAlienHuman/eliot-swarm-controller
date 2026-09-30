@@ -48,6 +48,7 @@ const turns = new Map();
 const nativePending = new Map();
 const sessionVersions = new Map();
 let standingEffort, refreshInFlight;
+const childReads = new Map();
 function saveOutcome(operationId, result) {
   const pending = nativePending.get(operationId);
   if (pending?.resolved && !['applied','rejected'].includes(result.outcome)) return;
@@ -97,9 +98,11 @@ function onNotification(n) {
   if (n.method === 'view/gap' || n.method === 'session/viewHealthChanged') {
     latest.gaps++; latest.view_health = { method:n.method, sessionId:p.sessionId, status:p.status ?? p.health ?? 'unknown' };
   }
-  if (n.method === 'turn/started' || n.method === 'turn/completed') {
+  if (['turn/started','turn/completed','turn/unqueued'].includes(n.method)) {
+    if (typeof p.sessionId !== 'string' || typeof p.turnId !== 'string' || !p.turnId) { latest.gaps++; changed(); return; }
     const state = { sessionId:p.sessionId, turnId:p.turnId, commandId:p.commandId,
-      event:n.method, terminal:p.terminal, viewCursor:p.viewCursor };
+      event:n.method, terminal:n.method==='turn/unqueued'?'cancelled':p.terminal, viewCursor:p.viewCursor,
+      sourceRange:p.sourceRange, errorKind:p.error?.kind };
     const key = `${p.sessionId}:${p.turnId}`;
     if (n.method === 'turn/started' && turns.get(key)?.terminal) return;
     turns.set(key, state);
@@ -114,12 +117,19 @@ function onNotification(n) {
     latest.execution = p.status; latest.attention = p.attention;
   }
   const item = p.item;
-  if (item?.childSessionId && (p.sessionId === rootId || children.has(p.sessionId))) {
+  if (['subagent','reminderChild'].includes(item?.kind) && typeof item.childSessionId==='string'
+      && typeof item.itemId==='string' && Number.isSafeInteger(item.revision)
+      && (p.sessionId === rootId || children.has(p.sessionId))) {
     if (children.has(item.childSessionId) || children.size < 2000) {
       const old = children.get(item.childSessionId);
       if (!old || item.itemId !== old.itemId || Number(item.revision ?? 0) >= Number(old.revision ?? 0)) {
-        children.set(item.childSessionId, { sessionId:item.childSessionId, parentSessionId:p.sessionId,
-          itemId:item.itemId, parentTurnId:item.turnId, status:item.status, controlStatus:item.controlStatus, revision:item.revision });
+        children.set(item.childSessionId, { ...old, sessionId:item.childSessionId, parentSessionId:p.sessionId,
+          itemId:item.itemId, subagentId:item.subagentId, parentTurnId:item.turnId,
+          status:item.status, controlStatus:item.controlStatus, revision:item.revision,
+          result_available:Boolean(item.result),
+          result_summary:typeof item.result?.summary==='string'?item.result.summary.slice(0,512):undefined,
+          result_error_kind:item.result?.errorKind,
+          result_source:item.result?{parentSessionId:p.sessionId,itemId:item.itemId,revision:item.revision,viewCursor:p.viewCursor}:undefined });
       }
       if (!old && msp) {
         // Subscribe from an observed read cursor; never acquire a child's writer lease.
@@ -237,13 +247,36 @@ async function reconcileNative(target) {
   return {target_operation_id:target,disposition:entry.resolved?'resolved':'pending_application',resubmitted:true,native_command_id:entry.id};
 }
 
-async function followChild(id) {
-  try {
-    const r = await msp.connection.request('session/read', {sessionId:id});
-    const child=compactSession(r.session);
-    children.set(id, {...children.get(id), snapshot:child}); changed();
+async function refreshChild(id) {
+  if (childReads.has(id)) return childReads.get(id);
+  if (!children.has(id)) throw new Error('CHILD_OUTSIDE_OBSERVED_FAMILY');
+  const pending = (async () => {
+    const before = sessionVersions.get(id)??0;
+    const r = await msp.connection.request('session/read', {sessionId:id,excludeItems:true});
+    const snapshot = compactSession(r.session);
+    if (snapshot.sessionId!==id) throw new Error('SNAPSHOT_IDENTITY_MISMATCH');
+    const fresh = before===(sessionVersions.get(id)??0);
+    if (fresh) children.set(id, {...children.get(id),snapshot});
+    // Resume observation from the read cursor, never acquire a child's writer
+    // lease or consume its result through subagent/readResult.
     await msp.connection.request('view/subscribe', {sessionId:id,after:required(r,'viewCursor')});
-  } catch { latest.gaps++; changed(); }
+    const pendingAt = sessionVersions.get(id)??0;
+    const questions = await msp.connection.request('approval/listPending',{sessionId:id});
+    if (!Array.isArray(questions.approvals) || !Array.isArray(questions.userInputs)) throw new Error('INVALID_PENDING_INVENTORY');
+    if (pendingAt===(sessionVersions.get(id)??0)) {
+      for (const [key, entry] of pendingRequests) if (entry.view.params?.sessionId===id) pendingRequests.delete(key);
+      for (const params of questions.approvals) pendingRequests.set(`approval:${required(params,'approvalId')}`,{view:{method:'approval/request',params}});
+      for (const params of questions.userInputs) pendingRequests.set(`input:${required(params,'userInputId')}`,{view:{method:'userInput/request',params}});
+    }
+    const refreshed={at_ms:Date.now(),session_id:id,metadata_applied:fresh,viewCursor:r.viewCursor,coverage:'observed_child_metadata_and_pending_requests'};
+    children.set(id,{...children.get(id),last_refresh:refreshed});changed();
+    return refreshed;
+  })();
+  childReads.set(id,pending);
+  try {return await pending;} finally {childReads.delete(id);}
+}
+async function followChild(id) {
+  try {await refreshChild(id);} catch {latest.gaps++;changed();}
 }
 async function startNative(command) {
   if (handshake) throw new Error('NATIVE_ALREADY_OWNED');
@@ -333,7 +366,8 @@ async function execute(command) {
         await submitNative(command,goal.method,goal.params,'goal');
         return;
       } else if (command.method === 'agent.refresh') {
-        result = {details:{completion_condition:'native_read_completed',snapshot:await refreshRoot()}};
+        const target = p.session_id===undefined?rootId:required(p,'session_id');
+        result = {details:{completion_condition:'native_read_completed',snapshot:await (target===rootId?refreshRoot():refreshChild(target))}};
       } else if (command.method === 'agent.reconcile') {
         nativeAdmissionPossible = true;
         result = {details:await reconcileNative(required(p,'operation_id'))};

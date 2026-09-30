@@ -241,6 +241,14 @@ pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
             "binding_generation",
         ],
         "task.dispatch" => &["client_request_id", "attempt_id", "text"],
+        "attempt.bind_producer" => &[
+            "client_request_id",
+            "attempt_id",
+            "assignment_id",
+            "native_session_id",
+            "native_run_id",
+            "observation_id",
+        ],
         "attempt.release" => &[
             "client_request_id",
             "attempt_id",
@@ -266,7 +274,12 @@ pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
             "action",
             "objective",
         ],
-        "agent.refresh" => &["client_request_id", "binding_id", "generation"],
+        "agent.refresh" => &[
+            "client_request_id",
+            "binding_id",
+            "generation",
+            "session_id",
+        ],
         "agent.reconcile" => &[
             "client_request_id",
             "binding_id",
@@ -292,7 +305,24 @@ pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
         let spec: TaskSpec = serde_json::from_value(params["spec"].clone())?;
         spec.validate()?;
     }
-    for field in ["owner_id", "origin_key", "binding_id", "in_reply_to"] {
+    if method == "attempt.bind_producer" {
+        for field in [
+            "attempt_id",
+            "assignment_id",
+            "native_session_id",
+            "native_run_id",
+        ] {
+            text(params, field)?;
+        }
+        positive(params, "observation_id")?;
+    }
+    for field in [
+        "owner_id",
+        "origin_key",
+        "binding_id",
+        "in_reply_to",
+        "session_id",
+    ] {
         if let Some(value) = params.get(field)
             && !value.is_null()
         {

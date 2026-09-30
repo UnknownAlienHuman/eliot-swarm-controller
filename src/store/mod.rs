@@ -1,5 +1,6 @@
 //! A single database owner. The async facade never holds a SQLite connection.
 mod operations;
+mod producers;
 mod runtime;
 mod tasks;
 use crate::{
@@ -283,6 +284,7 @@ fn is_read(method: &str) -> bool {
             | "attempt.get"
             | "operation.get"
             | "operation.list"
+            | "agent.family"
             | "agent.state"
             | "agent.list"
             | "route.list"
@@ -326,6 +328,7 @@ fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config
                 json!({"version":env!("CARGO_PKG_VERSION"),"controller_id":meta(db,"controller_id")?,"host_epoch":meta(db,"host_epoch")?,"sqlite":rusqlite::version(),"tasks":tasks,"unreleased_attempts":owners,"queued_operations":queued,"execution_mode":meta(db,"execution_mode")?,"native_modules_connected":db.query_row("SELECT count(*) FROM bindings WHERE released_at_ms IS NULL AND json_extract(state_json, '$.connection')='connected'",[],|r|r.get::<_,i64>(0))?,"native_execution":"external_module_protocol"}),
             )
         }
+        "agent.family" => producers::family(db, v),
         "task.get" => {
             model::fields(v, &["task_id"])?;
             tasks::get_task(db, model::text(v, "task_id")?)
@@ -510,6 +513,7 @@ fn apply(
         "task.create" => tasks::create(tx, p, v, id, now).map(|v| (v, false)),
         "task.revise" => tasks::revise(tx, p, v, id, now).map(|v| (v, false)),
         "task.claim" => tasks::claim(tx, p, v, id, now).map(|v| (v, false)),
+        "attempt.bind_producer" => producers::bind(tx, p, v, id, now).map(|v| (v, false)),
         "attempt.release" => tasks::release(tx, p, v, id, now).map(|v| (v, false)),
         "task.dispatch" => operations::dispatch(tx, p, v, id, now),
         "agent.send" | "agent.reply" | "agent.configure" | "agent.goal" | "agent.refresh"

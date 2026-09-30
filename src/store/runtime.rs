@@ -1,6 +1,6 @@
 //! Module admission and facts, scoped by a credential to one reserved native root.
 //! Network I/O is never performed inside these transactions.
-use super::{meta, operations, tasks};
+use super::{meta, operations, producers, tasks};
 use crate::{
     error::{Error, Result},
     model::{self, Principal, Role},
@@ -316,7 +316,11 @@ pub(super) fn outcome(db: &mut Connection, p: &Principal, v: &Value) -> Result<V
             // A short turn can finish before its admission response arrives.
             // Reuse already-recorded exact-run evidence instead of waiting for
             // another notification which may never be emitted.
-            apply_turn_evidence(&mut producer, &b["observation"]["native"]["turns"]);
+            producers::apply_evidence(
+                &mut producer,
+                &b["observation"]["native"],
+                b["observation"]["native_observation_id"].as_i64(),
+            );
             tx.execute("UPDATE attempts SET state='running',producers_json=json_insert(producers_json,'$[#]',json(?2)),updated_at_ms=?3 WHERE attempt_id=?1 AND released_at_ms IS NULL",params![attempt,model::canonical(&producer)?,now])?;
         }
     } else if o["method"] == "agent.open" && !matches!(r.outcome, EffectOutcome::Accepted) {
@@ -374,12 +378,13 @@ pub(super) fn observe(db: &mut Connection, p: &Principal, v: &Value) -> Result<V
             (_, None) => true,
         };
     tx.execute("INSERT INTO observations(source_stream_id,source_event_key,binding_id,binding_generation,kind,payload_json,recorded_at_ms) VALUES(?1,?2,?3,?4,'runtime.state',?5,?6)",params![format!("module:{}",p.client_id),event,id,generation,encoded,now])?;
+    let observation_id = tx.last_insert_rowid();
     if !current {
         tx.commit()?;
         return Ok(json!({"recorded":true,"stale":true}));
     }
-    tx.execute("UPDATE bindings SET state_json=json_set(state_json,'$.native',json(?3),'$.observed_at_ms',?4,'$.native_sequence',?5) WHERE binding_id=?1 AND generation=?2",params![id,generation,encoded,now,sequence])?;
-    if v["state"]["turns"].is_array() {
+    tx.execute("UPDATE bindings SET state_json=json_set(state_json,'$.native',json(?3),'$.observed_at_ms',?4,'$.native_sequence',?5,'$.native_observation_id',?6) WHERE binding_id=?1 AND generation=?2",params![id,generation,encoded,now,sequence,observation_id])?;
+    if v["state"]["turns"].is_array() || v["state"]["observed_children"].is_array() {
         let mut stmt = tx.prepare("SELECT attempt_id, producers_json FROM attempts WHERE binding_id=?1 AND binding_generation=?2 AND released_at_ms IS NULL")?;
         let rows = stmt
             .query_map(params![id, generation], |r| {
@@ -390,7 +395,7 @@ pub(super) fn observe(db: &mut Connection, p: &Principal, v: &Value) -> Result<V
         for (attempt, raw) in rows {
             let mut producers: Vec<Value> = serde_json::from_str(&raw)?;
             for producer in &mut producers {
-                apply_turn_evidence(producer, &v["state"]["turns"]);
+                producers::apply_evidence(producer, &v["state"], Some(observation_id));
             }
             tx.execute(
                 "UPDATE attempts SET producers_json=?2 WHERE attempt_id=?1",
@@ -399,7 +404,7 @@ pub(super) fn observe(db: &mut Connection, p: &Principal, v: &Value) -> Result<V
         }
     }
     tx.commit()?;
-    Ok(json!({"recorded":true,"stale":false}))
+    Ok(json!({"recorded":true,"stale":false,"observation_id":observation_id}))
 }
 
 pub(super) fn disconnected(db: &Connection, p: &Principal) -> Result<()> {
@@ -411,22 +416,6 @@ pub(super) fn disconnected(db: &Connection, p: &Principal) -> Result<()> {
     };
     db.execute("UPDATE bindings SET state=CASE WHEN state='ready' THEN 'reconciling' ELSE state END,state_json=json_set(state_json,'$.connection','disconnected') WHERE binding_id=?1 AND generation=?2 AND json_extract(state_json,'$.module_link_id')=?3 AND released_at_ms IS NULL",params![c["binding_id"].as_str(),c["binding_generation"].as_i64(),p.link_id])?;
     Ok(())
-}
-
-fn apply_turn_evidence(producer: &mut Value, turns: &Value) {
-    if let Some(turns) = turns.as_array() {
-        for turn in turns {
-            if producer["native_session_id"] == turn["sessionId"]
-                && producer["native_run_id"] == turn["turnId"]
-                && matches!(
-                    turn["terminal"].as_str(),
-                    Some("completed" | "failed" | "cancelled")
-                )
-            {
-                producer["disposition"] = turn["terminal"].clone();
-            }
-        }
-    }
 }
 
 fn is_recovery_control(method: &str, input: &Value, binding: &Value) -> bool {

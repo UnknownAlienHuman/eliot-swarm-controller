@@ -54,6 +54,18 @@ enum Command {
         #[arg(long)]
         generation: Option<i64>,
     },
+    /// Read a stable page of recorded native children without calling the harness.
+    Family {
+        binding_id: String,
+        #[arg(long)]
+        generation: i64,
+        #[arg(long)]
+        observation_id: Option<i64>,
+        #[arg(long, default_value_t = 0)]
+        after: i64,
+        #[arg(long, default_value_t = 50)]
+        limit: i64,
+    },
     Report {
         #[arg(long, default_value_t = 0)]
         after: i64,
@@ -88,6 +100,22 @@ enum TaskCommand {
         owner: Option<String>,
         #[arg(long,default_value="native_manager",value_parser=["controller","native_manager"])]
         start_owner: String,
+        #[arg(long, requires = "generation")]
+        binding_id: Option<String>,
+        #[arg(long, requires = "binding_id")]
+        generation: Option<i64>,
+    },
+    /// Associate existing native work with an Attempt; never spawns a worker.
+    Bind {
+        attempt_id: String,
+        #[arg(long)]
+        assignment: String,
+        #[arg(long)]
+        session: String,
+        #[arg(long)]
+        turn: String,
+        #[arg(long)]
+        observation_id: i64,
     },
     Revise {
         task_id: String,
@@ -138,6 +166,19 @@ async fn run(cli: Cli) -> Result<()> {
                 json!({})
             },
         ),
+        Command::Family {
+            binding_id,
+            generation,
+            observation_id,
+            after,
+            limit,
+        } => {
+            let mut value = json!({"binding_id":binding_id,"generation":generation,"after":after,"limit":limit});
+            if let Some(id) = observation_id {
+                value["observation_id"] = json!(id);
+            }
+            ("agent.family".into(), value)
+        }
         Command::Report { after, limit } => {
             ("report.delta".into(), json!({"after":after,"limit":limit}))
         }
@@ -162,13 +203,30 @@ async fn run(cli: Cli) -> Result<()> {
                 revision,
                 owner,
                 start_owner,
+                binding_id,
+                generation,
             } => {
                 let mut value = json!({"task_id":task_id,"expected_revision":revision,"start_owner":start_owner});
                 if let Some(owner) = owner {
                     value["owner_id"] = json!(owner);
                 }
+                if let (Some(binding), Some(generation)) = (binding_id, generation) {
+                    value["binding_id"] = json!(binding);
+                    value["binding_generation"] = json!(generation);
+                }
                 ("task.claim".into(), value)
             }
+            TaskCommand::Bind {
+                attempt_id,
+                assignment,
+                session,
+                turn,
+                observation_id,
+            } => (
+                "attempt.bind_producer".into(),
+                json!({"attempt_id":attempt_id,"assignment_id":assignment,
+                    "native_session_id":session,"native_run_id":turn,"observation_id":observation_id}),
+            ),
             TaskCommand::Revise {
                 task_id,
                 revision,
@@ -222,6 +280,7 @@ async fn run(cli: Cli) -> Result<()> {
             | "attempt.get"
             | "operation.get"
             | "operation.list"
+            | "agent.family"
             | "agent.state"
             | "agent.list"
             | "route.list"

@@ -44,6 +44,7 @@ jobs:
           rustc --version > build-info/rustc.txt
           cargo --version > build-info/cargo.txt
           node --version > build-info/node.txt
+          git archive --format=tar HEAD > build-info/source.tar
           git diff --exit-code
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: success()
