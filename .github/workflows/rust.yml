@@ -2,10 +2,10 @@ name: Rust
 on:
   push:
     branches: [main]
-    paths: ['src/**', 'migrations/**', 'Cargo.toml', 'Cargo.lock', '.github/workflows/rust.yml']
+    paths: ['src/**', 'migrations/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.github/workflows/rust.yml']
   workflow_dispatch:
 permissions:
-  contents: write
+  contents: read
 jobs:
   build:
     strategy:
@@ -15,55 +15,37 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-      - name: Toolchain
+      - name: Pinned toolchain
         shell: bash
         run: |
-          rustup update stable --no-self-update
-          rustup default stable
-          rustup component add rustfmt clippy
+          rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy --no-self-update
           rustc --version
           cargo --version
-      - name: Resolve initial dependencies
-        shell: bash
-        run: |
-          if [ ! -f Cargo.lock ]; then cargo generate-lockfile; fi
-      - name: Format sources
-        run: cargo fmt --all
+      - name: Formatting
+        run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --locked --lib --bins --no-deps -- -D warnings
       - name: Build
         run: cargo build --locked --release --bin swarm
-      - name: Commit initial formatting and lockfile once
-        if: success() && matrix.os == 'ubuntu-latest'
-        shell: bash
-        run: |
-          # Bootstrap only. The read-only final workflow replaces this step.
-          # Refuse to publish on top of an independently advanced main.
-          test "$(git ls-remote origin refs/heads/main | cut -f1)" = "$GITHUB_SHA"
-          git add -- src Cargo.lock
-          if ! git diff --cached --quiet; then
-            git config user.name 'github-actions[bot]'
-            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-            git switch -C main
-            git commit -m 'build: lock dependencies and format initial Rust implementation'
-            git push origin HEAD:refs/heads/main
-          fi
-      - name: Record exact build inputs
+      - name: Record build inputs
         if: always()
         shell: bash
         run: |
           mkdir -p build-info
-          git diff -- src > build-info/rustfmt.patch
-          git rev-parse HEAD > build-info/source-commit.txt
+          printf '%s\n' "$GITHUB_SHA" > build-info/source-commit.txt
           rustc --version > build-info/rustc.txt
+          cargo --version > build-info/cargo.txt
+          git diff --exit-code
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: always()
+        if: success()
         with:
           name: swarm-${{ matrix.os }}
           retention-days: 7
+          if-no-files-found: error
           path: |
             Cargo.lock
-            src/
+            config/
+            README.md
             build-info/
             target/release/swarm
             target/release/swarm.exe

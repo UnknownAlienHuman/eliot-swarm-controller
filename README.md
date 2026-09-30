@@ -2,22 +2,28 @@
 
 Headless, modular Rust controller for native coding-agent harnesses. This is the prototype for Eliot Memory OS's Agent Execution Fabric, not a replacement model loop.
 
-## Current implementation
+## Current implementation — 0.1.0
 
-`swarm` now contains a local user host, authenticated JSON-RPC IPC, a single SQLite owner thread, task/revision/claim operations, durable request receipts, opening-binding reservations, directed mailbox and incremental reports. Windows uses same-user Named Pipes; Unix uses a private local socket. No network listener is opened.
+`swarm` contains a local user host, authenticated JSON-RPC IPC, a single SQLite owner thread, task/revision/claim operations, durable request receipts, opening-binding reservations, directed mailbox and incremental reports. Windows uses same-user Named Pipes; Unix uses a private local socket. No TCP listener is opened.
 
-**Native execution is not connected yet.** No adapter, MCP facade, Cargo executor, acceptance pipeline or Windows-service installer is claimed complete. `agent.open` can reserve a durable opening request, but cannot report native readiness. `task.dispatch` refuses a missing/unready binding. The next implementation work is the Muse SDK bridge and direct OpenCode V2 boundary, with the remaining task/check lifecycle added on their real consumers.
+**Native execution is not connected yet.** No adapter, MCP facade, Cargo executor, acceptance pipeline or Windows-service installer is claimed complete. `agent.open` reserves a durable opening request but cannot report native readiness. `task.dispatch` refuses a missing/unready binding. There is no fake executor that marks a task running. These are implemented portions of C01/C02 and the local mailbox, not completion of every target contract in those packages.
 
-The first Rust changes are undergoing compilation/Clippy through the repository workflow. No vendor SDK, model call, Windows agent session or load qualification has run merely because these files exist.
+Next: connect the Muse SDK bridge and direct OpenCode V2 boundary, adding the remaining producer/submission/check transitions where real consumers need them. Preserve native subscriptions, Max and existing shared-server ownership. Do not replace the working base with another architecture rewrite.
+
+### Build evidence
+
+On 2026-09-30, [CI run 36692907519](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/36692907519) passed Clippy with warnings denied and release builds on Windows and Linux. Rust 1.98.1 and the resolved Cargo.lock are retained. The permanent workflow is read-only, checks formatting without rewriting it, builds with `--locked`, and includes the exact source SHA in its binary artifacts.
+
+The first Linux binary was also invoked locally: host startup, status, task creation/claim, identical-request replay, delta report and orderly shutdown succeeded. This was a short operational invocation, not a test suite or load qualification. No native SDK, model calls, Windows agent sessions or broad tests have run. Windows compilation does not establish runtime/ACL behavior on the owner's machine.
 
 ## Build and run
 
 ```powershell
-cargo build --release --bin swarm
+cargo build --locked --release --bin swarm
 .\target\release\swarm.exe --data-dir C:\SwarmState host
 ```
 
-Use a dedicated, local state directory. The host creates only its own database, lock and `operator.json` credential there. It does not change global PATH, UAC, existing harness settings or any vendor service. The state directory is restricted to the current user. Do not point it at an existing shared data directory.
+Use a dedicated local state directory: initially empty, then recognized by its locked ownership marker. The host creates only its own database, lock and `operator.json` credential there. It does not modify global PATH, UAC, existing harness settings or vendor services. It refuses an unrelated nonempty directory rather than rewriting its permissions. Keep credentials out of Git and messages.
 
 In another PowerShell:
 
@@ -31,9 +37,11 @@ $swarm = '.\target\release\swarm.exe'
 & $swarm --data-dir C:\SwarmState report --after 0
 ```
 
-Repeat the exact same method/payload with the same `--request-id` after a lost reply. This returns the saved receipt; a different payload under that ID is rejected. A new ID is a new request, although origin identity and unreleased task ownership still prevent duplicate work. A native-manager claim never generates an extra controller prompt.
+For an unpacked CI binary, use `target\release\swarm.exe` in the artifact directory; no Rust install is needed to invoke that executable. Source builds use the pinned `rust-toolchain.toml`.
 
-`swarm call METHOD --file params.json` exposes the implemented application methods without shell interpolation. `--request-id` is printed to stderr before each mutation; JSON results go to stdout. `--config config/controller.example.toml` loads the implementation configuration. The reference configurations in `docs/` describe the broader target and are not silently accepted as implemented settings.
+Repeat the identical method/payload with the same `--request-id` after a lost reply. This returns the saved receipt; a different payload under that ID is rejected. A new ID is a new request, although origin identity and unreleased task ownership still prevent duplicate work. A native-manager claim never generates an extra controller prompt. Do not put passwords or API keys in task text; the control mailbox is persistent project data.
+
+`swarm call METHOD --file params.json` exposes implemented application methods without shell interpolation. `--request-id` is printed to stderr before a mutation; JSON results go to stdout. `--config config/controller.example.toml` loads the implementation configuration. Reference configurations in `docs/` describe the broader target and are not silently accepted as implemented settings. Read-only client calls do not initialize a new database or launch the host.
 
 ### Local clients and messages
 
@@ -42,9 +50,9 @@ Repeat the exact same method/payload with the same `--request-id` after a lost r
 & $swarm --data-dir C:\SwarmState --credential C:\SwarmState\W1.credential.json task list
 ```
 
-For `message.send`, pass `{"recipient":"W1","text":"..."}` in a params file. The recipient reads `message.read` with its own credential and an `after` cursor. This is a persistent mailbox, not yet a native wake/steer integration. Operator/manager/observer roles coordinate trusted clients of the same Windows user; they do not sandbox full-access agents from one another.
+For `message.send`, pass `{"recipient":"W1","text":"..."}` in a params file. The recipient reads `message.read` with its credential and an `after` cursor. This is a persistent mailbox, not yet native wake/steer. Operator/manager/observer roles coordinate trusted clients of the same OS user; they do not sandbox full-access agents from one another.
 
-Implemented methods: `host.status`, `host.mode`, `client.register/list`, `task.create/get/list/revise/claim/dispatch`, `attempt.get/release`, `agent.open/state/list`, `route.list`, `operation.get/list/cancel`, `message.send/read`, `report.delta`. Release requires explicit caller attestation that the assignment is closed; it never kills a process or fabricates successful acceptance. Other methods fail explicitly, without side effects.
+Implemented methods: `host.status`, `host.mode`, `client.register/list`, `task.create/get/list/revise/claim/dispatch`, `attempt.get/release`, `agent.open/state/list`, `route.list`, `operation.get/list/cancel`, `message.send/read`, `report.delta`. Release requires explicit caller attestation that the assignment is closed; it never kills a process or fabricates successful acceptance. Unsupported methods fail without a native effect. Native-manager assignments can be coordinated locally; actual harness launch still belongs to the manager until its adapter is implemented.
 
 ## Design and development
 
@@ -52,13 +60,15 @@ Implemented methods: `host.status`, `host.mode`, `client.register/list`, `task.c
 | --- | --- |
 | [Architecture](docs/agent_swarm.md) | Target responsibilities and execution model |
 | [Implementation plan](docs/agent_swarm.implementation-v6.md) | C01–C11 and transactional boundaries |
-| [Module contract](docs/agent_swarm.module-contract-v2.md) | Native capability, delivery and lifecycle boundaries |
+| [Module contract](docs/agent_swarm.module-contract-v2.md) | Native capability, delivery and lifecycle |
 | [Reference specification](docs/agent_swarm.spec-v18/README.md) | Design examples; not proof of implementation |
-| [Donors](docs/agent_swarm.donors-20260929.toml) | Candidate source pins; not an installed dependency lock |
-| [Lessons](docs/lessons-learned.md) / [runtime notes](docs/runtime-notes.md) / [candidates](docs/candidate-notes.md) | On-demand evidence, not additional worker instructions |
+| [Donors](docs/agent_swarm.donors-20260929.toml) | Candidate source pins; not installed SDKs |
+| [Lessons](docs/lessons-learned.md) / [runtime notes](docs/runtime-notes.md) / [candidates](docs/candidate-notes.md) | On-demand evidence, not extra worker instructions |
 
-Work on `main`, without worktrees. Implement useful paths first, then focused `cargo fmt` and `cargo clippy --lib --bins --no-deps -- -D warnings`. Do not build a test framework or run the broad test phase before the working slices.
+This README records current implementation status. The dated design documents describe the larger target; their earlier "not implemented" statements record the design-stage snapshot, not deletion of the present code. No full C01–C11 completion is implied by compiling this first slice.
 
-The runtime migration is frozen under `migrations/`; initialization stamps application ID, schema digest and version in the same transaction. A draft/reference database, unknown schema or missing existing operator credential is not silently overwritten. Keep the entire state directory for recovery; do not copy only a live `.db` without its WAL.
+Work on `main`, without worktrees. Implement useful paths first, then `cargo fmt --all -- --check` and `cargo clippy --locked --lib --bins --no-deps -- -D warnings`. No test framework or broad test phase before working slices.
+
+The runtime migration is frozen under `migrations/`; initialization stamps application ID, schema digest and version in one transaction. A draft/reference database, unknown schema or missing existing operator credential is not silently overwritten. A cleanly stopped state directory can be copied in full for preservation; do not copy only a live `.db` without its WAL.
 
 Historical briefs were distilled and removed from the current tree. Originals remain at `b5a437f57488f8ddcdcc3f4aaea24746a3ea1f62`; their local paths, launch commands and cancelled rules are not installation defaults.
