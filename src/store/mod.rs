@@ -122,7 +122,12 @@ impl Store {
         }
         let wake_dispatch = matches!(
             method.as_str(),
-            "agent.open" | "task.dispatch" | "agent.send" | "agent.reply" | "host.mode"
+            "agent.open"
+                | "task.dispatch"
+                | "agent.send"
+                | "agent.reply"
+                | "host.mode"
+                | "module.outcome"
         );
         let config = self.config.clone();
         let result = self
