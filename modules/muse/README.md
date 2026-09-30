@@ -1,18 +1,18 @@
 # Muse SDK bridge — native integration
 
-Executable module using the complete published `@muse-code/sdk` **1.3.0**, locked locally, and the reviewed [MSP schema](https://github.com/meta-models/muse-code-sdk/blob/a7c10c5dd3f66be412077d29f9d11111af70317b/schema/msp/msp.d.ts). Current example artifact: **`muse-sdk-1.3.0-bridge.4`**. Native/Windows/model qualification is pending; syntax/import checks are not model runs.
+Executable module using the complete published `@muse-code/sdk` **1.3.0**, locked locally, and the reviewed [MSP schema](https://github.com/meta-models/muse-code-sdk/blob/a7c10c5dd3f66be412077d29f9d11111af70317b/schema/msp/msp.d.ts). Current artifact: **`muse-sdk-1.3.0-bridge.4`**. Native/Windows/model qualification is pending; syntax/import checks are not model runs. Host-only result assembly does not require replacing this bridge.
 
 ## Ownership and implemented path
 
-One independently started Node process owns a `muse serve` connection. The Rust host exposes `module.hello/next/outcome/observe/result` over authenticated local IPC. Credentials are scoped to a reserved binding/generation; the module cannot accept Tasks or impersonate GM. No extra service, inference proxy or task database is added.
+One independently started Node process owns a `muse serve` connection. The Rust host exposes `module.hello/next/outcome/observe/result` over authenticated local IPC. Credentials are scoped to one reserved binding/generation; the module cannot accept Tasks or impersonate GM. No extra service, inference proxy or task database is added.
 
-The host commits admission before yielding native commands. Input admissions are ordered; protocol replies do not wait for model completion. Unknown admission is not blindly repeated on reconnect/timeout. Explicit reconciliation uses the original native command ID and retained payload. Outcomes remain until host acknowledgement; Task snapshots, requested effort, native readback and exact turn identities are separate from Task acceptance.
+The host commits admission before yielding native commands. Input admissions are ordered; protocol replies do not wait for model completion. Unknown admission is not blindly repeated on reconnect/timeout. Explicit reconciliation uses the original native command ID and retained payload. Outcomes remain until host acknowledgement; Task snapshots, requested effort, native readback and exact turn identities are distinct from Task acceptance.
 
 Host disconnect does not call SDK.close. The same live bridge reconnects with its boot/native identities. A new process confronting possibly live old work requires recovery rather than implicitly creating another executor. Explicitly terminating the bridge closes its native connection, not an unrelated service.
 
 **MSP presentation acknowledgement is not a decision.** `approval/request` and `userInput/request` receive the native `RequestReceipt` `{}` immediately, while the question is retained. Real answers use `approval/decide` or `userInput/*` with current IDs. Root goal observations exclude child goal events.
 
-Token deltas/full transcripts remain native. Compact observations contain children, pending questions, recent exact turn terminals and an unsummed usage snapshot. Family completeness is partial. Automatic launching, bridge-process crash/resume, complete family reconstruction, whole-result assembly, Task acceptance and autonomous handoff remain unfinished. Do not label full C03 complete.
+Token deltas/full transcripts stay native. Compact observations include children, pending questions, recent exact turn terminals and an unsummed usage snapshot. Family completeness remains partial. Automatic launching, bridge-process crash/resume, complete family reconstruction, Task submission/acceptance and autonomous handoff are unfinished. Do not label full C03 complete.
 
 ## Explicit setup
 
@@ -21,7 +21,7 @@ Token deltas/full transcripts remain native. Compact observations contain childr
 3. Enable a private controller route below, run `swarm --config <file> host`, then `agent.open` with `{"lane_id":"MC","route":"muse-manager"}`. Preserve binding_id/generation.
 4. As operator, run `swarm client-create muse-MC --role module --binding-id BINDING --generation 1 --out <private-credential.json>` with the same data-dir. Preserve the request ID; keep the credential out of model context.
 5. Copy `module.example.json` outside Git. Set the printed host endpoint, credential path, actual executable/argv and matching moduleArtifactId. Independently run `node modules/muse/bridge.mjs --config <private-module.json>`. Only the reserved opening operation starts Muse.
-6. Inspect `agent.state`. Claim a controller-start Task with `task claim TASK --revision N --start-owner controller --binding-id BINDING --generation 1`; dispatch via `task.dispatch` with attempt_id/text. Do not hand-edit DB readiness.
+6. Inspect `agent.state`. Claim a controller-start Task with `task claim TASK --revision N --start-owner controller --binding-id BINDING --generation 1`; dispatch through `task.dispatch` with attempt_id/text. Do not hand-edit DB readiness.
 
 ```toml
 [[routes]]
@@ -55,9 +55,9 @@ Use `swarm call METHOD --file params.json` with the normal durable request ID. Q
 | `agent.refresh` | Optional session_id of an observed child | Metadata/pending questions and child subscription, without writer lease/resume. |
 | `agent.reconcile` | operation_id of unresolved command | Explicit same-command reconciliation on the same live bridge. |
 
-Table values describe fields; actual requests are JSON with quoted strings. Configure one setter per Operation because native setters are separate. Before goal set/edit/resume, configure the standing effort and wait for its applied outcome. A prior per-turn override does not configure future goal continuation. Current effective settings and immutable initial route remain distinct.
+Actual requests are JSON with quoted strings. Configure one setter per Operation because native setters are separate. Before goal set/edit/resume, configure standing effort and wait for its applied outcome. A prior per-turn override does not configure future goal continuation. Current effective settings and immutable initial route are distinct.
 
-New work disabled prevents goal starts/new inputs at dispatch. Goal pause/clear stay available and cancel old *locally queued* goal starts. Already admitted effects still require native disposition.
+New work disabled prevents goal starts/new inputs at dispatch. Goal pause/clear stay available and cancel old locally queued goal starts. Already admitted effects still require native disposition.
 
 Lost native admission may be reconciled with the exact retained ID/payload. Once model-setting admission is known, reconciliation reads state instead of resending. Correlated turn evidence can settle input admission. Lost bridge memory/session-start recovery is not reconstructed by this path. Missing context produces explicit recovery/unavailable status, not a replacement model call.
 
@@ -74,7 +74,7 @@ swarm --request-id bind-worker-1 task bind ATTEMPT --assignment worker-1 --sessi
 swarm call attempt.get --file attempt.json
 ```
 
-Supply normal data-dir/config/credential options. `task claim` defaults to native_manager, so there is no second initial controller prompt. Assignment identity remains stable for that activation; another turn is another assignment. Do not infer run IDs from filenames, timestamps, model names or session IDs alone.
+Supply normal data-dir/config/credential options. `task claim` defaults to native_manager, so there is no second initial controller prompt. Assignment identity stays stable for that activation; another turn is another assignment. Do not infer run IDs from filenames, timestamps, model names or session IDs alone.
 
 Family reads use SQLite only. Preserve observation_id for subsequent pages; the end of this retained list is not proof of full native discovery. Missing observations are unknown, not zero children. Older observations can support an exact run omitted from the latest buffer.
 
@@ -84,9 +84,9 @@ The bridge preserves child snapshots/last turns across parent item updates, reco
 
 ## Result retrieval — bridge.4
 
-Implemented in `results.mjs`, `src/artifacts.rs`, `src/store/results.rs` and their host/CLI call sites. One `agent.result` requests one source page. It reads a **pinned item revision**, not the latest answer with a similar name.
+Implemented in `results.mjs`, `src/artifacts.rs`, `src/store/results.rs` and their host/CLI call sites. One `agent.result` requests one source page. It reads a pinned item revision, not the latest answer with a similar name.
 
-Create a Muse selector file, replacing all identifiers and revision with actual observed values:
+Create a selector file, replacing all identifiers and revision with observed values:
 
 ```json
 {
@@ -99,34 +99,40 @@ Create a Muse selector file, replacing all identifiers and revision with actual 
 
 | Selector kind | Selected native data |
 | --- | --- |
-| result | The subagent item's result object, including structuredData/artifactRefs/evidenceRefs, serialized as canonical JSON. |
-| message | Complete agentMessage text; a native truncated message is rejected. |
-| output | Available stored outputRef; include exact `output_ref` ID. |
-| patch | Available stored patchRef; include exact `output_ref` ID. |
+| result | Subagent result object, including structuredData/artifactRefs/evidenceRefs, serialized as canonical JSON. |
+| message | Complete agentMessage text; a truncated native message is rejected. |
+| output | Available stored outputRef; include exact output_ref ID. |
+| patch | Available stored patchRef; include exact output_ref ID. |
 
-Optional `before_cursor` is an opaque native backward-page cursor. Optional `expected_digest` must match the reported source digest exactly; it is not the individual page hash. The session must be the root or an observed family member. Exact revision absence is an error, not permission to substitute a newer revision.
+Optional before_cursor is an opaque backward-page cursor. Optional expected_digest must match the reported source digest, not the individual page hash. The session must be the root or an observed family member. Exact revision absence does not authorize substitution of a newer revision.
 
 ```powershell
 swarm --request-id result-page-1 result BINDING --generation 1 --file selector.json --offset 0 --length 65536
-# Save operation_id; operation.json contains {"operation_id":"THE_RETURNED_ID"}:
+# operation.json contains the returned operation_id:
 swarm call operation.get --file operation.json
 # Once settled with result.details.artifact_ref:
 swarm artifact get ARTIFACT_ID
 swarm artifact read ARTIFACT_ID --offset 0 --length 65536
 ```
 
-Use normal host/data-dir/credential options. The queue response is not the result body. Muse reads `view/page` to identify the exact item; stored output uses `item/readOutput`. Neither path calls a model, resumes a session, consumes `subagent/readResult`, or follows arbitrary URIs/files from result references.
+Use normal host/data-dir/credential options. Muse reads `view/page` to identify the exact item; stored output uses `item/readOutput`. Neither path calls a model, resumes a session, consumes `subagent/readResult`, or follows arbitrary URIs/files from result references.
 
-The bridge retains each unacknowledged page while it remains alive. The host validates the decoded page length/range/EOF and SHA-256, publishes bytes under an immutable generated name without overwriting, then registers the artifact and settles the Operation. File I/O stays off the DB thread. Lost acknowledgements can replay the same retained page; different committed bytes/provenance cannot replace it.
+The live bridge retains unacknowledged pages. The host validates decoded byte length/range/EOF and SHA-256, publishes immutable bytes without overwrite, then registers the artifact and settles the Operation. File I/O stays off the DB thread. Lost acknowledgements can replay the retained page; different bytes/provenance cannot replace it.
 
-**Two offsets:** result offset addresses the native source body; artifact-read offset addresses that one local page. `result.details.next_offset_bytes` requests the following native page with a new logical request ID and the same source identity. The 64 KiB page bound is not a maximum full-result size. UTF-8 split across byte ranges is returned as base64 when necessary; use the returned encoding.
+Result offset addresses the native source body; artifact-read offset addresses one local page. Use `result.details.next_offset_bytes` for the following native page with a new request ID and the same selector/source identity. The 64 KiB transfer bound is not a full-result size limit. UTF-8 split across ranges returns base64 when necessary; honor the returned encoding.
 
-Per-page hashes do not establish complete whole-result coverage. Whole-digest verification is reported only when available and the entire source fits the checked page. Automatic multi-page assembly, retrieval of arbitrary artifact/evidence reference targets and Task acceptance are not implemented. Source/output digest may be unavailable; absence is not a verified digest. Large native items can still occupy SDK memory even though our transport page is bounded. Readback describes native data, not independent verification that the worker's conclusions are correct.
+## Assemble and export retained results
 
-## Recovered checkpoint — 2026-09-30
+Host-side `artifact.assemble`, implemented in `src/artifacts/assembly.rs` and `src/store/assembly.rs`, combines registered pages without contacting Muse. Pass an ordered `page_refs` list and optional expected whole-body SHA-256 through `swarm artifact assemble --file pages.json`.
 
-After bridge.3 (`36b4f702`, documentation `00fdce16`), the interrupted continuation committed result retrieval in **`46a216a7`** and corrected signed SQLite length conversion in **`684bc33a`**. [Run 36759367801](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/36759367801) passed Windows/Linux format, Clippy, release build and all Muse .mjs syntax/SDK-import steps for the latter exact commit.
+Assembly verifies exact source/binding/selector identity, continuous coverage, page digests and EOF; it rejects missing, overlapping, reordered or mixed-source pages. Bytes stream into a new immutable artifact with a computed whole digest, verified against available native SHA-256 and explicit expectations. Missing native digests remain unverified. Original page evidence is retained.
 
-Recovery obtained its source archive from artifact `11117908898`: the reconstructed Git tree matches `7debef1ee27af1dcb44c86de133b1c1a9d3dfefb`. The code was saved; these instructions and the final progress report had lagged behind. No new unpublished implementation was found in current mounted files. Do not repeat SDK preparation or reimplement the result reader. Recovery's local invocation covered CLI help and empty-host startup/status/shutdown, not a native result call.
+`artifact.parts` pages the provenance list. `artifact.read` addresses the assembled file and verifies touched segments. `swarm artifact export ID --out FILE` uses one authenticated IPC connection, verifies the complete SHA-256 and publishes the destination without overwrite. Even an empty export reads and checks its backing artifact; the destination path is local to the CLI, never a host/model command.
 
-**Next implementation:** bridge-process crash recovery with known session/process ownership, complete family/result-consumer integration, then direct OpenCode V2. Task submission/acceptance and CheckRunner are still separate unfinished paths. Live Muse/Max and Windows lifecycle remain unqualified. No broad tests or native calls were added by this recovery. [OpenCodex Issue #1](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/1) stays after the main code, not a prerequisite.
+See the [root README](../../README.md#complete-results-without-model-roundtrips) for the full workflow. Known failed assembly returns a saved failure via operation.get. After host interruption, the same request ID can recover deterministic local assembly without repeating a native prompt. Automatic fetching of missing pages, arbitrary reference-target retrieval and semantic Task acceptance remain separate unfinished work. Native item materialization can still consume SDK memory even when our content pages are bounded.
+
+## Implementation checkpoint
+
+Result paging was saved in `46a216a7` and corrected in `684bc33a`; [CI 36759367801](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/36759367801) passed on Windows/Linux. Local assembly/export is the separate `3631a646` slice, followed by the empty-export verification fix. Use the CI run for the exact code commit; no live native qualification is implied.
+
+Next: bridge-process crash recovery with known session/process ownership and Task submission/CheckRunner consumers, then direct OpenCode V2. Do not repeat SDK preparation or reimplement result paging/assembly. Live Muse/Max and Windows lifecycle remain unqualified. [OpenCodex Issue #1](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/1) stays after the main code, not a prerequisite.

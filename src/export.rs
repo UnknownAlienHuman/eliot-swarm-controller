@@ -65,8 +65,10 @@ pub async fn artifact(
     platform::private_permissions(&temp.0, false)?;
     let mut offset = 0u64;
     let mut hash = Sha256::new();
-    while offset < total {
-        let length = (total - offset).min(MAX_PAGE_BYTES as u64);
+    // Read even an empty artifact once: metadata alone does not prove that its
+    // backing file is still present and valid.
+    loop {
+        let length = (total - offset).clamp(1, MAX_PAGE_BYTES as u64);
         let page = client
             .request(
                 "artifact.read",
@@ -90,7 +92,7 @@ pub async fn artifact(
             || page["artifact_sha256"] != expected
             || page["offset_bytes"].as_u64() != Some(offset)
             || page["byte_length"].as_u64() != Some(bytes.len() as u64)
-            || bytes.is_empty()
+            || (bytes.is_empty() && total != 0)
             || bytes.len() as u64 > length
             || end > total
             || page["eof"].as_bool() != Some(end == total)
@@ -103,6 +105,9 @@ pub async fn artifact(
         file.write_all(&bytes)?;
         hash.update(&bytes);
         offset = end;
+        if offset == total {
+            break;
+        }
     }
     let digest = format!("{:x}", hash.finalize());
     if digest != expected {
