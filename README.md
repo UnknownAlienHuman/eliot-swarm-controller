@@ -10,9 +10,15 @@ Headless, modular Rust controller for native coding-agent harnesses. This is the
 
 Next: connect the Muse SDK bridge and direct OpenCode V2 boundary, adding the remaining producer/submission/check transitions where real consumers need them. Preserve native subscriptions, Max and existing shared-server ownership. Do not replace the working base with another architecture rewrite.
 
+### Native integration checkpoint — 2026-09-30
+
+The interrupted continuation reached committed Muse SDK preparation (`0e3ccd6b`, `db45be62`), not a published native executor. Its SDK input artifact was recovered and verified; the exact local dependency lock is now preserved in `modules/muse/package-lock.json`. [The module checkpoint](modules/muse/README.md) records recoverable inputs, missing local-only implementation bytes and the next code boundary. Do not reset or reimplement the working controller base.
+
+The requested OpenAI Sign in with ChatGPT guide was reviewed separately. [Runtime notes §3.1](docs/runtime-notes.md) distinguish its owned stdio/OAuth route from our existing shared-server target, including token renewal and capability limits. This is a documented optional route, not installed authentication or a change to the Muse/OpenCode implementation priority.
+
 ### Build evidence
 
-On 2026-09-30, [CI run 36692907519](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/36692907519) passed Clippy with warnings denied and release builds on Windows and Linux. Rust 1.98.1 and the resolved Cargo.lock are retained. The permanent workflow is read-only, checks formatting without rewriting it, builds with `--locked`, and includes the exact source SHA in its binary artifacts.
+For controller commit `c37e6bbfb67c9fc97aaa6e78772884d43d73d92f`, [CI run 36693929400](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/36693929400) passed formatting, Clippy with warnings denied and release builds on Windows and Linux on 2026-09-30. Recovery re-read those successful jobs; it did not rerun them. Rust 1.98.1 and the resolved Cargo.lock are retained. The permanent workflow is read-only, checks formatting without rewriting it, builds with `--locked`, and includes the exact source SHA in its binary artifacts.
 
 The first Linux binary was also invoked locally: host startup, status, task creation/claim, identical-request replay, delta report and orderly shutdown succeeded. This was a short operational invocation, not a test suite or load qualification. No native SDK, model calls, Windows agent sessions or broad tests have run. Windows compilation does not establish runtime/ACL behavior on the owner's machine.
 
