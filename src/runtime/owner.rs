@@ -78,6 +78,7 @@ pub fn run(state_dir: &Path, executable: &Path, args: &[String]) -> Result<()> {
     #[cfg(windows)]
     if executable
         .extension()
+        .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"))
     {
         return Err(Error::invalid(
