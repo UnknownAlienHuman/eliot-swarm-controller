@@ -1,0 +1,22 @@
+# Explicit opt-in. Copy beside private controller configuration and edit as needed.
+schema_version = 1
+[storage]
+data_dir = '../.swarm-controller'
+queue_capacity = 256
+[checks]
+enabled = true
+max_running = 2
+git_executable = 'git'
+[[checks.profiles]]
+profile_id = 'clippy-lib-bin'
+profile_revision = '1'
+executable = 'cargo'
+args = ['clippy', '--locked', '--lib', '--bins', '--message-format=json', '--no-deps', '--', '-D', 'warnings']
+parser = 'cargo_json'
+resource = 'rust-default'
+# These names match THIS repository. Set the real required targets of your project.
+expected_targets = ['eliot_swarm_controller', 'swarm']
+[checks.profiles.environment]
+CARGO_INCREMENTAL = '0'
+RUSTC_WRAPPER = ''
+RUSTC_WORKSPACE_WRAPPER = ''

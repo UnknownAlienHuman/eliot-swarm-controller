@@ -129,6 +129,12 @@ pub(super) fn cancel(
     let reason = model::text(v, "reason")?;
     let o = get_operation(tx, target)?;
     p.owns(model::text(&o, "caller_id")?)?;
+    if o["method"] == "check.run" {
+        return Err(Error::new(
+            "CHECK_CANCEL_METHOD",
+            "use check.cancel with the CheckRun ID",
+        ));
+    }
     if o["state"] != "queued" {
         return Err(Error::new(
             "NOT_QUEUED",

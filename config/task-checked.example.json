@@ -1,0 +1,11 @@
+{
+  "objective": "Implement the assigned change and provide its exact committed source for review.",
+  "phase": "implementation",
+  "requirements": [
+    {"id": "W1", "statement": "The code implements the assigned behavior."},
+    {"id": "A1", "statement": "The fixed source passes the controller's clippy-lib-bin profile revision 1."}
+  ],
+  "acceptance": {"required_check_profiles": [{"profile_id": "clippy-lib-bin", "profile_revision": "1"}]},
+  "dependencies": [],
+  "source_refs": ["docs/agent_swarm.implementation-v6.md#10-checks-artifacts-миграции"]
+}

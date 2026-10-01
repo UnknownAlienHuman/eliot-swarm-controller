@@ -183,6 +183,7 @@ dependencies = [
  "base64",
  "clap",
  "futures-util",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

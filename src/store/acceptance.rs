@@ -225,6 +225,7 @@ fn evidence(
         if op["method"] != "check.run"
             || op["state"] != "settled"
             || op["result"]["outcome"] != "applied"
+            || op["result"]["source_checkout_verified"] != true
             || op["result"]["check_id"] != id.as_str()
             || op["result"]["result_ref"] != c["result_ref"]
         {
@@ -394,8 +395,8 @@ pub(super) fn finish(
                 "attempt_id":input.attempt_id,"task_revision":input.expected_revision,"phase":e["phase"],
                 "submission_ref":input.submission_ref,"candidate_ref":input.candidate_ref,"reviewer_id":op["caller_id"],
                 "reason":input.reason,"reviews":input.reviews,"check_ids":input.check_ids,
-                "feedback_observation_id":input.expected_feedback_observation_id,"evidence_level":"operator_review",
-                "source_checkout_verified":false,"task_accepted":true,"ownership_released":false})
+                "feedback_observation_id":input.expected_feedback_observation_id,"evidence_level":if input.check_ids.is_empty(){"operator_review"}else{"operator_review_with_checks"},
+                "source_checkout_verified":!input.check_ids.is_empty(),"task_accepted":true,"ownership_released":false})
         }
         Err(error) => {
             json!({"operation_id":id,"outcome":"failed","error":error,"task_accepted":false})

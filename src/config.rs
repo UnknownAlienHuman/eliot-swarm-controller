@@ -10,6 +10,7 @@ pub struct Config {
     pub storage: Storage,
     pub ipc: Ipc,
     pub routes: Vec<Route>,
+    pub checks: crate::checks::model::CheckConfig,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -61,6 +62,7 @@ impl Default for Config {
             storage: Storage::default(),
             ipc: Ipc::default(),
             routes: Vec::new(),
+            checks: crate::checks::model::CheckConfig::default(),
         }
     }
 }
@@ -125,6 +127,7 @@ impl Config {
                 ));
             }
         }
+        cfg.checks.validate()?;
         Ok(cfg)
     }
     pub fn route(&self, alias: &str) -> Result<Route> {

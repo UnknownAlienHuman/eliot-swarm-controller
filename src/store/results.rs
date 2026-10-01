@@ -107,7 +107,7 @@ pub(super) fn record(
 
 pub(super) fn get(db: &Connection, id: &str) -> Result<ArtifactRecord> {
     let row: Option<(String,String,i64,String,String)> = db.query_row(
-        "SELECT kind,relative_path,byte_length,content_digest,metadata_json FROM artifacts WHERE artifact_id=?1 AND kind IN ('native_result_page','native_result','task_submission')",
+        "SELECT kind,relative_path,byte_length,content_digest,metadata_json FROM artifacts WHERE artifact_id=?1 AND kind IN ('native_result_page','native_result','task_submission','source_snapshot','check_result','check_output')",
         [id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
     let (kind, relative_path, byte_length, content_digest, metadata) =
         row.ok_or_else(|| Error::new("NOT_FOUND", "result artifact is not registered"))?;

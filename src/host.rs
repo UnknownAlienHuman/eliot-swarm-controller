@@ -20,6 +20,7 @@ pub async fn run(config: Config) -> Result<()> {
     let ipc_config = Arc::new(config.ipc.clone());
     let mut listener = ipc::Listener::bind(&root_path)?;
     let (shutdown, stopping) = watch::channel(false);
+    let checks = tokio::spawn(owner.store.clone().supervise_checks(stopping.clone()));
     let semaphore = Arc::new(Semaphore::new(config.ipc.max_connections));
     let mut connections = JoinSet::new();
     eprintln!("swarm host ready: {}", listener.endpoint());
@@ -43,6 +44,7 @@ pub async fn run(config: Config) -> Result<()> {
     drop(listener);
     let _ = shutdown.send(true);
     while connections.join_next().await.is_some() {}
+    let _ = checks.await;
     owner.close().await?;
     exit
 }

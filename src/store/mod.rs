@@ -1,6 +1,7 @@
 //! A single database owner. The async facade never holds a SQLite connection.
 mod acceptance;
 mod assembly;
+mod checks;
 mod operations;
 mod producers;
 mod results;
@@ -29,6 +30,7 @@ pub struct Store {
     changed: watch::Sender<u64>,
     artifacts: ArtifactFiles,
     artifact_io: Arc<Semaphore>,
+    data_dir: std::path::PathBuf,
 }
 pub struct StoreOwner {
     thread: JoinHandle<()>,
@@ -42,6 +44,7 @@ impl StoreOwner {
         credential: Credential,
     ) -> Result<Self> {
         let artifacts = ArtifactFiles::new(&root.path)?;
+        let data_dir = root.path.clone();
         let (tx, mut rx) = mpsc::channel::<Job>(config.storage.queue_capacity);
         let (ready_tx, ready_rx) = oneshot::channel();
         let thread = std::thread::Builder::new()
@@ -71,6 +74,7 @@ impl StoreOwner {
                 config,
                 changed: watch::channel(0).0,
                 artifacts,
+                data_dir,
                 artifact_io: Arc::new(Semaphore::new(4)),
             },
         })
@@ -115,6 +119,9 @@ impl Store {
         .await
     }
     pub async fn call(&self, principal: Principal, method: String, params: Value) -> Result<Value> {
+        if method == "source.capture" {
+            return self.capture_source(principal, params).await;
+        }
         if method == "task.accept" {
             return self.accept_task(principal, params).await;
         }
@@ -149,7 +156,9 @@ impl Store {
         }
         let wake_dispatch = matches!(
             method.as_str(),
-            "agent.open"
+            "check.run"
+                | "check.cancel"
+                | "agent.open"
                 | "task.dispatch"
                 | "agent.send"
                 | "agent.reply"
@@ -465,6 +474,10 @@ fn open_database(root: &Path, credential: &Credential) -> Result<Connection> {
         "UPDATE bindings SET state='reconciling',state_json=json_set(state_json,'$.connection','disconnected') WHERE state='ready' AND released_at_ms IS NULL",
         [],
     )?;
+    tx.execute(
+        "UPDATE check_runs SET state='reconciling' WHERE state='running'",
+        [],
+    )?;
     tx.commit()?;
     let fk: i64 = db.pragma_query_value(None, "foreign_keys", |r| r.get(0))?;
     let mode: String = db.pragma_query_value(None, "journal_mode", |r| r.get(0))?;
@@ -493,7 +506,9 @@ fn set_meta(db: &Connection, key: &str, value: &Value) -> Result<()> {
 fn is_read(method: &str) -> bool {
     matches!(
         method,
-        "artifact.get"
+        "check.get"
+            | "check.profiles"
+            | "artifact.get"
             | "artifact.parts"
             | "host.status"
             | "task.submission"
@@ -530,6 +545,14 @@ fn page(params: &Value) -> Result<(i64, i64)> {
 }
 fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config) -> Result<Value> {
     match method {
+        "check.get" => checks::describe(db, v),
+        "check.profiles" => {
+            model::fields(v, &[])?;
+            Ok(
+                json!({"enabled":config.checks.enabled,"profiles":config.checks.profiles,"cache_reuse":false}),
+            )
+        }
+
         "artifact.get" => results::describe(db, p, v),
         "artifact.parts" => assembly::parts(db, v),
         "task.acceptance" => acceptance::describe(db, v),
@@ -643,7 +666,7 @@ fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config
             model::fields(v, &["after", "limit"])?;
             let (limit, after) = page(v)?;
             let only_mail = method == "message.read";
-            let mut s=db.prepare("SELECT observation_id,kind,payload_json,recorded_at_ms FROM observations WHERE observation_id>?1 AND (?2=0 OR (kind IN ('message.send','task.feedback') AND json_extract(payload_json,'$.recipient')=?3)) ORDER BY observation_id LIMIT ?4")?;
+            let mut s=db.prepare("SELECT observation_id,kind,payload_json,recorded_at_ms FROM observations WHERE observation_id>?1 AND (?2=0 OR (kind IN ('message.send','task.feedback','check.completed') AND json_extract(payload_json,'$.recipient')=?3)) ORDER BY observation_id LIMIT ?4")?;
             let rows = s
                 .query_map(params![after, only_mail, p.client_id, limit], |r| {
                     Ok((
@@ -733,6 +756,10 @@ fn apply(
     now: i64,
 ) -> Result<(Value, bool)> {
     match method {
+        "source.capture" => checks::reserve_source(tx, p, v, id, config).map(|v| (v, true)),
+        "check.run" => checks::reserve(tx, p, v, id, config),
+        "check.cancel" => checks::cancel(tx, p, v, id).map(|v| (v, false)),
+
         "artifact.assemble" => assembly::reserve(tx, p, v, id).map(|v| (v, true)),
         "task.submit" => submissions::reserve(tx, p, v, id).map(|v| (v, true)),
         "task.accept" => acceptance::reserve(tx, p, v, id).map(|v| {

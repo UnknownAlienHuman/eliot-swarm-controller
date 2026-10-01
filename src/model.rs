@@ -235,6 +235,16 @@ pub fn response(id: Value, result: Result<Value>) -> Value {
 /// particular, an accidental client.hello/token must never become a receipt.
 pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
     let allowed: &[&str] = match method {
+        "source.capture" => {
+            crate::checks::model::CaptureRequest::parse(params)?;
+            return Ok(());
+        }
+        "check.run" => {
+            crate::checks::model::CheckRequest::parse(params)?;
+            return Ok(());
+        }
+        "check.cancel" => &["client_request_id", "check_id", "reason"],
+
         "artifact.assemble" => &["client_request_id", "page_refs", "expected_sha256"],
         "task.submit" => &[
             "client_request_id",

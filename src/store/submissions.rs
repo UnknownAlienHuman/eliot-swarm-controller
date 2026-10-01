@@ -48,6 +48,17 @@ fn current(db: &Connection, p: &Principal, input: &SubmitRequest) -> Result<Valu
 }
 fn candidate(db: &Connection, a: &Value, input: &SubmitRequest) -> Result<ArtifactRecord> {
     let record = results::get(db, &input.candidate_ref)?;
+    if record.kind == "source_snapshot" {
+        if record.metadata["attempt_id"] != input.attempt_id
+            || record.metadata["task_revision"] != input.expected_revision
+        {
+            return Err(Error::new(
+                "CANDIDATE_SCOPE",
+                "source snapshot belongs to another Attempt/revision",
+            ));
+        }
+        return Ok(record);
+    }
     let identity = match record.kind.as_str() {
         "native_result" if record.metadata["coverage"] == "complete" => {
             &record.metadata["identity"]

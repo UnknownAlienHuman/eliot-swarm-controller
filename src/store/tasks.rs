@@ -290,7 +290,9 @@ pub(super) fn release(
         ));
     }
     // Caller explicitly seals cooperative native work. This is not process evidence.
-    tx.execute("UPDATE operations SET state='cancelled',result_json=?2,settled_at_ms=?3,updated_at_ms=?3 WHERE attempt_id=?1 AND state='queued'",params![attempt_id,model::canonical(&json!({"reason":"attempt released before delivery"}))?,now])?;
+    // A queued check needs a retained cancellation result, not an orphaned row.
+    tx.execute("UPDATE check_runs SET spec_json=json_set(spec_json,'$.cancel_requested','attempt released before execution') WHERE attempt_id=?1 AND state='queued'",[attempt_id])?;
+    tx.execute("UPDATE operations SET state='cancelled',result_json=?2,settled_at_ms=?3,updated_at_ms=?3 WHERE attempt_id=?1 AND state='queued' AND method<>'check.run'",params![attempt_id,model::canonical(&json!({"reason":"attempt released before delivery"}))?,now])?;
     tx.execute(
         "UPDATE attempts SET state=?2,released_at_ms=?3,updated_at_ms=?3 WHERE attempt_id=?1",
         params![attempt_id, outcome, now],

@@ -31,6 +31,20 @@ struct Cli {
 enum Command {
     /// Start the user host in the foreground; never launches vendor agents implicitly.
     Host,
+    /// Internal transient executor; never opens the controller database.
+    #[command(hide = true)]
+    CheckWorker {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    Source {
+        #[command(subcommand)]
+        command: SourceCommand,
+    },
+    Check {
+        #[command(subcommand)]
+        command: CheckCommand,
+    },
     Status,
     /// Call a supported application method; JSON params are read from a file.
     Call {
@@ -87,6 +101,29 @@ enum Command {
         after: i64,
         #[arg(long, default_value_t = 50)]
         limit: i64,
+    },
+}
+#[derive(Subcommand)]
+enum SourceCommand {
+    Capture {
+        #[arg(long)]
+        file: PathBuf,
+    },
+}
+#[derive(Subcommand)]
+enum CheckCommand {
+    Run {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    Get {
+        check_id: String,
+    },
+    Profiles,
+    Cancel {
+        check_id: String,
+        #[arg(long)]
+        reason: String,
     },
 }
 #[derive(Subcommand)]
@@ -215,6 +252,9 @@ fn main() {
     }
 }
 fn execute(cli: Cli) -> Result<()> {
+    if let Command::CheckWorker { file } = &cli.command {
+        return eliot_swarm_controller::checks::worker::run(file);
+    }
     // Only the long-lived host needs a worker pool. CLI calls perform one local
     // exchange and must not create a CPU-sized pool for every status request.
     let mut builder = if matches!(&cli.command, Command::Host) {
@@ -251,7 +291,19 @@ async fn run(cli: Cli) -> Result<()> {
     }
     let mut pending_credential = None;
     let (method, mut params) = match cli.command {
-        Command::Host => unreachable!("host returned above"),
+        Command::Host | Command::CheckWorker { .. } => unreachable!("executor returned above"),
+        Command::Source {
+            command: SourceCommand::Capture { file },
+        } => ("source.capture".into(), read_json(&file)?),
+        Command::Check { command } => match command {
+            CheckCommand::Run { file } => ("check.run".into(), read_json(&file)?),
+            CheckCommand::Get { check_id } => ("check.get".into(), json!({"check_id":check_id})),
+            CheckCommand::Profiles => ("check.profiles".into(), json!({})),
+            CheckCommand::Cancel { check_id, reason } => (
+                "check.cancel".into(),
+                json!({"check_id":check_id,"reason":reason}),
+            ),
+        },
         Command::Status => ("host.status".to_string(), json!({})),
         Command::Call { method, file } => (
             method,
@@ -425,7 +477,9 @@ async fn run(cli: Cli) -> Result<()> {
     };
     let is_read = matches!(
         method.as_str(),
-        "host.status"
+        "check.get"
+            | "check.profiles"
+            | "host.status"
             | "artifact.get"
             | "artifact.read"
             | "artifact.parts"

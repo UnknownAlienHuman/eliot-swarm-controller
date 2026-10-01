@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
@@ -69,7 +69,7 @@ impl ResultPage {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtifactRecord {
     pub kind: String,
     pub artifact_id: String,
@@ -98,6 +98,78 @@ impl ArtifactFiles {
         platform::private_permissions(&root, true)?;
         Ok(Self { root })
     }
+    /// Sealed controller document; metadata is only its compact address/provenance.
+    pub fn document(
+        kind: &str,
+        id: &str,
+        document: &Value,
+        metadata: Value,
+    ) -> Result<(ArtifactRecord, Vec<u8>)> {
+        let bytes = model::canonical(document)?.into_bytes();
+        Ok((
+            ArtifactRecord {
+                kind: kind.into(),
+                artifact_id: id.into(),
+                relative_path: format!("artifacts/{id}.bin"),
+                byte_length: bytes.len() as u64,
+                content_digest: model::digest(&bytes),
+                metadata,
+            },
+            bytes,
+        ))
+    }
+    pub fn document_bytes(&self, record: &ArtifactRecord) -> Result<Vec<u8>> {
+        let size = usize::try_from(record.byte_length)
+            .map_err(|_| Error::invalid("document is too large"))?;
+        // These are metadata documents, never arbitrary stdout or source blobs.
+        if size > 64 * 1024 * 1024 {
+            return Err(Error::invalid("document exceeds the metadata envelope"));
+        }
+        self.verified_range(record, 0, size)
+    }
+    /// Only closed, completed check outputs may be sealed. The complete body stays
+    /// on disk; its compact hash is what gets registered in SQLite.
+    pub fn seal_file(
+        &self,
+        identity: &str,
+        source: &Path,
+        mut metadata: Value,
+    ) -> Result<ArtifactRecord> {
+        let mut input = OpenOptions::new().read(true).write(true).open(source)?;
+        let mut hash = Sha256::new();
+        let mut length = 0u64;
+        let mut segments = Vec::new();
+        let mut buffer = [0; MAX_PAGE_BYTES];
+        loop {
+            let remaining = input.metadata()?.len().saturating_sub(length);
+            if remaining == 0 {
+                break;
+            }
+            let n = remaining.min(MAX_PAGE_BYTES as u64) as usize;
+            input.read_exact(&mut buffer[..n])?;
+            hash.update(&buffer[..n]);
+            segments.push(model::digest(&buffer[..n]));
+            length += n as u64;
+        }
+        input.sync_all()?;
+        drop(input);
+        let id = format!("checklog-{}", model::digest(identity.as_bytes()));
+        metadata["segment_sha256"] = json!(segments);
+        let record = ArtifactRecord {
+            kind: "check_output".into(),
+            artifact_id: id.clone(),
+            relative_path: format!("artifacts/{id}.bin"),
+            byte_length: length,
+            content_digest: format!("{:x}", hash.finalize()),
+            metadata,
+        };
+        match fs::hard_link(source, self.path(&record)?) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => self.verify(&record)?,
+            Err(e) => return Err(e.into()),
+        }
+        Ok(record)
+    }
     pub fn record(operation_id: &str, bytes: &[u8], metadata: Value) -> ArtifactRecord {
         let id = format!("result-{}", model::digest(operation_id.as_bytes()));
         ArtifactRecord {
@@ -114,6 +186,9 @@ impl ArtifactFiles {
             "native_result_page" => "result-",
             "native_result" => "assembled-",
             "task_submission" => "submission-",
+            "source_snapshot" => "source-",
+            "check_result" => "check-",
+            "check_output" => "checklog-",
             _ => return Err(Error::new("ARTIFACT_KIND", "unsupported artifact kind")),
         };
         let hex = record.artifact_id.strip_prefix(prefix).unwrap_or("");
@@ -249,16 +324,67 @@ impl ArtifactFiles {
         }
         Ok(selected)
     }
+    fn read_check_output(
+        &self,
+        record: &ArtifactRecord,
+        offset: u64,
+        length: usize,
+    ) -> Result<Value> {
+        let mut file = self.open_regular(record)?;
+        let hashes = record.metadata["segment_sha256"]
+            .as_array()
+            .ok_or_else(|| Error::new("ARTIFACT_DAMAGED", "output segment index is absent"))?;
+        if hashes.len() as u64 != record.byte_length.div_ceil(MAX_PAGE_BYTES as u64) {
+            return Err(Error::new(
+                "ARTIFACT_DAMAGED",
+                "output segment index length differs",
+            ));
+        }
+        let end = record.byte_length.min(offset.saturating_add(length as u64));
+        let mut selected = Vec::new();
+        if end > offset {
+            for index in offset / MAX_PAGE_BYTES as u64..=(end - 1) / MAX_PAGE_BYTES as u64 {
+                let begin = index * MAX_PAGE_BYTES as u64;
+                let n = (record.byte_length - begin).min(MAX_PAGE_BYTES as u64) as usize;
+                let mut buf = vec![0; n];
+                file.seek(SeekFrom::Start(begin))?;
+                file.read_exact(&mut buf)?;
+                if hashes[index as usize].as_str() != Some(model::digest(&buf).as_str()) {
+                    return Err(Error::new(
+                        "ARTIFACT_DAMAGED",
+                        "check output segment changed",
+                    ));
+                }
+                selected.extend_from_slice(
+                    &buf[(offset.saturating_sub(begin)) as usize
+                        ..(end.min(begin + n as u64) - begin) as usize],
+                );
+            }
+        }
+        let (encoding, content) = match std::str::from_utf8(&selected) {
+            Ok(s) => ("utf8", s.to_owned()),
+            Err(_) => ("base64", STANDARD.encode(&selected)),
+        };
+        Ok(
+            json!({"artifact_id":record.artifact_id,"offset_bytes":offset,"byte_length":selected.len(),"eof":end==record.byte_length,"encoding":encoding,"content":content,"artifact_sha256":record.content_digest,"metadata":record.public_metadata()}),
+        )
+    }
     pub fn read(&self, record: &ArtifactRecord, offset: u64, length: usize) -> Result<Value> {
         if length == 0 || length > MAX_PAGE_BYTES || offset > record.byte_length {
             return Err(Error::invalid(
                 "artifact range is outside the retained content",
             ));
         }
+        if record.kind == "check_output" {
+            return self.read_check_output(record, offset, length);
+        }
         if record.kind == "native_result" {
             return self.read_assembled(record, offset, length);
         }
-        if record.kind == "task_submission" {
+        if matches!(
+            record.kind.as_str(),
+            "task_submission" | "source_snapshot" | "check_result" | "check_output"
+        ) {
             let bytes = self.verified_range(record, offset, length)?;
             let (encoding, content) = match std::str::from_utf8(&bytes) {
                 Ok(s) => ("utf8", s.to_owned()),
@@ -293,7 +419,7 @@ impl ArtifactRecord {
         match self.metadata.as_object() {
             Some(map) => Value::Object(
                 map.iter()
-                    .filter(|(key, _)| key.as_str() != "parts")
+                    .filter(|(key, _)| !matches!(key.as_str(), "parts" | "segment_sha256"))
                     .map(|(key, value)| (key.clone(), value.clone()))
                     .collect(),
             ),
