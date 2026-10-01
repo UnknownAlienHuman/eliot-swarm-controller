@@ -11,20 +11,29 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-      - name: Collect source and matching formatter
+      - name: Collect pinned source, toolchain and dependency inputs
         shell: bash
         run: |
-          rustup toolchain install 1.98.1 --profile minimal --component rustfmt --no-self-update
-          mkdir -p .local/inputs/formatter/bin .local/inputs/formatter/lib
+          set -euo pipefail
+          rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy --no-self-update
+          mkdir -p .local/inputs/dependency-inputs
           git archive --format=tar HEAD > .local/inputs/source.tar
-          (cd .local/inputs && sha256sum source.tar > source.tar.sha256)
-          cp "$(rustup which rustfmt)" .local/inputs/formatter/bin/
-          TOOLCHAIN="$(dirname "$(dirname "$(rustup which rustfmt)")")"
-          find "$TOOLCHAIN/lib" -maxdepth 1 -name '*.so*' -exec cp -L '{}' .local/inputs/formatter/lib/ \;
           printf '%s\n' "$GITHUB_SHA" > .local/inputs/source-commit.txt
+          TOOLCHAIN="$(dirname "$(dirname "$(rustup which rustc)")")"
+          tar -C "$TOOLCHAIN" -czf .local/inputs/toolchain.tar.gz bin lib
+          # Prepare the next adapter's HTTP dependency without changing repository files.
+          # Cargo's resolver preserves the existing lock; the resulting inputs are reviewed
+          # and committed together with the implementation, never silently installed.
+          cargo add 'reqwest@=0.13.5' --no-default-features --features json,stream
+          cp Cargo.toml Cargo.lock .local/inputs/dependency-inputs/
+          cargo vendor --locked --versioned-dirs .local/vendor > .local/inputs/dependency-inputs/vendor-config.toml
+          tar -C .local -czf .local/inputs/vendor.tar.gz vendor
+          curl --fail --silent --show-error --location https://opencode.ai/v2/openapi.json -o .local/inputs/opencode-v2.openapi.json
+          (cd .local/inputs && sha256sum source.tar toolchain.tar.gz vendor.tar.gz opencode-v2.openapi.json dependency-inputs/Cargo.toml dependency-inputs/Cargo.lock > SHA256SUMS)
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: native-development-inputs
           path: .local/inputs/
+          compression-level: 0
           retention-days: 3
           if-no-files-found: error
