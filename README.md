@@ -4,13 +4,13 @@ Headless modular Rust controller for native coding-agent harnesses; a prototype 
 
 ## Current implementation — 0.1.0
 
-The Rust core provides authenticated clients, tasks/revisions/claims, durable request receipts, directed mailbox, incremental reports, binding-scoped module admission and immutable result storage. Windows uses user-restricted Named Pipes; Unix uses a private socket. No TCP control listener is opened.
+The Rust core provides authenticated clients, task revisions/ownership, durable request receipts, directed mailbox, incremental reports, binding-scoped module admission, immutable artifacts, submission/review and acceptance. Windows uses user-restricted Named Pipes; Unix uses a private socket. No TCP control listener is opened.
 
-The Muse SDK bridge opens an explicitly selected native executable, delivers Task snapshots with per-turn effort, handles exact-turn steer/questions/goal/configuration, and reports observed children and run identities. A live bridge reconnects without closing Muse or replaying model input. Bridge.4 reads pinned native result pages without consuming `subagent/readResult`.
+The Muse SDK bridge opens an explicitly selected native executable, delivers Task snapshots with per-turn effort, handles exact-turn steer/questions/goal/configuration, and reports observed children and run identities. A live bridge reconnects without closing Muse or replaying model input. Bridge.4 reads pinned native result pages without consuming `subagent/readResult`. Local whole-result assembly and verified export are implemented.
 
-**Local whole-result assembly and export are implemented.** `artifact.assemble` validates a complete ordered set of retained pages, publishes a whole-result file and records provenance. `artifact.parts` pages that provenance; `artifact.read` verifies touched segments. `swarm artifact export` reuses one authenticated IPC connection, streams bytes to an explicitly chosen local file and checks the full SHA-256 before publication. It never sends the destination path to a model or the host.
+**CheckRunner executes configured commands on captured Git sources. Active cancellation and recovery of a recorded departed check worker are now implemented.** Cancellation does not stop the host or native agents. Recovery uses the worker lock and OS group identity; it does not infer success or replay a command.
 
-**Still pending:** bridge-process crash/resume, complete native family reconstruction, automatic handoff, active check cancellation/orphan recovery, reverse-dependency scope/cache reuse, direct OpenCode V2 and other native adapters, MCP and automatic module/service installation. Whole-result coverage is not Task acceptance. Live Muse/Max inference and Windows native launch remain unqualified. Do not mark all C01–C03 complete.
+**Still pending:** Muse bridge-process crash/resume, complete native family reconstruction, automatic handoff, unresolved pre-identity check launches, reverse-dependency scope/cache reuse, direct OpenCode V2 and other native adapters, MCP and automatic module/service installation. Live Muse/Max inference and Windows native launch remain unqualified. Do not mark all C01–C03 complete.
 
 ## Build and run
 
@@ -19,7 +19,7 @@ cargo build --locked --release --bin swarm
 .\target\release\swarm.exe --data-dir C:\SwarmState host
 ```
 
-Use an initially empty dedicated local directory. The host owns only its marker/lock, database, artifacts and credentials there. It refuses unrelated nonempty directories; global PATH, UAC and existing vendor settings are not changed. Read-only CLI calls do not initialize a database or launch the host.
+Use an initially empty dedicated local directory. The host owns only its marker/lock, database, artifacts and credentials there. It refuses unrelated nonempty directories; global PATH, UAC and vendor settings are untouched. Read-only CLI calls do not initialize a database or launch the host.
 
 In another PowerShell:
 
@@ -33,17 +33,17 @@ $swarm = '.\target\release\swarm.exe'
 & $swarm --data-dir C:\SwarmState report --after 0
 ```
 
-Repeat the identical method/payload and request ID after a lost reply. A different payload under that ID is rejected. New IDs do not bypass origin/ownership/initial-start uniqueness. Request IDs go to stderr, JSON results to stdout. Keep secrets out of persisted task text and mailbox messages.
+After a lost reply, repeat the identical method/payload and request ID. Different content under that ID is rejected. New IDs do not bypass origin/ownership/initial-start uniqueness. Request IDs go to stderr, JSON results to stdout. Keep secrets out of persisted task text and mailbox messages.
 
-`swarm call METHOD --file params.json` invokes the implemented API. `--config config/controller.example.toml` uses the implementation configuration, not the broader target examples under docs/.
+`swarm call METHOD --file params.json` invokes the implemented API. `--config config/controller.example.toml` uses the implementation configuration, not the broader target examples under docs/. Commands below also require the appropriate data-dir/config/credential options.
 
 ## Native Muse, clients and task-specific children
 
-Follow [modules/muse/README.md](modules/muse/README.md). Enable a private route, reserve `agent.open`, register its scoped module credential, install the locked module-local SDK and independently launch the bridge using the installed native executable. The shipped route is disabled; its artifact version is **`muse-sdk-1.3.0-bridge.4`**. These local artifact changes do not require replacing a running bridge.
+Follow [modules/muse/README.md](modules/muse/README.md). Enable a private route, reserve `agent.open`, register its scoped module credential, install the locked module-local SDK and independently launch the bridge using the installed native executable. The shipped route is disabled; its artifact version is **`muse-sdk-1.3.0-bridge.4`**. Local check changes do not require replacing a running bridge.
 
-Native subscriptions/auth and effort remain in the harness. Requested effort, effective setting and observed inference are different evidence. No Go/API route silently substitutes for Muse Code Max. Full conversation history stays native.
+Native subscription/auth and effort remain in the harness. Requested effort, effective setting and observed inference are different evidence. No Go/API route silently substitutes for Muse Code Max. Full conversation history stays native.
 
-`agent.send` supports next-turn input or exact-turn steer. `agent.reply` submits native decisions with current IDs; the bridge's immediate MSP `{}` response acknowledges presentation only. Configure/goal/refresh/reconcile keep their distinct application boundaries. Refresh is not resume and a timeout does not authorize another prompt.
+`agent.send` supports next-turn input or exact-turn steer. `agent.reply` submits native decisions with current IDs; the bridge's immediate MSP `{}` response acknowledges presentation only. Configure/goal/refresh/reconcile keep their distinct application boundaries. Refresh is not resume; a timeout does not authorize another prompt.
 
 ```powershell
 swarm --data-dir C:\SwarmState --request-id register-w1 client-create W1 --role manager --out C:\SwarmState\W1.credential.json
@@ -56,214 +56,145 @@ Mailbox readers have independent cursors. Module credentials are binding-scoped 
 
 ## Complete results without model roundtrips
 
-First obtain native pages with `swarm result BINDING --generation 1 --file selector.json --offset N --length 65536`. Each settled `agent.result` provides a `result.details.artifact_ref` and `next_offset_bytes`. Reuse the same selector, item revision and source digest for subsequent pages. Native source offsets and local page offsets are different. See the module README for native selectors.
+Obtain native pages with `swarm result BINDING --generation 1 --file selector.json --offset N --length 65536`. Each settled `agent.result` provides `result.details.artifact_ref` and `next_offset_bytes`. Reuse the same selector, item revision and source digest for subsequent pages. Native source offsets and local page offsets are different. Native selectors are in the Muse module README.
 
-Create `pages.json` containing the actual retained artifact IDs in source-byte order:
+Create `pages.json` with actual retained IDs in source-byte order:
 
 ```json
 {"page_refs":["result-FIRST_PAGE_ID","result-SECOND_PAGE_ID"]}
 ```
 
-Optional `expected_sha256` is the expected **whole-body** SHA-256, not a page hash. Do not invent one when the source does not supply it.
+Optional `expected_sha256` means the expected **whole-body** SHA-256, not a page hash. Do not invent one when the source supplies none.
 
 ```powershell
-swarm --data-dir C:\SwarmState --request-id assemble-result-1 artifact assemble --file pages.json
+swarm --request-id assemble-result-1 artifact assemble --file pages.json
 # operation.json contains the returned operation_id:
-swarm --data-dir C:\SwarmState call operation.get --file operation.json
+swarm call operation.get --file operation.json
 # After outcome=applied, use result.details.artifact_ref:
-swarm --data-dir C:\SwarmState artifact get ASSEMBLED_ID
-swarm --data-dir C:\SwarmState artifact parts ASSEMBLED_ID --after 0 --limit 50
-swarm --data-dir C:\SwarmState artifact read ASSEMBLED_ID --offset 65520 --length 64
-swarm --data-dir C:\SwarmState artifact export ASSEMBLED_ID --out .\worker-result.json
+swarm artifact get ASSEMBLED_ID
+swarm artifact parts ASSEMBLED_ID --after 0 --limit 50
+swarm artifact read ASSEMBLED_ID --offset 65520 --length 64
+swarm artifact export ASSEMBLED_ID --out .\worker-result.json
 ```
 
-Assembly accepts registered result pages only. It rejects mixed bindings/generations/selectors/source revisions, reordered/duplicate/overlapping pages, missing bytes, incorrect EOF and altered bytes. Source identity must match exactly, except the per-page whole-digest-verification flag. It computes a whole SHA-256 and checks any reported native SHA-256 and explicit expected digest. Missing native digests remain unverified, not fabricated.
+Assembly rejects mixed bindings/generations/selectors/source revisions, reordered/duplicate/overlapping pages, missing bytes, incorrect EOF and altered bytes. It verifies any supplied native SHA-256 and explicit whole digest; absent native digests remain unverified. Source identity must match except the per-page whole-digest-verification flag.
 
-The initial response is the saved admission receipt. `operation.get` reports completion or the concrete assembly error. File work runs outside the SQLite owner thread. Concurrent repeats return the same operation; after a host restart an unfinished **local assembly** can continue through the identical request ID. A previously published file is verified, never overwritten. This local recovery rule does not authorize replay of native prompts or restart Muse. A known failed assembly remains a failed outcome; retry a repaired input with a new request ID.
+The initial response is durable admission; `operation.get` reports completion or a concrete error. File work stays off the SQLite thread. Repeats return the same operation; unfinished **local assembly** can resume through the identical request ID after host restart. Existing files are verified, not overwritten. This does not authorize native prompt replay. A known failed assembly remains failed; repaired inputs use a new request ID.
 
-Original pages and source provenance remain retained. The whole result has its own file/digest; large manifests are paginated rather than copied into every range response. Export reads byte ranges over one IPC connection, verifies the final digest and only then creates the requested file. Existing destination paths are never replaced. Failed exports remove only their own temporary file.
+Original pages remain retained; provenance is paginated. Export streams over one authenticated IPC connection, verifies the whole digest and only then publishes the chosen local destination. Existing paths are never replaced; failed exports remove only their own temporary file. The destination path is not sent to the host or model.
 
-The 64 KiB bound applies to byte transfers, not the total result size. Assembly keeps one content page in memory at a time plus its page descriptors. Request/manifest metadata still scales with the number of pages and must fit the existing IPC envelope. Automatic fetching of missing pages, arbitrary reference-URI downloads and semantic acceptance are not performed by this path.
+64 KiB limits transfers, not the total result. Assembly holds one content page plus descriptors; request/manifest metadata still scales with page count and must fit the IPC envelope. Automatic missing-page fetching, arbitrary reference-URI downloads and Task acceptance are not performed by this path.
 
 ## Fixed-source CheckRunner
 
-**C06 now executes configured commands and retains machine evidence.** The full path is
-`source.capture → task.submit/check.run → task.accept`. Source capture reads exact Git tree/blob
-objects and materializes normal files under the controller state directory. It does not switch main,
-stage work, create worktrees, run repository hooks or include uncommitted edits. Symlinks, gitlinks,
-LFS pointers and unsafe/case-colliding paths are reported as unsupported, not silently omitted.
+`source.capture → task.submit/check.run → task.accept`
 
-Use [the CheckRunner guide](docs/check-runner.md), [trusted check configuration](config/checks.example.toml),
-[source selector](config/source-capture.example.json), [check request](config/check-run.example.json)
-and [checks-required Task](config/task-checked.example.json). Profiles are explicit local configuration,
-not arbitrary command lines supplied by a worker. Normal configuration keeps check execution disabled.
+Capture reads exact Git tree/blob objects and materializes normal files under the controller state directory. It does not switch main, stage work, create worktrees, run repository hooks or include uncommitted edits. Symlinks, gitlinks, LFS pointers and unsafe/case-colliding paths are explicitly unsupported, not silently omitted.
+
+Use [the CheckRunner guide](docs/check-runner.md), [trusted check configuration](config/checks.example.toml), [source selector](config/source-capture.example.json), [check request](config/check-run.example.json) and [checks-required Task](config/task-checked.example.json). Profiles are local configuration, not arbitrary worker-supplied commands. Normal configuration keeps execution disabled.
 
 ```powershell
 swarm --request-id capture-1 source capture --file capture.json
-# Read the Operation result.candidate_ref; submit/check this same candidate.
+# Read Operation result.candidate_ref; submit/check that same candidate.
 swarm --request-id check-1 check run --file check.json
 swarm check get CHECK_ID
 swarm artifact get RESULT_REF
 swarm artifact export OUTPUT_REF --out .\check-stdout.txt
 ```
 
-Use normal config/data-dir/credential arguments. Check output reaches its owner's durable mailbox;
-large stdout/stderr stay in range-readable artifacts. Cargo profiles require the declared target names,
-valid build-finished evidence and no parsing/coverage gaps. Exit 0 alone, or a changed source directory,
-does not produce a pass. Semantic review and final Task acceptance remain separate.
+Output reaches the owner's mailbox; full stdout/stderr stay in range-readable artifacts. Cargo profiles require declared targets, valid build-finished evidence and no parsing/coverage gaps. Exit zero or changed sources cannot produce a pass. Semantic review and final acceptance remain separate.
 
-One transient process of the same `swarm` binary owns a check Job/process group, not a new permanent
-service. The host commits its resource claim and worker identity before allowing command execution.
-Disconnect/restart of the host does not close an admitted worker; the next host collects its retained
-completion. Repeated active requests coalesce within the same Attempt/candidate/profile. Unknown
-worker/launch outcomes retain only their resource; they do not authorize a second writer there.
-Queued cancellation is available; active cancellation and automatic orphan disposition are unfinished.
+A transient process of the same `swarm` binary owns each check Job/process group. Resource claim and worker identity are committed before tool execution is allowed. Host disconnect/restart does not close admitted workers; the next host collects retained completion. Active identical requests coalesce within an Attempt/candidate/profile. An uncertain outcome retains its resource, not the whole controller.
+
+### Active cancellation and recovery
+
+```powershell
+swarm --request-id cancel-1 check cancel CHECK_ID --reason 'Superseded verification'
+swarm check get CHECK_ID
+```
+
+The reply confirms a **durable request**, not process termination. `check.get` separates `cancel_request` from terminal `cancellation` evidence. Queued work is cancelled without execution even while new-work admission is disabled. New control-version-2 workers receive token/CheckRun-addressed cancellation before go-ahead when both are pending, before tool spawn, while the parent runs and while descendants remain.
+
+Only this check's tool processes are targeted; the reporting worker, host, other checks and native-agent families are not. This is explicit termination, not graceful application shutdown or an age/CPU-triggered policy. Source materialization and artifact sealing remain finite noninterruptible local operations. The target stays held until the owned group is actually empty. A late request does not rewrite a naturally completed verdict. Older already running workers report unsupported cancellation rather than being replaced in place.
+
+After a worker crash, recovery acquires its released lock, rechecks receipts and verifies exact OS group disposition. Live descendants or denied/unknown inspection keep ownership. A prepared terminal receipt is validated and restored with the same artifacts. Without it, retained output becomes **incomplete**, with unknown exit/coverage, never a guessed pass. Recovery neither replays the command nor kills orphaned processes.
+
+Windows uses a uniquely named Global Job and query-only recovery; cancellation validates membership through pinned process handles. Linux uses boot/birth/group identities and pidfds, including whole-process termination when the main thread exits first. These are trusted execution boundaries, not sandboxes against deliberate process-group escape. Missing pre-identity launch evidence, legacy unnamed Windows Jobs and damaged records remain explicit gaps. Platform details and limits are in the CheckRunner guide.
 
 ## Task submission and anchored feedback
 
-`task.submit` now seals a complete retained result together with the Attempt's requirement report.
-The candidate can be an exact source snapshot of this Attempt/revision, an assembled native result,
-or a single native page that covers its complete source body. Native results of a bound Attempt must
-belong to that binding/generation. The retained document bytes are verified off the SQLite thread
-before a separate immutable submission is published. Submission alone is not a machine pass or semantic
-acceptance; only the source-snapshot path can be used by CheckRunner.
-
-Use [config/submission.example.json](config/submission.example.json), replacing the sample IDs:
+`task.submit` seals a candidate and requirement report. The candidate can be an exact source snapshot of this Attempt/revision, an assembled native result, or one native page covering its complete source. Bound native results must belong to that binding/generation. Bytes are checked off the DB thread before immutable submission publication. Only source snapshots can be machine-checked by CheckRunner.
 
 ```powershell
-swarm --data-dir C:\SwarmState --request-id submit-1 task submit --file submission.json
-# Read the returned operation_id with operation.get; result contains submission_ref.
-swarm --data-dir C:\SwarmState task submission SUBMISSION_REF --limit 50
-swarm --data-dir C:\SwarmState artifact export SUBMISSION_REF --out .\submission.json
+# Fill config/submission.example.json with actual IDs and claims:
+swarm --request-id submit-1 task submit --file submission.json
+# Read the operation result.submission_ref:
+swarm task submission SUBMISSION_REF --limit 50
+swarm artifact export SUBMISSION_REF --out .\submission.json
+# Separate decision owner; config/request-changes.example.json:
+swarm --request-id review-1 task request-changes --file review.json
 ```
 
-`expected_submission_ref` must be explicit: null for the first submission, the previous reference
-for a replacement. Revision/owner/reference are checked again at final commit after file I/O.
-Concurrent proposals cannot overwrite each other. Submission does not release Task ownership or
-require unrelated children to finish; native turn completion does not erase a submitted/review state.
-A host restart permits retrying the identical local publication request, not replaying model input.
-Read the operation outcome even if the initial durable receipt says queued.
+`expected_submission_ref` is explicit: null for the first submission, the prior reference for replacement. Owner/revision/reference are checked again after file I/O. Concurrent proposals cannot overwrite one another. Submission does not release the producer or wait for unrelated children; late native completion cannot erase submitted/review state. An identical local publication request can continue after restart, not replay model input.
 
-Claims name existing requirement IDs. Omitted requirements become **unreported**, using the frozen
-Task specification, rather than silently disappearing. `met` needs an evidence reference; `not_met`
-and `deferred` need an explanation. These strings are submitter assertions, not controller-verified
-symbols. A partially reported proposal can be retained and reviewed without manufacturing a PASS.
-`task.submission` pages the immutable claims; `artifact.read/export` verifies the actual document.
+Claims name frozen requirement IDs. Omitted requirements become **unreported**; `met` needs evidence, `not_met/deferred` need reasons. Evidence strings remain writer assertions, not proof of symbol existence/correctness. A useful incomplete proposal is retainable without acceptance.
 
-As the operator/decision owner, submit [config/request-changes.example.json](config/request-changes.example.json):
-
-```powershell
-swarm --data-dir C:\SwarmState --request-id review-1 task request-changes --file review.json
-# As the assigned manager, read message.read using that manager's credential.
-```
-
-Feedback names the exact Attempt, Task revision, submission, candidate and a stable finding_id.
-An applicable finding changes only that Attempt to needs_correction and atomically enters its owner's
-mailbox. Repeating the same finding does not send it again; different content under that identity
-conflicts. Stale feedback is preserved as historical evidence and does not alter or notify newer work.
-The manager can reply using message.send/in_reply_to with the feedback's message_id, then resubmit
-against the previous submission reference. No second task.dispatch, process or automatic native wake
-is involved. Decision recording and exact invalidation are described below; CheckRunner does not bypass them.
+Feedback names exact Attempt/revision/submission/candidate and a stable finding_id. Applicable feedback sets needs_correction and enters the owner's mailbox atomically. Repeating the same finding does not send it twice; conflicting content under that identity fails. Stale review remains historical and does not alter or notify newer work. The manager can reply with message.send/in_reply_to and resubmit in the same Attempt. No new dispatch, writer or automatic native wake is created.
 
 ## Reviewed acceptance and exact invalidation
 
-`task.accept` records an operator decision about the **exact sealed proposal**; machine-check
-evidence is recorded separately from semantic review. The operator must differ from both the owner
-and submitter. Same-user client identities prevent accidental self-approval; they do not prove that
-a different model or human performed the review.
+`task.accept` records a decision about the **exact sealed proposal**. The operator differs from both owner and submitter; client identities prevent accidental self-approval but do not prove that another model/person reviewed the work.
 
-The Task author explicitly selects `acceptance.required_check_profiles`. An empty list selects
-review-only acceptance ([example Task](config/task-review.example.json)); nonempty entries name
-`profile_id` and `profile_revision` that must be covered by actual completed CheckRuns. The worker
-cannot supply a boolean `passed` in their place. The configured CheckRunner produces these records
-for exact source candidates; native prose is not a substitute for a checked checkout. Missing policy
-on an older Task is not silently treated as empty: revise the Task explicitly before assigning its next
-Attempt. Writing and submission do not require an acceptance policy.
+The Task author selects `acceptance.required_check_profiles`. An explicit empty list selects [review-only](config/task-review.example.json); nonempty profile_id/profile_revision entries require actual completed CheckRuns. A worker-supplied `passed:true` cannot replace them. Missing policy on older Tasks is not silently treated as empty; revise before assigning a new Attempt. Writing/submission do not require an acceptance policy.
 
-Review-only accepts the retained result and its reviewed requirements. It is **not** a verified
-Git checkout, a machine-verified semantic verdict, publication, or a reason to mark a GitHub Issue
-code-complete. Review-only decisions record `evidence_level=operator_review` and
-`source_checkout_verified=false`. Decisions using actual required passes record
-`operator_review_with_checks` and source verification, without claiming semantic correctness beyond
-the reviewed requirements. Do not choose review-only when the campaign requires executed build evidence.
+Review-only records `evidence_level=operator_review`, `source_checkout_verified=false`; it is not a checked Git tree, publication or Issue closure. Required machine passes produce `operator_review_with_checks`, without independently proving semantic correctness. Do not choose review-only when the campaign requires executed builds.
 
 ```powershell
-# Read the exact submission; retain latest_feedback_observation_id.
 swarm task submission SUBMISSION_REF
-# As a separate decision owner, fill config/acceptance.example.json with real evidence.
+# Retain latest_feedback_observation_id; fill config/acceptance.example.json:
 swarm --request-id accept-1 task accept --file acceptance.json
-# Inspect operation.get; on applied, read its acceptance_operation_id:
+# After applied, read result.acceptance_operation_id:
 swarm task acceptance ACCEPTANCE_OPERATION_ID
-# Revoke that decision, not "whichever decision currently has this candidate":
+# Fill config/invalidate-acceptance.example.json with the exact decision:
 swarm --request-id revoke-1 task invalidate-acceptance --file invalidate.json
 ```
 
-Use normal data-dir/config/credential arguments. Review must cover exactly the frozen requirement
-IDs with rationale and evidence, independently of the writer's `met/unreported` list. Its expected
-feedback cursor comes from `task.submission`; new applicable feedback during byte verification
-makes the decision proposal stale, without discarding the worker's candidate. Missing/corrupt
-submission, candidate or required-check artifact prevents acceptance. File reads stay off the DB
-thread; final state, authority, feedback and pinned dependency decisions are checked again inside
-the final transaction.
+Review covers all frozen requirement IDs with rationale/evidence, independently of the writer's list. New feedback during byte verification makes a decision proposal stale without discarding the candidate. Missing/corrupt candidate, submission or required-check artifacts prevent acceptance. Final authority, ownership, revision, feedback and dependency decisions are rechecked in the transaction.
 
-Acceptance retains producer ownership. `attempt.release` permits `outcome=accepted` only after a
-recorded acceptance and still checks assigned native runs and outstanding effects/resources.
-Acceptance is not cancellation. Invalidating the current decision reopens the Task and returns
-one feedback message to its still-owning manager. Invalidating an older decision retains the
-historical revocation without clearing a newer decision, even when both accepted the same bytes.
-Replies use the existing mailbox; no new prompt, writer, process or Issue mutation is performed.
+Acceptance preserves producer ownership. `attempt.release` with accepted requires recorded acceptance and known disposition of assigned native runs, effects and check resources. Invalidation names an **acceptance_operation_id**, not whichever decision now refers to the same SHA. A current decision's invalidation reopens the Task and sends one feedback to its current owner; an old invalidation cannot erase a newer decision. No writer/process/Issue mutation is automatically started.
 
-Dependency lookup now uses valid historical acceptance decisions, rather than only today's Task
-pointer. A newer producer revision does not revoke a pinned earlier decision. Explicit revocation
-is rechecked when a consumer is accepted. No cascade deletes already accepted consumer results.
+Dependency lookup uses valid historical acceptance decisions. A newer producer revision does not revoke an earlier pinned decision; explicit revocation is checked again at consumer acceptance. No cascade deletes accepted consumer results.
 
-## API and remaining work
+## API and next code
 
-Public methods: `source.capture`, `check.run/get/profiles/cancel`, `host.status/mode`, `client.register/list`, `task.create/get/list/revise/claim/dispatch/submit/submission/request_changes/accept/acceptance/invalidate_acceptance`, `attempt.get/release/bind_producer`, `agent.open/state/list/family/send/reply/configure/goal/refresh/reconcile/result`, `artifact.get/read/assemble/parts`, `route.list`, `operation.get/list/cancel`, `message.send/read`, `report.delta`. Module methods remain `module.hello/next/outcome/observe/result`. Export is a CLI client operation over get/read, not a remote arbitrary-file-write method.
+Public methods: `source.capture`, `check.run/get/profiles/cancel`, `host.status/mode`, `client.register/list`, `task.create/get/list/revise/claim/dispatch/submit/submission/request_changes/accept/acceptance/invalidate_acceptance`, `attempt.get/release/bind_producer`, `agent.open/state/list/family/send/reply/configure/goal/refresh/reconcile/result`, `artifact.get/read/assemble/parts`, `route.list`, `operation.get/list/cancel`, `message.send/read`, `report.delta`. Module methods: `module.hello/next/outcome/observe/result`. Export is a client operation, not a remote arbitrary-file-write method.
 
-Next: finish the remaining check-worker recovery/cancellation and native Muse crash-recovery
-boundaries, then direct OpenCode V2 on the same contract. Exact-source capture, check execution,
-result retention and acceptance are already implemented; do not reimplement them or reopen the
-platform selection. Preserve the native shared-Codex/subscription targets. [SIWC notes](docs/runtime-notes.md)
-describe an optional OAuth route, not installed authorization. [OpenCodex Issue #1](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/1)
-remains after the main controller code.
+**Next: Muse bridge-process crash recovery, then direct OpenCode V2 on the same host contract.** Recorded check-worker recovery is implemented; missing pre-identity launch evidence remains explicit. Do not reimplement source capture, results, submission, acceptance or CheckRunner. Preserve the native shared-Codex/subscription targets. [SIWC notes](docs/runtime-notes.md) describe an optional OAuth route, not installed auth. [OpenCodex Issue #1](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/1) remains after the main code.
 
 ## Evidence and development
 
-**Current code checkpoint: `c56f50a408b622bb6b2b9449af4003c560fcd315`.** C06 code was published in
-`cfa436f8`; a one-line Clippy finding on a byte separator was corrected without warning suppression.
-On **2026-10-01**, [CI run 36828917649](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/36828917649)
-passed formatting, warnings-denied Clippy, Muse syntax/SDK import and release builds on **Windows and Linux**
-for that exact corrected commit. The first failing run is not the validation result. The nine-table
-migration and native modules are unchanged. libc was already locked; it is now also a direct Linux
-dependency for process-group setup. Existing package versions were not updated.
+**Current code: `611f7c11c70d6d9be3c24e8f49d27c04e8816589`.** Cancellation/recovery were published in `4afb8b6c`; the Windows query-access import was corrected without widening permissions or suppressing warnings. On **2026-10-01**, exact [CI run 36832982495](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/36832982495) passed formatting, warnings-denied Clippy, Muse syntax/SDK import and release builds on **Windows and Linux**. Earlier Linux-only success is not used as evidence of the corrected Windows build.
 
-Linux artifact `11146446370` passed ZIP/SHA-256 verification
-(`f43a04eb7709379aa7b5bc44d6ce13c9f965ecd34b0a464158d3d78b599a81e7`); all 101 archived source files
-matched the uploaded tree `334f0f3a2ba12b4f3c7734f5d2c408009297cd33`.
-A bounded invocation of the compiled host/CLI used a self-owned local Git repository and **real configured
-Python commands**, not a mocked CheckRun or a native model. It confirmed exact committed-source capture
-while leaving different dirty checkout bytes untouched; command output retention and request replay;
-nonzero-exit failure; exit-zero source modification producing incomplete; waiting for a live child after
-its parent exited; the same worker surviving host restart; queued cancellation while admission was disabled;
-and acceptance consuming an actual completed check. Owner mailbox delivery and clean host exit succeeded.
-This is a command-executor invocation, not Cargo runtime or Windows Job qualification. The Cargo parser and
-Windows implementation compiled; their full runtime behavior, orphan recovery, cache and load remain pending.
-No native SDK/model, user repository or broad test suite was exercised.
+Linux artifact `11147996922` passed ZIP/SHA-256 verification (`c2a6a391e383eb83f0c052f7f67ced3596b8d337b5aa527297a168324402501c`); its archive reconstructed exact tree `f3ff96f50db5287e62362f1f82870a47b4f08c2d`. No migration, package/dependency version, native module, table or permanent service was added by this change.
 
-Previous acceptance code `01212a4e` passed [CI 36816310704](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/36816310704).
-That earlier synthetic invocation is historical evidence, not the C06 execution proof. Resume from the
-present CheckRunner code, not the older documentation-only recovery checkpoint or acceptance patch.
+A bounded invocation of that exact Linux binary used the real host/CLI and configured Python commands in a self-owned Git repository. It confirmed cancellation of an observed parent plus child, rejection of another manager's cancellation, identical-request replay and survival of an unrelated process; cancellation after parent exit; resource retention after killing the exact fixture worker while descendants still ran; eventual incomplete recovery and admission of a waiting check; cancellation across restart; unchanged terminal verdict on late cancellation; and orderly host shutdown.
 
-The read-only workflow pins Rust 1.98.1/Cargo.lock and runs formatting, warnings-denied Clippy, release builds and Muse syntax/SDK import checks. It does not run `cargo test`, vendor sessions, login or global installation. Artifacts include exact source SHA/source archive. Windows compilation is not qualification on the owner's machine.
+Prepared-terminal recovery was exercised by **renaming the final completion receipt in the isolated fixture after stopping the host**, not by claiming a spontaneous crash: the original receipt bytes were restored and the command's retained start record did not change. No mock CheckRun, native model, user repository or broad test suite was used.
+
+This does not qualify Windows Job execution, pidfd availability on every Linux kernel, deliberate process-group escape, Cargo runtime coverage, missing pre-identity launch evidence, cache or load. Windows lifecycle is compiled, not run here. Resume from the present code, not old acceptance patches or documentation-only recovery checkpoints.
+
+Historical baselines: C06 `c56f50a4` passed [CI 36828917649](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/36828917649) and a real-command invocation of capture, output, failure/source-change rejection, host restart and checked acceptance. Acceptance `01212a4e` passed [CI 36816310704](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/36816310704). Those are earlier evidence, not substitutes for this cancellation/recovery run.
+
+The read-only workflow pins Rust 1.98.1/Cargo.lock and checks formatting, Clippy, release builds and Muse syntax/import. It does not run cargo test, vendor sessions, login or global installation. Artifacts include exact source SHA and a source archive.
 
 | Document | Purpose |
 | --- | --- |
 | [Architecture](docs/agent_swarm.md) | Target execution model |
-| [Implementation plan](docs/agent_swarm.implementation-v6.md) | C01–C11 and transactional boundaries |
+| [Implementation plan](docs/agent_swarm.implementation-v6.md) | C01–C11 and transaction boundaries |
 | [Module contract](docs/agent_swarm.module-contract-v2.md) | Capabilities, delivery and lifecycle |
+| [CheckRunner](docs/check-runner.md) | Implemented execution/cancellation/recovery details |
 | [Reference specification](docs/agent_swarm.spec-v18/README.md) | Design examples, not implementation evidence |
 | [Donors](docs/agent_swarm.donors-20260929.toml) | Source candidates, not installed runtimes |
-| [Lessons](docs/lessons-learned.md) / [runtime notes](docs/runtime-notes.md) / [candidates](docs/candidate-notes.md) | On-demand reference, not extra worker instructions |
+| [Lessons](docs/lessons-learned.md) / [runtime notes](docs/runtime-notes.md) / [candidates](docs/candidate-notes.md) | On-demand evidence, not extra worker instructions |
 
-This README records current readiness. Work only in main, without worktrees. Code useful paths first, then focused formatting/Clippy; broad tests follow working slices. The nine-table migration is unchanged; the exact dependency lock is committed. Foreign/draft/newer databases and missing credentials are not silently replaced. Preserve a cleanly stopped state directory in full, not a live `.db` without WAL. Historical briefs remain in Git history for provenance, not present install defaults.
+This README records current readiness. Work only in main, without worktrees. Code useful paths first, then focused formatting/Clippy; broad tests follow working slices. The nine-table migration is unchanged. Foreign/draft/newer databases and missing credentials are not silently replaced. Preserve a cleanly stopped state directory in full, not only a live DB without WAL. Historical briefs remain in Git history for provenance, not present install defaults.
