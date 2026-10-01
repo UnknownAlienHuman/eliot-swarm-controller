@@ -10,7 +10,7 @@ The Muse SDK bridge opens an explicitly selected native executable, delivers Tas
 
 **Local whole-result assembly and export are implemented.** `artifact.assemble` validates a complete ordered set of retained pages, publishes a whole-result file and records provenance. `artifact.parts` pages that provenance; `artifact.read` verifies touched segments. `swarm artifact export` reuses one authenticated IPC connection, streams bytes to an explicitly chosen local file and checks the full SHA-256 before publication. It never sends the destination path to a model or the host.
 
-**Still pending:** bridge-process crash/resume, complete native family reconstruction, automatic handoff, CheckRunner, direct OpenCode V2 and other native adapters, MCP and automatic module/service installation. Whole-result coverage is not Task acceptance. Live Muse/Max inference and Windows native launch remain unqualified. Do not mark all C01–C03 complete.
+**Still pending:** bridge-process crash/resume, complete native family reconstruction, automatic handoff, active check cancellation/orphan recovery, reverse-dependency scope/cache reuse, direct OpenCode V2 and other native adapters, MCP and automatic module/service installation. Whole-result coverage is not Task acceptance. Live Muse/Max inference and Windows native launch remain unqualified. Do not mark all C01–C03 complete.
 
 ## Build and run
 
@@ -85,13 +85,48 @@ Original pages and source provenance remain retained. The whole result has its o
 
 The 64 KiB bound applies to byte transfers, not the total result size. Assembly keeps one content page in memory at a time plus its page descriptors. Request/manifest metadata still scales with the number of pages and must fit the existing IPC envelope. Automatic fetching of missing pages, arbitrary reference-URI downloads and semantic acceptance are not performed by this path.
 
+## Fixed-source CheckRunner
+
+**C06 now executes configured commands and retains machine evidence.** The full path is
+`source.capture → task.submit/check.run → task.accept`. Source capture reads exact Git tree/blob
+objects and materializes normal files under the controller state directory. It does not switch main,
+stage work, create worktrees, run repository hooks or include uncommitted edits. Symlinks, gitlinks,
+LFS pointers and unsafe/case-colliding paths are reported as unsupported, not silently omitted.
+
+Use [the CheckRunner guide](docs/check-runner.md), [trusted check configuration](config/checks.example.toml),
+[source selector](config/source-capture.example.json), [check request](config/check-run.example.json)
+and [checks-required Task](config/task-checked.example.json). Profiles are explicit local configuration,
+not arbitrary command lines supplied by a worker. Normal configuration keeps check execution disabled.
+
+```powershell
+swarm --request-id capture-1 source capture --file capture.json
+# Read the Operation result.candidate_ref; submit/check this same candidate.
+swarm --request-id check-1 check run --file check.json
+swarm check get CHECK_ID
+swarm artifact get RESULT_REF
+swarm artifact export OUTPUT_REF --out .\check-stdout.txt
+```
+
+Use normal config/data-dir/credential arguments. Check output reaches its owner's durable mailbox;
+large stdout/stderr stay in range-readable artifacts. Cargo profiles require the declared target names,
+valid build-finished evidence and no parsing/coverage gaps. Exit 0 alone, or a changed source directory,
+does not produce a pass. Semantic review and final Task acceptance remain separate.
+
+One transient process of the same `swarm` binary owns a check Job/process group, not a new permanent
+service. The host commits its resource claim and worker identity before allowing command execution.
+Disconnect/restart of the host does not close an admitted worker; the next host collects its retained
+completion. Repeated active requests coalesce within the same Attempt/candidate/profile. Unknown
+worker/launch outcomes retain only their resource; they do not authorize a second writer there.
+Queued cancellation is available; active cancellation and automatic orphan disposition are unfinished.
+
 ## Task submission and anchored feedback
 
 `task.submit` now seals a complete retained result together with the Attempt's requirement report.
-The candidate must be an assembled result or a single page that covers its complete source body.
-For a bound Attempt it must belong to that binding/generation. Its bytes are verified off the SQLite
-thread before the separate immutable submission document is published. This is a proposed result,
-**not a Git checkout snapshot, CheckRunner pass or semantic acceptance**.
+The candidate can be an exact source snapshot of this Attempt/revision, an assembled native result,
+or a single native page that covers its complete source body. Native results of a bound Attempt must
+belong to that binding/generation. The retained document bytes are verified off the SQLite thread
+before a separate immutable submission is published. Submission alone is not a machine pass or semantic
+acceptance; only the source-snapshot path can be used by CheckRunner.
 
 Use [config/submission.example.json](config/submission.example.json), replacing the sample IDs:
 
@@ -128,27 +163,29 @@ mailbox. Repeating the same finding does not send it again; different content un
 conflicts. Stale feedback is preserved as historical evidence and does not alter or notify newer work.
 The manager can reply using message.send/in_reply_to with the feedback's message_id, then resubmit
 against the previous submission reference. No second task.dispatch, process or automatic native wake
-is involved. Decision recording and exact invalidation are described below; CheckRunner execution remains unfinished.
+is involved. Decision recording and exact invalidation are described below; CheckRunner does not bypass them.
 
 ## Reviewed acceptance and exact invalidation
 
-`task.accept` records an operator decision about the **exact sealed proposal**, not a claim that
-the controller has compiled the repository. The operator must differ from both the owner and
-submitter. Same-user client identities prevent accidental self-approval; they do not prove that
+`task.accept` records an operator decision about the **exact sealed proposal**; machine-check
+evidence is recorded separately from semantic review. The operator must differ from both the owner
+and submitter. Same-user client identities prevent accidental self-approval; they do not prove that
 a different model or human performed the review.
 
 The Task author explicitly selects `acceptance.required_check_profiles`. An empty list selects
 review-only acceptance ([example Task](config/task-review.example.json)); nonempty entries name
 `profile_id` and `profile_revision` that must be covered by actual completed CheckRuns. The worker
-cannot supply a boolean `passed` in their place. The present product has no CheckRunner producer,
-so checks-required policies cannot pass until that path exists. Missing policy on an older Task
-is not silently treated as an empty policy: revise the Task explicitly before assigning its next
+cannot supply a boolean `passed` in their place. The configured CheckRunner produces these records
+for exact source candidates; native prose is not a substitute for a checked checkout. Missing policy
+on an older Task is not silently treated as empty: revise the Task explicitly before assigning its next
 Attempt. Writing and submission do not require an acceptance policy.
 
 Review-only accepts the retained result and its reviewed requirements. It is **not** a verified
 Git checkout, a machine-verified semantic verdict, publication, or a reason to mark a GitHub Issue
-code-complete. Decisions record `evidence_level=operator_review` and `source_checkout_verified=false`.
-Do not choose review-only when the campaign requires controller-executed build evidence.
+code-complete. Review-only decisions record `evidence_level=operator_review` and
+`source_checkout_verified=false`. Decisions using actual required passes record
+`operator_review_with_checks` and source verification, without claiming semantic correctness beyond
+the reviewed requirements. Do not choose review-only when the campaign requires executed build evidence.
 
 ```powershell
 # Read the exact submission; retain latest_feedback_observation_id.
@@ -182,49 +219,41 @@ is rechecked when a consumer is accepted. No cascade deletes already accepted co
 
 ## API and remaining work
 
-Public methods: `host.status/mode`, `client.register/list`, `task.create/get/list/revise/claim/dispatch/submit/submission/request_changes/accept/acceptance/invalidate_acceptance`, `attempt.get/release/bind_producer`, `agent.open/state/list/family/send/reply/configure/goal/refresh/reconcile/result`, `artifact.get/read/assemble/parts`, `route.list`, `operation.get/list/cancel`, `message.send/read`, `report.delta`. Module methods remain `module.hello/next/outcome/observe/result`. Export is a CLI client operation over get/read, not a remote arbitrary-file-write method.
+Public methods: `source.capture`, `check.run/get/profiles/cancel`, `host.status/mode`, `client.register/list`, `task.create/get/list/revise/claim/dispatch/submit/submission/request_changes/accept/acceptance/invalidate_acceptance`, `attempt.get/release/bind_producer`, `agent.open/state/list/family/send/reply/configure/goal/refresh/reconcile/result`, `artifact.get/read/assemble/parts`, `route.list`, `operation.get/list/cancel`, `message.send/read`, `report.delta`. Module methods remain `module.hello/next/outcome/observe/result`. Export is a CLI client operation over get/read, not a remote arbitrary-file-write method.
 
-Next code slice: C06 CheckRunner, using the existing `check_runs`, Operation, artifact and acceptance contracts (implementation plan §10). Implement actual command execution and Cargo result handling with exact inputs, explicit process/resource disposition and retained output; do not manufacture a passed row or treat a worker result as a verified checkout. Then finish Muse bridge-process recovery and direct OpenCode V2 on the same contract. Do not rebuild the core or reimplement result paging. Preserve the native shared-Codex and subscription targets. [SIWC notes](docs/runtime-notes.md) describe an optional OAuth route, not installed authorization. [OpenCodex Issue #1](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/1) remains after the main controller code.
+Next: finish the remaining check-worker recovery/cancellation and native Muse crash-recovery
+boundaries, then direct OpenCode V2 on the same contract. Exact-source capture, check execution,
+result retention and acceptance are already implemented; do not reimplement them or reopen the
+platform selection. Preserve the native shared-Codex/subscription targets. [SIWC notes](docs/runtime-notes.md)
+describe an optional OAuth route, not installed authorization. [OpenCodex Issue #1](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/1)
+remains after the main controller code.
 
 ## Evidence and development
 
-**Recovery checked 2026-10-01:** the interrupted continuation did not advance `main` beyond
-`fe161da1ce5edd3514520e7ff6d6ff9cd5ea8978`; the latest build remains `01212a4e` below.
-Re-read both successful CI jobs and checked the mounted source/binary archives. No additional
-CheckRunner implementation was found in the current workspace or retained archives. The Linux
-artifact passed SHA-256/ZIP verification again; all 90 source files reconstructed the exact
-`158a147fa968149eb6c12764ed050e0682151e9b` tree. The old acceptance patch predates the already
-published fixes: do not reapply it, roll back, or restart SDK preparation. Resume with CheckRunner
-from the present code. This recovery changes documentation only; it does not rerun compilation,
-model calls or the previous synthetic invocation, and does not claim access to lost ephemeral files.
+**Current code checkpoint: `c56f50a408b622bb6b2b9449af4003c560fcd315`.** C06 code was published in
+`cfa436f8`; a one-line Clippy finding on a byte separator was corrected without warning suppression.
+On **2026-10-01**, [CI run 36828917649](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/36828917649)
+passed formatting, warnings-denied Clippy, Muse syntax/SDK import and release builds on **Windows and Linux**
+for that exact corrected commit. The first failing run is not the validation result. The nine-table
+migration and native modules are unchanged. libc was already locked; it is now also a direct Linux
+dependency for process-group setup. Existing package versions were not updated.
 
-**Current code checkpoint: `01212a4e2a646693a4d8dd44443779e670f6c555`.** The retained
-acceptance implementation was published on the exact `0c34b5e` main base in `bdc4bc17`.
-Two compilation defects in the previously uncompiled patch were corrected: sibling Store access
-to the sealed submission reader, and comparing a check receipt ID with `&str` rather than `&String`.
-On **2026-10-01**, [CI run 36816310704](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/36816310704)
-passed formatting, warnings-denied Clippy, Muse syntax/SDK import and release builds on **Windows
-and Linux** for the exact corrected commit. The initial failing run is not the validation result.
-Migrations, dependency locks and native modules remain unchanged.
+Linux artifact `11146446370` passed ZIP/SHA-256 verification
+(`f43a04eb7709379aa7b5bc44d6ce13c9f965ecd34b0a464158d3d78b599a81e7`); all 101 archived source files
+matched the uploaded tree `334f0f3a2ba12b4f3c7734f5d2c408009297cd33`.
+A bounded invocation of the compiled host/CLI used a self-owned local Git repository and **real configured
+Python commands**, not a mocked CheckRun or a native model. It confirmed exact committed-source capture
+while leaving different dirty checkout bytes untouched; command output retention and request replay;
+nonzero-exit failure; exit-zero source modification producing incomplete; waiting for a live child after
+its parent exited; the same worker surviving host restart; queued cancellation while admission was disabled;
+and acceptance consuming an actual completed check. Owner mailbox delivery and clean host exit succeeded.
+This is a command-executor invocation, not Cargo runtime or Windows Job qualification. The Cargo parser and
+Windows implementation compiled; their full runtime behavior, orphan recovery, cache and load remain pending.
+No native SDK/model, user repository or broad test suite was exercised.
 
-The downloaded Linux artifact `11141153858` passed ZIP and SHA-256 validation
-(`706c046e0c82ad6f8ea8ecf67af4a58311d37932ced7379bed578900fc2efda3`); its archived source
-reconstructed the exact Git tree `158a147fa968149eb6c12764ed050e0682151e9b`.
-A bounded invocation used the real compiled host/CLI and **synthetic authenticated module data**.
-It exercised acceptance/replay without implicit release; rejection of writer self-acceptance;
-one-time revocation feedback and reply; reacceptance of the same bytes with a new decision ID;
-stale revocation preserving that new decision; rejection of absent policy or missing required
-checks; historical dependency resolution followed by explicit revocation; and refusal to accept
-corrupted synthetic backing bytes. The isolated host exited with code 0. No native SDK/model,
-user repository, Windows runtime or broad test suite was exercised. Positive CheckRunner execution
-and native crash recovery remain unqualified, not inferred from these local decision checks.
-
-Previous slices: submission/feedback `8e19f1df` passed
-[CI 36775844956](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/36775844956);
-assembly/export `1953ff5a` passed
-[CI 36771097804](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/36771097804).
-Their earlier synthetic invocations are historical evidence, not substitutes for the current build.
-Resume from the published acceptance code; the former downloadable patch is no longer pending.
+Previous acceptance code `01212a4e` passed [CI 36816310704](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/36816310704).
+That earlier synthetic invocation is historical evidence, not the C06 execution proof. Resume from the
+present CheckRunner code, not the older documentation-only recovery checkpoint or acceptance patch.
 
 The read-only workflow pins Rust 1.98.1/Cargo.lock and runs formatting, warnings-denied Clippy, release builds and Muse syntax/SDK import checks. It does not run `cargo test`, vendor sessions, login or global installation. Artifacts include exact source SHA/source archive. Windows compilation is not qualification on the owner's machine.
 
@@ -237,4 +266,4 @@ The read-only workflow pins Rust 1.98.1/Cargo.lock and runs formatting, warnings
 | [Donors](docs/agent_swarm.donors-20260929.toml) | Source candidates, not installed runtimes |
 | [Lessons](docs/lessons-learned.md) / [runtime notes](docs/runtime-notes.md) / [candidates](docs/candidate-notes.md) | On-demand reference, not extra worker instructions |
 
-This README records current readiness. Work only in main, without worktrees. Code useful paths first, then focused formatting/Clippy; broad tests follow working slices. The nine-table migration and dependency locks are unchanged by this acceptance slice. Foreign/draft/newer databases and missing credentials are not silently replaced. Preserve a cleanly stopped state directory in full, not a live `.db` without WAL. Historical briefs remain in Git history for provenance, not present install defaults.
+This README records current readiness. Work only in main, without worktrees. Code useful paths first, then focused formatting/Clippy; broad tests follow working slices. The nine-table migration is unchanged; the exact dependency lock is committed. Foreign/draft/newer databases and missing credentials are not silently replaced. Preserve a cleanly stopped state directory in full, not a live `.db` without WAL. Historical briefs remain in Git history for provenance, not present install defaults.
