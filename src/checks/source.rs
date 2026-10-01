@@ -238,7 +238,7 @@ pub fn capture(
                 }
                 let mut newline = [0];
                 stdout.read_exact(&mut newline)?;
-                if newline != [b'\n'] {
+                if newline != *b"\n" {
                     return Err(Error::new("GIT_SOURCE_ERROR", "invalid blob separator"));
                 }
                 out.sync_all()?;
