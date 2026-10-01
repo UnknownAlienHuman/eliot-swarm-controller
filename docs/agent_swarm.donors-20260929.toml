@@ -85,15 +85,19 @@ notes = "The crate alone is not the entire CCCC Job/process-tree subsystem; no c
 
 [[donors]]
 id = "atlas-redact"
-selection = "diagnostic_export_candidate"
-module = "artifacts.export"
+selection = "vendored_diagnostic_redaction"
+module = "runtime.opencode_v2.observation"
+source_vendored = true
+local_source = "vendor/atlas/crates/atlas-redact"
+build_wrapper = "modules/atlas-redact/Cargo.toml"
+provenance = "THIRD_PARTY_NOTICES.md"
 repository = "https://github.com/pacifio/atlas"
 revision = "a34a6d44bf37d26d9a6f8f6fe1fab5ce0a92d8d1"
 source_units = ["crates/atlas-redact"]
 manifest_version = "0.1.0"
 license_declaration = "Root Apache-2.0; bundled rule notices must also be retained."
 source_dependencies = ["regex", "serde_json"]
-execution = "Rust library on exported diagnostic copies; not between model and harness."
+execution = "Rust library on bounded persisted native question/diagnostic copies; not between model and harness. This individual snapshot is vendored; other inventory candidates are not thereby installed or qualified."
 retain = ["Complete crate", "Rule files", "Third-party notices", "Upstream fixtures"]
 qualification_points = ["No envelope corruption", "Known secret patterns", "False positives", "Throughput on bounded payloads"]
 do_not_copy = ["Atlas editor", "Atlas task/session store", "Per-tool repository snapshots"]

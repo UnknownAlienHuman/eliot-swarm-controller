@@ -1,0 +1,14 @@
+# Local build wrapper; the complete upstream unit remains unchanged under vendor/.
+[package]
+name = "atlas-redact"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+path = "../../vendor/atlas/crates/atlas-redact/src/lib.rs"
+
+[dependencies]
+regex = "1"
+serde_json = "1"

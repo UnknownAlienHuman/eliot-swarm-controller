@@ -1,0 +1,15 @@
+# Third-party source and runtime notices
+
+## Atlas redaction — complete selected Rust unit
+
+Upstream: `pacifio/atlas`, commit **a34a6d44bf37d26d9a6f8f6fe1fab5ce0a92d8d1**. Selected unit: the complete `crates/atlas-redact` directory, version 0.1.0. Its source, rules, README, tests, fixtures, script and manifest are retained **unchanged** under `vendor/atlas/crates/atlas-redact/`.
+
+Copyright 2026 Adib Mohsin. Atlas is Apache-2.0; the complete [upstream license](vendor/atlas/LICENSE) accompanies this source and binary distribution. Bundled betterleaks rules retain their separate [MIT license and copyright notice](vendor/atlas/crates/atlas-redact/LICENSE-betterleaks). Do not drop either license when redistributing the binary or source.
+
+`vendor/atlas/UPSTREAM_COMMIT` identifies the source snapshot; `vendor/atlas/SHA256SUMS` covers every imported file. `modules/atlas-redact/Cargo.toml` is **ELIOT's separate build wrapper**, not an edited upstream manifest. It resolves upstream `regex` and `serde_json` dependencies through the controller's ordinary Cargo.lock and exposes the original lib.rs without Atlas's unrelated workspace. `src/redaction.rs` is ELIOT-owned integration glue. The donor processes copies of bounded native diagnostic/question payloads, never rewrites prompts or the vendor's inference stream. Detection limits and false positives still require qualification.
+
+## Muse SDK — official external package
+
+The existing Muse module uses the complete `@muse-code/sdk` 1.3.0 package through its module-local lockfile. Canonical donor source is `meta-models/muse-code-sdk@a7c10c5dd3f66be412077d29f9d11111af70317b` (MIT). SDK installation and its package notices stay module-local; the source and binary archives do not bundle node_modules. See [Muse setup](modules/muse/README.md) and [JavaScript provenance](docs/javascript-provenance.md).
+
+Other ordinary Rust dependencies are identified, versioned and checksum-locked in `Cargo.lock`; their package licenses remain with their upstream distributions. No new CCCC, ACP, agent scheduler, UI or model loop was copied in the OpenCode HTTP implementation.

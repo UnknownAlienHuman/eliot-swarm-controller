@@ -2,7 +2,7 @@ name: Rust
 on:
   push:
     branches: [main]
-    paths: ['src/**', 'migrations/**', 'modules/muse/**', 'config/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.github/workflows/rust.yml']
+    paths: ['src/**', 'migrations/**', 'modules/**', 'vendor/**', 'config/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.github/workflows/rust.yml']
   workflow_dispatch:
 permissions:
   contents: read
@@ -21,8 +21,24 @@ jobs:
           rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy --no-self-update
           rustc --version
           cargo --version
-      - name: Formatting
-        run: cargo fmt --all -- --check
+      - name: Formatting (owned crate only; preserve upstream snapshot)
+        run: cargo fmt -p eliot-swarm-controller -- --check
+      - name: Verify Atlas donor snapshot
+        shell: python
+        run: |
+          import hashlib
+          from pathlib import Path
+          root = Path('vendor/atlas')
+          expected = {}
+          for line in (root / 'SHA256SUMS').read_text().splitlines():
+              digest, name = line.split('  ', 1)
+              assert name not in expected, name
+              path = root / name
+              assert not path.is_symlink() and path.is_file(), name
+              assert hashlib.sha256(path.read_bytes()).hexdigest() == digest, name
+              expected[name] = digest
+          actual = {p.relative_to(root).as_posix() for p in root.rglob('*') if p.is_file()}
+          assert actual == set(expected) | {'SHA256SUMS'}, 'donor file set changed'
       - name: Clippy
         run: cargo clippy --locked --lib --bins --no-deps -- -D warnings
       - name: Muse bridge syntax and pinned SDK import
@@ -41,6 +57,7 @@ jobs:
         run: |
           mkdir -p build-info
           printf '%s\n' "$GITHUB_SHA" > build-info/source-commit.txt
+          git rev-parse HEAD^{tree} > build-info/source-tree.txt
           rustc --version > build-info/rustc.txt
           cargo --version > build-info/cargo.txt
           node --version > build-info/node.txt
@@ -56,9 +73,12 @@ jobs:
             Cargo.lock
             config/
             README.md
+            THIRD_PARTY_NOTICES.md
             modules/muse/*.mjs
             modules/muse/*.json
             modules/muse/README.md
+            modules/opencode/README.md
+            vendor/atlas/
             build-info/
             target/release/swarm
             target/release/swarm.exe

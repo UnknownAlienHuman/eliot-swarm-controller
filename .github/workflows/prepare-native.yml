@@ -1,8 +1,5 @@
 name: Prepare native integration inputs
 on:
-  push:
-    branches: [main]
-    paths: ['.github/workflows/prepare-native.yml']
   workflow_dispatch:
 permissions:
   contents: read
@@ -11,32 +8,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-      - name: Collect pinned source, toolchain and dependency inputs
+      - name: Collect exact source, toolchain and locked dependencies
         shell: bash
         run: |
           set -euo pipefail
           rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy --no-self-update
-          mkdir -p .local/inputs/dependency-inputs .local/atlas .local/inputs/donors/atlas
+          mkdir -p .local/inputs/dependency-inputs
           git archive --format=tar HEAD > .local/inputs/source.tar
           printf '%s\n' "$GITHUB_SHA" > .local/inputs/source-commit.txt
           TOOLCHAIN="$(dirname "$(dirname "$(rustup which rustc)")")"
           tar -C "$TOOLCHAIN" -czf .local/inputs/toolchain.tar.gz bin lib
-          # Resolve next adapter inputs in the disposable checkout, not on main.
-          cargo add 'reqwest@=0.13.5' --no-default-features --features json,stream
-          cargo add 'eventsource-stream@=0.2.3' 'regex@1'
           cp Cargo.toml Cargo.lock .local/inputs/dependency-inputs/
           cargo vendor --locked --versioned-dirs .local/vendor > .local/inputs/dependency-inputs/vendor-config.toml
           tar -C .local -czf .local/inputs/vendor.tar.gz vendor
-          # Whole selected donor unit from the canonical inventory, never a moving branch.
-          ATLAS=a34a6d44bf37d26d9a6f8f6fe1fab5ce0a92d8d1
-          curl --fail --silent --show-error --location "https://codeload.github.com/pacifio/atlas/tar.gz/$ATLAS" -o .local/inputs/atlas-source.tar.gz
-          tar -xzf .local/inputs/atlas-source.tar.gz -C .local/atlas --strip-components=1
-          mkdir -p .local/inputs/donors/atlas/crates
-          cp -a .local/atlas/crates/atlas-redact .local/inputs/donors/atlas/crates/
-          find .local/atlas -maxdepth 1 -type f \( -iname '*license*' -o -iname '*notice*' \) -exec cp '{}' .local/inputs/donors/atlas/ \;
-          printf '%s\n' "$ATLAS" > .local/inputs/donors/atlas/UPSTREAM_COMMIT
-          curl --fail --silent --show-error --location https://opencode.ai/v2/openapi.json -o .local/inputs/opencode-v2.openapi.json
-          (cd .local/inputs && sha256sum source.tar toolchain.tar.gz vendor.tar.gz atlas-source.tar.gz opencode-v2.openapi.json dependency-inputs/Cargo.toml dependency-inputs/Cargo.lock > SHA256SUMS)
+          (cd .local/inputs && sha256sum source.tar toolchain.tar.gz vendor.tar.gz dependency-inputs/Cargo.toml dependency-inputs/Cargo.lock > SHA256SUMS)
+          git diff --exit-code
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: native-development-inputs

@@ -127,6 +127,43 @@ impl Config {
                 ));
             }
         }
+        let mut services = std::collections::BTreeMap::new();
+        let mut records = std::collections::BTreeMap::new();
+        for route in cfg
+            .routes
+            .iter()
+            .filter(|r| r.enabled && r.runtime == crate::runtime::opencode_v2::RUNTIME)
+        {
+            if route.module_artifact_id != crate::runtime::opencode_v2::ARTIFACT_ID {
+                return Err(Error::new(
+                    "CONFIG_ERROR",
+                    "unsupported builtin OpenCode module artifact",
+                ));
+            }
+            let options = crate::runtime::opencode_v2::Options::parse(&route.native_options)?;
+            if records
+                .insert(options.connection_file.clone(), options.service_id.clone())
+                .is_some_and(|old| old != options.service_id)
+            {
+                return Err(Error::new(
+                    "CONFIG_ERROR",
+                    "one connection record must have one service namespace",
+                ));
+            }
+            let key = (
+                options.connection_file.clone(),
+                options.expected_version.clone(),
+            );
+            if services
+                .insert(options.service_id, key.clone())
+                .is_some_and(|old| old != key)
+            {
+                return Err(Error::new(
+                    "CONFIG_ERROR",
+                    "one OpenCode service ID must use one connection record and version",
+                ));
+            }
+        }
         cfg.checks.validate()?;
         Ok(cfg)
     }

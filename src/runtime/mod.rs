@@ -1,9 +1,10 @@
 //! External modules share this command boundary, not vendor request schemas.
+pub mod opencode_v2;
 pub mod owner;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeCommand {
     pub operation_id: String,
     pub method: String,
@@ -36,5 +37,8 @@ pub struct RuntimeOutcome {
     pub native_root_id: Option<String>,
     #[serde(default)]
     pub turn_id: Option<String>,
+    /// Durable native input admission is not a native turn or its completion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_input_id: Option<String>,
     pub details: Value,
 }

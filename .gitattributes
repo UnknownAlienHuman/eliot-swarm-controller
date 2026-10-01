@@ -9,3 +9,6 @@
 *.sh text eol=lf
 *.cmd text eol=crlf
 *.zip binary
+
+# Preserve the audited upstream snapshot byte-for-byte on every platform.
+vendor/atlas/** -text

@@ -9,6 +9,7 @@ pub mod host;
 pub mod ipc;
 pub mod model;
 pub mod platform;
+mod redaction;
 pub mod runtime;
 pub mod store;
 pub mod submission;

@@ -10,7 +10,7 @@ The Muse SDK bridge opens an explicitly selected native executable, delivers Tas
 
 **CheckRunner executes configured commands on captured Git sources. Active cancellation and recovery of a recorded departed check worker are now implemented.** Cancellation does not stop the host or native agents. Recovery uses the worker lock and OS group identity; it does not infer success or replay a command.
 
-**Still pending:** live Muse resume qualification, missing-identity/native-outcome recovery gaps, complete native family reconstruction, automatic handoff, unresolved pre-identity check launches, reverse-dependency scope/cache reuse, direct OpenCode V2 and other native adapters, MCP and automatic module/service installation. Live Muse/Max inference and Windows native launch remain unqualified. Do not mark all C01–C03 complete.
+**Still pending:** live Muse resume qualification, missing-identity/native-outcome recovery gaps, complete native family reconstruction, automatic handoff, unresolved pre-identity check launches, reverse-dependency scope/cache reuse, OpenCode exact input/run completion and result export, other native adapters, MCP and automatic module/service installation. Live Muse/Max inference and Windows native launch remain unqualified. Do not mark all C01–C03 complete.
 
 ## Build and run
 
@@ -36,6 +36,16 @@ $swarm = '.\target\release\swarm.exe'
 After a lost reply, repeat the identical method/payload and request ID. Different content under that ID is rejected. New IDs do not bypass origin/ownership/initial-start uniqueness. Request IDs go to stderr, JSON results to stdout. Keep secrets out of persisted task text and mailbox messages.
 
 `swarm call METHOD --file params.json` invokes the implemented API. `--config config/controller.example.toml` uses the implementation configuration, not the broader target examples under docs/. Commands below also require the appropriate data-dir/config/credential options.
+
+## Direct OpenCode V2 in Rust
+
+The built-in `eliot-opencode-v2.http.1` adapter attaches to an explicitly configured **existing** local HTTP service. It creates scoped sessions, delivers frozen Tasks/next-turn inputs, reads paginated family and pending requests, sends addressed answers and reconciles lost create/prompt responses by GET only. One service namespace has one pooled client and volatile SSE reader. No OpenCode CLI, process restart, model substitution or duplicate POST is used.
+
+**Inbox admission is not native turn completion.** Input producers remain unresolved until genuine run disposition is available; exact terminal correlation, result export, configure/goal controls and live OpenCode qualification remain pending. Unknown children/stream gaps never become an idle family or a passed Task. Follow [the module guide](modules/opencode/README.md) and the disabled route in [configuration](config/controller.example.toml).
+
+The complete pinned `atlas-redact` donor is now used to scrub retained native question/diagnostic copies. Its upstream files remain unchanged behind a separate Cargo wrapper; licenses, rule notices and snapshot hashes are retained in [third-party notices](THIRD_PARTY_NOTICES.md). This is actual library reuse, not a claim that all listed donors were installed.
+
+**Why JavaScript exists:** only the Muse adapter needs the official Node SDK. Its first runnable bridge is commit `b2bd0211` (2026-09-30); controller authority and the new OpenCode adapter are Rust. See [the exact provenance](docs/javascript-provenance.md). No Muse files were deleted or language statistics hidden.
 
 ## Native Muse, clients and task-specific children
 
@@ -178,11 +188,14 @@ Dependency lookup uses valid historical acceptance decisions. A newer producer r
 
 Public methods: `source.capture`, `check.run/get/profiles/cancel`, `host.status/mode`, `client.register/list`, `task.create/get/list/revise/claim/dispatch/submit/submission/request_changes/accept/acceptance/invalidate_acceptance`, `attempt.get/release/bind_producer`, `agent.open/state/list/family/send/reply/configure/goal/refresh/reconcile/recover/result`, `artifact.get/read/assemble/parts`, `route.list`, `operation.get/list/cancel`, `message.send/read`, `report.delta`. Module methods: `module.hello/next/outcome/observe/result`. Export is a client operation, not a remote arbitrary-file-write method.
 
-**Next: direct OpenCode V2 on the same host contract.** Recorded-session Muse recovery and recorded check-worker recovery are implemented; missing identity, unresolved native outcomes and actual vendor/Windows runtime qualification remain explicit. Do not repeat the recorded-recovery implementation solely because an older checkpoint called it pending. Do not reimplement source capture, results, submission, acceptance or CheckRunner. Preserve the native shared-Codex/subscription targets. [SIWC notes](docs/runtime-notes.md) describe an optional OAuth route, not installed auth. [OpenCodex Issue #1](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/1) remains after the main code.
+**Next: exact OpenCode input-to-run/terminal correlation and result export on the implemented HTTP path.** Do not repeat session/inbox/readback/SSE implementation solely because an older checkpoint called all of C04 pending. Recorded-session Muse recovery and recorded check-worker recovery are implemented; missing identity, unresolved native outcomes and actual vendor/Windows runtime qualification remain explicit. Do not repeat the recorded-recovery implementation solely because an older checkpoint called it pending. Do not reimplement source capture, results, submission, acceptance or CheckRunner. Preserve the native shared-Codex/subscription targets. [SIWC notes](docs/runtime-notes.md) describe an optional OAuth route, not installed auth. [OpenCodex Issue #1](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/1) remains after the main code.
 
 ## Evidence and development
 
-**Current code: `d385498b00fe1a049c357613a7777cc4a1c83f72`.** The interrupted continuation saved the module owner, checkpoint and controlled session-recovery implementation through `8a84e6be`; it was not lost. Recovery reconstructed its exact 104-file source tree from the CI artifact. A bounded invocation then found an actual runtime defect: changed-boot admission used nonexistent `operations.generation` instead of `binding_generation`. The single-query correction is in `d385498b`; schema, dependencies and native-module source are unchanged by that correction.
+**OpenCode HTTP slice, 2026-10-01:** 16 focused local Rust fixtures passed, including two bindings sharing an SSE reader, a real Store restart, lost creation/delivery readback with no duplicate POST, disabled new-work admission, unresolved-producer release protection, foreign-family rejection and actual Atlas redaction. Rust 1.98.1 compilation, package formatting and all-target warnings-denied Clippy passed. The fixture HTTP server is not the installed vendor; no model, billing, native Windows service or subscription qualification is claimed. CI repeats these focused tests on Windows/Linux; exact run status is separate evidence.
+
+
+**Previous Muse recovery baseline: `d385498b00fe1a049c357613a7777cc4a1c83f72`.** The interrupted continuation saved the module owner, checkpoint and controlled session-recovery implementation through `8a84e6be`; it was not lost. Recovery reconstructed its exact 104-file source tree from the CI artifact. A bounded invocation then found an actual runtime defect: changed-boot admission used nonexistent `operations.generation` instead of `binding_generation`. The single-query correction is in `d385498b`; schema, dependencies and native-module source are unchanged by that correction.
 
 On **2026-10-01**, exact [CI run 36872022736](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/36872022736) passed formatting, warnings-denied Clippy, Muse syntax/SDK import and release builds on **Windows and Linux**. Earlier green compilation alone did not catch the SQL execution error.
 
@@ -194,7 +207,7 @@ The exact corrected Linux binary passed 13 directed assertions through the real 
 
 Historical baselines: C06 `c56f50a4` passed [CI 36828917649](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/36828917649) and a real-command invocation of capture, output, failure/source-change rejection, host restart and checked acceptance. Acceptance `01212a4e` passed [CI 36816310704](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/36816310704). Those are earlier evidence, not substitutes for this cancellation/recovery run.
 
-The read-only workflow pins Rust 1.98.1/Cargo.lock and checks formatting, Clippy, release builds and Muse syntax/import. It does not run cargo test, vendor sessions, login or global installation. Artifacts include exact source SHA and a source archive.
+The read-only workflow pins Rust 1.98.1/Cargo.lock and checks formatting, Clippy, release builds and Muse syntax/import. It runs only the focused `cargo test --locked --lib opencode` fixtures, not a broad qualification suite, vendor sessions, login or global installation. Artifacts include exact source SHA and a source archive.
 
 | Document | Purpose |
 | --- | --- |
@@ -203,7 +216,7 @@ The read-only workflow pins Rust 1.98.1/Cargo.lock and checks formatting, Clippy
 | [Module contract](docs/agent_swarm.module-contract-v2.md) | Capabilities, delivery and lifecycle |
 | [CheckRunner](docs/check-runner.md) | Implemented execution/cancellation/recovery details |
 | [Reference specification](docs/agent_swarm.spec-v18/README.md) | Design examples, not implementation evidence |
-| [Donors](docs/agent_swarm.donors-20260929.toml) | Source candidates, not installed runtimes |
+| [Donors](docs/agent_swarm.donors-20260929.toml) | Inventory; selected Atlas snapshot is tracked separately, not all installed runtimes |
 | [Lessons](docs/lessons-learned.md) / [runtime notes](docs/runtime-notes.md) / [candidates](docs/candidate-notes.md) | On-demand evidence, not extra worker instructions |
 
 This README records current readiness. Work only in main, without worktrees. Code useful paths first, then focused formatting/Clippy; broad tests follow working slices. The nine-table migration is unchanged. Foreign/draft/newer databases and missing credentials are not silently replaced. Preserve a cleanly stopped state directory in full, not only a live DB without WAL. Historical briefs remain in Git history for provenance, not present install defaults.

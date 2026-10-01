@@ -28,6 +28,12 @@ pub(super) fn scope(
     if !b["released_at_ms"].is_null() {
         return Err(Error::new("BINDING_CLOSED", "module binding is released"));
     }
+    if b["observation"]["module_client_id"] != p.client_id {
+        return Err(Error::new(
+            "MODULE_OWNER_MISMATCH",
+            "credential does not own this module binding",
+        ));
+    }
     if check_link && b["observation"]["module_link_id"] != p.link_id {
         return Err(Error::new(
             "STALE_LINK",
@@ -182,7 +188,9 @@ pub(super) fn next(db: &mut Connection, p: &Principal) -> Result<Value> {
         if caller["disabled"] == true {
             return Err(Error::new("UNAUTHORIZED", "original caller disabled"));
         }
-        let reconcile_starts_work = if method == "agent.reconcile" {
+        let reconcile_starts_work = if method == "agent.reconcile"
+            && b["route"]["runtime"] != crate::runtime::opencode_v2::RUNTIME
+        {
             let target = operations::get_operation(&tx, model::text(&input, "operation_id")?)?;
             matches!(
                 target["method"].as_str(),
@@ -382,13 +390,25 @@ pub(super) fn outcome(db: &mut Connection, p: &Principal, v: &Value) -> Result<V
             }
             tx.execute("UPDATE bindings SET native_root_id=?3,native_scope_key=?4,state=CASE WHEN json_extract(state_json,'$.recovery_required')=1 THEN 'reconciling' ELSE 'ready' END,state_json=json_set(state_json,'$.waiting_for',NULL,'$.opening_evidence',json(?5)) WHERE binding_id=?1 AND generation=?2",params![id,generation,native,namespace,model::canonical(&r.details)?])?;
         } else if o["method"] == "task.dispatch" {
-            let turn = r
-                .turn_id
-                .as_deref()
-                .filter(|x| !x.is_empty())
-                .ok_or_else(|| Error::invalid("dispatch admission needs the native turn ID"))?;
             let attempt = model::text(&o, "attempt_id")?;
-            let mut producer = json!({"assignment_id":r.operation_id,"native_session_id":b["native_root_id"],"native_run_id":turn,"disposition":"admitted"});
+            let mut producer = json!({"assignment_id":r.operation_id,"native_session_id":b["native_root_id"],"disposition":"admitted"});
+            match (r.turn_id.as_deref(), r.native_input_id.as_deref()) {
+                (Some(turn), None) if !turn.is_empty() => producer["native_run_id"] = json!(turn),
+                (None, Some(input))
+                    if !input.is_empty()
+                        && r.details["completion_condition"] == "native_input_admitted" =>
+                {
+                    // A durable inbox ID is not a turn ID. Keep this producer
+                    // unresolved until actual execution/disposition is evidenced.
+                    producer["native_input_id"] = json!(input);
+                    producer["admission_kind"] = json!("native_inbox");
+                }
+                _ => {
+                    return Err(Error::invalid(
+                        "dispatch admission needs an exact native turn or explicit inbox receipt",
+                    ));
+                }
+            }
             // A short turn can finish before its admission response arrives.
             // Reuse already-recorded exact-run evidence instead of waiting for
             // another notification which may never be emitted.
@@ -416,7 +436,7 @@ pub(super) fn outcome(db: &mut Connection, p: &Principal, v: &Value) -> Result<V
             tx.execute("UPDATE bindings SET state='ready',state_json=json_set(state_json,'$.recovery_required',json('false'),'$.last_recovery',json(?3)) WHERE binding_id=?1 AND generation=?2",params![id,generation,encoded])?;
         }
     }
-    tx.execute("UPDATE operations SET state=?2,result_json=?3,native_refs_json=?4,settled_at_ms=?5,updated_at_ms=?6 WHERE operation_id=?1",params![r.operation_id,state,encoded,model::canonical(&json!({"session_id":r.native_root_id,"turn_id":r.turn_id}))?,if matches!(state,"outcome_unknown"|"native_accepted"){None}else{Some(now)},now])?;
+    tx.execute("UPDATE operations SET state=?2,result_json=?3,native_refs_json=?4,settled_at_ms=?5,updated_at_ms=?6 WHERE operation_id=?1",params![r.operation_id,state,encoded,model::canonical(&json!({"session_id":r.native_root_id,"turn_id":r.turn_id,"input_id":r.native_input_id}))?,if matches!(state,"outcome_unknown"|"native_accepted"){None}else{Some(now)},now])?;
     tx.execute("INSERT INTO observations(source_stream_id,source_event_key,binding_id,binding_generation,operation_id,kind,payload_json,recorded_at_ms) VALUES(?1,?2,?3,?4,?5,'runtime.outcome',?6,?7)",params![format!("module:{}",p.client_id),key,id,generation,r.operation_id,encoded,now])?;
     tx.commit()?;
     Ok(json!({"recorded":true}))

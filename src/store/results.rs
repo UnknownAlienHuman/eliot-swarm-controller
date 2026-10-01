@@ -90,6 +90,7 @@ pub(super) fn record(
         artifact.metadata["offset_bytes"].as_u64().and_then(|n| n.checked_add(artifact.byte_length))
     }});
     let outcome = RuntimeOutcome {
+        native_input_id: None,
         operation_id: operation_id.to_string(),
         outcome: EffectOutcome::Applied,
         native_root_id: context["native_root_id"].as_str().map(str::to_owned),
