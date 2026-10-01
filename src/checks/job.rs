@@ -18,11 +18,11 @@ mod os {
         System::{
             JobObjects::{
                 AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob,
-                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_QUERY,
-                JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_BASIC_PROCESS_ID_LIST,
-                JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAccountingInformation,
-                JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation, OpenJobObjectW,
-                QueryInformationJobObject, SetInformationJobObject,
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+                JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+                JobObjectBasicAccountingInformation, JobObjectBasicProcessIdList,
+                JobObjectExtendedLimitInformation, OpenJobObjectW, QueryInformationJobObject,
+                SetInformationJobObject,
             },
             Threading::{
                 GetCurrentProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -30,6 +30,9 @@ mod os {
             },
         },
     };
+    // Win32 documented job-specific access mask (not exposed by the enabled bindings).
+    // https://learn.microsoft.com/windows/win32/procthread/job-object-security-and-access-rights
+    const JOB_QUERY_ACCESS: u32 = 0x0004;
     pub struct Group {
         job: HANDLE,
         pub identity: Value,
@@ -283,7 +286,7 @@ mod os {
                 }
             }
             let name: Vec<u16> = expected.encode_utf16().chain(Some(0)).collect();
-            let job = OpenJobObjectW(JOB_OBJECT_QUERY, 0, name.as_ptr());
+            let job = OpenJobObjectW(JOB_QUERY_ACCESS, 0, name.as_ptr());
             if job.is_null() {
                 let error = std::io::Error::last_os_error();
                 return if error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) {
