@@ -134,7 +134,7 @@ pub(super) fn hello(
     }
     if recovered && needs_recovery {
         tx.execute("UPDATE bindings SET state='reconciling',state_json=json_set(state_json,'$.recovery_required',json('true'),'$.previous_bridge_boot_id',?3) WHERE binding_id=?1 AND generation=?2", params![id,generation,old_boot])?;
-        tx.execute("UPDATE operations SET state='outcome_unknown',updated_at_ms=?3 WHERE binding_id=?1 AND binding_generation=?2 AND state IN ('sending','native_accepted')",params![id,generation,model::now_ms()?])?;
+        tx.execute("UPDATE operations SET state='outcome_unknown',updated_at_ms=?3 WHERE binding_id=?1 AND generation=?2 AND state IN ('sending','native_accepted')",params![id,generation,model::now_ms()?])?;
     }
     if let Some(owner) = v.get("managed_owner") {
         tx.execute("UPDATE bindings SET state_json=json_set(state_json,'$.managed_owner',json(?3)) WHERE binding_id=?1 AND generation=?2",params![id,generation,model::canonical(owner)?])?;
@@ -206,16 +206,15 @@ pub(super) fn next(db: &mut Connection, p: &Principal) -> Result<Value> {
                 "new work disabled before dispatch",
             ));
         }
-        if method == "agent.recover" {
-            if caller["role"] != "operator"
+        if method == "agent.recover"
+            && (caller["role"] != "operator"
                 || input["expected_boot_id"] != b["observation"]["bridge_boot_id"]
-                || b["observation"]["recovery_required"] != true
-            {
-                return Err(Error::new(
-                    "STALE_RECOVERY",
-                    "recovery must target this unresolved bridge boot",
-                ));
-            }
+                || b["observation"]["recovery_required"] != true)
+        {
+            return Err(Error::new(
+                "STALE_RECOVERY",
+                "recovery must target this unresolved bridge boot",
+            ));
         }
         if method == "agent.open" {
             if b["state"] != "opening" || !b["native_root_id"].is_null() {
@@ -342,17 +341,17 @@ pub(super) fn outcome(db: &mut Connection, p: &Principal, v: &Value) -> Result<V
             "cannot replace a known native result or execute an unadmitted operation",
         ));
     }
+    let now = model::now_ms()?;
     let key = format!(
         "outcome:{}:{}",
         r.operation_id,
         model::digest(encoded.as_bytes())
     );
     if superseded {
-        tx.execute("INSERT INTO observations(source_stream_id,source_event_key,binding_id,binding_generation,operation_id,kind,payload_json,recorded_at_ms) VALUES(?1,?2,?3,?4,?5,'runtime.outcome',?6,?7)",params![stream,key,id,generation,r.operation_id,encoded,model::now_ms()?])?;
+        tx.execute("INSERT INTO observations(source_stream_id,source_event_key,binding_id,binding_generation,operation_id,kind,payload_json,recorded_at_ms) VALUES(?1,?2,?3,?4,?5,'runtime.outcome',?6,?7)",params![stream,key,id,generation,r.operation_id,encoded,now])?;
         tx.commit()?;
         return Ok(json!({"recorded":true,"superseded":true,"state":o["state"]}));
     }
-    let now = model::now_ms()?;
     let state = match r.outcome {
         EffectOutcome::Accepted => "native_accepted",
         EffectOutcome::Applied => "settled",
@@ -381,7 +380,7 @@ pub(super) fn outcome(db: &mut Connection, p: &Principal, v: &Value) -> Result<V
             {
                 return Err(Error::conflict("native identity changed"));
             }
-            tx.execute("UPDATE bindings SET native_root_id=?3,native_scope_key=?4,state='ready',state_json=json_set(state_json,'$.waiting_for',NULL,'$.opening_evidence',json(?5)) WHERE binding_id=?1 AND generation=?2",params![id,generation,native,namespace,model::canonical(&r.details)?])?;
+            tx.execute("UPDATE bindings SET native_root_id=?3,native_scope_key=?4,state=CASE WHEN json_extract(state_json,'$.recovery_required')=1 THEN 'reconciling' ELSE 'ready' END,state_json=json_set(state_json,'$.waiting_for',NULL,'$.opening_evidence',json(?5)) WHERE binding_id=?1 AND generation=?2",params![id,generation,native,namespace,model::canonical(&r.details)?])?;
         } else if o["method"] == "task.dispatch" {
             let turn = r
                 .turn_id
