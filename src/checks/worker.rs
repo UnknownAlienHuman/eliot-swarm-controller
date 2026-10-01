@@ -1,7 +1,7 @@
 //! One short-lived worker per check. It owns no DB or model session and executes
 //! at most one configured command, after the host durably acknowledges its identity.
 use super::{
-    job::Group,
+    job::{Group, departed_empty},
     model::{CheckProfile, Parser},
     source,
 };
@@ -32,7 +32,18 @@ pub struct Work {
     pub profile: CheckProfile,
     #[serde(default)]
     pub preflight_error: Option<Value>,
+    #[serde(default)]
+    pub cancel_request: Option<CancelRequest>,
+    #[serde(default)]
+    pub expected_worker: Option<Value>,
 }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CancelRequest {
+    pub operation_id: String,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Completion {
@@ -45,6 +56,8 @@ pub struct Completion {
     pub coverage: Value,
     pub result: ArtifactRecord,
     pub outputs: Vec<ArtifactRecord>,
+    #[serde(default)]
+    pub cancellation: Option<Value>,
 }
 pub fn directory(root: &Path, id: &str) -> Result<PathBuf> {
     if uuid::Uuid::parse_str(id).is_err() {
@@ -176,12 +189,79 @@ pub fn allow(work: &Work) -> Result<()> {
         &json!({"token":work.token}),
     )
 }
+/// Delivery is idempotent and never creates another worker or a missing job directory.
+pub fn deliver_cancel(work: &Work) -> Result<()> {
+    let Some(request) = &work.cancel_request else {
+        return Ok(());
+    };
+    let dir = directory(&work.data_dir, &work.check_id)?;
+    let identity = dir.join("worker.json");
+    if !identity.try_exists()? {
+        return Ok(());
+    }
+    let v = read_value(&identity)?;
+    if v["token"] != work.token {
+        return Err(Error::conflict("cancellation worker token mismatch"));
+    }
+    if v["control_version"] != 2 {
+        return Err(Error::new(
+            "CHECK_CANCEL_UNSUPPORTED",
+            "this already running worker predates active cancellation",
+        ));
+    }
+    write_once(
+        &dir.join("cancel.json"),
+        &json!({"check_id":work.check_id,"token":work.token,"request":request}),
+    )
+}
+#[derive(Default)]
+struct Cancellation {
+    request: Option<CancelRequest>,
+    signals_sent: u64,
+    termination_attempted: bool,
+    skipped_start: bool,
+    last_error: Option<Error>,
+}
+impl Cancellation {
+    fn read(&mut self, work: &Work, dir: &Path) -> Result<bool> {
+        if self.request.is_none() && dir.join("cancel.json").try_exists()? {
+            let v = read_value(&dir.join("cancel.json"))?;
+            if v["token"] != work.token || v["check_id"] != work.check_id {
+                return Err(Error::conflict("cancellation targets another worker"));
+            }
+            self.request = Some(serde_json::from_value(v["request"].clone())?);
+        }
+        Ok(self.request.is_some())
+    }
+    fn interrupt(&mut self, group: &Group) {
+        if self.request.is_none() {
+            return;
+        }
+        self.termination_attempted = true;
+        match group.cancel_children() {
+            Ok(sent) => self.signals_sent = self.signals_sent.saturating_add(sent),
+            Err(e) => self.last_error = Some(e),
+        }
+    }
+    fn applied(&self) -> bool {
+        self.skipped_start || self.termination_attempted
+    }
+    fn evidence(&self) -> Option<Value> {
+        self.request.as_ref().map(|r| json!({"operation_id":r.operation_id,"reason":r.reason,
+            "disposition":if self.skipped_start {"cancelled_before_command"} else if self.termination_attempted {"cancel_attempted_group_empty"} else {"completed_before_termination"},
+            "termination_requests":self.signals_sent,"last_error":self.last_error}))
+    }
+}
+
 pub fn completion(work: &Work, files: &ArtifactFiles) -> Result<Option<Completion>> {
     let p = directory(&work.data_dir, &work.check_id)?.join("completion.json");
     if !p.try_exists()? {
         return Ok(None);
     }
     let c: Completion = serde_json::from_value(read_value(&p)?)?;
+    validate_completion(work, files, c).map(Some)
+}
+fn validate_completion(work: &Work, files: &ArtifactFiles, c: Completion) -> Result<Completion> {
     if c.token != work.token
         || c.operation_id != work.operation_id
         || c.check_id != work.check_id
@@ -208,6 +288,7 @@ pub fn completion(work: &Work, files: &ArtifactFiles) -> Result<Option<Completio
         || report["exit_code"] != json!(c.exit_code)
         || report["profile"] != json!(work.profile)
         || report["resource_released"] != true
+        || report["cancellation"] != json!(c.cancellation)
     {
         return Err(Error::conflict(
             "check receipt differs from its published report",
@@ -222,7 +303,7 @@ pub fn completion(work: &Work, files: &ArtifactFiles) -> Result<Option<Completio
             "incomplete execution cannot be a passed CheckRun",
         ));
     }
-    Ok(Some(c))
+    Ok(c)
 }
 pub fn failure(work: &Work, files: &ArtifactFiles, error: Value) -> Result<Completion> {
     let state = if error["code"] == "CHECK_CANCELLED" {
@@ -250,12 +331,102 @@ pub fn failure(work: &Work, files: &ArtifactFiles, error: Value) -> Result<Compl
         coverage,
         result: record,
         outputs: Vec::new(),
+        cancellation: None,
     };
     let dir = directory(&work.data_dir, &work.check_id)?;
     std::fs::create_dir_all(&dir)?;
     write_once(&dir.join("completion.json"), &json!(c))?;
     Ok(c)
 }
+/// Read-only recovery after the worker lock is released. Never replays the command
+/// or signals a numeric PID from an old snapshot. Unknown/live groups retain ownership.
+pub fn recover(work: &Work, files: &ArtifactFiles) -> Result<Option<Completion>> {
+    let dir = directory(&work.data_dir, &work.check_id)?;
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(dir.join("worker.lock"))?;
+    match lock.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+        Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+    }
+    if let Some(c) = completion(work, files)? {
+        return Ok(Some(c));
+    }
+    let identity = read_value(&dir.join("worker.json"))?;
+    if identity["token"] != work.token
+        || work
+            .expected_worker
+            .as_ref()
+            .is_some_and(|v| v != &identity)
+    {
+        return Err(Error::conflict(
+            "lost worker identity differs from the admitted worker",
+        ));
+    }
+    if !departed_empty(&identity["process"], &work.token)? {
+        return Err(Error::new(
+            "CHECK_ORPHAN_ACTIVE",
+            "worker or descendants may still write; resource remains held",
+        ));
+    }
+    // New workers prepare this exact receipt before final publication. A crash in
+    // between need not discard an already verified result or invent another process.
+    if dir.join("terminal.json").try_exists()? {
+        let c = validate_completion(
+            work,
+            files,
+            serde_json::from_value(read_value(&dir.join("terminal.json"))?)?,
+        )?;
+        write_once(&dir.join("completion.json"), &json!(c))?;
+        return Ok(Some(c));
+    }
+    let mut outputs = Vec::new();
+    for stream in ["stdout", "stderr"] {
+        let path = dir.join(stream);
+        if path.try_exists()? {
+            outputs.push(files.seal_file(
+                &format!("{}:{stream}", work.operation_id),
+                &path,
+                json!({"check_id":work.check_id,"stream":stream}),
+            )?);
+        }
+    }
+    let coverage = json!({"requested":work.profile.expected_targets,"checked":[],"gaps":["worker_lost_without_terminal_receipt"]});
+    // An absent worker and empty group do not prove success, exit code or coverage.
+    let report = json!({"version":1,"check_id":work.check_id,"operation_id":work.operation_id,
+        "candidate_ref":work.candidate.artifact_id,"profile":work.profile,"state":"incomplete",
+        "exit_code":null,"resource_released":true,"source_checkout_verified":false,"coverage":coverage,
+        "process":identity["process"],"recovery":{"disposition":"departed_group_observed_empty","command_replayed":false},
+        "outputs":outputs.iter().map(|r|json!({"artifact_ref":r.artifact_id,"stream":r.metadata["stream"],"sha256":r.content_digest,"length":r.byte_length})).collect::<Vec<_>>()});
+    let id = format!(
+        "check-{}",
+        model::digest(format!("recovered:{}", work.operation_id).as_bytes())
+    );
+    let (record, bytes) = ArtifactFiles::document(
+        "check_result",
+        &id,
+        &report,
+        json!({"check_id":work.check_id,"candidate_ref":work.candidate.artifact_id,"state":"incomplete"}),
+    )?;
+    files.publish(&record, &bytes)?;
+    let c = Completion {
+        check_id: work.check_id.clone(),
+        operation_id: work.operation_id.clone(),
+        token: work.token.clone(),
+        state: "incomplete".into(),
+        exit_code: None,
+        resource_released: true,
+        coverage,
+        result: record,
+        outputs,
+        cancellation: None,
+    };
+    write_once(&dir.join("completion.json"), &json!(c))?;
+    Ok(Some(c))
+}
+
 fn environment(profile: &CheckProfile) -> BTreeMap<String, String> {
     let mut values = BTreeMap::new();
     for name in [
@@ -454,7 +625,7 @@ pub fn run(file: &Path) -> Result<()> {
             "a previous worker started; command will not be repeated",
         ));
     }
-    let group = match Group::enter() {
+    let group = match Group::enter(&work.token) {
         Ok(g) => g,
         Err(e) => {
             failure(&work, &ArtifactFiles::new(&work.data_dir)?, json!(e))?;
@@ -465,7 +636,12 @@ pub fn run(file: &Path) -> Result<()> {
         &dir.join("worker.json"),
         &super::job::waiting_identity(&group, &work.token),
     )?;
+    let mut cancellation = Cancellation::default();
     loop {
+        if cancellation.read(&work, &dir)? {
+            cancellation.skipped_start = true;
+            break;
+        }
         let go = dir.join("go.json");
         if go.try_exists()? {
             if read_value(&go)?["token"] != work.token {
@@ -481,6 +657,12 @@ pub fn run(file: &Path) -> Result<()> {
     let started = model::now_ms()?;
     let mut source_verified = false;
     let outcome = (|| -> Result<Value> {
+        if cancellation.skipped_start {
+            return Err(Error::new(
+                "CHECK_CANCELLED",
+                "cancelled before command execution",
+            ));
+        }
         let source_dir = dir.join("source");
         let manifest = source::materialize(&work.data_dir, &files, &work.candidate, &source_dir)?;
         let mut env = environment(&work.profile);
@@ -533,14 +715,33 @@ pub fn run(file: &Path) -> Result<()> {
             use std::os::windows::process::CommandExt;
             command.creation_flags(0x08000000);
         }
+        if cancellation.read(&work, &dir)? {
+            cancellation.skipped_start = true;
+            return Err(Error::new(
+                "CHECK_CANCELLED",
+                "cancelled before command execution",
+            ));
+        }
         let mut child = command.spawn()?;
         write_once(
             &dir.join("started.json"),
             &json!({"pid":child.id(),"program":program,"started_at_ms":started,"token":work.token}),
         )?;
-        code = child.wait()?.code();
+        loop {
+            if let Some(status) = child.try_wait()? {
+                code = status.code();
+                break;
+            }
+            if cancellation.read(&work, &dir)? {
+                cancellation.interrupt(&group);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
         drop(command);
         while !group.children_empty()? {
+            if cancellation.read(&work, &dir)? {
+                cancellation.interrupt(&group);
+            }
             std::thread::sleep(Duration::from_millis(100));
         }
         let mut coverage = if work.profile.parser == Parser::CargoJson {
@@ -561,8 +762,13 @@ pub fn run(file: &Path) -> Result<()> {
     })();
     // Do not publish terminal evidence until the entire owned group is done.
     while !group.children_empty()? {
+        if cancellation.read(&work, &dir)? {
+            cancellation.interrupt(&group);
+        }
         std::thread::sleep(Duration::from_millis(100));
     }
+    // A late request cannot rewrite an already completed command's verdict.
+    cancellation.read(&work, &dir)?;
     for stream in ["stdout", "stderr"] {
         let p = dir.join(stream);
         if p.try_exists()? {
@@ -580,7 +786,9 @@ pub fn run(file: &Path) -> Result<()> {
             Some(e),
         ),
     };
-    let state = if error.is_some() {
+    let state = if cancellation.applied() {
+        "cancelled"
+    } else if error.is_some() {
         "error"
     } else if code != Some(0) {
         "failed"
@@ -593,7 +801,7 @@ pub fn run(file: &Path) -> Result<()> {
         "passed"
     };
     let report = json!({"version":1,"check_id":work.check_id,"operation_id":work.operation_id,"candidate_ref":work.candidate.artifact_id,"candidate_sha256":work.candidate.content_digest,
-        "profile":work.profile,"worker_version":env!("CARGO_PKG_VERSION"),"process":group.identity,"state":state,"exit_code":code,"resource_released":true,"source_checkout_verified":source_verified,"coverage":coverage,"error":error,
+        "profile":work.profile,"cancellation":cancellation.evidence(),"worker_version":env!("CARGO_PKG_VERSION"),"process":group.identity,"state":state,"exit_code":code,"resource_released":true,"source_checkout_verified":source_verified,"coverage":coverage,"error":error,
         "outputs":outputs.iter().map(|r|json!({"artifact_ref":r.artifact_id,"stream":r.metadata["stream"],"sha256":r.content_digest,"length":r.byte_length})).collect::<Vec<_>>(),"started_at_ms":started,"finished_at_ms":model::now_ms()?});
     let id = format!("check-{}", model::digest(work.operation_id.as_bytes()));
     let (record, bytes) = ArtifactFiles::document(
@@ -603,21 +811,21 @@ pub fn run(file: &Path) -> Result<()> {
         json!({"check_id":work.check_id,"candidate_ref":work.candidate.artifact_id,"state":state}),
     )?;
     files.publish(&record, &bytes)?;
+    let completed = Completion {
+        check_id: work.check_id,
+        operation_id: work.operation_id,
+        token: work.token,
+        state: state.into(),
+        exit_code: code,
+        resource_released: true,
+        coverage,
+        result: record,
+        outputs,
+        cancellation: cancellation.evidence(),
+    };
+    write_once(&dir.join("terminal.json"), &json!(completed))?;
     group.disarm()?;
-    write_once(
-        &dir.join("completion.json"),
-        &json!(Completion {
-            check_id: work.check_id,
-            operation_id: work.operation_id,
-            token: work.token,
-            state: state.into(),
-            exit_code: code,
-            resource_released: true,
-            coverage,
-            result: record,
-            outputs
-        }),
-    )?;
+    write_once(&dir.join("completion.json"), &json!(completed))?;
     drop(lock);
     Ok(())
 }

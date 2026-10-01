@@ -5,7 +5,7 @@ use crate::{
     checks::{
         model::{CaptureRequest, CheckRequest},
         source,
-        worker::{self, Completion, Work},
+        worker::{self, CancelRequest, Completion, Work},
     },
     config::Config,
     error::{Error, Result},
@@ -174,30 +174,53 @@ pub(super) fn cancel(tx: &Transaction<'_>, p: &Principal, v: &Value, id: &str) -
     let c = describe(tx, &json!({"check_id":check}))?;
     let a = tasks::get_attempt(tx, model::text(&c, "attempt_id")?)?;
     p.owns(model::text(&a, "owner_id")?)?;
-    if c["state"] != "queued" {
+    if !matches!(
+        c["state"].as_str(),
+        Some("queued" | "running" | "reconciling")
+    ) {
+        return Ok(
+            json!({"operation_id":id,"check_id":check,"cancellation_requested":false,"state":c["state"],"disposition":"already_terminal"}),
+        );
+    }
+    if let Some(previous) = c.get("cancel_request").filter(|v| !v.is_null()) {
+        return Ok(
+            json!({"operation_id":id,"check_id":check,"cancellation_operation_id":previous["operation_id"],"cancellation_requested":true,"coalesced":true,"process_killed":false}),
+        );
+    }
+    // An older independently running binary cannot be hot-upgraded into a new protocol.
+    if !c["process"].is_null() && c["process"]["control_version"] != 2 {
         return Err(Error::new(
-            "CHECK_ALREADY_STARTED",
-            "only queued check cancellation is supported; active work is not killed",
+            "CHECK_CANCEL_UNSUPPORTED",
+            "this running worker predates active cancellation; its normal result is still collected",
         ));
     }
-    tx.execute("UPDATE check_runs SET spec_json=json_set(spec_json,'$.cancel_requested',?2) WHERE check_id=?1",params![check,reason])?;
+    let request = CancelRequest {
+        operation_id: id.into(),
+        reason: reason.into(),
+    };
+    tx.execute("UPDATE check_runs SET spec_json=json_set(spec_json,'$.cancel_requested',?2,'$.cancel_request',json(?3)) WHERE check_id=?1",
+        params![check,reason,model::canonical(&json!(request))?])?;
+    tx.execute(
+        "UPDATE operations SET task_id=?2,attempt_id=?3 WHERE operation_id=?1",
+        params![id, a["task_id"].as_str(), a["attempt_id"].as_str()],
+    )?;
     Ok(
-        json!({"operation_id":id,"check_id":check,"cancellation_requested":true,"process_killed":false}),
+        json!({"operation_id":id,"check_id":check,"cancellation_operation_id":id,"cancellation_requested":true,"admission":"durable_request","process_killed":false}),
     )
 }
 pub(super) fn describe(db: &Connection, v: &Value) -> Result<Value> {
     model::fields(v, &["check_id"])?;
     let id = model::text(v, "check_id")?;
-    let raw:Option<String>=db.query_row("SELECT json_object('check_id',check_id,'operation_id',operation_id,'attempt_id',attempt_id,'candidate_ref',candidate_ref,'state',state,'resource_key',resource_key,'resource_claimed_at_ms',resource_claimed_at_ms,'resource_released_at_ms',resource_released_at_ms,'process',json(process_identity_json),'coverage',json(coverage_json),'result_ref',result_ref,'exit_code',exit_code,'profile_id',json_extract(spec_json,'$.profile_id'),'profile_revision',json_extract(spec_json,'$.profile_revision')) FROM check_runs WHERE check_id=?1",[id],|r|r.get(0)).optional()?;
+    let raw:Option<String>=db.query_row("SELECT json_object('check_id',check_id,'operation_id',operation_id,'attempt_id',attempt_id,'candidate_ref',candidate_ref,'state',state,'resource_key',resource_key,'resource_claimed_at_ms',resource_claimed_at_ms,'resource_released_at_ms',resource_released_at_ms,'process',json(process_identity_json),'coverage',json(coverage_json),'result_ref',result_ref,'exit_code',exit_code,'profile_id',json_extract(spec_json,'$.profile_id'),'profile_revision',json_extract(spec_json,'$.profile_revision'),'cancel_request',json_extract(spec_json,'$.cancel_request'),'cancellation',json_extract(spec_json,'$.cancellation')) FROM check_runs WHERE check_id=?1",[id],|r|r.get(0)).optional()?;
     Ok(serde_json::from_str(&raw.ok_or_else(|| {
         Error::new("NOT_FOUND", "unknown CheckRun")
     })?)?)
 }
 fn work(db: &Connection, id: &str, root: PathBuf) -> Result<Work> {
-    let (op, raw): (String, String) = db.query_row(
-        "SELECT operation_id,spec_json FROM check_runs WHERE check_id=?1",
+    let (op, raw, identity): (String, String, Option<String>) = db.query_row(
+        "SELECT operation_id,spec_json,process_identity_json FROM check_runs WHERE check_id=?1",
         [id],
-        |r| Ok((r.get(0)?, r.get(1)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
     let spec: Value = serde_json::from_str(&raw)?;
     Ok(Work {
@@ -211,6 +234,13 @@ fn work(db: &Connection, id: &str, root: PathBuf) -> Result<Work> {
         data_dir: root,
         candidate: serde_json::from_value(spec["candidate"].clone())?,
         profile: serde_json::from_value(spec["profile"].clone())?,
+        cancel_request: spec
+            .get("cancel_request")
+            .filter(|v| !v.is_null())
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()?,
+        expected_worker: identity.map(|raw| serde_json::from_str(&raw)).transpose()?,
     })
 }
 fn next(db: &mut Connection, config: &Config, root: PathBuf) -> Result<Option<Work>> {
@@ -288,7 +318,10 @@ fn ready(db: &mut Connection, w: &Work, identity: Value) -> Result<bool> {
         ));
     }
     if status["state"] == "running" && status["process"] == identity {
-        return Ok(true);
+        let op = operations::get_operation(&tx, &w.operation_id)?;
+        if op["state"] == "native_accepted" {
+            return Ok(true);
+        }
     }
     tx.execute(
         "UPDATE check_runs SET state='running',process_identity_json=?2 WHERE check_id=?1",
@@ -318,10 +351,12 @@ fn finish(db: &mut Connection, w: &Work, c: Completion) -> Result<()> {
         artifact(&tx, out)?;
     }
     let now = model::now_ms()?;
+    tx.execute("UPDATE check_runs SET spec_json=json_set(spec_json,'$.cancellation',json(?2)) WHERE check_id=?1",params![w.check_id,model::canonical(&json!(c.cancellation))?])?;
     tx.execute("UPDATE check_runs SET state=?2,resource_released_at_ms=CASE WHEN resource_claimed_at_ms IS NOT NULL THEN ?3 ELSE NULL END,finished_at_ms=?3,exit_code=?4,result_ref=?5,coverage_json=?6 WHERE check_id=?1",params![w.check_id,c.state,now,c.exit_code,c.result.artifact_id,model::canonical(&c.coverage)?])?;
     let owner:String=tx.query_row("SELECT a.owner_id FROM attempts a JOIN check_runs c ON c.attempt_id=a.attempt_id WHERE c.check_id=?1",[&w.check_id],|r|r.get(0))?;
     let report = json!({"operation_id":w.operation_id,"outcome":"applied","check_id":w.check_id,"state":c.state,"exit_code":c.exit_code,"result_ref":c.result.artifact_id,"recipient":owner,"source_checkout_verified":c.state=="passed","output_refs":c.outputs.iter().map(|o|&o.artifact_id).collect::<Vec<_>>(),"task_accepted":false});
     settle(&tx, &w.operation_id, &report)?;
+    tx.execute("UPDATE incidents SET state='resolved',last_seen_at_ms=?2 WHERE state='open' AND dedup_key LIKE ?1", params![format!("check:{}:%", w.check_id), now])?;
     tx.commit()?;
     Ok(())
 }
@@ -391,12 +426,27 @@ impl Store {
                             return self.run(move |db| finish(db, &done, c)).await;
                         }
                         let scan = w.clone();
-                        if let Some(identity) = self.file_io(move |_| worker::ready(&scan)).await? {
-                            let active = w.clone();
-                            if self.run(move |db| ready(db, &active, identity)).await? {
-                                let allow = w.clone();
-                                self.file_io(move |_| worker::allow(&allow)).await?;
+                        match self.file_io(move |_| worker::ready(&scan)).await {
+                            Ok(Some(identity)) => {
+                                let active = w.clone();
+                                if self.run(move |db| ready(db, &active, identity)).await? {
+                                    let allow = w.clone();
+                                    // Persisted cancellation is delivered before go-ahead when both are pending.
+                                    self.file_io(move |_| { worker::deliver_cancel(&allow)?; worker::allow(&allow) }).await?;
+                                }
                             }
+                            Ok(None) => {},
+                            Err(e) if e.code == "CHECK_WORKER_LOST" => {
+                                let id = w.check_id.clone();
+                                self.run(move |db| { db.execute("UPDATE check_runs SET state='reconciling' WHERE check_id=?1 AND state='running'",[id])?; Ok(()) }).await?;
+                                let scan = w.clone();
+                                if let Some(c) = self.file_io(move |files| worker::recover(&scan, &files)).await? {
+                                    let done = w.clone();
+                                    return self.run(move |db| finish(db, &done, c)).await;
+                                }
+                                return Err(e);
+                            }
+                            Err(e) => return Err(e),
                         }
                         Ok(())
                     }
