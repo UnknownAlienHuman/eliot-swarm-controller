@@ -1,110 +1,32 @@
-name: Stage verified OpenCode implementation
+name: Recover preserved OpenCode source
 on:
   push:
     branches: [main]
     paths: ['.github/workflows/import-opencode-http.yml']
 permissions:
-  contents: write
+  contents: read
 jobs:
-  stage:
+  recover:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          fetch-depth: 3
+          ref: 66341200dd6317a7ed4dedf628b078d16b3b5c64
           persist-credentials: false
-      - name: Verify exact source and stage ordinary source tree
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Archive the preserved source tree
         shell: bash
         run: |
           set -euo pipefail
-          python - <<'PY'
-          import base64, hashlib, io, json, lzma, os, pathlib, subprocess, tarfile, urllib.request, urllib.error
-          repo = os.environ['GITHUB_REPOSITORY']
-          assert repo == 'UnknownAlienHuman/eliot-swarm-controller'
-          parent_sha = os.environ['GITHUB_SHA']
-          def api(path, data=None):
-              headers = {'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json', 'X-GitHub-Api-Version': '2022-11-28'}
-              body = None if data is None else json.dumps(data).encode()
-              req = urllib.request.Request('https://api.github.com/repos/' + repo + '/' + path, data=body, headers=headers)
-              try:
-                  with urllib.request.urlopen(req, timeout=90) as response:
-                      return json.load(response)
-              except urllib.error.HTTPError as error:
-                  print('GitHub API failure:', path, error.code, error.read(4096).decode(errors='replace'))
-                  raise
-          def git(*args, **kwargs):
-              return subprocess.check_output(['git', *args], **kwargs)
-          parent = api('git/commits/' + parent_sha)
-          assert [p['sha'] for p in parent['parents']] == ['19d4d533a2639d7af9c9da929155182fb2769055'], 'main advanced before import'
-          chunks = ['c9fa6fb171988a68703d6d016334e43bad09f1f9', 'f7902978897e2508b559efbad60a99d624265ed5', '8a528e14c9c392f0256b24c4f058095037374b8b']
-          encoded = b''.join(base64.b64decode(api('git/blobs/' + sha)['content']) for sha in chunks)
-          compressed = base64.b64decode(encoded, validate=True)
-          assert hashlib.sha256(compressed).hexdigest() == '4ca7d7bf0aa02137d40567b83613c64be3ed2ee464c34b7a8454ba6d957665c9'
-          payload = json.loads(lzma.decompress(compressed))
-          assert payload['schema_version'] == 1
-          assert git('rev-parse', 'HEAD^^:').decode().strip() == payload['base_tree']
-          patch = payload['patch'].encode()
-          subprocess.run(['git', 'apply', '--check', '--binary', '-'], input=patch, check=True)
-          subprocess.run(['git', 'apply', '--binary', '-'], input=patch, check=True)
-          revision = payload['atlas_commit']
-          assert revision == 'a34a6d44bf37d26d9a6f8f6fe1fab5ce0a92d8d1'
-          with urllib.request.urlopen('https://codeload.github.com/pacifio/atlas/tar.gz/' + revision, timeout=90) as response:
-              archive = response.read(100 * 1024 * 1024 + 1)
-          assert len(archive) <= 100 * 1024 * 1024
-          imported = set()
-          with tarfile.open(fileobj=io.BytesIO(archive), mode='r:gz') as source:
-              for member in source.getmembers():
-                  if not member.isfile() or '/' not in member.name:
-                      continue
-                  name = member.name.split('/', 1)[1]
-                  if name != 'LICENSE' and not name.startswith('crates/atlas-redact/'):
-                      continue
-                  relative = pathlib.PurePosixPath(name)
-                  assert not relative.is_absolute() and '..' not in relative.parts
-                  path = pathlib.Path('vendor/atlas') / relative
-                  path.parent.mkdir(parents=True, exist_ok=True)
-                  path.write_bytes(source.extractfile(member).read())
-                  path.chmod(0o644)
-                  imported.add(name)
-          assert len(imported) == 22
-          checksums = pathlib.Path('vendor/atlas/SHA256SUMS').read_text().splitlines()
-          for line in checksums:
-              digest, name = line.split('  ', 1)
-              assert hashlib.sha256((pathlib.Path('vendor/atlas') / name).read_bytes()).hexdigest() == digest, name
-          assert imported | {'UPSTREAM_COMMIT'} == {line.split('  ', 1)[1] for line in checksums}
-          attributes = pathlib.Path('.gitattributes')
-          attributes.write_text(attributes.read_text() + '\n# Preserve the audited upstream snapshot byte-for-byte on every platform.\nvendor/atlas/** -text\n')
-          pathlib.Path('.github/workflows/import-opencode-http.yml').unlink()
-          subprocess.run(['git', 'add', '--all'], check=True)
-          expected_tree = 'a2972a5cecff5369812a03684a8ed6d3e07c2868'
-          assert git('write-tree').decode().strip() == expected_tree, 'source tree differs from locally built implementation'
-          names = git('diff', '--cached', '--no-renames', '--name-only', '-z').decode().split('\0')[:-1]
-          entries = []
-          for name in names:
-              # GITHUB_TOKEN does not publish workflow edits. The authorized
-              # connected client applies those three entries separately.
-              if name.startswith('.github/workflows/'):
-                  continue
-              path = pathlib.Path(name)
-              if not path.exists():
-                  entries.append({'path': name, 'mode': '100644', 'type': 'blob', 'sha': None})
-              else:
-                  mode = git('ls-files', '--stage', '--', name).decode().split()[0]
-                  entries.append({'path': name, 'mode': mode, 'type': 'blob', 'content': path.read_bytes().decode('utf-8')})
-          tree = api('git/trees', {'base_tree': parent['tree']['sha'], 'tree': entries})
-          output = pathlib.Path(os.environ['RUNNER_TEMP']) / 'opencode-candidate'
-          output.mkdir()
-          manifest = {'source_tree': tree['sha'], 'expected_final_tree': expected_tree, 'parent': parent_sha, 'changed_source_files': len(entries)}
-          (output / 'tree.json').write_text(json.dumps(manifest, indent=2))
-          print('Verified ordinary source tree:', json.dumps(manifest))
-          # No workflow writes, commit creation or branch updates with this token.
-          PY
+          test "$(git rev-parse HEAD^{tree})" = f54b9259dbc052c942e089aea95a130166916a01
+          mkdir -p "$RUNNER_TEMP/recovered-source"
+          git archive --format=tar HEAD > "$RUNNER_TEMP/recovered-source/source.tar"
+          git rev-parse HEAD > "$RUNNER_TEMP/recovered-source/source-commit.txt"
+          git rev-parse HEAD^{tree} > "$RUNNER_TEMP/recovered-source/source-tree.txt"
+          (cd "$RUNNER_TEMP/recovered-source" && sha256sum source.tar > SHA256SUMS)
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: verified-opencode-candidate
-          path: ${{ runner.temp }}/opencode-candidate/
+          name: recovered-opencode-source
+          path: ${{ runner.temp }}/recovered-source/
           retention-days: 1
           if-no-files-found: error
