@@ -10,7 +10,7 @@ The Muse SDK bridge opens an explicitly selected native executable, delivers Tas
 
 **Local whole-result assembly and export are implemented.** `artifact.assemble` validates a complete ordered set of retained pages, publishes a whole-result file and records provenance. `artifact.parts` pages that provenance; `artifact.read` verifies touched segments. `swarm artifact export` reuses one authenticated IPC connection, streams bytes to an explicitly chosen local file and checks the full SHA-256 before publication. It never sends the destination path to a model or the host.
 
-**Still pending:** bridge-process crash/resume, complete native family reconstruction, automatic handoff, Task acceptance, CheckRunner, direct OpenCode V2 and other native adapters, MCP and automatic module/service installation. Whole-result coverage is not Task acceptance. Live Muse/Max inference and Windows native launch remain unqualified. Do not mark all C01–C03 complete.
+**Still pending:** bridge-process crash/resume, complete native family reconstruction, automatic handoff, CheckRunner, direct OpenCode V2 and other native adapters, MCP and automatic module/service installation. Whole-result coverage is not Task acceptance. Live Muse/Max inference and Windows native launch remain unqualified. Do not mark all C01–C03 complete.
 
 ## Build and run
 
@@ -128,21 +128,93 @@ mailbox. Repeating the same finding does not send it again; different content un
 conflicts. Stale feedback is preserved as historical evidence and does not alter or notify newer work.
 The manager can reply using message.send/in_reply_to with the feedback's message_id, then resubmit
 against the previous submission reference. No second task.dispatch, process or automatic native wake
-is involved. Acceptance/invalidation and independent CheckRunner policy remain separate unfinished work.
+is involved. Decision recording and exact invalidation are described below; CheckRunner execution remains unfinished.
+
+## Reviewed acceptance and exact invalidation
+
+`task.accept` records an operator decision about the **exact sealed proposal**, not a claim that
+the controller has compiled the repository. The operator must differ from both the owner and
+submitter. Same-user client identities prevent accidental self-approval; they do not prove that
+a different model or human performed the review.
+
+The Task author explicitly selects `acceptance.required_check_profiles`. An empty list selects
+review-only acceptance ([example Task](config/task-review.example.json)); nonempty entries name
+`profile_id` and `profile_revision` that must be covered by actual completed CheckRuns. The worker
+cannot supply a boolean `passed` in their place. The present product has no CheckRunner producer,
+so checks-required policies cannot pass until that path exists. Missing policy on an older Task
+is not silently treated as an empty policy: revise the Task explicitly before assigning its next
+Attempt. Writing and submission do not require an acceptance policy.
+
+Review-only accepts the retained result and its reviewed requirements. It is **not** a verified
+Git checkout, a machine-verified semantic verdict, publication, or a reason to mark a GitHub Issue
+code-complete. Decisions record `evidence_level=operator_review` and `source_checkout_verified=false`.
+Do not choose review-only when the campaign requires controller-executed build evidence.
+
+```powershell
+# Read the exact submission; retain latest_feedback_observation_id.
+swarm task submission SUBMISSION_REF
+# As a separate decision owner, fill config/acceptance.example.json with real evidence.
+swarm --request-id accept-1 task accept --file acceptance.json
+# Inspect operation.get; on applied, read its acceptance_operation_id:
+swarm task acceptance ACCEPTANCE_OPERATION_ID
+# Revoke that decision, not "whichever decision currently has this candidate":
+swarm --request-id revoke-1 task invalidate-acceptance --file invalidate.json
+```
+
+Use normal data-dir/config/credential arguments. Review must cover exactly the frozen requirement
+IDs with rationale and evidence, independently of the writer's `met/unreported` list. Its expected
+feedback cursor comes from `task.submission`; new applicable feedback during byte verification
+makes the decision proposal stale, without discarding the worker's candidate. Missing/corrupt
+submission, candidate or required-check artifact prevents acceptance. File reads stay off the DB
+thread; final state, authority, feedback and pinned dependency decisions are checked again inside
+the final transaction.
+
+Acceptance retains producer ownership. `attempt.release` permits `outcome=accepted` only after a
+recorded acceptance and still checks assigned native runs and outstanding effects/resources.
+Acceptance is not cancellation. Invalidating the current decision reopens the Task and returns
+one feedback message to its still-owning manager. Invalidating an older decision retains the
+historical revocation without clearing a newer decision, even when both accepted the same bytes.
+Replies use the existing mailbox; no new prompt, writer, process or Issue mutation is performed.
+
+Dependency lookup now uses valid historical acceptance decisions, rather than only today's Task
+pointer. A newer producer revision does not revoke a pinned earlier decision. Explicit revocation
+is rechecked when a consumer is accepted. No cascade deletes already accepted consumer results.
 
 ## API and remaining work
 
-Public methods: `host.status/mode`, `client.register/list`, `task.create/get/list/revise/claim/dispatch/submit/submission/request_changes`, `attempt.get/release/bind_producer`, `agent.open/state/list/family/send/reply/configure/goal/refresh/reconcile/result`, `artifact.get/read/assemble/parts`, `route.list`, `operation.get/list/cancel`, `message.send/read`, `report.delta`. Module methods remain `module.hello/next/outcome/observe/result`. Export is a CLI client operation over get/read, not a remote arbitrary-file-write method.
+Public methods: `host.status/mode`, `client.register/list`, `task.create/get/list/revise/claim/dispatch/submit/submission/request_changes/accept/acceptance/invalidate_acceptance`, `attempt.get/release/bind_producer`, `agent.open/state/list/family/send/reply/configure/goal/refresh/reconcile/result`, `artifact.get/read/assemble/parts`, `route.list`, `operation.get/list/cancel`, `message.send/read`, `report.delta`. Module methods remain `module.hello/next/outcome/observe/result`. Export is a CLI client operation over get/read, not a remote arbitrary-file-write method.
 
 Next: implement the remaining Muse crash-recovery boundary and Task result/CheckRunner consumers; then direct OpenCode V2 on the same contract. Do not rebuild the core or reimplement result paging. Preserve the native shared-Codex and subscription targets. [SIWC notes](docs/runtime-notes.md) describe an optional OAuth route, not installed authorization. [OpenCodex Issue #1](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/1) remains after the main controller code.
 
 ## Evidence and development
 
-**Current code checkpoint: `8e19f1dfb00375c00d755554ce63a609ddb29aae`.** The submission/feedback slice implements architecture §5/12 and implementation plan §4/9 using the existing artifact, Operation and mailbox paths. On 2026-09-30, [CI run 36775844956](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/36775844956) passed formatting, warnings-denied Clippy, Muse syntax/SDK import and release builds on **Windows and Linux**. No migration, dependency, native module or service was added.
+**Current code checkpoint: `01212a4e2a646693a4d8dd44443779e670f6c555`.** The retained
+acceptance implementation was published on the exact `0c34b5e` main base in `bdc4bc17`.
+Two compilation defects in the previously uncompiled patch were corrected: sibling Store access
+to the sealed submission reader, and comparing a check receipt ID with `&str` rather than `&String`.
+On **2026-10-01**, [CI run 36816310704](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/36816310704)
+passed formatting, warnings-denied Clippy, Muse syntax/SDK import and release builds on **Windows
+and Linux** for the exact corrected commit. The initial failing run is not the validation result.
+Migrations, dependency locks and native modules remain unchanged.
 
-The compiled Linux artifact was downloaded and its checksum/source identity verified; all 85 tracked files in its source archive matched the uploaded tree `0335033c1a38826d9a6398c70fcd8296bf21605a`. A short local invocation used the real host/CLI and **synthetic module data**, not Muse. It completed submission and request replay, explicit missing-requirement reporting, paginated report/export, delayed native-admission state preservation, one-time feedback with a reply, replacement submission and rejection of stale anchors. Late review preserved the newer submission and produced no second mailbox message. Ownership remained unreleased and the isolated host exited cleanly. No SDK/native model, user repository, Windows runtime or broad test suite was exercised by this invocation.
+The downloaded Linux artifact `11141153858` passed ZIP and SHA-256 validation
+(`706c046e0c82ad6f8ea8ecf67af4a58311d37932ced7379bed578900fc2efda3`); its archived source
+reconstructed the exact Git tree `158a147fa968149eb6c12764ed050e0682151e9b`.
+A bounded invocation used the real compiled host/CLI and **synthetic authenticated module data**.
+It exercised acceptance/replay without implicit release; rejection of writer self-acceptance;
+one-time revocation feedback and reply; reacceptance of the same bytes with a new decision ID;
+stale revocation preserving that new decision; rejection of absent policy or missing required
+checks; historical dependency resolution followed by explicit revocation; and refusal to accept
+corrupted synthetic backing bytes. The isolated host exited with code 0. No native SDK/model,
+user repository, Windows runtime or broad test suite was exercised. Positive CheckRunner execution
+and native crash recovery remain unqualified, not inferred from these local decision checks.
 
-Previous result assembly/export code `1953ff5a` passed [CI run 36771097804](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/36771097804); its earlier synthetic invocation verified a three-page 153,602-byte export and empty-file handling. That older evidence does not qualify the current native recovery or acceptance paths. Resume from the present submission/result code, not from the removed documentation-only checkpoint.
+Previous slices: submission/feedback `8e19f1df` passed
+[CI 36775844956](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/36775844956);
+assembly/export `1953ff5a` passed
+[CI 36771097804](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/36771097804).
+Their earlier synthetic invocations are historical evidence, not substitutes for the current build.
+Resume from the published acceptance code; the former downloadable patch is no longer pending.
 
 The read-only workflow pins Rust 1.98.1/Cargo.lock and runs formatting, warnings-denied Clippy, release builds and Muse syntax/SDK import checks. It does not run `cargo test`, vendor sessions, login or global installation. Artifacts include exact source SHA/source archive. Windows compilation is not qualification on the owner's machine.
 
@@ -155,4 +227,4 @@ The read-only workflow pins Rust 1.98.1/Cargo.lock and runs formatting, warnings
 | [Donors](docs/agent_swarm.donors-20260929.toml) | Source candidates, not installed runtimes |
 | [Lessons](docs/lessons-learned.md) / [runtime notes](docs/runtime-notes.md) / [candidates](docs/candidate-notes.md) | On-demand reference, not extra worker instructions |
 
-This README records current readiness. Work only in main, without worktrees. Code useful paths first, then focused formatting/Clippy; broad tests follow working slices. The nine-table migration and dependency locks are unchanged by result assembly. Foreign/draft/newer databases and missing credentials are not silently replaced. Preserve a cleanly stopped state directory in full, not a live `.db` without WAL. Historical briefs remain in Git history for provenance, not present install defaults.
+This README records current readiness. Work only in main, without worktrees. Code useful paths first, then focused formatting/Clippy; broad tests follow working slices. The nine-table migration and dependency locks are unchanged by this acceptance slice. Foreign/draft/newer databases and missing credentials are not silently replaced. Preserve a cleanly stopped state directory in full, not a live `.db` without WAL. Historical briefs remain in Git history for provenance, not present install defaults.
