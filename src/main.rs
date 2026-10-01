@@ -31,6 +31,15 @@ struct Cli {
 enum Command {
     /// Start the user host in the foreground; never launches vendor agents implicitly.
     Host,
+    /// Independently run one bridge under a persistent, non-killing process owner.
+    ModuleRun {
+        #[arg(long)]
+        state_dir: PathBuf,
+        #[arg(long)]
+        command: PathBuf,
+        #[arg(last = true, required = true)]
+        args: Vec<String>,
+    },
     /// Internal transient executor; never opens the controller database.
     #[command(hide = true)]
     CheckWorker {
@@ -252,6 +261,14 @@ fn main() {
     }
 }
 fn execute(cli: Cli) -> Result<()> {
+    if let Command::ModuleRun {
+        state_dir,
+        command,
+        args,
+    } = &cli.command
+    {
+        return eliot_swarm_controller::runtime::owner::run(state_dir, command, args);
+    }
     if let Command::CheckWorker { file } = &cli.command {
         return eliot_swarm_controller::checks::worker::run(file);
     }
@@ -291,7 +308,9 @@ async fn run(cli: Cli) -> Result<()> {
     }
     let mut pending_credential = None;
     let (method, mut params) = match cli.command {
-        Command::Host | Command::CheckWorker { .. } => unreachable!("executor returned above"),
+        Command::Host | Command::CheckWorker { .. } | Command::ModuleRun { .. } => {
+            unreachable!("executor returned above")
+        }
         Command::Source {
             command: SourceCommand::Capture { file },
         } => ("source.capture".into(), read_json(&file)?),

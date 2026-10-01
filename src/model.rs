@@ -342,6 +342,13 @@ pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
             "generation",
             "session_id",
         ],
+        "agent.recover" => &[
+            "client_request_id",
+            "binding_id",
+            "generation",
+            "expected_boot_id",
+            "reason",
+        ],
         "agent.reconcile" => &[
             "client_request_id",
             "binding_id",

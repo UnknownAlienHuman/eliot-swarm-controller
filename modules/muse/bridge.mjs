@@ -8,6 +8,8 @@ import { spawnMspConnection, MspError } from '@muse-code/sdk';
 import { Control } from './control.mjs';
 import { configuration, modelMatches, goalCommand } from './settings.mjs';
 import { readResult } from './results.mjs';
+import { spawnOwned } from './owned.mjs';
+import { recoveryState } from './checkpoint.mjs';
 
 function required(object, key) {
   if (typeof object?.[key] !== 'string' || !object[key].trim()) throw new Error(`MISSING_${key}`);
@@ -37,9 +39,12 @@ if (!path.isAbsolute(config.command)) throw new Error('NATIVE_EXECUTABLE_MUST_BE
 if (process.platform === 'win32' && /\.(cmd|bat)$/i.test(config.command)) throw new Error('USE_NATIVE_EXE_NOT_SHELL_WRAPPER');
 if (!Array.isArray(config.args) || config.args.some(a => typeof a !== 'string')) throw new Error('EXPLICIT_ARGV_REQUIRED');
 
-const bootId = randomUUID();
+const recovery = await recoveryState();
+const saved = recovery?.saved;
+if(saved && (saved.client_id!==credential.client_id || saved.module_artifact_id!==config.moduleArtifactId))throw new Error('CHECKPOINT_BINDING_MISMATCH');
+const bootId = recovery?.owner.token ?? randomUUID();
 let control, connected = false, stopping = false, nativeReady = false, handshake, msp, rootId, nativeScope;
-let revision = 0, lastSentRevision = -1, eventsSeen = 0;
+let revision = 0, lastSentRevision = -1, eventsSeen = 0, savedRevision = -1;
 let latest = { execution: 'not_started', family_completeness: 'partial', observed_children: [], pending_requests: [], gaps: 0 };
 const children = new Map(), pendingRequests = new Map(), outcomes = new Map(), active = new Map();
 const routeDefaults = {};
@@ -48,8 +53,28 @@ const turns = new Map();
 // through explicit agent.reconcile, never through reconnect or a timeout loop.
 const nativePending = new Map();
 const sessionVersions = new Map();
-let standingEffort, refreshInFlight;
+let standingEffort, refreshInFlight, bindingContext;
 const childReads = new Map();
+if(saved) {
+  rootId=saved.root_id;nativeScope=saved.native_scope;
+  Object.assign(routeDefaults,saved.route_defaults);
+  standingEffort=saved.standing_effort;
+  bindingContext=saved.binding;
+  for(const [id,value] of saved.outcomes??[])outcomes.set(id,value);
+  for(const [id,value] of saved.native_pending??[])nativePending.set(id,value);
+  for(const [id,value] of saved.children??[])children.set(id,value);
+  for(const [id,value] of saved.turns??[])turns.set(id,value);
+  latest={...saved.latest,execution:'recovery_required',gaps:(saved.latest?.gaps??0)+1,
+    family_completeness:'partial',recovered_checkpoint:true};
+}
+function checkpoint(force=false) {
+  if(!recovery || !force && savedRevision===revision)return Promise.resolve();
+  const at=revision;
+  return recovery.write({client_id:credential.client_id,module_artifact_id:config.moduleArtifactId,
+    boot_id:bootId,binding:bindingContext,root_id:rootId,native_scope:nativeScope,
+    route_defaults:routeDefaults,standing_effort:standingEffort,latest,
+    outcomes:[...outcomes],native_pending:[...nativePending],children:[...children],turns:[...turns]}).then(()=>{savedRevision=at;});
+}
 function saveOutcome(operationId, result) {
   const pending = nativePending.get(operationId);
   if (pending?.resolved && !['applied','rejected'].includes(result.outcome)) return;
@@ -189,6 +214,27 @@ async function refreshRoot() {
 
 async function completeNative(entry, ack) {
   entry.ack = ack;
+  await checkpoint(true);
+  if(entry.kind==='recover') {
+    const session=compactSession(ack.session);
+    if(session.sessionId!==rootId)throw new Error('RESUMED_IDENTITY_MISMATCH');
+    if(!modelMatches(session,routeDefaults))throw new Error('MODEL_CHANGED_DURING_RECOVERY');
+    const current=entry.submission_boot_id===bootId;
+    if(current) {
+      latest.session=session;latest.execution=session.status;latest.active_turn_id=session.activeTurnId;
+      latest.recovery={status:'resumed',operation_id:entry.command.operation_id,viewCursor:ack.viewCursor};
+      nativeReady=true;
+    }
+    settle(entry,{completion_condition:'native_session_resumed',resume_boot_id:entry.submission_boot_id,
+      native_command_id:entry.id,viewCursor:ack.viewCursor,session,model_input_replayed:false});
+    await checkpoint();
+    // Restoring observation is read-only, separate from the admitted resume.
+    if(current) {
+      void refreshRoot().catch(()=>{latest.gaps++;changed();});
+      for(const id of children.keys())void followChild(id);
+    }
+    return;
+  }
   if (ack.status !== 'accepted') throw new Error('UNEXPECTED_ADMISSION_STATUS');
   if (entry.kind === 'input') {
     settle(entry, {native_ack:ack,completion_condition:'native_input_admitted',requested_reasoning_effort:entry.params.reasoningEffort}, required(ack,'turnId'));
@@ -219,8 +265,9 @@ async function completeNative(entry, ack) {
 }
 
 async function submitNative(command, method, params, kind, setting) {
-  const entry = {command,id:commandId(command),method,params,kind,setting,ack:null,resolved:false};
+  const entry = {command,id:commandId(command),method,params,kind,setting,ack:null,resolved:false,submission_boot_id:bootId};
   nativePending.set(command.operation_id, entry);
+  await checkpoint(true); // Native mutation must not precede its recoverable ID/payload.
   const ack = await msp.connection.command(method, params, {maxAttempts:1,commandId:entry.id});
   await completeNative(entry, ack);
 }
@@ -231,7 +278,7 @@ async function reconcileNative(target) {
   if (active.has(target)) return {target_operation_id:target,disposition:'native_request_in_progress',resubmitted:false};
   if (entry.resolved) return {target_operation_id:target,disposition:'awaiting_host_receipt',resubmitted:false};
   if (entry.ack) {
-    await refreshRoot();
+    await completeNative(entry,entry.ack);
     return {target_operation_id:target,disposition:entry.resolved?'resolved':'pending_application',resubmitted:false};
   }
   // This is an explicit reconciliation command, not a read-only healthcheck.
@@ -279,16 +326,14 @@ async function refreshChild(id) {
 async function followChild(id) {
   try {await refreshChild(id);} catch {latest.gaps++;changed();}
 }
-async function startNative(command) {
+async function launchConnection(options) {
   if (handshake) throw new Error('NATIVE_ALREADY_OWNED');
-  const options=command.route.native_options;
   required(options,'workspaceRoot'); required(options,'modelId'); required(options,'reasoningEffort');
   if (!path.isAbsolute(options.workspaceRoot)) throw new Error('WORKSPACE_MUST_BE_ABSOLUTE');
   const allowed=['workspaceRoot','modelId','providerId','reasoningEffort','approvalMode'];
   for (const name of Object.keys(options)) if (!allowed.includes(name)) throw new Error(`UNSUPPORTED_NATIVE_OPTION_${name}`);
-  Object.assign(routeDefaults, options);
   // Explicit launch only, never from describe/status/reconnect. Current vendor auth is inherited.
-  handshake=spawnMspConnection({command:config.command,args:config.args,cwd:options.workspaceRoot,
+  handshake=(recovery?spawnOwned:spawnMspConnection)({command:config.command,args:config.args,cwd:options.workspaceRoot,
     onStderr:()=>{latest.stderr_chunks=(latest.stderr_chunks??0)+1;}});
   handshake.onNotification(onNotification);
   handshake.onProtocolError(()=>{latest.gaps++;latest.protocol_error=true;changed();});
@@ -307,9 +352,19 @@ async function startNative(command) {
   msp=await handshake.initialize({clientInfo:{name:'eliot-swarm-controller',version:'0.1.0'}});
   const init=msp.initializeResult;
   const home=await realpath(required(init,'museHome'));
-  nativeScope=`muse:${process.platform}:${process.platform==='win32'?home.toLowerCase():home}`;
+  const scope=`muse:${process.platform}:${process.platform==='win32'?home.toLowerCase():home}`;
+  if(nativeScope && nativeScope!==scope)throw new Error('RECOVERY_NAMESPACE_MISMATCH');
+  nativeScope=scope;
   latest.server=init.serverInfo; latest.schema=init.schema;
   latest.fingerprint_warning=Boolean(msp.fingerprintWarning);
+  return init;
+}
+
+async function startNative(command) {
+  const options=command.route.native_options;
+  Object.assign(routeDefaults,options);
+  await checkpoint(true);
+  const init=await launchConnection(options);
   const params={workspaceRoot:options.workspaceRoot,modelId:options.modelId};
   if(options.providerId!==undefined)params.providerId=options.providerId;
   if(options.approvalMode!==undefined)params.approvalMode=options.approvalMode;
@@ -320,8 +375,28 @@ async function startNative(command) {
   latest.requested_reasoning_effort=options.reasoningEffort;
   latest.reasoning_application='explicit_per_turn_option'; // Sampled at submission, not a claimed inference measurement.
   nativeReady=true;changed();
+  await checkpoint();
   return {native_scope_key:nativeScope,native_root_id:rootId,details:{session:latest.session,server:init.serverInfo,
     reasoning:{requested:options.reasoningEffort,application:'per_turn_at_submission'},fingerprint_warning:Boolean(msp.fingerprintWarning)}};
+}
+async function recoverNative(command) {
+  if(!recovery || !rootId || !nativeScope)throw new Error('RECOVERY_CHECKPOINT_UNAVAILABLE');
+  if(command.input.expected_boot_id!==bootId || command.native_root_id!==rootId)throw new Error('RECOVERY_TARGET_CHANGED');
+  if(nativeReady)throw new Error('NATIVE_ALREADY_READY');
+  if(!handshake)await launchConnection(routeDefaults);
+  if(!msp)throw new Error('NATIVE_INITIALIZE_UNKNOWN');
+  // Check the retained root before taking a writer lease. Never replace a
+  // missing session with a new one, fork, or an initial Task prompt.
+  const read=await msp.connection.request('session/read',{sessionId:rootId,excludeItems:true});
+  const session=compactSession(read.session);
+  if(session.sessionId!==rootId)throw new Error('RECOVERY_SESSION_MISMATCH');
+  if(!modelMatches(session,routeDefaults)) {
+    const expected=[...nativePending.values()].some(entry=>entry.kind==='configure' && entry.setting?.key==='model' && modelMatches(session,entry.setting.desired));
+    if(!expected)throw new Error('RECOVERY_MODEL_MISMATCH');
+    routeDefaults.modelId=session.modelId;routeDefaults.providerId=session.providerId??undefined;
+    await checkpoint(true);
+  }
+  await submitNative(command,'session/resume',{sessionId:rootId,excludeItems:true},'recover');
 }
 async function execute(command) {
   const base={operation_id:command.operation_id};
@@ -329,6 +404,7 @@ async function execute(command) {
   try {
     let result;
     if (command.method==='agent.open') { nativeAdmissionPossible=true;result=await startNative(command); }
+    else if(command.method==='agent.recover') {nativeAdmissionPossible=true;await recoverNative(command);return;}
     else {
       if (!msp || command.native_root_id!==rootId) throw new Error('NATIVE_IDENTITY_MISMATCH');
       const p=command.input;
@@ -393,6 +469,7 @@ async function execute(command) {
   }
 }
 async function report(link = control) {
+  await checkpoint(); // Retain outcomes before allowing a host ACK to retire them.
   for(const [id,outcome] of outcomes){
     if(outcome.result_page) await link.call('module.result',{operation_id:id,page:outcome.result_page});
     else await link.call('module.outcome',outcome);
@@ -429,14 +506,20 @@ interval.unref();
 async function stop(){
   if(stopping)return;stopping=true;connected=false;control?.close();clearInterval(interval);
   // Only explicit termination of this SDK owner closes the native transport.
+  await checkpoint(true).catch(()=>{});
   if(handshake)await handshake.close().catch(()=>{});
 }
 process.once('SIGINT',()=>{void stop();});process.once('SIGTERM',()=>{void stop();});
 while(!stopping){
   try{
     control=new Control(config.endpoint,credential);await control.connect();
-    await control.call('module.hello',{boot_id:bootId,module_artifact_id:config.moduleArtifactId,native_ready:nativeReady,
+    const hello=await control.call('module.hello',{boot_id:bootId,module_artifact_id:config.moduleArtifactId,native_ready:nativeReady,
+      ...(recovery?{managed_owner:recovery.owner}:{}),
       ...(rootId?{native_root_id:rootId,native_scope_key:nativeScope}:{})});
+    if(bindingContext && (hello.binding_id!==bindingContext.binding_id || hello.generation!==bindingContext.generation))throw new Error('CHECKPOINT_BINDING_CHANGED');
+    bindingContext={binding_id:hello.binding_id,generation:hello.generation};
+    if(hello.recovery_required)latest.recovery={status:'awaiting_explicit_agent_recover',boot_id:bootId};
+    await checkpoint(true);
     lastSentRevision=-1;await report();connected=true;
     while(!stopping && control.socket){
       if(active.size+outcomes.size>=8){await delay(50);continue;}

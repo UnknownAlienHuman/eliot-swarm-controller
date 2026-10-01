@@ -119,6 +119,35 @@ impl Store {
         .await
     }
     pub async fn call(&self, principal: Principal, method: String, params: Value) -> Result<Value> {
+        if method == "module.hello" {
+            let p = principal.clone();
+            let v = params.clone();
+            let mut plan = self.run(move |db| runtime::hello_plan(db, &p, &v)).await?;
+            let inspect = plan.clone();
+            let new_owner = params.get("managed_owner").cloned();
+            self.file_io(move |_| {
+                if let Some(owner) = new_owner {
+                    let token = model::text(&owner, "token")?;
+                    if uuid::Uuid::parse_str(token).is_err()
+                        || owner["process"]["purpose"] != "module"
+                        || crate::platform::process_group::departed_empty(&owner["process"], token)?
+                    {
+                        return Err(Error::invalid(
+                            "managed module owner must identify a live local process group",
+                        ));
+                    }
+                }
+                if inspect["changed"] == true && !inspect["owner"].is_null() {
+                    crate::runtime::owner::verify_departed(&inspect["owner"])?;
+                }
+                Ok(())
+            })
+            .await?;
+            plan["departed"] = json!(plan["changed"] == true && !plan["owner"].is_null());
+            return self
+                .run(move |db| runtime::hello(db, &principal, &params, &plan))
+                .await;
+        }
         if method == "source.capture" {
             return self.capture_source(principal, params).await;
         }
@@ -167,6 +196,7 @@ impl Store {
                 | "agent.refresh"
                 | "agent.reconcile"
                 | "agent.result"
+                | "agent.recover"
                 | "host.mode"
                 | "module.outcome"
         );
@@ -176,7 +206,6 @@ impl Store {
                 let principal = current_principal(db, principal)?;
                 if principal.role == Role::Module {
                     return match method.as_str() {
-                        "module.hello" => runtime::hello(db, &principal, &params),
                         "module.outcome" => runtime::outcome(db, &principal, &params),
                         "module.observe" => runtime::observe(db, &principal, &params),
                         _ => Err(Error::new(
@@ -779,7 +808,7 @@ fn apply(
         "attempt.release" => tasks::release(tx, p, v, id, now).map(|v| (v, false)),
         "task.dispatch" => operations::dispatch(tx, p, v, id, now),
         "agent.send" | "agent.reply" | "agent.configure" | "agent.goal" | "agent.refresh"
-        | "agent.reconcile" | "agent.result" => {
+        | "agent.reconcile" | "agent.result" | "agent.recover" => {
             runtime::user_command(tx, p, method, v, id).map(|v| (v, true))
         }
         "agent.open" => operations::open(tx, p, v, config, id, now).map(|v| (v, true)),

@@ -1,4 +1,5 @@
 //! External modules share this command boundary, not vendor request schemas.
+pub mod owner;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 

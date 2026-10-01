@@ -1,7 +1,6 @@
 //! One short-lived worker per check. It owns no DB or model session and executes
 //! at most one configured command, after the host durably acknowledges its identity.
 use super::{
-    job::{Group, departed_empty},
     model::{CheckProfile, Parser},
     source,
 };
@@ -9,6 +8,7 @@ use crate::{
     artifacts::{ArtifactFiles, ArtifactRecord},
     error::{Error, Result},
     model,
+    platform::process_group::{Group, departed_empty},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -634,7 +634,7 @@ pub fn run(file: &Path) -> Result<()> {
     };
     write_once(
         &dir.join("worker.json"),
-        &super::job::waiting_identity(&group, &work.token),
+        &waiting_identity(&group, &work.token),
     )?;
     let mut cancellation = Cancellation::default();
     loop {
@@ -828,4 +828,8 @@ pub fn run(file: &Path) -> Result<()> {
     write_once(&dir.join("completion.json"), &json!(completed))?;
     drop(lock);
     Ok(())
+}
+
+fn waiting_identity(group: &Group, token: &str) -> Value {
+    json!({"token":token,"process":group.identity,"ready_at_ms":model::now_ms().unwrap_or(0),"control_version":2})
 }

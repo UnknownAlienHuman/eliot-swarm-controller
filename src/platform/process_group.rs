@@ -1,5 +1,5 @@
-//! A transient check worker owns its process group before starting any tool.
-//! Native agent processes are never added to this group.
+//! OS process ownership shared by checks and independently launched modules.
+//! Only check groups use kill-on-close; module groups never kill on owner loss.
 use crate::{
     error::{Error, Result},
     model,
@@ -39,9 +39,16 @@ mod os {
     }
     impl Group {
         pub fn enter(token: &str) -> Result<Self> {
+            Self::enter_owned(token, false)
+        }
+        pub fn enter_module(token: &str) -> Result<Self> {
+            Self::enter_owned(token, true)
+        }
+        fn enter_owned(token: &str, module: bool) -> Result<Self> {
             // SAFETY: structures are initialized and handles are local to this worker.
             unsafe {
-                let name = format!("Global\\EliotSwarmCheck-{token}");
+                let purpose = if module { "Module" } else { "Check" };
+                let name = format!("Global\\EliotSwarm{purpose}-{token}");
                 let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
                 let job = CreateJobObjectW(ptr::null(), wide.as_ptr());
                 if job.is_null() {
@@ -55,7 +62,11 @@ mod os {
                     ));
                 }
                 let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                info.BasicLimitInformation.LimitFlags = if module {
+                    0
+                } else {
+                    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+                };
                 if SetInformationJobObject(
                     job,
                     JobObjectExtendedLimitInformation,
@@ -93,7 +104,7 @@ mod os {
                 }
                 Ok(Self {
                     job,
-                    identity: json!({"pid":std::process::id(),"creation_filetime":((creation.dwHighDateTime as u64)<<32)|creation.dwLowDateTime as u64,"scope":"windows_job","job_name":name,"disposition_source":"job_accounting"}),
+                    identity: json!({"pid":std::process::id(),"creation_filetime":((creation.dwHighDateTime as u64)<<32)|creation.dwLowDateTime as u64,"scope":"windows_job","purpose":if module {"module"} else {"check"},"job_name":name,"disposition_source":"job_accounting"}),
                 })
             }
         }
@@ -241,7 +252,12 @@ mod os {
         }
     }
     pub fn departed_empty(identity: &Value, token: &str) -> Result<bool> {
-        let expected = format!("Global\\EliotSwarmCheck-{token}");
+        let purpose = if identity["purpose"] == "module" {
+            "Module"
+        } else {
+            "Check"
+        };
+        let expected = format!("Global\\EliotSwarm{purpose}-{token}");
         if identity["scope"] != "windows_job" || identity["job_name"] != expected {
             return Err(Error::new(
                 "CHECK_RECOVERY_UNSUPPORTED",
@@ -390,7 +406,13 @@ mod os {
         Ok(poll.revents & (libc::POLLIN | libc::POLLHUP) == 0)
     }
     impl Group {
-        pub fn enter(_token: &str) -> Result<Self> {
+        pub fn enter(token: &str) -> Result<Self> {
+            Self::enter_owned(token, false)
+        }
+        pub fn enter_module(token: &str) -> Result<Self> {
+            Self::enter_owned(token, true)
+        }
+        fn enter_owned(_token: &str, module: bool) -> Result<Self> {
             // SAFETY: make only this worker a group leader before launching tools.
             if unsafe { libc::setpgid(0, 0) } != 0 {
                 return Err(std::io::Error::last_os_error().into());
@@ -400,7 +422,7 @@ mod os {
             let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
             Ok(Self {
                 pgid,
-                identity: json!({"pid":pid,"pgid":pgid,"start_ticks":start,"boot_id":boot.trim(),"scope":"linux_process_group","disposition_source":"proc_group_members"}),
+                identity: json!({"pid":pid,"pgid":pgid,"start_ticks":start,"boot_id":boot.trim(),"scope":"linux_process_group","purpose":if module {"module"} else {"check"},"disposition_source":"proc_group_members"}),
             })
         }
         pub fn children_empty(&self) -> Result<bool> {
@@ -536,6 +558,9 @@ mod os {
         pub identity: Value,
     }
     impl Group {
+        pub fn enter_module(token: &str) -> Result<Self> {
+            Self::enter(token)
+        }
         pub fn enter(_token: &str) -> Result<Self> {
             Err(Error::new(
                 "CHECK_PLATFORM_UNSUPPORTED",
@@ -566,6 +591,3 @@ mod os {
     }
 }
 pub use os::{Group, departed_empty};
-pub fn waiting_identity(group: &Group, token: &str) -> Value {
-    json!({"token":token,"process":group.identity,"ready_at_ms":model::now_ms().unwrap_or(0),"control_version":2})
-}

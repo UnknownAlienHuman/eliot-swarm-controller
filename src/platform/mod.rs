@@ -1,3 +1,4 @@
+pub mod process_group;
 use crate::error::{Error, Result};
 use crate::model::{Credential, new_id};
 use std::fs::{File, OpenOptions};

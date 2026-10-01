@@ -1,7 +1,7 @@
 {
   "endpoint": "\\\\.\\pipe\\REPLACE_WITH_HOST_ENDPOINT",
   "credentialFile": "C:\\SwarmState\\muse-MC.credential.json",
-  "moduleArtifactId": "muse-sdk-1.3.0-bridge.4",
+  "moduleArtifactId": "muse-sdk-1.3.0-bridge.5",
   "command": "C:\\Tools\\MuseCode\\REPLACE_WITH_INSTALLED_NATIVE.exe",
   "args": ["serve"]
 }

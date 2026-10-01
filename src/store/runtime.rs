@@ -54,7 +54,21 @@ pub(super) fn register(db: &Connection, v: &Value, client_id: &str) -> Result<Va
     Ok(json!({"binding_id":id,"binding_generation":generation}))
 }
 
-pub(super) fn hello(db: &mut Connection, p: &Principal, v: &Value) -> Result<Value> {
+pub(super) fn hello_plan(db: &Connection, p: &Principal, v: &Value) -> Result<Value> {
+    let (_, _, b) = scope(db, p, false)?;
+    let changed = b["observation"]["bridge_boot_id"]
+        .as_str()
+        .is_some_and(|old| Some(old) != v["boot_id"].as_str());
+    Ok(json!({"old_boot":b["observation"]["bridge_boot_id"],
+        "owner":b["observation"]["managed_owner"],"changed":changed}))
+}
+
+pub(super) fn hello(
+    db: &mut Connection,
+    p: &Principal,
+    v: &Value,
+    verified: &Value,
+) -> Result<Value> {
     model::fields(
         v,
         &[
@@ -63,6 +77,7 @@ pub(super) fn hello(db: &mut Connection, p: &Principal, v: &Value) -> Result<Val
             "native_root_id",
             "native_scope_key",
             "native_ready",
+            "managed_owner",
         ],
     )?;
     let boot = model::text(v, "boot_id")?;
@@ -76,9 +91,26 @@ pub(super) fn hello(db: &mut Connection, p: &Principal, v: &Value) -> Result<Val
         ));
     }
     let old_boot = b["observation"]["bridge_boot_id"].as_str();
+    if verified["old_boot"] != b["observation"]["bridge_boot_id"]
+        || verified["owner"] != b["observation"]["managed_owner"]
+    {
+        return Err(Error::new(
+            "STALE_RECOVERY",
+            "module owner changed during OS inspection",
+        ));
+    }
+    if old_boot == Some(boot) && v.get("managed_owner") != b["observation"].get("managed_owner") {
+        return Err(Error::new(
+            "OWNER_MISMATCH",
+            "a live bridge cannot replace its process owner",
+        ));
+    }
+    let recovered = old_boot.is_some_and(|old| old != boot) && verified["departed"] == true;
+    let mut needs_recovery = false;
     if old_boot.is_some_and(|old| old != boot) {
         let possible:i64=tx.query_row("SELECT count(*) FROM operations WHERE binding_id=?1 AND binding_generation=?2 AND state IN ('sending','native_accepted','outcome_unknown','settled') AND method IN ('agent.open','task.dispatch','agent.send','agent.reply','agent.configure','agent.goal')",params![id,generation],|r|r.get(0))?;
-        if possible > 0 || !b["native_root_id"].is_null() {
+        needs_recovery = possible > 0 || !b["native_root_id"].is_null();
+        if needs_recovery && !recovered {
             return Err(Error::new(
                 "RECOVERY_REQUIRED",
                 "previous module may own native work; a new bridge must not spawn a second executor",
@@ -94,8 +126,21 @@ pub(super) fn hello(db: &mut Connection, p: &Principal, v: &Value) -> Result<Val
             "reconnect must identify the previously owned native session",
         ));
     }
-    tx.execute("UPDATE bindings SET state_json=json_set(state_json,'$.bridge_boot_id',?3,'$.module_link_id',?4,'$.connection','connected','$.connected_at_ms',?5),state=CASE WHEN native_root_id IS NOT NULL AND state='reconciling' AND ?6 THEN 'ready' ELSE state END WHERE binding_id=?1 AND generation=?2", params![id,generation,boot,p.link_id,model::now_ms()?,v["native_ready"]==true])?;
-    let result = json!({"binding_id":id,"generation":generation,"route":b["route"],"host_epoch":meta(&tx,"host_epoch")?,"native_root_id":b["native_root_id"]});
+    if recovered && v.get("managed_owner").is_none() {
+        return Err(Error::new(
+            "MANAGED_OWNER_REQUIRED",
+            "recovery requires the non-killing module launcher",
+        ));
+    }
+    if recovered && needs_recovery {
+        tx.execute("UPDATE bindings SET state='reconciling',state_json=json_set(state_json,'$.recovery_required',json('true'),'$.previous_bridge_boot_id',?3) WHERE binding_id=?1 AND generation=?2", params![id,generation,old_boot])?;
+        tx.execute("UPDATE operations SET state='outcome_unknown',updated_at_ms=?3 WHERE binding_id=?1 AND binding_generation=?2 AND state IN ('sending','native_accepted')",params![id,generation,model::now_ms()?])?;
+    }
+    if let Some(owner) = v.get("managed_owner") {
+        tx.execute("UPDATE bindings SET state_json=json_set(state_json,'$.managed_owner',json(?3)) WHERE binding_id=?1 AND generation=?2",params![id,generation,model::canonical(owner)?])?;
+    }
+    tx.execute("UPDATE bindings SET state_json=json_set(state_json,'$.bridge_boot_id',?3,'$.module_link_id',?4,'$.connection','connected','$.connected_at_ms',?5),state=CASE WHEN native_root_id IS NOT NULL AND state='reconciling' AND ?6 AND COALESCE(json_extract(state_json,'$.recovery_required'),0)=0 THEN 'ready' ELSE state END WHERE binding_id=?1 AND generation=?2", params![id,generation,boot,p.link_id,model::now_ms()?,v["native_ready"]==true])?;
+    let result = json!({"binding_id":id,"generation":generation,"route":b["route"],"host_epoch":meta(&tx,"host_epoch")?,"native_root_id":b["native_root_id"],"native_scope_key":b["native_scope_key"],"recovery_required":(recovered && needs_recovery) || b["observation"]["recovery_required"]==true});
     tx.commit()?;
     Ok(result)
 }
@@ -114,17 +159,18 @@ pub(super) fn next(db: &mut Connection, p: &Principal) -> Result<Value> {
     let row:Option<(String,String,String,i64)>=tx.query_row(
         "SELECT operation_id,method,original_request_json,created_at_ms FROM operations AS candidate
          WHERE binding_id=?1 AND binding_generation=?2 AND state='queued' AND due_at_ms<=?3
-           AND method IN ('agent.open','task.dispatch','agent.send','agent.reply','agent.configure','agent.goal','agent.refresh','agent.reconcile','agent.result')
-           AND (method IN ('agent.reply','agent.refresh','agent.reconcile','agent.result')
+           AND (COALESCE(json_extract(?4,'$.recovery_required'),0)=0 OR method IN ('agent.recover','agent.reconcile'))
+           AND method IN ('agent.open','task.dispatch','agent.send','agent.reply','agent.configure','agent.goal','agent.refresh','agent.reconcile','agent.result','agent.recover')
+           AND (method IN ('agent.reply','agent.refresh','agent.reconcile','agent.result','agent.recover')
              OR (method='agent.goal' AND json_extract(original_request_json,'$.action') IN ('pause','clear'))
              OR NOT EXISTS (SELECT 1 FROM operations AS pending
                WHERE pending.binding_id=?1 AND pending.binding_generation=?2
                  AND pending.state IN ('sending','native_accepted','outcome_unknown')
-                 AND pending.method IN ('agent.open','task.dispatch','agent.send','agent.configure','agent.goal')))
+                 AND pending.method IN ('agent.open','task.dispatch','agent.send','agent.configure','agent.goal','agent.recover')))
          ORDER BY CASE WHEN method='agent.reply' THEN 0
                        WHEN method='agent.goal' AND json_extract(original_request_json,'$.action') IN ('pause','clear') THEN 1
-                       WHEN method IN ('agent.refresh','agent.reconcile','agent.result') THEN 2 ELSE 3 END, due_at_ms, rowid LIMIT 1",
-        params![id,generation,model::now_ms()?],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+                       WHEN method IN ('agent.refresh','agent.reconcile','agent.result','agent.recover') THEN 2 ELSE 3 END, due_at_ms, rowid LIMIT 1",
+        params![id,generation,model::now_ms()?,model::canonical(&b["observation"])?],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
     let Some((op, method, raw, created)) = row else {
         return Ok(json!({"command":null}));
     };
@@ -136,7 +182,18 @@ pub(super) fn next(db: &mut Connection, p: &Principal) -> Result<Value> {
         if caller["disabled"] == true {
             return Err(Error::new("UNAUTHORIZED", "original caller disabled"));
         }
-        let starts_work = method == "agent.open"
+        let reconcile_starts_work = if method == "agent.reconcile" {
+            let target = operations::get_operation(&tx, model::text(&input, "operation_id")?)?;
+            matches!(
+                target["method"].as_str(),
+                Some("task.dispatch" | "agent.send" | "agent.goal" | "agent.recover")
+            )
+        } else {
+            false
+        };
+        let starts_work = reconcile_starts_work
+            || method == "agent.open"
+            || method == "agent.recover"
             || method == "task.dispatch"
             || (method == "agent.send" && input["delivery"] == "next_turn")
             || (method == "agent.goal"
@@ -148,6 +205,17 @@ pub(super) fn next(db: &mut Connection, p: &Principal) -> Result<Value> {
                 "ADMISSION_DISABLED",
                 "new work disabled before dispatch",
             ));
+        }
+        if method == "agent.recover" {
+            if caller["role"] != "operator"
+                || input["expected_boot_id"] != b["observation"]["bridge_boot_id"]
+                || b["observation"]["recovery_required"] != true
+            {
+                return Err(Error::new(
+                    "STALE_RECOVERY",
+                    "recovery must target this unresolved bridge boot",
+                ));
+            }
         }
         if method == "agent.open" {
             if b["state"] != "opening" || !b["native_root_id"].is_null() {
@@ -336,6 +404,19 @@ pub(super) fn outcome(db: &mut Connection, p: &Principal, v: &Value) -> Result<V
         // A failure may follow spawn: preserve ownership and its known native identity.
         tx.execute("UPDATE bindings SET state='reconciling',native_root_id=COALESCE(?3,native_root_id),native_scope_key=COALESCE(?4,native_scope_key),state_json=json_set(state_json,'$.opening_evidence',json(?5)) WHERE binding_id=?1 AND generation=?2",params![id,generation,r.native_root_id,r.native_scope_key,model::canonical(&r.details)?])?;
     }
+    if o["method"] == "agent.recover" && matches!(r.outcome, EffectOutcome::Applied) {
+        if r.native_root_id.as_deref() != b["native_root_id"].as_str()
+            || r.native_scope_key.as_deref() != b["native_scope_key"].as_str()
+            || r.details["completion_condition"] != "native_session_resumed"
+        {
+            return Err(Error::invalid(
+                "recovery must confirm the exact retained native session",
+            ));
+        }
+        if r.details["resume_boot_id"] == b["observation"]["bridge_boot_id"] {
+            tx.execute("UPDATE bindings SET state='ready',state_json=json_set(state_json,'$.recovery_required',json('false'),'$.last_recovery',json(?3)) WHERE binding_id=?1 AND generation=?2",params![id,generation,encoded])?;
+        }
+    }
     tx.execute("UPDATE operations SET state=?2,result_json=?3,native_refs_json=?4,settled_at_ms=?5,updated_at_ms=?6 WHERE operation_id=?1",params![r.operation_id,state,encoded,model::canonical(&json!({"session_id":r.native_root_id,"turn_id":r.turn_id}))?,if matches!(state,"outcome_unknown"|"native_accepted"){None}else{Some(now)},now])?;
     tx.execute("INSERT INTO observations(source_stream_id,source_event_key,binding_id,binding_generation,operation_id,kind,payload_json,recorded_at_ms) VALUES(?1,?2,?3,?4,?5,'runtime.outcome',?6,?7)",params![format!("module:{}",p.client_id),key,id,generation,r.operation_id,encoded,now])?;
     tx.commit()?;
@@ -432,7 +513,7 @@ fn is_recovery_control(method: &str, input: &Value, binding: &Value) -> bool {
         && binding["native_root_id"].is_string()
         && (matches!(
             method,
-            "agent.refresh" | "agent.reply" | "agent.reconcile" | "agent.result"
+            "agent.refresh" | "agent.reply" | "agent.reconcile" | "agent.result" | "agent.recover"
         ) || (method == "agent.goal"
             && matches!(input["action"].as_str(), Some("pause" | "clear"))))
 }
@@ -458,6 +539,18 @@ pub(super) fn user_command(
         let owns:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM attempts WHERE owner_id=?1 AND binding_id=?2 AND binding_generation=?3 AND released_at_ms IS NULL)",params![p.client_id,id,generation],|r|r.get(0))?;
         if !owns {
             return Err(Error::new("FORBIDDEN", "no assignment on this binding"));
+        }
+    }
+    if method == "agent.recover" {
+        p.require_operator()?;
+        model::text(v, "reason")?;
+        if v["expected_boot_id"] != b["observation"]["bridge_boot_id"]
+            || b["observation"]["recovery_required"] != true
+        {
+            return Err(Error::new(
+                "STALE_RECOVERY",
+                "use the current boot of a recovery-required binding",
+            ));
         }
     }
     if method == "agent.result" && v["selector"].as_object().is_none_or(|o| o.is_empty()) {
