@@ -184,9 +184,19 @@ is rechecked when a consumer is accepted. No cascade deletes already accepted co
 
 Public methods: `host.status/mode`, `client.register/list`, `task.create/get/list/revise/claim/dispatch/submit/submission/request_changes/accept/acceptance/invalidate_acceptance`, `attempt.get/release/bind_producer`, `agent.open/state/list/family/send/reply/configure/goal/refresh/reconcile/result`, `artifact.get/read/assemble/parts`, `route.list`, `operation.get/list/cancel`, `message.send/read`, `report.delta`. Module methods remain `module.hello/next/outcome/observe/result`. Export is a CLI client operation over get/read, not a remote arbitrary-file-write method.
 
-Next: implement the remaining Muse crash-recovery boundary and Task result/CheckRunner consumers; then direct OpenCode V2 on the same contract. Do not rebuild the core or reimplement result paging. Preserve the native shared-Codex and subscription targets. [SIWC notes](docs/runtime-notes.md) describe an optional OAuth route, not installed authorization. [OpenCodex Issue #1](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/1) remains after the main controller code.
+Next code slice: C06 CheckRunner, using the existing `check_runs`, Operation, artifact and acceptance contracts (implementation plan §10). Implement actual command execution and Cargo result handling with exact inputs, explicit process/resource disposition and retained output; do not manufacture a passed row or treat a worker result as a verified checkout. Then finish Muse bridge-process recovery and direct OpenCode V2 on the same contract. Do not rebuild the core or reimplement result paging. Preserve the native shared-Codex and subscription targets. [SIWC notes](docs/runtime-notes.md) describe an optional OAuth route, not installed authorization. [OpenCodex Issue #1](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/1) remains after the main controller code.
 
 ## Evidence and development
+
+**Recovery checked 2026-10-01:** the interrupted continuation did not advance `main` beyond
+`fe161da1ce5edd3514520e7ff6d6ff9cd5ea8978`; the latest build remains `01212a4e` below.
+Re-read both successful CI jobs and checked the mounted source/binary archives. No additional
+CheckRunner implementation was found in the current workspace or retained archives. The Linux
+artifact passed SHA-256/ZIP verification again; all 90 source files reconstructed the exact
+`158a147fa968149eb6c12764ed050e0682151e9b` tree. The old acceptance patch predates the already
+published fixes: do not reapply it, roll back, or restart SDK preparation. Resume with CheckRunner
+from the present code. This recovery changes documentation only; it does not rerun compilation,
+model calls or the previous synthetic invocation, and does not claim access to lost ephemeral files.
 
 **Current code checkpoint: `01212a4e2a646693a4d8dd44443779e670f6c555`.** The retained
 acceptance implementation was published on the exact `0c34b5e` main base in `bdc4bc17`.
