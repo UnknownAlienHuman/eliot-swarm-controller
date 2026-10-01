@@ -123,6 +123,20 @@ enum ArtifactCommand {
 }
 #[derive(Subcommand)]
 enum TaskCommand {
+    /// Accept the exact proposal as a separate decision owner after review.
+    Accept {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// Inspect one decision and its current/revoked status.
+    Acceptance {
+        acceptance_operation_id: String,
+    },
+    /// Revoke only the named acceptance, without restarting its producer.
+    InvalidateAcceptance {
+        #[arg(long)]
+        file: PathBuf,
+    },
     /// Submit an immutable retained candidate and a requirement report; not acceptance.
     Submit {
         #[arg(long)]
@@ -298,6 +312,16 @@ async fn run(cli: Cli) -> Result<()> {
             ("report.delta".into(), json!({"after":after,"limit":limit}))
         }
         Command::Task { command } => match command {
+            TaskCommand::Accept { file } => ("task.accept".into(), read_json(&file)?),
+            TaskCommand::Acceptance {
+                acceptance_operation_id,
+            } => (
+                "task.acceptance".into(),
+                json!({"acceptance_operation_id":acceptance_operation_id}),
+            ),
+            TaskCommand::InvalidateAcceptance { file } => {
+                ("task.invalidate_acceptance".into(), read_json(&file)?)
+            }
             TaskCommand::Submit { file } => ("task.submit".into(), read_json(&file)?),
             TaskCommand::RequestChanges { file } => {
                 ("task.request_changes".into(), read_json(&file)?)
@@ -406,6 +430,7 @@ async fn run(cli: Cli) -> Result<()> {
             | "artifact.read"
             | "artifact.parts"
             | "task.submission"
+            | "task.acceptance"
             | "task.get"
             | "task.list"
             | "attempt.get"

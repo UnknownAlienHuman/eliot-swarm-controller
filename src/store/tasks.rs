@@ -1,4 +1,4 @@
-use super::{meta, operations};
+use super::{acceptance, meta, operations};
 use crate::{
     error::{Error, Result},
     model::{self, Principal, StartOwner, TaskSpec},
@@ -7,7 +7,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
 
 pub(super) fn get_task(db: &Connection, id: &str) -> Result<Value> {
-    let raw:Option<String>=db.query_row("SELECT json_object('task_id',task_id,'project_id',project_id,'revision',revision,'state',state,'origin_key',origin_key,'spec',json(spec_json),'accepted_attempt_id',accepted_attempt_id,'accepted_operation_id',accepted_operation_id) FROM tasks WHERE task_id=?1",[id],|r|r.get(0)).optional()?;
+    let raw:Option<String>=db.query_row("SELECT json_object('task_id',task_id,'project_id',project_id,'revision',revision,'state',state,'origin_key',origin_key,'spec',json(spec_json),'accepted_attempt_id',accepted_attempt_id,'accepted_operation_id',accepted_operation_id,'accepted_revision',accepted_revision,'accepted_phase',accepted_phase,'accepted_candidate_ref',accepted_candidate_ref) FROM tasks WHERE task_id=?1",[id],|r|r.get(0)).optional()?;
     let mut task: Value =
         serde_json::from_str(&raw.ok_or_else(|| Error::new("NOT_FOUND", format!("Task {id}")))?)?;
     let owner: Option<String> = db
@@ -183,16 +183,7 @@ pub(super) fn claim(
     let spec: TaskSpec = serde_json::from_value(task["spec"].clone())?;
     let mut dependency_receipts = Vec::new();
     for d in &spec.dependencies {
-        let accepted:Option<String>=tx.query_row("SELECT accepted_operation_id FROM tasks WHERE task_id=?1 AND accepted_revision=?2 AND accepted_phase=?3 AND state='accepted'",params![d.task_id,d.required_revision,d.required_phase],|r|r.get(0)).optional()?;
-        let accepted = accepted.ok_or_else(|| {
-            Error::new(
-                "DEPENDENCY_NOT_READY",
-                format!(
-                    "{} revision {} phase {}",
-                    d.task_id, d.required_revision, d.required_phase
-                ),
-            )
-        })?;
+        let accepted = acceptance::resolve_dependency(tx, d)?;
         dependency_receipts.push(json!({"task_id":d.task_id,"acceptance_operation_id":accepted}));
     }
     let (binding, generation) = match (v.get("binding_id"), v.get("binding_generation")) {
@@ -247,9 +238,9 @@ pub(super) fn release(
     let attempt_id = model::text(v, "attempt_id")?;
     let outcome = model::text(v, "outcome")?;
     let reason = model::text(v, "reason")?;
-    if !["failed", "cancelled", "superseded"].contains(&outcome) {
+    if !["accepted", "failed", "cancelled", "superseded"].contains(&outcome) {
         return Err(Error::invalid(
-            "release outcome must be failed/cancelled/superseded; acceptance is a separate future path",
+            "release outcome must be accepted/failed/cancelled/superseded; accepted requires an existing decision",
         ));
     }
     if v["assignment_closed"] != true {
@@ -263,6 +254,20 @@ pub(super) fn release(
         return Ok(
             json!({"operation_id":id,"attempt_id":attempt_id,"released":true,"changed":false}),
         );
+    }
+    let accepted = a["state"] == "accepted" && acceptance::accepted_attempt(tx, &a)?;
+    if (outcome == "accepted") != accepted {
+        return Err(Error::new(
+            "ACCEPTANCE_STATE_MISMATCH",
+            "accepted ownership must be released as accepted; revoke the decision before changing its outcome",
+        ));
+    }
+    let held: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM check_runs WHERE attempt_id=?1 AND resource_claimed_at_ms IS NOT NULL AND resource_released_at_ms IS NULL)", [attempt_id], |r| r.get(0))?;
+    if held {
+        return Err(Error::new(
+            "CHECK_RESOURCE_HELD",
+            "check process disposition is unresolved",
+        ));
     }
     let unresolved:i64=tx.query_row("SELECT count(*) FROM operations WHERE attempt_id=?1 AND state IN ('sending','native_accepted','outcome_unknown')",[attempt_id],|r|r.get(0))?;
     if unresolved > 0 {

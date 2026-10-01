@@ -193,7 +193,7 @@ pub(super) fn finish(
     Ok(())
 }
 
-fn document(db: &Connection, submission_ref: &str) -> Result<Value> {
+pub(super) fn document(db: &Connection, submission_ref: &str) -> Result<Value> {
     let a = results::get(db, submission_ref)?;
     if a.kind != "task_submission" {
         return Err(Error::invalid("reference is not a Task submission"));
@@ -244,10 +244,14 @@ pub(super) fn describe(db: &Connection, v: &Value) -> Result<Value> {
     let a = tasks::get_attempt(db, model::text(&doc, "attempt_id")?)?;
     let t = tasks::get_task(db, model::text(&doc, "task_id")?)?;
     doc["submission_ref"] = json!(reference);
+    doc["latest_feedback_observation_id"] =
+        json!(super::acceptance::feedback_cursor(db, reference)?);
     doc["current"] = json!(
         a["submission_ref"] == reference
             && t["revision"] == doc["task_revision"]
-            && t["current_attempt_id"] == a["attempt_id"]
+            && (t["current_attempt_id"] == a["attempt_id"]
+                || (t["accepted_attempt_id"] == a["attempt_id"]
+                    && !t["accepted_operation_id"].is_null()))
     );
     doc["next_after"] = json!(next);
     doc["content_availability"] = json!("use artifact.read/export to verify the backing bytes");

@@ -132,6 +132,9 @@ pub struct Scope {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TaskSpec {
+    /// Absent policy does not block writing/submitting, but cannot imply acceptance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acceptance: Option<crate::acceptance::AcceptancePolicy>,
     pub objective: String,
     pub phase: String,
     pub requirements: Vec<Requirement>,
@@ -144,6 +147,9 @@ pub struct TaskSpec {
 }
 impl TaskSpec {
     pub fn validate(&self) -> Result<()> {
+        if let Some(policy) = &self.acceptance {
+            policy.validate()?;
+        }
         if self.objective.trim().is_empty()
             || self.phase.trim().is_empty()
             || self.requirements.is_empty()
@@ -239,6 +245,23 @@ pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
             "summary",
             "claims",
         ],
+        "task.accept" => &[
+            "client_request_id",
+            "attempt_id",
+            "expected_revision",
+            "submission_ref",
+            "candidate_ref",
+            "expected_feedback_observation_id",
+            "reason",
+            "reviews",
+            "check_ids",
+        ],
+        "task.invalidate_acceptance" => &[
+            "client_request_id",
+            "acceptance_operation_id",
+            "reason",
+            "evidence",
+        ],
         "task.request_changes" => &[
             "client_request_id",
             "attempt_id",
@@ -330,6 +353,12 @@ pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
     };
     fields(params, allowed)?;
     match method {
+        "task.accept" => {
+            crate::acceptance::AcceptRequest::parse(params)?;
+        }
+        "task.invalidate_acceptance" => {
+            crate::acceptance::InvalidateRequest::parse(params)?;
+        }
         "task.submit" => {
             crate::submission::SubmitRequest::parse(params)?;
         }

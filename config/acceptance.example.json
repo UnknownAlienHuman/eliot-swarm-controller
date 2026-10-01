@@ -1,0 +1,25 @@
+{
+  "attempt_id": "REPLACE_WITH_ATTEMPT_ID",
+  "expected_revision": 1,
+  "submission_ref": "REPLACE_WITH_SUBMISSION_REF",
+  "candidate_ref": "REPLACE_WITH_CANDIDATE_REF",
+  "expected_feedback_observation_id": 0,
+  "reason": "Reviewed the sealed proposal against every requirement of this revision.",
+  "reviews": [
+    {
+      "requirement_id": "W1",
+      "rationale": "REPLACE_WITH_ACTUAL_REVIEW_FINDING",
+      "evidence": [
+        "REPLACE_WITH_EXACT_CANDIDATE_ANCHOR"
+      ]
+    },
+    {
+      "requirement_id": "A1",
+      "rationale": "REPLACE_WITH_ACTUAL_REVIEW_FINDING",
+      "evidence": [
+        "REPLACE_WITH_ACTUAL_BUILD_OR_REVIEW_EVIDENCE"
+      ]
+    }
+  ],
+  "check_ids": []
+}

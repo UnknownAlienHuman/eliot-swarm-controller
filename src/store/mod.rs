@@ -1,4 +1,5 @@
 //! A single database owner. The async facade never holds a SQLite connection.
+mod acceptance;
 mod assembly;
 mod operations;
 mod producers;
@@ -114,6 +115,9 @@ impl Store {
         .await
     }
     pub async fn call(&self, principal: Principal, method: String, params: Value) -> Result<Value> {
+        if method == "task.accept" {
+            return self.accept_task(principal, params).await;
+        }
         if method == "task.submit" {
             return self.submit_task(principal, params).await;
         }
@@ -269,6 +273,42 @@ impl Store {
             self.run(move |db| submissions::finish(db, principal, &id, outcome))
                 .await?;
         }
+        Ok(receipt)
+    }
+    async fn accept_task(&self, principal: Principal, params: Value) -> Result<Value> {
+        let p = principal.clone();
+        let config = self.config.clone();
+        let receipt = self
+            .run(move |db| {
+                let p = current_principal(db, p)?;
+                p.require_operator()?;
+                mutate(db, &p, "task.accept", &params, &config)
+            })
+            .await?;
+        let id = model::text(&receipt, "operation_id")?.to_owned();
+        let start_id = id.clone();
+        let p = principal.clone();
+        if let Some(work) = self
+            .run(move |db| acceptance::begin(db, p, &start_id))
+            .await?
+        {
+            let outcome = match work {
+                Ok(records) => {
+                    self.file_io(move |files| {
+                        for record in &records {
+                            files.verify(record)?;
+                        }
+                        Ok(())
+                    })
+                    .await
+                }
+                Err(error) => Err(error),
+            };
+            self.run(move |db| acceptance::finish(db, principal, &id, outcome))
+                .await?;
+        }
+        // Like submission, acceptance keeps its original admission receipt. The
+        // current decision outcome is available via operation.get/task.acceptance.
         Ok(receipt)
     }
     async fn assemble_artifact(&self, principal: Principal, params: Value) -> Result<Value> {
@@ -457,6 +497,7 @@ fn is_read(method: &str) -> bool {
             | "artifact.parts"
             | "host.status"
             | "task.submission"
+            | "task.acceptance"
             | "task.get"
             | "task.list"
             | "attempt.get"
@@ -491,6 +532,7 @@ fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config
     match method {
         "artifact.get" => results::describe(db, p, v),
         "artifact.parts" => assembly::parts(db, v),
+        "task.acceptance" => acceptance::describe(db, v),
         "host.status" => {
             model::fields(v, &[])?;
             let tasks: i64 = db.query_row("SELECT count(*) FROM tasks", [], |r| r.get(0))?;
@@ -693,6 +735,13 @@ fn apply(
     match method {
         "artifact.assemble" => assembly::reserve(tx, p, v, id).map(|v| (v, true)),
         "task.submit" => submissions::reserve(tx, p, v, id).map(|v| (v, true)),
+        "task.accept" => acceptance::reserve(tx, p, v, id).map(|v| {
+            let queued = v.get("coalesced") != Some(&Value::Bool(true));
+            (v, queued)
+        }),
+        "task.invalidate_acceptance" => {
+            acceptance::invalidate(tx, p, v, id, now).map(|v| (v, false))
+        }
         "task.request_changes" => {
             submissions::request_changes(tx, p, v, id, now).map(|v| (v, false))
         }
@@ -782,7 +831,9 @@ fn apply(
                 let prior = operations::get_operation(tx, reply)?;
                 if !(prior["method"] == "message.send"
                     || (prior["method"] == "task.request_changes"
-                        && prior["result"]["applied"] == true))
+                        && prior["result"]["applied"] == true)
+                    || (prior["method"] == "task.invalidate_acceptance"
+                        && prior["result"]["message_id"] == reply))
                     || prior["result"]["recipient"] != p.client_id
                     || prior["result"]["sender"] != recipient
                 {
