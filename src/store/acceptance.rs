@@ -225,7 +225,7 @@ fn evidence(
         if op["method"] != "check.run"
             || op["state"] != "settled"
             || op["result"]["outcome"] != "applied"
-            || op["result"]["check_id"] != id
+            || op["result"]["check_id"] != id.as_str()
             || op["result"]["result_ref"] != c["result_ref"]
         {
             return Err(Error::new(
