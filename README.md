@@ -6,11 +6,11 @@ Headless modular Rust controller for native coding-agent harnesses; a prototype 
 
 The Rust core provides authenticated clients, task revisions/ownership, durable request receipts, directed mailbox, incremental reports, binding-scoped module admission, immutable artifacts, submission/review and acceptance. Windows uses user-restricted Named Pipes; Unix uses a private socket. No TCP control listener is opened.
 
-The Muse SDK bridge opens an explicitly selected native executable, delivers Task snapshots with per-turn effort, handles exact-turn steer/questions/goal/configuration, and reports observed children and run identities. A live bridge reconnects without closing Muse or replaying model input. Bridge.4 reads pinned native result pages without consuming `subagent/readResult`. Local whole-result assembly and verified export are implemented.
+The Muse SDK bridge opens an explicitly selected native executable, delivers Task snapshots with per-turn effort, handles exact-turn steer/questions/goal/configuration, and reports observed children and run identities. A live bridge reconnects without closing Muse or replaying model input. Bridge.5 retains a recovery checkpoint and supports explicit recovery of a recorded native session through the non-killing `module-run` owner. Pinned result reads do not consume `subagent/readResult`; local whole-result assembly and verified export are implemented.
 
 **CheckRunner executes configured commands on captured Git sources. Active cancellation and recovery of a recorded departed check worker are now implemented.** Cancellation does not stop the host or native agents. Recovery uses the worker lock and OS group identity; it does not infer success or replay a command.
 
-**Still pending:** Muse bridge-process crash/resume, complete native family reconstruction, automatic handoff, unresolved pre-identity check launches, reverse-dependency scope/cache reuse, direct OpenCode V2 and other native adapters, MCP and automatic module/service installation. Live Muse/Max inference and Windows native launch remain unqualified. Do not mark all C01–C03 complete.
+**Still pending:** live Muse resume qualification, missing-identity/native-outcome recovery gaps, complete native family reconstruction, automatic handoff, unresolved pre-identity check launches, reverse-dependency scope/cache reuse, direct OpenCode V2 and other native adapters, MCP and automatic module/service installation. Live Muse/Max inference and Windows native launch remain unqualified. Do not mark all C01–C03 complete.
 
 ## Build and run
 
@@ -39,7 +39,7 @@ After a lost reply, repeat the identical method/payload and request ID. Differen
 
 ## Native Muse, clients and task-specific children
 
-Follow [modules/muse/README.md](modules/muse/README.md). Enable a private route, reserve `agent.open`, register its scoped module credential, install the locked module-local SDK and independently launch the bridge using the installed native executable. The shipped route is disabled; its artifact version is **`muse-sdk-1.3.0-bridge.4`**. Local check changes do not require replacing a running bridge.
+Follow [modules/muse/README.md](modules/muse/README.md). Enable a private route, reserve `agent.open`, register its scoped module credential, install the locked module-local SDK and independently launch the bridge using the installed native executable. The shipped route is disabled; its artifact version is **`muse-sdk-1.3.0-bridge.5`**. Local check changes do not require replacing a running bridge.
 
 Native subscription/auth and effort remain in the harness. Requested effort, effective setting and observed inference are different evidence. No Go/API route silently substitutes for Muse Code Max. Full conversation history stays native.
 
@@ -54,9 +54,18 @@ swarm --data-dir C:\SwarmState --credential C:\SwarmState\W1.credential.json tas
 
 Mailbox readers have independent cursors. Module credentials are binding-scoped and cannot accept Tasks or become GM. Same-user roles coordinate trusted clients; they are not an OS sandbox.
 
+### Recorded Muse recovery
+
+For new managed launches, use `swarm module-run --state-dir MODULE_STATE --command ABSOLUTE_NODE_PATH -- BRIDGE_SCRIPT --config MODULE_CONFIG`; paths/argv stay separate. The module directory is distinct from the host directory. The owner holds its OS lock and waits for both the bridge and remaining native processes; losing the owner does not authorize replacing a still-live group.
+
+After the recorded old group has ended, a replacement bridge restores its checkpoint and the host marks that binding `reconciling`. Explicit operator `agent.recover` targets its current `expected_boot_id`. The bridge resumes the same known native session, not a fresh session/fork or replayed Task prompt. A historical open receipt can restore identity but not new-boot readiness. Only the correlated current-boot resume outcome makes the binding ready. Refer to [the module guide](modules/muse/README.md#recorded-session-recovery--bridge5) for the JSON request and failure boundaries.
+
+Existing unguarded bridges are not retroactively qualified. Unknown/corrupt checkpoint or process identity remains an explicit recovery gap; no force-reset or blanket retry is added. Live vendor resume/children/Max have not been exercised by the local process-owner invocation below.
+
+
 ## Complete results without model roundtrips
 
-Obtain native pages with `swarm result BINDING --generation 1 --file selector.json --offset N --length 65536`. Each settled `agent.result` provides `result.details.artifact_ref` and `next_offset_bytes`. Reuse the same selector, item revision and source digest for subsequent pages. Native source offsets and local page offsets are different. Native selectors are in the Muse module README.
+Obtain native pages with `swarm result BINDING --generation 1 --file selector.json --offset N --length 65536`. Each settled `agent.result` provides `result.details.artifact_ref` and `next_offset_bytes`. Reuse the same selector, item revision and source digest for subsequent pages. Native source offsets and local page offsets are different.
 
 Create `pages.json` with actual retained IDs in source-byte order:
 
@@ -167,21 +176,21 @@ Dependency lookup uses valid historical acceptance decisions. A newer producer r
 
 ## API and next code
 
-Public methods: `source.capture`, `check.run/get/profiles/cancel`, `host.status/mode`, `client.register/list`, `task.create/get/list/revise/claim/dispatch/submit/submission/request_changes/accept/acceptance/invalidate_acceptance`, `attempt.get/release/bind_producer`, `agent.open/state/list/family/send/reply/configure/goal/refresh/reconcile/result`, `artifact.get/read/assemble/parts`, `route.list`, `operation.get/list/cancel`, `message.send/read`, `report.delta`. Module methods: `module.hello/next/outcome/observe/result`. Export is a client operation, not a remote arbitrary-file-write method.
+Public methods: `source.capture`, `check.run/get/profiles/cancel`, `host.status/mode`, `client.register/list`, `task.create/get/list/revise/claim/dispatch/submit/submission/request_changes/accept/acceptance/invalidate_acceptance`, `attempt.get/release/bind_producer`, `agent.open/state/list/family/send/reply/configure/goal/refresh/reconcile/recover/result`, `artifact.get/read/assemble/parts`, `route.list`, `operation.get/list/cancel`, `message.send/read`, `report.delta`. Module methods: `module.hello/next/outcome/observe/result`. Export is a client operation, not a remote arbitrary-file-write method.
 
-**Next: Muse bridge-process crash recovery, then direct OpenCode V2 on the same host contract.** Recorded check-worker recovery is implemented; missing pre-identity launch evidence remains explicit. Do not reimplement source capture, results, submission, acceptance or CheckRunner. Preserve the native shared-Codex/subscription targets. [SIWC notes](docs/runtime-notes.md) describe an optional OAuth route, not installed auth. [OpenCodex Issue #1](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/1) remains after the main code.
+**Next: direct OpenCode V2 on the same host contract.** Recorded-session Muse recovery and recorded check-worker recovery are implemented; missing identity, unresolved native outcomes and actual vendor/Windows runtime qualification remain explicit. Do not repeat the recorded-recovery implementation solely because an older checkpoint called it pending. Do not reimplement source capture, results, submission, acceptance or CheckRunner. Preserve the native shared-Codex/subscription targets. [SIWC notes](docs/runtime-notes.md) describe an optional OAuth route, not installed auth. [OpenCodex Issue #1](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/1) remains after the main code.
 
 ## Evidence and development
 
-**Current code: `611f7c11c70d6d9be3c24e8f49d27c04e8816589`.** Cancellation/recovery were published in `4afb8b6c`; the Windows query-access import was corrected without widening permissions or suppressing warnings. On **2026-10-01**, exact [CI run 36832982495](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/36832982495) passed formatting, warnings-denied Clippy, Muse syntax/SDK import and release builds on **Windows and Linux**. Earlier Linux-only success is not used as evidence of the corrected Windows build.
+**Current code: `d385498b00fe1a049c357613a7777cc4a1c83f72`.** The interrupted continuation saved the module owner, checkpoint and controlled session-recovery implementation through `8a84e6be`; it was not lost. Recovery reconstructed its exact 104-file source tree from the CI artifact. A bounded invocation then found an actual runtime defect: changed-boot admission used nonexistent `operations.generation` instead of `binding_generation`. The single-query correction is in `d385498b`; schema, dependencies and native-module source are unchanged by that correction.
 
-Linux artifact `11147996922` passed ZIP/SHA-256 verification (`c2a6a391e383eb83f0c052f7f67ced3596b8d337b5aa527297a168324402501c`); its archive reconstructed exact tree `f3ff96f50db5287e62362f1f82870a47b4f08c2d`. No migration, package/dependency version, native module, table or permanent service was added by this change.
+On **2026-10-01**, exact [CI run 36872022736](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/36872022736) passed formatting, warnings-denied Clippy, Muse syntax/SDK import and release builds on **Windows and Linux**. Earlier green compilation alone did not catch the SQL execution error.
 
-A bounded invocation of that exact Linux binary used the real host/CLI and configured Python commands in a self-owned Git repository. It confirmed cancellation of an observed parent plus child, rejection of another manager's cancellation, identical-request replay and survival of an unrelated process; cancellation after parent exit; resource retention after killing the exact fixture worker while descendants still ran; eventual incomplete recovery and admission of a waiting check; cancellation across restart; unchanged terminal verdict on late cancellation; and orderly host shutdown.
+Corrected Linux artifact `11168070937` passed ZIP/SHA-256 verification (`7b1d8422ffbdb858cc984349f3087c63a97eec3f5e6162411ffa865095f2c1d5`); its 104 source files match the fixed tree `d385c392228da6213eb217739c885ceef62d5d2f`.
 
-Prepared-terminal recovery was exercised by **renaming the final completion receipt in the isolated fixture after stopping the host**, not by claiming a spontaneous crash: the original receipt bytes were restored and the command's retained start record did not change. No mock CheckRun, native model, user repository or broad test suite was used.
+The exact corrected Linux binary passed 13 directed assertions through the real host and `module-run`: live-owner exclusion, descendant survival after the fixture bridge and launcher were killed, no replacement until that recorded group ended, changed-boot admission, old-link rejection, delayed-open receipt without readiness, input refusal before resume, stale/disabled recovery rejection and correlated current-boot readiness. The real Node checkpoint writer serialized concurrent writes and read the last committed state. Both the remaining managed process and host exited cleanly.
 
-This does not qualify Windows Job execution, pidfd availability on every Linux kernel, deliberate process-group escape, Cargo runtime coverage, missing pre-identity launch evidence, cache or load. Windows lifecycle is compiled, not run here. Resume from the present code, not old acceptance patches or documentation-only recovery checkpoints.
+**Native open/resume outcomes in this invocation were synthetic module messages.** It exercised real OS ownership, Store and IPC, not Muse inference or a vendor SDK session. No new test modules, cargo test, native models, user repositories or system settings were involved. Windows Job runtime, actual Muse resume with children/Max, missing-identity windows, Cargo runtime/cache and load remain unqualified. The failed pre-fix invocation and successful corrected one are different evidence, not a renamed old pass.
 
 Historical baselines: C06 `c56f50a4` passed [CI 36828917649](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/36828917649) and a real-command invocation of capture, output, failure/source-change rejection, host restart and checked acceptance. Acceptance `01212a4e` passed [CI 36816310704](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/36816310704). Those are earlier evidence, not substitutes for this cancellation/recovery run.
 
