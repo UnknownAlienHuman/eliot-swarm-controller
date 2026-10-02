@@ -5,6 +5,7 @@ mod effects;
 mod execution;
 mod goal;
 mod http;
+mod prerequisites;
 mod results;
 mod snapshot;
 #[cfg(test)]
@@ -12,14 +13,15 @@ pub(crate) mod tests;
 
 use crate::error::{Error, Result};
 pub(crate) use configuration::{
-    AGENT_SETTINGS_REVISION_KIND, ConfigurationExpectation, INSTRUCTION_SETTINGS_REVISION_KIND,
-    MODEL_SETTINGS_REVISION_KIND, configuration_contract, configuration_expectation,
+    ConfigurationExpectation, ValidatedConfiguration, configuration_contract,
+    configuration_expectation,
 };
 pub(crate) use execution::{
     ExecutionRead, ExecutionScan, NativeInputDescriptor, SessionRead, SessionScan,
 };
 pub(crate) use goal::GOAL_CONTRACT_REVISION;
 pub(crate) use http::{EventReader, EventState, Service};
+pub(crate) use prerequisites::Validator as PrerequisiteValidator;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 

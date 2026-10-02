@@ -1,17 +1,23 @@
 //! Short, fixed native preparation chains. This is not a workflow engine:
 //! one Operation may name one earlier setup Operation on the same binding.
+//!
+//! This module is the generic receipt/barrier only: Operation and
+//! binding/generation ownership, earlier-Operation ordering, the typed
+//! completion boundary, digest/revision equality over validated evidence,
+//! the later-conflicting-evidence check, and observation freshness. All
+//! vendor interpretation of configuration evidence lives behind the
+//! runtime-side validator registry (`crate::runtime::prerequisites`),
+//! keyed by runtime kind; this module names no vendor types, kinds, or
+//! contract revisions.
 use crate::{
     error::{Error, Result},
     model,
-    runtime::opencode_v2::{self, ConfigurationExpectation},
+    runtime::prerequisites::{
+        EffectiveRecord, EffectiveSlot, Expectation, ValidatedEvidence, Validator, validator_for,
+    },
 };
 use rusqlite::{Connection, OptionalExtension, params};
-use serde_json::{Value, json};
-use std::collections::BTreeSet;
-
-const INSTRUCTION_STATE_CONTRACT_REVISION: &str = "opencode-configure-prerequisite-v1";
-const AGENT_STATE_CONTRACT_REVISION: &str = "opencode-session-agent-state-v1";
-const MODEL_STATE_CONTRACT_REVISION: &str = "opencode-session-model-state-v1";
+use serde_json::Value;
 
 #[derive(Debug)]
 pub(super) enum Gate {
@@ -60,12 +66,6 @@ impl Gate {
     }
 }
 
-pub(super) enum EffectiveConfiguration {
-    InstructionEntries(Value),
-    SessionAgent(Value),
-    SessionModel(Value),
-}
-
 struct StoredOperation {
     rowid: i64,
     operation_id: String,
@@ -93,15 +93,6 @@ type StoredOperationRow = (
     String,
     Option<String>,
 );
-
-struct ValidatedConfiguration {
-    expectation: ConfigurationExpectation,
-    settings_revision: String,
-    entries_revision: Option<String>,
-    agent_definition_digest: Option<String>,
-    model_definition_digest: Option<String>,
-    model_variant_digest: Option<String>,
-}
 
 fn load(db: &Connection, operation_id: &str) -> Result<StoredOperation> {
     let row: Option<StoredOperationRow> = db
@@ -160,84 +151,17 @@ fn load(db: &Connection, operation_id: &str) -> Result<StoredOperation> {
     })
 }
 
-fn sha256(value: &Value, field: &str) -> Result<String> {
-    let digest = model::text(value, field)?;
-    let hex = digest
-        .strip_prefix("sha256:")
-        .filter(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .ok_or_else(|| {
-            Error::new(
-                "PREREQUISITE_EVIDENCE_INVALID",
-                format!("{field} is not a SHA-256 reference"),
-            )
-        })?;
-    Ok(format!("sha256:{}", hex.to_ascii_lowercase()))
+fn binding_validator(binding: &Value) -> Option<Validator> {
+    validator_for(binding["route"]["runtime"].as_str().unwrap_or_default())
 }
 
-fn compact_model_ref(value: &Value) -> Result<Value> {
-    model::fields(value, &["id", "providerID", "variant"]).map_err(|_| {
-        Error::new(
-            "PREREQUISITE_EVIDENCE_INVALID",
-            "native model snapshot has an invalid model reference",
-        )
-    })?;
-    let invalid = || {
-        Error::new(
-            "PREREQUISITE_EVIDENCE_INVALID",
-            "native model snapshot has an invalid model reference",
-        )
-    };
-    let id = model::text(value, "id").map_err(|_| invalid())?;
-    let provider = model::text(value, "providerID").map_err(|_| invalid())?;
-    let variant = match value.get("variant") {
-        None | Some(Value::Null) => None,
-        Some(_) => Some(
-            model::text(value, "variant")
-                .map(str::to_owned)
-                .map_err(|_| invalid())?,
-        ),
-    };
-    if [id, provider]
-        .into_iter()
-        .chain(variant.as_deref())
-        .any(|part| {
-            part.is_empty() || part.len() > 256 || part.bytes().any(|byte| byte.is_ascii_control())
-        })
-    {
-        return Err(Error::new(
-            "PREREQUISITE_EVIDENCE_INVALID",
-            "native model snapshot has an invalid model reference",
-        ));
-    }
-    Ok(json!({"id":id,"providerID":provider,"variant":variant}))
-}
-
-fn expected_configuration(original: &Value) -> Result<ConfigurationExpectation> {
-    opencode_v2::configuration_expectation(&original["settings"]).map_err(|_| {
-        Error::new(
-            "PREREQUISITE_EVIDENCE_INVALID",
-            "saved configure request is not a supported OpenCode configuration change",
-        )
-    })
-}
-
-fn validate_contract(
-    operation: &StoredOperation,
-    binding: &Value,
-    expectation: &ConfigurationExpectation,
-) -> Result<()> {
+/// The generic half of contract validation: the recorded contract must
+/// order its effects on this exact binding generation. Every other
+/// contract field is adapter vocabulary and is checked by the validator.
+fn validate_order_scope(operation: &StoredOperation, binding: &Value) -> Result<()> {
     let contract = &operation.effective["operation_contract"];
-    if contract["effect_scope"] != "native_session"
-        || contract["completion_condition"] != "native_configuration_applied"
-        || contract["application_boundary"] != expectation.application_boundary()
-        || contract["replay_policy"] != "readback_only_no_mutation_replay"
-        || contract["fallback_used"] != false
-        || contract["contract_revision"] != expectation.contract_revision()
-        || contract["order_scope"]["binding_id"] != binding["binding_id"]
+    if contract["order_scope"]["binding_id"] != binding["binding_id"]
         || contract["order_scope"]["generation"] != binding["generation"]
-        || contract
-            .get("configuration_kind")
-            .is_some_and(|kind| kind != expectation.kind())
     {
         return Err(Error::new(
             "PREREQUISITE_CONTRACT_MISMATCH",
@@ -247,268 +171,54 @@ fn validate_contract(
     Ok(())
 }
 
-fn validate_evidence(details: &Value) -> Result<()> {
-    let evidence = model::text(details, "evidence")?;
-    let mutation_sent = details["mutation_sent"]
-        .as_bool()
-        .ok_or_else(|| Error::new("PREREQUISITE_EVIDENCE_INVALID", "missing mutation evidence"))?;
-    if !matches!(
-        (evidence, mutation_sent),
-        ("preexisting_exact_readback", false)
-            | ("post_mutation_exact_readback", true)
-            | ("exact_state_reconciliation", false)
-    ) {
-        return Err(Error::new(
-            "PREREQUISITE_EVIDENCE_INVALID",
-            "configure result has an unsupported readback proof",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_applied_result(
+fn validate_contract(
+    validator: &Validator,
     operation: &StoredOperation,
     binding: &Value,
+    expectation: &Expectation,
+) -> Result<()> {
+    validate_order_scope(operation, binding)?;
+    validator.validate_contract(expectation, &operation.effective["operation_contract"])
+}
+
+/// The generic half of result validation: the settled result envelope
+/// must belong to this Operation and to this binding's native root. The
+/// adapter-owned details are validated by the validator.
+fn validate_applied_result(
+    validator: &Validator,
+    operation: &StoredOperation,
+    binding: &Value,
+    expectation: &Expectation,
     result: &Value,
-) -> Result<ValidatedConfiguration> {
-    let expectation = expected_configuration(&operation.original)?;
-    validate_contract(operation, binding, &expectation)?;
-    let details = &result["details"];
+) -> Result<ValidatedEvidence> {
     if result["operation_id"] != operation.operation_id
         || result["outcome"] != "applied"
         || result["native_root_id"] != binding["native_root_id"]
         || result["native_scope_key"] != binding["native_scope_key"]
-        || details["completion_condition"] != "native_configuration_applied"
-        || details["configuration_kind"] != expectation.kind()
-        || details["action"] != expectation.action()
-        || details["application_scope"] != "session"
-        || details["application_boundary"] != expectation.application_boundary()
-        || details["native_applied"] != true
-        || details["model_work_started"] != false
-        || details["replay_policy"] != "readback_only_no_mutation_replay"
-        || details["contract_revision"] != expectation.contract_revision()
-        || details["settings_revision_kind"] != expectation.settings_revision_kind()
-        || details["read_method"] != expectation.read_method()
     {
         return Err(Error::new(
             "PREREQUISITE_EVIDENCE_INVALID",
             "configure result does not prove the required typed native application",
         ));
     }
-    match expectation.desired_digest() {
-        Some(expected) if details["desired_digest"].as_str() == Some(expected) => {}
-        None if details["desired_digest"].is_null() => {}
-        _ => {
-            return Err(Error::new(
-                "PREREQUISITE_EVIDENCE_INVALID",
-                "configure result does not match the saved requested value",
-            ));
-        }
-    }
-    validate_evidence(details)?;
-    let settings_revision = sha256(details, "settings_revision")?;
-    let (entries_revision, agent_definition_digest, model_definition_digest, model_variant_digest) =
-        match &expectation {
-            ConfigurationExpectation::InstructionEntry { action, key, .. } => {
-                if details["action"].as_str() != Some(action.as_str())
-                    || details["key"].as_str() != Some(key.as_str())
-                {
-                    return Err(Error::new(
-                        "PREREQUISITE_EVIDENCE_INVALID",
-                        "instruction-entry result does not match the saved target",
-                    ));
-                }
-                (Some(sha256(details, "entries_revision")?), None, None, None)
-            }
-            ConfigurationExpectation::SessionAgent { agent_id, .. } => {
-                if details["agent_id"].as_str() != Some(agent_id.as_str())
-                    || details["catalog_verified"] != true
-                    || !matches!(
-                        details["agent_mode"].as_str(),
-                        Some("subagent" | "primary" | "all")
-                    )
-                    || details["agent_hidden"].as_bool().is_none()
-                    || details["agent_model_override"].as_bool().is_none()
-                {
-                    return Err(Error::new(
-                        "PREREQUISITE_EVIDENCE_INVALID",
-                        "session-agent result does not match the saved target",
-                    ));
-                }
-                sha256(details, "agent_catalog_revision")?;
-                (
-                    None,
-                    Some(sha256(details, "agent_definition_digest")?),
-                    None,
-                    None,
-                )
-            }
-            ConfigurationExpectation::SessionModel { model, .. } => {
-                if details["model"] != json!(model)
-                    || details["catalog_verified"] != true
-                    || details["model_enabled"] != true
-                    || !matches!(
-                        details["model_status"].as_str(),
-                        Some("alpha" | "beta" | "deprecated" | "active")
-                    )
-                {
-                    return Err(Error::new(
-                        "PREREQUISITE_EVIDENCE_INVALID",
-                        "session-model result does not match the saved route target",
-                    ));
-                }
-                sha256(details, "model_catalog_revision")?;
-                (
-                    None,
-                    None,
-                    Some(sha256(details, "model_definition_digest")?),
-                    Some(sha256(details, "model_variant_digest")?),
-                )
-            }
-        };
-    Ok(ValidatedConfiguration {
+    validator.validate_applied(
         expectation,
-        settings_revision,
-        entries_revision,
-        agent_definition_digest,
-        model_definition_digest,
-        model_variant_digest,
-    })
-}
-
-fn snapshot_matches(binding: &Value, validated: &ValidatedConfiguration) -> Result<Option<bool>> {
-    match &validated.expectation {
-        ConfigurationExpectation::InstructionEntry {
-            action,
-            key,
-            desired_digest,
-        } => {
-            let configuration = &binding["observation"]["native"]["configuration"];
-            if configuration["complete"] != true {
-                return Ok(None);
-            }
-            sha256(configuration, "revision")?;
-            let entries = configuration["owned_entries"].as_array().ok_or_else(|| {
-                Error::new(
-                    "PREREQUISITE_EVIDENCE_INVALID",
-                    "invalid native configuration snapshot",
-                )
-            })?;
-            let mut keys = BTreeSet::new();
-            let mut found = None;
-            for entry in entries {
-                let observed_key = model::text(entry, "key")?;
-                if !keys.insert(observed_key.to_owned()) {
-                    return Err(Error::new(
-                        "PREREQUISITE_EVIDENCE_INVALID",
-                        "native configuration snapshot contains a duplicate key",
-                    ));
-                }
-                let digest = sha256(entry, "value_digest")?;
-                if observed_key == key {
-                    found = Some(digest);
-                }
-            }
-            Ok(Some(match action.as_str() {
-                "put" => found.as_deref() == desired_digest.as_deref(),
-                "remove" => found.is_none(),
-                _ => false,
-            }))
-        }
-        ConfigurationExpectation::SessionAgent { agent_id, .. } => {
-            let agent = &binding["observation"]["native"]["agent_configuration"];
-            if agent["complete"] != true {
-                return Ok(None);
-            }
-            let revision = sha256(agent, "settings_revision")?;
-            let definition = match agent["definition_digest"].as_str() {
-                Some(_) => Some(sha256(agent, "definition_digest")?),
-                None if agent["definition_digest"].is_null() => None,
-                None => {
-                    return Err(Error::new(
-                        "PREREQUISITE_EVIDENCE_INVALID",
-                        "native agent snapshot has an invalid definition digest",
-                    ));
-                }
-            };
-            Ok(Some(
-                agent["agent_id"].as_str() == Some(agent_id.as_str())
-                    && revision == validated.settings_revision
-                    && definition.as_deref() == validated.agent_definition_digest.as_deref(),
-            ))
-        }
-        ConfigurationExpectation::SessionModel {
-            model: expected, ..
-        } => {
-            let observed = &binding["observation"]["native"]["model_configuration"];
-            if observed["complete"] != true {
-                return Ok(None);
-            }
-            let revision = sha256(observed, "settings_revision")?;
-            sha256(observed, "catalog_revision")?;
-            let definition = match observed["definition_digest"].as_str() {
-                Some(_) => Some(sha256(observed, "definition_digest")?),
-                None if observed["definition_digest"].is_null() => None,
-                None => {
-                    return Err(Error::new(
-                        "PREREQUISITE_EVIDENCE_INVALID",
-                        "native model snapshot has an invalid definition digest",
-                    ));
-                }
-            };
-            let variant = match observed["variant_digest"].as_str() {
-                Some(_) => Some(sha256(observed, "variant_digest")?),
-                None if observed["variant_digest"].is_null() => None,
-                None => {
-                    return Err(Error::new(
-                        "PREREQUISITE_EVIDENCE_INVALID",
-                        "native model snapshot has an invalid variant digest",
-                    ));
-                }
-            };
-            let model_matches = observed
-                .get("model")
-                .filter(|model| model.is_object())
-                .map(compact_model_ref)
-                .transpose()?
-                .is_some_and(|model| model == json!(expected));
-            Ok(Some(
-                model_matches
-                    && observed["enabled"] == true
-                    && matches!(
-                        observed["status"].as_str(),
-                        Some("alpha" | "beta" | "deprecated" | "active")
-                    )
-                    && revision == validated.settings_revision
-                    && definition.as_deref() == validated.model_definition_digest.as_deref()
-                    && variant.as_deref() == validated.model_variant_digest.as_deref(),
-            ))
-        }
-    }
-}
-
-fn same_effective(expected: &ValidatedConfiguration, later: &ValidatedConfiguration) -> bool {
-    if expected.expectation != later.expectation {
-        return false;
-    }
-    match &expected.expectation {
-        ConfigurationExpectation::InstructionEntry { .. } => true,
-        ConfigurationExpectation::SessionAgent { .. }
-        | ConfigurationExpectation::SessionModel { .. } => {
-            expected.settings_revision == later.settings_revision
-        }
-    }
+        &operation.effective["operation_contract"],
+        &result["details"],
+    )
 }
 
 fn current_configuration(
     db: &Connection,
     binding: &Value,
+    validator: &Validator,
     prerequisite: &StoredOperation,
     current_rowid: i64,
-    validated: &ValidatedConfiguration,
+    validated: &ValidatedEvidence,
 ) -> Result<Gate> {
     let binding_id = model::text(binding, "binding_id")?;
     let generation = model::positive(binding, "generation")?;
+    let validated_scope = validator.evidence_scope(validated)?;
     let mut latest_settled_at = prerequisite.settled_at_ms.ok_or_else(|| {
         Error::new(
             "PREREQUISITE_EVIDENCE_INVALID",
@@ -528,17 +238,17 @@ fn current_configuration(
     drop(stmt);
     for operation_id in ids {
         let operation = load(db, &operation_id)?;
-        let later_expectation = expected_configuration(&operation.original)?;
-        if !validated.expectation.same_scope(&later_expectation) {
+        let later_expectation = validator.parse_expectation(&operation.original)?;
+        if validator.scope(&later_expectation)? != validated_scope {
             continue;
         }
-        validate_contract(&operation, binding, &later_expectation)?;
+        validate_contract(validator, &operation, binding, &later_expectation)?;
         match operation.state.as_str() {
             "queued" | "sending" | "native_accepted" | "outcome_unknown" => {
                 return Ok(Gate::Pending {
                     operation_id: prerequisite.operation_id.clone(),
                     blocking_operation_id: Some(operation_id),
-                    contract_revision: validated.expectation.contract_revision().to_owned(),
+                    contract_revision: validator.evidence_contract_revision(validated)?.to_owned(),
                 });
             }
             "rejected" | "cancelled" => continue,
@@ -549,14 +259,20 @@ fn current_configuration(
                         "later settled configuration has no typed result",
                     )
                 })?;
-                let later = validate_applied_result(&operation, binding, result)?;
-                if !validated.expectation.same_scope(&later.expectation) {
+                let later = validate_applied_result(
+                    validator,
+                    &operation,
+                    binding,
+                    &later_expectation,
+                    result,
+                )?;
+                if !validator.evidence_same_scope(validated, &later)? {
                     return Err(Error::new(
                         "PREREQUISITE_EVIDENCE_INVALID",
                         "later configuration changed scope during validation",
                     ));
                 }
-                latest_matches = same_effective(validated, &later);
+                latest_matches = validator.same_effective(validated, &later)?;
                 latest_settled_at = operation.settled_at_ms.ok_or_else(|| {
                     Error::new(
                         "PREREQUISITE_EVIDENCE_INVALID",
@@ -575,14 +291,15 @@ fn current_configuration(
 
     let snapshot_time = binding["observation"]["observed_at_ms"].as_i64();
     if snapshot_time.is_some_and(|observed| observed >= latest_settled_at)
-        && let Some(matches) = snapshot_matches(binding, validated)?
+        && let Some(matches) =
+            validator.snapshot_matches(validated, &binding["observation"]["native"])?
     {
         latest_matches = matches;
     }
     if latest_matches {
         Ok(Gate::Ready {
             operation_id: prerequisite.operation_id.clone(),
-            contract_revision: validated.expectation.contract_revision().to_owned(),
+            contract_revision: validator.evidence_contract_revision(validated)?.to_owned(),
         })
     } else {
         Ok(Gate::Failed(Error::new(
@@ -598,12 +315,12 @@ fn gate_for_id(
     current_rowid: i64,
     operation_id: &str,
 ) -> Result<Gate> {
-    if binding["route"]["runtime"] != opencode_v2::RUNTIME {
+    let Some(validator) = binding_validator(binding) else {
         return Ok(Gate::Failed(Error::new(
             "UNSUPPORTED_PREREQUISITE",
             "this runtime does not implement persisted configure-to-input prerequisites",
         )));
-    }
+    };
     let prerequisite = load(db, operation_id)?;
     if prerequisite.rowid >= current_rowid {
         return Ok(Gate::Failed(Error::new(
@@ -620,14 +337,17 @@ fn gate_for_id(
             "prerequisite must be an agent.configure Operation on this exact binding generation",
         )));
     }
-    let expectation = match expected_configuration(&prerequisite.original) {
+    let expectation = match validator.parse_expectation(&prerequisite.original) {
         Ok(expectation) => expectation,
         Err(error) => return Ok(Gate::Failed(error)),
     };
-    if let Err(error) = validate_contract(&prerequisite, binding, &expectation) {
+    if let Err(error) = validate_contract(&validator, &prerequisite, binding, &expectation) {
         return Ok(Gate::Failed(error));
     }
-    let contract_revision = expectation.contract_revision().to_owned();
+    let contract_revision = match validator.contract_revision(&expectation) {
+        Ok(revision) => revision.to_owned(),
+        Err(error) => return Ok(Gate::Failed(error)),
+    };
     match prerequisite.state.as_str() {
         "queued" | "sending" | "native_accepted" | "outcome_unknown" => Ok(Gate::Pending {
             operation_id: prerequisite.operation_id,
@@ -641,9 +361,17 @@ fn gate_for_id(
                     "settled prerequisite has no typed result",
                 )));
             };
-            match validate_applied_result(&prerequisite, binding, result).and_then(|validated| {
-                current_configuration(db, binding, &prerequisite, current_rowid, &validated)
-            }) {
+            match validate_applied_result(&validator, &prerequisite, binding, &expectation, result)
+                .and_then(|validated| {
+                    current_configuration(
+                        db,
+                        binding,
+                        &validator,
+                        &prerequisite,
+                        current_rowid,
+                        &validated,
+                    )
+                }) {
                 Ok(gate) => Ok(gate),
                 Err(error) => Ok(Gate::Failed(error)),
             }
@@ -705,13 +433,16 @@ pub(super) fn for_operation(
     gate_for_id(db, binding, current.rowid, operation_id)
 }
 
+/// Validate an applied configure result and build the effective record
+/// the caller folds into binding state. Generic ownership checks happen
+/// here; every adapter-owned check happens in the validator.
 pub(super) fn applied_configuration(
     db: &Connection,
     binding: &Value,
     operation_id: &str,
     result: &Value,
     observed_at_ms: i64,
-) -> Result<EffectiveConfiguration> {
+) -> Result<EffectiveRecord> {
     let operation = load(db, operation_id)?;
     if operation.method != "agent.configure"
         || operation.binding_id.as_deref() != binding["binding_id"].as_str()
@@ -722,223 +453,42 @@ pub(super) fn applied_configuration(
             "configuration result is outside this exact binding generation",
         ));
     }
-    let validated = validate_applied_result(&operation, binding, result)?;
-    match validated.expectation {
-        ConfigurationExpectation::InstructionEntry { .. } => {
-            Ok(EffectiveConfiguration::InstructionEntries(json!({
-                "kind":opencode_v2::INSTRUCTION_SETTINGS_REVISION_KIND,
-                "revision":validated.settings_revision,
-                "entries_revision":validated.entries_revision,
-                "operation_id":operation_id,
-                "key":result["details"]["key"],
-                "action":result["details"]["action"],
-                "desired_digest":result["details"]["desired_digest"],
-                "complete":true,
-                "source":"exact_configuration_result",
-                "observed_at_ms":observed_at_ms,
-                "contract_revision":INSTRUCTION_STATE_CONTRACT_REVISION
-            })))
-        }
-        ConfigurationExpectation::SessionAgent { agent_id, .. } => {
-            Ok(EffectiveConfiguration::SessionAgent(json!({
-                "kind":opencode_v2::AGENT_SETTINGS_REVISION_KIND,
-                "revision":validated.settings_revision,
-                "operation_id":operation_id,
-                "agent_id":agent_id,
-                "definition_digest":validated.agent_definition_digest,
-                "desired_digest":result["details"]["desired_digest"],
-                "complete":true,
-                "source":"exact_configuration_result",
-                "observed_at_ms":observed_at_ms,
-                "contract_revision":AGENT_STATE_CONTRACT_REVISION
-            })))
-        }
-        ConfigurationExpectation::SessionModel { model, .. } => {
-            Ok(EffectiveConfiguration::SessionModel(json!({
-                "kind":opencode_v2::MODEL_SETTINGS_REVISION_KIND,
-                "revision":validated.settings_revision,
-                "operation_id":operation_id,
-                "model":model,
-                "definition_digest":validated.model_definition_digest,
-                "variant_digest":validated.model_variant_digest,
-                "desired_digest":result["details"]["desired_digest"],
-                "complete":true,
-                "source":"exact_configuration_result",
-                "observed_at_ms":observed_at_ms,
-                "contract_revision":MODEL_STATE_CONTRACT_REVISION
-            })))
-        }
-    }
+    let validator = binding_validator(binding).ok_or_else(|| {
+        Error::new(
+            "UNSUPPORTED_PREREQUISITE",
+            "this runtime does not implement persisted configure-to-input prerequisites",
+        )
+    })?;
+    let expectation = validator.parse_expectation(&operation.original)?;
+    let validated = validate_applied_result(&validator, &operation, binding, &expectation, result)?;
+    validator.applied_record(&validated, operation_id, result, observed_at_ms)
 }
 
+/// Fold a native observation into effective-configuration records via the
+/// binding runtime's validator. Runtimes without a registered validator
+/// produce no records.
 pub(super) fn observed_configurations(
     binding: &Value,
     native_state: &Value,
     observation_id: i64,
     observed_at_ms: i64,
-) -> Result<Vec<EffectiveConfiguration>> {
-    let mut updates = Vec::new();
-    let configuration = &native_state["configuration"];
-    if configuration["complete"] == true {
-        let revision = sha256(configuration, "revision")?;
-        let prior = &binding["observation"]["effective_settings"];
-        let operation_id = if prior["kind"] == opencode_v2::INSTRUCTION_SETTINGS_REVISION_KIND
-            && prior["contract_revision"] == INSTRUCTION_STATE_CONTRACT_REVISION
-            && prior["complete"] == true
-            && prior["revision"] == revision
-        {
-            prior["operation_id"].clone()
-        } else {
-            Value::Null
-        };
-        updates.push(EffectiveConfiguration::InstructionEntries(json!({
-            "kind":opencode_v2::INSTRUCTION_SETTINGS_REVISION_KIND,
-            "revision":revision,
-            "operation_id":operation_id,
-            "complete":true,
-            "source":"native_snapshot",
-            "observation_id":observation_id,
-            "observed_at_ms":observed_at_ms,
-            "contract_revision":INSTRUCTION_STATE_CONTRACT_REVISION
-        })));
-    }
+) -> Result<Vec<EffectiveRecord>> {
+    let Some(validator) = binding_validator(binding) else {
+        return Ok(Vec::new());
+    };
+    validator.observed_records(
+        &binding["observation"],
+        native_state,
+        observation_id,
+        observed_at_ms,
+    )
+}
 
-    let agent = &native_state["agent_configuration"];
-    if agent["complete"] == true {
-        let revision = sha256(agent, "settings_revision")?;
-        let definition_digest = match agent["definition_digest"].as_str() {
-            Some(_) => Some(sha256(agent, "definition_digest")?),
-            None if agent["definition_digest"].is_null() => None,
-            None => {
-                return Err(Error::new(
-                    "PREREQUISITE_EVIDENCE_INVALID",
-                    "native agent snapshot has an invalid definition digest",
-                ));
-            }
-        };
-        let prior = &binding["observation"]["effective_agent"];
-        let operation_id = if prior["kind"] == opencode_v2::AGENT_SETTINGS_REVISION_KIND
-            && prior["contract_revision"] == AGENT_STATE_CONTRACT_REVISION
-            && prior["complete"] == true
-            && prior["revision"] == revision
-        {
-            prior["operation_id"].clone()
-        } else {
-            Value::Null
-        };
-        updates.push(EffectiveConfiguration::SessionAgent(json!({
-            "kind":opencode_v2::AGENT_SETTINGS_REVISION_KIND,
-            "revision":revision,
-            "operation_id":operation_id,
-            "agent_id":agent["agent_id"],
-            "definition_digest":definition_digest,
-            "complete":true,
-            "source":"native_snapshot",
-            "observation_id":observation_id,
-            "observed_at_ms":observed_at_ms,
-            "contract_revision":AGENT_STATE_CONTRACT_REVISION
-        })));
+/// The binding-state JSON path a folded effective record belongs to.
+pub(super) fn slot_path(slot: EffectiveSlot) -> &'static str {
+    match slot {
+        EffectiveSlot::Settings => "$.effective_settings",
+        EffectiveSlot::Agent => "$.effective_agent",
+        EffectiveSlot::Model => "$.effective_model",
     }
-
-    let model_state = &native_state["model_configuration"];
-    if model_state["complete"] == true {
-        let revision = sha256(model_state, "settings_revision")?;
-        sha256(model_state, "catalog_revision")?;
-        let selected = match model_state.get("model") {
-            Some(value) if value.is_object() => compact_model_ref(value)?,
-            Some(value) if value.is_null() => Value::Null,
-            _ => {
-                return Err(Error::new(
-                    "PREREQUISITE_EVIDENCE_INVALID",
-                    "native model snapshot has an invalid model reference",
-                ));
-            }
-        };
-        let definition_digest = match model_state["definition_digest"].as_str() {
-            Some(_) => Some(sha256(model_state, "definition_digest")?),
-            None if model_state["definition_digest"].is_null() => None,
-            None => {
-                return Err(Error::new(
-                    "PREREQUISITE_EVIDENCE_INVALID",
-                    "native model snapshot has an invalid definition digest",
-                ));
-            }
-        };
-        let variant_digest = match model_state["variant_digest"].as_str() {
-            Some(_) => Some(sha256(model_state, "variant_digest")?),
-            None if model_state["variant_digest"].is_null() => None,
-            None => {
-                return Err(Error::new(
-                    "PREREQUISITE_EVIDENCE_INVALID",
-                    "native model snapshot has an invalid variant digest",
-                ));
-            }
-        };
-        let enabled = match model_state.get("enabled") {
-            Some(value) if value.is_boolean() || value.is_null() => value.clone(),
-            _ => {
-                return Err(Error::new(
-                    "PREREQUISITE_EVIDENCE_INVALID",
-                    "native model snapshot has an invalid enabled flag",
-                ));
-            }
-        };
-        let status = match model_state.get("status") {
-            Some(value) if value.is_null() => Value::Null,
-            Some(value)
-                if matches!(
-                    value.as_str(),
-                    Some("alpha" | "beta" | "deprecated" | "active")
-                ) =>
-            {
-                value.clone()
-            }
-            _ => {
-                return Err(Error::new(
-                    "PREREQUISITE_EVIDENCE_INVALID",
-                    "native model snapshot has an invalid status",
-                ));
-            }
-        };
-        let inconsistent = if selected.is_null() {
-            definition_digest.is_some()
-                || variant_digest.is_some()
-                || !enabled.is_null()
-                || !status.is_null()
-        } else {
-            definition_digest.is_none() || enabled.is_null() || status.is_null()
-        };
-        if inconsistent {
-            return Err(Error::new(
-                "PREREQUISITE_EVIDENCE_INVALID",
-                "native model snapshot contains inconsistent selected-model evidence",
-            ));
-        }
-        let prior = &binding["observation"]["effective_model"];
-        let operation_id = if prior["kind"] == opencode_v2::MODEL_SETTINGS_REVISION_KIND
-            && prior["contract_revision"] == MODEL_STATE_CONTRACT_REVISION
-            && prior["complete"] == true
-            && prior["revision"] == revision
-        {
-            prior["operation_id"].clone()
-        } else {
-            Value::Null
-        };
-        updates.push(EffectiveConfiguration::SessionModel(json!({
-            "kind":opencode_v2::MODEL_SETTINGS_REVISION_KIND,
-            "revision":revision,
-            "operation_id":operation_id,
-            "model":selected,
-            "definition_digest":definition_digest,
-            "variant_digest":variant_digest,
-            "enabled":enabled,
-            "status":status,
-            "complete":true,
-            "source":"native_snapshot",
-            "observation_id":observation_id,
-            "observed_at_ms":observed_at_ms,
-            "contract_revision":MODEL_STATE_CONTRACT_REVISION
-        })));
-    }
-    Ok(updates)
 }

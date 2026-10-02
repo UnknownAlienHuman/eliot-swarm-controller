@@ -130,6 +130,19 @@ impl ConfigurationExpectation {
     }
 }
 
+/// Evidence proven by validating one settled configure result against its
+/// saved expectation: the effective revision that now holds natively, plus
+/// the per-kind digests the observation check compares against.
+#[derive(Clone, Debug)]
+pub(crate) struct ValidatedConfiguration {
+    pub(crate) expectation: ConfigurationExpectation,
+    pub(crate) settings_revision: String,
+    pub(crate) entries_revision: Option<String>,
+    pub(crate) agent_definition_digest: Option<String>,
+    pub(crate) model_definition_digest: Option<String>,
+    pub(crate) model_variant_digest: Option<String>,
+}
+
 #[derive(Clone)]
 enum ChangeAction {
     Put(Value),

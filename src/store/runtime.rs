@@ -395,7 +395,10 @@ pub(super) fn outcome(db: &mut Connection, p: &Principal, v: &Value) -> Result<V
     let now = model::now_ms()?;
     let result_value = serde_json::to_value(&r)?;
     let applied_configuration = if o["method"] == "agent.configure"
-        && b["route"]["runtime"] == crate::runtime::opencode_v2::RUNTIME
+        && crate::runtime::prerequisites::validator_for(
+            b["route"]["runtime"].as_str().unwrap_or_default(),
+        )
+        .is_some()
         && matches!(r.outcome, EffectOutcome::Applied)
     {
         Some(prerequisites::applied_configuration(
@@ -482,26 +485,13 @@ pub(super) fn outcome(db: &mut Connection, p: &Principal, v: &Value) -> Result<V
         tx.execute("UPDATE bindings SET state='reconciling',native_root_id=COALESCE(?3,native_root_id),native_scope_key=COALESCE(?4,native_scope_key),state_json=json_set(state_json,'$.opening_evidence',json(?5)) WHERE binding_id=?1 AND generation=?2",params![id,generation,r.native_root_id,r.native_scope_key,model::canonical(&r.details)?])?;
     }
     if let Some(configuration) = applied_configuration {
-        match configuration {
-            prerequisites::EffectiveConfiguration::InstructionEntries(settings) => {
-                tx.execute(
-                    "UPDATE bindings SET state_json=json_set(state_json,'$.effective_settings',json(?3)) WHERE binding_id=?1 AND generation=?2",
-                    params![id, generation, model::canonical(&settings)?],
-                )?;
-            }
-            prerequisites::EffectiveConfiguration::SessionAgent(agent) => {
-                tx.execute(
-                    "UPDATE bindings SET state_json=json_set(state_json,'$.effective_agent',json(?3)) WHERE binding_id=?1 AND generation=?2",
-                    params![id, generation, model::canonical(&agent)?],
-                )?;
-            }
-            prerequisites::EffectiveConfiguration::SessionModel(model_state) => {
-                tx.execute(
-                    "UPDATE bindings SET state_json=json_set(state_json,'$.effective_model',json(?3)) WHERE binding_id=?1 AND generation=?2",
-                    params![id, generation, model::canonical(&model_state)?],
-                )?;
-            }
-        }
+        tx.execute(
+            &format!(
+                "UPDATE bindings SET state_json=json_set(state_json,'{}',json(?3)) WHERE binding_id=?1 AND generation=?2",
+                prerequisites::slot_path(configuration.slot)
+            ),
+            params![id, generation, model::canonical(&configuration.value)?],
+        )?;
     }
     if o["method"] == "agent.recover" && matches!(r.outcome, EffectOutcome::Applied) {
         if r.native_root_id.as_deref() != b["native_root_id"].as_str()
@@ -572,33 +562,17 @@ pub(super) fn observe(db: &mut Connection, p: &Principal, v: &Value) -> Result<V
         tx.commit()?;
         return Ok(json!({"recorded":true,"stale":true}));
     }
-    let observed_configurations = if b["route"]["runtime"] == crate::runtime::opencode_v2::RUNTIME {
-        prerequisites::observed_configurations(&b, &v["state"], observation_id, now)?
-    } else {
-        Vec::new()
-    };
+    let observed_configurations =
+        prerequisites::observed_configurations(&b, &v["state"], observation_id, now)?;
     tx.execute("UPDATE bindings SET state_json=json_set(state_json,'$.native',json(?3),'$.observed_at_ms',?4,'$.native_sequence',?5,'$.native_observation_id',?6) WHERE binding_id=?1 AND generation=?2",params![id,generation,encoded,now,sequence,observation_id])?;
     for configuration in observed_configurations {
-        match configuration {
-            prerequisites::EffectiveConfiguration::InstructionEntries(settings) => {
-                tx.execute(
-                    "UPDATE bindings SET state_json=json_set(state_json,'$.effective_settings',json(?3)) WHERE binding_id=?1 AND generation=?2",
-                    params![id, generation, model::canonical(&settings)?],
-                )?;
-            }
-            prerequisites::EffectiveConfiguration::SessionAgent(agent) => {
-                tx.execute(
-                    "UPDATE bindings SET state_json=json_set(state_json,'$.effective_agent',json(?3)) WHERE binding_id=?1 AND generation=?2",
-                    params![id, generation, model::canonical(&agent)?],
-                )?;
-            }
-            prerequisites::EffectiveConfiguration::SessionModel(model_state) => {
-                tx.execute(
-                    "UPDATE bindings SET state_json=json_set(state_json,'$.effective_model',json(?3)) WHERE binding_id=?1 AND generation=?2",
-                    params![id, generation, model::canonical(&model_state)?],
-                )?;
-            }
-        }
+        tx.execute(
+            &format!(
+                "UPDATE bindings SET state_json=json_set(state_json,'{}',json(?3)) WHERE binding_id=?1 AND generation=?2",
+                prerequisites::slot_path(configuration.slot)
+            ),
+            params![id, generation, model::canonical(&configuration.value)?],
+        )?;
     }
     if v["state"]["turns"].is_array() || v["state"]["observed_children"].is_array() {
         let mut stmt = tx.prepare("SELECT attempt_id, producers_json FROM attempts WHERE binding_id=?1 AND binding_generation=?2 AND released_at_ms IS NULL")?;
