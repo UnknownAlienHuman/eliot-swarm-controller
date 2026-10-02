@@ -25,12 +25,29 @@
 //! retried. A failed transport is dropped, never silently retried: the
 //! next tool call reconnects first.
 //!
-//! Proposed, **not implemented** (R20): an MCP Tasks projection of
-//! Operations — this facade returns Operation handles for polling with
-//! `operation_get` instead — and RMCP subscriptions; bounded-lag and
-//! resync semantics for subscriptions are a future contract, not current
-//! behavior. Fact: the facade keeps no cache; authoritative reads are
-//! forwarded to the host with no stale-on-error caching.
+//! Tasks projection (R20, Documentation Program §17.1): the server
+//! advertises the `io.modelcontextprotocol/tasks` extension. When the
+//! client declares the same extension, a mutation whose Operation is
+//! still in flight returns an MCP task seed whose `taskId` is the
+//! existing Operation's ID; the Operation stays the single authority
+//! for state, acceptance and completion, and this facade stores no task
+//! state of its own. `tasks/get` projects the Operation read model
+//! (`operation.get`, plus the Operation's exact pending native-input
+//! attention items from `report.attention`, mapped to elicitation input
+//! requests). `tasks/cancel` submits the existing addressed
+//! `operation.cancel` — which only cancels queued Operations — so an
+//! in-flight Operation refuses with the store's own reason instead of
+//! inventing a parallel cancel path. RMCP's `TaskManager` is never
+//! used: nothing in this facade executes work a second time. Clients
+//! that do not declare the extension receive exactly the pre-Tasks
+//! responses (the durable Operation handle in the structured result).
+//! `tasks/update` is deliberately not implemented: a pending native
+//! input is answered by the addressed `agent_reply` tool call, which is
+//! a durable Operation of its own, not by a free-form elicitation
+//! response. Subscriptions (§17.3) remain **not implemented** — that is
+//! slice S8, a future contract, not current behavior. Fact: the facade
+//! keeps no cache; authoritative reads are forwarded to the host with
+//! no stale-on-error caching.
 
 use crate::{
     config::{Config, Ipc},
@@ -41,9 +58,11 @@ use crate::{
 use rmcp::{
     ErrorData as McpError, ServerHandler, ServiceExt,
     model::{
-        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
-        ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
-        ToolAnnotations,
+        CallToolRequestParams, CallToolResponse, CallToolResult, CancelTaskParams, ContentBlock,
+        CreateTaskResult, DetailedTask, ElicitRequest, ElicitRequestParams, ElicitationSchema,
+        GetTaskParams, GetTaskResult, Implementation, InputRequest, InputRequests, ListToolsResult,
+        PaginatedRequestParams, ServerCapabilities, ServerConfig, Task as McpTask, TaskPayload,
+        Tool, ToolAnnotations,
     },
     service::{RequestContext, RoleServer},
     transport::stdio,
@@ -586,6 +605,34 @@ pub struct McpFacade {
 }
 
 impl McpFacade {
+    /// One forwarded request over the lazily connected IPC link. A failed
+    /// link is never reused or silently retried under a possibly
+    /// different outcome; the next request reconnects first.
+    async fn request(&self, method: &str, params: Value) -> Result<Value> {
+        let mut client = self.client.lock().await;
+        if client.is_none() {
+            *client =
+                Some(ipc::Client::connect(&self.root, &self.credential, &self.ipc_config).await?);
+        }
+        let connected = client.as_mut().expect("client connected above");
+        match connected.request(method, params).await {
+            Ok(result) => Ok(result),
+            Err(e) => {
+                if matches!(
+                    e.code.as_str(),
+                    "DISCONNECTED"
+                        | "OUTCOME_UNKNOWN"
+                        | "PROTOCOL_ERROR"
+                        | "IO_ERROR"
+                        | "WRITE_TIMEOUT"
+                ) {
+                    *client = None;
+                }
+                Err(e)
+            }
+        }
+    }
+
     async fn call(&self, method: &str, mut params: Value, read_only: bool) -> CallToolResult {
         let mut generated_request_id = None;
         if !read_only {
@@ -598,15 +645,7 @@ impl McpFacade {
                 generated_request_id = Some(id);
             }
         }
-        let mut client = self.client.lock().await;
-        if client.is_none() {
-            match ipc::Client::connect(&self.root, &self.credential, &self.ipc_config).await {
-                Ok(connected) => *client = Some(connected),
-                Err(e) => return tool_error(e),
-            }
-        }
-        let connected = client.as_mut().expect("client connected above");
-        match connected.request(method, params).await {
+        match self.request(method, params).await {
             Ok(mut result) => {
                 if let Some(id) = generated_request_id
                     && let Value::Object(map) = &mut result
@@ -615,21 +654,74 @@ impl McpFacade {
                 }
                 CallToolResult::structured(result)
             }
-            Err(e) => {
-                // A failed link is never reused or silently retried under a
-                // possibly different outcome; the next call reconnects.
-                if matches!(
-                    e.code.as_str(),
-                    "DISCONNECTED"
-                        | "OUTCOME_UNKNOWN"
-                        | "PROTOCOL_ERROR"
-                        | "IO_ERROR"
-                        | "WRITE_TIMEOUT"
-                ) {
-                    *client = None;
-                }
-                tool_error(e)
+            Err(e) => tool_error(e),
+        }
+    }
+
+    /// The full task projection of one Operation, read fresh from the
+    /// host. This is a read model only: it stores nothing and executes
+    /// nothing.
+    async fn project_task(&self, task_id: &str) -> Result<DetailedTask> {
+        let operation = self
+            .request("operation.get", json!({"operation_id": task_id}))
+            .await?;
+        let inputs = if is_terminal_state(&operation) {
+            InputRequests::new()
+        } else {
+            self.pending_inputs(&operation).await?
+        };
+        Ok(project_operation(&operation, inputs))
+    }
+
+    /// The Operation's pending native-input items, taken from the same
+    /// `report.attention` projection managers read (§8.3) so there is
+    /// exactly one definition of a pending attention item. Every page is
+    /// read: a page cut could silently drop a pending request, which
+    /// would understate what the task is waiting for.
+    async fn pending_inputs(&self, operation: &Value) -> Result<InputRequests> {
+        if operation["binding_id"].as_str().is_none() {
+            return Ok(InputRequests::new());
+        }
+        let mut items = Vec::new();
+        let mut after = 0_i64;
+        loop {
+            let page = self
+                .request("report.attention", json!({"after": after, "limit": 200}))
+                .await?;
+            if let Some(batch) = page["items"].as_array() {
+                items.extend(batch.iter().cloned());
             }
+            let total = page["total_items"].as_i64().unwrap_or(0);
+            let next = page["next_after"].as_i64().unwrap_or(after);
+            if next <= after || next >= total {
+                break;
+            }
+            after = next;
+        }
+        Ok(pending_input_requests(operation, &items))
+    }
+
+    /// Convert a finished mutation reply into the MCP task seed for its
+    /// Operation — only for Tasks-negotiated clients, and only while
+    /// the Operation is still in flight. Anything else (terminal
+    /// Operations, error replies, replies without an Operation handle,
+    /// a failed readback) keeps the plain result the caller would have
+    /// received before the Tasks projection existed; a mutation that
+    /// already succeeded never fails retroactively here.
+    async fn task_seed_response(&self, result: CallToolResult) -> CallToolResponse {
+        let Some(operation_id) = result
+            .structured_content
+            .as_ref()
+            .filter(|_| result.is_error != Some(true))
+            .and_then(|value| value["operation_id"].as_str().map(str::to_owned))
+        else {
+            return result.into();
+        };
+        match self.project_task(&operation_id).await {
+            Ok(detailed) if !detailed.status().is_terminal() => {
+                CallToolResponse::Task(CreateTaskResult::new(detailed.task))
+            }
+            _ => result.into(),
         }
     }
 }
@@ -640,23 +732,242 @@ fn tool_error(error: Error) -> CallToolResult {
     )])
 }
 
+/// Map an application error onto the JSON-RPC surface of `tasks/*`,
+/// preserving the ELIOT code and message verbatim in `data`.
+fn protocol_error(error: Error) -> McpError {
+    let data = json!({"code": error.code, "message": error.message});
+    match error.code.as_str() {
+        "NOT_FOUND" | "INVALID_PARAMS" => {
+            McpError::invalid_params(error.message.clone(), Some(data))
+        }
+        _ => McpError::internal_error(error.message.clone(), Some(data)),
+    }
+}
+
+fn is_terminal_state(operation: &Value) -> bool {
+    matches!(
+        operation["state"].as_str(),
+        Some("settled" | "rejected" | "cancelled")
+    )
+}
+
+/// How `tasks/cancel` treats an Operation in this state. This mirrors
+/// `operation.cancel` exactly: only a queued Operation can be cancelled
+/// through it, a terminal one needs no cancellation, and an in-flight
+/// one is refused — already-sent work requires native
+/// cancellation/reconciliation, never local deletion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CancelAction {
+    Ack,
+    Submit,
+    Refuse,
+}
+
+fn cancel_action(state: &str) -> CancelAction {
+    match state {
+        "settled" | "rejected" | "cancelled" => CancelAction::Ack,
+        "queued" => CancelAction::Submit,
+        _ => CancelAction::Refuse,
+    }
+}
+
+/// Suggested `tasks/get` poll interval. Operations settle on native
+/// evidence, which is slow relative to a local read; one second keeps
+/// polling cheap without busy-looping the host.
+const TASK_POLL_INTERVAL_MS: u64 = 1000;
+
+/// Project one Operation record (the `operation.get` shape) into the
+/// MCP `DetailedTask` shape. Pure: the caller supplies the Operation
+/// and its pending input requests.
+///
+/// State mapping: `settled` → completed with the Operation's own
+/// recorded result as the tool result; `rejected` → failed with the
+/// recorded admission/native error preserved in `data`; `cancelled` →
+/// cancelled; every in-flight state (`queued`, `sending`,
+/// `native_accepted`, `outcome_unknown`, …) → working, or
+/// input_required while exact native input requests are pending.
+/// `outcome_unknown` stays working on purpose: the Operation has not
+/// failed, its outcome is simply not yet proven, and the status
+/// message names the exact ELIOT state.
+fn project_operation(operation: &Value, input_requests: InputRequests) -> DetailedTask {
+    let state = operation["state"].as_str().unwrap_or("unknown");
+    let payload = match state {
+        "settled" => TaskPayload::Completed {
+            result: completed_result(operation),
+        },
+        "rejected" => TaskPayload::Failed {
+            error: failure_error(operation),
+        },
+        "cancelled" => TaskPayload::Cancelled,
+        _ if !input_requests.is_empty() => TaskPayload::InputRequired { input_requests },
+        _ => TaskPayload::Working,
+    };
+    let task = McpTask::new(
+        operation["operation_id"].as_str().unwrap_or_default(),
+        payload.status(),
+        iso8601_utc(operation["created_at_ms"].as_i64().unwrap_or(0)),
+        iso8601_utc(operation["updated_at_ms"].as_i64().unwrap_or(0)),
+    )
+    .with_status_message(format!(
+        "{} operation is {}",
+        operation["method"].as_str().unwrap_or("unknown"),
+        state
+    ))
+    .with_poll_interval_ms(TASK_POLL_INTERVAL_MS);
+    DetailedTask::new(task, payload)
+}
+
+/// The terminal result of a settled Operation, in the same
+/// `CallToolResult` shape a non-Tasks client receives in the mutation
+/// reply: structured content is the Operation's recorded result.
+fn completed_result(operation: &Value) -> Map<String, Value> {
+    let result = operation["result"].clone();
+    let structured = if result.is_object() {
+        result
+    } else {
+        json!({"result": result})
+    };
+    match serde_json::to_value(CallToolResult::structured(structured)) {
+        Ok(Value::Object(map)) => map,
+        _ => Map::new(),
+    }
+}
+
+/// The failure of a rejected Operation. The wire `code` is the generic
+/// JSON-RPC internal-error code; the exact ELIOT error object is
+/// preserved verbatim in `data`.
+fn failure_error(operation: &Value) -> Map<String, Value> {
+    let stored = operation["result"].clone();
+    let message = stored["message"]
+        .as_str()
+        .unwrap_or("operation rejected")
+        .to_string();
+    let mut error = Map::new();
+    error.insert("code".to_string(), json!(-32603));
+    error.insert("message".to_string(), json!(message));
+    error.insert("data".to_string(), stored);
+    error
+}
+
+/// Filter the unified attention projection down to the Operation's own
+/// pending native-input requests and map each to an elicitation input
+/// request keyed by its native request ID. An item qualifies only by an
+/// exact recorded address: kind `waiting_for_native_request` and the
+/// Operation's own binding/generation. Nothing is paraphrased into a
+/// form schema: the native request's own shape stays with the native
+/// runtime, and the answer is the addressed `agent_reply` tool call.
+fn pending_input_requests(operation: &Value, attention_items: &[Value]) -> InputRequests {
+    let (Some(binding_id), Some(generation)) = (
+        operation["binding_id"].as_str(),
+        operation["binding_generation"].as_i64(),
+    ) else {
+        return InputRequests::new();
+    };
+    let mut requests = InputRequests::new();
+    for item in attention_items {
+        if item["kind"].as_str() != Some("waiting_for_native_request")
+            || item["binding_id"].as_str() != Some(binding_id)
+            || item["generation"].as_i64() != Some(generation)
+        {
+            continue;
+        }
+        let Some(request_id) = item["address"]["request_id"].as_str() else {
+            continue;
+        };
+        requests.insert(
+            request_id.to_string(),
+            InputRequest::Elicitation(ElicitRequest::new(
+                ElicitRequestParams::FormElicitationParams {
+                    meta: None,
+                    message: input_request_message(item),
+                    requested_schema: ElicitationSchema::new(Default::default()),
+                },
+            )),
+        );
+    }
+    requests
+}
+
+fn input_request_message(item: &Value) -> String {
+    let address = &item["address"];
+    let text = |key: &str| address[key].as_str().unwrap_or("unknown");
+    let mut message = format!(
+        "Native {} request {} in session {} is waiting for a decision",
+        text("request_kind"),
+        text("request_id"),
+        text("session_id"),
+    );
+    if let Some(fingerprint) = address["fingerprint"].as_str() {
+        message.push_str(&format!(" (fingerprint {fingerprint})"));
+    }
+    message.push_str(&format!(
+        ". Answer it with the agent_reply tool for binding {} generation {}: \
+         a reply is a durable addressed operation of its own, so \
+         tasks/update is not supported for it.",
+        text("binding_id"),
+        address["generation"],
+    ));
+    message
+}
+
+/// Format epoch milliseconds as an ISO 8601 UTC timestamp (the wire
+/// shape MCP task timestamps use). The crate carries no date library;
+/// operations store epoch ms, so convert directly.
+fn iso8601_utc(ms: i64) -> String {
+    let days = ms.div_euclid(86_400_000);
+    let day_ms = ms.rem_euclid(86_400_000);
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
+        day_ms / 3_600_000,
+        day_ms / 60_000 % 60,
+        day_ms / 1_000 % 60,
+        day_ms % 1_000
+    )
+}
+
+/// Days since the Unix epoch → (year, month, day), proleptic Gregorian
+/// (Howard Hinnant's civil-from-days algorithm).
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m as u32, d as u32)
+}
+
 impl ServerHandler for McpFacade {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new(
-                "eliot-swarm-controller",
-                env!("CARGO_PKG_VERSION"),
-            ))
-            .with_instructions(
-                "Tools map one-to-one onto the swarm controller's application API and are \
-                 executed against the running host over local IPC with the configured \
-                 credential. Mutations accept a stable client_request_id: supply and \
-                 retain your own before dispatch if a mutation must be safely retryable \
-                 after a lost reply. When it is omitted, a generated ID is echoed only \
-                 in a received result and cannot make a retry safe if that response \
-                 itself was lost. Operations returned by mutations are durable handles \
-                 to poll with operation_get.",
-            )
+        ServerConfig::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_tasks()
+                .build(),
+        )
+        .with_server_info(Implementation::new(
+            "eliot-swarm-controller",
+            env!("CARGO_PKG_VERSION"),
+        ))
+        .with_instructions(
+            "Tools map one-to-one onto the swarm controller's application API and are \
+             executed against the running host over local IPC with the configured \
+             credential. Mutations accept a stable client_request_id: supply and \
+             retain your own before dispatch if a mutation must be safely retryable \
+             after a lost reply. When it is omitted, a generated ID is echoed only \
+             in a received result and cannot make a retry safe if that response \
+             itself was lost. Operations returned by mutations are durable handles \
+             to poll with operation_get. If the client declares the \
+             io.modelcontextprotocol/tasks extension, a mutation whose operation is \
+             still in flight instead returns an MCP task whose taskId is that \
+             operation's ID: poll it with tasks/get, and cancel a still-queued \
+             operation with tasks/cancel. Pending native inputs surfaced by \
+             tasks/get are answered with the agent_reply tool, not tasks/update.",
+        )
     }
 
     async fn list_tools(
@@ -687,7 +998,7 @@ impl ServerHandler for McpFacade {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResponse, McpError> {
         let Some((read_only, spec)) = find_tool(&request.name) else {
             return Err(McpError::method_not_found::<
@@ -698,8 +1009,95 @@ impl ServerHandler for McpFacade {
             .arguments
             .map(Value::Object)
             .unwrap_or_else(|| json!({}));
-        Ok(self.call(spec.method, params, *read_only).await.into())
+        let result = self.call(spec.method, params, *read_only).await;
+        // SEP-2663: a task handle is returned only to a client that
+        // declared the tasks extension, and only for mutations; every
+        // other response is byte-identical to the pre-Tasks facade.
+        if *read_only || !client_tasks_negotiated(&context) {
+            return Ok(result.into());
+        }
+        Ok(self.task_seed_response(result).await)
     }
+
+    /// SEP-2663 `tasks/get`: project the Operation the taskId names.
+    /// The Operation store is the only state read; an unknown taskId is
+    /// the store's own NOT_FOUND.
+    async fn get_task(
+        &self,
+        request: GetTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> std::result::Result<GetTaskResult, McpError> {
+        let detailed = self
+            .project_task(&request.task_id)
+            .await
+            .map_err(protocol_error)?;
+        Ok(GetTaskResult::new(detailed))
+    }
+
+    /// SEP-2663 `tasks/cancel`: submit the existing addressed
+    /// `operation.cancel` for a queued Operation. A terminal Operation
+    /// is acknowledged (there is nothing to cancel); an in-flight one
+    /// is refused with the store's reason, because already-sent work
+    /// requires native cancellation/reconciliation. The ack is
+    /// cooperative: the resulting state is observed via `tasks/get`.
+    async fn cancel_task(
+        &self,
+        request: CancelTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> std::result::Result<(), McpError> {
+        let operation = self
+            .request("operation.get", json!({"operation_id": request.task_id}))
+            .await
+            .map_err(protocol_error)?;
+        let state = operation["state"].as_str().unwrap_or_default();
+        match cancel_action(state) {
+            CancelAction::Ack => Ok(()),
+            CancelAction::Refuse => Err(McpError::invalid_request(
+                format!(
+                    "operation {} is {state}: tasks/cancel submits operation_cancel, \
+                     which cancels only queued operations",
+                    request.task_id
+                ),
+                Some(json!({
+                    "code": "NOT_QUEUED",
+                    "message": "already-sent operations require native cancellation/reconciliation, not local deletion",
+                })),
+            )),
+            CancelAction::Submit => {
+                let cancel = json!({
+                    "operation_id": request.task_id,
+                    "reason": "mcp tasks/cancel",
+                    "client_request_id": model::new_id(),
+                });
+                match self.request("operation.cancel", cancel).await {
+                    Ok(_) => Ok(()),
+                    Err(e) if matches!(e.code.as_str(), "NOT_QUEUED" | "CONFLICT") => {
+                        // The operation left the queued state while the
+                        // cancel was in flight; if it is terminal now,
+                        // there is nothing left to cancel.
+                        let current = self
+                            .request("operation.get", json!({"operation_id": request.task_id}))
+                            .await
+                            .map_err(protocol_error)?;
+                        match cancel_action(current["state"].as_str().unwrap_or_default()) {
+                            CancelAction::Ack => Ok(()),
+                            _ => Err(protocol_error(e)),
+                        }
+                    }
+                    Err(e) => Err(protocol_error(e)),
+                }
+            }
+        }
+    }
+}
+
+/// Whether the connected client declared the tasks extension during
+/// initialize — the gate for returning task handles from `tools/call`
+/// and the same check the RMCP router applies to `tasks/*` methods.
+fn client_tasks_negotiated(context: &RequestContext<RoleServer>) -> bool {
+    context
+        .client_capabilities()
+        .is_some_and(|caps| caps.supports_tasks())
 }
 
 /// Serve MCP over stdio until the client disconnects. The host connection is
@@ -760,3 +1158,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod tasks_tests;
