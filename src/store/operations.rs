@@ -1,4 +1,4 @@
-use super::{meta, tasks};
+use super::{meta, prerequisites, tasks};
 use crate::{
     config::Config,
     error::{Error, Result},
@@ -8,7 +8,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
 
 pub(super) fn get_operation(db: &Connection, id: &str) -> Result<Value> {
-    let raw:Option<String>=db.query_row("SELECT json_object('operation_id',operation_id,'caller_id',caller_id,'method',method,'state',state,'task_id',task_id,'attempt_id',attempt_id,'binding_id',binding_id,'binding_generation',binding_generation,'native_refs',json(native_refs_json),'result',json(result_json),'created_at_ms',created_at_ms,'updated_at_ms',updated_at_ms) FROM operations WHERE operation_id=?1",[id],|r|r.get(0)).optional()?;
+    let raw:Option<String>=db.query_row("SELECT json_object('operation_id',operation_id,'caller_id',caller_id,'method',method,'state',state,'task_id',task_id,'attempt_id',attempt_id,'binding_id',binding_id,'binding_generation',binding_generation,'prerequisite_operation_id',prerequisite_operation_id,'operation_contract',json_extract(effective_request_json,'$.operation_contract'),'native_refs',json(native_refs_json),'result',json(result_json),'created_at_ms',created_at_ms,'updated_at_ms',updated_at_ms) FROM operations WHERE operation_id=?1",[id],|r|r.get(0)).optional()?;
     Ok(serde_json::from_str(&raw.ok_or_else(|| {
         Error::new("NOT_FOUND", format!("Operation {id}"))
     })?)?)
@@ -59,7 +59,15 @@ pub(super) fn dispatch(
     id: &str,
     now: i64,
 ) -> Result<(Value, bool)> {
-    model::fields(v, &["client_request_id", "attempt_id", "text"])?;
+    model::fields(
+        v,
+        &[
+            "client_request_id",
+            "attempt_id",
+            "text",
+            "prerequisite_operation_id",
+        ],
+    )?;
     let attempt = model::text(v, "attempt_id")?;
     let body = model::text(v, "text")?;
     let a = tasks::get_attempt(tx, attempt)?;
@@ -77,9 +85,11 @@ pub(super) fn dispatch(
             |r| r.get(0),
         )?;
         let prior: Value = serde_json::from_str(&prior)?;
-        if prior["text"] != body {
+        if prior["text"] != body
+            || prior.get("prerequisite_operation_id") != v.get("prerequisite_operation_id")
+        {
             return Err(Error::conflict(
-                "initial delivery already exists with different input; use correction, not dispatch",
+                "initial delivery already exists with different input or setup prerequisite; use correction, not dispatch",
             ));
         }
         return Ok((
@@ -110,10 +120,34 @@ pub(super) fn dispatch(
             "native binding has not been observed ready",
         ));
     }
-    tx.execute("UPDATE operations SET task_id=?2,attempt_id=?3,binding_id=?4,binding_generation=?5,effective_request_json=?6 WHERE operation_id=?1",params![id,a["task_id"].as_str(),attempt,binding,generation,model::canonical(&json!({"route":b["route"],"input":body,"task_snapshot":a["task_snapshot"]}))?])?;
+    let prerequisite = prerequisites::validate_request(tx, &b, v, id)?;
+    let prerequisite_id = prerequisite.operation_id().map(str::to_owned);
+    let mut effective = json!({
+        "route":b["route"],
+        "input":body,
+        "task_snapshot":a["task_snapshot"]
+    });
+    if b["route"]["runtime"] == crate::runtime::opencode_v2::RUNTIME {
+        effective["operation_contract"] = json!({
+            "effect_scope":"native_session",
+            "order_scope":{"binding_id":binding,"generation":generation},
+            "completion_condition":"native_input_admitted",
+            "replay_policy":"readback_only_no_mutation_replay",
+            "fallback_used":false,
+            "contract_revision":"opencode-input-v1"
+        });
+    }
+    if let Some(prerequisite_id) = &prerequisite_id {
+        effective["prerequisite"] = json!({
+            "operation_id":prerequisite_id,
+            "required_completion_condition":"native_configuration_applied",
+            "required_contract_revision":"opencode-instruction-entry-v1"
+        });
+    }
+    tx.execute("UPDATE operations SET task_id=?2,attempt_id=?3,binding_id=?4,binding_generation=?5,prerequisite_operation_id=?6,effective_request_json=?7 WHERE operation_id=?1",params![id,a["task_id"].as_str(),attempt,binding,generation,prerequisite_id,model::canonical(&effective)?])?;
     tx.execute("UPDATE attempts SET start_operation_id=?2,updated_at_ms=?3 WHERE attempt_id=?1 AND start_operation_id IS NULL",params![attempt,id,now])?;
     Ok((
-        json!({"operation_id":id,"attempt_id":attempt,"state":"queued","admission":"durable_local","native_admission":"not_observed"}),
+        json!({"operation_id":id,"attempt_id":attempt,"state":"queued","admission":"durable_local","native_admission":"not_observed","prerequisite_operation_id":prerequisite_id,"prerequisite_state":prerequisite.receipt_state()}),
         true,
     ))
 }

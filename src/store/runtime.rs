@@ -1,6 +1,6 @@
 //! Module admission and facts, scoped by a credential to one reserved native root.
 //! Network I/O is never performed inside these transactions.
-use super::{meta, operations, producers, tasks};
+use super::{meta, operations, prerequisites, producers, tasks};
 use crate::{
     error::{Error, Result},
     model::{self, Principal, Role},
@@ -162,23 +162,61 @@ pub(super) fn next(db: &mut Connection, p: &Principal) -> Result<Value> {
     }
     // Readback, replies and continuation-stop controls stay available while an
     // ordinary mutation awaits application. They do not spawn another executor.
-    let row:Option<(String,String,String,i64)>=tx.query_row(
-        "SELECT operation_id,method,original_request_json,created_at_ms FROM operations AS candidate
-         WHERE binding_id=?1 AND binding_generation=?2 AND state='queued' AND due_at_ms<=?3
-           AND (COALESCE(json_extract(?4,'$.recovery_required'),0)=0 OR method IN ('agent.recover','agent.reconcile'))
-           AND method IN ('agent.open','task.dispatch','agent.send','agent.reply','agent.configure','agent.goal','agent.refresh','agent.reconcile','agent.result','agent.recover')
-           AND (method IN ('agent.reply','agent.refresh','agent.reconcile','agent.result','agent.recover')
-             OR (method='agent.goal' AND json_extract(original_request_json,'$.action') IN ('pause','clear'))
-             OR NOT EXISTS (SELECT 1 FROM operations AS pending
-               WHERE pending.binding_id=?1 AND pending.binding_generation=?2
-                 AND pending.state IN ('sending','native_accepted','outcome_unknown')
-                 AND pending.method IN ('agent.open','task.dispatch','agent.send','agent.configure','agent.goal','agent.recover')))
-         ORDER BY CASE WHEN method='agent.reply' THEN 0
-                       WHEN method='agent.goal' AND json_extract(original_request_json,'$.action') IN ('pause','clear') THEN 1
-                       WHEN method IN ('agent.refresh','agent.reconcile','agent.result','agent.recover') THEN 2 ELSE 3 END, due_at_ms, rowid LIMIT 1",
-        params![id,generation,model::now_ms()?,model::canonical(&b["observation"])?],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
-    let Some((op, method, raw, created)) = row else {
-        return Ok(json!({"command":null}));
+    let (op, method, raw, created) = {
+        let row:Option<(String,String,String,i64)>=tx.query_row(
+            "SELECT operation_id,method,original_request_json,created_at_ms FROM operations AS candidate
+             WHERE binding_id=?1 AND binding_generation=?2 AND state='queued' AND due_at_ms<=?3
+               AND (COALESCE(json_extract(?4,'$.recovery_required'),0)=0 OR method IN ('agent.recover','agent.reconcile'))
+               AND method IN ('agent.open','task.dispatch','agent.send','agent.reply','agent.configure','agent.goal','agent.refresh','agent.reconcile','agent.result','agent.recover')
+               AND (method IN ('agent.reply','agent.refresh','agent.reconcile','agent.result','agent.recover')
+                 OR (method='agent.send' AND json_extract(original_request_json,'$.delivery')='steer')
+                 OR (method='agent.goal' AND json_extract(original_request_json,'$.action') IN ('pause','clear'))
+                 OR NOT EXISTS (SELECT 1 FROM operations AS pending
+                   WHERE pending.binding_id=?1 AND pending.binding_generation=?2
+                     AND pending.state IN ('sending','native_accepted','outcome_unknown')
+                     AND pending.method IN ('agent.open','task.dispatch','agent.send','agent.configure','agent.goal','agent.recover')))
+             ORDER BY CASE WHEN method='agent.reply' THEN 0
+                           WHEN method='agent.send' AND json_extract(original_request_json,'$.delivery')='steer' THEN 1
+                           WHEN method='agent.goal' AND json_extract(original_request_json,'$.action') IN ('pause','clear') THEN 1
+                           WHEN method IN ('agent.refresh','agent.reconcile','agent.result','agent.recover') THEN 2 ELSE 3 END, due_at_ms, rowid LIMIT 1",
+            params![id,generation,model::now_ms()?,model::canonical(&b["observation"])?],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+        let Some((op, method, raw, created)) = row else {
+            return Ok(json!({"command":null}));
+        };
+        match prerequisites::for_operation(&tx, &b, &op)? {
+            prerequisites::Gate::None | prerequisites::Gate::Ready { .. } => {
+                (op, method, raw, created)
+            }
+            prerequisites::Gate::Pending { operation_id } => {
+                return Ok(json!({
+                    "command":null,
+                    "waiting_operation_id":op,
+                    "waiting_for_prerequisite_operation_id":operation_id
+                }));
+            }
+            prerequisites::Gate::Failed(error) => {
+                let now = model::now_ms()?;
+                let result = json!({
+                    "error":error,
+                    "reason":"prerequisite_unsatisfied"
+                });
+                let changed = tx.execute(
+                    "UPDATE operations SET state='rejected',result_json=?2,settled_at_ms=?3,updated_at_ms=?3 WHERE operation_id=?1 AND state='queued'",
+                    params![op, model::canonical(&result)?, now],
+                )?;
+                if changed != 1 {
+                    return Err(Error::conflict(
+                        "prerequisite-dependent operation changed before rejection",
+                    ));
+                }
+                tx.commit()?;
+                return Ok(json!({
+                    "command":null,
+                    "rejected_operation_id":op,
+                    "error":result["error"]
+                }));
+            }
+        }
     };
     let mut input: Value = serde_json::from_str(&raw)?;
     let guard = (|| -> Result<()> {
@@ -350,6 +388,21 @@ pub(super) fn outcome(db: &mut Connection, p: &Principal, v: &Value) -> Result<V
         ));
     }
     let now = model::now_ms()?;
+    let result_value = serde_json::to_value(&r)?;
+    let applied_settings = if o["method"] == "agent.configure"
+        && b["route"]["runtime"] == crate::runtime::opencode_v2::RUNTIME
+        && matches!(r.outcome, EffectOutcome::Applied)
+    {
+        Some(prerequisites::applied_settings(
+            &tx,
+            &b,
+            &r.operation_id,
+            &result_value,
+            now,
+        )?)
+    } else {
+        None
+    };
     let key = format!(
         "outcome:{}:{}",
         r.operation_id,
@@ -423,6 +476,12 @@ pub(super) fn outcome(db: &mut Connection, p: &Principal, v: &Value) -> Result<V
         // A failure may follow spawn: preserve ownership and its known native identity.
         tx.execute("UPDATE bindings SET state='reconciling',native_root_id=COALESCE(?3,native_root_id),native_scope_key=COALESCE(?4,native_scope_key),state_json=json_set(state_json,'$.opening_evidence',json(?5)) WHERE binding_id=?1 AND generation=?2",params![id,generation,r.native_root_id,r.native_scope_key,model::canonical(&r.details)?])?;
     }
+    if let Some(settings) = applied_settings {
+        tx.execute(
+            "UPDATE bindings SET state_json=json_set(state_json,'$.effective_settings',json(?3)) WHERE binding_id=?1 AND generation=?2",
+            params![id, generation, model::canonical(&settings)?],
+        )?;
+    }
     if o["method"] == "agent.recover" && matches!(r.outcome, EffectOutcome::Applied) {
         if r.native_root_id.as_deref() != b["native_root_id"].as_str()
             || r.native_scope_key.as_deref() != b["native_scope_key"].as_str()
@@ -492,7 +551,16 @@ pub(super) fn observe(db: &mut Connection, p: &Principal, v: &Value) -> Result<V
         tx.commit()?;
         return Ok(json!({"recorded":true,"stale":true}));
     }
-    tx.execute("UPDATE bindings SET state_json=json_set(state_json,'$.native',json(?3),'$.observed_at_ms',?4,'$.native_sequence',?5,'$.native_observation_id',?6) WHERE binding_id=?1 AND generation=?2",params![id,generation,encoded,now,sequence,observation_id])?;
+    let observed_settings = if b["route"]["runtime"] == crate::runtime::opencode_v2::RUNTIME {
+        prerequisites::observed_settings(&b, &v["state"], observation_id, now)?
+    } else {
+        None
+    };
+    if let Some(settings) = observed_settings {
+        tx.execute("UPDATE bindings SET state_json=json_set(state_json,'$.native',json(?3),'$.observed_at_ms',?4,'$.native_sequence',?5,'$.native_observation_id',?6,'$.effective_settings',json(?7)) WHERE binding_id=?1 AND generation=?2",params![id,generation,encoded,now,sequence,observation_id,model::canonical(&settings)?])?;
+    } else {
+        tx.execute("UPDATE bindings SET state_json=json_set(state_json,'$.native',json(?3),'$.observed_at_ms',?4,'$.native_sequence',?5,'$.native_observation_id',?6) WHERE binding_id=?1 AND generation=?2",params![id,generation,encoded,now,sequence,observation_id])?;
+    }
     if v["state"]["turns"].is_array() || v["state"]["observed_children"].is_array() {
         let mut stmt = tx.prepare("SELECT attempt_id, producers_json FROM attempts WHERE binding_id=?1 AND binding_generation=?2 AND released_at_ms IS NULL")?;
         let rows = stmt
@@ -581,6 +649,9 @@ pub(super) fn user_command(
             "next_turn" => {}
             "steer" => {
                 model::text(v, "expected_turn_id")?;
+                if v.get("prerequisite_operation_id").is_some() {
+                    return Err(Error::invalid("steer does not accept a setup prerequisite"));
+                }
             }
             _ => return Err(Error::invalid("delivery must be next_turn or steer")),
         }
@@ -621,6 +692,8 @@ pub(super) fn user_command(
             ));
         }
     }
+    let prerequisite = prerequisites::validate_request(tx, &b, v, op)?;
+    let prerequisite_id = prerequisite.operation_id().map(str::to_owned);
     if method == "agent.goal" && matches!(v["action"].as_str(), Some("pause" | "clear")) {
         // A pause received before dispatch also cancels old local goal starts.
         // Otherwise priority scheduling could execute pause first and revive the
@@ -641,7 +714,28 @@ pub(super) fn user_command(
             "fallback_used":false,
             "contract_revision":"opencode-instruction-entry-v1"
         });
+    } else if method == "agent.send"
+        && v["delivery"] == "next_turn"
+        && b["route"]["runtime"] == crate::runtime::opencode_v2::RUNTIME
+    {
+        effective["operation_contract"] = json!({
+            "effect_scope":"native_session",
+            "order_scope":{"binding_id":id,"generation":generation},
+            "completion_condition":"native_input_admitted",
+            "replay_policy":"readback_only_no_mutation_replay",
+            "fallback_used":false,
+            "contract_revision":"opencode-input-v1"
+        });
     }
-    tx.execute("UPDATE operations SET binding_id=?2,binding_generation=?3,effective_request_json=?4 WHERE operation_id=?1",params![op,id,generation,model::canonical(&effective)?])?;
-    Ok(json!({"operation_id":op,"state":"queued","native_admission":"not_observed"}))
+    if let Some(prerequisite_id) = &prerequisite_id {
+        effective["prerequisite"] = json!({
+            "operation_id":prerequisite_id,
+            "required_completion_condition":"native_configuration_applied",
+            "required_contract_revision":"opencode-instruction-entry-v1"
+        });
+    }
+    tx.execute("UPDATE operations SET binding_id=?2,binding_generation=?3,prerequisite_operation_id=?4,effective_request_json=?5 WHERE operation_id=?1",params![op,id,generation,prerequisite_id,model::canonical(&effective)?])?;
+    Ok(
+        json!({"operation_id":op,"state":"queued","native_admission":"not_observed","prerequisite_operation_id":prerequisite_id,"prerequisite_state":prerequisite.receipt_state()}),
+    )
 }

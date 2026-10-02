@@ -82,9 +82,32 @@ Only controller-owned keys under `eliot.*` are accepted. One Operation changes o
 
 Invoke these through `swarm call agent.configure --file REQUEST.json`. Keys are limited to 128 ASCII bytes and native lowercase alphanumeric/dot/underscore/hyphen syntax. Values use the native 256 KiB JSON boundary. Put permits every JSON value, including `null`; remove does not accept `value`. Credentials and access tokens do not belong in instruction entries because the requested value is retained in the Operation input.
 
-A matching pre-existing value is a valid no-op. Otherwise the adapter sends exactly one native PUT or DELETE and requires an exact subsequent list readback before returning `native_configuration_applied`. The result records the key, desired digest, full entry-list revision, scope, evidence and actual application boundary. OpenCode stores the value immediately and announces a change/removal to the model at the **next step boundary**; this Operation does not itself start model work. Submit a dependent model input only after `operation.get` reports the typed applied result with `native_applied=true`; request admission/order alone is not that prerequisite, and the current API does not infer a dependency merely from submission order.
+A matching pre-existing value is a valid no-op. Otherwise the adapter sends exactly one native PUT or DELETE and requires an exact subsequent list readback before returning `native_configuration_applied`. The result records the key, desired digest, full entry-list revision, controller-owned settings revision, scope, evidence and actual application boundary. OpenCode stores the value immediately and announces a change/removal to the model at the **next step boundary**; this Operation does not itself start model work.
 
 A lost mutation response becomes `outcome_unknown`. Reconciliation repeats only verified GET/readback and never repeats PUT or DELETE. Current snapshots retain at most 128 controller-owned keys and value digests, not duplicate values; overflow is marked incomplete. An unsupported experimental endpoint, changed binding/model/location, duplicate key, read gap or mismatching value remains explicit. Provider/model/variant, agent, effort and arbitrary native settings are not silently mapped onto this control.
+
+## Explicit configure → input prerequisite
+
+`prerequisite_operation_id` implements the short persisted setup sequence required by the module contract. It is accepted on another `agent.configure`, on `agent.send` with `delivery=next_turn`, and on `task.dispatch`. The value must name one earlier `agent.configure` Operation on the exact same binding generation. Each Operation has at most one direct predecessor; a setup sequence can name the preceding step, but this is not a general DAG or workflow language. Submission order alone never creates a dependency.
+
+A dependent request may be durably queued while its prerequisite is still `queued`, `sending`, `native_accepted` or `outcome_unknown`. Immediately before `queued → sending`, Store rechecks the prerequisite inside the same SQLite transaction that admits the native send. The check requires the saved OpenCode configuration OperationContract, the original key/action/value digest, an `applied` RuntimeOutcome for the same native root and service scope, exact instruction-list readback evidence, and valid settings/entry revisions. A plain ACK, `state=settled` without the typed result, rejection, cancellation, failure or unknown outcome never satisfies the dependency.
+
+The relevant setting must still be effective. A same-key configure ordered between the referenced setup and the dependent input either remains a wait or supersedes the old setup; a later same-key configure that restores the exact value satisfies the value requirement again. Unrelated `eliot.*` keys do not invalidate the dependency. A complete newer native configuration snapshot can independently reconfirm or invalidate the key. This is the documented per-binding prepare/admission barrier: conflicting configure/input mutations cannot interleave before native input admission, while replies, readback/reconciliation/result operations, stop controls and other bindings continue independently. OpenCode exact-turn steer remains unsupported for its separate atomic-guard reason and cannot carry a setup prerequisite.
+
+Example dependent send, after reading the applied configure Operation ID:
+
+```json
+{
+  "client_request_id": "oc-send-after-policy-1",
+  "binding_id": "BINDING_ID",
+  "generation": 1,
+  "text": "Continue under the applied controller policy.",
+  "delivery": "next_turn",
+  "prerequisite_operation_id": "CONFIGURE_OPERATION_ID"
+}
+```
+
+Use `swarm call agent.send --file modules/opencode/send-after-configuration.example.json`. Initial controller-owned delivery uses the same field in `task.dispatch`; invoke the generic `swarm call task.dispatch --file REQUEST.json` when that explicit setup chain is required. `operation.get` exposes both `prerequisite_operation_id` and the effective OperationContract. A stale or failed prerequisite rejects the dependent Operation before any native input is sent; it is not silently rebound to another configure. The barrier proves configuration at the admission boundary, not frozen context for every later model step, Task acceptance or family completion.
 
 ## Delivery, observation and recovery
 
@@ -165,12 +188,12 @@ Each timeline pass is bounded to 32 pages of at most 50 messages and 8 MiB of sc
 
 ## Remaining C04 work — do not declare end-to-end completion
 
-Cross-restart native continuation after shutdown/missing terminal, automatic configure-to-start prerequisite chaining, goal/model/agent controls and complete family reconstruction remain unfinished. Exact inline/location-confined tool-file retrieval is implemented; external URI schemes, files outside the verified location and sources above 64 MiB remain deliberately unsupported. Durable `eliot.*` instruction-entry configuration is implemented, but it does not claim provider/model/effort control. The durable-log path now resolves ordinary admitted/delivered inputs and exact pending cancellation; incomplete or unsupported native histories keep the producer unresolved. Parent idle or the latest assistant outcome cannot discharge it. Unsupported methods report an explicit capability error.
+Cross-restart native continuation after shutdown/missing terminal, goal/model/agent controls and complete family reconstruction remain unfinished. Explicit configure-to-input prerequisite chaining is implemented for durable instruction entries. Exact inline/location-confined tool-file retrieval is implemented; external URI schemes, files outside the verified location and sources above 64 MiB remain deliberately unsupported. Durable `eliot.*` instruction-entry configuration is implemented, but it does not claim provider/model/effort control. The durable-log path now resolves ordinary admitted/delivered inputs and exact pending cancellation; incomplete or unsupported native histories keep the producer unresolved. Parent idle or the latest assistant outcome cannot discharge it. Unsupported methods report an explicit capability error.
 
 Live installed OpenCode, actual inference/subscription behavior and native Windows service interoperability remain unqualified. This adapter must not be presented as a fully qualified automatic Task-completion route yet. It does not require or install the optional OpenCodex provider proxy (Issue #1).
 
 ## Focused implementation evidence
 
-The instruction-entry baseline `0c854556` passed [Windows/Linux CI 36966299714](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/36966299714). The subsequent exact tool-file reader passed local Rust 1.98.1 owned-crate formatting and locked offline lib/bin Clippy with warnings denied. Its exact Windows/Linux CI must be checked separately. No tests or live native calls were run for this addition; dependencies, migrations and the Atlas donor are unchanged.
+The exact tool-file baseline `b11a24a6` passed [Windows/Linux CI 36968398773](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/36968398773). The subsequent prerequisite slice passed Rust 1.98.1 owned-crate formatting and locked minimal lib/bin Clippy with warnings denied before publication. Its exact permanent Windows/Linux CI must be checked separately. No tests or live native calls were run for this addition; dependencies, migrations and the Atlas donor are unchanged.
 
 The interrupted 2026-10-01 implementation retained 16 protocol/Store fixtures. They were preserved, not rerun during source recovery. Fresh Rust 1.98.1 package formatting and minimal warnings-denied Clippy passed; the Windows/Linux workflow checks the exact commit's formatting, Clippy, donor hashes, release build and existing Muse SDK import. Tests remain deferred while the product code is being completed. Fixture HTTP servers are not OpenCode, and compilation is not live service, model, billing or subscription qualification.

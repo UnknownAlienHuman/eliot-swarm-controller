@@ -294,7 +294,12 @@ pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
             "binding_id",
             "binding_generation",
         ],
-        "task.dispatch" => &["client_request_id", "attempt_id", "text"],
+        "task.dispatch" => &[
+            "client_request_id",
+            "attempt_id",
+            "text",
+            "prerequisite_operation_id",
+        ],
         "attempt.bind_producer" => &[
             "client_request_id",
             "attempt_id",
@@ -318,6 +323,7 @@ pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
             "text",
             "delivery",
             "expected_turn_id",
+            "prerequisite_operation_id",
         ],
         "agent.result" => &[
             "client_request_id",
@@ -328,7 +334,13 @@ pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
             "length_bytes",
         ],
         "agent.reply" => &["client_request_id", "binding_id", "generation", "reply"],
-        "agent.configure" => &["client_request_id", "binding_id", "generation", "settings"],
+        "agent.configure" => &[
+            "client_request_id",
+            "binding_id",
+            "generation",
+            "settings",
+            "prerequisite_operation_id",
+        ],
         "agent.goal" => &[
             "client_request_id",
             "binding_id",
@@ -385,6 +397,17 @@ pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
         _ => {}
     }
     text(params, "client_request_id")?;
+    if params.get("prerequisite_operation_id").is_some() {
+        let operation_id = text(params, "prerequisite_operation_id")?;
+        if operation_id.is_empty()
+            || operation_id.len() > 128
+            || operation_id
+                .bytes()
+                .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+        {
+            return Err(Error::invalid("invalid prerequisite_operation_id"));
+        }
+    }
     if matches!(method, "task.create" | "task.revise") {
         let spec: TaskSpec = serde_json::from_value(params["spec"].clone())?;
         spec.validate()?;

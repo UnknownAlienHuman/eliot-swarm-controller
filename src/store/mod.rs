@@ -4,6 +4,7 @@ mod assembly;
 mod checks;
 mod opencode;
 mod operations;
+mod prerequisites;
 mod producers;
 mod results;
 mod runtime;
@@ -188,6 +189,7 @@ impl Store {
             method.as_str(),
             "check.run"
                 | "check.cancel"
+                | "operation.cancel"
                 | "agent.open"
                 | "task.dispatch"
                 | "agent.send"

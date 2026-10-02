@@ -34,6 +34,7 @@ struct Change {
 struct Readback {
     matches: bool,
     entries_revision: String,
+    settings_revision: String,
 }
 
 fn native_key(value: &str) -> bool {
@@ -128,6 +129,8 @@ impl Change {
             "key":self.key,
             "desired_digest":self.desired_digest,
             "entries_revision":readback.entries_revision,
+            "settings_revision":readback.settings_revision,
+            "settings_revision_kind":"eliot_owned_instruction_entries_v1",
             "application_scope":"session",
             "application_boundary":"next_step_boundary",
             "native_applied":true,
@@ -156,6 +159,34 @@ fn validate_entries(entries: Vec<Value>) -> Result<Vec<Value>> {
     Ok(entries)
 }
 
+fn owned_projection(entries: &[Value]) -> Result<Vec<Value>> {
+    let mut owned = Vec::new();
+    for entry in entries.iter().filter(|entry| {
+        entry["key"]
+            .as_str()
+            .is_some_and(|key| key.starts_with(OWNED_KEY_PREFIX))
+    }) {
+        let key = model::text(entry, "key")?;
+        let value = model::canonical(&entry["value"])?;
+        owned.push(json!({
+            "key":key,
+            "value_digest":format!("sha256:{}",model::digest(value.as_bytes()))
+        }));
+    }
+    owned.sort_by(|left, right| {
+        left["key"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(right["key"].as_str().unwrap_or_default())
+    });
+    Ok(owned)
+}
+
+fn projection_revision(projection: &[Value]) -> Result<String> {
+    let canonical = model::canonical(&Value::Array(projection.to_vec()))?;
+    Ok(format!("sha256:{}", model::digest(canonical.as_bytes())))
+}
+
 impl Service {
     async fn instruction_entries(&self, root: &str) -> Result<Vec<Value>> {
         let response: Data<Vec<Value>> = decode(
@@ -181,9 +212,11 @@ impl Service {
         self.verify_binding(root, options, &command.binding_id, command.generation)
             .await?;
         let canonical = model::canonical(&Value::Array(entries.clone()))?;
+        let owned = owned_projection(&entries)?;
         Ok(Readback {
             matches: change.matches(&entries),
             entries_revision: format!("sha256:{}", model::digest(canonical.as_bytes())),
+            settings_revision: projection_revision(&owned)?,
         })
     }
 
@@ -306,30 +339,16 @@ impl Service {
 
     pub(super) async fn instruction_observation(&self, root: &str) -> Result<Value> {
         let entries = self.instruction_entries(root).await?;
-        let owned_entries = entries
+        let projection = owned_projection(&entries)?;
+        let complete = projection.len() <= MAX_OBSERVED_ENTRIES;
+        let owned = projection
             .iter()
-            .filter(|entry| {
-                entry["key"]
-                    .as_str()
-                    .is_some_and(|key| key.starts_with(OWNED_KEY_PREFIX))
-            })
+            .take(MAX_OBSERVED_ENTRIES)
+            .cloned()
             .collect::<Vec<_>>();
-        let complete = owned_entries.len() <= MAX_OBSERVED_ENTRIES;
-        let mut owned = Vec::new();
-        for entry in owned_entries.into_iter().take(MAX_OBSERVED_ENTRIES) {
-            let key = model::text(entry, "key")?;
-            let value = model::canonical(&entry["value"])?;
-            owned.push(json!({
-                "key":key,
-                "value_digest":format!("sha256:{}",model::digest(value.as_bytes()))
-            }));
-        }
-        let revision = if complete {
-            let revision = model::canonical(&Value::Array(owned.clone()))?;
-            Some(format!("sha256:{}", model::digest(revision.as_bytes())))
-        } else {
-            None
-        };
+        let revision = complete
+            .then(|| projection_revision(&projection))
+            .transpose()?;
         Ok(json!({
             "complete":complete,
             "owned_entries":owned,
