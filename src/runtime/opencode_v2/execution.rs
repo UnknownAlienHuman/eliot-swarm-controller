@@ -655,7 +655,7 @@ impl SessionScan {
     }
     /// Session-level disposition. Evidence about periods, never about the
     /// family: `family_complete` stays false at every consumer.
-    pub(crate) fn disposition(&self) -> &'static str {
+    pub(crate) fn disposition(&self) -> &str {
         if self.uncertainty.is_some() {
             return "unknown";
         }
