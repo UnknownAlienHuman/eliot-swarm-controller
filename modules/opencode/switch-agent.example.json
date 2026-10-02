@@ -1,10 +1,10 @@
 {
-  "client_request_id": "oc-agent-build-1",
+  "client_request_id": "oc-switch-agent-1",
   "binding_id": "BINDING_ID",
   "generation": 1,
   "settings": {
     "agent": {
-      "id": "build"
+      "id": "REPLACE_WITH_EXACT_NATIVE_AGENT_ID"
     }
   }
 }
