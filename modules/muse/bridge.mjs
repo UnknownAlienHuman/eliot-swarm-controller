@@ -370,6 +370,10 @@ async function startNative(command) {
   if(options.approvalMode!==undefined)params.approvalMode=options.approvalMode;
   const r=await msp.connection.command('session/start',params,{maxAttempts:1,commandId:commandId(command)});
   rootId=required(r.session,'sessionId'); latest.session=compactSession(r.session);latest.execution=r.session.status;
+  // Persist the root identity before any further native work or readback
+  // verdict: a crash after session/start must leave a recorded session that
+  // explicit recovery can target, not an unrecorded one known only in memory.
+  changed(); await checkpoint(true);
   if(r.session.modelId!==options.modelId)throw new Error('MODEL_READBACK_MISMATCH');
   if(options.providerId!==undefined && r.session.providerId!==options.providerId)throw new Error('PROVIDER_READBACK_MISMATCH');
   latest.requested_reasoning_effort=options.reasoningEffort;

@@ -67,6 +67,24 @@ fn publish(path: &Path, value: &Value) -> Result<()> {
     result
 }
 
+/// Persist an explicit recovery-gap classification in the module state
+/// directory. A missing or corrupt owner identity is a terminal gap for this
+/// state directory — not a prompt to invent an owner, adopt the checkpoint or
+/// start fresh. Best-effort: the classified error is returned either way, and
+/// an existing record of a different gap is never overwritten.
+fn record_gap(dir: &Path, kind: &str, detail: &str) {
+    let path = dir.join("recovery-gap.json");
+    if let Ok(existing) = read_record(&path)
+        && existing["kind"] == kind
+    {
+        return;
+    }
+    let _ = publish(
+        &path,
+        &json!({"version":1,"kind":kind,"detail":detail,"disposition":"recovery_not_authorized","recorded_at_ms":model::now_ms().unwrap_or(0)}),
+    );
+}
+
 /// Run one explicit bridge command. No auto restart, executable lookup, shell
 /// interpolation or native prompt. A second invocation never adopts live work.
 pub fn run(state_dir: &Path, executable: &Path, args: &[String]) -> Result<()> {
@@ -118,11 +136,37 @@ pub fn run(state_dir: &Path, executable: &Path, args: &[String]) -> Result<()> {
     private_permissions(&dir, true)?;
     let record = dir.join("owner.json");
     if record.try_exists()? {
-        verify_departed(&read_record(&record)?)?;
+        let parsed = read_record(&record);
+        match parsed {
+            Ok(owner) => {
+                if let Err(e) = verify_departed(&owner) {
+                    // A structurally incomplete identity is a recorded gap;
+                    // an active owner is a live boundary, not a gap.
+                    if e.code == "INVALID_PARAMS" {
+                        record_gap(&dir, "incomplete_owner_identity", &e.to_string());
+                    }
+                    return Err(e);
+                }
+            }
+            Err(e) => {
+                record_gap(&dir, "corrupt_owner_identity", &e.to_string());
+                return Err(Error::new(
+                    "MODULE_OWNER_IDENTITY_INVALID",
+                    format!(
+                        "recorded module-owner identity is unreadable; recovery gap recorded, checkpoint is not adopted: {e}"
+                    ),
+                ));
+            }
+        }
     } else if dir.join("checkpoint.json").try_exists()? {
+        record_gap(
+            &dir,
+            "missing_owner_identity",
+            "checkpoint exists without an ownership record",
+        );
         return Err(Error::new(
-            "MODULE_OWNER_UNKNOWN",
-            "checkpoint without ownership evidence is not safe to resume",
+            "MODULE_OWNER_IDENTITY_MISSING",
+            "checkpoint without ownership evidence is not safe to resume; recovery gap recorded",
         ));
     }
     let token = model::new_id();
