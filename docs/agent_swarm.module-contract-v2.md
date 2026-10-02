@@ -1,6 +1,6 @@
 # ELIOT Swarm — контракт модулей и качества интеграции v2
 
-**Уточнено 30.09.2026. Контракт к архитектуре v18; реализации и live-квалификации пока нет.**
+**Уточнено 02.10.2026 (Фаза A Documentation Program, PR #13). Контракт к архитектуре v18. Реализация существует: baseline `main` = `b0d27f4` — ядро и Store, встроенный OpenCode V2 adapter, Muse SDK bridge, модули Codex (без controller route), Claude, Command и Antigravity, Zed как отдельный unit без wiring в операции контроллера (issue #12), OpenCodex slices 1–2, MCP-фасад и GM/doctor реализованы и в основном проверены на фикстурах. Live-квалификации у большинства native поверхностей нет: она не следует из наличия кода, фикстур или успешной сборки и для каждой поверхности указывается отдельно по §5.**
 
 Назначение: один разработчик должен подключить очередной native harness, не изменяя scheduler, Task/Attempt и остальные adapters. Этот документ определяет нашу границу. Он не переписывает протоколы производителей и не утверждает, что все перечисленные возможности есть у каждого harness.
 
@@ -10,9 +10,28 @@
 
 В коде одна зависимость: `api/scheduler → RuntimePort → implementation`. Ни core, ни Store не импортируют vendor SDK и не ветвятся по `if runtime == Muse/Codex/...`. Ветвление по смыслу операции и её проверенному контракту допустимо. Идентификатор runtime — открытая строка; набор собственных базовых операций — небольшой типизированный enum.
 
+### Именованное исключение: Store и OpenCode prerequisites
+
+Норма абзаца выше действует с одним именованным исключением, зафиксированным по факту кода, а не молча. Store vendor-neutral, за одним исключением: bounded prerequisite-парсер OpenCode configure→input в `src/store/prerequisites.rs` и `src/store/opencode*`. Этот парсер работает по сохранённому типизированному результату шага configure и по contract revisions `opencode-configure-prerequisite-v1`, `opencode-session-agent-state-v1`, `opencode-session-model-state-v1`; он импортирует `runtime::opencode_v2` и разбирает форму native snapshot OpenCode (включая native model ref `{id, providerID, variant}`). Других vendor-парсеров в Store нет; исключение не распространяется на новые вендоры и новые виды подготовки без отдельного именованного решения.
+
+Статус: исключение — `implemented` (baseline `b0d27f4`). Извлечение adapter-validation из Store (R3 программы) зафиксировано кандидатом в Фазу B: это `proposed`, в текущем коде не выполнено. Обещание нейтральности из-за исключения не удаляется и код нейтральным не объявляется.
+
 `native.*` — расширение одного adapter, а не команда «исполнить произвольный JSON». Adapter регистрирует имя, input schema, область эффекта, порядок и способ подтверждения; host ведёт его как обычную Operation. Новые инструменты этого пространства не загружаются всем моделям в контекст. Справка по ним выдаётся адресно.
 
 Одного названия `supports_steer` недостаточно: важно, какой шаг можно поправить, нужна ли active turn identity и что подтверждает ответ. Поведение не выбирается угадыванием по бренду CLI.
+
+### Классы доставки input
+
+Доставка input заявляется одним из классов, а не общим флагом steer:
+
+| Класс | Смысл | Статус по факту кода |
+|---|---|---|
+| `next_turn` | Input для следующего turn; не исправляет уже идущий | `implemented`: OpenCode inbox, Muse bridge |
+| `native_expected_target` | Точный steer активного turn по native identity ожидаемого turn (`expected_turn_id` / `expectedTurnId`) | `implemented`: Muse bridge (`turn/steer`); у OpenCode отклоняется (`UNSUPPORTED_EXACT_TURN_STEER` — нет атомарного expected-turn guard); SDK Codex метод имеет, но controller route нет — через операции ELIOT `unavailable`. Само обозначение класса — термин программы (R19), поле и семантика в Muse существуют в коде |
+| `queue` | Постановка input в очередь native runtime | Не эквивалент steer и не замена `native_expected_target`. Как нативный исход `next_turn` при занятом turn — `implemented` в Muse bridge (`ifBusy=queue`); как самостоятельный обещанный класс доставки — не заявляется |
+| `unavailable` | Adapter честно отклоняет доставку этого класса | `implemented` как поведение отклонения (OpenCode steer, неподдержанные delivery отклоняются валидацией) |
+
+ACK транспортной или native границы подтверждает только эту документированную границу — admission, — а не чтение input моделью, не start исполнения и не terminal. Foreground wait, pending form, очередь и native execution требуют разных действий (см. также подраздел об attention в §7). Неизвестная доставка не превращается в отказ и не повторяется слепо (см. replay policy в §4).
 
 ## 2. Один контракт с четырьмя реализациями подключения
 
@@ -70,6 +89,31 @@ modules/<name>/<artifact-version>/
 
 Малый `OperationContract` сохраняется в `effective_request_json`: `effect_scope`, `order_scope`, `completion_condition`, `replay_policy`, `fallback_used`, `contract_revision`. Это обычные данные решения adapter, не язык выполнения произвольных workflows. Scope задаёт binding/session/turn/request либо shared service, если операция действительно глобальная.
 
+### Scoped delivery (R22)
+
+Адресная доставка между участниками выражается данными существующего `OperationContract` и существующего mailbox, а не новым ledger и не вторым хранилищем доставок. Полный набор полей доставки: `delivery_id`, source/target scope, actor identity + generation, payload digest, admission/delivery/reply deadlines, `reply_to` исходной доставки, cancellation, ссылающаяся на исходную identity и digest.
+
+Статус по факту кода: `implemented` частично — `message.send` сохраняет durable mailbox-сообщение, где `message_id` совпадает с `operation_id` (это и есть delivery identity), получатель — зарегистрированный client (target scope), отправитель берётся из аутентифицированного principal, а `in_reply_to` проверяется по исходному сообщению (совпадение sender/recipient обязательно). `proposed` — payload digest, deadlines, actor generation и cancellation по исходной delivery: в текущих полях mailbox их нет, и свободный текст/напоминание не становится workflow transition и не вызывает модель автоматически.
+
+### Replay policy по операциям
+
+Какая identity и какой payload могут повторяться и на каком основании:
+
+| Операция | Повтор допустим | Основание |
+|---|---|---|
+| Любая мутация с `client_request_id` | Тот же caller + тот же ID + тот же метод + байт-в-байт тот же payload возвращает сохранённый receipt; тот же ID с другим payload — `REQUEST_ID_CONFLICT` | `implemented` (Store) |
+| `open` / create native session | Native мутация не повторяется по generic retry; потерянный ответ разрешается readback либо остаётся `outcome_unknown`/incident | Норма `implemented` на путях с `replay_policy=readback_only_no_mutation_replay` (OpenCode configure/goal, configuration Operations OpenCodex); как универсальная таблица для всех adapters — норма контракта |
+| `send` / prompt | Тот же input повторно не отправляется из-за потерянного ACK; повтор — только явный same-ID replay конкретного adapter (Muse: `agent.reconcile` с исходным command ID и неизменными параметрами) | `implemented`: Muse reconcile, OpenCode GET-only reconciliation; blanket replay при reconnect запрещён |
+| `configure` | Повтор незавершённого шага подготовки, не успешно применённого (см. §6) | `implemented` |
+| `reply` | Не повторяется на завершённый или изменившийся native request; stale-guard по ID и текущему содержанию обязателен | `implemented` (OpenCode: exact request ID + fingerprint текущего pending body) |
+| Reads (`snapshot`, `result`, `family`, `report.delta`) | Повторяются свободно; read не является мутацией | `implemented` |
+
+### Проекции: bounded preview, лимиты и gap (R6/R22)
+
+Проекция (snapshot, timeline, report) — не сами данные. Bounded preview не равен полным artifact bytes: полные байты выдаются только immutable artifact с digest и читаются постранично (offset/length, ограниченный размер страницы); preview не подменяет эту выдачу и не выдаётся за неё. Лимиты проекции применяются после проекции, к её результату: число source rows, число projected items, serialized bytes всего ответа и bytes одного item; усечение при записи лога вместо этих лимитов не засчитывается.
+
+Live notification path не равен authoritative fetch: живой поток даёт свежесть, авторитет даёт точное сохранённое чтение. В OpenCode volatile event feed уже не используется как доказательство — авторитетен durable execution log (`implemented`). Неполнота проекции выражается явно: `gap` — отсутствующий диапазон, а не пустое место; подписка, отставшая от потока, помечается `lagged`, что семантически тот же gap: авторитет восстанавливается точным read (`report.delta`, exact operation/result reads), а не доверием к хвосту кэша. Статус: cursor-чтения `report.delta`/`message.read` и пометки `gaps` в наблюдениях — `implemented`; MCP subscriptions и timeline-проекция по паттерну Paseo — `proposed`, подписок в фасаде сейчас нет.
+
 Начало Task имеет одного владельца, выбранного до работы: controller либо native_manager. В первом случае start идёт через сохранённую Operation; во втором manager использует native spawn, а наш send не дублирует старт даже до bind_producer. Исполнитель, получивший controller-start, по-прежнему вправе запускать native детей.
 
 Короткая admission-фаза не держит target заблокированным до конца model run. Ожидаемый смысл результата определён методом: установка effort ждёт факта применения; доставка сообщения может закончиться на native admission, не подтверждая его использование.
@@ -77,6 +121,36 @@ modules/<name>/<artifact-version>/
 ## 5. Готовность маршрута — по роли, а не один зелёный индикатор
 
 Различаются `implemented`, `documented`, `observed`, `unavailable`, `unknown`. Последние сведения имеют версию/entrypoint и source. Достаточно существующего JSON, отдельного сервиса сертификации не требуется.
+
+### Лестница доказательств и классы свидетельств
+
+Ни один результат не повышает свой уровень доказательств по косвенным признакам. Лестница границ для одного действия:
+
+```text
+intent persisted
+→ transport attempted
+→ native admission established
+→ native execution started
+→ exact execution terminal observed
+→ result bytes captured and pinned
+→ configured check passed against exact candidate
+→ acceptance committed and still current
+```
+
+`idle`, process exit, тишина, возраст, успешный HTTP status, имя ветки, отчёт модели или отсутствие элемента в частичной проекции не поднимают действие на следующую ступень. Каждая ступень подтверждается своим свидетельством.
+
+Словарь готовности выше не заменяется словарём программы; они соотносятся так:
+
+| Программа (§0/§0.2) | Этот контракт (§5) |
+|---|---|
+| `implemented` | `implemented` — код пути существует на baseline |
+| `fixture_checked` | `implemented` + `observed` на фикстурах; live не наблюдалось |
+| `live_observed` | `observed` на живой native поверхности |
+| `qualified` | `observed` + ступень check/acceptance лестницы для exact candidate пройдена и текуща |
+| `unavailable` | `unavailable` |
+| `unknown` | `unknown` |
+
+Отдельно от готовности каждое утверждение в документации несёт класс свидетельства происхождения: `CODE` (прочитанный код), `DOC` (документация/контракт), `RELEASE` (релиз/пин донора), `ISSUE` (зафиксированный issue), `USER` (решение/сообщение пользователя), `INFERENCE` (вывод) или `UNVERIFIED`. Reviewed pin донора, установленный pin и live-квалификация — три разных факта и не подменяют друг друга.
 
 Требования задаёт выбранная роль:
 
@@ -108,6 +182,12 @@ open admitted
 
 Прежнее applied остаётся историческим фактом, но не вечным условием запуска. Для конфликтующих session-wide settings модуль сохраняет effective settings revision и привязывает setup к ней. Per-turn options предпочтительны; иначе короткий prepare/admission barrier исключает interleaving `set max → set high → start Max task`. При динамическом применении settings на следующих model calls совместимость определяется native lifecycle, не названием config setter. Другие bindings и protocol replies не ждут этого barrier.
 
+### Typed condition evidence (R3)
+
+Условие готовности шага подготовки — типизированное свидетельство, а не строка и не сам факт окончания операции. Digest внутри такого свидетельства описывает наблюдённое состояние (definition/variant digests конфигурации), но не создаёт native CAS: совпадение digest не даёт права считать, что native поверхность применит или удержит состояние, и не заменяет readback результата configure. Admission barrier вокруг конфликтующих session-wide settings короткий: он закрывает interleaving подготовки и запуска одной работы, а не удерживается на время model run.
+
+Статус: `implemented` единственной реализацией — именованное исключение §1: OpenCode configure→input в `src/store/prerequisites.rs` (contract revisions `opencode-*-v1`), где gate сверяет типизированный результат, contract `effect_scope`/`replay_policy` и актуальный native snapshot. Обобщённая форма typed evidence для других вендоров и извлечение этой validation из Store в adapter — `proposed`, кандидат Фазы B.
+
 ## 7. Одна native-сессия — один control owner, независимо от aliases
 
 Ключ root состоит из `native_scope_key + native_root_id`. Scope — не произвольное имя route; adapter разрешает реальное пространство native IDs: runtime/account/store namespace, при необходимости user/machine domain. Секреты в ключ не входят. Порт, PID, model, lane label и имя bridge не являются заменой устойчивого namespace.
@@ -125,6 +205,30 @@ open admitted
 ### ProducerRef относится к активации, не только к беседе
 
 Каждый task-specific ProducerRef связывает assignment_id с native session и конкретным run/turn/child-run ID или иной документированной correlation. Сессия может использоваться повторно. Поздний terminal предыдущего run сохраняется в его истории и не закрывает новое задание. При неполной корреляции adapter возвращает unknown, а manager явно закрывает assignment; синтетический локальный ID сам по себе не доказывает происхождение native event. Это использует существующий producers_json, не новый task store.
+
+### Family: declaration-first и частичные наблюдения
+
+Идентичность ребёнка начинается с авторитетного native объявления/run identity, а не с догадки по времени, cwd или заголовку. Aliases и parent links сохраняются рядом с этой identity. Raw native status, нормализованное отображение и разрешённое lifecycle-действие хранятся раздельно; terminal или idle родителя не закрывает детей, а неполное наблюдение не превращается в пустое множество: отсутствие элемента в неполном наблюдении не означает его terminal disposition, а недоступное наблюдение — не пустая семья.
+
+Статус: `implemented` на пути OpenCode — snapshot перечисляет детей по native списку с проверкой `parentID`, `agent.family` постранично читает retained observation и честно возвращает `available:false, family_completeness:unknown, items:null` при отсутствии наблюдения; consumer-уровень `family_complete` остаётся `false`. Как универсальная норма для всех adapters — обязательство контракта; у adapters без native объявления детей семья заявляется `unknown`, а не пустой.
+
+### Attention и native background (R12)
+
+Attention item адресует текущий native request/tool и Task: форма, approval, foreground wait, blocked dependency или missing result. Ответ (`reply`) проверяет тот же request ID и текущее содержание запроса; повторные решения на завершённый request не отправляются. Неизвестная схема или неизвестное решение не угадываются: не выбирается автоматически first/recommended/cancel — вопрос передаётся менеджеру как задача выбора. Недостаток writers вычисляется только для разрешённой работы и известной capacity, с учётом pending native admissions; неизвестный roster не превращается в команду «запусти N».
+
+Отдельная операция перевода foreground backgroundable tool в native background (`session.background`) заявляется только adapter, у которого endpoint подтверждён native контрактом. Она работает с foreground-инструментами, допускающими background, а не с любой активностью; ей не приписывается выдуманный expected-turn CAS, и она не считается прочитанным steer. Успех подтверждается native границей и последующим наблюдением, а не фактом отправленного запроса.
+
+Статус: адресный reply со stale-guard — `implemented` (OpenCode: exact request ID, fingerprint текущего pending body, проверенная принадлежность корню семьи); обобщённая модель attention item — норма контракта, единого отдельного реестра attention в коде нет. `session.background` — `proposed`: ни один adapter её сейчас не реализует (в OpenCode она не заявлена как capability).
+
+### Lifecycle, drain и postconditions (R13)
+
+Завершение бывает разных видов, и они не подменяют друг друга: detach (контроллер отпускает наблюдение/управление, native работа может продолжаться), stop собственного ресурса (process job/bridge, которым владеет контроллер) и release (освобождение binding/claim в Store). Ни одно из них не останавливает shared native server и чужих детей; read-only observer сервер не запускает и не перезапускает.
+
+Draining запрещает новый workload, но позволяет получить результаты детей, ответить на текущие вопросы и довести незавершённые операции до известного disposition. Parent idle и выход клиента сами по себе не освобождают native goal/детей; прекращение цели, interrupt, detach и release — разные явные действия с собственными postconditions: после stop известен disposition собственного процесса, после release binding не принимает новых операций, после detach native состояние остаётся таким, каким его показывает следующее наблюдение.
+
+Неизвестный исход create/prompt/control разрешается предусмотренным native readback либо остаётся адресным incident: generic retry мутацию только из-за потерянного ответа не повторяет (см. replay policy в §4).
+
+Статус: release binding/attempt и stop собственных process jobs — `implemented`; detach read-only observer без второго control binding — `implemented` (§2); единая drain-операция как метод контракта — `proposed`, отдельного drain-метода в API сейчас нет.
 
 ## 8. Шина без общего тормоза
 
@@ -170,6 +274,12 @@ open admitted
 
 Для собственных batch/check jobs результат и владение ресурсом раздельны. `failed/incomplete` не сообщает, что все дочерние процессы прекратили работу. Adapter возвращает process disposition, control host освобождает ресурс только по нему. Для `external_attach` не применяется завершение shared server. Результат проверки сохраняется даже при неудачной очистке, а повторный writer target-dir не запускается на неизвестной старой работе. Повторное использование законченного machine check обозначается cached_from_check_id и не выдаётся за новый process run: не создаёт PID, собственного exit code или фиктивного resource release.
 
+### Install/update: согласие по preview и fingerprint
+
+Установка и обновление модуля следуют паттерну preview/fingerprint/reapproval: точный source и package разрешаются заранее; вычисляются fingerprint-ы source/manifest/lock/build/capability; delta показывается до действия; одобрение относится к этому fingerprint; перед применением разрешение повторяется, устаревший fingerprint отклоняется; новая generation ставится отдельно, её postcondition проверяется, а старая generation снимается только после доказательства владения. Расширение permissions или capability требует повторного одобрения (reapproval), даже если остальная delta пуста.
+
+Статус: для установки/обновления модулей — `proposed`: автоматической установки модулей и сервисов в контроллере нет. Тот же паттерн `implemented` на соседней границе — конфигурационные Operations OpenCodex (preview + `planFingerprint`, пара both-or-neither, `409` при stale preview, сверка readback) — но это изменение конфигурации внешнего сервиса, а не install модуля, и одно за другое не выдаётся.
+
 ## 12. Проверяемая граница качества
 
 | Ситуация | Ожидаемый результат реализованного пути |
@@ -191,6 +301,10 @@ open admitted
 | Child session повторно использована | Старое completion не закрывает новую activation |
 | Review пришёл после новой сдачи/приёмки | Исторический finding; актуальный pointer не меняется |
 | Reuse process check из cache | Собственная привязка к Task, без выдуманного process/resource lifecycle |
+| Старый HOLD/возврат пришёл на новую сдачу той же ветки | Старая сдача историческая; новый submission и его owner не меняются |
+| Shared stream несёт детей трёх managers | Scoped roster/metrics каждого manager без чужих детей в count/usage/quota |
+| Preservation при untracked source-файле в worktree | Cleanup удерживается, пока требуемые bytes не сохранены; сохранённый HEAD не равен сохранённому worktree |
+| Cargo-профиль изменён вне Git source | Старое check evidence не переиспользуется без соответствующего контракта входов |
 
 Это критерии реализации, не результаты выполненных runtime-тестов. Первая обязательная пара исполнителей — Muse Max и OpenCode V2; batch и shared Codex проверяют остальные особенности того же контракта по мере подключения. Нет требования одновременно дописать все семь harness до первого полезного результата.
 
@@ -210,6 +324,6 @@ open admitted
 
 [T5] SQLite partial unique indexes: https://www.sqlite.org/partialindex.html
 
-Повторная проверка всех vendor docs, сборка доноров, Windows execution, платные пробы и нагрузка не выполнялись. Пример устранённой alias-коллизии относится к reference DDL, не к уже существовавшему Rust-сервису.
+Историческая оговорка (ревизия 29–30.09.2026): повторная проверка всех vendor docs, сборка доноров, Windows execution, платные пробы и нагрузка тогда не выполнялись. Пример устранённой alias-коллизии относился к reference DDL, не к уже существовавшему Rust-сервису. Эта оговорка описывает область проверки той ревизии, а не текущий статус: актуальная готовность на 02.10.2026 — заголовок документа и §5, native mappings выше по-прежнему опираются на источники 29.09.2026 и заново не переаттестовывались.
 
 [T6] Уточнения v18 относятся к собственному протоколу и reference-схеме: [сохранённые контрпримеры](lessons-learned.md#3-исправленные-ошибки-собственной-спецификации), [plan-v6](agent_swarm.implementation-v6.md). Native mappings и donor pins не переаттестованы.
