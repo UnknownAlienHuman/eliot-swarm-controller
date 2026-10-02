@@ -903,15 +903,33 @@ fn apply(
         "message.send" => {
             model::fields(
                 v,
-                &["client_request_id", "recipient", "text", "in_reply_to"],
+                &[
+                    "client_request_id",
+                    "recipient",
+                    "text",
+                    "in_reply_to",
+                    "in_reply_to_digest",
+                    "admission_deadline_ms",
+                    "delivery_deadline_ms",
+                    "reply_deadline_ms",
+                ],
             )?;
             let recipient = model::text(v, "recipient")?;
             let body = model::text(v, "text")?;
-            if meta(tx, &format!("client:{recipient}"))?.is_none() {
-                return Err(Error::new("NOT_FOUND", "recipient is not registered"));
-            }
+            let recipient_registration = meta(tx, &format!("client:{recipient}"))?
+                .ok_or_else(|| Error::new("NOT_FOUND", "recipient is not registered"))?;
+            let sender_registration = meta(tx, &format!("client:{}", p.client_id))?
+                .ok_or_else(|| Error::new("UNAUTHORIZED", "sender is not registered"))?;
+            let payload_digest = model::message_payload_digest(&p.client_id, recipient, body)?;
+            let mut reply_to = Value::Null;
             if let Some(reply) = v.get("in_reply_to").and_then(Value::as_str) {
-                let prior = operations::get_operation(tx, reply)?;
+                // A reply addresses the original delivery: by its own
+                // delivery_id when it carries one, otherwise by the
+                // historical operation id.
+                let prior = match find_delivery(tx, reply)? {
+                    Some(original) => original,
+                    None => operations::get_operation(tx, reply)?,
+                };
                 if !(prior["method"] == "message.send"
                     || (prior["method"] == "task.request_changes"
                         && prior["result"]["applied"] == true)
@@ -924,15 +942,87 @@ fn apply(
                         "reply does not match the sender and recipient of that message",
                     ));
                 }
+                model::verify_payload_digest_claim(
+                    prior["result"]["payload_digest"].as_str(),
+                    v.get("in_reply_to_digest").and_then(Value::as_str),
+                )?;
+                reply_to = model::message_reply_reference(&prior["result"]);
             }
             Ok((
-                json!({"operation_id":id,"message_id":id,"sender":p.client_id,"recipient":recipient,"text":body,"in_reply_to":v.get("in_reply_to"),"delivery":"durable_mailbox_only"}),
+                json!({"operation_id":id,"message_id":id,"delivery_id":model::new_id(),"sender":p.client_id,"recipient":recipient,"source_scope":model::message_scope(&sender_registration,&p.client_id),"target_scope":model::message_scope(&recipient_registration,recipient),"actor":model::message_actor(&sender_registration,&p.client_id),"payload_digest":payload_digest,"admission_deadline_ms":model::deadline(v,"admission_deadline_ms")?,"delivery_deadline_ms":model::deadline(v,"delivery_deadline_ms")?,"reply_deadline_ms":model::deadline(v,"reply_deadline_ms")?,"text":body,"in_reply_to":v.get("in_reply_to"),"reply_to":reply_to,"cancellation":Value::Null,"delivery":"durable_mailbox_only"}),
                 false,
             ))
         }
+        "message.cancel" => cancel_message(tx, p, v, id).map(|v| (v, false)),
         _ => Err(Error::new(
             "METHOD_NOT_FOUND",
             format!("{method} is not implemented; no native effect was attempted"),
         )),
     }
 }
+
+/// Finds a settled mailbox delivery by its own delivery identity (R22).
+/// Records written before delivery identity existed have no `delivery_id`
+/// and stay addressable only by their historical operation id.
+fn find_delivery(db: &Connection, delivery_id: &str) -> Result<Option<Value>> {
+    let operation_id: Option<String> = db
+        .query_row(
+            "SELECT operation_id FROM operations WHERE method='message.send' AND state='settled' AND json_extract(result_json,'$.delivery_id')=?1",
+            [delivery_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match operation_id {
+        Some(id) => Ok(Some(operations::get_operation(db, &id)?)),
+        None => Ok(None),
+    }
+}
+
+/// Records the cancellation of one mailbox delivery. A cancellation is its
+/// own durable record referencing the original delivery by identity and
+/// digest; the original record is evidence and is never rewritten, and no
+/// workflow state changes because a delivery was cancelled — this text, like
+/// any message text, is not a workflow transition.
+fn cancel_message(tx: &Transaction<'_>, p: &Principal, v: &Value, id: &str) -> Result<Value> {
+    model::fields(
+        v,
+        &[
+            "client_request_id",
+            "delivery_id",
+            "payload_digest",
+            "reason",
+        ],
+    )?;
+    let delivery_id = model::text(v, "delivery_id")?;
+    let claimed = model::text(v, "payload_digest")?;
+    let original = find_delivery(tx, delivery_id)?
+        .ok_or_else(|| Error::new("NOT_FOUND", format!("Delivery {delivery_id}")))?;
+    if original["result"]["sender"] != p.client_id {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "only the original sender can cancel a delivery",
+        ));
+    }
+    model::verify_payload_digest_claim(
+        original["result"]["payload_digest"].as_str(),
+        Some(claimed),
+    )?;
+    let existing: Option<String> = tx
+        .query_row(
+            "SELECT operation_id FROM operations WHERE method='message.cancel' AND state='settled' AND json_extract(result_json,'$.cancellation.delivery_id')=?1",
+            [delivery_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if existing.is_some() {
+        return Err(Error::conflict("delivery is already cancelled"));
+    }
+    let sender_registration = meta(tx, &format!("client:{}", p.client_id))?
+        .ok_or_else(|| Error::new("UNAUTHORIZED", "sender is not registered"))?;
+    Ok(
+        json!({"operation_id":id,"cancellation":{"delivery_id":delivery_id,"payload_digest":claimed},"cancelled_by":model::message_actor(&sender_registration,&p.client_id),"reason":v.get("reason").cloned().unwrap_or(Value::Null),"original_record_changed":false,"delivery":"durable_mailbox_only"}),
+    )
+}
+
+#[cfg(test)]
+mod mailbox_tests;
