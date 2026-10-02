@@ -1,0 +1,161 @@
+D",
++                    "native configuration did not match after mutation acknowledgement",
++                ),
++                true,
++            ),
++            Err(error) => failed(command, options, &error, true),
++        }
++    }
++
++    pub(super) async fn reconcile_configuration(
++        &self,
++        command: &RuntimeCommand,
++        options: &Options,
++    ) -> RuntimeOutcome {
++        let readback = async {
++            self.verify().await?;
++            let root = command
++                .native_root_id
++                .as_deref()
++                .ok_or_else(|| Error::invalid("native root is missing"))?;
++            let change = Change::parse(command)?;
++            let readback = self
++                .configuration_readback(root, options, command, &change)
++                .await?;
++            if !readback.matches {
++                return Err(Error::new(
++                    "NATIVE_CONFIGURATION_UNRESOLVED",
++                    "saved configuration is not the current native state",
++                ));
++            }
++            Ok(outcome(
++                command,
++                EffectOutcome::Applied,
++                options,
++                change.details(&readback, "exact_state_reconciliation", false),
++            ))
++        }
++        .await;
++        match readback {
++            Ok(outcome) => outcome,
++            Err(error) => outcome(
++                command,
++                EffectOutcome::Unknown,
++                options,
++                super::diagnostic(&error),
++            ),
++        }
++    }
++
++    pub(super) async fn instruction_observation(&self, root: &str) -> Result<Value> {
++        let entries = self.instruction_entries(root).await?;
++        let owned_entries = entries
++            .iter()
++            .filter(|entry| {
++                entry["key"]
++                    .as_str()
++                    .is_some_and(|key| key.starts_with(OWNED_KEY_PREFIX))
++            })
++            .collect::<Vec<_>>();
++        let complete = owned_entries.len() <= MAX_OBSERVED_ENTRIES;
++        let mut owned = Vec::new();
++        for entry in owned_entries.into_iter().take(MAX_OBSERVED_ENTRIES) {
++            let key = model::text(entry, "key")?;
++            let value = model::canonical(&entry["value"])?;
++            owned.push(json!({
++                "key":key,
++                "value_digest":format!("sha256:{}",model::digest(value.as_bytes()))
++            }));
++        }
++        let revision = if complete {
++            let revision = model::canonical(&Value::Array(owned.clone()))?;
++            Some(format!("sha256:{}", model::digest(revision.as_bytes())))
++        } else {
++            None
++        };
++        Ok(json!({
++            "complete":complete,
++            "owned_entries":owned,
++            "revision":revision,
++            "limit":MAX_OBSERVED_ENTRIES,
++            "limit_reached":!complete,
++            "value_content_persisted":false,
++            "source":"experimental.session.instructions.entry.list"
++        }))
++    }
++}
+diff --git a/src/runtime/opencode_v2/effects.rs b/src/runtime/opencode_v2/effects.rs
+index 877f232..2c94f80 100644
+--- a/src/runtime/opencode_v2/effects.rs
++++ b/src/runtime/opencode_v2/effects.rs
+@@ -11,7 +11,7 @@ use crate::{
+ use serde_json::{Value, json};
+ use std::{collections::BTreeSet, path::Path};
+ 
+-fn outcome(
++pub(super) fn outcome(
+     command: &RuntimeCommand,
+     state: EffectOutcome,
+     options: &Options,
+@@ -27,7 +27,7 @@ fn outcome(
+         details,
+     }
+ }
+-fn failed(
++pub(super) fn failed(
+     command: &RuntimeCommand,
+     options: &Options,
+     error: &Error,
+@@ -204,6 +204,7 @@ impl Service {
+             "agent.open" => self.open(command, options).await,
+             "task.dispatch" | "agent.send" => self.send(command, options).await,
+             "agent.reply" => self.reply(command, options).await,
++            "agent.configure" => self.configure(command, options).await,
+             _ => failed(
+                 command,
+                 options,
+@@ -409,6 +410,9 @@ impl Service {
+     ) -> RuntimeOutcome {
+         let readback=async {
+             self.verify().await?;
++            if original.method=="agent.configure" {
++                return Ok(self.reconcile_configuration(original, options).await);
++            }
+             if original.method=="agent.open" {
+                 let id=root_id(&original.binding_id,original.generation);
+                 let session=self.check_root(&id,options).await?;
+diff --git a/src/runtime/opencode_v2/http.rs b/src/runtime/opencode_v2/http.rs
+index dae413d..3eb391a 100644
+--- a/src/runtime/opencode_v2/http.rs
++++ b/src/runtime/opencode_v2/http.rs
+@@ -199,6 +199,12 @@ impl Service {
+     pub(super) async fn post(&self, path: &str, body: Value) -> Result<Value> {
+         self.request(Method::POST, path, &[], Some(body)).await
+     }
++    pub(super) async fn put(&self, path: &str, body: Value) -> Result<Value> {
++        self.request(Method::PUT, path, &[], Some(body)).await
++    }
++    pub(super) async fn delete(&self, path: &str) -> Result<Value> {
++        self.request(Method::DELETE, path, &[], None).await
++    }
+     async fn request(
+         &self,
+         method: Method,
+@@ -229,14 +235,17 @@ impl Service {
+         let status = response.status();
+         if !status.is_success() {
+             // Never save a reflected error body or follow a redirect with credentials.
+-            let code =
+-                if effect && matches!(status.as_u16(), 400 | 401 | 403 | 404 | 405 | 409 | 422) {
+-                    "NATIVE_REJECTED"
+-                } else if effect {
+-                    "NATIVE_OUTCOME_UNKNOWN"
+-                } else {
+-                    "NATIVE_READ_FAILED"
+-                };
++            let code = if effect
++                && matches!(
++                    status.as_u16(),
++                    400 | 401 | 403 | 404 | 405 | 409 | 413 | 422
++                ) {
++                "NATIVE_REJECTED

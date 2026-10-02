@@ -1,0 +1,169 @@
+  ));
++            }
++        };
++        let desired_digest = match &action {
++            ChangeAction::Put(value) => {
++                let value = model::canonical(value)?;
++                Some(format!("sha256:{}", model::digest(value.as_bytes())))
++            }
++            ChangeAction::Remove => None,
++        };
++        Ok(Self {
++            key: key.to_owned(),
++            action,
++            desired_digest,
++        })
++    }
++
++    fn action_name(&self) -> &'static str {
++        match &self.action {
++            ChangeAction::Put(_) => "put",
++            ChangeAction::Remove => "remove",
++        }
++    }
++
++    fn matches(&self, entries: &[Value]) -> bool {
++        let found = entries.iter().find(|entry| entry["key"] == self.key);
++        match (&self.action, found) {
++            (ChangeAction::Put(value), Some(entry)) => entry.get("value") == Some(value),
++            (ChangeAction::Remove, None) => true,
++            _ => false,
++        }
++    }
++
++    fn details(&self, readback: &Readback, evidence: &str, mutation_sent: bool) -> Value {
++        json!({
++            "completion_condition":"native_configuration_applied",
++            "configuration_kind":"instruction_entry",
++            "action":self.action_name(),
++            "key":self.key,
++            "desired_digest":self.desired_digest,
++            "entries_revision":readback.entries_revision,
++            "application_scope":"session",
++            "application_boundary":"next_step_boundary",
++            "native_applied":true,
++            "model_work_started":false,
++            "mutation_sent":mutation_sent,
++            "evidence":evidence,
++            "read_method":"experimental.session.instructions.entry.list",
++            "replay_policy":"readback_only_no_mutation_replay",
++            "contract_revision":"opencode-instruction-entry-v1"
++        })
++    }
++}
++
++fn validate_entries(entries: Vec<Value>) -> Result<Vec<Value>> {
++    let mut keys = BTreeSet::new();
++    for entry in &entries {
++        model::fields(entry, &["key", "value"])?;
++        let key = model::text(entry, "key")?;
++        if !native_key(key) || entry.get("value").is_none() || !keys.insert(key.to_owned()) {
++            return Err(Error::new(
++                "NATIVE_CONFIGURATION_SCHEMA",
++                "native instruction entry list is invalid or ambiguous",
++            ));
++        }
++    }
++    Ok(entries)
++}
++
++impl Service {
++    async fn instruction_entries(&self, root: &str) -> Result<Vec<Value>> {
++        let response: Data<Vec<Value>> = decode(
++            self.get(
++                &format!("/api/experimental/session/{root}/instructions/entries"),
++                &[],
++            )
++            .await?,
++        )?;
++        validate_entries(response.data)
++    }
++
++    async fn configuration_readback(
++        &self,
++        root: &str,
++        options: &Options,
++        command: &RuntimeCommand,
++        change: &Change,
++    ) -> Result<Readback> {
++        self.verify_binding(root, options, &command.binding_id, command.generation)
++            .await?;
++        let entries = self.instruction_entries(root).await?;
++        self.verify_binding(root, options, &command.binding_id, command.generation)
++            .await?;
++        let canonical = model::canonical(&Value::Array(entries.clone()))?;
++        Ok(Readback {
++            matches: change.matches(&entries),
++            entries_revision: format!("sha256:{}", model::digest(canonical.as_bytes())),
++        })
++    }
++
++    pub(super) async fn configure(
++        &self,
++        command: &RuntimeCommand,
++        options: &Options,
++    ) -> RuntimeOutcome {
++        let prepared = async {
++            let root = command
++                .native_root_id
++                .as_deref()
++                .ok_or_else(|| Error::invalid("native root is missing"))?;
++            let change = Change::parse(command)?;
++            let readback = self
++                .configuration_readback(root, options, command, &change)
++                .await?;
++            Ok::<_, Error>((root.to_owned(), change, readback))
++        }
++        .await;
++        let (root, change, readback) = match prepared {
++            Ok(prepared) => prepared,
++            Err(error) => return failed(command, options, &error, false),
++        };
++        if readback.matches {
++            return outcome(
++                command,
++                EffectOutcome::Applied,
++                options,
++                change.details(&readback, "preexisting_exact_readback", false),
++            );
++        }
++
++        let path = format!(
++            "/api/experimental/session/{root}/instructions/entries/{}",
++            change.key
++        );
++        let written = match &change.action {
++            ChangeAction::Put(value) => self.put(&path, json!({"value":value})).await,
++            ChangeAction::Remove => self.delete(&path).await,
++        };
++        match written {
++            Ok(Value::Null) => {}
++            Ok(_) => {
++                return failed(
++                    command,
++                    options,
++                    &Error::new(
++                        "NATIVE_CONFIGURATION_SCHEMA",
++                        "native configuration mutation returned an unexpected body",
++                    ),
++                    true,
++                );
++            }
++            Err(error) => return failed(command, options, &error, true),
++        }
++
++        match self
++            .configuration_readback(&root, options, command, &change)
++            .await
++        {
++            Ok(readback) if readback.matches => outcome(
++                command,
++                EffectOutcome::Applied,
++                options,
++                change.details(&readback, "post_mutation_exact_readback", true),
++            ),
++            Ok(_) => failed(
++                command,
++                options,
++                &Error::new(
++                    "NATIVE_CONFIGURATION_UNRESOLVE

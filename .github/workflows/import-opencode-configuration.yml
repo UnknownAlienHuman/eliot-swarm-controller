@@ -1,0 +1,155 @@
+name: Import OpenCode configuration slice
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/import-opencode-configuration.yml'
+      - '.github/import-opencode-configuration/**'
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: import-opencode-configuration
+  cancel-in-progress: false
+
+jobs:
+  import:
+    if: github.repository == 'UnknownAlienHuman/eliot-swarm-controller'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+
+      - name: Verify transport and apply exact patch
+        shell: bash
+        env:
+          EXPECTED_PARENT: 1aa4669f1dc2f72e9186d2a9b93db8cd7e4f07ef
+          EXPECTED_PATCH_SHA256: b11a4b88eb8371531f3de9c88354b2db99a5dea625e1154ac686d2991b6d2551
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "$EXPECTED_PARENT"
+
+          cat .github/import-opencode-configuration/part-* > /tmp/configuration-slice.patch
+          printf '%s  %s\n' "$EXPECTED_PATCH_SHA256" /tmp/configuration-slice.patch | sha256sum -c -
+          git apply --check /tmp/configuration-slice.patch
+          git apply /tmp/configuration-slice.patch
+
+          cat > /tmp/expected-feature-paths <<'EOF'
+          README.md
+          modules/opencode/README.md
+          src/runtime/opencode_v2.rs
+          src/runtime/opencode_v2/configuration.rs
+          src/runtime/opencode_v2/effects.rs
+          src/runtime/opencode_v2/http.rs
+          src/runtime/opencode_v2/snapshot.rs
+          src/store/opencode.rs
+          src/store/runtime.rs
+          EOF
+          { git diff --name-only; git ls-files --others --exclude-standard; } | sort -u > /tmp/actual-feature-paths
+          diff -u /tmp/expected-feature-paths /tmp/actual-feature-paths
+
+          cat > /tmp/expected-feature-sha256 <<'EOF'
+          78e7ab3dbc9c0a36e5f456ac0e0433b07e704eafb384a4d9a2777d7186210d01  README.md
+          101d238a86cbc4bd0bdea92d7cbcc19afa3b25bdb98e22189cf31ed34ef7d53b  modules/opencode/README.md
+          d96d64a60e78ffb0dbbbc30f9cdf7921dd11a22784d16fd99ccf37956fc42c77  src/runtime/opencode_v2.rs
+          04e831b6604f2c5e245c6ac6d278914b900b4908de8c67a6b12e2d3a78939d55  src/runtime/opencode_v2/configuration.rs
+          99d74adb3caaa12e9d4a3ba77f4207755cbecc414092b2ac5fc935eae3aa9803  src/runtime/opencode_v2/effects.rs
+          e2be97754b76556fe919bd346c94920af217d402c8ad6b03d70c1cd9d02959ee  src/runtime/opencode_v2/http.rs
+          6ee8b4e2770cba0de99b34270993ee8f17817812191360f7c890bf546d40a691  src/runtime/opencode_v2/snapshot.rs
+          42a912653d1ce3789ced52915205cf979c52176ebd567092fdb62b3d327e79e7  src/store/opencode.rs
+          e02e41540ac6a499f58c023de7b1f5251adfee4ce42d1a80e716d07a29ac7edf  src/store/runtime.rs
+          EOF
+          sha256sum -c /tmp/expected-feature-sha256
+
+          rm -rf .github/import-opencode-configuration
+          rm .github/workflows/import-opencode-configuration.yml
+          git diff --check
+
+      - name: Pinned toolchain
+        shell: bash
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy --no-self-update
+          rustc --version
+          cargo --version
+
+      - name: Formatting
+        run: cargo fmt -p eliot-swarm-controller -- --check
+
+      - name: Verify Atlas donor snapshot
+        shell: python
+        run: |
+          import hashlib
+          from pathlib import Path
+          root = Path('vendor/atlas')
+          expected = {}
+          for line in (root / 'SHA256SUMS').read_text().splitlines():
+              digest, name = line.split('  ', 1)
+              assert name not in expected, name
+              path = root / name
+              assert not path.is_symlink() and path.is_file(), name
+              assert hashlib.sha256(path.read_bytes()).hexdigest() == digest, name
+              expected[name] = digest
+          actual = {p.relative_to(root).as_posix() for p in root.rglob('*') if p.is_file()}
+          assert actual == set(expected) | {'SHA256SUMS'}, 'donor file set changed'
+
+      - name: Clippy
+        run: cargo clippy --locked --lib --bins --no-deps -- -D warnings
+
+      - name: Publish checked source to main
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cat > /tmp/expected-final-paths <<'EOF'
+          .github/import-opencode-configuration/part-00
+          .github/import-opencode-configuration/part-01
+          .github/import-opencode-configuration/part-02
+          .github/import-opencode-configuration/part-03
+          .github/import-opencode-configuration/part-04
+          .github/import-opencode-configuration/part-05
+          .github/workflows/import-opencode-configuration.yml
+          README.md
+          modules/opencode/README.md
+          src/runtime/opencode_v2.rs
+          src/runtime/opencode_v2/configuration.rs
+          src/runtime/opencode_v2/effects.rs
+          src/runtime/opencode_v2/http.rs
+          src/runtime/opencode_v2/snapshot.rs
+          src/store/opencode.rs
+          src/store/runtime.rs
+          EOF
+          git status --porcelain=v1 | sed -E 's/^.. //' | sort -u > /tmp/actual-final-paths
+          diff -u /tmp/expected-final-paths /tmp/actual-final-paths
+
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = "$GITHUB_SHA"
+          git config user.name 'Iurii Lisenkov'
+          git config user.email '71514792+UnknownAlienHuman@users.noreply.github.com'
+          git add -A
+          git diff --cached --check
+          git commit -F - <<'EOF'
+          feat: apply durable OpenCode instruction entries with exact readback
+
+          Delegate controller-owned eliot.* session context to OpenCode's complete
+          instruction-entry backend. Treat matching native state as an idempotent
+          no-op; otherwise issue one PUT or DELETE and require exact list readback
+          before applied. Record desired/list digests, scope and next-step boundary.
+
+          Reconcile unknown mutations with GET only and never replay PUT or DELETE.
+          Retain bounded key/digest configuration observations without duplicating
+          values. Add the explicit OperationContract and keep provider, model,
+          agent, effort and model work outside this control.
+
+          Reuse the existing-control-bundle direct HTTP donor boundary and unchanged
+          Atlas redaction unit; native storage and rendering remain upstream
+          OpenCode. Rust 1.98.1 formatting and locked warnings-denied minimal Clippy
+          passed. All 23 Atlas file hashes passed. No tests, live native/model calls,
+          dependencies, migrations or permanent workflow changes.
+          EOF
+          git push origin HEAD:main
+          gh api --method POST repos/${GITHUB_REPOSITORY}/actions/workflows/rust.yml/dispatches -f ref=main
