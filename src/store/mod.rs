@@ -1,6 +1,7 @@
 //! A single database owner. The async facade never holds a SQLite connection.
 mod acceptance;
 mod assembly;
+pub(crate) mod capacity;
 mod checks;
 mod gm;
 mod opencode;
@@ -580,6 +581,8 @@ fn is_read(method: &str) -> bool {
             | "agent.list"
             | "route.list"
             | "report.delta"
+            | "report.capacity"
+            | "report.attention"
             | "message.read"
             | "client.list"
     )
@@ -719,6 +722,16 @@ fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config
                 .collect::<Result<Vec<_>>>()?;
             Ok(json!({"items":items,"next_after":after+ids.len() as i64}))
         }
+        "report.capacity" => {
+            model::fields(v, &["after", "limit"])?;
+            let (limit, after) = page(v)?;
+            capacity::capacity_report(db, limit, after)
+        }
+        "report.attention" => {
+            model::fields(v, &["after", "limit"])?;
+            let (limit, after) = page(v)?;
+            capacity::attention_report(db, limit, after)
+        }
         "report.delta" | "message.read" => {
             model::fields(v, &["after", "limit"])?;
             let (limit, after) = page(v)?;
@@ -815,6 +828,9 @@ fn mutate(
             tx.execute_batch("RELEASE mutation_effect")?;
             let state = if *queued { "queued" } else { "settled" };
             tx.execute("UPDATE operations SET state=?2,result_json=?3,settled_at_ms=?4,updated_at_ms=?5 WHERE operation_id=?1",params![id,state,model::canonical(value)?,if *queued{None}else{Some(now)},now])?;
+            // The admitted operation now holds (or releases) native
+            // capacity; record that in the durable ledger (R23).
+            capacity::sync_operation(&tx, &id, now)?;
             tx.execute("INSERT INTO observations(source_stream_id,source_event_key,operation_id,kind,payload_json,recorded_at_ms) VALUES('controller',?1,?1,?2,?3,?4)",params![id,method,model::canonical(value)?,now])?;
             json!({"ok":true,"value":value})
         }
@@ -1063,5 +1079,7 @@ fn cancel_message(tx: &Transaction<'_>, p: &Principal, v: &Value, id: &str) -> R
     )
 }
 
+#[cfg(test)]
+mod capacity_tests;
 #[cfg(test)]
 mod mailbox_tests;

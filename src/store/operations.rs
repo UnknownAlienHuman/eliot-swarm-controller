@@ -180,6 +180,10 @@ pub(super) fn cancel(
     if count != 1 {
         return Err(Error::conflict("operation changed before cancellation"));
     }
+    super::capacity::sync_operation(tx, target, now)?;
+    if let Some(attempt_id) = o["attempt_id"].as_str() {
+        super::capacity::sync_attempt(tx, attempt_id, now)?;
+    }
     if o["method"] == "agent.open" {
         tx.execute("UPDATE bindings SET state='closed',released_at_ms=?3 WHERE binding_id=?1 AND generation=?2 AND state='opening' AND native_root_id IS NULL",params![o["binding_id"].as_str(),o["binding_generation"].as_i64(),now])?;
     }

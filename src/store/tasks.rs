@@ -301,6 +301,7 @@ pub(super) fn release(
         "UPDATE operations SET task_id=?2,attempt_id=?3 WHERE operation_id=?1",
         params![id, a["task_id"].as_str(), attempt_id],
     )?;
+    super::capacity::sync_attempt(tx, attempt_id, now)?;
     Ok(
         json!({"operation_id":id,"attempt_id":attempt_id,"released":true,"outcome":outcome,"reason":reason,"evidence_kind":"caller_attested_assignment_closed","native_processes_stopped":false}),
     )

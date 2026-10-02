@@ -113,6 +113,7 @@ fn attach(db: &mut Connection, binding: &Value, boot: &str) -> Result<Principal>
         role: Role::Module,
     };
     tx.execute("UPDATE operations SET state='outcome_unknown',updated_at_ms=?3 WHERE binding_id=?1 AND binding_generation=?2 AND state IN ('sending','native_accepted')",params![id,generation,model::now_ms()?])?;
+    super::capacity::sync_binding(&tx, id, generation, model::now_ms()?)?;
     tx.execute("UPDATE bindings SET state=CASE WHEN state='ready' THEN 'reconciling' ELSE state END,state_json=json_set(state_json,'$.bridge_boot_id',?3,'$.module_link_id',?4,'$.connection','connecting','$.native_owner','external_shared_service') WHERE binding_id=?1 AND generation=?2",params![id,generation,boot,p.link_id])?;
     tx.commit()?;
     Ok(p)

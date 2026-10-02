@@ -404,6 +404,7 @@ pub(super) fn finish(
     };
     tx.execute("UPDATE operations SET state='settled',result_json=?2,settled_at_ms=?3,updated_at_ms=?3 WHERE operation_id=?1",
         params![id,model::canonical(&result)?,now])?;
+    super::capacity::sync_attempt(&tx, &input.attempt_id, now)?;
     tx.execute("INSERT INTO observations(source_stream_id,source_event_key,operation_id,kind,payload_json,recorded_at_ms) VALUES('controller:acceptance',?1,?2,'task.acceptance',?3,?4)",
         params![format!("accept:{id}"),id,model::canonical(&result)?,now])?;
     tx.commit()?;
@@ -438,6 +439,7 @@ pub(super) fn invalidate(
         if notify {
             tx.execute("UPDATE attempts SET state='needs_correction',updated_at_ms=?2 WHERE attempt_id=?1 AND state='accepted'",params![attempt_id,now])?;
         }
+        super::capacity::sync_attempt(tx, attempt_id, now)?;
     }
     let value = json!({"operation_id":id,"acceptance_operation_id":input.acceptance_operation_id,"task_id":task_id,"attempt_id":attempt_id,
         "submission_ref":prior["submission_ref"],"candidate_ref":prior["candidate_ref"],"reason":input.reason,"evidence":input.evidence,

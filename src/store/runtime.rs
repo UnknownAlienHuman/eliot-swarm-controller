@@ -141,6 +141,9 @@ pub(super) fn hello(
     if recovered && needs_recovery {
         tx.execute("UPDATE bindings SET state='reconciling',state_json=json_set(state_json,'$.recovery_required',json('true'),'$.previous_bridge_boot_id',?3) WHERE binding_id=?1 AND generation=?2", params![id,generation,old_boot])?;
         tx.execute("UPDATE operations SET state='outcome_unknown',updated_at_ms=?3 WHERE binding_id=?1 AND binding_generation=?2 AND state IN ('sending','native_accepted')",params![id,generation,model::now_ms()?])?;
+        // The unknown outcomes free no capacity: the ledger marks the
+        // entries unknown and keeps their phases (R23).
+        super::capacity::sync_binding(&tx, &id, generation, model::now_ms()?)?;
     }
     if let Some(owner) = v.get("managed_owner") {
         tx.execute("UPDATE bindings SET state_json=json_set(state_json,'$.managed_owner',json(?3)) WHERE binding_id=?1 AND generation=?2",params![id,generation,model::canonical(owner)?])?;
@@ -519,6 +522,11 @@ pub(super) fn outcome(db: &mut Connection, p: &Principal, v: &Value) -> Result<V
     }
     tx.execute("UPDATE operations SET state=?2,result_json=?3,native_refs_json=?4,settled_at_ms=?5,updated_at_ms=?6 WHERE operation_id=?1",params![r.operation_id,state,encoded,model::canonical(&json!({"session_id":r.native_root_id,"turn_id":r.turn_id,"input_id":r.native_input_id}))?,if matches!(state,"outcome_unknown"|"native_accepted"){None}else{Some(now)},now])?;
     tx.execute("INSERT INTO observations(source_stream_id,source_event_key,binding_id,binding_generation,operation_id,kind,payload_json,recorded_at_ms) VALUES(?1,?2,?3,?4,?5,'runtime.outcome',?6,?7)",params![format!("module:{}",p.client_id),key,id,generation,r.operation_id,encoded,now])?;
+    super::capacity::note_outcome(&tx, &o, &r, now)?;
+    super::capacity::sync_operation(&tx, &r.operation_id, now)?;
+    if let Some(attempt_id) = o["attempt_id"].as_str() {
+        super::capacity::sync_attempt(&tx, attempt_id, now)?;
+    }
     tx.commit()?;
     Ok(json!({"recorded":true}))
 }
@@ -593,8 +601,8 @@ pub(super) fn observe(db: &mut Connection, p: &Principal, v: &Value) -> Result<V
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(stmt);
-        for (attempt, raw) in rows {
-            let mut producers: Vec<Value> = serde_json::from_str(&raw)?;
+        for (attempt, raw) in &rows {
+            let mut producers: Vec<Value> = serde_json::from_str(raw)?;
             for producer in &mut producers {
                 producers::apply_evidence(producer, &v["state"], Some(observation_id));
             }
@@ -602,6 +610,9 @@ pub(super) fn observe(db: &mut Connection, p: &Principal, v: &Value) -> Result<V
                 "UPDATE attempts SET producers_json=?2 WHERE attempt_id=?1",
                 params![attempt, model::canonical(&json!(producers))?],
             )?;
+        }
+        for (attempt, _) in &rows {
+            super::capacity::sync_attempt(&tx, attempt, now)?;
         }
     }
     tx.commit()?;

@@ -198,6 +198,7 @@ pub(super) fn finish(
         Err(e) => json!({"operation_id":id,"outcome":"failed","error":e,"task_accepted":false}),
     };
     tx.execute("UPDATE operations SET state='settled',result_json=?2,settled_at_ms=?3,updated_at_ms=?3 WHERE operation_id=?1", params![id,model::canonical(&value)?,now])?;
+    super::capacity::sync_attempt(&tx, &input.attempt_id, now)?;
     tx.execute("INSERT INTO observations(source_stream_id,source_event_key,operation_id,kind,payload_json,recorded_at_ms) VALUES('controller',?1,?2,'task.submission',?3,?4)",
         params![format!("submission:{id}"),id,model::canonical(&value)?,now])?;
     tx.commit()?;
@@ -339,6 +340,7 @@ pub(super) fn request_changes(
             "UPDATE attempts SET state='needs_correction',updated_at_ms=?2 WHERE attempt_id=?1",
             params![input.attempt_id, now],
         )?;
+        super::capacity::sync_attempt(tx, &input.attempt_id, now)?;
     }
     tx.execute(
         "UPDATE operations SET task_id=?2,attempt_id=?3 WHERE operation_id=?1",

@@ -303,6 +303,7 @@ pub(super) fn bind(
         params![attempt_id,model::canonical(&json!(producers))?,now])?;
     tx.execute("UPDATE operations SET task_id=?2,attempt_id=?3,binding_id=?4,binding_generation=?5 WHERE operation_id=?1",
         params![operation,a["task_id"].as_str(),attempt_id,a["binding_id"].as_str(),a["binding_generation"].as_i64()])?;
+    super::capacity::sync_attempt(tx, attempt_id, now)?;
     Ok(
         json!({"operation_id":operation,"attempt_id":attempt_id,"producer":producers[index],"native_start_sent":false}),
     )

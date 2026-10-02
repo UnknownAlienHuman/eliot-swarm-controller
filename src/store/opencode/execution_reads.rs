@@ -328,6 +328,10 @@ fn record(
             params![command.operation_id, model::canonical(&json!(refs))?, now],
         )?;
     }
+    super::super::capacity::sync_operation(&tx, &command.operation_id, now)?;
+    if let Some(attempt_id) = op["attempt_id"].as_str() {
+        super::super::capacity::sync_attempt(&tx, attempt_id, now)?;
+    }
     tx.commit()?;
     Ok(changed || admitted)
 }
