@@ -3,21 +3,23 @@ use serde_json::json;
 
 #[test]
 fn options_require_explicit_model_bounded_timeout_and_absolute_workdir() {
+    // An absolute path on every platform: "/tmp" is not absolute on Windows.
+    let abs = std::env::temp_dir().to_string_lossy().into_owned();
     let base = json!({
         "scope_id": "fixture",
         "executable": "eval-cli",
-        "workdir": "/tmp",
+        "workdir": abs,
         "model": "anthropic/claude-sonnet-4-6",
         "timeout_seconds": 60
     });
     assert!(Options::parse(&base).is_ok());
     for broken in [
-        json!({"scope_id":"fixture","executable":"eval-cli","workdir":"/tmp","model":"claude-sonnet-4-6","timeout_seconds":60}),
+        json!({"scope_id":"fixture","executable":"eval-cli","workdir":abs,"model":"claude-sonnet-4-6","timeout_seconds":60}),
         json!({"scope_id":"fixture","executable":"eval-cli","workdir":"relative/dir","model":"anthropic/claude-sonnet-4-6","timeout_seconds":60}),
-        json!({"scope_id":"fixture","executable":"eval-cli","workdir":"/tmp","model":"anthropic/claude-sonnet-4-6","timeout_seconds":0}),
-        json!({"scope_id":"fixture","executable":"eval-cli","workdir":"/tmp","model":"anthropic/","timeout_seconds":60}),
-        json!({"scope_id":"fixture","executable":"eval-cli","workdir":"/tmp","model":"anthropic/claude-sonnet-4-6","timeout_seconds":60,"env_keys":["1BAD"]}),
-        json!({"scope_id":"fixture","executable":"eval-cli","workdir":"/tmp","model":"anthropic/claude-sonnet-4-6","timeout_seconds":60,"surprise":true}),
+        json!({"scope_id":"fixture","executable":"eval-cli","workdir":abs,"model":"anthropic/claude-sonnet-4-6","timeout_seconds":0}),
+        json!({"scope_id":"fixture","executable":"eval-cli","workdir":abs,"model":"anthropic/","timeout_seconds":60}),
+        json!({"scope_id":"fixture","executable":"eval-cli","workdir":abs,"model":"anthropic/claude-sonnet-4-6","timeout_seconds":60,"env_keys":["1BAD"]}),
+        json!({"scope_id":"fixture","executable":"eval-cli","workdir":abs,"model":"anthropic/claude-sonnet-4-6","timeout_seconds":60,"surprise":true}),
     ] {
         assert_eq!(
             Options::parse(&broken).unwrap_err().code,
