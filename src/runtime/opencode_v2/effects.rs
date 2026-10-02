@@ -47,7 +47,7 @@ pub(super) fn failed(
 pub(super) fn marker(command: &RuntimeCommand) -> Value {
     json!({"binding":command.binding_id,"generation":command.generation,"operation":command.operation_id})
 }
-fn prompt(command: &RuntimeCommand) -> Result<String> {
+pub(super) fn prompt(command: &RuntimeCommand) -> Result<String> {
     let text = model::text(&command.input, "text")?;
     if command.method == "task.dispatch" {
         if !command.input["task_snapshot"].is_object() {

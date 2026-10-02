@@ -2,9 +2,8 @@
 use super::{REQUEST_TIMEOUT, Service, header};
 use crate::{
     error::{Error, Result},
-    runtime::{
-        RuntimeCommand,
-        opencode_v2::{ExecutionRead, ExecutionScan, SessionRead, SessionScan},
+    runtime::opencode_v2::{
+        ExecutionRead, ExecutionScan, NativeInputDescriptor, SessionRead, SessionScan,
     },
 };
 use eventsource_stream::Eventsource;
@@ -24,7 +23,7 @@ trait LogScan {
 }
 struct InputScan<'a> {
     scan: ExecutionScan,
-    command: &'a RuntimeCommand,
+    descriptor: &'a NativeInputDescriptor,
 }
 impl LogScan for InputScan<'_> {
     fn session_id(&self) -> &str {
@@ -40,7 +39,7 @@ impl LogScan for InputScan<'_> {
         self.scan.verify_anchor(value)
     }
     fn consume(&mut self, value: &Value) -> Result<()> {
-        self.scan.consume(value, self.command)
+        self.scan.consume(value, self.descriptor)
     }
     fn synchronize(&mut self, value: &Value) -> Result<()> {
         self.scan.synchronize(value)
@@ -192,14 +191,11 @@ impl Service {
 
     pub(in crate::runtime::opencode_v2) async fn execution_log(
         &self,
-        command: &RuntimeCommand,
+        descriptor: &NativeInputDescriptor,
         scan: ExecutionScan,
     ) -> Result<ExecutionRead> {
-        let root = command
-            .native_root_id
-            .as_deref()
-            .ok_or_else(|| Error::invalid("execution read needs the exact native root"))?;
-        let mut input = InputScan { scan, command };
+        let root = descriptor.session_id();
+        let mut input = InputScan { scan, descriptor };
         if input.session_id() != root {
             return Err(Error::invalid("execution scan belongs to another session"));
         }

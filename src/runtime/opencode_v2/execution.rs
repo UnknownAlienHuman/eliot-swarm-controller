@@ -1,6 +1,21 @@
 //! Durable inbox -> serialized native busy-period evidence. Projected messages
 //! and the volatile service feed never enter this state machine.
-use super::{Options, Service, effects::delivered_matches, input_id, valid_id};
+//!
+//! Correlation is always through one exact input, named by a
+//! [`NativeInputDescriptor`]: the exact native input ID, the SHA-256 digest of
+//! the exact prompt text and the exact `eliot` marker the input carried. There
+//! is deliberately no text or time-window matching anywhere in this reader.
+//! Execution start correlates through the input's own `inbox.delivered` event:
+//! delivery binds the `session.execution.started` event that is active at
+//! delivery time, and the terminal of that serialized busy period belongs to
+//! the same run. A busy period started by an earlier input may therefore be
+//! shared by several inputs delivered while it is active; sharing is an
+//! expected property of the serialized native model, not an ambiguity.
+use super::{
+    Options, Service,
+    effects::{marker, no_attachments, prompt},
+    input_id, valid_id,
+};
 use crate::{
     error::{Error, Result},
     model,
@@ -11,17 +26,101 @@ use serde_json::{Value, json};
 
 pub(crate) const READER_REVISION: &str = "opencode-execution-log-v1";
 
-fn enqueued_matches(item: &Value, command: &RuntimeCommand) -> Result<bool> {
-    if item["type"] != "user" || item["delivery"] != "queue" || !item["payload"].is_object() {
-        return Ok(false);
+/// Typed identity of the one native input an [`ExecutionScan`] correlates.
+///
+/// Every fact here is controller-known before the input is sent: the exact
+/// input ID derived from the Operation, the digest of the exact prompt text,
+/// the exact marker object placed in the input metadata, and the session
+/// origin facts (binding, generation, creation model) the log's
+/// `session.created` event must match. Two different Operations on the same
+/// session produce different descriptors; no descriptor can match another
+/// input's lifecycle events.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeInputDescriptor {
+    session_id: String,
+    input_id: String,
+    prompt_sha256: String,
+    marker: Value,
+    binding_id: String,
+    generation: i64,
+    model: Value,
+}
+
+impl NativeInputDescriptor {
+    /// Descriptor for a `task.dispatch` / `agent.send` input: the prompt text
+    /// and marker are exactly the ones `effects` put on the wire.
+    pub(crate) fn from_command(command: &RuntimeCommand) -> Result<Self> {
+        let session_id = command
+            .native_root_id
+            .clone()
+            .ok_or_else(|| gap("NATIVE_ROOT_MISSING"))?;
+        valid_id(&session_id, "ses")?;
+        Ok(Self {
+            session_id,
+            input_id: input_id(&command.operation_id),
+            prompt_sha256: model::digest(prompt(command)?.as_bytes()),
+            marker: marker(command),
+            binding_id: command.binding_id.clone(),
+            generation: command.generation,
+            model: command.route["native_options"]["model"].clone(),
+        })
     }
-    // Reuse the exact original prompt/metadata/attachment contract. The log
-    // envelope supplies identity; the native inbox payload supplies content.
-    let mut message = item["payload"].clone();
-    message["id"] = json!(input_id(&command.operation_id));
-    message["type"] = json!("user");
-    message["sessionID"] = json!(command.native_root_id);
-    delivered_matches(&message, command)
+
+    /// Descriptor for a goal activation input. The goal's prompt text and
+    /// marker are record-derived rather than command-derived, so the caller
+    /// supplies exactly the text and marker it placed (or would have placed)
+    /// on the activation input for this goal Operation.
+    pub(crate) fn for_goal_activation(
+        command: &RuntimeCommand,
+        prompt_text: &str,
+        marker: Value,
+    ) -> Result<Self> {
+        let session_id = command
+            .native_root_id
+            .clone()
+            .ok_or_else(|| gap("NATIVE_ROOT_MISSING"))?;
+        valid_id(&session_id, "ses")?;
+        Ok(Self {
+            session_id,
+            input_id: input_id(&command.operation_id),
+            prompt_sha256: model::digest(prompt_text.as_bytes()),
+            marker,
+            binding_id: command.binding_id.clone(),
+            generation: command.generation,
+            model: command.route["native_options"]["model"].clone(),
+        })
+    }
+
+    pub(crate) fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub(crate) fn input_id(&self) -> &str {
+        &self.input_id
+    }
+
+    fn fingerprint(&self) -> Result<String> {
+        Ok(model::digest(
+            model::canonical(&serde_json::to_value(self)?)?.as_bytes(),
+        ))
+    }
+}
+
+fn enqueued_matches(item: &Value, descriptor: &NativeInputDescriptor) -> bool {
+    if item["type"] != "user" || item["delivery"] != "queue" || !item["payload"].is_object() {
+        return false;
+    }
+    // The exact original prompt/marker/attachment contract, checked against
+    // the descriptor: the payload text must hash to the descriptor's prompt
+    // digest and the payload marker must equal the descriptor's marker. The
+    // log envelope supplies identity; the native inbox payload supplies content.
+    let payload = &item["payload"];
+    payload["text"]
+        .as_str()
+        .is_some_and(|text| model::digest(text.as_bytes()) == descriptor.prompt_sha256)
+        && payload["metadata"]["eliot"] == descriptor.marker
+        && no_attachments(payload)
 }
 
 fn gap(code: &str) -> Error {
@@ -117,17 +216,29 @@ pub(crate) struct ExecutionRead {
 
 impl ExecutionScan {
     pub(crate) fn restore(command: &RuntimeCommand, saved: Option<&Value>) -> Result<Self> {
-        let session = command
-            .native_root_id
-            .as_deref()
-            .ok_or_else(|| gap("NATIVE_ROOT_MISSING"))?;
-        valid_id(session, "ses")?;
         if !matches!(command.method.as_str(), "task.dispatch" | "agent.send") {
             return Err(Error::invalid(
                 "execution read requires an already-sent input",
             ));
         }
+        let session = command
+            .native_root_id
+            .as_deref()
+            .ok_or_else(|| gap("NATIVE_ROOT_MISSING"))?;
+        valid_id(session, "ses")?;
         let fingerprint = model::digest(model::canonical(&json!(command))?.as_bytes());
+        Self::restore_for(session, fingerprint, saved)
+    }
+
+    /// A fresh, uncheckpointed scan for a goal activation input. Goal evidence
+    /// is derived at reconciliation time only; nothing here is persisted, so
+    /// there is no saved checkpoint to validate. The scan is fingerprinted by
+    /// its descriptor so a scan can never be replayed against another input.
+    pub(crate) fn for_goal(descriptor: &NativeInputDescriptor) -> Result<Self> {
+        Self::restore_for(descriptor.session_id(), descriptor.fingerprint()?, None)
+    }
+
+    fn restore_for(session: &str, fingerprint: String, saved: Option<&Value>) -> Result<Self> {
         if let Some(saved) = saved {
             let scan: Self = serde_json::from_value(saved.clone())
                 .map_err(|_| gap("NATIVE_LOG_CHECKPOINT_SCHEMA"))?;
@@ -184,7 +295,11 @@ impl ExecutionScan {
     fn envelope(&self, value: &Value) -> Result<EventRef> {
         envelope_for(value, &self.session_id)
     }
-    pub(crate) fn consume(&mut self, value: &Value, command: &RuntimeCommand) -> Result<()> {
+    pub(crate) fn consume(
+        &mut self,
+        value: &Value,
+        descriptor: &NativeInputDescriptor,
+    ) -> Result<()> {
         let event = self.envelope(value)?;
         if self
             .anchor
@@ -206,9 +321,9 @@ impl ExecutionScan {
             if kind != "session.created"
                 || version != 1
                 || !data["parentID"].is_null()
-                || data["metadata"]["eliot"]["binding"] != command.binding_id
-                || data["metadata"]["eliot"]["generation"] != command.generation
-                || data["model"] != command.route["native_options"]["model"]
+                || data["metadata"]["eliot"]["binding"] != descriptor.binding_id
+                || data["metadata"]["eliot"]["generation"] != descriptor.generation
+                || data["model"] != descriptor.model
             {
                 return Err(gap("NATIVE_LOG_ORIGIN"));
             }
@@ -221,7 +336,7 @@ impl ExecutionScan {
         {
             return Err(gap("NATIVE_LOG_LIFECYCLE_VERSION"));
         }
-        let input = input_id(&command.operation_id);
+        let input = descriptor.input_id.as_str();
         match kind {
             "session.created" => {}
             "session.execution.started" => {
@@ -236,7 +351,7 @@ impl ExecutionScan {
             "session.inbox.enqueued" if data["inboxID"] == input => {
                 if self.admission.is_some() {
                     self.mark_uncertain("NATIVE_INPUT_ID_REUSED");
-                } else if enqueued_matches(&data["item"], command)? {
+                } else if enqueued_matches(&data["item"], descriptor) {
                     self.admission = Some(event.clone());
                 } else {
                     return Err(gap("NATIVE_INPUT_MISMATCH"));
@@ -385,6 +500,29 @@ impl ExecutionScan {
             "log_watermark":self.watermark,"correlation":"durable_serialized_execution",
             "family_complete":false}),
         )
+    }
+
+    /// The exact input was admitted: its `session.inbox.enqueued` event
+    /// matched the descriptor. Admission proves the input exists natively;
+    /// it says nothing about delivery or model execution.
+    pub(crate) fn input_admitted(&self) -> bool {
+        self.admission.is_some()
+    }
+
+    /// The `session.execution.started` event this input's delivery correlated
+    /// to, as a serialized event ref — the only execution-start evidence this
+    /// reader ever reports. `None` both when no start is proven and when the
+    /// scan is uncertain (for example delivery with no active start,
+    /// `NATIVE_EXECUTION_START_MISSING`): uncertainty is never reported as a
+    /// start. A start proven for the busy period may be shared with other
+    /// inputs delivered during the same period.
+    pub(crate) fn execution_started(&self) -> Option<Value> {
+        if self.uncertainty.is_some() {
+            return None;
+        }
+        self.run
+            .as_ref()
+            .and_then(|run| serde_json::to_value(run).ok())
     }
 }
 
@@ -700,7 +838,8 @@ impl Service {
         if !session["fork"].is_null() || !session["revert"].is_null() {
             return Err(gap("NATIVE_INPUT_HISTORY_CHANGED"));
         }
-        let read = self.execution_log(command, scan).await?;
+        let descriptor = NativeInputDescriptor::from_command(command)?;
+        let read = self.execution_log(&descriptor, scan).await?;
         self.verify_binding(
             &read.scan.session_id,
             options,
