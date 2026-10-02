@@ -4,7 +4,7 @@ Built-in Rust adapter for an **already running, externally owned** OpenCode V2 H
 
 ## Contract and exact scope
 
-Implements the HTTP/inbox/readback part of C04: native session creation, immutable Task delivery, next-turn input, family snapshots, addressed form/permission replies, durable instruction entries, exact session-agent and route-model controls, refresh, read-only reconciliation, scoped projected-result export, native per-turn patch export, exact detached tool-file export and durable input/execution disposition. One connection pool and volatile SSE reader serve bindings with the same configured `service_id`. Aliases must share that namespace, connection file and exact version. Do not assign different service IDs/files to the same service: physical endpoint aliases are not automatically discovered.
+Implements the HTTP/inbox/readback part of C04: native session creation, immutable Task delivery, next-turn input, family snapshots, addressed form/permission replies, durable instruction entries, exact session-agent and route-model controls, controller-recorded goal, refresh, read-only reconciliation, scoped projected-result export, native per-turn patch export, exact detached tool-file export and durable input/execution disposition. One connection pool and volatile SSE reader serve bindings with the same configured `service_id`. Aliases must share that namespace, connection file and exact version. Do not assign different service IDs/files to the same service: physical endpoint aliases are not automatically discovered.
 
 Canonical requirements: [architecture §8](../../docs/agent_swarm.md), [implementation C04](../../docs/agent_swarm.implementation-v6.md), [module contract §§4–7](../../docs/agent_swarm.module-contract-v2.md). Wire contract reviewed against the [official V2 API](https://opencode.ai/v2/docs/api) and [OpenAPI document](https://opencode.ai/v2/openapi.json), captured 2026-10-01. These documents move; they are not proof that a particular installed server has been qualified.
 
@@ -107,7 +107,7 @@ Use `swarm call agent.configure --file modules/opencode/switch-agent.example.jso
 
 A matching pre-existing session agent is an exact no-op. Otherwise the adapter sends one `POST /api/session/{sessionID}/agent`, then requires repeated equal catalog and `session.get` projections proving the selected ID and unchanged agent definition. The typed result records the agent ID, definition/catalog digests, mode, hidden flag, application boundary `subsequent_provider_turn`, and whether the definition carried the same exact model override. Raw system prompts, request settings and permissions are not copied into controller state.
 
-A lost response becomes `outcome_unknown`; reconciliation performs only catalog/session GETs and never repeats the switch. Family snapshots retain the selected agent plus definition/catalog revisions. A later external switch or definition reload invalidates a configure prerequisite for that agent rather than silently starting under changed instructions. This control does not implement goal set/edit/pause/resume/clear, effort changes, or arbitrary agent-definition mutation. Native semantics were reviewed at OpenCode `4c0d0ff4`: [session switch routes](https://github.com/anomalyco/opencode/blob/4c0d0ff478ca9150c163fb8b04a76395e4dccafe/packages/protocol/src/groups/session.ts), [session projection](https://github.com/anomalyco/opencode/blob/4c0d0ff478ca9150c163fb8b04a76395e4dccafe/packages/schema/src/session.ts), [agent catalog routes](https://github.com/anomalyco/opencode/blob/4c0d0ff478ca9150c163fb8b04a76395e4dccafe/packages/protocol/src/groups/agent.ts), and [agent schema](https://github.com/anomalyco/opencode/blob/4c0d0ff478ca9150c163fb8b04a76395e4dccafe/packages/schema/src/agent.ts).
+A lost response becomes `outcome_unknown`; reconciliation performs only catalog/session GETs and never repeats the switch. Family snapshots retain the selected agent plus definition/catalog revisions. A later external switch or definition reload invalidates a configure prerequisite for that agent rather than silently starting under changed instructions. This control does not implement effort changes or arbitrary agent-definition mutation; goal set/edit/pause/resume/clear are the separate controller-recorded control below. Native semantics were reviewed at OpenCode `4c0d0ff4`: [session switch routes](https://github.com/anomalyco/opencode/blob/4c0d0ff478ca9150c163fb8b04a76395e4dccafe/packages/protocol/src/groups/session.ts), [session projection](https://github.com/anomalyco/opencode/blob/4c0d0ff478ca9150c163fb8b04a76395e4dccafe/packages/schema/src/session.ts), [agent catalog routes](https://github.com/anomalyco/opencode/blob/4c0d0ff478ca9150c163fb8b04a76395e4dccafe/packages/protocol/src/groups/agent.ts), and [agent schema](https://github.com/anomalyco/opencode/blob/4c0d0ff478ca9150c163fb8b04a76395e4dccafe/packages/schema/src/agent.ts).
 
 ### Exact route-model control
 
@@ -136,7 +136,7 @@ A lost mutation response becomes `outcome_unknown`. Reconciliation performs only
 
 ## Explicit configure → input prerequisite
 
-`prerequisite_operation_id` implements the short persisted setup sequence required by the module contract. It is accepted on another `agent.configure`, on `agent.send` with `delivery=next_turn`, and on `task.dispatch`. The value must name one earlier `agent.configure` Operation on the exact same binding generation. Each Operation has at most one direct predecessor; a setup sequence can name the preceding step, but this is not a general DAG or workflow language. Submission order alone never creates a dependency.
+`prerequisite_operation_id` implements the short persisted setup sequence required by the module contract. It is accepted on another `agent.configure`, on `agent.send` with `delivery=next_turn`, on `task.dispatch`, and on `agent.goal` (see the goal section below). The value must name one earlier `agent.configure` Operation on the exact same binding generation. Each Operation has at most one direct predecessor; a setup sequence can name the preceding step, but this is not a general DAG or workflow language. Submission order alone never creates a dependency.
 
 A dependent request may be durably queued while its prerequisite is still `queued`, `sending`, `native_accepted` or `outcome_unknown`. Immediately before `queued → sending`, Store rechecks the prerequisite inside the same SQLite transaction that admits the native send. The check requires the saved OpenCode configuration OperationContract, the original typed target/digest, an `applied` RuntimeOutcome for the same native root and service scope, the configuration kind's exact native readback evidence, and valid settings/catalog/definition revisions. A plain ACK, `state=settled` without the typed result, rejection, cancellation, failure or unknown outcome never satisfies the dependency.
 
@@ -156,6 +156,32 @@ Example dependent send, after reading the applied configure Operation ID:
 ```
 
 Use `swarm call agent.send --file modules/opencode/send-after-configuration.example.json`. Initial controller-owned delivery uses the same field in `task.dispatch`; invoke the generic `swarm call task.dispatch --file REQUEST.json` when that explicit setup chain is required. `operation.get` exposes both `prerequisite_operation_id` and the effective OperationContract. A stale or failed prerequisite rejects the dependent Operation before any native input is sent; it is not silently rebound to another configure. The barrier proves configuration at the admission boundary, not frozen context for every later model step, Task acceptance or family completion.
+
+## Controller-recorded goal — not a native goal API
+
+OpenCode V2 has **no native goal API**: at the reviewed pin `4c0d0ff4` the session routes and `Session.Info` schema contain no goal endpoint, field or event, and the local runtime matrix records no durable goal API for this runtime. `agent.goal` therefore implements the architecture's explicitly permitted controller fallback: the goal is a controller-owned durable instruction entry with key `eliot.goal`, stored through the same native backend as the instruction-entry configuration above:
+
+```json
+{"objective": "<text>", "status": "active|paused", "revision": 3, "updated_by_operation_id": "<operation_id>"}
+```
+
+```json
+{
+  "client_request_id": "oc-goal-1",
+  "binding_id": "BINDING_ID",
+  "generation": 1,
+  "action": "set",
+  "objective": "REPLACE_WITH_GOAL_OBJECTIVE"
+}
+```
+
+Use `swarm call agent.goal --file modules/opencode/goal.example.json`. One Operation changes only this entry. `set`/`edit` write the objective (bounded to 32 KiB, well below the native entry limit) and, when the recorded content actually changes and the goal is active, admit exactly one activation prompt with the deterministic input ID and a prompt text that names itself a controller-recorded goal. `resume` reactivates a paused record and admits one prompt. `pause` changes only the recorded status: it does not interrupt the current native turn, does not touch the inbox and is not Task acceptance. `clear` deletes the entry. Matching pre-existing state is an exact no-op with no PUT, DELETE or prompt. `edit`/`pause`/`resume` without a record are rejected with `NATIVE_GOAL_ABSENT` before any mutation.
+
+The typed result reports `completion_condition: "native_goal_recorded"` — never `native_goal_admitted`, which would claim a native goal that does not exist — plus the action, status, revision, objective digest, entry-list and settings revisions, `continuation_owner: "controller_record"` and `native_goal_api: false`. The objective itself is not copied into snapshot state: family snapshots expose a separate `goal_configuration` axis with presence, status, revision and digest only, so goal remains an independent observation axis rather than part of the configuration or execution state. `agent.goal` accepts `prerequisite_operation_id` naming an applied `agent.configure` on the same binding generation, so an `open → configure(applied) → goal` sequence is gated by typed applied evidence; a goal Operation can never itself be a prerequisite.
+
+A lost PUT/DELETE or activation-prompt response becomes `outcome_unknown`. Reconciliation repeats only GET/readback and never repeats the entry write or the prompt, including after host restart. Because the completion condition is the record, reconciliation can settle a `set` whose entry landed but whose activation prompt was never sent; its details then honestly report `activation_input_id: null` and `model_work_started: false`, and an operator `resume` admits the activation. A record written by another operation is not this Operation's evidence and stays unknown.
+
+There is **no automatic continuation**: when a native turn terminates, the controller does not re-prompt toward the goal, and native idle is never read as goal completion. Continuation has exactly one owner — this record — and no controller timer duplicates it.
 
 ## Delivery, observation and recovery
 
@@ -236,7 +262,7 @@ Each timeline pass is bounded to 32 pages of at most 50 messages and 8 MiB of sc
 
 ## Remaining C04 work — do not declare end-to-end completion
 
-Cross-restart native continuation after shutdown/missing terminal, goal/effort controls and complete family reconstruction remain unfinished. Explicit configure-to-input prerequisite chaining is implemented for durable instruction entries, exact session-agent selection and exact route-model restoration. Exact inline/location-confined tool-file retrieval is implemented; external URI schemes, files outside the verified location and sources above 64 MiB remain deliberately unsupported. The model control preserves the route's existing provider/model/variant; it is not an arbitrary model/billing-route switch and does not claim goal or effort control. The durable-log path now resolves ordinary admitted/delivered inputs and exact pending cancellation; incomplete or unsupported native histories keep the producer unresolved. Parent idle or the latest assistant outcome cannot discharge it. Unsupported methods report an explicit capability error.
+Cross-restart native continuation after shutdown/missing terminal, effort controls and complete family reconstruction remain unfinished. Goal controls are implemented as a controller record, not a native goal API (see the goal section above); automatic continuation after a terminal turn is not implemented. Explicit configure-to-input prerequisite chaining is implemented for durable instruction entries, exact session-agent selection and exact route-model restoration. Exact inline/location-confined tool-file retrieval is implemented; external URI schemes, files outside the verified location and sources above 64 MiB remain deliberately unsupported. The model control preserves the route's existing provider/model/variant; it is not an arbitrary model/billing-route switch and does not claim goal or effort control. The durable-log path now resolves ordinary admitted/delivered inputs and exact pending cancellation; incomplete or unsupported native histories keep the producer unresolved. Parent idle or the latest assistant outcome cannot discharge it. Unsupported methods report an explicit capability error.
 
 Live installed OpenCode, actual inference/subscription behavior and native Windows service interoperability remain unqualified. This adapter must not be presented as a fully qualified automatic Task-completion route yet. It does not require or install the optional OpenCodex provider proxy (Issue #1).
 

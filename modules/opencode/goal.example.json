@@ -1,0 +1,7 @@
+{
+  "client_request_id": "oc-goal-1",
+  "binding_id": "BINDING_ID",
+  "generation": 1,
+  "action": "set",
+  "objective": "REPLACE_WITH_GOAL_OBJECTIVE"
+}
