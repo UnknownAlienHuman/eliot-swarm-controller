@@ -1,0 +1,7 @@
+{
+  "kind": "tool_file",
+  "session_id": "ses_EXACT_NATIVE_ID",
+  "message_id": "msg_EXACT_ASSISTANT_ID",
+  "tool_call_id": "EXACT_TOOL_CALL_ID",
+  "content_index": 0
+}
