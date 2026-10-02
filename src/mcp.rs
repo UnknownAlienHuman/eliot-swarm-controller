@@ -51,6 +51,7 @@ const fn f(name: &'static str, kind: &'static str) -> Field {
     Field { name, kind }
 }
 const S: &str = "string";
+const SN: &str = "string_or_null";
 const I: &str = "integer";
 const B: &str = "boolean";
 const O: &str = "object";
@@ -314,7 +315,7 @@ static TOOLS: &[(bool, ToolSpec)] = &[
         &[
             f("attempt_id", S),
             f("expected_revision", I),
-            f("expected_submission_ref", S),
+            f("expected_submission_ref", SN),
             f("candidate_ref", S),
             f("summary", S),
             f("claims", A),
@@ -322,6 +323,7 @@ static TOOLS: &[(bool, ToolSpec)] = &[
         &[
             "attempt_id",
             "expected_revision",
+            "expected_submission_ref",
             "candidate_ref",
             "summary",
         ],
@@ -548,6 +550,7 @@ fn input_schema(spec: &ToolSpec, read_only: bool) -> Arc<JsonObject> {
 fn field_schema(kind: &str) -> Value {
     match kind {
         "string" => json!({"type": "string"}),
+        "string_or_null" => json!({"type": ["string", "null"]}),
         "integer" => json!({"type": "integer"}),
         "boolean" => json!({"type": "boolean"}),
         "object" => json!({"type": "object"}),

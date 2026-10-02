@@ -403,11 +403,6 @@ pub fn inspect(db: &Connection, config: &Config) -> Result<Inspection> {
         },
         "known_gaps": [
             {
-                "area": "mcp_facade",
-                "status": "not_implemented",
-                "note": "This build has no MCP facade; the CLI and IPC expose the same API.",
-            },
-            {
                 "area": "forge_publication",
                 "status": "not_implemented",
                 "note": "Git/GitHub publication is not performed or recorded by this controller yet, so there are no publication facts to audit.",
