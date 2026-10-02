@@ -19,7 +19,7 @@ runtime = 'muse'
 module_artifact_id = 'muse-sdk-1.3.0-bridge.5'
 enabled = false
 [routes.native_options]
-workspaceRoot = 'C:\\Projects\\YourRepository'
+workspaceRoot = 'C:\Projects\YourRepository'
 modelId = 'muse-spark-1.3-contributor'
 reasoningEffort = 'max'
 approvalMode = 'allowAll'
