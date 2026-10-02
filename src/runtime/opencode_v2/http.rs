@@ -1,3 +1,4 @@
+mod execution_log;
 use super::{Options, valid_id};
 use crate::error::{Error, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD};

@@ -1,5 +1,6 @@
 //! Built-in HTTP modules use the existing operation/observation boundary. They
 //! own clients only; neither restart nor shutdown owns an OpenCode process.
+mod execution_reads;
 mod result_reads;
 use super::{Store, meta, operations, runtime, set_meta, tasks};
 use crate::{
@@ -227,6 +228,7 @@ impl Store {
     async fn drive_opencode(&self, service_id: &str, mut stopping: watch::Receiver<bool>) {
         let boot = model::new_id();
         let mut principals = BTreeMap::new();
+        let mut execution_reader = execution_reads::Reader::default();
         let mut result_retries: BTreeMap<(String, i64), (String, Instant)> = BTreeMap::new();
         let mut connection = None;
         let mut events: Option<oc::EventReader> = None;
@@ -284,6 +286,16 @@ impl Store {
                         connection = None;
                     }
                     Ok(()) => {
+                        execution_reader
+                            .schedule(
+                                self,
+                                service,
+                                &options,
+                                &list,
+                                &principals,
+                                stopping.clone(),
+                            )
+                            .await;
                         for b in list {
                             if *stopping.borrow() {
                                 break;
@@ -476,6 +488,7 @@ impl Store {
                 _=async { match events.as_mut() { Some(reader)=>{let _=reader.state.changed().await;},None=>std::future::pending::<()>().await } }=>{},
             }
         }
+        execution_reader.close().await;
         for p in principals.values() {
             let _ = self.oc_connection(p, false, None).await;
         }

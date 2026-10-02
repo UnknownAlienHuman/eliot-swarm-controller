@@ -1,6 +1,7 @@
 //! OpenCode V2 attaches to an explicitly configured, externally owned HTTP service.
 //! No CLI, process launch, service restart, implicit model choice or POST replay.
 mod effects;
+mod execution;
 mod http;
 mod results;
 mod snapshot;
@@ -8,6 +9,7 @@ mod snapshot;
 pub(crate) mod tests;
 
 use crate::error::{Error, Result};
+pub(crate) use execution::{ExecutionRead, ExecutionScan};
 pub(crate) use http::{EventReader, EventState, Service};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
