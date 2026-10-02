@@ -12,4 +12,8 @@ Copyright 2026 Adib Mohsin. Atlas is Apache-2.0; the complete [upstream license]
 
 The existing Muse module uses the complete `@muse-code/sdk` 1.3.0 package through its module-local lockfile. Canonical donor source is `meta-models/muse-code-sdk@a7c10c5dd3f66be412077d29f9d11111af70317b` (MIT). SDK installation and its package notices stay module-local; the source and binary archives do not bundle node_modules. See [Muse setup](modules/muse/README.md) and [JavaScript provenance](docs/javascript-provenance.md).
 
+## rmcp — MCP facade dependency
+
+The C02 MCP facade uses the official `rmcp` 3.5.0 crate (modelcontextprotocol/rust-sdk, Apache-2.0) as an ordinary Cargo dependency with only the `server` and `transport-io` (stdio) features enabled; it is not vendored or modified, and no optional MCP features are enabled by default. The exact version and checksum are locked in `Cargo.lock`.
+
 Other ordinary Rust dependencies are identified, versioned and checksum-locked in `Cargo.lock`; their package licenses remain with their upstream distributions. No new CCCC, ACP, agent scheduler, UI or model loop was copied in the OpenCode HTTP implementation.
