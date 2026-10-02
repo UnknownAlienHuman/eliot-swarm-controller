@@ -4,7 +4,7 @@ Built-in Rust adapter for an **already running, externally owned** OpenCode V2 H
 
 ## Contract and exact scope
 
-Implements the HTTP/inbox/readback part of C04: native session creation, immutable Task delivery, next-turn input, family snapshots, addressed form/permission replies, refresh and read-only reconciliation. One connection pool and volatile SSE reader serve bindings with the same configured `service_id`. Aliases must share that namespace, connection file and exact version. Do not assign different service IDs/files to the same service: physical endpoint aliases are not automatically discovered.
+Implements the HTTP/inbox/readback part of C04: native session creation, immutable Task delivery, next-turn input, family snapshots, addressed form/permission replies, refresh, read-only reconciliation and scoped projected-result export. One connection pool and volatile SSE reader serve bindings with the same configured `service_id`. Aliases must share that namespace, connection file and exact version. Do not assign different service IDs/files to the same service: physical endpoint aliases are not automatically discovered.
 
 Canonical requirements: [architecture §8](../../docs/agent_swarm.md), [implementation C04](../../docs/agent_swarm.implementation-v6.md), [module contract §§4–7](../../docs/agent_swarm.module-contract-v2.md). Wire contract reviewed against the [official V2 API](https://opencode.ai/v2/docs/api) and [OpenAPI document](https://opencode.ai/v2/openapi.json), captured 2026-10-01. These documents move; they are not proof that a particular installed server has been qualified.
 
@@ -49,7 +49,7 @@ No native connection occurs merely to list routes or read host status. After exp
 
 A native session has a deterministic controller-owned ID plus binding/generation/operation metadata. Initial creation verifies the model and location. Task dispatch includes the frozen Task snapshot. Each admitted input has a deterministic native message ID. **A prompt response confirms inbox admission, not an executed turn or finished Task.** The retained producer has `native_input_id`, `admission_kind=native_inbox`, `disposition=admitted`; it does not acquire a fabricated turn/run ID.
 
-Lost creation and prompt replies become `outcome_unknown`. Readback checks the exact owned session, queued inbox or delivered user-message ID and original content/metadata. It never repeats the POST, including after host restart or while new-work admission is disabled. Unproven outcomes remain unknown. A changed service, model, binding owner or foreign child cannot silently receive the command.
+Lost creation and prompt replies become `outcome_unknown`. Readback checks the exact owned session, queued inbox or delivered user-message ID and original content/metadata, rejecting additional native attachments. It never repeats the POST, including after host restart or while new-work admission is disabled. Unproven outcomes remain unknown. A changed service, model, binding owner or foreign child cannot silently receive the command.
 
 `agent.send` currently supports `delivery=next_turn` only. Exact-turn steer is rejected: a preflight read followed by a steer without an atomic expected-turn guard would still race. Forms and permissions require the exact native request ID, the current pending-body fingerprint and verified ancestry under the binding's owned root. A native answer ACK is not Task acceptance.
 
@@ -59,12 +59,43 @@ Family enumeration uses parent-filtered pagination and bounded ancestry checks. 
 
 Per-response body cap: 4 MiB; connection file: 64 KiB; family: 256 retained sessions; pending requests: 128; one family readback: 20 seconds. SSE connections recycle after at most 16 MiB of input, including an unterminated frame. These limits bound observation, never terminate a native agent or imply success. Reaching a bound records incomplete coverage.
 
+## Read-only results
+
+`agent.result` uses the existing `swarm result` → `operation` → `artifact assemble/export` path. The selector file supports either an exact completed assistant message (root or a child with a verified parent chain):
+
+```json
+{"kind":"message","session_id":"ses_EXACT_NATIVE_ID","message_id":"msg_EXACT_NATIVE_ID"}
+```
+
+or a projected interval anchored to an already-sent input Operation on this exact root/binding/generation:
+
+```json
+{"kind":"input_interval","session_id":"ses_EXACT_NATIVE_ROOT","input_operation_id":"EXACT_DISPATCH_OR_SEND_OPERATION_ID"}
+```
+
+```powershell
+swarm --data-dir C:\SwarmState --request-id result-page-0 result BINDING_ID --generation 1 --file selector.json --offset 0 --length 65536
+swarm --data-dir C:\SwarmState operation RESULT_OPERATION_ID
+```
+
+The message body is canonical native JSON, preserving text, reasoning and tool/result references as **data**; references never trigger URL or filesystem reads. Completed tool states are required. Intervals use unfiltered ordered pagination to find the exact user ID and its first subsequent idle message, not the latest assistant or matching prompt text. Original text/metadata must match; an intervening additional input, compaction or settings switch is rejected. The root's selected model must match every included assistant. Forks, staged reverts, duplicate IDs/cursors, changed bodies and incomplete reads are not silently accepted. The body is read twice and scope checked before/after; this detects observed changes, not an atomic native snapshot.
+
+**Neither selector proves native run completion.** V2's projected idle message has an outcome but no input/run reference. Source metadata retains `correlation=projected_order_only` for intervals and `execution_complete=false`, `family_complete=false` for both kinds. No producer disposition, native turn ID, Task acceptance or release is synthesized.
+
+Successful Operations return `result.details.artifact_ref`, `source.content_digest` and `next_offset_bytes`. Optional `expected_digest: "sha256:<64 hex digits>"` pins the complete canonical source body. Use the identical selector for all pages; after an unpinned discovery read, re-read page zero with the pinned selector before assembly. Every page and the assembled body are hashed. Native JSON stays in private artifact files, not in SQLite telemetry.
+
+Unfinished reads recover with GET only, at most one background retry per binding per five seconds, rotating past unresolved reads; queued commands have priority. Explicit `agent.reconcile` also retries the exact saved read. Publication uses the existing no-overwrite file/SQLite boundary. An orphan file can be registered after the same source is read again; changed or missing native data stays unresolved rather than overwriting the orphan or replaying a prompt. A settled request ID returns its saved receipt.
+
+Each timeline pass is bounded to 32 pages of at most 50 messages and 8 MiB of scanned JSON; one result read has a 20-second deadline and publishes at most 64 KiB. Large/old/unavailable results report their limit rather than partial success. Detached binary/output/patch reference retrieval remains unsupported.
+
 ## Remaining C04 work — do not declare end-to-end completion
 
-Exact input-to-native-run/terminal correlation, full result retrieval into immutable artifacts, configuration/goal controls and complete family reconstruction are not implemented by this artifact. An admitted inbox producer remains unresolved and blocks release until genuine native disposition can be established; parent idle or the latest assistant outcome cannot discharge it. Unsupported methods report an explicit capability error. Generic Muse result support is not automatically OpenCode result support.
+Exact input-to-native-run/terminal correlation, detached native output retrieval, configuration/goal controls and complete family reconstruction are not implemented by this artifact. An admitted inbox producer remains unresolved and blocks release until genuine native disposition can be established; parent idle or the latest assistant outcome cannot discharge it. Unsupported methods report an explicit capability error.
 
 Live installed OpenCode, actual inference/subscription behavior and native Windows service interoperability remain unqualified. This adapter must not be presented as a fully qualified automatic Task-completion route yet. It does not require or install the optional OpenCodex provider proxy (Issue #1).
 
 ## Focused implementation evidence
+
+The projected-result reader was compiled locally with Rust 1.98.1 using locked offline dependencies; owned-crate formatting and warnings-denied lib/bin Clippy passed. No new tests or live native calls were run for this addition.
 
 The interrupted 2026-10-01 implementation retained 16 protocol/Store fixtures. They were preserved, not rerun during source recovery. Fresh Rust 1.98.1 package formatting and minimal warnings-denied Clippy passed; the Windows/Linux workflow checks the exact commit's formatting, Clippy, donor hashes, release build and existing Muse SDK import. Tests remain deferred while the product code is being completed. Fixture HTTP servers are not OpenCode, and compilation is not live service, model, billing or subscription qualification.

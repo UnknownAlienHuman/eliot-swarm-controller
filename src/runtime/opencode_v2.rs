@@ -2,6 +2,7 @@
 //! No CLI, process launch, service restart, implicit model choice or POST replay.
 mod effects;
 mod http;
+mod results;
 mod snapshot;
 #[cfg(test)]
 pub(crate) mod tests;

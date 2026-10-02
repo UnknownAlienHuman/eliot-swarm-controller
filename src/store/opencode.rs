@@ -1,5 +1,6 @@
 //! Built-in HTTP modules use the existing operation/observation boundary. They
 //! own clients only; neither restart nor shutdown owns an OpenCode process.
+mod result_reads;
 use super::{Store, meta, operations, runtime, set_meta, tasks};
 use crate::{
     error::{Error, Result},
@@ -11,7 +12,10 @@ use crate::{
 };
 use rusqlite::{Connection, TransactionBehavior, params};
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
 use tokio::{sync::watch, task::JoinHandle};
 
 fn bindings(db: &Connection, service: Option<&str>) -> Result<Vec<Value>> {
@@ -223,6 +227,7 @@ impl Store {
     async fn drive_opencode(&self, service_id: &str, mut stopping: watch::Receiver<bool>) {
         let boot = model::new_id();
         let mut principals = BTreeMap::new();
+        let mut result_retries: BTreeMap<(String, i64), (String, Instant)> = BTreeMap::new();
         let mut connection = None;
         let mut events: Option<oc::EventReader> = None;
         let mut changed = self.changed.subscribe();
@@ -345,11 +350,44 @@ impl Store {
                             }
                             let principal = p.clone();
                             let next = self.run(move |db| runtime::next(db, &principal)).await;
-                            let Some(command) = next.ok().and_then(|v| {
+                            let command = next.ok().and_then(|v| {
                                 serde_json::from_value::<RuntimeCommand>(v["command"].clone()).ok()
-                            }) else {
-                                continue;
+                            });
+                            let command = if let Some(command) = command {
+                                command
+                            } else {
+                                // Explicit queued work wins. Recover at most one read per
+                                // binding per five seconds, rotating past unresolved reads.
+                                let key = (
+                                    model::text(&b, "binding_id").unwrap_or_default().to_owned(),
+                                    b["generation"].as_i64().unwrap_or(0),
+                                );
+                                if result_retries
+                                    .get(&key)
+                                    .is_some_and(|(_, at)| at.elapsed() < Duration::from_secs(5))
+                                {
+                                    continue;
+                                }
+                                let after = result_retries
+                                    .get(&key)
+                                    .map(|(id, _)| id.clone())
+                                    .unwrap_or_default();
+                                let principal = p.clone();
+                                let read = self
+                                    .run(move |db| result_reads::next_read(db, &principal, &after))
+                                    .await;
+                                let Ok(Some(command)) = read else {
+                                    continue;
+                                };
+                                result_retries
+                                    .insert(key, (command.operation_id.clone(), Instant::now()));
+                                command
                             };
+                            if command.method == "agent.result" {
+                                self.oc_result_outcome(p, service, &binding_options, &command)
+                                    .await;
+                                continue;
+                            }
                             let result = if command.method == "agent.refresh" {
                                 let read = match fresh {
                                     Ok(fresh) => {
@@ -392,9 +430,19 @@ impl Store {
                                 let target =
                                     self.run(move |db| original(db, &principal, &target)).await;
                                 let resolved = if let Ok(target) = target {
-                                    let r = service.reconcile(&target, &binding_options).await;
-                                    let resolved = matches!(r.outcome, EffectOutcome::Applied);
-                                    self.record_oc_outcome(p, r).await.is_ok() && resolved
+                                    if target.method == "agent.result" {
+                                        self.oc_result_outcome(
+                                            p,
+                                            service,
+                                            &binding_options,
+                                            &target,
+                                        )
+                                        .await
+                                    } else {
+                                        let r = service.reconcile(&target, &binding_options).await;
+                                        let resolved = matches!(r.outcome, EffectOutcome::Applied);
+                                        self.record_oc_outcome(p, r).await.is_ok() && resolved
+                                    }
                                 } else {
                                     false
                                 };

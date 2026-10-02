@@ -301,7 +301,7 @@ impl Service {
         result
     }
     /// Confirm exact family ownership before replying to a pending child request.
-    async fn owns_member(&self, root: &str, member: &str) -> Result<()> {
+    pub(super) async fn owns_member(&self, root: &str, member: &str) -> Result<()> {
         let mut current = member.to_owned();
         let mut visited = BTreeSet::new();
         for _ in 0..64 {
@@ -423,7 +423,7 @@ impl Service {
             let queued=inbox.data.iter().any(|item|inbox_matches(item,root,&id,&text,original));
             if !queued {
                 let message:Data<Value>=decode(self.get(&format!("/api/session/{root}/message/{id}"),&[]).await?)?;
-                if message.data["id"]!=id || message.data["type"]!="user" || message.data["text"]!=text || message.data["metadata"]["eliot"]!=marker(original) {
+                if !delivered_matches(&message.data, original)? {
                     return Err(Error::new("NATIVE_EVIDENCE_UNAVAILABLE","exact delivered input was not observed"));
                 }
             }
@@ -442,4 +442,25 @@ fn inbox_matches(item: &Value, root: &str, id: &str, text: &str, command: &Runti
         && item["delivery"] == "queue"
         && item["payload"]["text"] == text
         && item["payload"]["metadata"]["eliot"] == marker(command)
+        && no_attachments(&item["payload"])
+}
+
+// Exact IDs and the original content/metadata are necessary, not a substring or
+// equal text alone. Extra native attachments change the admitted assignment.
+fn no_attachments(value: &Value) -> bool {
+    ["files", "agents", "skills"].iter().all(|key| {
+        value
+            .get(*key)
+            .is_none_or(|v| v.as_array().is_some_and(Vec::is_empty))
+    })
+}
+pub(super) fn delivered_matches(message: &Value, command: &RuntimeCommand) -> Result<bool> {
+    Ok(message["id"] == input_id(&command.operation_id)
+        && message["type"] == "user"
+        && message
+            .get("sessionID")
+            .is_none_or(|id| id.as_str() == command.native_root_id.as_deref())
+        && message["text"] == prompt(command)?
+        && message["metadata"]["eliot"] == marker(command)
+        && no_attachments(message))
 }
