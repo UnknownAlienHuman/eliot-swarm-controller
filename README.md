@@ -10,7 +10,7 @@ The Muse SDK bridge opens an explicitly selected native executable, delivers Tas
 
 **CheckRunner executes configured commands on captured Git sources. Active cancellation and recovery of a recorded departed check worker are now implemented.** Cancellation does not stop the host or native agents. Recovery uses the worker lock and OS group identity; it does not infer success or replay a command.
 
-**Still pending:** live Muse resume qualification, native-outcome recovery for unrecorded effects, complete native family reconstruction, automatic handoff, reverse-dependency scope/cache reuse, OpenCode cross-restart execution continuation, other native adapters and automatic module/service installation. Live Muse/Max inference and Windows native launch remain unqualified. Do not mark all C01–C03 complete.
+**Still pending:** live Muse resume qualification, native-outcome recovery for unrecorded effects, complete native family reconstruction, automatic handoff, reverse-dependency scope/cache reuse, OpenCode cross-restart execution continuation, Command/Antigravity adapters and the remaining Claude surfaces (attach/resume, configure, goal, recovery), and automatic module/service installation. Live Muse/Max inference and Windows native launch remain unqualified. Do not mark all C01–C03 complete.
 
 ## Build and run
 
@@ -45,7 +45,7 @@ The built-in `eliot-opencode-v2.http.1` adapter attaches to an explicitly config
 
 The complete pinned `atlas-redact` donor is now used to scrub retained native question/diagnostic copies. Its upstream files remain unchanged behind a separate Cargo wrapper; licenses, rule notices and snapshot hashes are retained in [third-party notices](THIRD_PARTY_NOTICES.md). This is actual library reuse, not a claim that all listed donors were installed.
 
-**Why JavaScript exists:** only the Muse adapter needs the official Node SDK. Its first runnable bridge is commit `b2bd0211` (2026-09-30); controller authority and the new OpenCode adapter are Rust. See [the exact provenance](docs/javascript-provenance.md). No Muse files were deleted or language statistics hidden.
+**Why JavaScript exists:** the Muse adapter and the Claude adapter each use their vendor's official Node SDK; neither the controller authority nor the OpenCode adapter does. Muse's first runnable bridge is commit `b2bd0211` (2026-09-30). See [the exact provenance](docs/javascript-provenance.md). No Muse files were deleted or language statistics hidden.
 
 ## Native Muse, clients and task-specific children
 
@@ -75,6 +75,10 @@ For new managed launches, use `swarm module-run --state-dir MODULE_STATE --comma
 After the recorded old group has ended, a replacement bridge restores its checkpoint and the host marks that binding `reconciling`. Explicit operator `agent.recover` targets its current `expected_boot_id`. The bridge resumes the same known native session, not a fresh session/fork or replayed Task prompt. A historical open receipt can restore identity but not new-boot readiness. Only the correlated current-boot resume outcome makes the binding ready. Refer to [the module guide](modules/muse/README.md#recorded-session-recovery--bridge5) for the JSON request and failure boundaries.
 
 Existing unguarded bridges are not retroactively qualified. Unknown/corrupt checkpoint or process identity remains an explicit recovery gap; no force-reset or blanket retry is added. Live vendor resume/children/Max have not been exercised by the local process-owner invocation below.
+
+## Claude Agent SDK bridge — first slice
+
+Follow [modules/claude/README.md](modules/claude/README.md). The Claude adapter is a separate SDK-owned bridge over the pinned `@anthropic-ai/claude-agent-sdk` **0.3.287** (Anthropic Commercial Terms) and its matching bundled native binary; its artifact is **`claude-agent-sdk-0.3.287-bridge.1`** and the shipped route stays disabled. It implements describe/open, next-turn `agent.send`/`task.dispatch` and observation snapshots through the same binding-scoped module protocol as Muse. The stream mapper assembles complete messages from frames that share one `message.id` without losing content blocks, links children only by `parent_tool_use_id`, keeps init failures distinct and treats result usage as the SDK's cumulative estimate, never a sum. Attach/resume, configure (model/effort), goal, steer, permission replies, result pages and cross-restart recovery are reported **unavailable** by this artifact, not emulated; tool permission requests are recorded and denied rather than approved implicitly. Fixture streams authored from the pinned SDK types verify the mapping (`node modules/claude/selftest.mjs` after `npm ci`); no live Claude session is qualified by this slice.
 
 
 ## Complete results without model roundtrips

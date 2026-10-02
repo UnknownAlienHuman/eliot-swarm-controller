@@ -2,6 +2,8 @@
 
 Checked 2026-10-01. The JavaScript files belong to the module-local **Muse SDK bridge**, not the Rust host, database, task authority or OpenCode adapter. There is no browser UI or Node server in the controller core.
 
+A second module-local JavaScript bridge was added later for the **Claude adapter** (`modules/claude/`): it pins `@anthropic-ai/claude-agent-sdk` **0.3.287** (Anthropic Commercial Terms — an external package used whole, not vendored source) with a retained `package-lock.json`, and translates binding-scoped host commands, SDK stream observations and outcomes the same way. It exists because C08 selects the official Agent SDK streaming surface as the Claude entrypoint; deleting it would remove the Claude adapter, not simplify the core. Everything below about the Muse bridge is unchanged.
+
 The dependency was introduced in [0e3ccd6b](https://github.com/UnknownAlienHuman/eliot-swarm-controller/commit/0e3ccd6b7db5ee0665280be70e635642515cfccf), **2026-09-30 09:29:09 UTC / 05:29:09 New York**, to reuse the complete official SDK instead of writing another MSP transport. That checkpoint did not yet implement the bridge.
 
 The first runnable bridge was added in [b2bd0211](https://github.com/UnknownAlienHuman/eliot-swarm-controller/commit/b2bd0211e772f273494e808485a1af029588f74b), **2026-09-30 11:30:01 UTC / 07:30:01 New York**. Subsequent commits extended native controls, results, checkpointing and recovery.
