@@ -119,20 +119,20 @@ impl Service {
         model::text(&value["project"], "id")?;
         Ok(json!({"directory":value["directory"]}))
     }
-    pub(crate) async fn verify_binding(
+    pub(crate) async fn verify_binding_identity(
         &self,
         root: &str,
         options: &Options,
         binding: &str,
         generation: i64,
-    ) -> Result<()> {
+    ) -> Result<Value> {
         if root != root_id(binding, generation) {
             return Err(Error::new(
                 "NATIVE_IDENTITY_MISMATCH",
                 "native root does not belong to this binding",
             ));
         }
-        let session = self.check_root(root, options).await?;
+        let session = self.check_root_identity(root, options).await?;
         if session["metadata"]["eliot"]["binding"] != binding
             || session["metadata"]["eliot"]["generation"] != generation
         {
@@ -141,39 +141,44 @@ impl Service {
                 "native binding metadata changed",
             ));
         }
-        Ok(())
+        Ok(session)
     }
-    async fn check_model(&self, options: &Options) -> Result<()> {
-        let catalog = self
-            .get(
-                "/api/model",
-                &[(
-                    "location[directory]",
-                    options.directory.to_string_lossy().into_owned(),
-                )],
-            )
+
+    pub(super) async fn verify_binding_model(
+        &self,
+        root: &str,
+        options: &Options,
+        binding: &str,
+        generation: i64,
+    ) -> Result<Value> {
+        let session = self
+            .verify_binding_identity(root, options, binding, generation)
             .await?;
-        verify_directory(&options.directory, &catalog["location"]).await?;
-        let models = catalog["data"]
-            .as_array()
-            .ok_or_else(|| Error::new("NATIVE_SCHEMA_ERROR", "missing model catalog"))?;
-        let found = models.iter().any(|m| {
-            m["id"] == options.model.id
-                && m["providerID"] == options.model.provider_id
-                && m["enabled"] == true
-                && m["variants"].as_array().is_some_and(|variants| {
-                    variants.iter().any(|v| v["id"] == options.model.variant)
-                })
-        });
-        if !found {
+        if session["model"] != json!(options.model) {
             return Err(Error::new(
-                "NATIVE_MODEL_UNAVAILABLE",
-                "the exact provider/model/variant is not enabled in this location",
+                "NATIVE_MODEL_MISMATCH",
+                "native session model differs from the route's exact provider/model/variant",
             ));
         }
+        self.check_route_model_available(options).await?;
+        Ok(session)
+    }
+
+    pub(crate) async fn verify_binding(
+        &self,
+        root: &str,
+        options: &Options,
+        binding: &str,
+        generation: i64,
+    ) -> Result<()> {
+        let session = self
+            .verify_binding_model(root, options, binding, generation)
+            .await?;
+        self.verify_session_agent_route(&session, options).await?;
         Ok(())
     }
-    async fn check_root(&self, root: &str, options: &Options) -> Result<Value> {
+
+    async fn check_root_identity(&self, root: &str, options: &Options) -> Result<Value> {
         let session = self.session(root).await?;
         let location = self.location(options).await?;
         if !session["parentID"].is_null() || !session["fork"].is_null() {
@@ -182,12 +187,25 @@ impl Service {
                 "controller-created root became a child or a fork",
             ));
         }
-        if session["model"] != json!(options.model) || session["location"] != location {
+        if session["location"] != location {
             return Err(Error::new(
-                "NATIVE_SETTINGS_MISMATCH",
-                "native model/variant/location differs from the reserved route",
+                "NATIVE_LOCATION_MISMATCH",
+                "native location differs from the reserved route",
             ));
         }
+        Ok(session)
+    }
+
+    async fn check_root(&self, root: &str, options: &Options) -> Result<Value> {
+        let session = self.check_root_identity(root, options).await?;
+        if session["model"] != json!(options.model) {
+            return Err(Error::new(
+                "NATIVE_MODEL_MISMATCH",
+                "native session model differs from the route's exact provider/model/variant",
+            ));
+        }
+        self.check_route_model_available(options).await?;
+        self.verify_session_agent_route(&session, options).await?;
         Ok(session)
     }
     /// Executes only the already committed command, once. HTTP write errors are
@@ -218,7 +236,7 @@ impl Service {
     }
     async fn open(&self, command: &RuntimeCommand, options: &Options) -> RuntimeOutcome {
         let preflight = async {
-            self.check_model(options).await?;
+            self.check_route_model_available(options).await?;
             self.location(options).await
         }
         .await;

@@ -229,6 +229,22 @@ impl Service {
                 })
             }
         };
+        let model_configuration = match self.model_observation(&root_info).await {
+            Ok(configuration) => configuration,
+            Err(error) => {
+                failures.push(json!({"code":error.code,"source":"session_model"}));
+                json!({
+                    "complete":false,
+                    "model":null,
+                    "definition_digest":null,
+                    "variant_digest":null,
+                    "settings_revision":null,
+                    "catalog_revision":null,
+                    "raw_definition_persisted":false,
+                    "source":"session.get+model.list"
+                })
+            }
+        };
         let mut pending = BTreeMap::new();
         // Retain unresolved old questions when a member read fails; absence in an
         // incomplete family enumeration is not a native cancellation receipt.
@@ -307,7 +323,7 @@ impl Service {
             "observed_children":retained.into_values().collect::<Vec<_>>(),"pending_requests":pending.into_values().collect::<Vec<_>>(),
             "execution":match active_count {Some(n) if n>0=>"observed_active",Some(_)=>"not_observed_active",None=>"unknown"},
             "active_drain_count":active_count,"configuration":configuration,
-            "agent_configuration":agent_configuration,
+            "agent_configuration":agent_configuration,"model_configuration":model_configuration,
             "native_service_pid":self.pid,"native_service_version":self.version,
             "family_completeness":"partial","enumeration_complete":enumerated,
             "completeness_reason":"volatile_non_atomic_pages_are_not_family_terminal_evidence",

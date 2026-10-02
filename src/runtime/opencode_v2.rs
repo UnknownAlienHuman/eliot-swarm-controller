@@ -12,7 +12,7 @@ pub(crate) mod tests;
 use crate::error::{Error, Result};
 pub(crate) use configuration::{
     AGENT_SETTINGS_REVISION_KIND, ConfigurationExpectation, INSTRUCTION_SETTINGS_REVISION_KIND,
-    configuration_contract, configuration_expectation,
+    MODEL_SETTINGS_REVISION_KIND, configuration_contract, configuration_expectation,
 };
 pub(crate) use execution::{ExecutionRead, ExecutionScan};
 pub(crate) use http::{EventReader, EventState, Service};
@@ -30,6 +30,17 @@ pub struct ModelRef {
     pub provider_id: String,
     // Deliberately required: choosing a root model does not retain its variant.
     pub variant: String,
+}
+impl ModelRef {
+    pub(crate) fn valid(&self) -> bool {
+        [&self.id, &self.provider_id, &self.variant]
+            .iter()
+            .all(|value| {
+                !value.trim().is_empty()
+                    && value.len() <= 256
+                    && !value.bytes().any(|byte| byte.is_ascii_control())
+            })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,13 +68,7 @@ impl Options {
             || !options.directory.is_absolute()
             || options.directory.to_str().is_none()
             || options.expected_version.trim().is_empty()
-            || [
-                &options.model.id,
-                &options.model.provider_id,
-                &options.model.variant,
-            ]
-            .iter()
-            .any(|s| s.trim().is_empty() || s.len() > 256)
+            || !options.model.valid()
         {
             return Err(Error::new(
                 "CONFIG_ERROR",

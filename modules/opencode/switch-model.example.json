@@ -1,0 +1,12 @@
+{
+  "client_request_id": "oc-switch-model-1",
+  "binding_id": "BINDING_ID",
+  "generation": 1,
+  "settings": {
+    "model": {
+      "id": "REPLACE_WITH_ROUTE_MODEL_ID",
+      "providerID": "REPLACE_WITH_ROUTE_PROVIDER_ID",
+      "variant": "REPLACE_WITH_ROUTE_VARIANT"
+    }
+  }
+}

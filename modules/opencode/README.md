@@ -4,7 +4,7 @@ Built-in Rust adapter for an **already running, externally owned** OpenCode V2 H
 
 ## Contract and exact scope
 
-Implements the HTTP/inbox/readback part of C04: native session creation, immutable Task delivery, next-turn input, family snapshots, addressed form/permission replies, refresh, read-only reconciliation, scoped projected-result export, native per-turn patch export, exact detached tool-file export and durable input/execution disposition. One connection pool and volatile SSE reader serve bindings with the same configured `service_id`. Aliases must share that namespace, connection file and exact version. Do not assign different service IDs/files to the same service: physical endpoint aliases are not automatically discovered.
+Implements the HTTP/inbox/readback part of C04: native session creation, immutable Task delivery, next-turn input, family snapshots, addressed form/permission replies, durable instruction entries, exact session-agent and route-model controls, refresh, read-only reconciliation, scoped projected-result export, native per-turn patch export, exact detached tool-file export and durable input/execution disposition. One connection pool and volatile SSE reader serve bindings with the same configured `service_id`. Aliases must share that namespace, connection file and exact version. Do not assign different service IDs/files to the same service: physical endpoint aliases are not automatically discovered.
 
 Canonical requirements: [architecture §8](../../docs/agent_swarm.md), [implementation C04](../../docs/agent_swarm.implementation-v6.md), [module contract §§4–7](../../docs/agent_swarm.module-contract-v2.md). Wire contract reviewed against the [official V2 API](https://opencode.ai/v2/docs/api) and [OpenAPI document](https://opencode.ai/v2/openapi.json), captured 2026-10-01. These documents move; they are not proof that a particular installed server has been qualified.
 
@@ -92,12 +92,12 @@ The same `agent.configure` method supports one separate native configuration uni
 
 ```json
 {
-  "client_request_id": "oc-agent-build-1",
+  "client_request_id": "oc-switch-agent-1",
   "binding_id": "BINDING_ID",
   "generation": 1,
   "settings": {
     "agent": {
-      "id": "build"
+      "id": "REPLACE_WITH_EXACT_NATIVE_AGENT_ID"
     }
   }
 }
@@ -109,13 +109,38 @@ A matching pre-existing session agent is an exact no-op. Otherwise the adapter s
 
 A lost response becomes `outcome_unknown`; reconciliation performs only catalog/session GETs and never repeats the switch. Family snapshots retain the selected agent plus definition/catalog revisions. A later external switch or definition reload invalidates a configure prerequisite for that agent rather than silently starting under changed instructions. This control does not implement goal set/edit/pause/resume/clear, effort changes, or arbitrary agent-definition mutation. Native semantics were reviewed at OpenCode `4c0d0ff4`: [session switch routes](https://github.com/anomalyco/opencode/blob/4c0d0ff478ca9150c163fb8b04a76395e4dccafe/packages/protocol/src/groups/session.ts), [session projection](https://github.com/anomalyco/opencode/blob/4c0d0ff478ca9150c163fb8b04a76395e4dccafe/packages/schema/src/session.ts), [agent catalog routes](https://github.com/anomalyco/opencode/blob/4c0d0ff478ca9150c163fb8b04a76395e4dccafe/packages/protocol/src/groups/agent.ts), and [agent schema](https://github.com/anomalyco/opencode/blob/4c0d0ff478ca9150c163fb8b04a76395e4dccafe/packages/schema/src/agent.ts).
 
+### Exact route-model control
+
+A third `agent.configure` unit explicitly selects the session model used by subsequent provider turns. The request must contain all three fields and must exactly equal the binding route's pinned provider/model/variant:
+
+```json
+{
+  "client_request_id": "oc-switch-model-1",
+  "binding_id": "BINDING_ID",
+  "generation": 1,
+  "settings": {
+    "model": {
+      "id": "REPLACE_WITH_ROUTE_MODEL_ID",
+      "providerID": "REPLACE_WITH_ROUTE_PROVIDER_ID",
+      "variant": "REPLACE_WITH_ROUTE_VARIANT"
+    }
+  }
+}
+```
+
+Use `swarm call agent.configure --file modules/opencode/switch-model.example.json`. This is a repairable, explicit model setup step, not an arbitrary model picker. A different provider, model or variant is rejected before native admission and requires a new route configuration/binding. That preserves the route's model and billing identity instead of silently moving an existing conversation.
+
+The adapter reads the location-scoped native model catalog, requires the exact model and variant to exist and the model to be enabled, and validates the complete projected definition. A matching session model is an exact no-op. Otherwise it sends one `POST /api/session/{sessionID}/model`, then requires two equal catalog/session projections proving the exact model and unchanged definition/variant. The typed result records model/catalog/variant digests, enabled/status evidence, the settings revision and application boundary `subsequent_provider_turn`; raw provider options, headers, body overlays, costs and limits are not duplicated into controller state.
+
+A lost mutation response becomes `outcome_unknown`. Reconciliation performs only `session.get` plus location-scoped `model.list` reads and never repeats the switch. Family snapshots retain compact selected-model evidence. A later external model switch, catalog replacement, variant change or disabling invalidates a prerequisite instead of starting input under a changed model. Ordinary send/reply/result paths also verify the exact route model, while this model-control path deliberately uses identity/location readback so it can repair detected model drift. An active agent whose own model override differs from the route remains invalid; model repair does not legitimize that agent. Native semantics were reviewed at OpenCode `4c0d0ff4`: [session model route](https://github.com/anomalyco/opencode/blob/4c0d0ff478ca9150c163fb8b04a76395e4dccafe/packages/protocol/src/groups/session.ts), [model catalog route](https://github.com/anomalyco/opencode/blob/4c0d0ff478ca9150c163fb8b04a76395e4dccafe/packages/protocol/src/groups/model.ts), [session projection](https://github.com/anomalyco/opencode/blob/4c0d0ff478ca9150c163fb8b04a76395e4dccafe/packages/schema/src/session.ts), [model/reference schema](https://github.com/anomalyco/opencode/blob/4c0d0ff478ca9150c163fb8b04a76395e4dccafe/packages/schema/src/model.ts), and [native switch/no-op semantics](https://github.com/anomalyco/opencode/blob/4c0d0ff478ca9150c163fb8b04a76395e4dccafe/packages/core/src/session/session.ts).
+
 ## Explicit configure → input prerequisite
 
 `prerequisite_operation_id` implements the short persisted setup sequence required by the module contract. It is accepted on another `agent.configure`, on `agent.send` with `delivery=next_turn`, and on `task.dispatch`. The value must name one earlier `agent.configure` Operation on the exact same binding generation. Each Operation has at most one direct predecessor; a setup sequence can name the preceding step, but this is not a general DAG or workflow language. Submission order alone never creates a dependency.
 
-A dependent request may be durably queued while its prerequisite is still `queued`, `sending`, `native_accepted` or `outcome_unknown`. Immediately before `queued → sending`, Store rechecks the prerequisite inside the same SQLite transaction that admits the native send. The check requires the saved OpenCode configuration OperationContract, the original key/action/value digest, an `applied` RuntimeOutcome for the same native root and service scope, exact instruction-list readback evidence, and valid settings/entry revisions. A plain ACK, `state=settled` without the typed result, rejection, cancellation, failure or unknown outcome never satisfies the dependency.
+A dependent request may be durably queued while its prerequisite is still `queued`, `sending`, `native_accepted` or `outcome_unknown`. Immediately before `queued → sending`, Store rechecks the prerequisite inside the same SQLite transaction that admits the native send. The check requires the saved OpenCode configuration OperationContract, the original typed target/digest, an `applied` RuntimeOutcome for the same native root and service scope, the configuration kind's exact native readback evidence, and valid settings/catalog/definition revisions. A plain ACK, `state=settled` without the typed result, rejection, cancellation, failure or unknown outcome never satisfies the dependency.
 
-The relevant setting must still be effective. A same-key configure ordered between the referenced setup and the dependent input either remains a wait or supersedes the old setup; a later same-key configure that restores the exact value satisfies the value requirement again. Unrelated `eliot.*` keys do not invalidate the dependency. A complete newer native configuration snapshot can independently reconfirm or invalidate the key. This is the documented per-binding prepare/admission barrier: conflicting configure/input mutations cannot interleave before native input admission, while replies, readback/reconciliation/result operations, stop controls and other bindings continue independently. OpenCode exact-turn steer remains unsupported for its separate atomic-guard reason and cannot carry a setup prerequisite.
+The relevant setting must still be effective. A later configure in the same scope—same instruction key, session-agent selection or session-model selection—either remains a wait or supersedes the old setup; a later exact restoration can satisfy the requirement again. Unrelated configuration scopes do not invalidate the dependency. A complete newer native snapshot can independently reconfirm or invalidate the referenced setting. This is the documented per-binding prepare/admission barrier: conflicting configure/input mutations cannot interleave before native input admission, while replies, readback/reconciliation/result operations, stop controls and other bindings continue independently. OpenCode exact-turn steer remains unsupported for its separate atomic-guard reason and cannot carry a setup prerequisite.
 
 Example dependent send, after reading the applied configure Operation ID:
 
@@ -211,12 +236,12 @@ Each timeline pass is bounded to 32 pages of at most 50 messages and 8 MiB of sc
 
 ## Remaining C04 work — do not declare end-to-end completion
 
-Cross-restart native continuation after shutdown/missing terminal, goal/model controls and complete family reconstruction remain unfinished. Explicit configure-to-input prerequisite chaining is implemented for durable instruction entries and exact session-agent selection. Exact inline/location-confined tool-file retrieval is implemented; external URI schemes, files outside the verified location and sources above 64 MiB remain deliberately unsupported. Durable `eliot.*` instruction-entry configuration and exact session-agent selection are implemented, but they do not claim provider/model/effort or goal control. The durable-log path now resolves ordinary admitted/delivered inputs and exact pending cancellation; incomplete or unsupported native histories keep the producer unresolved. Parent idle or the latest assistant outcome cannot discharge it. Unsupported methods report an explicit capability error.
+Cross-restart native continuation after shutdown/missing terminal, goal/effort controls and complete family reconstruction remain unfinished. Explicit configure-to-input prerequisite chaining is implemented for durable instruction entries, exact session-agent selection and exact route-model restoration. Exact inline/location-confined tool-file retrieval is implemented; external URI schemes, files outside the verified location and sources above 64 MiB remain deliberately unsupported. The model control preserves the route's existing provider/model/variant; it is not an arbitrary model/billing-route switch and does not claim goal or effort control. The durable-log path now resolves ordinary admitted/delivered inputs and exact pending cancellation; incomplete or unsupported native histories keep the producer unresolved. Parent idle or the latest assistant outcome cannot discharge it. Unsupported methods report an explicit capability error.
 
 Live installed OpenCode, actual inference/subscription behavior and native Windows service interoperability remain unqualified. This adapter must not be presented as a fully qualified automatic Task-completion route yet. It does not require or install the optional OpenCodex provider proxy (Issue #1).
 
 ## Focused implementation evidence
 
-The configure-prerequisite baseline `26da2a09` passed [Windows/Linux CI 36979626316](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/36979626316). The subsequent exact session-agent slice must pass Rust 1.98.1 owned-crate formatting, locked minimal lib/bin Clippy and unchanged Atlas verification before publication; its permanent Windows/Linux CI remains separate evidence. No tests or live native calls were run for this addition; dependencies, migrations and the Atlas donor are unchanged.
+The exact session-agent baseline `1703b293` passed [Windows/Linux CI 36984502928](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/36984502928). The route-model slice is published only after Rust 1.98.1 owned-crate formatting, locked minimal lib/bin Clippy and unchanged Atlas verification; permanent Windows/Linux CI on its exact commit remains separate evidence. No tests or live native calls are run for this code-completion slice; dependencies, migrations and the Atlas donor remain unchanged.
 
 The interrupted 2026-10-01 implementation retained 16 protocol/Store fixtures. They were preserved, not rerun during source recovery. Fresh Rust 1.98.1 package formatting and minimal warnings-denied Clippy passed; the Windows/Linux workflow checks the exact commit's formatting, Clippy, donor hashes, release build and existing Muse SDK import. Tests remain deferred while the product code is being completed. Fixture HTTP servers are not OpenCode, and compilation is not live service, model, billing or subscription qualification.

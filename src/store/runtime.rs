@@ -495,6 +495,12 @@ pub(super) fn outcome(db: &mut Connection, p: &Principal, v: &Value) -> Result<V
                     params![id, generation, model::canonical(&agent)?],
                 )?;
             }
+            prerequisites::EffectiveConfiguration::SessionModel(model_state) => {
+                tx.execute(
+                    "UPDATE bindings SET state_json=json_set(state_json,'$.effective_model',json(?3)) WHERE binding_id=?1 AND generation=?2",
+                    params![id, generation, model::canonical(&model_state)?],
+                )?;
+            }
         }
     }
     if o["method"] == "agent.recover" && matches!(r.outcome, EffectOutcome::Applied) {
@@ -584,6 +590,12 @@ pub(super) fn observe(db: &mut Connection, p: &Principal, v: &Value) -> Result<V
                 tx.execute(
                     "UPDATE bindings SET state_json=json_set(state_json,'$.effective_agent',json(?3)) WHERE binding_id=?1 AND generation=?2",
                     params![id, generation, model::canonical(&agent)?],
+                )?;
+            }
+            prerequisites::EffectiveConfiguration::SessionModel(model_state) => {
+                tx.execute(
+                    "UPDATE bindings SET state_json=json_set(state_json,'$.effective_model',json(?3)) WHERE binding_id=?1 AND generation=?2",
+                    params![id, generation, model::canonical(&model_state)?],
                 )?;
             }
         }
@@ -736,8 +748,12 @@ pub(super) fn user_command(
     let mut effective = json!({"route":b["route"],"native_root_id":b["native_root_id"]});
     if method == "agent.configure" && b["route"]["runtime"] == crate::runtime::opencode_v2::RUNTIME
     {
-        effective["operation_contract"] =
-            crate::runtime::opencode_v2::configuration_contract(&v["settings"], id, generation)?;
+        effective["operation_contract"] = crate::runtime::opencode_v2::configuration_contract(
+            &v["settings"],
+            id,
+            generation,
+            &b["route"]["native_options"],
+        )?;
     } else if method == "agent.send"
         && v["delivery"] == "next_turn"
         && b["route"]["runtime"] == crate::runtime::opencode_v2::RUNTIME

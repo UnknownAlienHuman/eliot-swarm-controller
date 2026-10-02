@@ -194,7 +194,7 @@ impl Store {
     ) -> Result<()> {
         let root = model::text(b, "native_root_id")?;
         service
-            .verify_binding(
+            .verify_binding_identity(
                 root,
                 options,
                 model::text(b, "binding_id")?,
@@ -219,7 +219,7 @@ impl Store {
                 return Err(Error::new("NATIVE_SCOPE_MISMATCH","snapshot has another service namespace/root"));
             }
             runtime::observe(db,&p,&json!({"event_id":event,"state":state}))?;
-            // Finding a root cannot settle an unknown create. Ownership/settings
+            // Finding a root cannot settle an unknown create. Exact ownership/location
             // readback must succeed and the original open must already be settled.
             db.execute("UPDATE bindings SET state='ready' WHERE binding_id=?1 AND generation=?2 AND state='reconciling' AND EXISTS(SELECT 1 FROM operations WHERE binding_id=?1 AND binding_generation=?2 AND method='agent.open' AND state='settled')",params![id,generation])?;
             Ok(())

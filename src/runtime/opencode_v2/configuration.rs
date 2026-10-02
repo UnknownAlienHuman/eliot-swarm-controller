@@ -1,7 +1,7 @@
 //! Durable session configuration delegates to OpenCode's native state machines.
 //! ELIOT keeps only scoped evidence and never creates a parallel writable store.
 use super::{
-    Options, Service,
+    ModelRef, Options, Service,
     effects::{failed, outcome, verify_directory},
     http::{Data, decode},
 };
@@ -21,12 +21,17 @@ const MAX_OWNED_KEY_BYTES: usize = 128;
 const MAX_OBSERVED_ENTRIES: usize = 128;
 const MAX_AGENT_ID_BYTES: usize = 256;
 const MAX_AGENT_NAME_BYTES: usize = 512;
+const MAX_MODEL_NAME_BYTES: usize = 512;
+const MAX_MODEL_VARIANTS: usize = 256;
+const MAX_MODEL_COST_TIERS: usize = 64;
 const OWNED_KEY_PREFIX: &str = "eliot.";
 
 pub(crate) const INSTRUCTION_CONTRACT_REVISION: &str = "opencode-instruction-entry-v1";
 pub(crate) const AGENT_CONTRACT_REVISION: &str = "opencode-session-agent-v1";
+pub(crate) const MODEL_CONTRACT_REVISION: &str = "opencode-session-model-v1";
 pub(crate) const INSTRUCTION_SETTINGS_REVISION_KIND: &str = "eliot_owned_instruction_entries_v1";
 pub(crate) const AGENT_SETTINGS_REVISION_KIND: &str = "opencode_session_agent_v1";
+pub(crate) const MODEL_SETTINGS_REVISION_KIND: &str = "opencode_session_model_v1";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ConfigurationExpectation {
@@ -39,6 +44,10 @@ pub(crate) enum ConfigurationExpectation {
         agent_id: String,
         desired_digest: String,
     },
+    SessionModel {
+        model: ModelRef,
+        desired_digest: String,
+    },
 }
 
 impl ConfigurationExpectation {
@@ -46,20 +55,22 @@ impl ConfigurationExpectation {
         match self {
             Self::InstructionEntry { .. } => "instruction_entry",
             Self::SessionAgent { .. } => "session_agent",
+            Self::SessionModel { .. } => "session_model",
         }
     }
 
     pub(crate) fn action(&self) -> &str {
         match self {
             Self::InstructionEntry { action, .. } => action,
-            Self::SessionAgent { .. } => "switch",
+            Self::SessionAgent { .. } | Self::SessionModel { .. } => "switch",
         }
     }
 
     pub(crate) fn desired_digest(&self) -> Option<&str> {
         match self {
             Self::InstructionEntry { desired_digest, .. } => desired_digest.as_deref(),
-            Self::SessionAgent { desired_digest, .. } => Some(desired_digest),
+            Self::SessionAgent { desired_digest, .. }
+            | Self::SessionModel { desired_digest, .. } => Some(desired_digest),
         }
     }
 
@@ -67,6 +78,7 @@ impl ConfigurationExpectation {
         match self {
             Self::InstructionEntry { .. } => INSTRUCTION_CONTRACT_REVISION,
             Self::SessionAgent { .. } => AGENT_CONTRACT_REVISION,
+            Self::SessionModel { .. } => MODEL_CONTRACT_REVISION,
         }
     }
 
@@ -74,13 +86,14 @@ impl ConfigurationExpectation {
         match self {
             Self::InstructionEntry { .. } => INSTRUCTION_SETTINGS_REVISION_KIND,
             Self::SessionAgent { .. } => AGENT_SETTINGS_REVISION_KIND,
+            Self::SessionModel { .. } => MODEL_SETTINGS_REVISION_KIND,
         }
     }
 
     pub(crate) fn application_boundary(&self) -> &'static str {
         match self {
             Self::InstructionEntry { .. } => "next_step_boundary",
-            Self::SessionAgent { .. } => "subsequent_provider_turn",
+            Self::SessionAgent { .. } | Self::SessionModel { .. } => "subsequent_provider_turn",
         }
     }
 
@@ -88,7 +101,20 @@ impl ConfigurationExpectation {
         match self {
             Self::InstructionEntry { .. } => "experimental.session.instructions.entry.list",
             Self::SessionAgent { .. } => "session.get+agent.list",
+            Self::SessionModel { .. } => "session.get+model.list",
         }
+    }
+
+    pub(crate) fn ensure_route(&self, options: &Options) -> Result<()> {
+        if let Self::SessionModel { model, .. } = self
+            && model != &options.model
+        {
+            return Err(Error::new(
+                "NATIVE_MODEL_ROUTE_MISMATCH",
+                "session model control must select the route's exact provider/model/variant",
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn same_scope(&self, other: &Self) -> bool {
@@ -97,7 +123,8 @@ impl ConfigurationExpectation {
                 Self::InstructionEntry { key: left, .. },
                 Self::InstructionEntry { key: right, .. },
             ) => left == right,
-            (Self::SessionAgent { .. }, Self::SessionAgent { .. }) => true,
+            (Self::SessionAgent { .. }, Self::SessionAgent { .. })
+            | (Self::SessionModel { .. }, Self::SessionModel { .. }) => true,
             _ => false,
         }
     }
@@ -123,9 +150,16 @@ struct AgentChange {
 }
 
 #[derive(Clone)]
+struct ModelChange {
+    model: ModelRef,
+    desired_digest: String,
+}
+
+#[derive(Clone)]
 enum Change {
     InstructionEntry(InstructionChange),
     SessionAgent(AgentChange),
+    SessionModel(ModelChange),
 }
 
 struct InstructionReadback {
@@ -153,6 +187,36 @@ struct AgentReadback {
     settings_revision: String,
     catalog_revision: String,
     definition: AgentDefinition,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ModelDefinition {
+    definition_digest: String,
+    enabled: bool,
+    status: String,
+    variants: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ModelCatalog {
+    revision: String,
+    definitions: BTreeMap<String, ModelDefinition>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ModelState {
+    selected: Option<Value>,
+    catalog: ModelCatalog,
+    definition: ModelDefinition,
+    variant_digest: String,
+}
+
+struct ModelReadback {
+    matches: bool,
+    settings_revision: String,
+    catalog_revision: String,
+    definition: ModelDefinition,
+    variant_digest: String,
 }
 
 fn digest_json(value: &Value) -> Result<String> {
@@ -185,6 +249,58 @@ fn agent_settings_revision(
         "agent_id":agent_id,
         "definition_digest":definition_digest
     }))
+}
+
+fn model_ref_value(model: &ModelRef) -> Value {
+    json!({"id":model.id,"providerID":model.provider_id,"variant":model.variant})
+}
+
+fn parse_session_model(value: &Value) -> Result<Value> {
+    model::fields(value, &["id", "providerID", "variant"])
+        .map_err(|_| Error::new("NATIVE_MODEL_SCHEMA", "native session model is invalid"))?;
+    let id = model::text(value, "id")
+        .map_err(|_| Error::new("NATIVE_MODEL_SCHEMA", "native session model is invalid"))?;
+    let provider = model::text(value, "providerID")
+        .map_err(|_| Error::new("NATIVE_MODEL_SCHEMA", "native session model is invalid"))?;
+    let variant = value
+        .get("variant")
+        .map(|_| {
+            model::text(value, "variant")
+                .map(str::to_owned)
+                .map_err(|_| Error::new("NATIVE_MODEL_SCHEMA", "native session model is invalid"))
+        })
+        .transpose()?;
+    if [id, provider]
+        .into_iter()
+        .chain(variant.as_deref())
+        .any(|value| {
+            value.is_empty()
+                || value.len() > 256
+                || value.bytes().any(|byte| byte.is_ascii_control())
+        })
+    {
+        return Err(Error::new(
+            "NATIVE_MODEL_SCHEMA",
+            "native session model is invalid",
+        ));
+    }
+    Ok(json!({"id":id,"providerID":provider,"variant":variant}))
+}
+
+fn model_settings_revision(
+    model_ref: Option<&Value>,
+    definition_digest: Option<&str>,
+    variant_digest: Option<&str>,
+) -> Result<String> {
+    digest_json(&json!({
+        "model":model_ref,
+        "definition_digest":definition_digest,
+        "variant_digest":variant_digest
+    }))
+}
+
+fn model_catalog_key(provider_id: &str, model_id: &str) -> String {
+    format!("{provider_id}\u{0}{model_id}")
 }
 
 impl InstructionChange {
@@ -276,11 +392,51 @@ impl AgentChange {
     }
 }
 
+impl ModelChange {
+    fn expectation(&self) -> ConfigurationExpectation {
+        ConfigurationExpectation::SessionModel {
+            model: self.model.clone(),
+            desired_digest: self.desired_digest.clone(),
+        }
+    }
+
+    fn details(&self, readback: &ModelReadback, evidence: &str, mutation_sent: bool) -> Value {
+        json!({
+            "completion_condition":"native_configuration_applied",
+            "configuration_kind":"session_model",
+            "action":"switch",
+            "model":model_ref_value(&self.model),
+            "desired_digest":self.desired_digest,
+            "model_definition_digest":readback.definition.definition_digest,
+            "model_variant_digest":readback.variant_digest,
+            "model_catalog_revision":readback.catalog_revision,
+            "model_enabled":readback.definition.enabled,
+            "model_status":readback.definition.status,
+            "settings_revision":readback.settings_revision,
+            "settings_revision_kind":MODEL_SETTINGS_REVISION_KIND,
+            "application_scope":"session",
+            "application_boundary":"subsequent_provider_turn",
+            "native_applied":true,
+            "model_work_started":false,
+            "mutation_sent":mutation_sent,
+            "evidence":evidence,
+            "catalog_verified":true,
+            "read_method":"session.get+model.list",
+            "replay_policy":"readback_only_no_mutation_replay",
+            "contract_revision":MODEL_CONTRACT_REVISION
+        })
+    }
+}
+
 impl Change {
     fn parse(settings: &Value) -> Result<Self> {
-        model::fields(settings, &["instruction_entry", "agent"])?;
-        match (settings.get("instruction_entry"), settings.get("agent")) {
-            (Some(entry), None) => {
+        model::fields(settings, &["instruction_entry", "agent", "model"])?;
+        match (
+            settings.get("instruction_entry"),
+            settings.get("agent"),
+            settings.get("model"),
+        ) {
+            (Some(entry), None, None) => {
                 model::fields(entry, &["action", "key", "value"])?;
                 let key = model::text(entry, "key")?;
                 if key.len() > MAX_OWNED_KEY_BYTES
@@ -328,7 +484,7 @@ impl Change {
                     desired_digest,
                 }))
             }
-            (None, Some(agent)) => {
+            (None, Some(agent), None) => {
                 model::fields(agent, &["id"])?;
                 let agent_id = model::text(agent, "id")?;
                 if !bounded_agent_id(agent_id) {
@@ -342,8 +498,23 @@ impl Change {
                     desired_digest,
                 }))
             }
+            (None, None, Some(value)) => {
+                let requested: ModelRef = serde_json::from_value(value.clone()).map_err(|_| {
+                    Error::invalid("model must contain exact id, providerID and variant")
+                })?;
+                if !requested.valid() {
+                    return Err(Error::invalid(
+                        "model id, providerID and variant must be bounded nonempty strings",
+                    ));
+                }
+                let desired_digest = digest_json(&json!({"model":model_ref_value(&requested)}))?;
+                Ok(Self::SessionModel(ModelChange {
+                    model: requested,
+                    desired_digest,
+                }))
+            }
             _ => Err(Error::invalid(
-                "settings must select exactly one of instruction_entry or agent",
+                "settings must select exactly one of instruction_entry, agent or model",
             )),
         }
     }
@@ -352,7 +523,12 @@ impl Change {
         match self {
             Self::InstructionEntry(change) => change.expectation(),
             Self::SessionAgent(change) => change.expectation(),
+            Self::SessionModel(change) => change.expectation(),
         }
+    }
+
+    fn ensure_route(&self, options: &Options) -> Result<()> {
+        self.expectation().ensure_route(options)
     }
 }
 
@@ -364,8 +540,10 @@ pub(crate) fn configuration_contract(
     settings: &Value,
     binding_id: &str,
     generation: i64,
+    native_options: &Value,
 ) -> Result<Value> {
     let expectation = configuration_expectation(settings)?;
+    expectation.ensure_route(&Options::parse(native_options)?)?;
     Ok(json!({
         "effect_scope":"native_session",
         "order_scope":{"binding_id":binding_id,"generation":generation},
@@ -508,6 +686,284 @@ fn validate_agent_definition(agent: &Value) -> Result<(String, AgentDefinition)>
     ))
 }
 
+fn bounded_model_text(value: &Value, field: &str, max: usize) -> Result<String> {
+    let text = model::text(value, field)
+        .map_err(|_| Error::new("NATIVE_MODEL_SCHEMA", "native model definition is invalid"))?;
+    if text.is_empty() || text.len() > max || text.bytes().any(|byte| byte.is_ascii_control()) {
+        return Err(Error::new(
+            "NATIVE_MODEL_SCHEMA",
+            "native model definition is invalid",
+        ));
+    }
+    Ok(text.to_owned())
+}
+
+fn validate_string_map(value: &Value) -> bool {
+    value.as_object().is_some_and(|map| {
+        map.iter().all(|(key, value)| {
+            !key.is_empty()
+                && key.len() <= 256
+                && !key.bytes().any(|byte| byte.is_ascii_control())
+                && value.as_str().is_some_and(|value| value.len() <= 8192)
+        })
+    })
+}
+
+fn validate_model_compatibility(value: &Value) -> Result<()> {
+    model::fields(
+        value,
+        &[
+            "reasoningField",
+            "requireReasoning",
+            "maxTokensField",
+            "requireFinishReason",
+            "requireAssistantAfterTool",
+            "supportsPromptCacheKey",
+        ],
+    )
+    .map_err(|_| {
+        Error::new(
+            "NATIVE_MODEL_SCHEMA",
+            "native model compatibility is invalid",
+        )
+    })?;
+    if value.get("reasoningField").is_some_and(|field| {
+        field.as_str().is_none_or(|field| {
+            field.is_empty()
+                || field.len() > 128
+                || field.bytes().any(|byte| byte.is_ascii_control())
+        })
+    }) || value.get("maxTokensField").is_some_and(|field| {
+        !matches!(field.as_str(), Some("max_completion_tokens" | "max_tokens"))
+    }) || [
+        "requireReasoning",
+        "requireFinishReason",
+        "requireAssistantAfterTool",
+        "supportsPromptCacheKey",
+    ]
+    .iter()
+    .any(|field| value.get(*field).is_some_and(|flag| !flag.is_boolean()))
+    {
+        return Err(Error::new(
+            "NATIVE_MODEL_SCHEMA",
+            "native model compatibility is invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn finite(value: &Value) -> bool {
+    value.as_f64().is_some_and(f64::is_finite)
+}
+
+fn validate_model_costs(value: &Value) -> Result<()> {
+    let costs = value
+        .as_array()
+        .filter(|costs| costs.len() <= MAX_MODEL_COST_TIERS)
+        .ok_or_else(|| Error::new("NATIVE_MODEL_SCHEMA", "native model costs are invalid"))?;
+    for cost in costs {
+        model::fields(cost, &["tier", "input", "output", "cache"])
+            .map_err(|_| Error::new("NATIVE_MODEL_SCHEMA", "native model costs are invalid"))?;
+        model::fields(&cost["cache"], &["read", "write"])
+            .map_err(|_| Error::new("NATIVE_MODEL_SCHEMA", "native model costs are invalid"))?;
+        if !finite(&cost["input"])
+            || !finite(&cost["output"])
+            || !finite(&cost["cache"]["read"])
+            || !finite(&cost["cache"]["write"])
+        {
+            return Err(Error::new(
+                "NATIVE_MODEL_SCHEMA",
+                "native model costs are invalid",
+            ));
+        }
+        if let Some(tier) = cost.get("tier") {
+            model::fields(tier, &["type", "size"]).map_err(|_| {
+                Error::new("NATIVE_MODEL_SCHEMA", "native model cost tier is invalid")
+            })?;
+            if tier["type"] != "context" || tier["size"].as_i64().is_none() {
+                return Err(Error::new(
+                    "NATIVE_MODEL_SCHEMA",
+                    "native model cost tier is invalid",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_model_variant(variant: &Value) -> Result<(String, String)> {
+    model::fields(variant, &["id", "settings", "headers", "body"])
+        .map_err(|_| Error::new("NATIVE_MODEL_SCHEMA", "native model variant is invalid"))?;
+    let id = bounded_model_text(variant, "id", 256)?;
+    if variant
+        .get("settings")
+        .is_some_and(|value| !value.is_object())
+        || variant.get("body").is_some_and(|value| !value.is_object())
+        || variant
+            .get("headers")
+            .is_some_and(|value| !validate_string_map(value))
+    {
+        return Err(Error::new(
+            "NATIVE_MODEL_SCHEMA",
+            "native model variant is invalid",
+        ));
+    }
+    Ok((id, digest_json(variant)?))
+}
+
+fn validate_model_definition(value: &Value) -> Result<(String, ModelDefinition)> {
+    model::fields(
+        value,
+        &[
+            "id",
+            "modelID",
+            "providerID",
+            "canonical",
+            "family",
+            "name",
+            "compatibility",
+            "package",
+            "settings",
+            "headers",
+            "body",
+            "capabilities",
+            "variants",
+            "time",
+            "cost",
+            "status",
+            "enabled",
+            "limit",
+        ],
+    )
+    .map_err(|_| {
+        Error::new(
+            "NATIVE_MODEL_SCHEMA",
+            "native model definition contains unsupported fields",
+        )
+    })?;
+    let id = bounded_model_text(value, "id", 256)?;
+    bounded_model_text(value, "modelID", 256)?;
+    let provider = bounded_model_text(value, "providerID", 256)?;
+    bounded_model_text(value, "name", MAX_MODEL_NAME_BYTES)?;
+    for field in ["canonical", "family"] {
+        if value.get(field).is_some() {
+            bounded_model_text(value, field, 256)?;
+        }
+    }
+    if value.get("package").is_some() {
+        bounded_model_text(value, "package", 512)?;
+    }
+    if value
+        .get("compatibility")
+        .is_some_and(|value| !value.is_object())
+        || value
+            .get("settings")
+            .is_some_and(|value| !value.is_object())
+        || value.get("body").is_some_and(|value| !value.is_object())
+        || value
+            .get("headers")
+            .is_some_and(|value| !validate_string_map(value))
+        || !value["capabilities"].is_object()
+        || !value["time"].is_object()
+        || !value["cost"].is_array()
+        || !value["limit"].is_object()
+    {
+        return Err(Error::new(
+            "NATIVE_MODEL_SCHEMA",
+            "native model definition is invalid",
+        ));
+    }
+    if let Some(compatibility) = value.get("compatibility") {
+        validate_model_compatibility(compatibility)?;
+    }
+    validate_model_costs(&value["cost"])?;
+    model::fields(&value["capabilities"], &["tools", "input", "output"]).map_err(|_| {
+        Error::new(
+            "NATIVE_MODEL_SCHEMA",
+            "native model capabilities are invalid",
+        )
+    })?;
+    if value["capabilities"]["tools"].as_bool().is_none()
+        || ["input", "output"].iter().any(|field| {
+            value["capabilities"][*field]
+                .as_array()
+                .is_none_or(|items| {
+                    items.len() > 64
+                        || items.iter().any(|item| {
+                            item.as_str().is_none_or(|text| {
+                                text.is_empty()
+                                    || text.len() > 128
+                                    || text.bytes().any(|byte| byte.is_ascii_control())
+                            })
+                        })
+                })
+        })
+    {
+        return Err(Error::new(
+            "NATIVE_MODEL_SCHEMA",
+            "native model capabilities are invalid",
+        ));
+    }
+    model::fields(&value["time"], &["released"])
+        .map_err(|_| Error::new("NATIVE_MODEL_SCHEMA", "native model time is invalid"))?;
+    if value["time"]["released"]
+        .as_f64()
+        .is_none_or(|released| !released.is_finite())
+    {
+        return Err(Error::new(
+            "NATIVE_MODEL_SCHEMA",
+            "native model time is invalid",
+        ));
+    }
+    model::fields(&value["limit"], &["context", "input", "output"])
+        .map_err(|_| Error::new("NATIVE_MODEL_SCHEMA", "native model limits are invalid"))?;
+    if value["limit"]["context"].as_i64().is_none()
+        || value["limit"]["output"].as_i64().is_none()
+        || value["limit"]
+            .get("input")
+            .is_some_and(|input| input.as_i64().is_none())
+    {
+        return Err(Error::new(
+            "NATIVE_MODEL_SCHEMA",
+            "native model limits are invalid",
+        ));
+    }
+    let enabled = value["enabled"].as_bool().ok_or_else(|| {
+        Error::new(
+            "NATIVE_MODEL_SCHEMA",
+            "native model enabled flag is invalid",
+        )
+    })?;
+    let status = value["status"]
+        .as_str()
+        .filter(|status| matches!(*status, "alpha" | "beta" | "deprecated" | "active"))
+        .ok_or_else(|| Error::new("NATIVE_MODEL_SCHEMA", "native model status is invalid"))?
+        .to_owned();
+    let variants = value["variants"]
+        .as_array()
+        .filter(|variants| variants.len() <= MAX_MODEL_VARIANTS)
+        .ok_or_else(|| Error::new("NATIVE_MODEL_SCHEMA", "native model variants are invalid"))?;
+    let mut projected_variants = BTreeMap::new();
+    for variant in variants {
+        let (variant_id, digest) = validate_model_variant(variant)?;
+        if projected_variants.insert(variant_id, digest).is_some() {
+            return Err(Error::new(
+                "NATIVE_MODEL_SCHEMA",
+                "native model definition contains a duplicate variant",
+            ));
+        }
+    }
+    Ok((
+        model_catalog_key(&provider, &id),
+        ModelDefinition {
+            definition_digest: digest_json(value)?,
+            enabled,
+            status,
+            variants: projected_variants,
+        },
+    ))
+}
+
 impl Service {
     async fn instruction_entries(&self, root: &str) -> Result<Vec<Value>> {
         let response: Data<Vec<Value>> = decode(
@@ -577,6 +1033,78 @@ impl Service {
         })
     }
 
+    async fn model_catalog(&self, directory: &Path) -> Result<ModelCatalog> {
+        let catalog = self
+            .get(
+                "/api/model",
+                &[(
+                    "location[directory]",
+                    directory.to_string_lossy().into_owned(),
+                )],
+            )
+            .await?;
+        verify_directory(directory, &catalog["location"]).await?;
+        let models = catalog["data"]
+            .as_array()
+            .ok_or_else(|| Error::new("NATIVE_MODEL_SCHEMA", "missing native model catalog"))?;
+        let mut definitions = BTreeMap::new();
+        for model in models {
+            let (key, definition) = validate_model_definition(model)?;
+            if definitions.insert(key, definition).is_some() {
+                return Err(Error::new(
+                    "NATIVE_MODEL_SCHEMA",
+                    "native model catalog contains a duplicate provider/model id",
+                ));
+            }
+        }
+        let projection = definitions
+            .iter()
+            .map(|(key, definition)| {
+                json!({"key":key,"definition_digest":definition.definition_digest})
+            })
+            .collect::<Vec<_>>();
+        Ok(ModelCatalog {
+            revision: projection_revision(&projection)?,
+            definitions,
+        })
+    }
+
+    fn checked_model<'a>(
+        catalog: &'a ModelCatalog,
+        requested: &ModelRef,
+    ) -> Result<(&'a ModelDefinition, &'a str)> {
+        let key = model_catalog_key(&requested.provider_id, &requested.id);
+        let definition = catalog.definitions.get(&key).ok_or_else(|| {
+            Error::new(
+                "NATIVE_MODEL_UNAVAILABLE",
+                "the exact route provider/model is absent from the current catalog",
+            )
+        })?;
+        if !definition.enabled {
+            return Err(Error::new(
+                "NATIVE_MODEL_UNAVAILABLE",
+                "the exact route provider/model is disabled",
+            ));
+        }
+        let variant_digest = definition
+            .variants
+            .get(&requested.variant)
+            .map(String::as_str)
+            .ok_or_else(|| {
+                Error::new(
+                    "NATIVE_MODEL_UNAVAILABLE",
+                    "the exact route model variant is absent from the current catalog",
+                )
+            })?;
+        Ok((definition, variant_digest))
+    }
+
+    pub(super) async fn check_route_model_available(&self, options: &Options) -> Result<()> {
+        let catalog = self.model_catalog(&options.directory).await?;
+        Self::checked_model(&catalog, &options.model)?;
+        Ok(())
+    }
+
     fn checked_agent<'a>(
         catalog: &'a AgentCatalog,
         agent_id: &str,
@@ -599,6 +1127,25 @@ impl Service {
             ));
         }
         Ok(definition)
+    }
+
+    pub(super) async fn verify_session_agent_route(
+        &self,
+        session: &Value,
+        options: &Options,
+    ) -> Result<()> {
+        let Some(agent_id) = session.get("agent").and_then(Value::as_str) else {
+            return Ok(());
+        };
+        if !bounded_agent_id(agent_id) {
+            return Err(Error::new(
+                "NATIVE_AGENT_SCHEMA",
+                "native session agent is invalid",
+            ));
+        }
+        let catalog = self.agent_catalog(&options.directory).await?;
+        Self::checked_agent(&catalog, agent_id, options)?;
+        Ok(())
     }
 
     async fn agent_state_once(
@@ -632,11 +1179,11 @@ impl Service {
         command: &RuntimeCommand,
         change: &AgentChange,
     ) -> Result<AgentReadback> {
-        self.verify_binding(root, options, &command.binding_id, command.generation)
+        self.verify_binding_model(root, options, &command.binding_id, command.generation)
             .await?;
         let first = self.agent_state_once(root, options, change).await?;
         let second = self.agent_state_once(root, options, change).await?;
-        self.verify_binding(root, options, &command.binding_id, command.generation)
+        self.verify_binding_model(root, options, &command.binding_id, command.generation)
             .await?;
         if first != second {
             return Err(Error::new(
@@ -653,6 +1200,59 @@ impl Service {
             )?,
             catalog_revision: catalog.revision,
             definition,
+        })
+    }
+
+    async fn model_state_once(
+        &self,
+        root: &str,
+        options: &Options,
+        change: &ModelChange,
+    ) -> Result<ModelState> {
+        let catalog = self.model_catalog(&options.directory).await?;
+        let (definition, variant_digest) = Self::checked_model(&catalog, &change.model)?;
+        let definition = definition.clone();
+        let variant_digest = variant_digest.to_owned();
+        let session = self.session(root).await?;
+        let selected = session.get("model").map(parse_session_model).transpose()?;
+        Ok(ModelState {
+            selected,
+            catalog,
+            definition,
+            variant_digest,
+        })
+    }
+
+    async fn model_readback(
+        &self,
+        root: &str,
+        options: &Options,
+        command: &RuntimeCommand,
+        change: &ModelChange,
+    ) -> Result<ModelReadback> {
+        self.verify_binding_identity(root, options, &command.binding_id, command.generation)
+            .await?;
+        let first = self.model_state_once(root, options, change).await?;
+        let second = self.model_state_once(root, options, change).await?;
+        self.verify_binding_identity(root, options, &command.binding_id, command.generation)
+            .await?;
+        if first != second {
+            return Err(Error::new(
+                "NATIVE_CONFIGURATION_CHANGED",
+                "native session model or model catalog changed during readback",
+            ));
+        }
+        let requested = model_ref_value(&change.model);
+        Ok(ModelReadback {
+            matches: first.selected.as_ref() == Some(&requested),
+            settings_revision: model_settings_revision(
+                Some(&requested),
+                Some(&first.definition.definition_digest),
+                Some(&first.variant_digest),
+            )?,
+            catalog_revision: first.catalog.revision,
+            definition: first.definition,
+            variant_digest: first.variant_digest,
         })
     }
 
@@ -676,6 +1276,9 @@ impl Service {
             Ok(change) => change,
             Err(error) => return failed(command, options, &error, false),
         };
+        if let Err(error) = change.ensure_route(options) {
+            return failed(command, options, &error, false);
+        }
         match change {
             Change::InstructionEntry(change) => {
                 let readback = match self
@@ -791,6 +1394,59 @@ impl Service {
                     Err(error) => failed(command, options, &error, true),
                 }
             }
+            Change::SessionModel(change) => {
+                let readback = match self.model_readback(&root, options, command, &change).await {
+                    Ok(readback) => readback,
+                    Err(error) => return failed(command, options, &error, false),
+                };
+                if readback.matches {
+                    return outcome(
+                        command,
+                        EffectOutcome::Applied,
+                        options,
+                        change.details(&readback, "preexisting_exact_readback", false),
+                    );
+                }
+                let written = self
+                    .post(
+                        &format!("/api/session/{root}/model"),
+                        json!({"model":model_ref_value(&change.model)}),
+                    )
+                    .await;
+                match written {
+                    Ok(Value::Null) => {}
+                    Ok(_) => {
+                        return failed(
+                            command,
+                            options,
+                            &Error::new(
+                                "NATIVE_CONFIGURATION_SCHEMA",
+                                "native model switch returned an unexpected body",
+                            ),
+                            true,
+                        );
+                    }
+                    Err(error) => return failed(command, options, &error, true),
+                }
+                match self.model_readback(&root, options, command, &change).await {
+                    Ok(readback) if readback.matches => outcome(
+                        command,
+                        EffectOutcome::Applied,
+                        options,
+                        change.details(&readback, "post_mutation_exact_readback", true),
+                    ),
+                    Ok(_) => failed(
+                        command,
+                        options,
+                        &Error::new(
+                            "NATIVE_CONFIGURATION_UNRESOLVED",
+                            "native session model did not match after mutation acknowledgement",
+                        ),
+                        true,
+                    ),
+                    Err(error) => failed(command, options, &error, true),
+                }
+            }
         }
     }
 
@@ -805,7 +1461,9 @@ impl Service {
                 .native_root_id
                 .as_deref()
                 .ok_or_else(|| Error::invalid("native root is missing"))?;
-            match Change::parse(&command.input["settings"])? {
+            let change = Change::parse(&command.input["settings"])?;
+            change.ensure_route(options)?;
+            match change {
                 Change::InstructionEntry(change) => {
                     let readback = self
                         .instruction_readback(root, options, command, &change)
@@ -829,6 +1487,21 @@ impl Service {
                         return Err(Error::new(
                             "NATIVE_CONFIGURATION_UNRESOLVED",
                             "saved session agent is not the current native state",
+                        ));
+                    }
+                    Ok(outcome(
+                        command,
+                        EffectOutcome::Applied,
+                        options,
+                        change.details(&readback, "exact_state_reconciliation", false),
+                    ))
+                }
+                Change::SessionModel(change) => {
+                    let readback = self.model_readback(root, options, command, &change).await?;
+                    if !readback.matches {
+                        return Err(Error::new(
+                            "NATIVE_CONFIGURATION_UNRESOLVED",
+                            "saved session model is not the current native state",
                         ));
                     }
                     Ok(outcome(
@@ -920,6 +1593,66 @@ impl Service {
             "hidden":definition.as_ref().map(|definition|definition.hidden),
             "raw_definition_persisted":false,
             "source":"session.get+agent.list"
+        }))
+    }
+
+    pub(super) async fn model_observation(&self, session: &Value) -> Result<Value> {
+        let directory = Path::new(model::text(&session["location"], "directory")?);
+        if !directory.is_absolute() {
+            return Err(Error::new(
+                "NATIVE_LOCATION_MISMATCH",
+                "native session location is not absolute",
+            ));
+        }
+        let catalog = self.model_catalog(directory).await?;
+        let selected = session.get("model").map(parse_session_model).transpose()?;
+        let (definition, variant_digest) = if let Some(selected) = &selected {
+            let id = model::text(selected, "id")?;
+            let provider = model::text(selected, "providerID")?;
+            let definition = catalog
+                .definitions
+                .get(&model_catalog_key(provider, id))
+                .cloned()
+                .ok_or_else(|| {
+                    Error::new(
+                        "NATIVE_MODEL_UNAVAILABLE",
+                        "the session-selected model is absent from the current catalog",
+                    )
+                })?;
+            let variant_digest = match selected["variant"].as_str() {
+                Some(variant) => {
+                    Some(definition.variants.get(variant).cloned().ok_or_else(|| {
+                        Error::new(
+                            "NATIVE_MODEL_UNAVAILABLE",
+                            "the session-selected variant is absent from the current catalog",
+                        )
+                    })?)
+                }
+                None => None,
+            };
+            (Some(definition), variant_digest)
+        } else {
+            (None, None)
+        };
+        let definition_digest = definition
+            .as_ref()
+            .map(|definition| definition.definition_digest.as_str());
+        let settings_revision = model_settings_revision(
+            selected.as_ref(),
+            definition_digest,
+            variant_digest.as_deref(),
+        )?;
+        Ok(json!({
+            "complete":true,
+            "model":selected,
+            "definition_digest":definition_digest,
+            "variant_digest":variant_digest,
+            "settings_revision":settings_revision,
+            "catalog_revision":catalog.revision,
+            "enabled":definition.as_ref().map(|definition|definition.enabled),
+            "status":definition.as_ref().map(|definition|definition.status.as_str()),
+            "raw_definition_persisted":false,
+            "source":"session.get+model.list"
         }))
     }
 }

@@ -11,6 +11,7 @@ use std::collections::BTreeSet;
 
 const INSTRUCTION_STATE_CONTRACT_REVISION: &str = "opencode-configure-prerequisite-v1";
 const AGENT_STATE_CONTRACT_REVISION: &str = "opencode-session-agent-state-v1";
+const MODEL_STATE_CONTRACT_REVISION: &str = "opencode-session-model-state-v1";
 
 #[derive(Debug)]
 pub(super) enum Gate {
@@ -62,6 +63,7 @@ impl Gate {
 pub(super) enum EffectiveConfiguration {
     InstructionEntries(Value),
     SessionAgent(Value),
+    SessionModel(Value),
 }
 
 struct StoredOperation {
@@ -97,6 +99,8 @@ struct ValidatedConfiguration {
     settings_revision: String,
     entries_revision: Option<String>,
     agent_definition_digest: Option<String>,
+    model_definition_digest: Option<String>,
+    model_variant_digest: Option<String>,
 }
 
 fn load(db: &Connection, operation_id: &str) -> Result<StoredOperation> {
@@ -168,6 +172,44 @@ fn sha256(value: &Value, field: &str) -> Result<String> {
             )
         })?;
     Ok(format!("sha256:{}", hex.to_ascii_lowercase()))
+}
+
+fn compact_model_ref(value: &Value) -> Result<Value> {
+    model::fields(value, &["id", "providerID", "variant"]).map_err(|_| {
+        Error::new(
+            "PREREQUISITE_EVIDENCE_INVALID",
+            "native model snapshot has an invalid model reference",
+        )
+    })?;
+    let invalid = || {
+        Error::new(
+            "PREREQUISITE_EVIDENCE_INVALID",
+            "native model snapshot has an invalid model reference",
+        )
+    };
+    let id = model::text(value, "id").map_err(|_| invalid())?;
+    let provider = model::text(value, "providerID").map_err(|_| invalid())?;
+    let variant = match value.get("variant") {
+        None | Some(Value::Null) => None,
+        Some(_) => Some(
+            model::text(value, "variant")
+                .map(str::to_owned)
+                .map_err(|_| invalid())?,
+        ),
+    };
+    if [id, provider]
+        .into_iter()
+        .chain(variant.as_deref())
+        .any(|part| {
+            part.is_empty() || part.len() > 256 || part.bytes().any(|byte| byte.is_ascii_control())
+        })
+    {
+        return Err(Error::new(
+            "PREREQUISITE_EVIDENCE_INVALID",
+            "native model snapshot has an invalid model reference",
+        ));
+    }
+    Ok(json!({"id":id,"providerID":provider,"variant":variant}))
 }
 
 fn expected_configuration(original: &Value) -> Result<ConfigurationExpectation> {
@@ -265,42 +307,72 @@ fn validate_applied_result(
     }
     validate_evidence(details)?;
     let settings_revision = sha256(details, "settings_revision")?;
-    let (entries_revision, agent_definition_digest) = match &expectation {
-        ConfigurationExpectation::InstructionEntry { action, key, .. } => {
-            if details["action"].as_str() != Some(action.as_str())
-                || details["key"].as_str() != Some(key.as_str())
-            {
-                return Err(Error::new(
-                    "PREREQUISITE_EVIDENCE_INVALID",
-                    "instruction-entry result does not match the saved target",
-                ));
+    let (entries_revision, agent_definition_digest, model_definition_digest, model_variant_digest) =
+        match &expectation {
+            ConfigurationExpectation::InstructionEntry { action, key, .. } => {
+                if details["action"].as_str() != Some(action.as_str())
+                    || details["key"].as_str() != Some(key.as_str())
+                {
+                    return Err(Error::new(
+                        "PREREQUISITE_EVIDENCE_INVALID",
+                        "instruction-entry result does not match the saved target",
+                    ));
+                }
+                (Some(sha256(details, "entries_revision")?), None, None, None)
             }
-            (Some(sha256(details, "entries_revision")?), None)
-        }
-        ConfigurationExpectation::SessionAgent { agent_id, .. } => {
-            if details["agent_id"].as_str() != Some(agent_id.as_str())
-                || details["catalog_verified"] != true
-                || !matches!(
-                    details["agent_mode"].as_str(),
-                    Some("subagent" | "primary" | "all")
+            ConfigurationExpectation::SessionAgent { agent_id, .. } => {
+                if details["agent_id"].as_str() != Some(agent_id.as_str())
+                    || details["catalog_verified"] != true
+                    || !matches!(
+                        details["agent_mode"].as_str(),
+                        Some("subagent" | "primary" | "all")
+                    )
+                    || details["agent_hidden"].as_bool().is_none()
+                    || details["agent_model_override"].as_bool().is_none()
+                {
+                    return Err(Error::new(
+                        "PREREQUISITE_EVIDENCE_INVALID",
+                        "session-agent result does not match the saved target",
+                    ));
+                }
+                sha256(details, "agent_catalog_revision")?;
+                (
+                    None,
+                    Some(sha256(details, "agent_definition_digest")?),
+                    None,
+                    None,
                 )
-                || details["agent_hidden"].as_bool().is_none()
-                || details["agent_model_override"].as_bool().is_none()
-            {
-                return Err(Error::new(
-                    "PREREQUISITE_EVIDENCE_INVALID",
-                    "session-agent result does not match the saved target",
-                ));
             }
-            sha256(details, "agent_catalog_revision")?;
-            (None, Some(sha256(details, "agent_definition_digest")?))
-        }
-    };
+            ConfigurationExpectation::SessionModel { model, .. } => {
+                if details["model"] != json!(model)
+                    || details["catalog_verified"] != true
+                    || details["model_enabled"] != true
+                    || !matches!(
+                        details["model_status"].as_str(),
+                        Some("alpha" | "beta" | "deprecated" | "active")
+                    )
+                {
+                    return Err(Error::new(
+                        "PREREQUISITE_EVIDENCE_INVALID",
+                        "session-model result does not match the saved route target",
+                    ));
+                }
+                sha256(details, "model_catalog_revision")?;
+                (
+                    None,
+                    None,
+                    Some(sha256(details, "model_definition_digest")?),
+                    Some(sha256(details, "model_variant_digest")?),
+                )
+            }
+        };
     Ok(ValidatedConfiguration {
         expectation,
         settings_revision,
         entries_revision,
         agent_definition_digest,
+        model_definition_digest,
+        model_variant_digest,
     })
 }
 
@@ -365,6 +437,53 @@ fn snapshot_matches(binding: &Value, validated: &ValidatedConfiguration) -> Resu
                     && definition.as_deref() == validated.agent_definition_digest.as_deref(),
             ))
         }
+        ConfigurationExpectation::SessionModel {
+            model: expected, ..
+        } => {
+            let observed = &binding["observation"]["native"]["model_configuration"];
+            if observed["complete"] != true {
+                return Ok(None);
+            }
+            let revision = sha256(observed, "settings_revision")?;
+            sha256(observed, "catalog_revision")?;
+            let definition = match observed["definition_digest"].as_str() {
+                Some(_) => Some(sha256(observed, "definition_digest")?),
+                None if observed["definition_digest"].is_null() => None,
+                None => {
+                    return Err(Error::new(
+                        "PREREQUISITE_EVIDENCE_INVALID",
+                        "native model snapshot has an invalid definition digest",
+                    ));
+                }
+            };
+            let variant = match observed["variant_digest"].as_str() {
+                Some(_) => Some(sha256(observed, "variant_digest")?),
+                None if observed["variant_digest"].is_null() => None,
+                None => {
+                    return Err(Error::new(
+                        "PREREQUISITE_EVIDENCE_INVALID",
+                        "native model snapshot has an invalid variant digest",
+                    ));
+                }
+            };
+            let model_matches = observed
+                .get("model")
+                .filter(|model| model.is_object())
+                .map(compact_model_ref)
+                .transpose()?
+                .is_some_and(|model| model == json!(expected));
+            Ok(Some(
+                model_matches
+                    && observed["enabled"] == true
+                    && matches!(
+                        observed["status"].as_str(),
+                        Some("alpha" | "beta" | "deprecated" | "active")
+                    )
+                    && revision == validated.settings_revision
+                    && definition.as_deref() == validated.model_definition_digest.as_deref()
+                    && variant.as_deref() == validated.model_variant_digest.as_deref(),
+            ))
+        }
     }
 }
 
@@ -374,7 +493,8 @@ fn same_effective(expected: &ValidatedConfiguration, later: &ValidatedConfigurat
     }
     match &expected.expectation {
         ConfigurationExpectation::InstructionEntry { .. } => true,
-        ConfigurationExpectation::SessionAgent { .. } => {
+        ConfigurationExpectation::SessionAgent { .. }
+        | ConfigurationExpectation::SessionModel { .. } => {
             expected.settings_revision == later.settings_revision
         }
     }
@@ -633,6 +753,21 @@ pub(super) fn applied_configuration(
                 "contract_revision":AGENT_STATE_CONTRACT_REVISION
             })))
         }
+        ConfigurationExpectation::SessionModel { model, .. } => {
+            Ok(EffectiveConfiguration::SessionModel(json!({
+                "kind":opencode_v2::MODEL_SETTINGS_REVISION_KIND,
+                "revision":validated.settings_revision,
+                "operation_id":operation_id,
+                "model":model,
+                "definition_digest":validated.model_definition_digest,
+                "variant_digest":validated.model_variant_digest,
+                "desired_digest":result["details"]["desired_digest"],
+                "complete":true,
+                "source":"exact_configuration_result",
+                "observed_at_ms":observed_at_ms,
+                "contract_revision":MODEL_STATE_CONTRACT_REVISION
+            })))
+        }
     }
 }
 
@@ -702,6 +837,107 @@ pub(super) fn observed_configurations(
             "observation_id":observation_id,
             "observed_at_ms":observed_at_ms,
             "contract_revision":AGENT_STATE_CONTRACT_REVISION
+        })));
+    }
+
+    let model_state = &native_state["model_configuration"];
+    if model_state["complete"] == true {
+        let revision = sha256(model_state, "settings_revision")?;
+        sha256(model_state, "catalog_revision")?;
+        let selected = match model_state.get("model") {
+            Some(value) if value.is_object() => compact_model_ref(value)?,
+            Some(value) if value.is_null() => Value::Null,
+            _ => {
+                return Err(Error::new(
+                    "PREREQUISITE_EVIDENCE_INVALID",
+                    "native model snapshot has an invalid model reference",
+                ));
+            }
+        };
+        let definition_digest = match model_state["definition_digest"].as_str() {
+            Some(_) => Some(sha256(model_state, "definition_digest")?),
+            None if model_state["definition_digest"].is_null() => None,
+            None => {
+                return Err(Error::new(
+                    "PREREQUISITE_EVIDENCE_INVALID",
+                    "native model snapshot has an invalid definition digest",
+                ));
+            }
+        };
+        let variant_digest = match model_state["variant_digest"].as_str() {
+            Some(_) => Some(sha256(model_state, "variant_digest")?),
+            None if model_state["variant_digest"].is_null() => None,
+            None => {
+                return Err(Error::new(
+                    "PREREQUISITE_EVIDENCE_INVALID",
+                    "native model snapshot has an invalid variant digest",
+                ));
+            }
+        };
+        let enabled = match model_state.get("enabled") {
+            Some(value) if value.is_boolean() || value.is_null() => value.clone(),
+            _ => {
+                return Err(Error::new(
+                    "PREREQUISITE_EVIDENCE_INVALID",
+                    "native model snapshot has an invalid enabled flag",
+                ));
+            }
+        };
+        let status = match model_state.get("status") {
+            Some(value) if value.is_null() => Value::Null,
+            Some(value)
+                if matches!(
+                    value.as_str(),
+                    Some("alpha" | "beta" | "deprecated" | "active")
+                ) =>
+            {
+                value.clone()
+            }
+            _ => {
+                return Err(Error::new(
+                    "PREREQUISITE_EVIDENCE_INVALID",
+                    "native model snapshot has an invalid status",
+                ));
+            }
+        };
+        let inconsistent = if selected.is_null() {
+            definition_digest.is_some()
+                || variant_digest.is_some()
+                || !enabled.is_null()
+                || !status.is_null()
+        } else {
+            definition_digest.is_none() || enabled.is_null() || status.is_null()
+        };
+        if inconsistent {
+            return Err(Error::new(
+                "PREREQUISITE_EVIDENCE_INVALID",
+                "native model snapshot contains inconsistent selected-model evidence",
+            ));
+        }
+        let prior = &binding["observation"]["effective_model"];
+        let operation_id = if prior["kind"] == opencode_v2::MODEL_SETTINGS_REVISION_KIND
+            && prior["contract_revision"] == MODEL_STATE_CONTRACT_REVISION
+            && prior["complete"] == true
+            && prior["revision"] == revision
+        {
+            prior["operation_id"].clone()
+        } else {
+            Value::Null
+        };
+        updates.push(EffectiveConfiguration::SessionModel(json!({
+            "kind":opencode_v2::MODEL_SETTINGS_REVISION_KIND,
+            "revision":revision,
+            "operation_id":operation_id,
+            "model":selected,
+            "definition_digest":definition_digest,
+            "variant_digest":variant_digest,
+            "enabled":enabled,
+            "status":status,
+            "complete":true,
+            "source":"native_snapshot",
+            "observation_id":observation_id,
+            "observed_at_ms":observed_at_ms,
+            "contract_revision":MODEL_STATE_CONTRACT_REVISION
         })));
     }
     Ok(updates)
