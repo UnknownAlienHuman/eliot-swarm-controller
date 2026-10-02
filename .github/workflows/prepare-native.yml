@@ -32,8 +32,9 @@ jobs:
           test "$(git hash-object src/store/opencode.rs)" = 997dcf17a7dd2b523919d736e8b9554a099dc719
           test "$(git hash-object src/store/opencode/tests.rs)" = 54ca429e4d091d70f05082b0f2640b516777d093
           test "$(git hash-object src/store/producers.rs)" = 1a1efa0e70b8dcd307cc176ac3fb42f8cea25f8f
-          git show "$BASE:.github/workflows/prepare-native.yml" > .github/workflows/prepare-native.yml
-          rm .github/import/opencode-terminal-results.patch.gz.b64.*
+          # GitHub Actions tokens cannot publish workflow-file changes. Validate the
+          # proposed CI file above, then leave workflow cleanup to the repository API.
+          git show "$BASE:.github/workflows/rust.yml" > .github/workflows/rust.yml
           git diff --check
       - name: Pinned Rust checks before publication
         shell: bash
@@ -43,7 +44,7 @@ jobs:
           cargo fmt -p eliot-swarm-controller
           cargo clippy --locked --lib --bins --no-deps -- -D warnings
           cargo test --locked opencode -- --nocapture
-      - name: Publish feature commit and remove importer
+      - name: Publish verified code commit
         shell: bash
         run: |
           set -euo pipefail
