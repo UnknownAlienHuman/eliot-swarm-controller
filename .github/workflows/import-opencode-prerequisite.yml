@@ -17,7 +17,7 @@ jobs:
       - name: Verify content-addressed payload and materialize source
         shell: bash
         env:
-          EXPECTED_PARENT: 659acc3abf1ac0696a01bb862426408f1ae1b539
+          EXPECTED_PARENT: 69413b1c2c1c3ee5ca97fd322379898813c5cbdb
           EXPECTED_PAYLOAD_SHA256: 169ca1b006cf7f03a3e1e7ec7370972ad49c3930d1218e87df87fbd8e129e7a3
         run: |
           set -euo pipefail
@@ -75,12 +75,16 @@ jobs:
           from pathlib import Path
 
           path = Path('src/store/prerequisites.rs')
-          before = 'Some(expected) if details[\"desired_digest\"] == expected => {}'
-          after = 'Some(ref expected) if details[\"desired_digest\"] == expected => {}'
+          before = '''    match desired_digest {
+        Some(expected) if details[\"desired_digest\"] == expected => {}
+'''
+          after = '''    match desired_digest.as_deref() {
+        Some(expected) if details[\"desired_digest\"].as_str() == Some(expected) => {}
+'''
           text = path.read_text()
           assert text.count(before) == 1
           path.write_text(text.replace(before, after))
-          assert hashlib.sha256(path.read_bytes()).hexdigest() == 'b5f468c3b6541172bef5ce29447dc0b2c17fc21eb893e786b39b609a3552f610'
+          assert hashlib.sha256(path.read_bytes()).hexdigest() == 'ea0fb748a7f6f31f0d83152f800e58f7f7aedf61279ac03a767f3202baec4759'
           PY
           git diff --check
       - name: Pinned toolchain
