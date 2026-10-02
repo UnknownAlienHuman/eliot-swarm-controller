@@ -8,6 +8,7 @@ pub mod error;
 pub mod export;
 pub mod host;
 pub mod ipc;
+pub mod mcp;
 pub mod model;
 pub mod platform;
 mod redaction;
