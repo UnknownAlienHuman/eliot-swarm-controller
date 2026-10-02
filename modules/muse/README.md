@@ -131,3 +131,7 @@ For **`d385498b00fe1a049c357613a7777cc4a1c83f72`**, [CI 36872022736](https://git
 The bounded invocation passed 13 assertions: real launcher/descendant ownership after explicit fixture-process loss, replacement refusal until group departure, changed-boot admission, stale-link exclusion, historical open receipt retaining reconciling, normal-input refusal until resume, stale/disabled recovery rejection, current-boot resume readiness, serialized Node checkpoint publication/read and clean shutdown. The process fixture was Python, and native open/resume outcomes were synthetic module RPC messages. This is not a live Muse resume, Max measurement, complete native-child recovery or Windows-runtime qualification. No new test module or cargo test was added.
 
 Next code: direct OpenCode V2 through the same host contract. Qualify actual Muse resume/children on the installed runtime separately; do not reimplement the already saved local recovery path. Complete native family discovery, automatic service/module activation and all missing-identity recovery cases remain separate work. Do not reimplement already completed host results, submission, acceptance or CheckRunner. [OpenCodex Issue #1](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/1) stays after the main code.
+
+## Updates
+
+Pins, verification, activation and rollback for this module are recorded in [UPDATE.md](UPDATE.md).

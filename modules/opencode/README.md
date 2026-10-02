@@ -273,3 +273,7 @@ Live installed OpenCode, actual inference/subscription behavior and native Windo
 The exact session-agent baseline `1703b293` passed [Windows/Linux CI 36984502928](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/36984502928). The route-model slice is published only after Rust 1.98.1 owned-crate formatting, locked minimal lib/bin Clippy and unchanged Atlas verification; permanent Windows/Linux CI on its exact commit remains separate evidence. No tests or live native calls are run for this code-completion slice; dependencies, migrations and the Atlas donor remain unchanged.
 
 The interrupted 2026-10-01 implementation retained 16 protocol/Store fixtures. They were preserved, not rerun during source recovery. Fresh Rust 1.98.1 package formatting and minimal warnings-denied Clippy passed; the Windows/Linux workflow checks the exact commit's formatting, Clippy, donor hashes, release build and existing Muse SDK import. Tests remain deferred while the product code is being completed. Fixture HTTP servers are not OpenCode, and compilation is not live service, model, billing or subscription qualification.
+
+## Updates
+
+Pins, verification, activation and rollback for this adapter are recorded in [UPDATE.md](UPDATE.md).
