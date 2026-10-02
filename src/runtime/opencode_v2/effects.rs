@@ -11,7 +11,7 @@ use crate::{
 use serde_json::{Value, json};
 use std::{collections::BTreeSet, path::Path};
 
-fn outcome(
+pub(super) fn outcome(
     command: &RuntimeCommand,
     state: EffectOutcome,
     options: &Options,
@@ -27,7 +27,7 @@ fn outcome(
         details,
     }
 }
-fn failed(
+pub(super) fn failed(
     command: &RuntimeCommand,
     options: &Options,
     error: &Error,
@@ -204,6 +204,7 @@ impl Service {
             "agent.open" => self.open(command, options).await,
             "task.dispatch" | "agent.send" => self.send(command, options).await,
             "agent.reply" => self.reply(command, options).await,
+            "agent.configure" => self.configure(command, options).await,
             _ => failed(
                 command,
                 options,
@@ -409,6 +410,9 @@ impl Service {
     ) -> RuntimeOutcome {
         let readback=async {
             self.verify().await?;
+            if original.method=="agent.configure" {
+                return Ok(self.reconcile_configuration(original, options).await);
+            }
             if original.method=="agent.open" {
                 let id=root_id(&original.binding_id,original.generation);
                 let session=self.check_root(&id,options).await?;

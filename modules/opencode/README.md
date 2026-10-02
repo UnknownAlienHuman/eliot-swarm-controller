@@ -45,6 +45,47 @@ Port, PID and credentials above are placeholders, not defaults. Credentials are 
 
 No native connection occurs merely to list routes or read host status. After explicit `agent.open` admission, the host attaches its built-in worker. No `client.register` module token or `module-run` process is needed for this adapter; those are Muse bridge setup steps. Existing controller credentials and request IDs still apply. Read an operation's result before using its returned binding/generation.
 
+## Durable session configuration
+
+`agent.configure` supports one bounded native configuration unit: OpenCode's complete durable instruction-entry backend. ELIOT keeps the selected [`existing-control-bundle` donor boundary](../../docs/agent_swarm.donors-20260929.toml) for direct HTTP and delegates storage, replacement, removal and next-step rendering to the native backend rather than copying that state machine into Rust. The complete Atlas donor remains unchanged and continues to scrub retained native question/diagnostic copies. Native semantics were reviewed at OpenCode `4c0d0ff4`: [instruction-entry backend](https://github.com/anomalyco/opencode/blob/4c0d0ff478ca9150c163fb8b04a76395e4dccafe/packages/core/src/session/instruction-entry.ts), [key/value boundary](https://github.com/anomalyco/opencode/blob/4c0d0ff478ca9150c163fb8b04a76395e4dccafe/packages/schema/src/instruction-entry.ts), and [HTTP routes](https://github.com/anomalyco/opencode/blob/4c0d0ff478ca9150c163fb8b04a76395e4dccafe/packages/protocol/src/groups/session.ts).
+
+Only controller-owned keys under `eliot.*` are accepted. One Operation changes one key:
+
+```json
+{
+  "client_request_id": "oc-policy-1",
+  "binding_id": "BINDING_ID",
+  "generation": 1,
+  "settings": {
+    "instruction_entry": {
+      "action": "put",
+      "key": "eliot.policy",
+      "value": {"review_before_submit": true}
+    }
+  }
+}
+```
+
+```json
+{
+  "client_request_id": "oc-policy-remove-1",
+  "binding_id": "BINDING_ID",
+  "generation": 1,
+  "settings": {
+    "instruction_entry": {
+      "action": "remove",
+      "key": "eliot.policy"
+    }
+  }
+}
+```
+
+Invoke these through `swarm call agent.configure --file REQUEST.json`. Keys are limited to 128 ASCII bytes and native lowercase alphanumeric/dot/underscore/hyphen syntax. Values use the native 256 KiB JSON boundary. Put permits every JSON value, including `null`; remove does not accept `value`. Credentials and access tokens do not belong in instruction entries because the requested value is retained in the Operation input.
+
+A matching pre-existing value is a valid no-op. Otherwise the adapter sends exactly one native PUT or DELETE and requires an exact subsequent list readback before returning `native_configuration_applied`. The result records the key, desired digest, full entry-list revision, scope, evidence and actual application boundary. OpenCode stores the value immediately and announces a change/removal to the model at the **next step boundary**; this Operation does not itself start model work. Submit a dependent model input only after `operation.get` reports the typed applied result with `native_applied=true`; request admission/order alone is not that prerequisite, and the current API does not infer a dependency merely from submission order.
+
+A lost mutation response becomes `outcome_unknown`. Reconciliation repeats only verified GET/readback and never repeats PUT or DELETE. Current snapshots retain at most 128 controller-owned keys and value digests, not duplicate values; overflow is marked incomplete. An unsupported experimental endpoint, changed binding/model/location, duplicate key, read gap or mismatching value remains explicit. Provider/model/variant, agent, effort and arbitrary native settings are not silently mapped onto this control.
+
 ## Delivery, observation and recovery
 
 A native session has a deterministic controller-owned ID plus binding/generation/operation metadata. Initial creation verifies the model and location. Task dispatch includes the frozen Task snapshot. Each admitted input has a deterministic native message ID. **A prompt response confirms inbox admission, not an executed turn or finished Task.** The retained producer has `native_input_id`, `admission_kind=native_inbox`, `disposition=admitted`; it does not acquire a fabricated turn/run ID.
@@ -114,12 +155,12 @@ Each timeline pass is bounded to 32 pages of at most 50 messages and 8 MiB of sc
 
 ## Remaining C04 work — do not declare end-to-end completion
 
-Cross-restart native continuation after shutdown/missing terminal, detached binary/tool-output retrieval, configuration/goal controls and complete family reconstruction remain unfinished. The durable-log path now resolves ordinary admitted/delivered inputs and exact pending cancellation; incomplete or unsupported native histories keep the producer unresolved. Parent idle or the latest assistant outcome cannot discharge it. Unsupported methods report an explicit capability error.
+Cross-restart native continuation after shutdown/missing terminal, detached binary/tool-output retrieval, automatic configure-to-start prerequisite chaining, goal/model/agent controls and complete family reconstruction remain unfinished. Durable `eliot.*` instruction-entry configuration is implemented, but it does not claim provider/model/effort control. The durable-log path now resolves ordinary admitted/delivered inputs and exact pending cancellation; incomplete or unsupported native histories keep the producer unresolved. Parent idle or the latest assistant outcome cannot discharge it. Unsupported methods report an explicit capability error.
 
 Live installed OpenCode, actual inference/subscription behavior and native Windows service interoperability remain unqualified. This adapter must not be presented as a fully qualified automatic Task-completion route yet. It does not require or install the optional OpenCodex provider proxy (Issue #1).
 
 ## Focused implementation evidence
 
-The turn-diff baseline `ab505557` passed [Windows/Linux CI 36958046257](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/36958046257). The subsequent durable execution reader passed local Rust 1.98.1 owned-crate formatting and locked offline lib/bin Clippy with warnings denied. Its exact Windows/Linux CI must be checked separately. No tests or live native calls were run for this addition; dependencies, migrations and the Atlas donor are unchanged.
+The durable-execution baseline `1aa4669f` passed [Windows/Linux CI 36961601212](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/36961601212). The subsequent instruction-entry control passed local Rust 1.98.1 owned-crate formatting and locked offline lib/bin Clippy with warnings denied. Its exact Windows/Linux CI must be checked separately. No tests or live native calls were run for this addition; dependencies, migrations and the Atlas donor are unchanged.
 
 The interrupted 2026-10-01 implementation retained 16 protocol/Store fixtures. They were preserved, not rerun during source recovery. Fresh Rust 1.98.1 package formatting and minimal warnings-denied Clippy passed; the Windows/Linux workflow checks the exact commit's formatting, Clippy, donor hashes, release build and existing Muse SDK import. Tests remain deferred while the product code is being completed. Fixture HTTP servers are not OpenCode, and compilation is not live service, model, billing or subscription qualification.

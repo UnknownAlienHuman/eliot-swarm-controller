@@ -629,6 +629,19 @@ pub(super) fn user_command(
         tx.execute("UPDATE operations SET state='cancelled',result_json=?4,settled_at_ms=?3,updated_at_ms=?3 WHERE binding_id=?1 AND binding_generation=?2 AND state='queued' AND method='agent.goal' AND json_extract(original_request_json,'$.action') IN ('set','edit','resume')",
             params![id,generation,now,model::canonical(&json!({"reason":"superseded_by_goal_stop","stop_operation_id":op}))?])?;
     }
-    tx.execute("UPDATE operations SET binding_id=?2,binding_generation=?3,effective_request_json=?4 WHERE operation_id=?1",params![op,id,generation,model::canonical(&json!({"route":b["route"],"native_root_id":b["native_root_id"]}))?])?;
+    let mut effective = json!({"route":b["route"],"native_root_id":b["native_root_id"]});
+    if method == "agent.configure" && b["route"]["runtime"] == crate::runtime::opencode_v2::RUNTIME
+    {
+        effective["operation_contract"] = json!({
+            "effect_scope":"native_session",
+            "order_scope":{"binding_id":id,"generation":generation},
+            "completion_condition":"native_configuration_applied",
+            "application_boundary":"next_step_boundary",
+            "replay_policy":"readback_only_no_mutation_replay",
+            "fallback_used":false,
+            "contract_revision":"opencode-instruction-entry-v1"
+        });
+    }
+    tx.execute("UPDATE operations SET binding_id=?2,binding_generation=?3,effective_request_json=?4 WHERE operation_id=?1",params![op,id,generation,model::canonical(&effective)?])?;
     Ok(json!({"operation_id":op,"state":"queued","native_admission":"not_observed"}))
 }

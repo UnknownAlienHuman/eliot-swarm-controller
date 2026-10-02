@@ -187,6 +187,24 @@ impl Service {
                 None
             }
         };
+        let configuration = match self.instruction_observation(root).await {
+            Ok(configuration) => {
+                if configuration["complete"] != true {
+                    failures.push(json!({"code":"CONFIGURATION_OBSERVATION_LIMIT","source":"instruction_entries"}));
+                }
+                configuration
+            }
+            Err(error) => {
+                failures.push(json!({"code":error.code,"source":"instruction_entries"}));
+                json!({
+                    "complete":false,
+                    "owned_entries":[],
+                    "revision":null,
+                    "value_content_persisted":false,
+                    "source":"experimental.session.instructions.entry.list"
+                })
+            }
+        };
         let mut pending = BTreeMap::new();
         // Retain unresolved old questions when a member read fails; absence in an
         // incomplete family enumeration is not a native cancellation receipt.
@@ -264,7 +282,8 @@ impl Service {
             state: json!({"native_root_id":root,"session":compact(&root_info),
             "observed_children":retained.into_values().collect::<Vec<_>>(),"pending_requests":pending.into_values().collect::<Vec<_>>(),
             "execution":match active_count {Some(n) if n>0=>"observed_active",Some(_)=>"not_observed_active",None=>"unknown"},
-            "active_drain_count":active_count,"native_service_pid":self.pid,"native_service_version":self.version,
+            "active_drain_count":active_count,"configuration":configuration,
+            "native_service_pid":self.pid,"native_service_version":self.version,
             "family_completeness":"partial","enumeration_complete":enumerated,
             "completeness_reason":"volatile_non_atomic_pages_are_not_family_terminal_evidence",
             "source":"opencode_v2.http.snapshot","observed_at_ms":model::now_ms()?,

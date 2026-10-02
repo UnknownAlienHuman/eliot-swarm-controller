@@ -1,7 +1,0 @@
- OpenCode qualification remain pending; durable controller-owned instruction entries are implemented with exact readback. Unknown children/stream gaps never become an idle family or a passed Task. Follow [the module guide](modules/opencode/README.md) and the disabled route in [configuration](config/controller.example.toml).
- 
- The complete pinned `atlas-redact` donor is now used to scrub retained native question/diagnostic copies. Its upstream files remain unchanged behind a separate Cargo wrapper; licenses, rule notices and snapshot hashes are retained in [third-party notices](THIRD_PARTY_NOTICES.md). This is actual library reuse, not a claim that all listed donors were installed.
- 
-@@ -188,7 +188,7 @@ Dependency lookup uses valid historical acceptance decisions. A newer producer r
- 
- Public methods: `source.capture`, `check.run/get/profiles/cancel`, `host.status/mode`, `client.register/list`, `task.create/get/list/revise/claim/dispatch/submit/submission/request_changes/accept/accepta

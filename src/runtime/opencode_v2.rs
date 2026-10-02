@@ -1,5 +1,6 @@
 //! OpenCode V2 attaches to an explicitly configured, externally owned HTTP service.
 //! No CLI, process launch, service restart, implicit model choice or POST replay.
+mod configuration;
 mod effects;
 mod execution;
 mod http;

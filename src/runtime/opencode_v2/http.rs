@@ -199,6 +199,12 @@ impl Service {
     pub(super) async fn post(&self, path: &str, body: Value) -> Result<Value> {
         self.request(Method::POST, path, &[], Some(body)).await
     }
+    pub(super) async fn put(&self, path: &str, body: Value) -> Result<Value> {
+        self.request(Method::PUT, path, &[], Some(body)).await
+    }
+    pub(super) async fn delete(&self, path: &str) -> Result<Value> {
+        self.request(Method::DELETE, path, &[], None).await
+    }
     async fn request(
         &self,
         method: Method,
@@ -229,14 +235,17 @@ impl Service {
         let status = response.status();
         if !status.is_success() {
             // Never save a reflected error body or follow a redirect with credentials.
-            let code =
-                if effect && matches!(status.as_u16(), 400 | 401 | 403 | 404 | 405 | 409 | 422) {
-                    "NATIVE_REJECTED"
-                } else if effect {
-                    "NATIVE_OUTCOME_UNKNOWN"
-                } else {
-                    "NATIVE_READ_FAILED"
-                };
+            let code = if effect
+                && matches!(
+                    status.as_u16(),
+                    400 | 401 | 403 | 404 | 405 | 409 | 413 | 422
+                ) {
+                "NATIVE_REJECTED"
+            } else if effect {
+                "NATIVE_OUTCOME_UNKNOWN"
+            } else {
+                "NATIVE_READ_FAILED"
+            };
             return Err(Error::new(code, format!("HTTP {}", status.as_u16())));
         }
         if response
