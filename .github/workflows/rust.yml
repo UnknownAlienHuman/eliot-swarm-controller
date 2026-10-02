@@ -88,7 +88,7 @@ jobs:
             modules/claude/*.mjs
             modules/claude/*.json
             modules/claude/README.md
-            modules/claude/UPDATE.md
+            modules/*/UPDATE.md
             modules/claude/fixtures/
             modules/opencode/README.md
             vendor/atlas/

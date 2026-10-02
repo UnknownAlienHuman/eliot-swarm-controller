@@ -71,7 +71,8 @@ fn publish(path: &Path, value: &Value) -> Result<()> {
 /// directory. A missing or corrupt owner identity is a terminal gap for this
 /// state directory — not a prompt to invent an owner, adopt the checkpoint or
 /// start fresh. Best-effort: the classified error is returned either way, and
-/// an existing record of a different gap is never overwritten.
+/// an existing record of the same gap is kept; a different classification
+/// replaces it (the latest classification is the operative one).
 fn record_gap(dir: &Path, kind: &str, detail: &str) {
     let path = dir.join("recovery-gap.json");
     if let Ok(existing) = read_record(&path)
