@@ -18,9 +18,9 @@ jobs:
           BASE=8745e3334ed638ff98d09b00909a7b562e081b06
           test "$GITHUB_REF_NAME" = "feat/opencode-terminal-results"
           test "$(git merge-base HEAD "$BASE")" = "$BASE"
-          printf '%s  %s\n' c65fda68a1977b263a380e7e47c38be3bdc8f4db3247b9b12c1041d4a25f0cca .github/import/opencode-terminal-results.patch.gz | sha256sum -c -
+          printf '%s  %s\n' 32f1beae0248910ea48c2d10387d60b138768acbf61396646b86b3e3ecd18b55 .github/import/opencode-terminal-results.patch.gz | sha256sum -c -
           gzip -dc .github/import/opencode-terminal-results.patch.gz > "$RUNNER_TEMP/opencode-terminal-results.patch"
-          printf '%s  %s\n' 3fc416a462830f55e8cff7e1d099cb8c699e4d32148cd09c700783432028cc22 "$RUNNER_TEMP/opencode-terminal-results.patch" | sha256sum -c -
+          printf '%s  %s\n' 2d3c230bbc61ff1cffc0143af4ba48f31da3da2078e046e4700cc67bea7ea454 "$RUNNER_TEMP/opencode-terminal-results.patch" | sha256sum -c -
           git apply --check "$RUNNER_TEMP/opencode-terminal-results.patch"
           git apply "$RUNNER_TEMP/opencode-terminal-results.patch"
           test "$(git hash-object .github/workflows/rust.yml)" = b8dbc5881fcd65d483816efe6aa115b273217d54
@@ -29,7 +29,7 @@ jobs:
           test "$(git hash-object src/runtime/opencode_v2/transcript.rs)" = c5f2dbc285f49ab102245a1ee14aa465632a88c0
           test "$(git hash-object src/runtime/opencode_v2/tests.rs)" = d43b9b1161b06478bf46968ec9ccd785d6a182c8
           test "$(git hash-object src/store/opencode.rs)" = 997dcf17a7dd2b523919d736e8b9554a099dc719
-          test "$(git hash-object src/store/opencode/tests.rs)" = 269a431d04d3ffef14a07eef9c32b9c89291331d
+          test "$(git hash-object src/store/opencode/tests.rs)" = 54ca429e4d091d70f05082b0f2640b516777d093
           test "$(git hash-object src/store/producers.rs)" = 1a1efa0e70b8dcd307cc176ac3fb42f8cea25f8f
           git show "$BASE:.github/workflows/prepare-native.yml" > .github/workflows/prepare-native.yml
           rm .github/import/opencode-terminal-results.patch.gz
