@@ -340,11 +340,11 @@ pub fn inspect(db: &Connection, config: &Config) -> Result<Inspection> {
         {
             findings.push(finding(
                 "opencodex_version_mismatch",
-                "attention",
+                "info",
                 format!(
-                    "OpenCodex binding {binding_id} observed service version {observed}, expected {expected}"
+                    "OpenCodex binding {binding_id} observed service version {observed}, adapter contract baseline {expected}"
                 ),
-                "Treat the binding's readiness as unknown until the operator aligns the service version or the binding's expectedVersion; a mismatch is neither a failure nor a pass.",
+                "Recorded as an observation only: the service version is operator-managed and is not pinned by this project, so a difference changes neither the binding's readiness nor configuration Operations and requires no alignment. The adapter's contract baseline follows upstream current (see modules/opencodex/UPDATE.md).",
             ));
         }
         if stale {
@@ -595,7 +595,7 @@ pub fn inspect(db: &Connection, config: &Config) -> Result<Inspection> {
             {
                 "area": "opencodex_provider_service",
                 "status": "not_performed",
-                "note": "opencodex_live_qualification: not_performed — OpenCodex facts come from module snapshots verified against pinned-contract fixture reconstructions (v2.73.0); no live opencodex service has been installed or qualified.",
+                "note": "opencodex_live_qualification: not_performed — OpenCodex facts come from module snapshots verified against fixture reconstructions of the upstream Management contracts (adapter baseline last verified at v2.75.0; the baseline follows upstream current and the service itself is not pinned); no live opencodex service has been installed or qualified.",
             },
         ],
         "findings": findings,
@@ -808,7 +808,7 @@ mod tests {
     }
 
     #[test]
-    fn opencodex_section_projects_recorded_snapshot_and_flags_mismatch() {
+    fn opencodex_section_projects_recorded_snapshot_and_records_version_difference() {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -861,6 +861,15 @@ mod tests {
             codes.contains(&"opencodex_version_mismatch".to_string()),
             "{codes:?}"
         );
+        // A version difference is an observation, not a defect: the
+        // finding is informational and never asks for alignment.
+        let mismatch = inspection.report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["code"] == "opencodex_version_mismatch")
+            .expect("version-difference finding present");
+        assert_eq!(mismatch["severity"], "info");
         assert!(!codes.contains(&"opencodex_stale".to_string()), "{codes:?}");
         assert!(
             !codes.contains(&"opencodex_unavailable".to_string()),
