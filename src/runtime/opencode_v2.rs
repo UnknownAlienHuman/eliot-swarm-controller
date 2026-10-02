@@ -5,6 +5,7 @@ mod http;
 mod snapshot;
 #[cfg(test)]
 pub(crate) mod tests;
+mod transcript;
 
 use crate::error::{Error, Result};
 pub(crate) use http::{EventReader, EventState, Service};

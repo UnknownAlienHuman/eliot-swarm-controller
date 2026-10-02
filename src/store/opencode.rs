@@ -164,6 +164,54 @@ impl Store {
             .send_modify(|revision| *revision = revision.wrapping_add(1));
         Ok(())
     }
+    async fn oc_result(
+        &self,
+        p: &Principal,
+        service: &Service,
+        options: &Options,
+        command: &RuntimeCommand,
+    ) -> bool {
+        match service.result_page(command, options).await {
+            Ok(page) => {
+                match self
+                    .persist_result(
+                        p.clone(),
+                        json!({"operation_id":command.operation_id.clone(),"page":page}),
+                    )
+                    .await
+                {
+                    Ok(_) => true,
+                    Err(error) => {
+                        let outcome = RuntimeOutcome {
+                            operation_id: command.operation_id.clone(),
+                            outcome: EffectOutcome::Unknown,
+                            native_scope_key: Some(options.scope()),
+                            native_root_id: command.native_root_id.clone(),
+                            turn_id: None,
+                            native_input_id: None,
+                            details: json!({"code":error.code,"completion_condition":"result_persistence_unknown","native_read_replay_safe":true}),
+                        };
+                        let _ = self.record_oc_outcome(p, outcome).await;
+                        false
+                    }
+                }
+            }
+            Err(error) => {
+                // This path performs GETs only. A failed selector/read cannot have
+                // admitted native work, so a new pinned result request is safe.
+                let outcome = RuntimeOutcome {
+                    operation_id: command.operation_id.clone(),
+                    outcome: EffectOutcome::Rejected,
+                    native_scope_key: Some(options.scope()),
+                    native_root_id: command.native_root_id.clone(),
+                    turn_id: None,
+                    native_input_id: None,
+                    details: oc::diagnostic(&error),
+                };
+                self.record_oc_outcome(p, outcome).await.is_ok()
+            }
+        }
+    }
     async fn oc_connection(
         &self,
         p: &Principal,
@@ -306,7 +354,7 @@ impl Store {
                             let principal = p.clone();
                             let pending=self.run(move|db|{
                             let (id,generation,_)=runtime::scope(db,&principal,true)?;
-                            let mut stmt=db.prepare("SELECT operation_id FROM operations WHERE binding_id=?1 AND binding_generation=?2 AND state IN ('sending','native_accepted','outcome_unknown') AND method IN ('agent.open','task.dispatch','agent.send') ORDER BY created_at_ms LIMIT 16")?;
+                            let mut stmt=db.prepare("SELECT operation_id FROM operations WHERE binding_id=?1 AND binding_generation=?2 AND state IN ('sending','native_accepted','outcome_unknown') AND method IN ('agent.open','task.dispatch','agent.send','agent.result') ORDER BY created_at_ms LIMIT 16")?;
                             let ids=stmt.query_map(params![id,generation],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
                             ids.into_iter().map(|id|original(db,&principal,&id)).collect::<Result<Vec<_>>>()
                         }).await;
@@ -314,6 +362,11 @@ impl Store {
                                 for command in pending {
                                     if *stopping.borrow() {
                                         break;
+                                    }
+                                    if command.method == "agent.result" {
+                                        self.oc_result(p, service, &binding_options, &command)
+                                            .await;
+                                        continue;
                                     }
                                     let result =
                                         service.reconcile(&command, &binding_options).await;
@@ -350,6 +403,10 @@ impl Store {
                             }) else {
                                 continue;
                             };
+                            if command.method == "agent.result" {
+                                self.oc_result(p, service, &binding_options, &command).await;
+                                continue;
+                            }
                             let result = if command.method == "agent.refresh" {
                                 let read = match fresh {
                                     Ok(fresh) => {
@@ -392,9 +449,13 @@ impl Store {
                                 let target =
                                     self.run(move |db| original(db, &principal, &target)).await;
                                 let resolved = if let Ok(target) = target {
-                                    let r = service.reconcile(&target, &binding_options).await;
-                                    let resolved = matches!(r.outcome, EffectOutcome::Applied);
-                                    self.record_oc_outcome(p, r).await.is_ok() && resolved
+                                    if target.method == "agent.result" {
+                                        self.oc_result(p, service, &binding_options, &target).await
+                                    } else {
+                                        let r = service.reconcile(&target, &binding_options).await;
+                                        let resolved = matches!(r.outcome, EffectOutcome::Applied);
+                                        self.record_oc_outcome(p, r).await.is_ok() && resolved
+                                    }
                                 } else {
                                     false
                                 };

@@ -83,6 +83,16 @@ impl Service {
         let mut queue = VecDeque::from([root.to_owned()]);
         let mut seen = BTreeSet::from([root.to_owned()]);
         let mut failures = Vec::new();
+        let marker = &root_info["metadata"]["eliot"];
+        let binding = model::text(marker, "binding")?;
+        let generation = model::positive(marker, "generation")?;
+        let turns = match self.transcript_turns(root, binding, generation).await {
+            Ok(turns) => turns,
+            Err(e) => {
+                failures.push(json!({"code":e.code,"source":"message_timeline","session_id":root}));
+                previous["turns"].as_array().cloned().unwrap_or_default()
+            }
+        };
         let mut pages = 0usize;
         let mut enumerated = true;
         while let Some(parent) = queue.pop_front() {
@@ -261,7 +271,7 @@ impl Service {
                 + usize::from(a.contains_key(root))
         });
         Ok(Snapshot {
-            state: json!({"native_root_id":root,"session":compact(&root_info),
+            state: json!({"native_root_id":root,"session":compact(&root_info),"turns":turns,
             "observed_children":retained.into_values().collect::<Vec<_>>(),"pending_requests":pending.into_values().collect::<Vec<_>>(),
             "execution":match active_count {Some(n) if n>0=>"observed_active",Some(_)=>"not_observed_active",None=>"unknown"},
             "active_drain_count":active_count,"native_service_pid":self.pid,"native_service_version":self.version,

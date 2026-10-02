@@ -40,6 +40,7 @@ pub(crate) struct World {
     pub sessions: BTreeMap<String, Value>,
     pub inbox: BTreeMap<String, Value>,
     pub messages: BTreeMap<String, Value>,
+    pub timelines: BTreeMap<String, Vec<Value>>,
     pub forms: BTreeMap<String, Vec<Value>>,
     pub permissions: BTreeMap<String, Vec<Value>>,
     pub active: BTreeMap<String, Value>,
@@ -134,6 +135,16 @@ impl Fixture {
             .filter(|r| r.method == "POST" && r.path == path)
             .count()
     }
+    pub(crate) fn append_message(&self, session: &str, message: Value) {
+        let id = message["id"].as_str().unwrap().to_owned();
+        let mut world = self.world.lock().unwrap();
+        world.messages.insert(id, message.clone());
+        world
+            .timelines
+            .entry(session.to_owned())
+            .or_default()
+            .push(message);
+    }
     pub(crate) fn override_get(&self, path: &str, reply: Reply) {
         self.world
             .lock()
@@ -227,7 +238,9 @@ fn respond(w: &mut World, o: &Options, origin: &str, r: &Request) -> Reply {
                     let input = r.body["id"].as_str().unwrap().to_owned();
                     let item = json!({"id":input,"sessionID":id,"type":"user","time":{"created":1},"delivery":r.body["delivery"],"payload":{"text":r.body["text"],"metadata":r.body["metadata"]}});
                     if w.consume_prompt {
-                        w.messages.insert(input.clone(),json!({"id":input,"type":"user","time":{"created":1},"text":r.body["text"],"metadata":r.body["metadata"]}));
+                        let message = json!({"id":input,"type":"user","time":{"created":1},"text":r.body["text"],"metadata":r.body["metadata"]});
+                        w.messages.insert(input.clone(), message.clone());
+                        w.timelines.entry(id.to_owned()).or_default().push(message);
                     } else {
                         w.inbox.insert(input, item.clone());
                     }
@@ -235,6 +248,29 @@ fn respond(w: &mut World, o: &Options, origin: &str, r: &Request) -> Reply {
                         return Reply::Drop;
                     }
                     return Reply::Json(200, json!({"data":item}));
+                }
+                ("GET", "message") => {
+                    let url =
+                        reqwest::Url::parse(&format!("http://localhost{}", r.target)).unwrap();
+                    let limit = url
+                        .query_pairs()
+                        .find(|(key, _)| key == "limit")
+                        .and_then(|(_, value)| value.parse::<usize>().ok())
+                        .unwrap_or(100)
+                        .min(100);
+                    let start = url
+                        .query_pairs()
+                        .find(|(key, _)| key == "cursor")
+                        .and_then(|(_, value)| value.parse::<usize>().ok())
+                        .unwrap_or(0);
+                    let messages = w.timelines.get(id).cloned().unwrap_or_default();
+                    let end = messages.len().min(start.saturating_add(limit));
+                    let data = messages.get(start..end).unwrap_or(&[]).to_vec();
+                    let next = (end < messages.len()).then(|| end.to_string());
+                    return Reply::Json(
+                        200,
+                        json!({"data":data,"cursor":{"next":next,"previous":null}}),
+                    );
                 }
                 ("GET", "inbox") => {
                     return Reply::Json(
@@ -438,6 +474,95 @@ async fn exact_model_creation_and_input_admission_are_not_turn_completion() {
         json!(f.options.model)
     );
 }
+#[tokio::test]
+async fn transcript_idle_correlates_exact_input_and_exports_a_pinned_turn() {
+    let f = Fixture::new().await;
+    let s = f.service().await;
+    let open = f.open(&s).await;
+    f.world.lock().unwrap().consume_prompt = true;
+    let mut dispatch = f.command("task.dispatch");
+    dispatch.input["task_snapshot"] = json!({"objective":"immutable-fixture"});
+    assert_applied(s.execute(&dispatch, &f.options).await);
+    let root = root_id(&open.binding_id, open.generation);
+    let input = input_id(&dispatch.operation_id);
+    f.append_message(
+        &root,
+        json!({"id":"msg_model_fixture","type":"model-switched","time":{"created":2},"model":{"id":"fixture-model","providerID":"fixture-provider","variant":"explicit-variant"}}),
+    );
+    f.append_message(
+        &root,
+        json!({"id":"msg_assistant_fixture","type":"assistant","time":{"created":3,"completed":4},"content":[{"type":"text","text":"completed fixture result"}]}),
+    );
+    f.append_message(
+        &root,
+        json!({"id":"msg_idle_fixture","type":"idle","time":{"created":5},"outcome":"succeeded"}),
+    );
+    let snapshot = s.snapshot(&root, &Value::Null).await.unwrap();
+    assert_eq!(snapshot.state["turns"][0]["inputId"], input);
+    assert_eq!(snapshot.state["turns"][0]["turnId"], "msg_idle_fixture");
+    assert_eq!(snapshot.state["turns"][0]["terminal"], "completed");
+    assert_eq!(
+        snapshot.state["turns"][0]["identityKind"],
+        "terminal_message"
+    );
+
+    let mut result = f.command("agent.result");
+    result.input = json!({
+        "selector":{
+            "kind":"turn",
+            "session_id":root,
+            "input_id":input,
+            "turn_id":"msg_idle_fixture"
+        },
+        "offset_bytes":0,
+        "length_bytes":65536
+    });
+    let page = s.result_page(&result, &f.options).await.unwrap();
+    assert!(page.eof);
+    let document: Value = serde_json::from_slice(&page.decode().unwrap()).unwrap();
+    assert_eq!(document["native_outcome"], "succeeded");
+    assert_eq!(document["projected_messages"][0]["id"], "msg_model_fixture");
+    assert_eq!(
+        document["projected_messages"][1]["id"],
+        "msg_assistant_fixture"
+    );
+    assert_eq!(document["idle"]["id"], "msg_idle_fixture");
+    let digest = page.source["content_digest"].as_str().unwrap().to_owned();
+    result.input["selector"]["expected_digest"] = json!(digest);
+    assert!(s.result_page(&result, &f.options).await.is_ok());
+    result.input["selector"]["expected_digest"] = json!("sha256:changed");
+    assert_eq!(
+        s.result_page(&result, &f.options).await.unwrap_err().code,
+        "RESULT_SOURCE_DIGEST_CHANGED"
+    );
+}
+
+#[tokio::test]
+async fn intervening_user_message_does_not_inherit_a_later_idle() {
+    let f = Fixture::new().await;
+    let s = f.service().await;
+    let open = f.open(&s).await;
+    f.world.lock().unwrap().consume_prompt = true;
+    let mut dispatch = f.command("task.dispatch");
+    dispatch.input["task_snapshot"] = json!({"objective":"immutable-fixture"});
+    assert_applied(s.execute(&dispatch, &f.options).await);
+    let root = root_id(&open.binding_id, open.generation);
+    f.append_message(
+        &root,
+        json!({"id":"msg_foreign_fixture","type":"user","time":{"created":2},"text":"foreign input","metadata":{}}),
+    );
+    f.append_message(
+        &root,
+        json!({"id":"msg_assistant_foreign","type":"assistant","time":{"created":3},"content":[{"type":"text","text":"not attributable"}]}),
+    );
+    f.append_message(
+        &root,
+        json!({"id":"msg_idle_foreign","type":"idle","time":{"created":4},"outcome":"succeeded"}),
+    );
+    let snapshot = s.snapshot(&root, &Value::Null).await.unwrap();
+    assert!(snapshot.state["turns"].as_array().unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn lost_creation_is_resolved_by_exact_read_without_create_replay() {
     let f = Fixture::new().await;

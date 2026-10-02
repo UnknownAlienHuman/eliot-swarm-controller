@@ -138,6 +138,25 @@ fn matching_run<'a>(state: &'a Value, session: &str, run: &str) -> Option<&'a Va
     }
     observed
 }
+fn matching_input<'a>(state: &'a Value, session: &str, input: &str) -> Option<&'a Value> {
+    let turns = state["turns"].as_array().into_iter().flatten();
+    let child_turns = state["observed_children"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|c| &c["last_turn"]);
+    let mut found = None;
+    for turn in turns.chain(child_turns) {
+        if turn["sessionId"] == session && turn["inputId"] == input {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(turn);
+        }
+    }
+    found
+}
+
 fn run_observed(state: &Value, session: &str, run: &str) -> bool {
     let member = state["native_root_id"] == session
         || state["observed_children"]
@@ -164,18 +183,7 @@ pub(super) fn apply_evidence(producer: &mut Value, state: &Value, observation_id
     let Some(session) = producer["native_session_id"]
         .as_str()
         .filter(|x| !x.is_empty())
-    else {
-        return;
-    };
-    let Some(run) = producer["native_run_id"].as_str().filter(|x| !x.is_empty()) else {
-        return;
-    };
-    let Some(event) = matching_run(state, session, run) else {
-        return;
-    };
-    let Some(terminal) = event["terminal"]
-        .as_str()
-        .filter(|s| matches!(*s, "completed" | "failed" | "cancelled"))
+        .map(str::to_owned)
     else {
         return;
     };
@@ -185,8 +193,56 @@ pub(super) fn apply_evidence(producer: &mut Value, state: &Value, observation_id
     ) {
         return;
     }
+    if producer["native_run_id"]
+        .as_str()
+        .is_none_or(|run| run.is_empty())
+    {
+        let Some(input) = producer["native_input_id"]
+            .as_str()
+            .filter(|input| !input.is_empty())
+            .map(str::to_owned)
+        else {
+            return;
+        };
+        let Some(event) = matching_input(state, &session, &input) else {
+            return;
+        };
+        if event["operationId"] != producer["assignment_id"] {
+            return;
+        }
+        let Some(run) = event["turnId"].as_str().filter(|run| !run.is_empty()) else {
+            return;
+        };
+        producer["native_run_id"] = json!(run);
+        producer["correlation_evidence"] = json!({
+            "observation_id":observation_id,
+            "input_id":input,
+            "operation_id":event["operationId"],
+            "run_id":run,
+            "identity_kind":event["identityKind"],
+            "event":event["event"]
+        });
+    }
+    let Some(run) = producer["native_run_id"].as_str().filter(|x| !x.is_empty()) else {
+        return;
+    };
+    let Some(event) = matching_run(state, &session, run) else {
+        return;
+    };
+    let Some(terminal) = event["terminal"]
+        .as_str()
+        .filter(|s| matches!(*s, "completed" | "failed" | "cancelled"))
+    else {
+        return;
+    };
     producer["disposition"] = json!(terminal);
-    producer["terminal_evidence"] = json!({"observation_id":observation_id,"event":event["event"],"view_cursor":event["viewCursor"]});
+    producer["terminal_evidence"] = json!({
+        "observation_id":observation_id,
+        "event":event["event"],
+        "view_cursor":event["viewCursor"],
+        "identity_kind":event["identityKind"],
+        "native_outcome":event["nativeOutcome"]
+    });
 }
 
 pub(super) fn bind(
