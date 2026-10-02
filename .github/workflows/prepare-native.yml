@@ -1,6 +1,7 @@
 name: Publish prepared OpenCode terminal slice
 on:
-  workflow_dispatch:
+  push:
+    branches: ['feat/opencode-terminal-results']
 permissions:
   contents: write
 jobs:
@@ -15,7 +16,8 @@ jobs:
         run: |
           set -euo pipefail
           BASE=8745e3334ed638ff98d09b00909a7b562e081b06
-          test "$(git rev-parse HEAD^)" = "$BASE"
+          test "$GITHUB_REF_NAME" = "feat/opencode-terminal-results"
+          test "$(git merge-base HEAD "$BASE")" = "$BASE"
           printf '%s  %s\n' d9a3c287a41d034395fd88427bfbdd001621ceff052f3d554a6de3f42f4c0aab .github/import/opencode-terminal-results.patch.gz | sha256sum -c -
           gzip -dc .github/import/opencode-terminal-results.patch.gz > "$RUNNER_TEMP/opencode-terminal-results.patch"
           printf '%s  %s\n' 1c9e1f51079be4f6eb08781a82cc4475d71cf3680105599c7445d7a4b81893b3 "$RUNNER_TEMP/opencode-terminal-results.patch" | sha256sum -c -
