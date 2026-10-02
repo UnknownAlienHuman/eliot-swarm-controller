@@ -8,7 +8,7 @@ use serde_json::Value;
 use std::{
     io::Read,
     net::{IpAddr, SocketAddr},
-    path::Path,
+    path::{Component, Path},
     time::Duration,
 };
 
@@ -48,6 +48,11 @@ struct ServerPaths {
 #[derive(Deserialize)]
 pub(super) struct Data<T> {
     pub data: T,
+}
+
+pub(super) struct RawBody {
+    pub bytes: Vec<u8>,
+    pub media_type: String,
 }
 
 pub(super) fn decode<T: DeserializeOwned>(value: Value) -> Result<T> {
@@ -204,6 +209,108 @@ impl Service {
     }
     pub(super) async fn delete(&self, path: &str) -> Result<Value> {
         self.request(Method::DELETE, path, &[], None).await
+    }
+    /// Read one exact file through OpenCode's location-confined fs.read route.
+    /// Callers must derive `relative` from a native result descriptor; this API
+    /// deliberately does not accept an arbitrary URL or absolute path.
+    pub(super) async fn get_location_file(
+        &self,
+        relative: &Path,
+        directory: &Path,
+        limit: usize,
+    ) -> Result<RawBody> {
+        if limit == 0 || relative.as_os_str().is_empty() {
+            return Err(Error::invalid("invalid native file read boundary"));
+        }
+        let directory = directory.to_str().ok_or_else(|| {
+            Error::new(
+                "NATIVE_LOCATION_MISMATCH",
+                "native directory is not valid Unicode",
+            )
+        })?;
+        let mut url = self.endpoint.clone();
+        {
+            let mut segments = url.path_segments_mut().map_err(|_| {
+                Error::new(
+                    "NATIVE_ENDPOINT",
+                    "native endpoint cannot contain path segments",
+                )
+            })?;
+            segments.clear();
+            segments.push("api").push("fs").push("read");
+            for component in relative.components() {
+                let Component::Normal(segment) = component else {
+                    return Err(Error::new(
+                        "RESULT_TOOL_FILE_OUTSIDE_SCOPE",
+                        "native result file path is not a relative location path",
+                    ));
+                };
+                let segment = segment.to_str().ok_or_else(|| {
+                    Error::new(
+                        "NATIVE_TOOL_FILE_SCHEMA",
+                        "native result path is not valid Unicode",
+                    )
+                })?;
+                segments.push(segment);
+            }
+        }
+        url.query_pairs_mut()
+            .append_pair("location[directory]", directory);
+        if url.origin() != self.endpoint.origin() {
+            return Err(Error::new(
+                "NATIVE_ENDPOINT",
+                "cross-origin native request refused",
+            ));
+        }
+        let mut response = self
+            .client
+            .get(url)
+            .header(header::ACCEPT, header::HeaderValue::from_static("*/*"))
+            .timeout(REQUEST_TIMEOUT)
+            .send()
+            .await
+            .map_err(|_| transport_error(false))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(Error::new(
+                "NATIVE_READ_FAILED",
+                format!("HTTP {}", status.as_u16()),
+            ));
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > limit as u64)
+        {
+            return Err(Error::new(
+                "RESULT_TOOL_FILE_LIMIT",
+                "native result file exceeds the configured boundary",
+            ));
+        }
+        let media_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && value.len() <= 256)
+            .ok_or_else(|| {
+                Error::new(
+                    "NATIVE_TOOL_FILE_SCHEMA",
+                    "native file response has no bounded content type",
+                )
+            })?
+            .to_owned();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| transport_error(false))? {
+            if bytes.len().saturating_add(chunk.len()) > limit {
+                return Err(Error::new(
+                    "RESULT_TOOL_FILE_LIMIT",
+                    "native result file exceeds the configured boundary",
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(RawBody { bytes, media_type })
     }
     async fn request(
         &self,

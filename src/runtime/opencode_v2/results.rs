@@ -1,6 +1,7 @@
 //! Exact, on-demand projected result reads. Timeline adjacency is deliberately
 //! not native run identity and never supplies Task/producer terminal evidence.
 mod diffs;
+mod tool_files;
 
 use super::{
     Options, Service,
@@ -278,14 +279,19 @@ impl Service {
                 "session_id",
                 "message_id",
                 "input_operation_id",
+                "tool_call_id",
+                "content_index",
                 "expected_digest",
             ],
         )?;
         let kind = model::text(selector, "kind")?;
-        if !matches!(kind, "message" | "input_interval" | "turn_diff") {
+        if !matches!(
+            kind,
+            "message" | "input_interval" | "turn_diff" | "tool_file"
+        ) {
             return Err(Error::new(
                 "UNSUPPORTED_RESULT_KIND",
-                "use message, input_interval or turn_diff",
+                "use message, input_interval, turn_diff or tool_file",
             ));
         }
         let session = model::text(selector, "session_id")?;
@@ -308,88 +314,159 @@ impl Service {
             .ok_or_else(|| unavailable("NATIVE_ROOT_MISSING"))?;
         self.verify().await?;
         let scope = self.result_scope(root, session, command, options).await?;
-        let (document, mut source) = match kind {
-            "message" => {
-                if selector.get("input_operation_id").is_some() {
-                    return Err(Error::invalid(
-                        "input_operation_id is only valid for input_interval or turn_diff",
-                    ));
-                }
-                let id = model::text(selector, "message_id")?;
-                valid_id(id, "msg_")?;
-                let message = self.message(session, id).await?;
-                complete_assistant(&message)?;
-                if session == root && message["model"] != json!(options.model) {
-                    return Err(unavailable("RESULT_MODEL_CHANGED"));
-                }
-                if self.message(session, id).await? != message {
-                    return Err(unavailable("RESULT_SOURCE_CHANGED"));
-                }
-                let source = json!({"kind":kind,"native_session_id":session,"message_id":id,
+        let (bytes, mut source, media_type, digest_basis, reader_revision, read_consistency) =
+            match kind {
+                "message" => {
+                    if selector.get("input_operation_id").is_some()
+                        || selector.get("tool_call_id").is_some()
+                        || selector.get("content_index").is_some()
+                    {
+                        return Err(Error::invalid(
+                            "input_operation_id/tool fields are not valid for message",
+                        ));
+                    }
+                    let id = model::text(selector, "message_id")?;
+                    valid_id(id, "msg_")?;
+                    let message = self.message(session, id).await?;
+                    complete_assistant(&message)?;
+                    if session == root && message["model"] != json!(options.model) {
+                        return Err(unavailable("RESULT_MODEL_CHANGED"));
+                    }
+                    if self.message(session, id).await? != message {
+                        return Err(unavailable("RESULT_SOURCE_CHANGED"));
+                    }
+                    let source = json!({"kind":kind,"native_session_id":session,"message_id":id,
                     "model":message["model"],"native_completed_at":message["time"]["completed"],
                     "finish":message["finish"],"read_method":"session.message.get"});
-                (message, source)
-            }
-            "input_interval" | "turn_diff" => {
-                if selector.get("message_id").is_some() {
-                    return Err(Error::invalid("message_id is only valid for message"));
+                    (
+                        model::canonical(&message)?.into_bytes(),
+                        source,
+                        "application/json".to_owned(),
+                        "canonical_projected_json",
+                        "opencode-projected-result-v1",
+                        "repeated_equal_projection_not_atomic_snapshot",
+                    )
                 }
-                let original =
-                    original.ok_or_else(|| Error::invalid("exact input operation is required"))?;
-                if model::text(selector, "input_operation_id")? != original.operation_id
-                    || original.binding_id != command.binding_id
-                    || original.generation != command.generation
-                    || original.native_root_id.as_deref() != Some(session)
-                    || session != root
-                    || !matches!(original.method.as_str(), "task.dispatch" | "agent.send")
-                {
-                    return Err(Error::new(
-                        "FORBIDDEN",
-                        "input operation is outside the selected binding/session",
-                    ));
-                }
-                let interval = self
-                    .input_interval(original, session, kind == "turn_diff")
-                    .await?;
-                let diff = if kind == "turn_diff" {
-                    Some(self.turn_diff(session, original, &interval).await?)
-                } else {
-                    None
-                };
-                if self
-                    .input_interval(original, session, kind == "turn_diff")
-                    .await?
-                    != interval
-                {
-                    return Err(unavailable("RESULT_SOURCE_CHANGED"));
-                }
-                let idle = interval
-                    .last()
-                    .ok_or_else(|| unavailable("RESULT_INTERVAL_NOT_CLOSED"))?;
-                let mut source = json!({"kind":kind,"native_session_id":session,"input_operation_id":original.operation_id,
+                "input_interval" | "turn_diff" => {
+                    if selector.get("message_id").is_some()
+                        || selector.get("tool_call_id").is_some()
+                        || selector.get("content_index").is_some()
+                    {
+                        return Err(Error::invalid(
+                            "message_id/tool fields are not valid for input_interval or turn_diff",
+                        ));
+                    }
+                    let original = original
+                        .ok_or_else(|| Error::invalid("exact input operation is required"))?;
+                    if model::text(selector, "input_operation_id")? != original.operation_id
+                        || original.binding_id != command.binding_id
+                        || original.generation != command.generation
+                        || original.native_root_id.as_deref() != Some(session)
+                        || session != root
+                        || !matches!(original.method.as_str(), "task.dispatch" | "agent.send")
+                    {
+                        return Err(Error::new(
+                            "FORBIDDEN",
+                            "input operation is outside the selected binding/session",
+                        ));
+                    }
+                    let interval = self
+                        .input_interval(original, session, kind == "turn_diff")
+                        .await?;
+                    let diff = if kind == "turn_diff" {
+                        Some(self.turn_diff(session, original, &interval).await?)
+                    } else {
+                        None
+                    };
+                    if self
+                        .input_interval(original, session, kind == "turn_diff")
+                        .await?
+                        != interval
+                    {
+                        return Err(unavailable("RESULT_SOURCE_CHANGED"));
+                    }
+                    let idle = interval
+                        .last()
+                        .ok_or_else(|| unavailable("RESULT_INTERVAL_NOT_CLOSED"))?;
+                    let mut source = json!({"kind":kind,"native_session_id":session,"input_operation_id":original.operation_id,
                     "native_input_id":input_id(&original.operation_id),"idle_message_id":idle["id"],"idle_outcome":idle["outcome"],
                     "message_count":interval.len(),"read_method":"session.message.list","correlation":"projected_order_only"});
-                match diff {
-                    Some(diff) => {
-                        source["read_method"] = json!("session.diff");
-                        source["diff"] = diff.source;
-                        (diff.document, source)
+                    match diff {
+                        Some(diff) => {
+                            source["read_method"] = json!("session.diff");
+                            source["diff"] = diff.source;
+                            (
+                                model::canonical(&diff.document)?.into_bytes(),
+                                source,
+                                "application/json".to_owned(),
+                                "canonical_projected_json",
+                                "opencode-turn-diff-v1",
+                                "repeated_equal_projection_not_atomic_snapshot",
+                            )
+                        }
+                        None => {
+                            let document = json!({"session_id":session,"messages":interval});
+                            (
+                                model::canonical(&document)?.into_bytes(),
+                                source,
+                                "application/json".to_owned(),
+                                "canonical_projected_json",
+                                "opencode-projected-result-v1",
+                                "repeated_equal_projection_not_atomic_snapshot",
+                            )
+                        }
                     }
-                    None => (json!({"session_id":session,"messages":interval}), source),
                 }
-            }
-            _ => {
-                return Err(Error::new(
-                    "UNSUPPORTED_RESULT_KIND",
-                    "use message, input_interval or turn_diff",
-                ));
-            }
-        };
+                "tool_file" => {
+                    if selector.get("input_operation_id").is_some() {
+                        return Err(Error::invalid(
+                            "input_operation_id is not valid for tool_file",
+                        ));
+                    }
+                    let message_id = model::text(selector, "message_id")?;
+                    valid_id(message_id, "msg_")?;
+                    let tool_call_id = model::text(selector, "tool_call_id")?;
+                    let content_index = selector
+                        .get("content_index")
+                        .and_then(Value::as_u64)
+                        .and_then(|index| usize::try_from(index).ok())
+                        .filter(|index| *index <= 4096)
+                        .ok_or_else(|| {
+                            Error::invalid("content_index must be an integer from 0 through 4096")
+                        })?;
+                    let file = self
+                        .tool_file(
+                            tool_files::ToolFileLocator {
+                                root,
+                                session,
+                                message_id,
+                                tool_call_id,
+                                content_index,
+                            },
+                            options,
+                            &scope,
+                        )
+                        .await?;
+                    (
+                        file.bytes,
+                        file.source,
+                        file.media_type,
+                        "raw_tool_file_bytes",
+                        "opencode-tool-file-v1",
+                        "repeated_equal_native_source_not_atomic_snapshot",
+                    )
+                }
+                _ => {
+                    return Err(Error::new(
+                        "UNSUPPORTED_RESULT_KIND",
+                        "use message, input_interval, turn_diff or tool_file",
+                    ));
+                }
+            };
         if self.result_scope(root, session, command, options).await? != scope {
             return Err(unavailable("RESULT_SCOPE_CHANGED"));
         }
         self.verify().await?;
-        let bytes = model::canonical(&document)?.into_bytes();
         let digest = format!("sha256:{}", model::digest(&bytes));
         if expected.is_some_and(|expected| !expected.eq_ignore_ascii_case(&digest)) {
             return Err(unavailable("RESULT_SOURCE_DIGEST_CHANGED"));
@@ -412,14 +489,10 @@ impl Service {
         let end = bytes.len().min(offset.saturating_add(length as usize));
         let page = &bytes[offset..end];
         source["content_digest"] = json!(digest);
-        source["digest_basis"] = json!("canonical_projected_json");
+        source["digest_basis"] = json!(digest_basis);
         source["native_service_version"] = json!(self.version);
-        source["reader_revision"] = json!(if kind == "turn_diff" {
-            "opencode-turn-diff-v1"
-        } else {
-            "opencode-projected-result-v1"
-        });
-        source["read_consistency"] = json!("repeated_equal_projection_not_atomic_snapshot");
+        source["reader_revision"] = json!(reader_revision);
+        source["read_consistency"] = json!(read_consistency);
         source["execution_complete"] = json!(false);
         source["family_complete"] = json!(false);
         source["whole_digest_verified"] = json!(offset == 0 && end == bytes.len());
@@ -429,7 +502,7 @@ impl Service {
             byte_length: page.len() as u64,
             total_bytes: bytes.len() as u64,
             eof: end == bytes.len(),
-            media_type: "application/json".into(),
+            media_type,
             content_base64: STANDARD.encode(page),
             page_sha256: model::digest(page),
         })
