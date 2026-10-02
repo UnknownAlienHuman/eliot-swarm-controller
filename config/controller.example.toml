@@ -63,3 +63,27 @@ enabled = false
 [routes.native_options]
 workspaceRoot = 'C:\Projects\YourRepository'
 controlRoot = 'C:\SwarmState\command-runs'
+
+# Disabled. Routed models through an operator-run OpenCodex service
+# (modules/opencodex/README.md). Execution stays with the native Codex
+# backend (C07): this route only names a routed model id; the OpenCodex
+# binding itself (endpoint, expectedVersion, adminTokenEnv,
+# lifecycleOwner = external) is a SEPARATE module configuration and is
+# NOT part of this route. The operator applies OpenCodex's own client
+# integration (Codex config / OPENAI_BASE_URL); ELIOT never writes Codex
+# configuration. Honest label for the example below: provider=anthropic,
+# adapter=anthropic, authMode=oauth -> billing is the operator's Claude
+# subscription via OpenCodex's stored login (tier not reported by
+# upstream) — this is NOT the native Claude route and NOT a "Max route";
+# the native Max route is modules/claude/ above.
+# NOTE: registering runtime = 'codex' routes is the remainder of the
+# Codex-module wiring work (issue #9); this example documents the shape
+# ahead of that wiring and enabling it changes nothing today.
+[[routes]]
+alias = 'codex-opencodex-manager'
+runtime = 'codex'
+module_artifact_id = 'codex-sdk-18194bf-bridge.1'
+enabled = false
+[routes.native_options]
+model = 'anthropic/REPLACE_WITH_ROUTED_MODEL_ID'
+opencodex_service = 'REPLACE_WITH_OPENCODEX_MODULE_BINDING'
