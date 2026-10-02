@@ -276,7 +276,7 @@ pub(super) fn request_changes(
     id: &str,
     now: i64,
 ) -> Result<Value> {
-    p.require_operator()?; // Decision owner, not the worker or native module.
+    super::gm::require_authority(tx, p)?; // Decision owner (operator or current GM), not the worker or native module.
     let input = ChangeRequest::parse(v)?;
     let doc = document(tx, &input.submission_ref)?;
     if doc["attempt_id"] != input.attempt_id
