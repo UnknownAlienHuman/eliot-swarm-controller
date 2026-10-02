@@ -205,8 +205,6 @@ async fn builtin_identity_cannot_authenticate_over_external_ipc() {
 
 #[tokio::test]
 async fn goal_receipts_survive_host_restart_without_replaying_native_work() {
-async fn bound_child_producers_close_only_from_their_own_logs() {
-    use crate::runtime::opencode_v2::tests::child_events;
     let f = Fixture::new().await;
     let (owner, p) = start(&f).await;
     let (stop, receiver) = watch::channel(false);
@@ -216,7 +214,6 @@ async fn bound_child_producers_close_only_from_their_own_logs() {
         &p,
         "agent.open",
         json!({"lane_id":"goal-restart","route":"fixture"}),
-        json!({"lane_id":"fam","route":"fixture"}),
     )
     .await
     .unwrap();
@@ -435,6 +432,27 @@ async fn goal_pause_cancels_queued_goal_set_on_same_binding() {
         cancelled["result"]["stop_operation_id"],
         pause["operation_id"]
     );
+    stop.send(true).unwrap();
+    worker.await.unwrap();
+    owner.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn bound_child_producers_close_only_from_their_own_logs() {
+    use crate::runtime::opencode_v2::tests::child_events;
+    let f = Fixture::new().await;
+    let (owner, p) = start(&f).await;
+    let (stop, receiver) = watch::channel(false);
+    let worker = tokio::spawn(owner.store.clone().supervise_opencode(receiver));
+    let open = write(
+        &owner.store,
+        &p,
+        "agent.open",
+        json!({"lane_id":"fam","route":"fixture"}),
+    )
+    .await
+    .unwrap();
+    wait_operation(&owner.store, &p, &open, "settled").await;
     let root = f
         .world
         .lock()

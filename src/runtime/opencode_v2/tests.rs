@@ -283,6 +283,7 @@ fn respond(w: &mut World, o: &Options, origin: &str, r: &Request) -> Reply {
                 _ => {}
             }
         }
+    }
     if parts.len() == 5
         && parts[0] == "api"
         && parts[1] == "experimental"
@@ -1103,6 +1104,8 @@ async fn snapshot_exposes_goal_axis_with_digest_only() {
             .to_string()
             .contains("snapshot secret objective")
     );
+}
+
 pub(crate) fn child_events(child: &str, root: &str, runs: &[(&str, Option<&str>)]) -> Vec<Value> {
     let mut events = vec![
         json!({"id":format!("evt_{child}_created"),"type":"session.created","version":1,
