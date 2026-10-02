@@ -1,0 +1,1 @@
+{"description":"Local Antigravity CLI warm-stream bridge; no SDK, no global installation or model proxy","engines":{"node":">=22"},"name":"@eliot/swarm-antigravity-bridge","private":true,"type":"module","version":"0.1.0"}
