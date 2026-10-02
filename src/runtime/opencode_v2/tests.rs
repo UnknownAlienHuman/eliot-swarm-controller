@@ -7,7 +7,7 @@ use crate::{
 };
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
@@ -32,7 +32,7 @@ pub(crate) enum Reply {
     Empty(u16),
     Redirect(String),
     Drop,
-    Sse(&'static str, bool),
+    Sse(String, bool),
 }
 #[derive(Default)]
 pub(crate) struct World {
@@ -42,6 +42,7 @@ pub(crate) struct World {
     pub messages: BTreeMap<String, Value>,
     pub forms: BTreeMap<String, Vec<Value>>,
     pub permissions: BTreeMap<String, Vec<Value>>,
+    pub logs: BTreeMap<String, Vec<Value>>,
     pub active: BTreeMap<String, Value>,
     pub overrides: BTreeMap<(String, String), Reply>,
     pub entries: BTreeMap<String, BTreeMap<String, Value>>,
@@ -207,7 +208,7 @@ fn respond(w: &mut World, o: &Options, origin: &str, r: &Request) -> Reply {
         }
         ("GET", "/api/event") => {
             w.event_connections += 1;
-            return Reply::Sse("data: {\"fixture\":true}\n\n", true);
+            return Reply::Sse("data: {\"fixture\":true}\n\n".to_owned(), true);
         }
         ("GET", "/api/session/active") => return Reply::Json(200, json!({"data":w.active})),
         ("POST", "/api/session") => {
@@ -282,6 +283,35 @@ fn respond(w: &mut World, o: &Options, origin: &str, r: &Request) -> Reply {
                 _ => {}
             }
         }
+    if parts.len() == 5
+        && parts[0] == "api"
+        && parts[1] == "experimental"
+        && parts[2] == "session"
+        && parts[4] == "log"
+        && r.method == "GET"
+    {
+        let Some(events) = w.logs.get(parts[3]) else {
+            return Reply::Json(404, json!({"missing":true}));
+        };
+        let url = reqwest::Url::parse(&format!("http://localhost{}", r.target)).unwrap();
+        let after = url
+            .query_pairs()
+            .find(|(k, _)| k == "after")
+            .and_then(|(_, v)| v.parse::<u64>().ok());
+        let mut body = String::new();
+        let mut max = 0u64;
+        for e in events {
+            let seq = e["durable"]["seq"].as_u64().unwrap_or(0);
+            max = max.max(seq);
+            if after.is_none_or(|a| seq > a) {
+                body.push_str(&format!("data: {e}\n\n"));
+            }
+        }
+        body.push_str(&format!(
+            "data: {}\n\n",
+            json!({"type":"log.synced","aggregateID":parts[3],"seq":max})
+        ));
+        return Reply::Sse(body, false);
     }
     if parts.len() >= 3 && parts[0] == "api" && parts[1] == "session" {
         let id = parts[2];
@@ -415,7 +445,7 @@ async fn write_reply(stream: &mut TcpStream, reply: Reply) {
         Reply::Sse(body, hold) => (
             200,
             "Content-Type: text/event-stream\r\n".to_owned(),
-            body.to_owned(),
+            body,
             hold,
         ),
     };
@@ -635,11 +665,17 @@ async fn active_child_and_stale_retained_child_prevent_false_family_idle() {
         w.active
             .insert("ses_child".into(), json!({"type":"running"}));
     }
-    let first = s.snapshot(&root, &Value::Null).await.unwrap();
+    let first = s
+        .snapshot(&root, &Value::Null, &Default::default())
+        .await
+        .unwrap();
     assert_eq!(first.state["execution"], "observed_active");
     assert_eq!(first.state["family_completeness"], "partial");
     f.world.lock().unwrap().sessions.remove("ses_child");
-    let second = s.snapshot(&root, &first.state).await.unwrap();
+    let second = s
+        .snapshot(&root, &first.state, &Default::default())
+        .await
+        .unwrap();
     assert_eq!(second.state["execution"], "observed_active");
     assert_eq!(second.state["observed_children"][0]["observed_now"], false);
 }
@@ -661,6 +697,7 @@ async fn malformed_inventory_and_unknown_active_schema_are_not_empty_healthy() {
         .snapshot(
             &root,
             &json!({"observed_children":[{"sessionId":"ses_old"}]}),
+            &Default::default(),
         )
         .await
         .unwrap();
@@ -681,7 +718,10 @@ async fn pending_questions_use_the_whole_atlas_donor_before_persistence() {
         .unwrap()
         .forms
         .insert(root.clone(), vec![request.clone()]);
-    let result = s.snapshot(&root, &Value::Null).await.unwrap();
+    let result = s
+        .snapshot(&root, &Value::Null, &Default::default())
+        .await
+        .unwrap();
     let p = &result.state["pending_requests"][0];
     assert_eq!(p["request_id"], "frm_fixture");
     assert_eq!(
@@ -732,7 +772,10 @@ async fn sse_failure_records_a_gap_without_native_mutation() {
     let s = f.service().await;
     f.override_get(
         "/api/event",
-        Reply::Sse("event: effect/httpapi/stream/failure\ndata: []\n\n", false),
+        Reply::Sse(
+            "event: effect/httpapi/stream/failure\ndata: []\n\n".to_owned(),
+            false,
+        ),
     );
     let (stop, receiver) = tokio::sync::watch::channel(false);
     let mut reader = s.events(receiver);
@@ -1060,4 +1103,153 @@ async fn snapshot_exposes_goal_axis_with_digest_only() {
             .to_string()
             .contains("snapshot secret objective")
     );
+pub(crate) fn child_events(child: &str, root: &str, runs: &[(&str, Option<&str>)]) -> Vec<Value> {
+    let mut events = vec![
+        json!({"id":format!("evt_{child}_created"),"type":"session.created","version":1,
+        "durable":{"aggregateID":child,"seq":1},
+        "data":{"parentID":root}}),
+    ];
+    let mut seq = 1u64;
+    for (run, terminal) in runs {
+        seq += 1;
+        events.push(
+            json!({"id":run,"type":"session.execution.started","version":1,
+            "durable":{"aggregateID":child,"seq":seq},"data":{}}),
+        );
+        if let Some(outcome) = terminal {
+            seq += 1;
+            let (kind, data) = match *outcome {
+                "completed" => ("session.execution.succeeded", json!({})),
+                "failed" => ("session.execution.failed", json!({"error":{}})),
+                _ => ("session.execution.interrupted", json!({"reason":"user"})),
+            };
+            events.push(
+                json!({"id":format!("evt_{run}_terminal"),"type":kind,"version":1,
+                "durable":{"aggregateID":child,"seq":seq},"data":data}),
+            );
+        }
+    }
+    events
+}
+
+#[test]
+fn session_scan_records_periods_and_refuses_gap_terminals() {
+    let mut scan = SessionScan::restore("ses_kid", "ses_root", None).unwrap();
+    for e in child_events("ses_kid", "ses_root", &[("run_1", Some("failed"))]) {
+        scan.consume(&e).unwrap();
+    }
+    assert!(scan.is_terminal());
+    assert_eq!(scan.disposition(), "failed");
+    let turn = scan.last_turn().unwrap();
+    assert_eq!(turn["sessionId"], "ses_kid");
+    assert_eq!(turn["turnId"], "run_1");
+    assert_eq!(turn["terminal"], "failed");
+    // A second start while one is open is a restart gap, never a terminal.
+    let mut scan = SessionScan::restore("ses_kid", "ses_root", None).unwrap();
+    for e in child_events(
+        "ses_kid",
+        "ses_root",
+        &[("run_1", None), ("run_2", Some("completed"))],
+    ) {
+        scan.consume(&e).unwrap();
+    }
+    assert_eq!(scan.disposition(), "unknown");
+    assert!(scan.last_turn().is_none());
+    assert!(scan.turns().is_empty());
+    // The checkpoint round-trips through JSON with its uncertainty intact.
+    let saved = serde_json::to_value(&scan).unwrap();
+    let restored = SessionScan::restore("ses_kid", "ses_root", Some(&saved)).unwrap();
+    assert_eq!(restored.disposition(), "unknown");
+    // A scan never migrates across sessions or parents.
+    assert!(SessionScan::restore("ses_other", "ses_root", Some(&saved)).is_err());
+    assert!(SessionScan::restore("ses_kid", "ses_other", Some(&saved)).is_err());
+}
+
+#[tokio::test]
+async fn child_logs_bind_terminal_and_coverage_without_completeness() {
+    let f = Fixture::new().await;
+    let s = f.service().await;
+    let c = f.open(&s).await;
+    let root = root_id(&c.binding_id, c.generation);
+    {
+        let mut w = f.world.lock().unwrap();
+        for id in ["ses_a", "ses_b", "ses_c"] {
+            w.sessions.insert(
+                id.into(),
+                json!({"id":id,"parentID":root,"projectID":"prj_fixture","time":{"created":1,"updated":2}}),
+            );
+        }
+        w.active.insert("ses_b".into(), json!({"type":"running"}));
+        w.logs.insert(
+            "ses_a".into(),
+            child_events("ses_a", &root, &[("run_a", Some("completed"))]),
+        );
+        w.logs.insert(
+            "ses_b".into(),
+            child_events("ses_b", &root, &[("run_b", None)]),
+        );
+    }
+    let bound: BTreeSet<String> = ["ses_a".to_owned(), "ses_b".to_owned()]
+        .into_iter()
+        .collect();
+    let first = s.snapshot(&root, &Value::Null, &bound).await.unwrap();
+    let st = &first.state;
+    // Evidence grows per axis; completeness stays partial by design.
+    assert_eq!(st["family_completeness"], "partial");
+    assert_eq!(st["family_coverage"]["members_total"], 3);
+    assert_eq!(st["family_coverage"]["members_observed_now"], 3);
+    assert_eq!(st["family_coverage"]["members_active_verified"], 1);
+    assert_eq!(st["family_coverage"]["members_with_execution_evidence"], 2);
+    assert_eq!(st["family_coverage"]["members_with_terminal_evidence"], 1);
+    let turns = st["turns"].as_array().unwrap();
+    assert!(turns.iter().any(|t| t["sessionId"] == "ses_a"
+        && t["turnId"] == "run_a"
+        && t["terminal"] == "completed"));
+    assert!(
+        turns.iter().any(|t| t["sessionId"] == "ses_b"
+            && t["turnId"] == "run_b"
+            && t["terminal"].is_null())
+    );
+    let children = st["observed_children"].as_array().unwrap();
+    let child_a = children.iter().find(|c| c["sessionId"] == "ses_a").unwrap();
+    assert_eq!(child_a["last_turn"]["terminal"], "completed");
+    assert_eq!(child_a["execution_disposition"], "completed");
+    // The untracked child is never log-read: it stays without evidence and
+    // without a read failure, and the partial snapshot still succeeds.
+    let child_c = children.iter().find(|c| c["sessionId"] == "ses_c").unwrap();
+    assert!(child_c["last_turn"].is_null());
+    let failures = st["failures"].as_array().unwrap();
+    assert!(
+        failures
+            .iter()
+            .all(|x| !(x["session_id"] == "ses_c" && x["source"] == "child_execution_log")),
+        "untracked children are never log-read"
+    );
+    // Second snapshot: B's log gains a cancellation consumed through the saved
+    // anchor; A's recorded terminal persists although A is no longer tracked.
+    {
+        let mut w = f.world.lock().unwrap();
+        w.logs.get_mut("ses_b").unwrap().push(
+            json!({"id":"evt_run_b_terminal","type":"session.execution.interrupted","version":1,
+            "durable":{"aggregateID":"ses_b","seq":3},"data":{"reason":"user"}}),
+        );
+        w.active.remove("ses_b");
+    }
+    let second = s
+        .snapshot(&root, &first.state, &BTreeSet::new())
+        .await
+        .unwrap();
+    let st = &second.state;
+    assert_eq!(st["family_completeness"], "partial");
+    assert_eq!(st["family_coverage"]["members_with_terminal_evidence"], 2);
+    let children = st["observed_children"].as_array().unwrap();
+    assert_eq!(
+        children.iter().find(|c| c["sessionId"] == "ses_a").unwrap()["last_turn"]["terminal"],
+        "completed"
+    );
+    assert_eq!(
+        children.iter().find(|c| c["sessionId"] == "ses_b").unwrap()["last_turn"]["terminal"],
+        "cancelled"
+    );
+    assert_eq!(st["execution"], "not_observed_active");
 }

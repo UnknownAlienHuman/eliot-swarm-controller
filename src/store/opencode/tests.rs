@@ -205,6 +205,8 @@ async fn builtin_identity_cannot_authenticate_over_external_ipc() {
 
 #[tokio::test]
 async fn goal_receipts_survive_host_restart_without_replaying_native_work() {
+async fn bound_child_producers_close_only_from_their_own_logs() {
+    use crate::runtime::opencode_v2::tests::child_events;
     let f = Fixture::new().await;
     let (owner, p) = start(&f).await;
     let (stop, receiver) = watch::channel(false);
@@ -214,6 +216,7 @@ async fn goal_receipts_survive_host_restart_without_replaying_native_work() {
         &p,
         "agent.open",
         json!({"lane_id":"goal-restart","route":"fixture"}),
+        json!({"lane_id":"fam","route":"fixture"}),
     )
     .await
     .unwrap();
@@ -432,6 +435,150 @@ async fn goal_pause_cancels_queued_goal_set_on_same_binding() {
         cancelled["result"]["stop_operation_id"],
         pause["operation_id"]
     );
+    let root = f
+        .world
+        .lock()
+        .unwrap()
+        .sessions
+        .keys()
+        .next()
+        .unwrap()
+        .clone();
+    {
+        let mut w = f.world.lock().unwrap();
+        for id in ["ses_ca", "ses_cb"] {
+            w.sessions.insert(
+                id.into(),
+                json!({"id":id,"parentID":root,"projectID":"prj_fixture","time":{"created":1,"updated":2}}),
+            );
+            w.active.insert(id.into(), json!({"type":"running"}));
+        }
+        w.logs.insert(
+            "ses_ca".into(),
+            child_events("ses_ca", &root, &[("run_ca", Some("completed"))]),
+        );
+        w.logs.insert(
+            "ses_cb".into(),
+            child_events("ses_cb", &root, &[("run_cb", None)]),
+        );
+    }
+    let task=write(&owner.store,&p,"task.create",json!({"project_id":"fixture","spec":serde_json::from_str::<Value>(include_str!("../../../config/task.example.json")).unwrap()})).await.unwrap();
+    let attempt=write(&owner.store,&p,"task.claim",json!({"task_id":task["task_id"],"expected_revision":1,"start_owner":"controller","binding_id":open["binding_id"],"binding_generation":1})).await.unwrap();
+    // Both children are natively active, so the family snapshot reads their
+    // logs; wait until the recorded observation carries both runs.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let observation_id = loop {
+        let state = read(
+            &owner.store,
+            &p,
+            "agent.state",
+            json!({"binding_id":open["binding_id"],"generation":1}),
+        )
+        .await;
+        let turns = state["observation"]["native"]["turns"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if turns
+            .iter()
+            .any(|t| t["turnId"] == "run_ca" && t["terminal"] == "completed")
+            && turns.iter().any(|t| t["turnId"] == "run_cb")
+        {
+            assert_eq!(
+                state["observation"]["native"]["family_coverage"]["members_with_terminal_evidence"],
+                1
+            );
+            break state["observation"]["native_observation_id"]
+                .as_i64()
+                .unwrap();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "child turns never observed: {state}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let bind = |session: &str, run: &str, assignment: &str| {
+        json!({"attempt_id":attempt["attempt_id"],"assignment_id":assignment,
+        "native_session_id":session,"native_run_id":run,"observation_id":observation_id})
+    };
+    let bound_a = write(
+        &owner.store,
+        &p,
+        "attempt.bind_producer",
+        bind("ses_ca", "run_ca", "w-ca"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(bound_a["producer"]["disposition"], "completed");
+    let bound_b = write(
+        &owner.store,
+        &p,
+        "attempt.bind_producer",
+        bind("ses_cb", "run_cb", "w-cb"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(bound_b["producer"]["disposition"], "admitted");
+    let blocked = write(
+        &owner.store,
+        &p,
+        "attempt.release",
+        json!({"attempt_id":attempt["attempt_id"],"outcome":"completed","assignment_closed":true,"reason":"child B still running"}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(blocked.code, "NATIVE_WORK_UNRESOLVED");
+    // B finishes natively and leaves the active map. Only the bound-producer
+    // axis keeps B tracked, so its own log can close exactly its producer.
+    {
+        let mut w = f.world.lock().unwrap();
+        w.active.remove("ses_cb");
+        w.logs.get_mut("ses_cb").unwrap().push(
+            json!({"id":"evt_run_cb_terminal","type":"session.execution.interrupted","version":1,
+            "durable":{"aggregateID":"ses_cb","seq":3},"data":{"reason":"user"}}),
+        );
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let current = read(
+            &owner.store,
+            &p,
+            "attempt.get",
+            json!({"attempt_id":attempt["attempt_id"]}),
+        )
+        .await;
+        let producers = current["producers"].as_array().unwrap();
+        if producers.iter().all(|x| {
+            matches!(
+                x["disposition"].as_str(),
+                Some("completed" | "failed" | "cancelled")
+            )
+        }) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "child B never closed: {current}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    write(
+        &owner.store,
+        &p,
+        "attempt.release",
+        json!({"attempt_id":attempt["attempt_id"],"outcome":"completed","assignment_closed":true,"reason":"both children terminal"}),
+    )
+    .await
+    .unwrap();
+    let current = read(
+        &owner.store,
+        &p,
+        "attempt.get",
+        json!({"attempt_id":attempt["attempt_id"]}),
+    )
+    .await;
+    assert!(current["released_at_ms"].is_number());
     stop.send(true).unwrap();
     worker.await.unwrap();
     owner.close().await.unwrap();
