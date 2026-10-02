@@ -59,6 +59,10 @@ New workers prepare `terminal.json` after publishing verified artifacts and befo
 
 Missing launch/worker identity, denied OS inspection, damaged control/artifact data and still-live orphans remain explicit recovery boundaries. Timestamp age and a free lock alone do not authorize resource release. Do not delete records or invent a completion to clear these cases. Existing binary deployments are kept while their workers run.
 
+## Pre-identity launches
+
+At spawn the host records its own launch receipt for the worker process (platform-pinned process instance: pid plus creation time/start ticks and boot identity), persisted in the CheckRun spec before it is relied on. If the worker dies before publishing `worker.json`, there is no admitted worker to recover and nothing to reconcile against. Only with that receipt, and only after the spawned process and its prospective group (the group the worker would have led) are proven departed, the launch is fixed terminal as **incomplete** with unknown exit/coverage and gap `worker_lost_before_identity`. Before identity publication the worker spawns nothing and the command never runs, so no tool output is being guessed and no command is replayed. Without a launch receipt — workers spawned by an older host — or while departure is unproven, the check stays held and only that target resource is retained. Nothing is inferred from the absence of a process, a file or a lock alone.
+
 ## Explicit scope and references
 
 Initial capture supports self-contained UTF-8-named regular Git files. Symlinks, gitlinks/submodules, LFS pointers, case collisions and unsafe Windows paths are rejected, not omitted. External build inputs/configuration belong in the selected profile/environment. The example clears rustc wrappers for the check only, not global Cargo configuration. A small runtime environment and explicitly selected names are inherited; secrets must not be placed in literal persisted profile values.

@@ -10,7 +10,7 @@ The Muse SDK bridge opens an explicitly selected native executable, delivers Tas
 
 **CheckRunner executes configured commands on captured Git sources. Active cancellation and recovery of a recorded departed check worker are now implemented.** Cancellation does not stop the host or native agents. Recovery uses the worker lock and OS group identity; it does not infer success or replay a command.
 
-**Still pending:** live Muse resume qualification, missing-identity/native-outcome recovery gaps, complete native family reconstruction, automatic handoff, unresolved pre-identity check launches, reverse-dependency scope/cache reuse, OpenCode cross-restart execution continuation, other native adapters, MCP and automatic module/service installation. Live Muse/Max inference and Windows native launch remain unqualified. Do not mark all C01–C03 complete.
+**Still pending:** live Muse resume qualification, native-outcome recovery for unrecorded effects, complete native family reconstruction, automatic handoff, reverse-dependency scope/cache reuse, OpenCode cross-restart execution continuation, other native adapters and automatic module/service installation. Live Muse/Max inference and Windows native launch remain unqualified. Do not mark all C01-C03 complete.
 
 ## Build and run
 
@@ -142,7 +142,7 @@ Only this check's tool processes are targeted; the reporting worker, host, other
 
 After a worker crash, recovery acquires its released lock, rechecks receipts and verifies exact OS group disposition. Live descendants or denied/unknown inspection keep ownership. A prepared terminal receipt is validated and restored with the same artifacts. Without it, retained output becomes **incomplete**, with unknown exit/coverage, never a guessed pass. Recovery neither replays the command nor kills orphaned processes.
 
-Windows uses a uniquely named Global Job and query-only recovery; cancellation validates membership through pinned process handles. Linux uses boot/birth/group identities and pidfds, including whole-process termination when the main thread exits first. These are trusted execution boundaries, not sandboxes against deliberate process-group escape. Missing pre-identity launch evidence, legacy unnamed Windows Jobs and damaged records remain explicit gaps. Platform details and limits are in the CheckRunner guide.
+Windows uses a uniquely named Global Job and query-only recovery; cancellation validates membership through pinned process handles. Linux uses boot/birth/group identities and pidfds, including whole-process termination when the main thread exits first. These are trusted execution boundaries, not sandboxes against deliberate process-group escape. The host now records a launch receipt at spawn: a worker that dies before publishing its identity is fixed **incomplete** (unknown exit/coverage) once the spawned process and its prospective group are proven departed — never a guessed pass and never a replay. Launches by an older host have no receipt and remain held, as do legacy unnamed Windows Jobs and damaged records. Platform details and limits are in the CheckRunner guide.
 
 ## Task submission and anchored feedback
 
