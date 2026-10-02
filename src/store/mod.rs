@@ -169,6 +169,28 @@ impl Store {
         if method == "artifact.read" {
             return self.read_artifact(principal, params).await;
         }
+        if method == "doctor.inspect" {
+            // Read-only diagnostics over already recorded facts. The database
+            // side runs on the DB thread like every read; the filesystem side
+            // is metadata-only and is attached here, where the data directory
+            // is known. Doctor performs no mutation or repair.
+            model::fields(&params, &[])?;
+            let config = self.config.clone();
+            let mut inspection = self
+                .run(move |db| {
+                    let p = current_principal(db, principal)?;
+                    if p.role == Role::Module {
+                        return Err(Error::new(
+                            "FORBIDDEN",
+                            "module credentials serve only their native binding",
+                        ));
+                    }
+                    crate::doctor::inspect(db, &config)
+                })
+                .await?;
+            crate::doctor::attach_filesystem(&mut inspection, &self.data_dir);
+            return Ok(inspection.report);
+        }
 
         if method == "module.next" {
             model::fields(&params, &[])?;

@@ -55,6 +55,8 @@ enum Command {
         command: CheckCommand,
     },
     Status,
+    /// Read controller diagnostics from recorded facts; performs no repair.
+    Doctor,
     /// Call a supported application method; JSON params are read from a file.
     Call {
         method: String,
@@ -333,6 +335,7 @@ async fn run(cli: Cli) -> Result<()> {
             ),
         },
         Command::Status => ("host.status".to_string(), json!({})),
+        Command::Doctor => ("doctor.inspect".to_string(), json!({})),
         Command::Call { method, file } => (
             method,
             if let Some(p) = file {
@@ -522,6 +525,7 @@ async fn run(cli: Cli) -> Result<()> {
         "check.get"
             | "check.profiles"
             | "host.status"
+            | "doctor.inspect"
             | "artifact.get"
             | "artifact.read"
             | "artifact.parts"

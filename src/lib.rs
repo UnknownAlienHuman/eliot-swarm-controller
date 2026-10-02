@@ -3,6 +3,7 @@ pub mod acceptance;
 pub mod artifacts;
 pub mod checks;
 pub mod config;
+pub mod doctor;
 pub mod error;
 pub mod export;
 pub mod host;
