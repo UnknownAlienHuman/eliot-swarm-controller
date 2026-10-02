@@ -1,7 +1,7 @@
 name: Rust
 on:
   push:
-    branches: [main]
+    branches: [main, feat/opencode-terminal-results]
     paths: ['src/**', 'migrations/**', 'modules/**', 'vendor/**', 'config/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.github/workflows/rust.yml']
   workflow_dispatch:
 permissions:
