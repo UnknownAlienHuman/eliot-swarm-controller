@@ -1,32 +1,36 @@
-name: Prepare native integration inputs
+name: Publish verified OpenCode terminal-result documentation
 on:
-  workflow_dispatch:
+  push:
+    branches: ['feat/opencode-terminal-results']
 permissions:
-  contents: read
+  contents: write
 jobs:
-  sources:
+  publish-docs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-      - name: Collect exact source, toolchain and locked dependencies
+        with:
+          fetch-depth: 0
+      - name: Verify and apply exact documentation patch
         shell: bash
         run: |
           set -euo pipefail
-          rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy --no-self-update
-          mkdir -p .local/inputs/dependency-inputs
-          git archive --format=tar HEAD > .local/inputs/source.tar
-          printf '%s\n' "$GITHUB_SHA" > .local/inputs/source-commit.txt
-          TOOLCHAIN="$(dirname "$(dirname "$(rustup which rustc)")")"
-          tar -C "$TOOLCHAIN" -czf .local/inputs/toolchain.tar.gz bin lib
-          cp Cargo.toml Cargo.lock .local/inputs/dependency-inputs/
-          cargo vendor --locked --versioned-dirs .local/vendor > .local/inputs/dependency-inputs/vendor-config.toml
-          tar -C .local -czf .local/inputs/vendor.tar.gz vendor
-          (cd .local/inputs && sha256sum source.tar toolchain.tar.gz vendor.tar.gz dependency-inputs/Cargo.toml dependency-inputs/Cargo.lock > SHA256SUMS)
-          git diff --exit-code
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: native-development-inputs
-          path: .local/inputs/
-          compression-level: 0
-          retention-days: 3
-          if-no-files-found: error
+          test "$GITHUB_REF_NAME" = "feat/opencode-terminal-results"
+          cat .github/import/opencode-docs.patch.gz.b64.* | base64 --decode > "$RUNNER_TEMP/opencode-docs.patch.gz"
+          printf '%s  %s\n' 1d3568b1954cd53ff6a7c62bd3fdc02aec3febe84ad5c1e8e8710ec75cb4b105 "$RUNNER_TEMP/opencode-docs.patch.gz" | sha256sum -c -
+          gzip -dc "$RUNNER_TEMP/opencode-docs.patch.gz" > "$RUNNER_TEMP/opencode-docs.patch"
+          printf '%s  %s\n' ae876c5799d1066a0e1212b90c5a7af6552d94645dc28146f0cf7609280a0dae "$RUNNER_TEMP/opencode-docs.patch" | sha256sum -c -
+          git apply --check "$RUNNER_TEMP/opencode-docs.patch"
+          git apply "$RUNNER_TEMP/opencode-docs.patch"
+          test "$(git hash-object README.md)" = d6f0c2f7d79e2f6fe1bac8911ab4a241c974c835
+          test "$(git hash-object modules/opencode/README.md)" = 8c171d6088fa18f6d2f3e0a0349907ce091ce2c4
+          git diff --check
+      - name: Publish documentation commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'Iurii Lisenkov'
+          git config user.email '71514792+UnknownAlienHuman@users.noreply.github.com'
+          git add README.md modules/opencode/README.md
+          git commit -m 'docs: describe exact OpenCode terminal results' -m 'Document the exact input-to-idle selector, digest-pinned immutable result paging, bounded transcript contract, fail-closed ambiguity rules, and remaining live qualification gaps without claiming model or subscription validation.'
+          git push origin "HEAD:${GITHUB_REF_NAME}"
