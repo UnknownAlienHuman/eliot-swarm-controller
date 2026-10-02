@@ -49,6 +49,14 @@ jobs:
           cd modules/muse
           npm ci --ignore-scripts --no-audit --no-fund
           node --input-type=module -e 'import { spawnMspConnection, Connection } from "@muse-code/sdk"; if (typeof spawnMspConnection !== "function" || typeof Connection !== "function") throw new Error("SDK export mismatch");'
+      - name: Claude bridge syntax, pinned SDK import and fixture self-test
+        shell: bash
+        run: |
+          node --version
+          for file in modules/claude/*.mjs; do node --check "$file"; done
+          cd modules/claude
+          npm ci --ignore-scripts --no-audit --no-fund
+          node selftest.mjs
       - name: Build
         run: cargo build --locked --release --bin swarm
       - name: Record build inputs
@@ -77,6 +85,11 @@ jobs:
             modules/muse/*.mjs
             modules/muse/*.json
             modules/muse/README.md
+            modules/claude/*.mjs
+            modules/claude/*.json
+            modules/claude/README.md
+            modules/claude/UPDATE.md
+            modules/claude/fixtures/
             modules/opencode/README.md
             vendor/atlas/
             build-info/
