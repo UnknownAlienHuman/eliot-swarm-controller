@@ -14,16 +14,15 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           fetch-depth: 0
-      - name: Verify content-addressed payload and materialize source
+      - name: Verify and materialize source
         shell: bash
         env:
-          EXPECTED_PARENT: 69413b1c2c1c3ee5ca97fd322379898813c5cbdb
+          EXPECTED_PARENT: 7197faf219ce72dec0859dcbc035a61d5b25a784
           EXPECTED_PAYLOAD_SHA256: 169ca1b006cf7f03a3e1e7ec7370972ad49c3930d1218e87df87fbd8e129e7a3
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD^)" = "$EXPECTED_PARENT"
           git rev-parse HEAD > /tmp/staging-sha
-
           test "$(git hash-object .github/import-opencode-prerequisite/part-000)" = c858003495d07d36e51ffdfd2488346433f9954f
           test "$(git hash-object .github/import-opencode-prerequisite/part-001)" = f4e39186b05ca0ce21d1016e3e1625e19dede9f8
           test "$(git hash-object .github/import-opencode-prerequisite/part-002)" = 644e5c0af5f5176a31a8002dd2dd46bcfb3bc3d6
@@ -33,59 +32,31 @@ jobs:
           test "$(git hash-object .github/import-opencode-prerequisite/part-006)" = baa02045d5f08113971b4c0b202bc0c7d6799d3e
           cat .github/import-opencode-prerequisite/part-* > /tmp/opencode-prerequisite.tar.gz
           printf '%s  %s\n' "$EXPECTED_PAYLOAD_SHA256" /tmp/opencode-prerequisite.tar.gz | sha256sum -c -
-
-          python - <<'PY'
-          import hashlib
-          import shutil
-          import tarfile
-          from pathlib import Path, PurePosixPath
-
-          expected = {
-              'README.md': '1ecb51fab266bad565c2e4b2300d8e8cb3a50ba881c1b9116343b87e540d8aa0',
-              'modules/opencode/README.md': 'eac1cf2949dd7b2c845759ec6f21939c70dec0f71c19f2176018249ac0a9fb6b',
-              'modules/opencode/send-after-configuration.example.json': '23d2aa3322d047f62a0354557203148b41c41f97b5e05cbfa1aac1232cb242ba',
-              'src/model.rs': '7b6a3cd10cd9dfd299cb49d764c399864b4dc9cebf249568ead2a3e77503c7a5',
-              'src/runtime/opencode_v2/configuration.rs': '1dbfb449af414461440758f31981e524a73c220e0796f4efa90a5b2d9c39b745',
-              'src/store/mod.rs': '1bb1737abc47c88f02ec5bf006582dd9cd4efd6a41203eeda34f1c20157bff87',
-              'src/store/operations.rs': 'ed05cda2343bd1b296a48dffcad3b081c261a24b284652db65b64cf594fb6bfc',
-              'src/store/prerequisites.rs': '8064e197e6c4a9bf2fcba05404b0a4e23048cfe73c7c63f9d4b5f5e25039c275',
-              'src/store/runtime.rs': '52545ce8f20c7e139dc83ffe1c7235a3a70064266e7c3d9bdb5c1acd9f171ad1',
-          }
-          archive = Path('/tmp/opencode-prerequisite.tar.gz')
-          with tarfile.open(archive, 'r:gz') as source:
-              members = source.getmembers()
-              actual = []
-              for member in members:
-                  path = PurePosixPath(member.name)
-                  assert member.isfile(), member.name
-                  assert not path.is_absolute() and '..' not in path.parts, member.name
-                  actual.append(member.name)
-              assert sorted(actual) == sorted(expected), (actual, sorted(expected))
-              for member in members:
-                  stream = source.extractfile(member)
-                  assert stream is not None
-                  data = stream.read()
-                  assert hashlib.sha256(data).hexdigest() == expected[member.name], member.name
-                  target = Path(member.name)
-                  target.parent.mkdir(parents=True, exist_ok=True)
-                  target.write_bytes(data)
-          PY
-          python - <<'PY'
-          import hashlib
-          from pathlib import Path
-
-          path = Path('src/store/prerequisites.rs')
-          before = '''    match desired_digest {
-        Some(expected) if details[\"desired_digest\"] == expected => {}
-'''
-          after = '''    match desired_digest.as_deref() {
-        Some(expected) if details[\"desired_digest\"].as_str() == Some(expected) => {}
-'''
-          text = path.read_text()
-          assert text.count(before) == 1
-          path.write_text(text.replace(before, after))
-          assert hashlib.sha256(path.read_bytes()).hexdigest() == 'ea0fb748a7f6f31f0d83152f800e58f7f7aedf61279ac03a767f3202baec4759'
-          PY
+          printf '%s\n' \
+            README.md \
+            modules/opencode/README.md \
+            modules/opencode/send-after-configuration.example.json \
+            src/model.rs \
+            src/runtime/opencode_v2/configuration.rs \
+            src/store/mod.rs \
+            src/store/operations.rs \
+            src/store/prerequisites.rs \
+            src/store/runtime.rs | sort > /tmp/expected-product-paths
+          tar -tzf /tmp/opencode-prerequisite.tar.gz | sort > /tmp/archive-product-paths
+          diff -u /tmp/expected-product-paths /tmp/archive-product-paths
+          tar -xzf /tmp/opencode-prerequisite.tar.gz --no-same-owner --no-same-permissions
+          printf '%s\n' \
+            '1ecb51fab266bad565c2e4b2300d8e8cb3a50ba881c1b9116343b87e540d8aa0  README.md' \
+            'eac1cf2949dd7b2c845759ec6f21939c70dec0f71c19f2176018249ac0a9fb6b  modules/opencode/README.md' \
+            '23d2aa3322d047f62a0354557203148b41c41f97b5e05cbfa1aac1232cb242ba  modules/opencode/send-after-configuration.example.json' \
+            '7b6a3cd10cd9dfd299cb49d764c399864b4dc9cebf249568ead2a3e77503c7a5  src/model.rs' \
+            '1dbfb449af414461440758f31981e524a73c220e0796f4efa90a5b2d9c39b745  src/runtime/opencode_v2/configuration.rs' \
+            '1bb1737abc47c88f02ec5bf006582dd9cd4efd6a41203eeda34f1c20157bff87  src/store/mod.rs' \
+            'ed05cda2343bd1b296a48dffcad3b081c261a24b284652db65b64cf594fb6bfc  src/store/operations.rs' \
+            '8064e197e6c4a9bf2fcba05404b0a4e23048cfe73c7c63f9d4b5f5e25039c275  src/store/prerequisites.rs' \
+            '52545ce8f20c7e139dc83ffe1c7235a3a70064266e7c3d9bdb5c1acd9f171ad1  src/store/runtime.rs' | sha256sum -c -
+          python -c 'from pathlib import Path; p=Path("src/store/prerequisites.rs"); s=p.read_text(); before="    match desired_digest {\n        Some(expected) if details[\"desired_digest\"] == expected => {}\n"; after="    match desired_digest.as_deref() {\n        Some(expected) if details[\"desired_digest\"].as_str() == Some(expected) => {}\n"; assert s.count(before) == 1; p.write_text(s.replace(before, after))'
+          printf '%s  %s\n' ea0fb748a7f6f31f0d83152f800e58f7f7aedf61279ac03a767f3202baec4759 src/store/prerequisites.rs | sha256sum -c -
           git diff --check
       - name: Pinned toolchain
         shell: bash
@@ -99,21 +70,12 @@ jobs:
           cargo fmt -p eliot-swarm-controller -- --check
           git diff --check
       - name: Verify Atlas donor snapshot
-        shell: python
+        shell: bash
         run: |
-          import hashlib
-          from pathlib import Path
-          root = Path('vendor/atlas')
-          expected = {}
-          for line in (root / 'SHA256SUMS').read_text().splitlines():
-              digest, name = line.split('  ', 1)
-              assert name not in expected, name
-              path = root / name
-              assert not path.is_symlink() and path.is_file(), name
-              assert hashlib.sha256(path.read_bytes()).hexdigest() == digest, name
-              expected[name] = digest
-          actual = {p.relative_to(root).as_posix() for p in root.rglob('*') if p.is_file()}
-          assert actual == set(expected) | {'SHA256SUMS'}, 'donor file set changed'
+          set -euo pipefail
+          test -z "$(find vendor/atlas -type l -print -quit)"
+          test "$(find vendor/atlas -type f | wc -l)" -eq 24
+          (cd vendor/atlas && sha256sum -c SHA256SUMS)
       - name: Clippy
         run: cargo clippy --locked --lib --bins --no-deps -- -D warnings
       - name: Publish checked source to main
@@ -125,7 +87,6 @@ jobs:
           rm .github/workflows/import-opencode-prerequisite.yml
           git add -A
           git diff --cached --check
-
           printf '%s\n' \
             .github/import-opencode-prerequisite/part-000 \
             .github/import-opencode-prerequisite/part-001 \
@@ -146,14 +107,12 @@ jobs:
             src/store/runtime.rs | sort > /tmp/expected-staged-paths
           git diff --cached --name-only | sort > /tmp/actual-staged-paths
           diff -u /tmp/expected-staged-paths /tmp/actual-staged-paths
-
           git config user.name 'Iurii Lisenkov'
           git config user.email '71514792+UnknownAlienHuman@users.noreply.github.com'
           git commit -m 'feat: gate OpenCode inputs on exact applied configuration evidence' \
             -m 'Persist one earlier same-binding configure prerequisite for another configure, next-turn send or initial Task dispatch. Recheck the typed OperationContract, exact native root/scope, saved key/action/value digest and readback evidence in the queued-to-sending transaction; ACK, unknown, rejection and cancellation never satisfy it.' \
             -m 'Track controller-owned settings revisions, invalidate only the relevant key on an earlier conflicting configure or newer complete native snapshot, and preserve the short prepare-to-input-admission barrier. Replies, readback, stop controls, exact-turn steering policy and other bindings remain independent; no queue-order inference or workflow engine is added.' \
             -m 'Rust 1.98.1 formatting and locked warnings-denied minimal Clippy passed. All 23 Atlas donor files/checksums are unchanged. No tests, model calls, dependencies, migrations, service mutation or permanent workflow changes.'
-
           git fetch origin main
           test "$(git rev-parse origin/main)" = "$STAGING_SHA"
           git push origin HEAD:main
