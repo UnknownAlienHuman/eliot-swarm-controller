@@ -1,9 +1,10 @@
 schema_version = 1
 architecture = "ELIOT Swarm Prototype v18"
-as_of = "2026-09-29"
-status = "design_inventory_not_an_install_lock"
-source_downloaded_by_this_revision = false
-built_or_runtime_qualified = false
+as_of = "2026-10-02"
+status = "mixed_inventory_not_an_install_lock"
+inventory_note = "Mixed inventory, updated by Documentation Program Phase A (2026-10-02). Some units are vendored or installed module-locally, some are adopted external packages, and some are reviewed pattern/research entries with nothing installed. There is no single downloaded/built flag for the whole file: every entry records its reviewed pin, its installed/pinned-in-code pin and its qualification level separately, and this file remains an inventory, not an install lock."
+source_downloaded_by_this_revision = "mixed_per_entry_see_installed_pin"
+built_or_runtime_qualified = "mixed_per_entry_see_qualification_no_live_qualification_implied"
 
 [policy]
 reuse_unit = "Complete public package/crate/backend and its dependency closure; no rewrite of a state machine from snippets."
@@ -14,13 +15,19 @@ installation = "Project/module-local only; no global pip/npm/PATH mutations."
 qualification = "Versioned source read is not a successful Windows run."
 licensing = "Preserve upstream license, copyright, notices and applicable bundled third-party rules."
 activation = "Only one execution backend owns a session binding."
+inventory_fields = "Every entry records adoption_class (adopt|pilot|pattern|research|reject|conditional), reviewed_pin, installed_pin and qualification separately (Documentation Program sections 20 and 23). A reviewed or research pin is not an installed pin; compilation or fixture checks are not live qualification. A license that has not been checked against its primary source is recorded as UNVERIFIED, never guessed."
 
 [[donors]]
 id = "muse-sdk"
 selection = "primary"
+adoption_class = "adopt"
+program_decision = "KEEP / ADOPT WHOLE (Documentation Program section 1A)"
 module = "runtime.muse"
 repository = "https://github.com/meta-models/muse-code-sdk"
 revision = "a7c10c5dd3f66be412077d29f9d11111af70317b"
+reviewed_pin = "1.3.0 (commit a7c10c5dd3f66be412077d29f9d11111af70317b)"
+installed_pin = "1.3.0 (module-local @muse-code/sdk; modules/muse/package.json)"
+qualification = "not_live_qualified; reviewed pin equals installed module-local pin, but live Muse/Windows qualification is still required (see qualification_points)"
 source_units = ["clients/sdk-ts", "clients/msp-ts", "schema/msp"]
 package = "@muse-code/sdk"
 manifest_version = "1.3.0"
@@ -31,14 +38,21 @@ upstream_runtime_dependency_count = 0
 retain = ["Generated wire types", "Protocol fixtures", "Publish provenance", "Upstream notices"]
 local_glue = ["Module v1 facade", "Task/binding identity", "Normalized observations", "Native effort readback"]
 qualification_points = ["Account billing path", "Max on actual host", "Fresh and resume", "Parent and native children", "View replay/gap", "Goal may start execution"]
-do_not_copy = ["Model inference implementation", "Global installation scripts"]
+do_not_copy = ["Model inference implementation", "Global installation scripts", "Forked protocol state machines in Rust (Documentation Program section 1A)"]
 
 [[donors]]
 id = "codex-python-sdk"
 selection = "jsonl_sdk_donor_with_shared_transport_adaptation"
+adoption_class = "adopt"
+program_decision = "KEEP / ADOPT WHOLE (Documentation Program section 1A)"
 module = "runtime.codex"
 repository = "https://github.com/openai/codex"
 revision = "18194bfd3534ca567d886eac454028dafaa68b6c"
+reviewed_pin = "18194bfd3534ca567d886eac454028dafaa68b6c (sdk/python source snapshot; package 0.0.0-dev)"
+installed_pin = "vendored source snapshot at the reviewed commit under modules/codex/vendor_bridge (package 0.0.0-dev; a dev snapshot, not installed from a registry)"
+matching_binary_pin = "openai-codex-cli-bin==0.153.4 (the donor's own paired pin; server-side provenance only - the bridge installs no binary)"
+server_reported_version = "Separate runtime fact, not a pin: the version reported by the actual shared server (executor block in bridge output at attach time). No server-reported value is recorded as a pin in this inventory."
+qualification = "fixture_checked; read-only bridge slice with no controller route registered yet; live qualification points below remain open. The shared WebSocket adaptation overrides private SDK methods and must be requalified on every pin."
 source_units = ["sdk/python"]
 package = "openai-codex"
 manifest_version = "0.0.0-dev"
@@ -49,31 +63,41 @@ source_dependencies = ["pydantic>=2.12", "packaging>=26.2", "openai-codex-cli-bi
 retain = ["Generated models", "Reader/router implementation", "Fixtures/tests", "License"]
 local_glue = ["Module v1 facade", "Connection/profile identity", "Goal/family observation", "Exact runtime selection"]
 qualification_points = ["Owned stdio separately from shared daemon", "Existing auth/home", "Actual server version", "Concurrent requests and server requests", "Turn correlation", "Resume and goal"]
-do_not_copy = ["codex-rs/app-server-client into core: pulls core/app-server/executor dependency graph", "Legacy codex_as.py synchronous transport"]
+do_not_copy = ["codex-rs/app-server-client into core: pulls core/app-server/executor dependency graph", "Legacy codex_as.py synchronous transport", "The SDK default approval handler: it accepts command/file requests, so ELIOT must always provide an explicit policy (Documentation Program section 1A)"]
 notes = "codex_bin selects the launched executable; it does not remove the matching-binary package dependency. Do not install a dev version by invented registry version."
 
 [[donors]]
 id = "rmcp"
 selection = "primary"
+adoption_class = "adopt"
+program_decision = "KEEP / ADOPT PACKAGE (Documentation Program section 1A)"
 module = "api.mcp"
 repository = "https://github.com/modelcontextprotocol/rust-sdk"
 source_manifest = "Cargo.toml"
 source_manifest_blob_sha = "4caecb897242e6c63124ca91c709319e85022f6f"
 manifest_version = "3.5.0"
+reviewed_pin = "3.5.0 (source revision 0cde3c5cf3e6aff0cc852ce6045f107e95991f48, from Documentation Program section 24)"
+installed_pin = "registry crate rmcp 3.5.0 (Cargo.toml: rmcp = 3.5.0; Cargo.lock checksum fae7019994ae0fe4ada40b732f798f3ff26f0f04facb1477f1bf37eb4f18a2d3)"
+qualification = "implemented as the controller stdio MCP facade; live GM tool discovery is not qualified (see qualification_points)"
 source_units = ["crates/rmcp", "crates/rmcp-macros"]
 license_declaration = "Apache-2.0; workspace.package.license"
-revision_resolution = "Resolve exact compatible release and source revision into Cargo.lock during first build; not main at runtime."
+revision_resolution = "Resolved: reviewed source revision 0cde3c5cf3e6aff0cc852ce6045f107e95991f48 for release 3.5.0; the installed crate is locked in Cargo.lock (see installed_pin). Not main at runtime. The source_manifest_blob_sha above is the blob SHA of the upstream Cargo.toml manifest; a manifest blob SHA is not a commit and must not be conflated with the reviewed source revision."
 execution = "Rust MCP facade over the same application API used by CLI."
 retain = ["Required transport and schema features", "Upstream notices"]
 qualification_points = ["GM tools discovery", "MCP disconnect does not stop host", "Async operation handles"]
-do_not_copy = ["All examples into runtime", "Every optional MCP feature by default"]
+do_not_copy = ["All examples into runtime", "Every optional MCP feature by default", "MCP Tasks as a second authority: Tasks are a client facade over ELIOT Operations, and stale-on-error caching is forbidden for authoritative controller reads (Documentation Program section 1A)"]
 
 [[donors]]
 id = "cccc-windows-process"
 selection = "primary_platform_candidate"
+adoption_class = "conditional"
+program_decision = "CONDITIONAL CRATE (Documentation Program section 1A)"
 module = "platform.process"
 repository = "https://github.com/ChesterRa/cccc"
 revision = "c270e276591879c6edb7d08af67bec7035585c7e"
+reviewed_pin = "c270e276591879c6edb7d08af67bec7035585c7e (crates/cccc-windows-process; no package version is recorded for this unit in Documentation Program section 1A)"
+installed_pin = "none (not a Cargo dependency of the controller; no cccc crate appears in Cargo.lock)"
+qualification = "not_installed_not_qualified; use only if a child-first launch path is required - the current ELIOT owner-first Job topology already avoids the pre-assignment race (Documentation Program section 1A)"
 source_units = ["crates/cccc-windows-process"]
 license_declaration = "Apache-2.0; root LICENSE"
 execution = "Rust path/vendor dependency; existing suspended launch boundary."
@@ -81,11 +105,14 @@ retain = ["Complete crate", "Error cleanup", "Required workspace metadata", "Lic
 local_glue = ["Our ProcessSpec", "Job ownership policy", "Packaging-only workspace metadata patch if needed"]
 qualification_points = ["Windows process spawn", "Flags composition", "Job attach and cleanup", "No accidental kill policy for external daemon"]
 do_not_copy = ["CCCC scheduler", "CCCC UI", "Observer-loss stop policy"]
-notes = "The crate alone is not the entire CCCC Job/process-tree subsystem; no claim of equivalent lifecycle until qualified."
+notes = "The crate alone is not the entire CCCC Job/process-tree subsystem; no claim of equivalent lifecycle until qualified. This entry is a different unit from the cccc-delivery pattern entry below, although both come from the same upstream repository."
 
 [[donors]]
 id = "atlas-redact"
+name = "Atlas Redact"
 selection = "vendored_diagnostic_redaction"
+adoption_class = "adopt"
+program_decision = "KEEP / ADOPTED (Documentation Program section 1A)"
 module = "runtime.opencode_v2.observation"
 source_vendored = true
 local_source = "vendor/atlas/crates/atlas-redact"
@@ -93,6 +120,9 @@ build_wrapper = "modules/atlas-redact/Cargo.toml"
 provenance = "THIRD_PARTY_NOTICES.md"
 repository = "https://github.com/pacifio/atlas"
 revision = "a34a6d44bf37d26d9a6f8f6fe1fab5ce0a92d8d1"
+reviewed_pin = "a34a6d44bf37d26d9a6f8f6fe1fab5ce0a92d8d1 (crates/atlas-redact, manifest version 0.1.0)"
+installed_pin = "vendored snapshot at the reviewed commit under vendor/atlas/crates/atlas-redact (build wrapper modules/atlas-redact/Cargo.toml)"
+qualification = "vendored and used on bounded persisted native diagnostic/question copies; detection limits and false positives still require qualification (see qualification_points). Redaction here is not a security boundary."
 source_units = ["crates/atlas-redact"]
 manifest_version = "0.1.0"
 license_declaration = "Root Apache-2.0; bundled rule notices must also be retained."
@@ -101,13 +131,22 @@ execution = "Rust library on bounded persisted native question/diagnostic copies
 retain = ["Complete crate", "Rule files", "Third-party notices", "Upstream fixtures"]
 qualification_points = ["No envelope corruption", "Known secret patterns", "False positives", "Throughput on bounded payloads"]
 do_not_copy = ["Atlas editor", "Atlas task/session store", "Per-tool repository snapshots"]
+notes = "Same upstream repository and same commit as the atlas-acp-backend alternative below, but a different unit with a different decision: this entry is the adopted, vendored redaction crate only; the Atlas ACP stack is a separate research entry and is not adopted by this entry."
 
 [[donors]]
 id = "acpx"
+name = "ACPX"
 selection = "optional_acp_backend"
+adoption_class = "pilot"
+program_decision = "PILOT WHOLE OPTIONAL BACKEND (Documentation Program section 1A)"
 module = "runtime.acp"
 repository = "https://github.com/openclaw/acpx"
 revision = "ee6090df63afa9d6f7fc1c091e1961e50f2f1476"
+reviewed_pin = "v0.19.4"
+reviewed_pin_source = "Documentation Program sections 1A and 24 (2026-10-02), which postdate this inventory's 2026-09-29 pin."
+superseded_pin_note = "Superseded, retained and not silently overwritten: the 2026-09-29 inventory pin was manifest_version 0.19.3 at revision ee6090df63afa9d6f7fc1c091e1961e50f2f1476 (the revision and manifest_version fields of this entry). The reviewed pin is now v0.19.4; no commit for that tag is recorded in this inventory."
+installed_pin = "none (no ACPX code exists in this repository)"
+qualification = "not_installed_not_qualified; pilot only as a whole optional ACP backend when a real ACP consumer is ready. ELIOT retains Task/Operation/artifact/acceptance authority; ACPX is not a mandatory wrapper for Muse or OpenCode (Documentation Program section 1A)."
 source_units = ["Complete acpx package and retained upstream source"]
 manifest_version = "0.19.3"
 published_artifact_version_verified = false
@@ -120,29 +159,184 @@ do_not_copy = ["Mandatory ACP bridge for Muse MSP/OpenCode HTTP", "Flow engine i
 [[donors]]
 id = "existing-control-bundle"
 selection = "migration_source"
+adoption_class = "adopt"
+program_decision = "Not listed in Documentation Program section 1A; retained migration source (user-provided)."
 module = "runtime.command and runtime.opencode-v2"
 source_attachment = "eliot-swarm-control-20260929-2.zip"
+reviewed_pin = "source attachment eliot-swarm-control-20260929-2.zip (user-provided source; no upstream revision exists)"
+installed_pin = "complete native integration units moved into the module boundaries named in module above; see the module guides"
+qualification = "no live qualification claimed by this entry; see qualification_points"
 source_units = ["eliot-swarm-control/lanes/cc-root-inbox.ts", "eliot-swarm-control/lanes/oc_http.py", "eliot-swarm-control/lanes/Launch-CommandCode.ps1"]
 license_declaration = "User-provided source; not represented as third-party open-source."
 execution = "Retain complete native integration units; move ownership into module boundary."
 qualification_points = ["Mod ready handshake", "Direct HTTP cannot invoke CLI recovery", "No blind POST replay", "No session inferred dead by age"]
 do_not_copy = ["File CLAIM authority", "Synchronous RPC loop", "Destructive live-script overwrite", "Old polling/kill loops"]
 
+[[donors]]
+id = "opencodex"
+name = "OpenCodex"
+selection = "external_service"
+adoption_class = "adopt"
+program_decision = "USE WHOLE EXTERNAL SERVICE (Documentation Program section 1A)"
+module = "modules.opencodex"
+repository = "https://github.com/lidge-jun/opencodex"
+reviewed_pin = "2.75.0"
+pinned_in_code = "2.73.0"
+pinned_commit = "569e3e7dae48bafc54b8a1a7e3a85129befe2d98"
+installed_pin = "none"
+qualification = "fixture_checked only: observer (slice 1) and saved-Operation configuration changes (bridge.2) are implemented in modules/opencodex against fixtures reconstructed from the pinned-in-code contracts; no live service is installed or qualified, and live qualification remains issue #1 slice 4. The reviewed pin is program evidence (RELEASE/UNVERIFIED from this repository: no reviewed-release source is present here), the code pin was deliberately NOT raised in Phase A, and raising it is a Phase B code change with requalification under modules/opencodex/UPDATE.md. Owned launch (issue #1 slice 3) is not implemented."
+license_declaration = "MIT; modules/opencodex/README.md and THIRD_PARTY_NOTICES.md (upstream service license; no upstream source is vendored by this repository)"
+execution = "Whole external service run and owned by the operator; the ELIOT module is an original dependency-free client of its documented Management API. The module never starts, stops or restarts the service."
+retain = ["Conversation affinity", "Preview + planFingerprint + readback for configuration changes", "Partial/unknown mutation outcome handling"]
+do_not_copy = ["Provider translation in the Rust core", "Mixing data-plane and admin credentials: they stay separate (Documentation Program section 1A)"]
+
+[[donors]]
+id = "claude-agent-sdk"
+name = "Claude Agent SDK"
+selection = "used_external_package_not_an_open_source_donor"
+adoption_class = "adopt"
+program_decision = "No row in Documentation Program section 1A (gap in both the program and the previous inventory, recorded 2026-10-02); this entry records the package actually used by modules/claude."
+module = "runtime.claude"
+package_source = "npm registry @anthropic-ai/claude-agent-sdk 0.3.287 (resolved tarball recorded in modules/claude/package-lock.json); no source repository is recorded for this package in this repository"
+package = "@anthropic-ai/claude-agent-sdk"
+manifest_version = "0.3.287"
+reviewed_pin = "0.3.287"
+installed_pin = "0.3.287 (module-local; modules/claude/package.json and package-lock.json, including the matching bundled native binary packages @anthropic-ai/claude-agent-sdk-<platform> at the same version)"
+qualification = "fixture_checked (bridge.1, artifact claude-agent-sdk-0.3.287-bridge.1); no live Claude session, resume or Windows native launch is qualified"
+license_declaration = "Anthropic Commercial Terms (SEE LICENSE IN README.md inside the package; modules/claude/README.md and THIRD_PARTY_NOTICES.md); NOT a permissive open-source donor and must not be relabelled as one."
+execution = "Complete locked package used through the module-local Node bridge; no SDK source is copied into this repository and there is no global installation or model proxy."
+retain = ["Complete locked package", "Matching native binary packages at the same version", "Package notices"]
+do_not_copy = ["Relabelling Commercial Terms code as open-source", "Mixing SDK and native binary package versions"]
+
+[[donors]]
+id = "paseo"
+name = "Paseo"
+selection = "pattern_only"
+adoption_class = "pattern"
+program_decision = "PATTERN (Documentation Program section 1A)"
+module = "timeline/family projection (ELIOT contracts; no Paseo module)"
+repository = "https://github.com/getpaseo/paseo"
+reviewed_pin = "v0.10.3"
+installed_pin = "none (pattern only; no code imported)"
+qualification = "none_pattern_only; no installation and no live qualification"
+source_units = ["docs/timeline-sync.md", "packages/server/src/server/agent/timeline-projection.ts"]
+license_declaration = "UNVERIFIED"
+execution = "Pattern transfer into existing ELIOT boundaries only; this is not permission to copy Paseo source (Documentation Program section 1A preamble)."
+retain = ["Live vs authoritative split", "Epoch/ranges/gaps projection semantics", "Canonical prompt acknowledgment separate from RPC settlement", "Declaration-first children"]
+do_not_copy = ["Paseo app/server authority", "Any Paseo session or task store"]
+non_transferable_limits = ["Do not import its app/server authority", "Post-projection byte limits are enforced in ELIOT, not inherited from Paseo"]
+
+[[donors]]
+id = "cccc-delivery"
+name = "CCCC delivery contracts"
+selection = "pattern_only"
+adoption_class = "pattern"
+program_decision = "PATTERN (Documentation Program section 1A)"
+module = "communication/delivery contracts (ELIOT Operations/mailbox; no CCCC module)"
+repository = "https://github.com/ChesterRa/cccc"
+reviewed_pin = "v0.4.41"
+installed_pin = "none (pattern only; no code imported)"
+qualification = "none_pattern_only; no installation and no live qualification"
+source_units = ["crates/cccc-core/src/connect_delivery.rs"]
+license_declaration = "Apache-2.0; root LICENSE (recorded in this repository for the same upstream repository; see the cccc-windows-process entry)"
+execution = "Pattern transfer into existing ELIOT Operations/mailbox only. This entry is a different unit from the cccc-windows-process conditional crate above: delivery contracts here, suspended-child process crate there."
+retain = ["Delivery ID", "Actor identity + generation", "Recipient scope", "Reply/cancel binding to the original delivery", "Byte/deadline limits"]
+do_not_copy = ["CCCC scheduler", "CCCC ledger", "Per-actor process topology"]
+non_transferable_limits = ["Do not import its scheduler, ledger or per-actor process topology (Documentation Program section 1A)"]
+
+[[donors]]
+id = "agent-of-empires"
+name = "Agent of Empires"
+selection = "pattern_only"
+adoption_class = "pattern"
+program_decision = "PATTERN (Documentation Program section 1A)"
+module = "plugin/update consent and capacity policy (ELIOT contracts; no Agent of Empires module)"
+repository = "https://github.com/agent-of-empires/agent-of-empires"
+reviewed_pin = "v1.18.0"
+installed_pin = "none (pattern only; no code imported)"
+qualification = "none_pattern_only; no installation and no live qualification"
+source_units = ["src/plugin/automation_policy.rs"]
+license_declaration = "UNVERIFIED"
+execution = "Pattern transfer into existing ELIOT boundaries only; this is not permission to copy Agent of Empires source (Documentation Program section 1A preamble)."
+retain = ["Manifest fingerprint", "Reapproval on widened permissions", "Active + reserved accounting", "Unknown mode fail-high"]
+do_not_copy = ["Its numeric capacity defaults", "Its host API as an authority in ELIOT"]
+non_transferable_limits = ["Host API permissions are not OS sandboxing", "Its pending reservations are in-memory, not ELIOT durability (Documentation Program section 1A)"]
+
+[[donors]]
+id = "claw"
+name = "Claw"
+selection = "pattern_only"
+adoption_class = "pattern"
+program_decision = "PATTERN (Documentation Program section 1A)"
+module = "verifier/guard semantics (ELIOT CheckRunner/acceptance; no Claw module)"
+repository = "UNVERIFIED (no Claw repository is named in the Documentation Program section 24 source registry; not invented here)"
+reviewed_pin = "v7.6.1"
+installed_pin = "none (pattern only; no code imported)"
+qualification = "none_pattern_only; no installation and no live qualification"
+license_declaration = "UNVERIFIED"
+execution = "Pattern transfer into existing ELIOT boundaries only; this is not permission to copy Claw source (Documentation Program section 1A preamble)."
+retain = ["Guarded writer", "blocked/superseded states", "Caller-owned checks", "Protected test baseline", "verified/refuted/unverified verdict semantics"]
+do_not_copy = ["A second journal/workflow store in ELIOT", "Its file workflow authority"]
+non_transferable_limits = ["Do not add its second journal/workflow store; its nodes are at-least-once (Documentation Program section 1A)", "Evidence publication and external effects need stronger ELIOT guarantees than the pattern provides"]
+
+[[donors]]
+id = "waku"
+name = "Waku"
+selection = "pattern_with_exclusions"
+adoption_class = "pattern"
+program_decision = "PATTERN WITH EXCLUSIONS (Documentation Program section 1A)"
+module = "OpenCode driver pattern (ELIOT OpenCode adapter; no Waku module)"
+repository = "https://github.com/egoist/waku"
+reviewed_pin = "v0.1.20"
+installed_pin = "none (pattern only; no code imported)"
+qualification = "none_pattern_only; no installation and no live qualification"
+source_units = ["crates/waku-core/src/driver/opencode.rs"]
+license_declaration = "UNVERIFIED"
+execution = "Pattern transfer into the existing ELIOT OpenCode boundary only, with the exclusions below; this is not permission to copy Waku source (Documentation Program section 1A preamble)."
+retain = ["External-service ownership", "Single sequential worker", "Reconnect is not process exit", "Terminal taken from the execution outcome"]
+do_not_copy = ["Same-ID fresh-session fallback (rejected)", "Ignored model/agent switch failures (rejected)", "Transport-error-as-rejection (rejected)"]
+non_transferable_limits = ["The three rejected behaviours in do_not_copy are exclusions from the pattern, not optional details (Documentation Program section 1A)"]
+
 [[alternatives]]
 id = "helicon-muse-facade"
+name = "Helicon"
+adoption_class = "research"
+program_decision = "RESEARCH / ALTERNATIVE FACADE (Documentation Program section 1A)"
 repository = "https://github.com/HarjjotSinghh/helicon"
 revision = "80f3351e49b12a5ca21de748e2b4c3551e886d11"
+reviewed_pin = "80f3351e49b12a5ca21de748e2b4c3551e886d11 (packages/daemon)"
+installed_pin = "none (research only; nothing installed)"
+qualification = "none_research_only; no installation and no live qualification"
+license_declaration = "UNVERIFIED"
 units = ["packages/daemon", "Required dependency closure"]
-decision = "Use as a whole facade instead of more own Muse glue only if it removes work; not an additional mandatory server over direct SDK."
+decision = "Use as a whole facade instead of more own Muse glue only if it removes work; not an additional mandatory server over direct SDK. It duplicates session/store/UI authority and must never attach alongside ELIOT to the same Muse session (Documentation Program section 1A)."
 exclude = ["Model-based title discovery", "Desktop/web UI", "Second authoritative task store"]
 
 [[alternatives]]
 id = "atlas-acp-backend"
+name = "Atlas ACP stack"
+adoption_class = "research"
+program_decision = "RESEARCH / ALTERNATIVE PRODUCT STACK (Documentation Program section 1A)"
 repository = "https://github.com/pacifio/atlas"
 revision = "a34a6d44bf37d26d9a6f8f6fe1fab5ce0a92d8d1"
-decision = "Alternative to ACPX for an ACP binding, not a second connection to it."
+reviewed_pin = "a34a6d44bf37d26d9a6f8f6fe1fab5ce0a92d8d1 (full Atlas ACP stack)"
+installed_pin = "none (research only; the vendored snapshot at this commit covers only crates/atlas-redact - see the atlas-redact donor entry, a different unit on the same commit)"
+qualification = "none_research_only; no installation and no live qualification"
+license_declaration = "Apache-2.0; root LICENSE (same upstream repository as atlas-redact; recorded in THIRD_PARTY_NOTICES.md)"
+decision = "Alternative to ACPX for an ACP binding, not a second connection to it. Research only as an alternative product stack: its closure is broad and carries manager/store/transcript/native-agent authority, so it is not a small ELIOT backend (Documentation Program section 1A)."
+
+[[alternatives]]
+id = "multica-poracode-restate-coder"
+name = "Multica / Poracode / Restate / Coder"
+adoption_class = "research"
+program_decision = "REFERENCE ONLY FOR THIS PROGRAM (Documentation Program section 1A)"
+reviewed_pin = "none recorded in Documentation Program section 1A or section 24; no pin is invented here"
+installed_pin = "none (reference only; nothing installed)"
+qualification = "none_reference_only; no installation and no live qualification"
+license_declaration = "UNVERIFIED"
+decision = "Reference points only (native Codex steer; cockpit controls; durable outer workflows; governed workspaces). None of them becomes a current ELIOT authority through the Documentation Program."
 
 [[external_runtimes]]
 id = "vendor-cli"
 policy = "Use installed authorized native executors. Their binaries, subscriptions and model access are not covered by donor SDK licenses."
-claude_sdk_note = "Official TypeScript Agent SDK README uses Commercial Terms; do not label it a permissive open-source code donor without component-specific license verification."
+claude_sdk_note = "Official TypeScript Agent SDK README uses Commercial Terms; do not label it a permissive open-source code donor without component-specific license verification. The package actually used by this project is recorded as the claude-agent-sdk donor entry above."
