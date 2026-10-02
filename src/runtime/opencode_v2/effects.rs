@@ -64,7 +64,7 @@ fn prompt(command: &RuntimeCommand) -> Result<String> {
 /// A server fallback to its default workspace must not redirect an assignment.
 /// Native canonicalization (case, separators, symlinks) is allowed only when the
 /// two paths actually resolve to the same local directory. No I/O runs in Store.
-async fn verify_directory(expected: &Path, observed: &Value) -> Result<()> {
+pub(super) async fn verify_directory(expected: &Path, observed: &Value) -> Result<()> {
     let observed = Path::new(model::text(observed, "directory")?);
     if !observed.is_absolute() {
         return Err(Error::new(

@@ -43,6 +43,13 @@ pub(super) fn validate_session(value: &Value, expected: Option<&str>) -> Result<
         || value
             .get("parentID")
             .is_some_and(|v| v.as_str().is_none_or(|s| valid_id(s, "ses").is_err()))
+        || value.get("agent").is_some_and(|agent| {
+            agent.as_str().is_none_or(|agent| {
+                agent.is_empty()
+                    || agent.len() > 256
+                    || agent.bytes().any(|byte| byte.is_ascii_control())
+            })
+        })
     {
         return Err(Error::new(
             "NATIVE_SCHEMA_ERROR",
@@ -57,7 +64,9 @@ fn bounded_text(value: &Value) -> Option<&str> {
 fn compact(value: &Value) -> Value {
     let model = json!({"id":bounded_text(&value["model"]["id"]),"providerID":bounded_text(&value["model"]["providerID"]),"variant":bounded_text(&value["model"]["variant"])});
     json!({"sessionId":value["id"],"parentSessionId":value["parentID"],
-        "project_id":value["projectID"],"model":model,"time":{"created":value["time"]["created"],"updated":value["time"]["updated"]},
+        "project_id":value["projectID"],"model":model,
+        "agent":value.get("agent").and_then(bounded_text),"agent_observed":true,
+        "time":{"created":value["time"]["created"],"updated":value["time"]["updated"]},
         // A session-wide last outcome is not evidence about an assigned input/turn.
         "native_session_outcome":value["outcome"].as_str().filter(|s|matches!(*s,"succeeded"|"failed"|"interrupted")),"observed_now":true})
 }
@@ -205,6 +214,21 @@ impl Service {
                 })
             }
         };
+        let agent_configuration = match self.agent_observation(&root_info).await {
+            Ok(configuration) => configuration,
+            Err(error) => {
+                failures.push(json!({"code":error.code,"source":"session_agent"}));
+                json!({
+                    "complete":false,
+                    "agent_id":null,
+                    "definition_digest":null,
+                    "settings_revision":null,
+                    "catalog_revision":null,
+                    "raw_definition_persisted":false,
+                    "source":"session.get+agent.list"
+                })
+            }
+        };
         let mut pending = BTreeMap::new();
         // Retain unresolved old questions when a member read fails; absence in an
         // incomplete family enumeration is not a native cancellation receipt.
@@ -283,6 +307,7 @@ impl Service {
             "observed_children":retained.into_values().collect::<Vec<_>>(),"pending_requests":pending.into_values().collect::<Vec<_>>(),
             "execution":match active_count {Some(n) if n>0=>"observed_active",Some(_)=>"not_observed_active",None=>"unknown"},
             "active_drain_count":active_count,"configuration":configuration,
+            "agent_configuration":agent_configuration,
             "native_service_pid":self.pid,"native_service_version":self.version,
             "family_completeness":"partial","enumeration_complete":enumerated,
             "completeness_reason":"volatile_non_atomic_pages_are_not_family_terminal_evidence",

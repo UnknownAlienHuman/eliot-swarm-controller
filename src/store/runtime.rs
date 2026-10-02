@@ -187,11 +187,16 @@ pub(super) fn next(db: &mut Connection, p: &Principal) -> Result<Value> {
             prerequisites::Gate::None | prerequisites::Gate::Ready { .. } => {
                 (op, method, raw, created)
             }
-            prerequisites::Gate::Pending { operation_id } => {
+            prerequisites::Gate::Pending {
+                operation_id,
+                blocking_operation_id,
+                ..
+            } => {
                 return Ok(json!({
                     "command":null,
                     "waiting_operation_id":op,
-                    "waiting_for_prerequisite_operation_id":operation_id
+                    "waiting_for_prerequisite_operation_id":operation_id,
+                    "blocking_configuration_operation_id":blocking_operation_id
                 }));
             }
             prerequisites::Gate::Failed(error) => {
@@ -389,11 +394,11 @@ pub(super) fn outcome(db: &mut Connection, p: &Principal, v: &Value) -> Result<V
     }
     let now = model::now_ms()?;
     let result_value = serde_json::to_value(&r)?;
-    let applied_settings = if o["method"] == "agent.configure"
+    let applied_configuration = if o["method"] == "agent.configure"
         && b["route"]["runtime"] == crate::runtime::opencode_v2::RUNTIME
         && matches!(r.outcome, EffectOutcome::Applied)
     {
-        Some(prerequisites::applied_settings(
+        Some(prerequisites::applied_configuration(
             &tx,
             &b,
             &r.operation_id,
@@ -476,11 +481,21 @@ pub(super) fn outcome(db: &mut Connection, p: &Principal, v: &Value) -> Result<V
         // A failure may follow spawn: preserve ownership and its known native identity.
         tx.execute("UPDATE bindings SET state='reconciling',native_root_id=COALESCE(?3,native_root_id),native_scope_key=COALESCE(?4,native_scope_key),state_json=json_set(state_json,'$.opening_evidence',json(?5)) WHERE binding_id=?1 AND generation=?2",params![id,generation,r.native_root_id,r.native_scope_key,model::canonical(&r.details)?])?;
     }
-    if let Some(settings) = applied_settings {
-        tx.execute(
-            "UPDATE bindings SET state_json=json_set(state_json,'$.effective_settings',json(?3)) WHERE binding_id=?1 AND generation=?2",
-            params![id, generation, model::canonical(&settings)?],
-        )?;
+    if let Some(configuration) = applied_configuration {
+        match configuration {
+            prerequisites::EffectiveConfiguration::InstructionEntries(settings) => {
+                tx.execute(
+                    "UPDATE bindings SET state_json=json_set(state_json,'$.effective_settings',json(?3)) WHERE binding_id=?1 AND generation=?2",
+                    params![id, generation, model::canonical(&settings)?],
+                )?;
+            }
+            prerequisites::EffectiveConfiguration::SessionAgent(agent) => {
+                tx.execute(
+                    "UPDATE bindings SET state_json=json_set(state_json,'$.effective_agent',json(?3)) WHERE binding_id=?1 AND generation=?2",
+                    params![id, generation, model::canonical(&agent)?],
+                )?;
+            }
+        }
     }
     if o["method"] == "agent.recover" && matches!(r.outcome, EffectOutcome::Applied) {
         if r.native_root_id.as_deref() != b["native_root_id"].as_str()
@@ -551,15 +566,27 @@ pub(super) fn observe(db: &mut Connection, p: &Principal, v: &Value) -> Result<V
         tx.commit()?;
         return Ok(json!({"recorded":true,"stale":true}));
     }
-    let observed_settings = if b["route"]["runtime"] == crate::runtime::opencode_v2::RUNTIME {
-        prerequisites::observed_settings(&b, &v["state"], observation_id, now)?
+    let observed_configurations = if b["route"]["runtime"] == crate::runtime::opencode_v2::RUNTIME {
+        prerequisites::observed_configurations(&b, &v["state"], observation_id, now)?
     } else {
-        None
+        Vec::new()
     };
-    if let Some(settings) = observed_settings {
-        tx.execute("UPDATE bindings SET state_json=json_set(state_json,'$.native',json(?3),'$.observed_at_ms',?4,'$.native_sequence',?5,'$.native_observation_id',?6,'$.effective_settings',json(?7)) WHERE binding_id=?1 AND generation=?2",params![id,generation,encoded,now,sequence,observation_id,model::canonical(&settings)?])?;
-    } else {
-        tx.execute("UPDATE bindings SET state_json=json_set(state_json,'$.native',json(?3),'$.observed_at_ms',?4,'$.native_sequence',?5,'$.native_observation_id',?6) WHERE binding_id=?1 AND generation=?2",params![id,generation,encoded,now,sequence,observation_id])?;
+    tx.execute("UPDATE bindings SET state_json=json_set(state_json,'$.native',json(?3),'$.observed_at_ms',?4,'$.native_sequence',?5,'$.native_observation_id',?6) WHERE binding_id=?1 AND generation=?2",params![id,generation,encoded,now,sequence,observation_id])?;
+    for configuration in observed_configurations {
+        match configuration {
+            prerequisites::EffectiveConfiguration::InstructionEntries(settings) => {
+                tx.execute(
+                    "UPDATE bindings SET state_json=json_set(state_json,'$.effective_settings',json(?3)) WHERE binding_id=?1 AND generation=?2",
+                    params![id, generation, model::canonical(&settings)?],
+                )?;
+            }
+            prerequisites::EffectiveConfiguration::SessionAgent(agent) => {
+                tx.execute(
+                    "UPDATE bindings SET state_json=json_set(state_json,'$.effective_agent',json(?3)) WHERE binding_id=?1 AND generation=?2",
+                    params![id, generation, model::canonical(&agent)?],
+                )?;
+            }
+        }
     }
     if v["state"]["turns"].is_array() || v["state"]["observed_children"].is_array() {
         let mut stmt = tx.prepare("SELECT attempt_id, producers_json FROM attempts WHERE binding_id=?1 AND binding_generation=?2 AND released_at_ms IS NULL")?;
@@ -661,6 +688,9 @@ pub(super) fn user_command(
         if v["settings"].as_object().is_none_or(|o| o.is_empty()) {
             return Err(Error::invalid("nonempty adapter settings object required"));
         }
+        if b["route"]["runtime"] == crate::runtime::opencode_v2::RUNTIME {
+            crate::runtime::opencode_v2::configuration_expectation(&v["settings"])?;
+        }
     } else if method == "agent.goal" {
         match model::text(v, "action")? {
             "set" | "edit" => {
@@ -694,6 +724,7 @@ pub(super) fn user_command(
     }
     let prerequisite = prerequisites::validate_request(tx, &b, v, op)?;
     let prerequisite_id = prerequisite.operation_id().map(str::to_owned);
+    let prerequisite_contract_revision = prerequisite.contract_revision().map(str::to_owned);
     if method == "agent.goal" && matches!(v["action"].as_str(), Some("pause" | "clear")) {
         // A pause received before dispatch also cancels old local goal starts.
         // Otherwise priority scheduling could execute pause first and revive the
@@ -705,15 +736,8 @@ pub(super) fn user_command(
     let mut effective = json!({"route":b["route"],"native_root_id":b["native_root_id"]});
     if method == "agent.configure" && b["route"]["runtime"] == crate::runtime::opencode_v2::RUNTIME
     {
-        effective["operation_contract"] = json!({
-            "effect_scope":"native_session",
-            "order_scope":{"binding_id":id,"generation":generation},
-            "completion_condition":"native_configuration_applied",
-            "application_boundary":"next_step_boundary",
-            "replay_policy":"readback_only_no_mutation_replay",
-            "fallback_used":false,
-            "contract_revision":"opencode-instruction-entry-v1"
-        });
+        effective["operation_contract"] =
+            crate::runtime::opencode_v2::configuration_contract(&v["settings"], id, generation)?;
     } else if method == "agent.send"
         && v["delivery"] == "next_turn"
         && b["route"]["runtime"] == crate::runtime::opencode_v2::RUNTIME
@@ -731,7 +755,7 @@ pub(super) fn user_command(
         effective["prerequisite"] = json!({
             "operation_id":prerequisite_id,
             "required_completion_condition":"native_configuration_applied",
-            "required_contract_revision":"opencode-instruction-entry-v1"
+            "required_contract_revision":prerequisite_contract_revision
         });
     }
     tx.execute("UPDATE operations SET binding_id=?2,binding_generation=?3,prerequisite_operation_id=?4,effective_request_json=?5 WHERE operation_id=?1",params![op,id,generation,prerequisite_id,model::canonical(&effective)?])?;

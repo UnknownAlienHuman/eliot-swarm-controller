@@ -122,6 +122,7 @@ pub(super) fn dispatch(
     }
     let prerequisite = prerequisites::validate_request(tx, &b, v, id)?;
     let prerequisite_id = prerequisite.operation_id().map(str::to_owned);
+    let prerequisite_contract_revision = prerequisite.contract_revision().map(str::to_owned);
     let mut effective = json!({
         "route":b["route"],
         "input":body,
@@ -141,7 +142,7 @@ pub(super) fn dispatch(
         effective["prerequisite"] = json!({
             "operation_id":prerequisite_id,
             "required_completion_condition":"native_configuration_applied",
-            "required_contract_revision":"opencode-instruction-entry-v1"
+            "required_contract_revision":prerequisite_contract_revision
         });
     }
     tx.execute("UPDATE operations SET task_id=?2,attempt_id=?3,binding_id=?4,binding_generation=?5,prerequisite_operation_id=?6,effective_request_json=?7 WHERE operation_id=?1",params![id,a["task_id"].as_str(),attempt,binding,generation,prerequisite_id,model::canonical(&effective)?])?;

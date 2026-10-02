@@ -86,6 +86,29 @@ A matching pre-existing value is a valid no-op. Otherwise the adapter sends exac
 
 A lost mutation response becomes `outcome_unknown`. Reconciliation repeats only verified GET/readback and never repeats PUT or DELETE. Current snapshots retain at most 128 controller-owned keys and value digests, not duplicate values; overflow is marked incomplete. An unsupported experimental endpoint, changed binding/model/location, duplicate key, read gap or mismatching value remains explicit. Provider/model/variant, agent, effort and arbitrary native settings are not silently mapped onto this control.
 
+### Exact session-agent selection
+
+The same `agent.configure` method supports one separate native configuration unit: the agent used by subsequent provider turns. One Operation must select either `instruction_entry` or `agent`; combining them is rejected.
+
+```json
+{
+  "client_request_id": "oc-agent-build-1",
+  "binding_id": "BINDING_ID",
+  "generation": 1,
+  "settings": {
+    "agent": {
+      "id": "build"
+    }
+  }
+}
+```
+
+Use `swarm call agent.configure --file modules/opencode/switch-agent.example.json`. The adapter reads the complete native agent catalog for the verified route location, rejects duplicate or absent IDs, and never falls back to another agent. An agent-level model override is accepted only when it exactly equals the route's pinned provider/model/variant; an omitted override keeps the route model. This prevents agent selection from silently becoming a model or billing-route change.
+
+A matching pre-existing session agent is an exact no-op. Otherwise the adapter sends one `POST /api/session/{sessionID}/agent`, then requires repeated equal catalog and `session.get` projections proving the selected ID and unchanged agent definition. The typed result records the agent ID, definition/catalog digests, mode, hidden flag, application boundary `subsequent_provider_turn`, and whether the definition carried the same exact model override. Raw system prompts, request settings and permissions are not copied into controller state.
+
+A lost response becomes `outcome_unknown`; reconciliation performs only catalog/session GETs and never repeats the switch. Family snapshots retain the selected agent plus definition/catalog revisions. A later external switch or definition reload invalidates a configure prerequisite for that agent rather than silently starting under changed instructions. This control does not implement goal set/edit/pause/resume/clear, effort changes, or arbitrary agent-definition mutation. Native semantics were reviewed at OpenCode `4c0d0ff4`: [session switch routes](https://github.com/anomalyco/opencode/blob/4c0d0ff478ca9150c163fb8b04a76395e4dccafe/packages/protocol/src/groups/session.ts), [session projection](https://github.com/anomalyco/opencode/blob/4c0d0ff478ca9150c163fb8b04a76395e4dccafe/packages/schema/src/session.ts), [agent catalog routes](https://github.com/anomalyco/opencode/blob/4c0d0ff478ca9150c163fb8b04a76395e4dccafe/packages/protocol/src/groups/agent.ts), and [agent schema](https://github.com/anomalyco/opencode/blob/4c0d0ff478ca9150c163fb8b04a76395e4dccafe/packages/schema/src/agent.ts).
+
 ## Explicit configure → input prerequisite
 
 `prerequisite_operation_id` implements the short persisted setup sequence required by the module contract. It is accepted on another `agent.configure`, on `agent.send` with `delivery=next_turn`, and on `task.dispatch`. The value must name one earlier `agent.configure` Operation on the exact same binding generation. Each Operation has at most one direct predecessor; a setup sequence can name the preceding step, but this is not a general DAG or workflow language. Submission order alone never creates a dependency.
@@ -188,12 +211,12 @@ Each timeline pass is bounded to 32 pages of at most 50 messages and 8 MiB of sc
 
 ## Remaining C04 work — do not declare end-to-end completion
 
-Cross-restart native continuation after shutdown/missing terminal, goal/model/agent controls and complete family reconstruction remain unfinished. Explicit configure-to-input prerequisite chaining is implemented for durable instruction entries. Exact inline/location-confined tool-file retrieval is implemented; external URI schemes, files outside the verified location and sources above 64 MiB remain deliberately unsupported. Durable `eliot.*` instruction-entry configuration is implemented, but it does not claim provider/model/effort control. The durable-log path now resolves ordinary admitted/delivered inputs and exact pending cancellation; incomplete or unsupported native histories keep the producer unresolved. Parent idle or the latest assistant outcome cannot discharge it. Unsupported methods report an explicit capability error.
+Cross-restart native continuation after shutdown/missing terminal, goal/model controls and complete family reconstruction remain unfinished. Explicit configure-to-input prerequisite chaining is implemented for durable instruction entries and exact session-agent selection. Exact inline/location-confined tool-file retrieval is implemented; external URI schemes, files outside the verified location and sources above 64 MiB remain deliberately unsupported. Durable `eliot.*` instruction-entry configuration and exact session-agent selection are implemented, but they do not claim provider/model/effort or goal control. The durable-log path now resolves ordinary admitted/delivered inputs and exact pending cancellation; incomplete or unsupported native histories keep the producer unresolved. Parent idle or the latest assistant outcome cannot discharge it. Unsupported methods report an explicit capability error.
 
 Live installed OpenCode, actual inference/subscription behavior and native Windows service interoperability remain unqualified. This adapter must not be presented as a fully qualified automatic Task-completion route yet. It does not require or install the optional OpenCodex provider proxy (Issue #1).
 
 ## Focused implementation evidence
 
-The exact tool-file baseline `b11a24a6` passed [Windows/Linux CI 36968398773](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/36968398773). The subsequent prerequisite slice passed Rust 1.98.1 owned-crate formatting and locked minimal lib/bin Clippy with warnings denied before publication. Its exact permanent Windows/Linux CI must be checked separately. No tests or live native calls were run for this addition; dependencies, migrations and the Atlas donor are unchanged.
+The configure-prerequisite baseline `26da2a09` passed [Windows/Linux CI 36979626316](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/36979626316). The subsequent exact session-agent slice must pass Rust 1.98.1 owned-crate formatting, locked minimal lib/bin Clippy and unchanged Atlas verification before publication; its permanent Windows/Linux CI remains separate evidence. No tests or live native calls were run for this addition; dependencies, migrations and the Atlas donor are unchanged.
 
 The interrupted 2026-10-01 implementation retained 16 protocol/Store fixtures. They were preserved, not rerun during source recovery. Fresh Rust 1.98.1 package formatting and minimal warnings-denied Clippy passed; the Windows/Linux workflow checks the exact commit's formatting, Clippy, donor hashes, release build and existing Muse SDK import. Tests remain deferred while the product code is being completed. Fixture HTTP servers are not OpenCode, and compilation is not live service, model, billing or subscription qualification.

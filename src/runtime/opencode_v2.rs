@@ -10,6 +10,10 @@ mod snapshot;
 pub(crate) mod tests;
 
 use crate::error::{Error, Result};
+pub(crate) use configuration::{
+    AGENT_SETTINGS_REVISION_KIND, ConfigurationExpectation, INSTRUCTION_SETTINGS_REVISION_KIND,
+    configuration_contract, configuration_expectation,
+};
 pub(crate) use execution::{ExecutionRead, ExecutionScan};
 pub(crate) use http::{EventReader, EventState, Service};
 use serde::{Deserialize, Serialize};
