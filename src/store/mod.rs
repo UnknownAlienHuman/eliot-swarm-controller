@@ -2,6 +2,7 @@
 mod acceptance;
 mod assembly;
 mod checks;
+mod gm;
 mod opencode;
 mod operations;
 mod prerequisites;
@@ -322,7 +323,7 @@ impl Store {
         let receipt = self
             .run(move |db| {
                 let p = current_principal(db, p)?;
-                p.require_operator()?;
+                gm::require_authority(db, &p)?;
                 mutate(db, &p, "task.accept", &params, &config)
             })
             .await?;
@@ -602,7 +603,7 @@ fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config
                 |r| r.get(0),
             )?;
             Ok(
-                json!({"version":env!("CARGO_PKG_VERSION"),"controller_id":meta(db,"controller_id")?,"host_epoch":meta(db,"host_epoch")?,"sqlite":rusqlite::version(),"tasks":tasks,"unreleased_attempts":owners,"queued_operations":queued,"execution_mode":meta(db,"execution_mode")?,"native_modules_connected":db.query_row("SELECT count(*) FROM bindings WHERE released_at_ms IS NULL AND json_extract(state_json, '$.connection')='connected'",[],|r|r.get::<_,i64>(0))?,"native_execution":"scoped_runtime_protocol"}),
+                json!({"version":env!("CARGO_PKG_VERSION"),"controller_id":meta(db,"controller_id")?,"host_epoch":meta(db,"host_epoch")?,"gm":gm::record(db)?,"gm_wake_mode":gm::WAKE_MODE,"sqlite":rusqlite::version(),"tasks":tasks,"unreleased_attempts":owners,"queued_operations":queued,"execution_mode":meta(db,"execution_mode")?,"native_modules_connected":db.query_row("SELECT count(*) FROM bindings WHERE released_at_ms IS NULL AND json_extract(state_json, '$.connection')='connected'",[],|r|r.get::<_,i64>(0))?,"native_execution":"scoped_runtime_protocol"}),
             )
         }
         "agent.family" => producers::family(db, v),
@@ -649,7 +650,7 @@ fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config
             Ok(json!({"routes":config.routes,"live_qualification":false}))
         }
         "client.list" => {
-            p.require_operator()?;
+            gm::require_authority(db, p)?;
             model::fields(v, &[])?;
             let mut s = db.prepare(
                 "SELECT key,value_json FROM meta WHERE key LIKE 'client:%' ORDER BY key",
@@ -817,7 +818,7 @@ fn apply(
         "agent.open" => operations::open(tx, p, v, config, id, now).map(|v| (v, true)),
         "operation.cancel" => operations::cancel(tx, p, v, id, now).map(|v| (v, false)),
         "host.mode" => {
-            p.require_operator()?;
+            gm::require_authority(tx, p)?;
             model::fields(v, &["client_request_id", "new_work"])?;
             let mode = model::text(v, "new_work")?;
             if !["enabled", "disabled"].contains(&mode) {
@@ -829,8 +830,9 @@ fn apply(
                 false,
             ))
         }
+        "gm.handover" => gm::handover(tx, p, v, id).map(|v| (v, false)),
         "client.register" => {
-            p.require_operator()?;
+            gm::require_authority(tx, p)?;
             model::fields(
                 v,
                 &[

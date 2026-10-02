@@ -121,7 +121,7 @@ fn evidence(
     p: &Principal,
     input: &AcceptRequest,
 ) -> Result<(Value, Vec<ArtifactRecord>)> {
-    p.require_operator()?;
+    super::gm::require_authority(db, p)?;
     let doc = submissions::document(db, &input.submission_ref)?;
     let a = tasks::get_attempt(db, &input.attempt_id)?;
     let t = tasks::get_task(db, model::text(&a, "task_id")?)?;
@@ -271,7 +271,7 @@ fn evidence(
 }
 
 pub(super) fn reserve(tx: &Transaction<'_>, p: &Principal, v: &Value, id: &str) -> Result<Value> {
-    p.require_operator()?;
+    super::gm::require_authority(tx, p)?;
     let input = AcceptRequest::parse(v)?;
     let a = tasks::get_attempt(tx, &input.attempt_id)?;
     let t = tasks::get_task(tx, model::text(&a, "task_id")?)?;
@@ -324,7 +324,7 @@ pub(super) fn begin(
 ) -> Result<Option<Result<Vec<ArtifactRecord>>>> {
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let p = current_principal(&tx, p)?;
-    p.require_operator()?;
+    super::gm::require_authority(&tx, &p)?;
     let op = operations::get_operation(&tx, id)?;
     if op["method"] != "task.accept" {
         return Err(Error::invalid("not an acceptance operation"));
@@ -417,7 +417,7 @@ pub(super) fn invalidate(
     id: &str,
     now: i64,
 ) -> Result<Value> {
-    p.require_operator()?;
+    super::gm::require_authority(tx, p)?;
     let input = InvalidateRequest::parse(v)?;
     let prior = decision(tx, &input.acceptance_operation_id)?;
     let key = format!("invalidate:{}", input.acceptance_operation_id);

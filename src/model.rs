@@ -370,6 +370,12 @@ pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
         ],
         "operation.cancel" => &["client_request_id", "operation_id", "reason"],
         "host.mode" => &["client_request_id", "new_work"],
+        "gm.handover" => &[
+            "client_request_id",
+            "client_id",
+            "binding_id",
+            "binding_generation",
+        ],
         "client.register" => &[
             "client_request_id",
             "client_id",

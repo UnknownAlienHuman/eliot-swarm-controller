@@ -77,6 +77,15 @@ enum Command {
         #[arg(long, requires = "binding_id")]
         generation: Option<i64>,
     },
+    /// Designate the current GM client, optionally naming its native binding.
+    /// Rotates the GM epoch; the previous GM keeps no GM-only rights afterwards.
+    GmHandover {
+        client_id: String,
+        #[arg(long, requires = "generation")]
+        binding_id: Option<String>,
+        #[arg(long, requires = "binding_id")]
+        generation: Option<i64>,
+    },
     /// Read a retained family observation, not a live SDK query or complete inventory claim.
     Family {
         binding_id: String,
@@ -492,6 +501,20 @@ async fn run(cli: Cli) -> Result<()> {
             }
             pending_credential = Some(out);
             ("client.register".into(), value)
+        }
+        Command::GmHandover {
+            client_id,
+            binding_id,
+            generation,
+        } => {
+            let mut value = json!({"client_id":client_id});
+            if let Some(id) = binding_id {
+                value["binding_id"] = json!(id);
+            }
+            if let Some(generation) = generation {
+                value["binding_generation"] = json!(generation);
+            }
+            ("gm.handover".into(), value)
         }
     };
     let is_read = matches!(
