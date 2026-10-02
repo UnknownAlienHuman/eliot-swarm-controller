@@ -2,7 +2,7 @@ schema_version = 1
 architecture = "ELIOT Swarm Prototype v18"
 as_of = "2026-10-02"
 status = "mixed_inventory_not_an_install_lock"
-inventory_note = "Mixed inventory, updated by Documentation Program Phase A (2026-10-02). Some units are vendored or installed module-locally, some are adopted external packages, and some are reviewed pattern/research entries with nothing installed. There is no single downloaded/built flag for the whole file: every entry records its reviewed pin, its installed/pinned-in-code pin and its qualification level separately, and this file remains an inventory, not an install lock."
+inventory_note = "Mixed inventory, updated by Documentation Program Phase A (2026-10-02). Some units are vendored or installed module-locally, some are adopted external packages, and some are reviewed pattern/research entries with nothing installed. There is no single downloaded/built flag for the whole file: every entry records its reviewed pin, its installed/pinned-in-code pin and its qualification level separately, and this file remains an inventory, not an install lock. Evidence normalization (Documentation Program implementation review section 9) applied 2026-10-02: licenses verified against the LICENSE file at the exact reviewed tag where the review performed that check, tag-based reviewed pins resolved to their exact commits, and structured qualification booleans added alongside the prose qualification of every entry."
 source_downloaded_by_this_revision = "mixed_per_entry_see_installed_pin"
 built_or_runtime_qualified = "mixed_per_entry_see_qualification_no_live_qualification_implied"
 
@@ -15,7 +15,7 @@ installation = "Project/module-local only; no global pip/npm/PATH mutations."
 qualification = "Versioned source read is not a successful Windows run."
 licensing = "Preserve upstream license, copyright, notices and applicable bundled third-party rules."
 activation = "Only one execution backend owns a session binding."
-inventory_fields = "Every entry records adoption_class (adopt|pilot|pattern|research|reject|conditional), reviewed_pin, installed_pin and qualification separately (Documentation Program sections 20 and 23). A reviewed or research pin is not an installed pin; compilation or fixture checks are not live qualification. A license that has not been checked against its primary source is recorded as UNVERIFIED, never guessed."
+inventory_fields = "Every entry records adoption_class (adopt|pilot|pattern|research|reject|conditional), reviewed_pin, installed_pin and a prose qualification separately (Documentation Program sections 20 and 23). A tag-based reviewed_pin also records reviewed_commit (the exact commit the tag resolves to; a tag string alone is not an exact reviewed unit). Every entry also records seven structured qualification booleans alongside the prose (Documentation Program implementation review section 9.3): source_reviewed, installed, fixture_checked, live_smoke, fault_injected, soaked, role_qualified. Each boolean is true only on evidence recorded in this repository (module READMEs, UPDATE.md files, the README capability matrix); false means not performed or not evidenced, and no value is inferred from compilation alone. A reviewed or research pin is not an installed pin; compilation or fixture checks are not live qualification. A license that has not been checked against its primary source (the LICENSE file at the exact reviewed tag or commit) is recorded as UNVERIFIED, never guessed."
 
 [[donors]]
 id = "muse-sdk"
@@ -39,6 +39,13 @@ retain = ["Generated wire types", "Protocol fixtures", "Publish provenance", "Up
 local_glue = ["Module v1 facade", "Task/binding identity", "Normalized observations", "Native effort readback"]
 qualification_points = ["Account billing path", "Max on actual host", "Fresh and resume", "Parent and native children", "View replay/gap", "Goal may start execution"]
 do_not_copy = ["Model inference implementation", "Global installation scripts", "Forked protocol state machines in Rust (Documentation Program section 1A)"]
+source_reviewed = true
+installed = true
+fixture_checked = true
+live_smoke = false
+fault_injected = true
+soaked = false
+role_qualified = false
 
 [[donors]]
 id = "codex-python-sdk"
@@ -65,6 +72,13 @@ local_glue = ["Module v1 facade", "Connection/profile identity", "Goal/family ob
 qualification_points = ["Owned stdio separately from shared daemon", "Existing auth/home", "Actual server version", "Concurrent requests and server requests", "Turn correlation", "Resume and goal"]
 do_not_copy = ["codex-rs/app-server-client into core: pulls core/app-server/executor dependency graph", "Legacy codex_as.py synchronous transport", "The SDK default approval handler: it accepts command/file requests, so ELIOT must always provide an explicit policy (Documentation Program section 1A)"]
 notes = "codex_bin selects the launched executable; it does not remove the matching-binary package dependency. Do not install a dev version by invented registry version."
+source_reviewed = true
+installed = true
+fixture_checked = true
+live_smoke = false
+fault_injected = false
+soaked = false
+role_qualified = false
 
 [[donors]]
 id = "rmcp"
@@ -86,6 +100,13 @@ execution = "Rust MCP facade over the same application API used by CLI."
 retain = ["Required transport and schema features", "Upstream notices"]
 qualification_points = ["GM tools discovery", "MCP disconnect does not stop host", "Async operation handles"]
 do_not_copy = ["All examples into runtime", "Every optional MCP feature by default", "MCP Tasks as a second authority: Tasks are a client facade over ELIOT Operations, and stale-on-error caching is forbidden for authoritative controller reads (Documentation Program section 1A)"]
+source_reviewed = true
+installed = true
+fixture_checked = false
+live_smoke = false
+fault_injected = false
+soaked = false
+role_qualified = false
 
 [[donors]]
 id = "cccc-windows-process"
@@ -106,6 +127,13 @@ local_glue = ["Our ProcessSpec", "Job ownership policy", "Packaging-only workspa
 qualification_points = ["Windows process spawn", "Flags composition", "Job attach and cleanup", "No accidental kill policy for external daemon"]
 do_not_copy = ["CCCC scheduler", "CCCC UI", "Observer-loss stop policy"]
 notes = "The crate alone is not the entire CCCC Job/process-tree subsystem; no claim of equivalent lifecycle until qualified. This entry is a different unit from the cccc-delivery pattern entry below, although both come from the same upstream repository."
+source_reviewed = true
+installed = false
+fixture_checked = false
+live_smoke = false
+fault_injected = false
+soaked = false
+role_qualified = false
 
 [[donors]]
 id = "atlas-redact"
@@ -132,6 +160,13 @@ retain = ["Complete crate", "Rule files", "Third-party notices", "Upstream fixtu
 qualification_points = ["No envelope corruption", "Known secret patterns", "False positives", "Throughput on bounded payloads"]
 do_not_copy = ["Atlas editor", "Atlas task/session store", "Per-tool repository snapshots"]
 notes = "Same upstream repository and same commit as the atlas-acp-backend alternative below, but a different unit with a different decision: this entry is the adopted, vendored redaction crate only; the Atlas ACP stack is a separate research entry and is not adopted by this entry."
+source_reviewed = true
+installed = true
+fixture_checked = false
+live_smoke = false
+fault_injected = false
+soaked = false
+role_qualified = false
 
 [[donors]]
 id = "acpx"
@@ -142,9 +177,10 @@ program_decision = "PILOT WHOLE OPTIONAL BACKEND (Documentation Program section 
 module = "runtime.acp"
 repository = "https://github.com/openclaw/acpx"
 revision = "ee6090df63afa9d6f7fc1c091e1961e50f2f1476"
-reviewed_pin = "v0.19.4"
+reviewed_pin = "v0.19.4 (commit 8e396609238086dee6a407fdb3b3ac46dbdedd70)"
+reviewed_commit = "8e396609238086dee6a407fdb3b3ac46dbdedd70"
 reviewed_pin_source = "Documentation Program sections 1A and 24 (2026-10-02), which postdate this inventory's 2026-09-29 pin."
-superseded_pin_note = "Superseded, retained and not silently overwritten: the 2026-09-29 inventory pin was manifest_version 0.19.3 at revision ee6090df63afa9d6f7fc1c091e1961e50f2f1476 (the revision and manifest_version fields of this entry). The reviewed pin is now v0.19.4; no commit for that tag is recorded in this inventory."
+superseded_pin_note = "Superseded, retained and not silently overwritten: the 2026-09-29 inventory pin was manifest_version 0.19.3 at revision ee6090df63afa9d6f7fc1c091e1961e50f2f1476 (the revision and manifest_version fields of this entry remain those superseded 0.19.3 snapshot facts, not current facts). The reviewed pin is now v0.19.4; its exact commit was resolved on 2026-10-02 via git ls-remote (lightweight tag pointing directly at the commit) as 8e396609238086dee6a407fdb3b3ac46dbdedd70 and is recorded in reviewed_pin/reviewed_commit. The source review recorded in this inventory is of the 0.19.3 snapshot; a source review of the v0.19.4 tree is still owed before pilot."
 installed_pin = "none (no ACPX code exists in this repository)"
 qualification = "not_installed_not_qualified; pilot only as a whole optional ACP backend when a real ACP consumer is ready. ELIOT retains Task/Operation/artifact/acceptance authority; ACPX is not a mandatory wrapper for Muse or OpenCode (Documentation Program section 1A)."
 source_units = ["Complete acpx package and retained upstream source"]
@@ -155,6 +191,13 @@ execution = "Separate ACP owner backend using documented shared session/runtime 
 retain = ["Owner/queue/watch implementation", "Native registry", "Fixtures and source", "License"]
 qualification_points = ["Exact account/command/cwd/name scope", "Watch disconnect independent of execution", "Windows output behavior", "Native children coverage", "Antigravity question handling"]
 do_not_copy = ["Mandatory ACP bridge for Muse MSP/OpenCode HTTP", "Flow engine into Rust core", "UI"]
+source_reviewed = true
+installed = false
+fixture_checked = false
+live_smoke = false
+fault_injected = false
+soaked = false
+role_qualified = false
 
 [[donors]]
 id = "existing-control-bundle"
@@ -171,6 +214,13 @@ license_declaration = "User-provided source; not represented as third-party open
 execution = "Retain complete native integration units; move ownership into module boundary."
 qualification_points = ["Mod ready handshake", "Direct HTTP cannot invoke CLI recovery", "No blind POST replay", "No session inferred dead by age"]
 do_not_copy = ["File CLAIM authority", "Synchronous RPC loop", "Destructive live-script overwrite", "Old polling/kill loops"]
+source_reviewed = true
+installed = true
+fixture_checked = true
+live_smoke = false
+fault_injected = false
+soaked = false
+role_qualified = false
 
 [[donors]]
 id = "opencodex"
@@ -180,15 +230,23 @@ adoption_class = "adopt"
 program_decision = "USE WHOLE EXTERNAL SERVICE (Documentation Program section 1A)"
 module = "modules.opencodex"
 repository = "https://github.com/lidge-jun/opencodex"
-reviewed_pin = "2.75.0"
+reviewed_pin = "2.75.0 (release tag v2.75.0, commit ef0297f86c4540c7d757c8595170d66f9c584aec)"
 pinned_in_code = "2.75.0"
 pinned_commit = "ef0297f86c4540c7d757c8595170d66f9c584aec"
+adapter_contract_baseline = "v2.75.0 (upstream commit ef0297f86c4540c7d757c8595170d66f9c584aec, the same commit as the reviewed release; module artifact opencodex-2.75.0-bridge.3; selftest fixtures reconstructed from the v2.75.0 Management contracts). The baseline follows upstream current and is the release the adapter contracts were last verified against; it is not a pin on the operator's service."
 installed_pin = "none"
 qualification = "fixture_checked only: observer (slice 1) and saved-Operation configuration changes (bridge.2) are implemented in modules/opencodex, re-baselined to the current upstream contracts (v2.75.0) as bridge.3 against fixtures reconstructed from those contracts; no live service is installed or qualified, and live qualification remains issue #1 slice 4. The reviewed version is program evidence (RELEASE/UNVERIFIED from this repository: no reviewed-release source is present here). Per the operator's standing policy (2026-10-02) the service is not pinned: the operator runs and updates the service himself at upstream current, the adapter's contract baseline follows upstream current, and an observed version difference is recorded as an observation, not treated as a defect or a mutation blocker; the re-baseline to the current upstream contracts landed as bridge.3 (2026-10-02) under modules/opencodex/UPDATE.md, which also removed the former version gate from the module and the doctor projection. Owned launch (issue #1 slice 3) is not implemented."
 license_declaration = "MIT; modules/opencodex/README.md and THIRD_PARTY_NOTICES.md (upstream service license; no upstream source is vendored by this repository)"
 execution = "Whole external service run and owned by the operator; the ELIOT module is an original dependency-free client of its documented Management API. The module never starts, stops or restarts the service."
 retain = ["Conversation affinity", "Preview + planFingerprint + readback for configuration changes", "Partial/unknown mutation outcome handling"]
 do_not_copy = ["Provider translation in the Rust core", "Mixing data-plane and admin credentials: they stay separate (Documentation Program section 1A)"]
+source_reviewed = true
+installed = false
+fixture_checked = true
+live_smoke = false
+fault_injected = true
+soaked = false
+role_qualified = false
 
 [[donors]]
 id = "claude-agent-sdk"
@@ -207,6 +265,13 @@ license_declaration = "Anthropic Commercial Terms (SEE LICENSE IN README.md insi
 execution = "Complete locked package used through the module-local Node bridge; no SDK source is copied into this repository and there is no global installation or model proxy."
 retain = ["Complete locked package", "Matching native binary packages at the same version", "Package notices"]
 do_not_copy = ["Relabelling Commercial Terms code as open-source", "Mixing SDK and native binary package versions"]
+source_reviewed = false
+installed = true
+fixture_checked = true
+live_smoke = false
+fault_injected = false
+soaked = false
+role_qualified = false
 
 [[donors]]
 id = "paseo"
@@ -216,15 +281,23 @@ adoption_class = "pattern"
 program_decision = "PATTERN (Documentation Program section 1A)"
 module = "timeline/family projection (ELIOT contracts; no Paseo module)"
 repository = "https://github.com/getpaseo/paseo"
-reviewed_pin = "v0.10.3"
+reviewed_pin = "v0.10.3 (commit b4af508e2a9e5a34a8b0ffb8dfaff6fd679da6c7)"
+reviewed_commit = "b4af508e2a9e5a34a8b0ffb8dfaff6fd679da6c7"
 installed_pin = "none (pattern only; no code imported)"
 qualification = "none_pattern_only; no installation and no live qualification"
 source_units = ["docs/timeline-sync.md", "packages/server/src/server/agent/timeline-projection.ts"]
-license_declaration = "UNVERIFIED"
+license_declaration = "Apache-2.0; root LICENSE at v0.10.3 (verified 2026-10-02 against the LICENSE file at the exact tag: Paseo itself is licensed under the Apache License, Version 2.0; third-party components incorporated into Paseo retain the licenses of their respective copyright holders)"
 execution = "Pattern transfer into existing ELIOT boundaries only; this is not permission to copy Paseo source (Documentation Program section 1A preamble)."
 retain = ["Live vs authoritative split", "Epoch/ranges/gaps projection semantics", "Canonical prompt acknowledgment separate from RPC settlement", "Declaration-first children"]
 do_not_copy = ["Paseo app/server authority", "Any Paseo session or task store"]
 non_transferable_limits = ["Do not import its app/server authority", "Post-projection byte limits are enforced in ELIOT, not inherited from Paseo"]
+source_reviewed = true
+installed = false
+fixture_checked = false
+live_smoke = false
+fault_injected = false
+soaked = false
+role_qualified = false
 
 [[donors]]
 id = "cccc-delivery"
@@ -234,7 +307,8 @@ adoption_class = "pattern"
 program_decision = "PATTERN (Documentation Program section 1A)"
 module = "communication/delivery contracts (ELIOT Operations/mailbox; no CCCC module)"
 repository = "https://github.com/ChesterRa/cccc"
-reviewed_pin = "v0.4.41"
+reviewed_pin = "v0.4.41 (commit ff3e863ce0983dc529b92e169ed0f937903980fe)"
+reviewed_commit = "ff3e863ce0983dc529b92e169ed0f937903980fe"
 installed_pin = "none (pattern only; no code imported)"
 qualification = "none_pattern_only; no installation and no live qualification"
 source_units = ["crates/cccc-core/src/connect_delivery.rs"]
@@ -243,6 +317,13 @@ execution = "Pattern transfer into existing ELIOT Operations/mailbox only. This 
 retain = ["Delivery ID", "Actor identity + generation", "Recipient scope", "Reply/cancel binding to the original delivery", "Byte/deadline limits"]
 do_not_copy = ["CCCC scheduler", "CCCC ledger", "Per-actor process topology"]
 non_transferable_limits = ["Do not import its scheduler, ledger or per-actor process topology (Documentation Program section 1A)"]
+source_reviewed = true
+installed = false
+fixture_checked = false
+live_smoke = false
+fault_injected = false
+soaked = false
+role_qualified = false
 
 [[donors]]
 id = "agent-of-empires"
@@ -252,15 +333,23 @@ adoption_class = "pattern"
 program_decision = "PATTERN (Documentation Program section 1A)"
 module = "plugin/update consent and capacity policy (ELIOT contracts; no Agent of Empires module)"
 repository = "https://github.com/agent-of-empires/agent-of-empires"
-reviewed_pin = "v1.18.0"
+reviewed_pin = "v1.18.0 (commit a8e8b3b17feec03ae12874ea5df1941fcb5d1267)"
+reviewed_commit = "a8e8b3b17feec03ae12874ea5df1941fcb5d1267"
 installed_pin = "none (pattern only; no code imported)"
 qualification = "none_pattern_only; no installation and no live qualification"
 source_units = ["src/plugin/automation_policy.rs"]
-license_declaration = "UNVERIFIED"
+license_declaration = "MIT; root LICENSE at v1.18.0 (verified 2026-10-02 against the LICENSE file at the exact tag)"
 execution = "Pattern transfer into existing ELIOT boundaries only; this is not permission to copy Agent of Empires source (Documentation Program section 1A preamble)."
 retain = ["Manifest fingerprint", "Reapproval on widened permissions", "Active + reserved accounting", "Unknown mode fail-high"]
 do_not_copy = ["Its numeric capacity defaults", "Its host API as an authority in ELIOT"]
 non_transferable_limits = ["Host API permissions are not OS sandboxing", "Its pending reservations are in-memory, not ELIOT durability (Documentation Program section 1A)"]
+source_reviewed = true
+installed = false
+fixture_checked = false
+live_smoke = false
+fault_injected = false
+soaked = false
+role_qualified = false
 
 [[donors]]
 id = "claw"
@@ -269,15 +358,23 @@ selection = "pattern_only"
 adoption_class = "pattern"
 program_decision = "PATTERN (Documentation Program section 1A)"
 module = "verifier/guard semantics (ELIOT CheckRunner/acceptance; no Claw module)"
-repository = "UNVERIFIED (no Claw repository is named in the Documentation Program section 24 source registry; not invented here)"
-reviewed_pin = "v7.6.1"
+repository = "https://github.com/Enderfga/claw-orchestrator (named by the Documentation Program implementation review section 9.1; verified to resolve on 2026-10-02, with tag v7.6.1 and a root LICENSE)"
+reviewed_pin = "v7.6.1 (commit ffa595abfb6f6671ac995041f9c44f5e1a67f50f)"
+reviewed_commit = "ffa595abfb6f6671ac995041f9c44f5e1a67f50f"
 installed_pin = "none (pattern only; no code imported)"
 qualification = "none_pattern_only; no installation and no live qualification"
-license_declaration = "UNVERIFIED"
+license_declaration = "MIT; root LICENSE at v7.6.1 in Enderfga/claw-orchestrator (verified 2026-10-02 against the LICENSE file at the exact tag)"
 execution = "Pattern transfer into existing ELIOT boundaries only; this is not permission to copy Claw source (Documentation Program section 1A preamble)."
 retain = ["Guarded writer", "blocked/superseded states", "Caller-owned checks", "Protected test baseline", "verified/refuted/unverified verdict semantics"]
 do_not_copy = ["A second journal/workflow store in ELIOT", "Its file workflow authority"]
 non_transferable_limits = ["Do not add its second journal/workflow store; its nodes are at-least-once (Documentation Program section 1A)", "Evidence publication and external effects need stronger ELIOT guarantees than the pattern provides"]
+source_reviewed = true
+installed = false
+fixture_checked = false
+live_smoke = false
+fault_injected = false
+soaked = false
+role_qualified = false
 
 [[donors]]
 id = "waku"
@@ -287,15 +384,23 @@ adoption_class = "pattern"
 program_decision = "PATTERN WITH EXCLUSIONS (Documentation Program section 1A)"
 module = "OpenCode driver pattern (ELIOT OpenCode adapter; no Waku module)"
 repository = "https://github.com/egoist/waku"
-reviewed_pin = "v0.1.20"
+reviewed_pin = "v0.1.20 (commit 10bcd728c9b2f07d664cfece3c8c870d3418ddd2)"
+reviewed_commit = "10bcd728c9b2f07d664cfece3c8c870d3418ddd2"
 installed_pin = "none (pattern only; no code imported)"
 qualification = "none_pattern_only; no installation and no live qualification"
 source_units = ["crates/waku-core/src/driver/opencode.rs"]
-license_declaration = "UNVERIFIED"
+license_declaration = "GPL-3.0; root LICENSE at v0.1.20 (verified 2026-10-02 against the LICENSE file at the exact tag: GNU General Public License, Version 3). GPL-3.0 is an additional reason Waku stays pattern-only: its core must not be vendored into this repository (Documentation Program implementation review section 9.1)."
 execution = "Pattern transfer into the existing ELIOT OpenCode boundary only, with the exclusions below; this is not permission to copy Waku source (Documentation Program section 1A preamble)."
 retain = ["External-service ownership", "Single sequential worker", "Reconnect is not process exit", "Terminal taken from the execution outcome"]
 do_not_copy = ["Same-ID fresh-session fallback (rejected)", "Ignored model/agent switch failures (rejected)", "Transport-error-as-rejection (rejected)"]
 non_transferable_limits = ["The three rejected behaviours in do_not_copy are exclusions from the pattern, not optional details (Documentation Program section 1A)"]
+source_reviewed = true
+installed = false
+fixture_checked = false
+live_smoke = false
+fault_injected = false
+soaked = false
+role_qualified = false
 
 [[alternatives]]
 id = "helicon-muse-facade"
@@ -311,6 +416,13 @@ license_declaration = "UNVERIFIED"
 units = ["packages/daemon", "Required dependency closure"]
 decision = "Use as a whole facade instead of more own Muse glue only if it removes work; not an additional mandatory server over direct SDK. It duplicates session/store/UI authority and must never attach alongside ELIOT to the same Muse session (Documentation Program section 1A)."
 exclude = ["Model-based title discovery", "Desktop/web UI", "Second authoritative task store"]
+source_reviewed = true
+installed = false
+fixture_checked = false
+live_smoke = false
+fault_injected = false
+soaked = false
+role_qualified = false
 
 [[alternatives]]
 id = "atlas-acp-backend"
@@ -324,6 +436,13 @@ installed_pin = "none (research only; the vendored snapshot at this commit cover
 qualification = "none_research_only; no installation and no live qualification"
 license_declaration = "Apache-2.0; root LICENSE (same upstream repository as atlas-redact; recorded in THIRD_PARTY_NOTICES.md)"
 decision = "Alternative to ACPX for an ACP binding, not a second connection to it. Research only as an alternative product stack: its closure is broad and carries manager/store/transcript/native-agent authority, so it is not a small ELIOT backend (Documentation Program section 1A)."
+source_reviewed = true
+installed = false
+fixture_checked = false
+live_smoke = false
+fault_injected = false
+soaked = false
+role_qualified = false
 
 [[alternatives]]
 id = "multica-poracode-restate-coder"
@@ -335,6 +454,13 @@ installed_pin = "none (reference only; nothing installed)"
 qualification = "none_reference_only; no installation and no live qualification"
 license_declaration = "UNVERIFIED"
 decision = "Reference points only (native Codex steer; cockpit controls; durable outer workflows; governed workspaces). None of them becomes a current ELIOT authority through the Documentation Program."
+source_reviewed = false
+installed = false
+fixture_checked = false
+live_smoke = false
+fault_injected = false
+soaked = false
+role_qualified = false
 
 [[external_runtimes]]
 id = "vendor-cli"
