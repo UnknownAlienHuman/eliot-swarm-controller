@@ -45,6 +45,13 @@ The built-in `eliot-opencode-v2.http.1` adapter attaches to an explicitly config
 
 The complete pinned `atlas-redact` donor is now used to scrub retained native question/diagnostic copies. Its upstream files remain unchanged behind a separate Cargo wrapper; licenses, rule notices and snapshot hashes are retained in [third-party notices](THIRD_PARTY_NOTICES.md). Snapshot updates follow [modules/atlas-redact/UPDATE.md](modules/atlas-redact/UPDATE.md). This is actual library reuse, not a claim that all listed donors were installed.
 
+## Zed eval-cli batch runtime
+
+`src/runtime/zed.rs` implements the C11 Zed boundary as a batch executor unit over the pinned native `eval-cli` contract (ZD-EXEC basis `7604aa3f`): `describe` reports the configured entrypoint, the exact `provider/model`, a bounded timeout and the honestly absent capabilities — no persistent control, resume, goal, steer or session family, and Zed native is not an external ACP editor. One batch run spawns `eval-cli --workdir … --model … --instruction … --timeout … --output-dir …` with only the route-named environment keys passed through; values are never persisted. Exit codes keep their native meanings (0 agent finished, 1 error, 2 timeout, 3 interrupted) and exit 0 is a finished run, not Task acceptance. `result.json` is cross-checked against the exit code and the configured model before anything is believed, and `result.json`/`thread.md`/`thread.json` are published as immutable, digest-checked artifacts, paged without truncation. The installed Zed binary is not live-qualified, and host admission wiring (route validation, supervisor, operation mapping for a sessionless runtime) is the next slice: the runtime is not yet reachable through controller operations.
+
+The complete pinned `atlas-redact` donor is now used to scrub retained native question/diagnostic copies. Its upstream files remain unchanged behind a separate Cargo wrapper; licenses, rule notices and snapshot hashes are retained in [third-party notices](THIRD_PARTY_NOTICES.md). This is actual library reuse, not a claim that all listed donors were installed.
+>>>>>>> 1f42fe9 (docs: document Zed eval-cli batch runtime boundary)
+
 **Why JavaScript exists:** the Muse adapter and the Claude adapter each use their vendor's official Node SDK; neither the controller authority nor the OpenCode adapter does. Muse's first runnable bridge is commit `b2bd0211` (2026-09-30). See [the exact provenance](docs/javascript-provenance.md). No Muse files were deleted or language statistics hidden.
 
 ## Native Muse, clients and task-specific children
