@@ -1,0 +1,11 @@
+# Module-local environment for modules/codex. The pinned Codex Python SDK
+# itself is vendored under vendor_bridge/ (version 0.0.0-dev at upstream
+# commit 18194bfd3534ca567d886eac454028dafaa68b6c) and is used from source
+# via PYTHONPATH set inside bridge.py; it is a dev snapshot and is never
+# installed from a registry. The pins below are the exact versions locked
+# by the donor's own uv.lock at that commit (pydantic, packaging), plus
+# `websockets`, the maintained WebSocket client library used for the
+# shared-server transport (no hand-written framing).
+pydantic==2.13.4
+packaging==26.2
+websockets==17.1
