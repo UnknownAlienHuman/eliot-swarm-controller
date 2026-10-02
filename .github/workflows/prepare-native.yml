@@ -18,9 +18,9 @@ jobs:
           BASE=8745e3334ed638ff98d09b00909a7b562e081b06
           test "$GITHUB_REF_NAME" = "feat/opencode-terminal-results"
           test "$(git merge-base HEAD "$BASE")" = "$BASE"
-          printf '%s  %s\n' d9a3c287a41d034395fd88427bfbdd001621ceff052f3d554a6de3f42f4c0aab .github/import/opencode-terminal-results.patch.gz | sha256sum -c -
+          printf '%s  %s\n' c65fda68a1977b263a380e7e47c38be3bdc8f4db3247b9b12c1041d4a25f0cca .github/import/opencode-terminal-results.patch.gz | sha256sum -c -
           gzip -dc .github/import/opencode-terminal-results.patch.gz > "$RUNNER_TEMP/opencode-terminal-results.patch"
-          printf '%s  %s\n' 1c9e1f51079be4f6eb08781a82cc4475d71cf3680105599c7445d7a4b81893b3 "$RUNNER_TEMP/opencode-terminal-results.patch" | sha256sum -c -
+          printf '%s  %s\n' 3fc416a462830f55e8cff7e1d099cb8c699e4d32148cd09c700783432028cc22 "$RUNNER_TEMP/opencode-terminal-results.patch" | sha256sum -c -
           git apply --check "$RUNNER_TEMP/opencode-terminal-results.patch"
           git apply "$RUNNER_TEMP/opencode-terminal-results.patch"
           test "$(git hash-object .github/workflows/rust.yml)" = b8dbc5881fcd65d483816efe6aa115b273217d54
@@ -30,7 +30,7 @@ jobs:
           test "$(git hash-object src/runtime/opencode_v2/tests.rs)" = d43b9b1161b06478bf46968ec9ccd785d6a182c8
           test "$(git hash-object src/store/opencode.rs)" = 997dcf17a7dd2b523919d736e8b9554a099dc719
           test "$(git hash-object src/store/opencode/tests.rs)" = 269a431d04d3ffef14a07eef9c32b9c89291331d
-          test "$(git hash-object src/store/producers.rs)" = 909928913db5ef911e9f9690e8cba9553e809684
+          test "$(git hash-object src/store/producers.rs)" = 1a1efa0e70b8dcd307cc176ac3fb42f8cea25f8f
           git show "$BASE:.github/workflows/prepare-native.yml" > .github/workflows/prepare-native.yml
           rm .github/import/opencode-terminal-results.patch.gz
           git diff --check
