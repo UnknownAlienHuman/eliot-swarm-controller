@@ -14,7 +14,7 @@ use crate::{
 use rusqlite::{Connection, TransactionBehavior, params};
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     time::{Duration, Instant},
 };
 use tokio::{sync::watch, task::JoinHandle};
@@ -34,6 +34,37 @@ fn bindings(db: &Connection, service: Option<&str>) -> Result<Vec<Value>> {
         }
     }
     Ok(result)
+}
+/// Child sessions with a bound producer that no terminal evidence has
+/// discharged. The snapshot reader tracks exactly these (plus active and
+/// already-recorded open periods); unbound children are never log-read.
+fn bound_child_sessions(db: &Connection, p: &Principal) -> Result<BTreeSet<String>> {
+    let (id, generation, binding) = runtime::scope(db, p, true)?;
+    let root = binding["native_root_id"].as_str().unwrap_or_default();
+    let mut stmt = db.prepare(
+        "SELECT producers_json FROM attempts WHERE binding_id=?1 AND binding_generation=?2 AND released_at_ms IS NULL",
+    )?;
+    let rows = stmt
+        .query_map(params![id, generation], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    let mut out = BTreeSet::new();
+    for raw in rows {
+        let producers: Vec<Value> = serde_json::from_str(&raw)?;
+        for producer in producers {
+            if let Some(session) = producer["native_session_id"]
+                .as_str()
+                .filter(|s| !s.is_empty() && *s != root)
+                && !matches!(
+                    producer["disposition"].as_str(),
+                    Some("completed" | "failed" | "cancelled")
+                )
+            {
+                out.insert(session.to_owned());
+            }
+        }
+    }
+    Ok(out)
 }
 fn attach(db: &mut Connection, binding: &Value, boot: &str) -> Result<Principal> {
     let id = model::text(binding, "binding_id")?;
@@ -201,9 +232,14 @@ impl Store {
                 model::positive(b, "generation")?,
             )
             .await?;
+        let principal = p.clone();
+        let bound_children = self
+            .run(move |db| bound_child_sessions(db, &principal))
+            .await
+            .unwrap_or_default();
         let snapshot = tokio::time::timeout(
             Duration::from_secs(20),
-            service.snapshot(root, &b["observation"]["native"]),
+            service.snapshot(root, &b["observation"]["native"], &bound_children),
         )
         .await
         .map_err(|_| Error::new("NATIVE_SNAPSHOT_TIMEOUT", "bounded readback did not finish"))??;

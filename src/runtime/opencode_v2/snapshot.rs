@@ -1,5 +1,5 @@
 use super::{
-    Service,
+    Service, SessionScan,
     http::{Data, decode},
     valid_id,
 };
@@ -14,6 +14,11 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 const MAX_MEMBERS: usize = 256;
 const MAX_PAGES: usize = 64;
 const MAX_PENDING: usize = 128;
+/// Durable child-log reads per snapshot. Only tracked children are read:
+/// natively active members, members with an unfinished recorded period, and
+/// members with a bound non-terminal producer (supplied by the Store).
+const MAX_CHILD_LOG_READS: usize = 16;
+const MAX_TURNS: usize = 128;
 #[derive(Deserialize)]
 struct Page {
     data: Vec<Value>,
@@ -71,7 +76,12 @@ fn compact(value: &Value) -> Value {
         "native_session_outcome":value["outcome"].as_str().filter(|s|matches!(*s,"succeeded"|"failed"|"interrupted")),"observed_now":true})
 }
 impl Service {
-    pub(crate) async fn snapshot(&self, root: &str, previous: &Value) -> Result<Snapshot> {
+    pub(crate) async fn snapshot(
+        &self,
+        root: &str,
+        previous: &Value,
+        bound_children: &BTreeSet<String>,
+    ) -> Result<Snapshot> {
         let root_info = self.session(root).await?;
         let mut retained = BTreeMap::new();
         for old in previous["observed_children"]
@@ -151,7 +161,17 @@ impl Service {
                         failures.push(json!({"code":"FAMILY_RETAINED_LIMIT"}));
                         break;
                     }
-                    retained.insert(id.clone(), compact(&child));
+                    let mut entry = compact(&child);
+                    // A fresh session page must not erase durable execution
+                    // evidence recorded for this member by an earlier read.
+                    if let Some(old) = retained.get(&id) {
+                        for key in ["execution_scan", "last_turn", "execution_disposition"] {
+                            if old.get(key).is_some_and(|v| !v.is_null()) {
+                                entry[key] = old[key].clone();
+                            }
+                        }
+                    }
+                    retained.insert(id.clone(), entry);
                     queue.push_back(id);
                 }
                 if invalid {
@@ -336,9 +356,110 @@ impl Service {
             retained.keys().filter(|id| a.contains_key(*id)).count()
                 + usize::from(a.contains_key(root))
         });
+        // Addressed per-child execution evidence from each tracked child's own
+        // durable log. Only tracked members pay a log read: bound non-terminal
+        // producers first, then members with an unfinished recorded period,
+        // then natively active members. A failed or unsynced read keeps the
+        // previously recorded evidence and adds a failure; it never invents a
+        // terminal and never erases one already recorded.
+        let mut turns: Vec<Value> = Vec::new();
+        {
+            let mut tracked: Vec<String> = Vec::new();
+            let mut enqueue = |id: &str| {
+                if retained.contains_key(id) && !tracked.iter().any(|t| t.as_str() == id) {
+                    tracked.push(id.to_owned());
+                }
+            };
+            for id in bound_children {
+                enqueue(id);
+            }
+            for (id, entry) in &retained {
+                if let Some(saved) = entry.get("execution_scan").filter(|v| !v.is_null()) {
+                    let parent = entry["parentSessionId"].as_str().unwrap_or_default();
+                    if let Ok(scan) = SessionScan::restore(id, parent, Some(saved))
+                        && !scan.is_terminal()
+                    {
+                        enqueue(id);
+                    }
+                }
+            }
+            if let Some(active) = &active {
+                for id in active.keys() {
+                    enqueue(id);
+                }
+            }
+            let project_id = root_info["projectID"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            let mut reads = 0usize;
+            for id in tracked {
+                if reads >= MAX_CHILD_LOG_READS {
+                    failures.push(
+                        json!({"code":"CHILD_LOG_TRACK_LIMIT","session_id":id,"source":"child_execution_log"}),
+                    );
+                    continue;
+                }
+                let Some(entry) = retained.get(&id) else {
+                    continue;
+                };
+                let parent = entry["parentSessionId"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                let saved = entry
+                    .get("execution_scan")
+                    .filter(|v| !v.is_null())
+                    .cloned();
+                reads += 1;
+                match self
+                    .read_session_execution(&id, &parent, &project_id, saved.as_ref())
+                    .await
+                {
+                    Ok(read) => {
+                        let (synced, gap) = (read.synced, read.gap);
+                        let last = if synced { read.scan.last_turn() } else { None };
+                        let disposition = read.scan.disposition();
+                        let new_turns = if synced {
+                            read.scan.turns()
+                        } else {
+                            Vec::new()
+                        };
+                        let entry = retained.get_mut(&id).unwrap();
+                        entry["execution_scan"] = json!(read.scan);
+                        if synced {
+                            if let Some(last) = last {
+                                entry["last_turn"] = last;
+                            }
+                            entry["execution_disposition"] = json!(disposition);
+                            turns.extend(new_turns);
+                        } else {
+                            failures.push(json!({"code":gap.unwrap_or("NATIVE_LOG_NOT_SYNCED"),"session_id":id,"source":"child_execution_log"}));
+                        }
+                    }
+                    Err(e) => failures.push(
+                        json!({"code":e.code,"session_id":id,"source":"child_execution_log"}),
+                    ),
+                }
+            }
+            if turns.len() > MAX_TURNS {
+                turns.drain(..turns.len() - MAX_TURNS);
+            }
+        }
+        // Coverage is reported per axis. No axis raises family_completeness:
+        // these pages are still volatile and non-atomic.
+        let family_coverage = json!({
+            "members_total":retained.len(),
+            "members_observed_now":retained.values().filter(|e| e["observed_now"]==true).count(),
+            "members_active_verified":active.as_ref().map(|a| retained.keys().filter(|id| a.contains_key(*id)).count()),
+            "members_with_execution_evidence":retained.values().filter(|e| e["last_turn"].is_object()).count(),
+            "members_with_terminal_evidence":retained.values().filter(|e| matches!(e["last_turn"]["terminal"].as_str(),Some("completed"|"failed"|"cancelled"))).count(),
+            "root_active_verified":active.as_ref().map(|a| a.contains_key(root)),
+        });
         Ok(Snapshot {
             state: json!({"native_root_id":root,"session":compact(&root_info),
             "observed_children":retained.into_values().collect::<Vec<_>>(),"pending_requests":pending.into_values().collect::<Vec<_>>(),
+            "turns":turns,"family_coverage":family_coverage,
             "execution":match active_count {Some(n) if n>0=>"observed_active",Some(_)=>"not_observed_active",None=>"unknown"},
             "active_drain_count":active_count,"configuration":configuration,
             "agent_configuration":agent_configuration,"model_configuration":model_configuration,

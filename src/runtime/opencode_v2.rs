@@ -15,7 +15,7 @@ pub(crate) use configuration::{
     AGENT_SETTINGS_REVISION_KIND, ConfigurationExpectation, INSTRUCTION_SETTINGS_REVISION_KIND,
     MODEL_SETTINGS_REVISION_KIND, configuration_contract, configuration_expectation,
 };
-pub(crate) use execution::{ExecutionRead, ExecutionScan};
+pub(crate) use execution::{ExecutionRead, ExecutionScan, SessionRead, SessionScan};
 pub(crate) use goal::GOAL_CONTRACT_REVISION;
 pub(crate) use http::{EventReader, EventState, Service};
 use serde::{Deserialize, Serialize};

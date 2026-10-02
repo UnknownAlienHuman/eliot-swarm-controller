@@ -4,7 +4,7 @@ use crate::{
     error::{Error, Result},
     runtime::{
         RuntimeCommand,
-        opencode_v2::{ExecutionRead, ExecutionScan},
+        opencode_v2::{ExecutionRead, ExecutionScan, SessionRead, SessionScan},
     },
 };
 use eventsource_stream::Eventsource;
@@ -12,19 +12,69 @@ use futures_util::StreamExt;
 use serde_json::Value;
 use std::collections::BTreeSet;
 
+/// One scan's view of the shared stream loop. Anchor replay is verified, never
+/// assumed; consumption and watermark handling stay with the scan itself.
+trait LogScan {
+    fn session_id(&self) -> &str;
+    fn after(&self) -> Option<u64>;
+    fn has_anchor(&self) -> bool;
+    fn verify_anchor(&self, value: &Value) -> Result<()>;
+    fn consume(&mut self, value: &Value) -> Result<()>;
+    fn synchronize(&mut self, value: &Value) -> Result<()>;
+}
+struct InputScan<'a> {
+    scan: ExecutionScan,
+    command: &'a RuntimeCommand,
+}
+impl LogScan for InputScan<'_> {
+    fn session_id(&self) -> &str {
+        self.scan.session_id()
+    }
+    fn after(&self) -> Option<u64> {
+        self.scan.after()
+    }
+    fn has_anchor(&self) -> bool {
+        self.scan.anchor().is_some()
+    }
+    fn verify_anchor(&self, value: &Value) -> Result<()> {
+        self.scan.verify_anchor(value)
+    }
+    fn consume(&mut self, value: &Value) -> Result<()> {
+        self.scan.consume(value, self.command)
+    }
+    fn synchronize(&mut self, value: &Value) -> Result<()> {
+        self.scan.synchronize(value)
+    }
+}
+impl LogScan for SessionScan {
+    fn session_id(&self) -> &str {
+        self.session_id()
+    }
+    fn after(&self) -> Option<u64> {
+        self.after()
+    }
+    fn has_anchor(&self) -> bool {
+        self.anchor().is_some()
+    }
+    fn verify_anchor(&self, value: &Value) -> Result<()> {
+        self.verify_anchor(value)
+    }
+    fn consume(&mut self, value: &Value) -> Result<()> {
+        self.consume(value)
+    }
+    fn synchronize(&mut self, value: &Value) -> Result<()> {
+        self.synchronize(value)
+    }
+}
+
 impl Service {
-    pub(in crate::runtime::opencode_v2) async fn execution_log(
-        &self,
-        command: &RuntimeCommand,
-        mut scan: ExecutionScan,
-    ) -> Result<ExecutionRead> {
-        let root = command
-            .native_root_id
-            .as_deref()
-            .ok_or_else(|| Error::invalid("execution read needs the exact native root"))?;
+    async fn stream_log<S: LogScan>(&self, scan: &mut S) -> Result<(bool, Option<&'static str>)> {
         let mut url = self
             .endpoint
-            .join(&format!("/api/experimental/session/{root}/log"))
+            .join(&format!(
+                "/api/experimental/session/{}/log",
+                scan.session_id()
+            ))
             .map_err(|_| Error::new("NATIVE_ENDPOINT", "invalid native log route"))?;
         url.query_pairs_mut().append_pair("follow", "false");
         if let Some(after) = scan.after() {
@@ -66,7 +116,7 @@ impl Service {
             })
             .eventsource();
         futures_util::pin_mut!(stream);
-        let mut needs_anchor = scan.anchor().is_some();
+        let mut needs_anchor = scan.has_anchor();
         let mut synced = false;
         let mut ids = BTreeSet::new();
         let mut count = 0usize;
@@ -120,7 +170,7 @@ impl Service {
                 scan.verify_anchor(&value)?;
                 needs_anchor = false;
             } else {
-                scan.consume(&value, command)?;
+                scan.consume(&value)?;
             }
         }
         // A partial response may advance checked scan progress, never producer
@@ -132,14 +182,40 @@ impl Service {
             ));
         }
         let synced = synced && read_gap.is_none();
+        let gap = read_gap.or(if synced {
+            None
+        } else {
+            Some("NATIVE_LOG_NOT_SYNCED")
+        });
+        Ok((synced, gap))
+    }
+
+    pub(in crate::runtime::opencode_v2) async fn execution_log(
+        &self,
+        command: &RuntimeCommand,
+        scan: ExecutionScan,
+    ) -> Result<ExecutionRead> {
+        let root = command
+            .native_root_id
+            .as_deref()
+            .ok_or_else(|| Error::invalid("execution read needs the exact native root"))?;
+        let mut input = InputScan { scan, command };
+        if input.session_id() != root {
+            return Err(Error::invalid("execution scan belongs to another session"));
+        }
+        let (synced, gap) = self.stream_log(&mut input).await?;
         Ok(ExecutionRead {
-            scan,
+            scan: input.scan,
             synced,
-            gap: read_gap.or(if synced {
-                None
-            } else {
-                Some("NATIVE_LOG_NOT_SYNCED")
-            }),
+            gap,
         })
+    }
+
+    pub(in crate::runtime::opencode_v2) async fn session_log(
+        &self,
+        mut scan: SessionScan,
+    ) -> Result<SessionRead> {
+        let (synced, gap) = self.stream_log(&mut scan).await?;
+        Ok(SessionRead { scan, synced, gap })
     }
 }
