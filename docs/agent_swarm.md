@@ -1,6 +1,6 @@
 # ELIOT Swarm Prototype — архитектура v18
 
-**Уточнено 30 сентября 2026. Проект реализации. Rust-сервис ещё не написан.**
+**Уточнено 2 октября 2026. Реализация существует: Rust-сервис и модули собраны на baseline `b0d27f4` (кампания C01–C11). Этот документ — действующая архитектура реализованного сервиса, а не проект будущего сервиса. Текущая готовность и квалификация по поверхностям — в [README](../README.md); незакрытые остатки ведутся issue, а не этим текстом. Подразделы R10–R17 ниже — нормы Documentation Program: где основа уже реализована, это сказано прямо; остальное помечено как норма, код — Фаза B.**
 
 Headless Rust-контроллер над родными executors. Назначение — устойчиво обслуживать реальный рой, а проверенные модули и результаты перенести в Eliot Memory OS. Не новый model harness и не универсальная агентная платформа.
 
@@ -84,6 +84,30 @@ Native pipes, созданные SDK, принадлежат SDK. Поэтому
 
 Replacement bridge сначала проверяет прежний native owner. Constructor не запускает второй subprocess вслепую. Batch/legacy stdio допускается с честно более слабой границей отказа [S2–S3, S24].
 
+### Task specification и workflow policy (R10)
+
+**Task specification и workflow policy различаются.** Specification содержит исходные Work/Acceptance, канонические ссылки и versioned source comments. Policy содержит роли, разрешённые проверки, publication unit и порядок работы. Каждая назначенная Attempt знает, по какой принятой policy она работает. Ещё один BATCH planner над Issue не создаётся; политика не меняется автоматически по дате или mtime.
+
+**Одна Issue — одна единица сдачи.** Менеджер может разбить реализацию на внутренние задания писателям по непересекающимся участкам, но не создаёт из них независимые продуктовые сдачи без явно принятого исключения. Неполный результат можно сохранить; сохранение не означает разрешение merge или принятие Task.
+
+**Роли и граница host/model.** Менеджер читает canonical Issue и все требуемые комментарии один раз на актуальной revision и выдаёт каждому писателю необходимый фрагмент, exact source baseline, allowed files и смысл проверки, ожидаемый результат. Ревьюер проверяет candidate независимо от писателя. Полномочия «запускать cargo», «индексировать graph», «публиковать candidate», «принимать результат» задаются роли и application boundary; писатель без этих прав получает исходники, требования и read-only navigation — это не объявляется OS sandbox при сохранённом unrestricted native shell. Детерминированные обязанности host (heartbeat, таймеры, пересылка, подсчёты, due/retention) выполняет host без модели; модельная работа — содержательные решения внутри выданного задания. Shared contract меняется согласованно его владельцами, не саморазрешением писателя на любые файлы.
+
+**TASK/brief — проекция, не authority.** Проекция TASK/brief собирается из specification и принятой policy и не имеет права добавлять собственный процессный приказ или скрывать неизвестный комментарий как noise. Новые комментарии видны как обновление specification (новая revision), а не как бесконечный полный transcript в каждом ходе; процессная история не попадает во все writer prompts.
+
+**Owner-policy: статус — policy pending owner decision.** Присланный управляющий бриф противоречив: его §0 объявлен приоритетным, но последующая история и действующий TEMPLATE отменяют ряд его правил. Победившее правило не выбирается автоматически по дате, и согласованная редакция owner-policy ещё не опубликована владельцем. Этот документ фиксирует только факт ожидания решения; выдумывать победившие правила нельзя. Нормы ниже, зависящие от policy (в частности, порядок publication vs acceptance в R11), применяются в части, не зависящей от спорных правил, и помечены как policy-selected.
+
+### Идентичность сдачи (R11)
+
+> Одна рабочая ветка менеджера может последовательно обслуживать несколько Attempts, но имя ветки не является их идентичностью. Возврат, приёмка и очистка всегда адресуют конкретные retained submission/candidate.
+
+Manager identity, native binding generation, рабочее место и имя ветки не являются идентичностью сдачи. Сдача адресуется существующими Task revision, Attempt, `submission_ref` и `candidate_ref`; publication сохраняет exact native Git SHA. Все review, возвраты и уборка относятся к этой идентичности, не к «последнему файлу» и не к имени branch: запоздалое событие старой сдачи (например, поздний HOLD) не меняет новое состояние той же ветки, а stale cleanup mark не применяется к новой голове.
+
+После submit candidate неизменяем. Пока manager worktree участвует в проверяемом результате, запись в него для следующей Issue не допускается (frozen worktree); разрешено готовить документацию и задания вне frozen source. После принятого результата предыдущей работы branch может получить новое содержимое. Возврат и release применяются атомарно к ожидаемому текущему submission; историческое замечание хранится даже при новом candidate, но не подменяет его remaining, owner или marker. Повторное получение результата возвращает ту же Operation, а не повторяет merge; неизвестный ответ GitHub проверяется readback, а не повторной модельной работой.
+
+Требуемые item IDs берутся из замороженной спецификации, не из присланного подмножества. `PARTIAL-OK` — адресное решение уполномоченного лица по конкретной Task revision и remaining items, а не вечный файл рядом с Issue. TEST-PHASE допускается только на предусмотренной стадии, оставаясь неисполненным evidence.
+
+**Порядок publication vs финальная Task acceptance выбирает policy конкретного проекта (policy-selected, без дефолта в этом документе).** Зелёный Clippy не закрывает Issue, а merge не заменяет acceptance. Основа этой нормы уже реализована в существующих submissions/operations; приведение ручных marker-практик к ней — миграция R17, а не новый API.
+
 ## 5. Состояние и транзакции
 
 Девять таблиц: `meta/tasks/attempts/bindings/operations/observations/artifacts/check_runs/incidents`. Native payload — JSON в существующих records. Не таблица на каждое SDK-событие и не второй event store.
@@ -102,7 +126,7 @@ reserved → running → submitted → accepted
 
 Одна `rusqlite::Connection` на DB-thread; короткие reads/writes, никаких HTTP/Git/LLM в транзакции. Статус читается из общей memory projection. WAL/FULL, foreign_keys включены до transaction; выбирается bundled SQLite с требуемым исправлением WAL-reset [S7–S8, S16].
 
-Новый [reference DDL](agent_swarm.spec-v18/migrations/001_core.sql) добавляет origin identity, initial-dispatch pointer и отдельное владение ресурсом CheckRun. Active-check dedupe ограничен одной Attempt. Девять таблиц сохранены. Это поправка initial schema ещё не реализованного продукта, не миграция рабочей БД. Подробности Store/C01 — в [плане v6](agent_swarm.implementation-v6.md). Уточнение 30.09 добавляет только три поля в те же таблицы: `start_owner`, `accepted_operation_id`, `cached_from_check_id`; это всё ещё reference initial schema, не миграция установленного сервиса.
+Новый [reference DDL](agent_swarm.spec-v18/migrations/001_core.sql) добавляет origin identity, initial-dispatch pointer и отдельное владение ресурсом CheckRun. Active-check dedupe ограничен одной Attempt. Девять таблиц сохранены. Reference DDL — проектный источник; действующий файл initial schema — `migrations/001_core.sql` в корне репозитория, он применяется runtime, а не является миграцией уже развёрнутой внешней БД. Подробности Store/C01 — в [плане v6](agent_swarm.implementation-v6.md). Уточнение 30.09 добавляет только три поля в те же таблицы: `start_owner`, `accepted_operation_id`, `cached_from_check_id`; это всё ещё reference initial schema, не миграция установленного сервиса.
 
 ## 6. Шина и управление нагрузкой
 
@@ -156,6 +180,20 @@ Event identity определяется native контрактом: один me
 
 Doctor выдаёт причину и доступный следующий шаг: reconnect read path, адресная сверка, продолжение поддержанным resume либо task handoff после разрешения старых эффектов. Unknown не скрывается вечным зелёным running и не разрешает blind reassign.
 
+### Scoped observations и адресное внимание (R12)
+
+Adapter сообщает native identities и отношения родитель/ребёнок отдельно от нормализованного статуса. Неполное или недоступное наблюдение не превращается в пустое множество. Полный shared stream фильтруется принадлежностью binding/parent, а не title, cwd или окном времени: дети другой линии не попадают в count, usage и quota этого менеджера. Native status, связь транспорта и производственный прогресс — отдельные факты.
+
+Недостаток писателей вычисляется только для разрешённой работы и известной capacity; pending native admissions учитываются до получения running status. Удерживаемый ресурс, frozen submission и ожидание формы объясняют отсутствие записи, и reminder не должен отменять эти ограничения. Желаемый параллелизм не гарантируется, если effective native capacity меньше или неизвестна; неизвестный roster не вызывает приказ «запусти N писателей», а менеджер, чья сдача на проверке (under review), не получает приказ писать.
+
+Attention item адресует текущий native request/tool и Task: форма, approval, foreground wait, blocked dependency или missing result. Reply на attention проверяет тот же request ID и актуальное содержимое; retry attention не отправляет повторные решения на уже завершённый request. Unknown schema/decision передаётся менеджеру как задача выбора, а не разрешается автоматически первым, рекомендованным или отменой. Экономичный контроль: pending events coalesce, на неизменную причину — один активный incident, неизменный отчёт не создаёт новый модельный вызов.
+
+### Drain без новых дублей (R13)
+
+Intent и target сохраняются до первого native write; неизвестный исход create/prompt/control восстанавливается предусмотренным native readback либо остаётся адресным incident — generic retry не повторяет мутацию только потому, что caller не получил ответ. Наличие input ID означает заявленную native границу, а не автоматически начатое исполнение; старый intent не переносится в новую unrelated generation/Attempt, а отсутствие известной сессии не разрешает создать другую под прежним ID.
+
+Draining запрещает новый workload, но позволяет получить результаты детей, ответить на текущие вопросы и довести незавершённые операции. Parent idle и client exit не освобождают native goal и детей автоматически. Прекращение цели, interrupt, detach и release — разные действия; управление native continuation выполняется только явно поддержанным методом и с полномочиями на точную сессию. Read-only helper/observer не запускает и не перезапускает native server: по умолчанию отсутствие связи — incident, а не захват чужого процесса; ошибка probe остаётся unknown.
+
 ## 9. Маршруты и настройка
 
 ```text
@@ -197,6 +235,14 @@ GM wake квалифицируется: native input либо поддержан
 
 Client principal стабилен между переподключениями и не равен PID/link ID. Identity клиента и роль GM — разные вещи: в meta хранится текущий GM binding/epoch, а Application проверяет методы по роли и ownership. Writer не принимает собственную сдачу через `task.accept`; доверенный локальный operator и GM используют свои явные bindings. Это защита от случайных команд через штатный API, не sandbox от того же пользователя с полным shell-доступом.
 
+### Host scheduling, quota и отчёты (R16)
+
+Периодическая работа имеет одного host owner, сохранённые due/outcome и явную политику пропуска/задержки; смена GM и закрытие его клиента не теряют расписание и committed операции. Два observer не поднимают двух guardians на один slot. Retry выполняется по виду ошибки и evidence; structural/identity error не запускает loop с неизменными входами, а пропущенные slots не исполняются неожиданно пачкой, если контракт выбрал skip.
+
+Desired configuration и runtime availability хранятся раздельно: локальная ошибка не меняет owner-selected model, limits, safety, schedule или enabled policy. Ограничение quota/cooldown относится к scope native evidence — session, provider, account или shared service; неизвестный scope не дублируется как независимый бюджет каждой линии, а 429 с неизвестным subtype не объявляется автоматически hourly rate limit.
+
+Чтение отчёта — projection committed состояния: оно не запускает модели, не переписывает очередь, не освобождает claim и не удаляет файл. Отсутствующая observation показывается как unknown с source/freshness, а не нулём или DOWN; status text с цитатой ошибки не считается native failure. Отчёты и attention показывают next due и last failure; метрики — finished valid requirements/Issues, pending addressed submissions, retained writer outputs, actionable blockers и waiting cause, а не число созданных агентов.
+
 ## 11. Проверки и общая рабочая копия
 
 CheckRunner — один обычный process executor. Cargo — профиль/parser, не новая build system. CheckSpec фиксирует candidate, profile/toolchain, features/targets и существенное env. Active dedupe — `(attempt_id, check_input_key)`: разные Task не делят один mutable CheckRun. Для одинакового повторного запроса своей Attempt возвращается существующий handle. Завершённый машинный cache может переиспользоваться по exact inputs, но создаёт отдельный CheckRun новой Attempt с `cached_from_check_id`; её требования проверяются заново. Cache hit не запускает процесс, не захватывает target-dir и не выдумывает собственные PID/exit code/время исполнения: они читаются из исходного process CheckRun. Store проверяет его пригодность и отсутствие отзыва. Цепочки cache→cache не нужны: ссылка сразу на исходный процесс. Network/time/external inputs без версии не выдаются за воспроизводимые.
@@ -214,6 +260,8 @@ Build resources: один writer target-dir, согласованные jobs Car
 Писатель возвращает candidate, проверка — result, decision owner принимает phase. Сначала код и минимальный Clippy согласно кампании; broad tests после готового среза. Сборка одного пакета не выдаётся за проверку всего продукта.
 
 Для зависимости фиксируется acceptance identity (operation ID + revision/phase/candidate), а не только «было ready». Перед приёмкой потребителя проверяется, не отозвана ли она и не требуется ли адресная перепроверка. Пересмотр upstream не убивает выполняющихся писателей и не уничтожает полезные artifacts. Уже принятый результат потребителя остаётся историческим фактом; новая обязательная ревизия рассматривается явно, не каскадным стиранием всей приёмки.
+
+Дополнение R11 к этой секции: на время проверки candidate рабочая копия заморожена не только как источник CheckRunner — запись менеджера в тот же worktree для следующей Issue не допускается, пока его содержимое участвует в проверяемом результате; подготовка документации и заданий вне frozen source разрешена. Проверка относится к exact candidate и фактическим effective входам (см. норму R14 в плане v6; её cache/reuse часть — pending, issue #6).
 
 ## 12. Качество без микроменеджмента
 
@@ -243,6 +291,8 @@ Artifact: own temp → finish/flush → immutable publication без overwrite �
 Backup через SQLite Backup API. Migration до admission под singleton; неизвестную новую schema старый binary не открывает. Откат БД не безопасен при живых внешних effects: нужен reconciliation, не универсальный downgrade [S16].
 
 Restore сначала сохраняет текущее и проверяет task-owned пути; чужие изменения не перетираются. Нет blanket reset/clean, чужого WAL/gc и мнимого отката внешних эффектов через Git.
+
+Дополнение R11 к этой секции: порядок шагов выше — intent → remote effect/readback → publication fact → acceptance/bookkeeping — не фиксирует, что из пары publication/acceptance идёт первым: это выбирает policy проекта (policy-selected, см. §4/R11). В любом порядке повторное получение результата возвращает ту же Operation, а не повторяет merge, и зелёная проверка не подменяет acceptance.
 
 ## 14. Быстро, но с честной границей масштаба
 
@@ -290,6 +340,21 @@ Core не меняется ради очередного native метода. Л
 Семантика Eliot I10.15/17/18 сохраняется: наш RuntimePort → ExternalAgentAdapter/WorkExecutor, mailbox → PeerChannel, checks → InstrumentRunner, lifecycle → Kernel/AdapterSupervisor [S11]. Нет преждевременного полного Governor и production-системы receipts/подписей.
 
 При передаче домена Eliot его Task authority становится единственным. Prototype scheduler для домена выключается, native modules могут остаться executors. Локальная БД — история экспериментов, не второй канонический store. Переносятся исправленные adapters, протокольные cases и измеренные failure boundaries, не утверждение, что весь прототип production-ready.
+
+### Миграция без двойной authority (R17)
+
+Статус: норма миграции (proposed); этапы перехода выполняются после принятия документации, код и живой переход — Фаза B. Принцип один: **в каждый момент у работы один владелец и одна authority**; legacy связка перестаёт быть authority после принятой миграции, но архивы не удаляются, а процессы не останавливаются автоматически этим документом. Порядок: (1) read-only импорт и сверка архивных records с provenance — имя ветки, timestamp и STATUS-текст лишь подсказки, не доказательство владельца; (2) одна линия на существующем native service — старый runner больше не допускает новую работу, ELIOT сначала только наблюдает семью, не открывая второй control binding; (3) одна полная Issue через existing API — сохранённая revision, candidate, scoped gate, независимая проверка, адресный результат, повтор client request возвращает retained receipt; (4) обратимый переход наблюдения и ресурсов — legacy переводится в read-only exporter либо его mutating роли отключаются, состояние и forensic source не удаляются до проверки переноса; (5) следующие линии по тем же инвариантам. Rollback не запускает двух владельцев: сначала прекращение новых admissions, затем наблюдение и передача уже принятых операций; force-kill живой native семьи и удаление неизвестного файла не являются fallback.
+
+| Legacy связка | Целевая замена |
+|---|---|
+| Mutable PUSHED/NOCHANGE/HOLD + state.json files | Existing task.submit / expected_submission_ref / addressed review + read-only export при необходимости |
+| Plain text steer inbox | Existing message + stable Operation target; native-specific delivery semantics |
+| `oc_run.py` POST retry и `oc_busy.py` age release | Existing native effects/readback + scoped family/continuation observations |
+| `Remind-Subagents.py` самостоятельные SQL/роутинг/POST | Read-only report + attention policy поверх единой observation |
+| Manual Codex/Muse transport lifecycle | Existing SDK modules, qualified shared transport и module owner |
+| Review shell parser/uncoupled baseline | Existing source.capture/CheckRunner/profile/resource/results |
+| Global orphan sweeps/native DB trim | Owned ProcessJob/resource release; external maintenance отдельно и явно |
+| Report30/slot guardian loops в сессии root | Single host-owned scheduled observations, сохранённые due/outcome |
 
 ## Источники и проверенная область
 
