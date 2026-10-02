@@ -1,0 +1,123 @@
+name: Import OpenCode route-model control slice
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/import-opencode-model-control/**'
+      - '.github/workflows/import-opencode-model-control.yml'
+permissions:
+  contents: write
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+      - name: Verify and materialize exact source
+        shell: bash
+        env:
+          EXPECTED_PARENT: 1703b29394832541d354a2b942f34abf6ec271e6
+          EXPECTED_ARCHIVE_SHA256: 533ac5bb7f415d96618c8c36f3ba5907e524acb178d727a433d01c9007a8c996
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "$EXPECTED_PARENT"
+          git rev-parse HEAD > /tmp/staging-sha
+          cat > /tmp/chunk-hashes <<'EOF'
+          01ee2080685a93dcbffd3778720128d7666e24e7  .github/import-opencode-model-control/chunk-000
+          62fd0271810e8609a8e2c8bf933b7777e1f70229  .github/import-opencode-model-control/chunk-001
+          aa3d0a5adb5adc70e1d4f93ac54ac88c6f60c6f4  .github/import-opencode-model-control/chunk-002-00
+          09669a56a80e6cc318f270da367c2086b921a7a3  .github/import-opencode-model-control/chunk-002-01
+          2a1506bedfad0e2635828619927761051d978470  .github/import-opencode-model-control/chunk-002-02
+          1e7d293d624eb054fd64db84c4ef47cfa11a2616  .github/import-opencode-model-control/chunk-002-03
+          1beeb3aa7efeeb1043ee81a7a2973c601f90fe69  .github/import-opencode-model-control/chunk-003
+          EOF
+          while read -r expected path; do
+            test "$(git hash-object "$path")" = "$expected"
+          done < /tmp/chunk-hashes
+          cat .github/import-opencode-model-control/chunk-* | base64 -d > /tmp/opencode-model-control.tar.gz
+          printf '%s  %s\n' "$EXPECTED_ARCHIVE_SHA256" /tmp/opencode-model-control.tar.gz | sha256sum -c -
+          cat > /tmp/expected-product-paths <<'EOF'
+          README.md
+          modules/opencode/README.md
+          modules/opencode/switch-model.example.json
+          src/runtime/opencode_v2.rs
+          src/runtime/opencode_v2/configuration.rs
+          src/runtime/opencode_v2/effects.rs
+          src/runtime/opencode_v2/snapshot.rs
+          src/store/opencode.rs
+          src/store/prerequisites.rs
+          src/store/runtime.rs
+          EOF
+          sort -o /tmp/expected-product-paths /tmp/expected-product-paths
+          tar -tzf /tmp/opencode-model-control.tar.gz | sort > /tmp/archive-product-paths
+          diff -u /tmp/expected-product-paths /tmp/archive-product-paths
+          tar -xzf /tmp/opencode-model-control.tar.gz --no-same-owner --no-same-permissions
+          cat > /tmp/source-sha256 <<'EOF'
+          3fd4d1db9dd07ad1205abebbd2ebb1ef554146006bd27322af8f33a390d63215  README.md
+          7c670ecb551a6daa5ec81e55ce7006a441e1a6d6d9fb9ec36feb9efb5ff8a2b5  modules/opencode/README.md
+          f589008f8262227963a77f2caca70fec175a2e4837f8992cd599fe94b77480fc  modules/opencode/switch-model.example.json
+          f4446eac703845d7be3d8b7dc87e4c51adeb497635865691593f2363021aa50a  src/runtime/opencode_v2.rs
+          63d3795b93c2d93240403d6ac72fac4286e8887c7c9fd60ac68199a090149800  src/runtime/opencode_v2/configuration.rs
+          ccc0f2a2d241573561526fe314ac65811c5d2173764a725a17cddf5d5ba25b59  src/runtime/opencode_v2/effects.rs
+          ad409d19862d71289179623cf67967a1f2e69040ea62ccb8e253076367fdc053  src/runtime/opencode_v2/snapshot.rs
+          37511f0f54ca0ee0aed3a70cfa47c863af42898d3be24dadd4505d07574e4f6b  src/store/opencode.rs
+          18388791014da9b82ec3e6d5492b55432126eb0a47de40cb1bd1f47deab2bc57  src/store/prerequisites.rs
+          5fd47c8dffb415c41df8a35aed1aa998ffb448bf0f68a12edbfb097fa1416769  src/store/runtime.rs
+          EOF
+          sha256sum -c /tmp/source-sha256
+          git diff --check
+      - name: Pinned toolchain
+        shell: bash
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy --no-self-update
+          rustc --version
+          cargo --version
+      - name: Formatting
+        run: |
+          cargo fmt -p eliot-swarm-controller
+          cargo fmt -p eliot-swarm-controller -- --check
+          git diff --check
+      - name: Verify Atlas donor snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(find vendor/atlas -type l -print -quit)"
+          test "$(find vendor/atlas -type f | wc -l)" -eq 24
+          (cd vendor/atlas && sha256sum -c SHA256SUMS)
+      - name: Clippy
+        run: cargo clippy --locked --lib --bins --no-deps -- -D warnings
+      - name: Publish checked source to main
+        shell: bash
+        env:
+          EXPECTED_TREE: 1866056b23bb28fefc66b523aa99ec4b2814a9db
+        run: |
+          set -euo pipefail
+          STAGING_SHA="$(cat /tmp/staging-sha)"
+          rm -rf .github/import-opencode-model-control
+          rm .github/workflows/import-opencode-model-control.yml
+          git add -A
+          git diff --cached --check
+          cat > /tmp/expected-transport-paths <<'EOF'
+          .github/import-opencode-model-control/chunk-000
+          .github/import-opencode-model-control/chunk-001
+          .github/import-opencode-model-control/chunk-002-00
+          .github/import-opencode-model-control/chunk-002-01
+          .github/import-opencode-model-control/chunk-002-02
+          .github/import-opencode-model-control/chunk-002-03
+          .github/import-opencode-model-control/chunk-003
+          .github/workflows/import-opencode-model-control.yml
+          EOF
+          cat /tmp/expected-transport-paths /tmp/expected-product-paths | sort > /tmp/expected-staged-paths
+          git diff --cached --name-only | sort > /tmp/actual-staged-paths
+          diff -u /tmp/expected-staged-paths /tmp/actual-staged-paths
+          test "$(git write-tree)" = "$EXPECTED_TREE"
+          git config user.name 'Iurii Lisenkov'
+          git config user.email '71514792+UnknownAlienHuman@users.noreply.github.com'
+          git commit -m 'feat: restore exact OpenCode route model with native readback' \
+            -m 'Implement the documented session.switchModel control as an explicit repair/setup step for the binding route exact provider/model/variant. Reject any different model before native admission, validate the location-scoped catalog and complete projected model definition, send at most one mutation, and require repeated exact catalog/session readback before reporting applied.' \
+            -m 'Persist only compact catalog/definition/variant digests and settings revisions. Reconcile with GET only, block ordinary commands on model drift, and extend the configure-to-input prerequisite barrier so external switches, catalog replacement, variant changes or disabling cannot satisfy stale setup evidence.' \
+            -m 'Rust 1.98.1 owned-crate formatting and locked warnings-denied lib/bin Clippy passed with the saved offline toolchain/vendor inputs. All Atlas donor files/checksums are unchanged. No tests, live model/service calls, dependencies, migrations or permanent workflow changes.'
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = "$STAGING_SHA"
+          git push origin HEAD:main
