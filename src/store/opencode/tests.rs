@@ -281,6 +281,30 @@ async fn goal_receipts_survive_host_restart_without_replaying_native_work() {
     owner.close().await.unwrap();
 }
 
+async fn wait_native_entry(store: &Store, p: &Principal, binding: &str, key: &str) {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let state = read(
+                store,
+                p,
+                "agent.state",
+                json!({"binding_id":binding,"generation":1}),
+            )
+            .await;
+            let entries = &state["observation"]["native"]["configuration"]["owned_entries"];
+            if entries
+                .as_array()
+                .is_some_and(|entries| entries.iter().any(|entry| entry["key"] == key))
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn configure_prerequisite_gates_goal_start() {
     let f = Fixture::new().await;
@@ -353,6 +377,182 @@ async fn configure_prerequisite_gates_goal_start() {
     .await
     .unwrap_err();
     assert_eq!(invalid.code, "INVALID_PREREQUISITE");
+    stop.send(true).unwrap();
+    worker.await.unwrap();
+    owner.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn setup_snapshot_binds_dependent_to_the_whole_setup() {
+    // The implementation review §5.2 scenario: A puts instruction X;
+    // B is a later setup step naming A as its prerequisite; D then
+    // replaces X; C names only B. C must be blocked even though X is
+    // not B's own scope, because B settled with a bounded setup
+    // snapshot proving the whole setup (X included).
+    let f = Fixture::new().await;
+    let (owner, p) = start(&f).await;
+    let (stop, receiver) = watch::channel(false);
+    let worker = tokio::spawn(owner.store.clone().supervise_opencode(receiver));
+    let open = write(
+        &owner.store,
+        &p,
+        "agent.open",
+        json!({"lane_id":"setup-snapshot","route":"fixture"}),
+    )
+    .await
+    .unwrap();
+    wait_operation(&owner.store, &p, &open, "settled").await;
+    let binding = open["binding_id"].as_str().unwrap();
+    // A: put the required instruction X.
+    let a = write(
+        &owner.store,
+        &p,
+        "agent.configure",
+        json!({"binding_id":binding,"generation":1,"settings":{"instruction_entry":{"action":"put","key":"eliot.policy","value":{"review_before_submit":true}}}}),
+    )
+    .await
+    .unwrap();
+    let a = wait_operation(&owner.store, &p, &a, "settled").await;
+    assert_eq!(a["result"]["outcome"], "applied");
+    wait_native_entry(&owner.store, &p, binding, "eliot.policy").await;
+    // B: a second setup step on another owned entry, prerequisite A.
+    let b = write(
+        &owner.store,
+        &p,
+        "agent.configure",
+        json!({"binding_id":binding,"generation":1,"settings":{"instruction_entry":{"action":"put","key":"eliot.style","value":{"tone":"direct"}}},"prerequisite_operation_id":a["operation_id"]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(b["prerequisite_state"], "satisfied");
+    let b = wait_operation(&owner.store, &p, &b, "settled").await;
+    // The snapshot frozen at B's settlement names the whole setup.
+    let state = read(
+        &owner.store,
+        &p,
+        "agent.state",
+        json!({"binding_id":binding,"generation":1}),
+    )
+    .await;
+    let snapshot = &state["observation"]["setup_snapshots"][b["operation_id"].as_str().unwrap()];
+    let scopes: Vec<&str> = snapshot["conditions"]
+        .as_array()
+        .expect("setup snapshot must be persisted at settlement")
+        .iter()
+        .map(|condition| condition["scope"].as_str().unwrap())
+        .collect();
+    assert!(scopes.contains(&"instruction:eliot.policy"), "{snapshot}");
+    assert!(scopes.contains(&"instruction:eliot.style"), "{snapshot}");
+    // C0: a dependent naming only B is satisfied while the setup holds.
+    let c0 = write(
+        &owner.store,
+        &p,
+        "agent.goal",
+        json!({"binding_id":binding,"generation":1,"action":"set","objective":"control goal","prerequisite_operation_id":b["operation_id"]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(c0["prerequisite_state"], "satisfied");
+    wait_operation(&owner.store, &p, &c0, "settled").await;
+    // An unrelated instruction change does not block a dependent of B:
+    // eliot.other was never part of B's proven setup.
+    let unrelated = write(
+        &owner.store,
+        &p,
+        "agent.configure",
+        json!({"binding_id":binding,"generation":1,"settings":{"instruction_entry":{"action":"put","key":"eliot.other","value":{"unrelated":true}}}}),
+    )
+    .await
+    .unwrap();
+    wait_operation(&owner.store, &p, &unrelated, "settled").await;
+    let c1 = write(
+        &owner.store,
+        &p,
+        "agent.goal",
+        json!({"binding_id":binding,"generation":1,"action":"set","objective":"after unrelated change","prerequisite_operation_id":b["operation_id"]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(c1["prerequisite_state"], "satisfied");
+    wait_operation(&owner.store, &p, &c1, "settled").await;
+    // D: replace the required instruction X. C naming only B is now
+    // blocked with PREREQUISITE_STALE.
+    let d = write(
+        &owner.store,
+        &p,
+        "agent.configure",
+        json!({"binding_id":binding,"generation":1,"settings":{"instruction_entry":{"action":"put","key":"eliot.policy","value":{"review_before_submit":false}}}}),
+    )
+    .await
+    .unwrap();
+    wait_operation(&owner.store, &p, &d, "settled").await;
+    let blocked = write(
+        &owner.store,
+        &p,
+        "agent.goal",
+        json!({"binding_id":binding,"generation":1,"action":"set","objective":"blocked goal","prerequisite_operation_id":b["operation_id"]}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(blocked.code, "PREREQUISITE_STALE");
+
+    // Second binding: a later Operation pending on a snapshot scope
+    // makes the gate pending — not satisfied, not stale.
+    let open = write(
+        &owner.store,
+        &p,
+        "agent.open",
+        json!({"lane_id":"setup-snapshot-pending","route":"fixture"}),
+    )
+    .await
+    .unwrap();
+    wait_operation(&owner.store, &p, &open, "settled").await;
+    let binding = open["binding_id"].as_str().unwrap();
+    let root = oc::root_id(binding, 1);
+    let a = write(
+        &owner.store,
+        &p,
+        "agent.configure",
+        json!({"binding_id":binding,"generation":1,"settings":{"instruction_entry":{"action":"put","key":"eliot.policy","value":{"review_before_submit":true}}}}),
+    )
+    .await
+    .unwrap();
+    wait_operation(&owner.store, &p, &a, "settled").await;
+    wait_native_entry(&owner.store, &p, binding, "eliot.policy").await;
+    let b = write(
+        &owner.store,
+        &p,
+        "agent.configure",
+        json!({"binding_id":binding,"generation":1,"settings":{"instruction_entry":{"action":"put","key":"eliot.style","value":{"tone":"direct"}}},"prerequisite_operation_id":a["operation_id"]}),
+    )
+    .await
+    .unwrap();
+    let b = wait_operation(&owner.store, &p, &b, "settled").await;
+    f.world.lock().unwrap().overrides.insert(
+        (
+            "PUT".into(),
+            format!("/api/experimental/session/{root}/instructions/entries/eliot.policy"),
+        ),
+        crate::runtime::opencode_v2::tests::Reply::Drop,
+    );
+    let pending = write(
+        &owner.store,
+        &p,
+        "agent.configure",
+        json!({"binding_id":binding,"generation":1,"settings":{"instruction_entry":{"action":"put","key":"eliot.policy","value":{"review_before_submit":false}}}}),
+    )
+    .await
+    .unwrap();
+    wait_operation(&owner.store, &p, &pending, "outcome_unknown").await;
+    let c = write(
+        &owner.store,
+        &p,
+        "agent.goal",
+        json!({"binding_id":binding,"generation":1,"action":"set","objective":"pending goal","prerequisite_operation_id":b["operation_id"]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(c["prerequisite_state"], "pending");
     stop.send(true).unwrap();
     worker.await.unwrap();
     owner.close().await.unwrap();

@@ -488,10 +488,21 @@ pub(super) fn outcome(db: &mut Connection, p: &Principal, v: &Value) -> Result<V
         tx.execute(
             &format!(
                 "UPDATE bindings SET state_json=json_set(state_json,'{}',json(?3)) WHERE binding_id=?1 AND generation=?2",
-                prerequisites::slot_path(configuration.slot)
+                prerequisites::slot_path(configuration.record.slot)
             ),
-            params![id, generation, model::canonical(&configuration.value)?],
+            params![id, generation, model::canonical(&configuration.record.value)?],
         )?;
+        if let Some(snapshot) = configuration.setup_snapshot {
+            let mut snapshots = b["observation"]["setup_snapshots"].clone();
+            if !snapshots.is_object() {
+                snapshots = json!({});
+            }
+            snapshots[&r.operation_id] = snapshot.to_json();
+            tx.execute(
+                "UPDATE bindings SET state_json=json_set(state_json,'$.setup_snapshots',json(?3)) WHERE binding_id=?1 AND generation=?2",
+                params![id, generation, model::canonical(&snapshots)?],
+            )?;
+        }
     }
     if o["method"] == "agent.recover" && matches!(r.outcome, EffectOutcome::Applied) {
         if r.native_root_id.as_deref() != b["native_root_id"].as_str()

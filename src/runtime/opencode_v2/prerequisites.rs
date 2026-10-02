@@ -10,10 +10,10 @@ use super::configuration::{
 use crate::{
     error::{Error, Result},
     model,
-    runtime::prerequisites::EffectiveSlot,
+    runtime::prerequisites::{EffectiveSlot, SetupCondition, SetupSnapshot},
 };
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 const INSTRUCTION_STATE_CONTRACT_REVISION: &str = "opencode-configure-prerequisite-v1";
 const AGENT_STATE_CONTRACT_REVISION: &str = "opencode-session-agent-state-v1";
@@ -396,6 +396,292 @@ impl Validator {
                 ))
             }
         }
+    }
+
+    /// The generic condition one validated result proves: session axes
+    /// by their effective settings revision, an instruction entry by
+    /// its desired value digest (`None` = the entry must be absent).
+    pub(crate) fn condition(&self, validated: &ValidatedConfiguration) -> SetupCondition {
+        match &validated.expectation {
+            ConfigurationExpectation::InstructionEntry {
+                key,
+                desired_digest,
+                ..
+            } => SetupCondition {
+                scope: format!("instruction:{key}"),
+                revision: None,
+                desired_digest: desired_digest.clone(),
+            },
+            ConfigurationExpectation::SessionAgent { .. } => SetupCondition {
+                scope: "session:agent".to_owned(),
+                revision: Some(validated.settings_revision.clone()),
+                desired_digest: None,
+            },
+            ConfigurationExpectation::SessionModel { .. } => SetupCondition {
+                scope: "session:model".to_owned(),
+                revision: Some(validated.settings_revision.clone()),
+                desired_digest: None,
+            },
+        }
+    }
+
+    pub(crate) fn condition_holds(
+        &self,
+        condition: &SetupCondition,
+        later: &ValidatedConfiguration,
+    ) -> bool {
+        let later = self.condition(later);
+        if later.scope != condition.scope {
+            return false;
+        }
+        if condition.revision.is_some() || later.revision.is_some() {
+            return condition.revision == later.revision;
+        }
+        condition.desired_digest == later.desired_digest
+    }
+
+    /// Generic-condition form of the native observation check: the same
+    /// native subtrees and digest strictness as `snapshot_matches`, but
+    /// driven by the persisted condition instead of a live expectation.
+    /// For session axes the settings revision is a digest over the
+    /// selected identity and definition, so revision equality binds
+    /// both; the model check additionally requires the selection to
+    /// still be enabled with a live status.
+    pub(crate) fn condition_matches(
+        &self,
+        condition: &SetupCondition,
+        native: &Value,
+    ) -> Result<Option<bool>> {
+        if condition.scope == "session:agent" {
+            let agent = &native["agent_configuration"];
+            if agent["complete"] != true {
+                return Ok(None);
+            }
+            let revision = sha256(agent, "settings_revision")?;
+            match agent["definition_digest"].as_str() {
+                Some(_) => {
+                    sha256(agent, "definition_digest")?;
+                }
+                None if agent["definition_digest"].is_null() => {}
+                None => {
+                    return Err(Error::new(
+                        "PREREQUISITE_EVIDENCE_INVALID",
+                        "native agent snapshot has an invalid definition digest",
+                    ));
+                }
+            }
+            return Ok(Some(
+                condition.revision.as_deref() == Some(revision.as_str()),
+            ));
+        }
+        if condition.scope == "session:model" {
+            let observed = &native["model_configuration"];
+            if observed["complete"] != true {
+                return Ok(None);
+            }
+            let revision = sha256(observed, "settings_revision")?;
+            sha256(observed, "catalog_revision")?;
+            for field in ["definition_digest", "variant_digest"] {
+                if observed[field].is_string() {
+                    sha256(observed, field)?;
+                } else if !observed[field].is_null() {
+                    return Err(Error::new(
+                        "PREREQUISITE_EVIDENCE_INVALID",
+                        "native model snapshot has an invalid digest",
+                    ));
+                }
+            }
+            return Ok(Some(
+                condition.revision.as_deref() == Some(revision.as_str())
+                    && observed["enabled"] == true
+                    && matches!(
+                        observed["status"].as_str(),
+                        Some("alpha" | "beta" | "deprecated" | "active")
+                    ),
+            ));
+        }
+        if let Some(key) = condition.scope.strip_prefix("instruction:") {
+            let configuration = &native["configuration"];
+            if configuration["complete"] != true {
+                return Ok(None);
+            }
+            sha256(configuration, "revision")?;
+            let entries = configuration["owned_entries"].as_array().ok_or_else(|| {
+                Error::new(
+                    "PREREQUISITE_EVIDENCE_INVALID",
+                    "invalid native configuration snapshot",
+                )
+            })?;
+            let mut keys = BTreeSet::new();
+            let mut found = None;
+            for entry in entries {
+                let observed_key = model::text(entry, "key")?;
+                if !keys.insert(observed_key.to_owned()) {
+                    return Err(Error::new(
+                        "PREREQUISITE_EVIDENCE_INVALID",
+                        "native configuration snapshot contains a duplicate key",
+                    ));
+                }
+                let digest = sha256(entry, "value_digest")?;
+                if observed_key == key {
+                    found = Some(digest);
+                }
+            }
+            return Ok(Some(found == condition.desired_digest));
+        }
+        Err(Error::new(
+            "PREREQUISITE_EVIDENCE_INVALID",
+            "setup condition names a scope this adapter does not prove",
+        ))
+    }
+
+    /// Emit the bounded setup snapshot for a just-settled prerequisite
+    /// from the binding's recorded observation. Candidates come from the
+    /// native snapshot subtrees (a complete native read proves every
+    /// owned entry plus both session axes) and from the recorded
+    /// effective records (exact applied results); per scope the freshest
+    /// fact wins, and the prerequisite's own condition — being proven
+    /// right now — always wins its scope. Any inconsistency degrades to
+    /// `None` (no snapshot; the barrier keeps its single-condition
+    /// form) instead of failing the proven configure result.
+    pub(crate) fn setup_snapshot(
+        &self,
+        validated: &ValidatedConfiguration,
+        binding_observation: &Value,
+    ) -> Result<Option<SetupSnapshot>> {
+        match self.build_setup_snapshot(validated, binding_observation) {
+            Ok(snapshot) => Ok(Some(snapshot)),
+            Err(_) => Ok(None),
+        }
+    }
+
+    fn build_setup_snapshot(
+        &self,
+        validated: &ValidatedConfiguration,
+        binding_observation: &Value,
+    ) -> Result<SetupSnapshot> {
+        let mut by_scope: BTreeMap<String, (SetupCondition, i64)> = BTreeMap::new();
+        let mut offer = |condition: SetupCondition, observed_at_ms: i64| {
+            let replace = by_scope
+                .get(&condition.scope)
+                .is_none_or(|(_, at)| observed_at_ms >= *at);
+            if replace {
+                by_scope.insert(condition.scope.clone(), (condition, observed_at_ms));
+            }
+        };
+
+        let native = &binding_observation["native"];
+        let observed_at = binding_observation["observed_at_ms"].as_i64().unwrap_or(0);
+        if native.is_object() {
+            let configuration = &native["configuration"];
+            if configuration["complete"] == true {
+                let entries = configuration["owned_entries"].as_array().ok_or_else(|| {
+                    Error::new(
+                        "PREREQUISITE_EVIDENCE_INVALID",
+                        "invalid native configuration snapshot",
+                    )
+                })?;
+                let mut keys = BTreeSet::new();
+                for entry in entries {
+                    let key = model::text(entry, "key")?;
+                    if !keys.insert(key.to_owned()) {
+                        return Err(Error::new(
+                            "PREREQUISITE_EVIDENCE_INVALID",
+                            "native configuration snapshot contains a duplicate key",
+                        ));
+                    }
+                    offer(
+                        SetupCondition {
+                            scope: format!("instruction:{key}"),
+                            revision: None,
+                            desired_digest: Some(sha256(entry, "value_digest")?),
+                        },
+                        observed_at,
+                    );
+                }
+            }
+            let agent = &native["agent_configuration"];
+            if agent["complete"] == true {
+                offer(
+                    SetupCondition {
+                        scope: "session:agent".to_owned(),
+                        revision: Some(sha256(agent, "settings_revision")?),
+                        desired_digest: None,
+                    },
+                    observed_at,
+                );
+            }
+            let model_state = &native["model_configuration"];
+            if model_state["complete"] == true {
+                offer(
+                    SetupCondition {
+                        scope: "session:model".to_owned(),
+                        revision: Some(sha256(model_state, "settings_revision")?),
+                        desired_digest: None,
+                    },
+                    observed_at,
+                );
+            }
+        }
+
+        let settings = &binding_observation["effective_settings"];
+        if settings["complete"] == true
+            && settings["kind"] == INSTRUCTION_SETTINGS_REVISION_KIND
+            && settings["contract_revision"] == INSTRUCTION_STATE_CONTRACT_REVISION
+            && settings["source"] == "exact_configuration_result"
+            && let Some(key) = settings["key"].as_str()
+        {
+            let desired_digest = match settings["action"].as_str() {
+                Some("put") => Some(Some(sha256(settings, "desired_digest")?)),
+                Some("remove") => Some(None),
+                _ => None,
+            };
+            if let Some(desired_digest) = desired_digest {
+                offer(
+                    SetupCondition {
+                        scope: format!("instruction:{key}"),
+                        revision: None,
+                        desired_digest,
+                    },
+                    settings["observed_at_ms"].as_i64().unwrap_or(0),
+                );
+            }
+        }
+        let agent_slot = &binding_observation["effective_agent"];
+        if agent_slot["complete"] == true
+            && agent_slot["kind"] == AGENT_SETTINGS_REVISION_KIND
+            && agent_slot["contract_revision"] == AGENT_STATE_CONTRACT_REVISION
+        {
+            offer(
+                SetupCondition {
+                    scope: "session:agent".to_owned(),
+                    revision: Some(sha256(agent_slot, "revision")?),
+                    desired_digest: None,
+                },
+                agent_slot["observed_at_ms"].as_i64().unwrap_or(0),
+            );
+        }
+        let model_slot = &binding_observation["effective_model"];
+        if model_slot["complete"] == true
+            && model_slot["kind"] == MODEL_SETTINGS_REVISION_KIND
+            && model_slot["contract_revision"] == MODEL_STATE_CONTRACT_REVISION
+        {
+            offer(
+                SetupCondition {
+                    scope: "session:model".to_owned(),
+                    revision: Some(sha256(model_slot, "revision")?),
+                    desired_digest: None,
+                },
+                model_slot["observed_at_ms"].as_i64().unwrap_or(0),
+            );
+        }
+
+        offer(self.condition(validated), i64::MAX);
+        let conditions = by_scope
+            .into_values()
+            .map(|(condition, _)| condition)
+            .collect();
+        SetupSnapshot::new(conditions)
     }
 
     pub(crate) fn applied_record(

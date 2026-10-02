@@ -3,17 +3,21 @@
 //!
 //! This module is the generic receipt/barrier only: Operation and
 //! binding/generation ownership, earlier-Operation ordering, the typed
-//! completion boundary, digest/revision equality over validated evidence,
-//! the later-conflicting-evidence check, and observation freshness. All
-//! vendor interpretation of configuration evidence lives behind the
-//! runtime-side validator registry (`crate::runtime::prerequisites`),
-//! keyed by runtime kind; this module names no vendor types, kinds, or
-//! contract revisions.
+//! completion boundary, digest/revision equality over validated
+//! evidence, the later-conflicting-evidence check, and observation
+//! freshness. A dependent Operation is approved against the whole
+//! bounded setup snapshot the adapter froze at the prerequisite's
+//! settlement — a flat list of generic conditions, not a workflow
+//! graph. All vendor interpretation of configuration evidence lives
+//! behind the runtime-side validator registry
+//! (`crate::runtime::prerequisites`), keyed by runtime kind; this
+//! module names no vendor types, kinds, or contract revisions.
 use crate::{
     error::{Error, Result},
     model,
     runtime::prerequisites::{
-        EffectiveRecord, EffectiveSlot, Expectation, ValidatedEvidence, Validator, validator_for,
+        EffectiveRecord, EffectiveSlot, Expectation, SetupCondition, SetupSnapshot,
+        ValidatedEvidence, Validator, validator_for,
     },
 };
 use rusqlite::{Connection, OptionalExtension, params};
@@ -208,6 +212,27 @@ fn validate_applied_result(
     )
 }
 
+/// Verification state for one setup condition of the prerequisite: the
+/// condition itself, whether it is the prerequisite's own (checked at
+/// full adapter fidelity), the running verdict, and the settlement
+/// boundary a native observation must be at least as fresh as to
+/// override the Operation-scan verdict.
+struct ConditionState {
+    condition: SetupCondition,
+    own: bool,
+    holds: bool,
+    latest_settled_at: i64,
+}
+
+/// The barrier check. Approving a dependent Operation requires the
+/// prerequisite's *whole proven setup* to still hold, not just the
+/// prerequisite's own step: the condition set is the bounded setup
+/// snapshot the adapter froze at the prerequisite's settlement (or just
+/// the own condition for prerequisites settled before snapshots). For
+/// each condition, later Operations on the same scope are scanned in
+/// order — a pending one makes the gate pending, a settled one replaces
+/// the verdict — and a fresh-enough native observation may override.
+/// Conditions no later Operation touches keep their settled proof.
 fn current_configuration(
     db: &Connection,
     binding: &Value,
@@ -218,14 +243,35 @@ fn current_configuration(
 ) -> Result<Gate> {
     let binding_id = model::text(binding, "binding_id")?;
     let generation = model::positive(binding, "generation")?;
-    let validated_scope = validator.evidence_scope(validated)?;
-    let mut latest_settled_at = prerequisite.settled_at_ms.ok_or_else(|| {
+    let settled_at = prerequisite.settled_at_ms.ok_or_else(|| {
         Error::new(
             "PREREQUISITE_EVIDENCE_INVALID",
             "settled prerequisite is missing its settlement boundary",
         )
     })?;
-    let mut latest_matches = true;
+    let own_condition = validator.evidence_condition(validated)?;
+    let mut conditions: Vec<ConditionState> = Vec::new();
+    if let Some(stored) = binding["observation"]["setup_snapshots"].get(&prerequisite.operation_id)
+    {
+        let snapshot = SetupSnapshot::from_json(stored)?;
+        for condition in snapshot.conditions {
+            let own = condition.scope == own_condition.scope;
+            conditions.push(ConditionState {
+                condition,
+                own,
+                holds: true,
+                latest_settled_at: settled_at,
+            });
+        }
+    }
+    if !conditions.iter().any(|state| state.own) {
+        conditions.push(ConditionState {
+            condition: own_condition,
+            own: true,
+            holds: true,
+            latest_settled_at: settled_at,
+        });
+    }
     let mut stmt = db.prepare(
         "SELECT operation_id FROM operations WHERE binding_id=?1 AND binding_generation=?2 AND method='agent.configure' AND rowid>?3 AND rowid<?4 ORDER BY rowid",
     )?;
@@ -239,9 +285,13 @@ fn current_configuration(
     for operation_id in ids {
         let operation = load(db, &operation_id)?;
         let later_expectation = validator.parse_expectation(&operation.original)?;
-        if validator.scope(&later_expectation)? != validated_scope {
+        let scope = validator.scope(&later_expectation)?;
+        let Some(index) = conditions
+            .iter()
+            .position(|state| state.condition.scope == scope)
+        else {
             continue;
-        }
+        };
         validate_contract(validator, &operation, binding, &later_expectation)?;
         match operation.state.as_str() {
             "queued" | "sending" | "native_accepted" | "outcome_unknown" => {
@@ -266,14 +316,19 @@ fn current_configuration(
                     &later_expectation,
                     result,
                 )?;
-                if !validator.evidence_same_scope(validated, &later)? {
-                    return Err(Error::new(
-                        "PREREQUISITE_EVIDENCE_INVALID",
-                        "later configuration changed scope during validation",
-                    ));
+                if conditions[index].own {
+                    if !validator.evidence_same_scope(validated, &later)? {
+                        return Err(Error::new(
+                            "PREREQUISITE_EVIDENCE_INVALID",
+                            "later configuration changed scope during validation",
+                        ));
+                    }
+                    conditions[index].holds = validator.same_effective(validated, &later)?;
+                } else {
+                    conditions[index].holds =
+                        validator.condition_holds(&conditions[index].condition, &later)?;
                 }
-                latest_matches = validator.same_effective(validated, &later)?;
-                latest_settled_at = operation.settled_at_ms.ok_or_else(|| {
+                conditions[index].latest_settled_at = operation.settled_at_ms.ok_or_else(|| {
                     Error::new(
                         "PREREQUISITE_EVIDENCE_INVALID",
                         "later settled configuration is missing its settlement boundary",
@@ -289,14 +344,21 @@ fn current_configuration(
         }
     }
 
+    let native = &binding["observation"]["native"];
     let snapshot_time = binding["observation"]["observed_at_ms"].as_i64();
-    if snapshot_time.is_some_and(|observed| observed >= latest_settled_at)
-        && let Some(matches) =
-            validator.snapshot_matches(validated, &binding["observation"]["native"])?
-    {
-        latest_matches = matches;
+    for state in &mut conditions {
+        if snapshot_time.is_some_and(|observed| observed >= state.latest_settled_at) {
+            let verdict = if state.own {
+                validator.snapshot_matches(validated, native)?
+            } else {
+                validator.condition_matches(&state.condition, native)?
+            };
+            if let Some(matches) = verdict {
+                state.holds = matches;
+            }
+        }
     }
-    if latest_matches {
+    if conditions.iter().all(|state| state.holds) {
         Ok(Gate::Ready {
             operation_id: prerequisite.operation_id.clone(),
             contract_revision: validator.evidence_contract_revision(validated)?.to_owned(),
@@ -433,6 +495,15 @@ pub(super) fn for_operation(
     gate_for_id(db, binding, current.rowid, operation_id)
 }
 
+/// A validated applied configure result: the effective record to fold
+/// into binding state, plus the bounded setup snapshot frozen at this
+/// settlement (`None` when the adapter could not prove a wider setup;
+/// the barrier then checks the own condition only).
+pub(super) struct AppliedConfiguration {
+    pub(super) record: EffectiveRecord,
+    pub(super) setup_snapshot: Option<SetupSnapshot>,
+}
+
 /// Validate an applied configure result and build the effective record
 /// the caller folds into binding state. Generic ownership checks happen
 /// here; every adapter-owned check happens in the validator.
@@ -442,7 +513,7 @@ pub(super) fn applied_configuration(
     operation_id: &str,
     result: &Value,
     observed_at_ms: i64,
-) -> Result<EffectiveRecord> {
+) -> Result<AppliedConfiguration> {
     let operation = load(db, operation_id)?;
     if operation.method != "agent.configure"
         || operation.binding_id.as_deref() != binding["binding_id"].as_str()
@@ -461,7 +532,12 @@ pub(super) fn applied_configuration(
     })?;
     let expectation = validator.parse_expectation(&operation.original)?;
     let validated = validate_applied_result(&validator, &operation, binding, &expectation, result)?;
-    validator.applied_record(&validated, operation_id, result, observed_at_ms)
+    let record = validator.applied_record(&validated, operation_id, result, observed_at_ms)?;
+    let setup_snapshot = validator.setup_snapshot(&validated, &binding["observation"])?;
+    Ok(AppliedConfiguration {
+        record,
+        setup_snapshot,
+    })
 }
 
 /// Fold a native observation into effective-configuration records via the
