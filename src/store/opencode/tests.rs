@@ -499,8 +499,8 @@ async fn bound_child_producers_close_only_from_their_own_logs() {
             .unwrap_or_default();
         if turns
             .iter()
-            .any(|t| t["turnId"] == "run_ca" && t["terminal"] == "completed")
-            && turns.iter().any(|t| t["turnId"] == "run_cb")
+            .any(|t| t["turnId"] == "evt_run_ca_started" && t["terminal"] == "completed")
+            && turns.iter().any(|t| t["turnId"] == "evt_run_cb_started")
         {
             assert_eq!(
                 state["observation"]["native"]["family_coverage"]["members_with_terminal_evidence"],
@@ -524,7 +524,7 @@ async fn bound_child_producers_close_only_from_their_own_logs() {
         &owner.store,
         &p,
         "attempt.bind_producer",
-        bind("ses_ca", "run_ca", "w-ca"),
+        bind("ses_ca", "evt_run_ca_started", "w-ca"),
     )
     .await
     .unwrap();
@@ -533,7 +533,7 @@ async fn bound_child_producers_close_only_from_their_own_logs() {
         &owner.store,
         &p,
         "attempt.bind_producer",
-        bind("ses_cb", "run_cb", "w-cb"),
+        bind("ses_cb", "evt_run_cb_started", "w-cb"),
     )
     .await
     .unwrap();
@@ -542,7 +542,7 @@ async fn bound_child_producers_close_only_from_their_own_logs() {
         &owner.store,
         &p,
         "attempt.release",
-        json!({"attempt_id":attempt["attempt_id"],"outcome":"completed","assignment_closed":true,"reason":"child B still running"}),
+        json!({"attempt_id":attempt["attempt_id"],"outcome":"cancelled","assignment_closed":true,"reason":"child B still running"}),
     )
     .await
     .unwrap_err();
@@ -554,7 +554,8 @@ async fn bound_child_producers_close_only_from_their_own_logs() {
         w.active.remove("ses_cb");
         w.logs.get_mut("ses_cb").unwrap().push(
             json!({"id":"evt_run_cb_terminal","type":"session.execution.interrupted","version":1,
-            "durable":{"aggregateID":"ses_cb","seq":3},"data":{"reason":"user"}}),
+            "created":1.0,
+            "durable":{"aggregateID":"ses_cb","seq":3,"version":1},"data":{"sessionID":"ses_cb","reason":"user"}}),
         );
     }
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
@@ -585,7 +586,7 @@ async fn bound_child_producers_close_only_from_their_own_logs() {
         &owner.store,
         &p,
         "attempt.release",
-        json!({"attempt_id":attempt["attempt_id"],"outcome":"completed","assignment_closed":true,"reason":"both children terminal"}),
+        json!({"attempt_id":attempt["attempt_id"],"outcome":"cancelled","assignment_closed":true,"reason":"both children terminal"}),
     )
     .await
     .unwrap();

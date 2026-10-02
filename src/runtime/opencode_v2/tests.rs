@@ -1084,7 +1084,10 @@ async fn snapshot_exposes_goal_axis_with_digest_only() {
     let root = root_id("fixture-binding", 1);
     let c = f.goal_command(json!({"action":"set","objective":"snapshot secret objective"}));
     assert_applied(s.execute(&c, &f.options).await);
-    let snapshot = s.snapshot(&root, &Value::Null).await.unwrap();
+    let snapshot = s
+        .snapshot(&root, &Value::Null, &Default::default())
+        .await
+        .unwrap();
     let goal = &snapshot.state["goal_configuration"];
     assert_eq!(goal["complete"], true);
     assert_eq!(goal["present"], true);
@@ -1107,28 +1110,34 @@ async fn snapshot_exposes_goal_axis_with_digest_only() {
 }
 
 pub(crate) fn child_events(child: &str, root: &str, runs: &[(&str, Option<&str>)]) -> Vec<Value> {
+    // Events carry the full native envelope the log reader verifies:
+    // durable version, per-event sessionID and a finite creation time.
     let mut events = vec![
         json!({"id":format!("evt_{child}_created"),"type":"session.created","version":1,
-        "durable":{"aggregateID":child,"seq":1},
-        "data":{"parentID":root}}),
+        "created":1.0,
+        "durable":{"aggregateID":child,"seq":1,"version":1},
+        "data":{"sessionID":child,"parentID":root}}),
     ];
     let mut seq = 1u64;
     for (run, terminal) in runs {
         seq += 1;
         events.push(
-            json!({"id":run,"type":"session.execution.started","version":1,
-            "durable":{"aggregateID":child,"seq":seq},"data":{}}),
+            json!({"id":format!("evt_{run}_started"),"type":"session.execution.started","version":1,
+            "created":1.0,
+            "durable":{"aggregateID":child,"seq":seq,"version":1},"data":{"sessionID":child}}),
         );
         if let Some(outcome) = terminal {
             seq += 1;
-            let (kind, data) = match *outcome {
+            let (kind, mut data) = match *outcome {
                 "completed" => ("session.execution.succeeded", json!({})),
                 "failed" => ("session.execution.failed", json!({"error":{}})),
                 _ => ("session.execution.interrupted", json!({"reason":"user"})),
             };
+            data["sessionID"] = json!(child);
             events.push(
                 json!({"id":format!("evt_{run}_terminal"),"type":kind,"version":1,
-                "durable":{"aggregateID":child,"seq":seq},"data":data}),
+                "created":1.0,
+                "durable":{"aggregateID":child,"seq":seq,"version":1},"data":data}),
             );
         }
     }
@@ -1145,7 +1154,7 @@ fn session_scan_records_periods_and_refuses_gap_terminals() {
     assert_eq!(scan.disposition(), "failed");
     let turn = scan.last_turn().unwrap();
     assert_eq!(turn["sessionId"], "ses_kid");
-    assert_eq!(turn["turnId"], "run_1");
+    assert_eq!(turn["turnId"], "evt_run_1_started");
     assert_eq!(turn["terminal"], "failed");
     // A second start while one is open is a restart gap, never a terminal.
     let mut scan = SessionScan::restore("ses_kid", "ses_root", None).unwrap();
@@ -1206,13 +1215,11 @@ async fn child_logs_bind_terminal_and_coverage_without_completeness() {
     assert_eq!(st["family_coverage"]["members_with_terminal_evidence"], 1);
     let turns = st["turns"].as_array().unwrap();
     assert!(turns.iter().any(|t| t["sessionId"] == "ses_a"
-        && t["turnId"] == "run_a"
+        && t["turnId"] == "evt_run_a_started"
         && t["terminal"] == "completed"));
-    assert!(
-        turns.iter().any(|t| t["sessionId"] == "ses_b"
-            && t["turnId"] == "run_b"
-            && t["terminal"].is_null())
-    );
+    assert!(turns.iter().any(|t| t["sessionId"] == "ses_b"
+        && t["turnId"] == "evt_run_b_started"
+        && t["terminal"].is_null()));
     let children = st["observed_children"].as_array().unwrap();
     let child_a = children.iter().find(|c| c["sessionId"] == "ses_a").unwrap();
     assert_eq!(child_a["last_turn"]["terminal"], "completed");
@@ -1234,7 +1241,8 @@ async fn child_logs_bind_terminal_and_coverage_without_completeness() {
         let mut w = f.world.lock().unwrap();
         w.logs.get_mut("ses_b").unwrap().push(
             json!({"id":"evt_run_b_terminal","type":"session.execution.interrupted","version":1,
-            "durable":{"aggregateID":"ses_b","seq":3},"data":{"reason":"user"}}),
+            "created":1.0,
+            "durable":{"aggregateID":"ses_b","seq":3,"version":1},"data":{"sessionID":"ses_b","reason":"user"}}),
         );
         w.active.remove("ses_b");
     }
