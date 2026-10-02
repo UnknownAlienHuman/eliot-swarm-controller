@@ -17,7 +17,7 @@ jobs:
       - name: Verify and materialize exact source
         shell: bash
         env:
-          EXPECTED_PARENT: 245358702bcaae6f0beec5bfd8162d0f27eb35a2
+          EXPECTED_PARENT: 1b8ee07f83f01e73ae7a3ff0d6673959844d5624
           EXPECTED_ARCHIVE_SHA256: a913325f2b2967dec2082a650fb2e188625b09e807da3cba21c31e1a2bc2d65c
         run: |
           set -euo pipefail
@@ -107,8 +107,32 @@ jobs:
           for old, new in replacements:
               assert source.count(old) == 1, old
               source = source.replace(old, new)
+          unused = """
+
+              pub(super) fn waiting_for_operation_id(&self) -> Option<&str> {
+                  match self {
+                      Self::Pending {
+                          operation_id,
+                          blocking_operation_id,
+                          ..
+                      } => blocking_operation_id.as_deref().or(Some(operation_id)),
+                      _ => None,
+                  }
+              }
+          """
+          assert source.count(unused) == 1
+          source = source.replace(unused, "\n")
           path.write_text(source)
-          assert sha256(path.read_bytes()).hexdigest() == "9e1049d98a549f2ea7b9935e2f117ce48437e96d64543f697d18f290a646dd7b"
+
+          runtime = Path("src/store/runtime.rs")
+          source = runtime.read_text()
+          old = "\n            &id,\n"
+          new = "\n            id,\n"
+          assert source.count(old) == 1
+          runtime.write_text(source.replace(old, new))
+
+          assert sha256(path.read_bytes()).hexdigest() == "33ed11698c7be2b3d4148624af45cfa04ea902697547ecde71e497176071787e"
+          assert sha256(runtime.read_bytes()).hexdigest() == "2026b6bdd052b82c5699516c51ccb75c35a8f17189636e18076ce40c4bffc389"
       - name: Pinned toolchain
         shell: bash
         run: |
