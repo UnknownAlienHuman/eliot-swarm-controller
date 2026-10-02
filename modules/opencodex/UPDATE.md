@@ -6,18 +6,24 @@ rollback here. This module vendors **no** upstream code — it is an
 original, dependency-free client of the documented Management API — so
 there is nothing to merge and no license text ships inside the module.
 
-## Pins
+## Baseline
+
+The operator's service is **not pinned** by this project: the
+operator runs and updates OpenCodex himself at upstream current. The
+baseline below is the upstream release this adapter's contracts were
+last verified against; it follows upstream current and is refreshed
+by the update procedure below whenever upstream moves.
 
 | Fact | Value |
 | --- | --- |
 | Upstream | `lidge-jun/opencodex` (https://github.com/lidge-jun/opencodex) |
-| Release | **v2.73.0** (published 2026-09-30) |
-| Source commit | `569e3e7dae48bafc54b8a1a7e3a85129befe2d98` |
-| Upstream license | **MIT**, © 2026 opencodex contributors (read from the pin's `LICENSE`) |
-| Module artifact | `opencodex-2.73.0-bridge.2` (slice 1 shipped as `bridge.1`) |
+| Baseline release | **v2.75.0** (published 2026-10-01) |
+| Source commit | `ef0297f86c4540c7d757c8595170d66f9c584aec` |
+| Upstream license | **MIT**, © 2026 opencodex contributors (read from upstream's `LICENSE`) |
+| Module artifact | `opencodex-2.75.0-bridge.3` (slices 1–2 shipped as `opencodex-2.73.0-bridge.1`/`.2`) |
 | Runtime | Node.js ≥ 22, standard library only, zero dependencies |
 
-## Contract sources (read at the pin)
+## Contract sources (read at the slice-1 baseline, v2.73.0)
 
 - Issue #1 (this repository) — purpose, boundaries, acceptance.
 - Upstream docs-site `management-api.md` at the pin, in full —
@@ -36,9 +42,10 @@ Known contract risks carried honestly: `/api/system/health` may drift
 without a docs trail (tolerant parser; version recorded with every
 snapshot); the full `/api/models` row schema was not read from source
 (only doc-named fields are kept); the health `version` string format
-vs the release tag is assumed, not live-verified (exact-string compare,
-any difference is `unknown`); the live docs site moves — where it and
-the pin differ, the pin wins.
+vs the release tag is assumed, not live-verified (exact-string
+compare; any difference is recorded as an observation — see the
+slice-3 section); the live docs site moves — where it and the
+baseline differ, the baseline wins.
 
 ## Changed files in this slice
 
@@ -46,7 +53,7 @@ the pin differ, the pin wins.
   Management client, attach probe, snapshot assembly, CLI seam).
 - `modules/opencodex/control.mjs` — pure normalisation/version/
   redaction/unknown-mapping helpers.
-- `modules/opencodex/fixtures/` — pinned-contract fixture
+- `modules/opencodex/fixtures/` — baseline-contract fixture
   reconstructions + `fake-management-server.mjs`.
 - `modules/opencodex/selftest.mjs` — 11 fixture tests.
 - `modules/opencodex/module.example.json`, `package.json`,
@@ -76,7 +83,7 @@ unqualified until exercised against an operator-installed service.
 
 ## Update procedure (new upstream release)
 
-1. Read the new release's pin-side sources for every contract this
+1. Read the new release's sources for every contract this
    module consumes (management-api docs, system routes, ledger
    snapshot, restart contracts if a later slice uses them). Do not
    carry field assumptions across releases silently.
@@ -198,3 +205,109 @@ pinned contracts, not against a live service.
   (This supersedes the slice-1 note above for bridge.2: the artifact
   now performs exactly the remote effects an operator requested, one
   per saved Operation, each with its readback evidence recorded.)
+
+## Slice 3 — re-baseline to upstream v2.75.0; version differences are observations
+
+Artifact bumped to **`opencodex-2.75.0-bridge.3`**. Two changes land
+together:
+
+1. **Re-baseline.** The contract baseline moves from v2.73.0 (commit
+   `569e3e7dae48bafc54b8a1a7e3a85129befe2d98`) to upstream current,
+   **v2.75.0** (commit `ef0297f86c4540c7d757c8595170d66f9c584aec`).
+2. **Version semantics.** Per the operator's standing policy the
+   service is not pinned, so an observed version differing from the
+   baseline is now a recorded observation only. The version gate is
+   removed everywhere it lived:
+   - `bridge.mjs` — `attach`/`snapshot` readiness no longer depends on
+     `versionComparison`; the configure/preview gate no longer
+     refuses with `version_mismatch`. Configure records now carry
+     `serviceVersion` (`observed` / `baseline` / `comparison`) as
+     facts. Observed and baseline versions remain recorded in every
+     snapshot.
+   - `src/doctor.rs` — the `opencodex_version_mismatch` finding is
+     severity `info` with observation-only text (no alignment step);
+     the finding code is unchanged so recorded history still parses.
+   - Selftest tests 6 and 27 now assert the new semantics: readiness
+     stays `observed` under a differing version, and a configure
+     under a differing version applies exactly one mutation with the
+     version facts recorded.
+
+### Contract diff, 569e3e7 → v2.75.0 (evidence)
+
+Full upstream diff: 270 files, +10848/−912 — overwhelmingly provider
+and routing internals plus upstream's own tests. Inside
+`src/server/management/` exactly five files changed:
+
+- `route-registry.ts`, `integration-routes.ts`,
+  `aside-profile-routes.ts`, `sibling-guard.ts`, `system-routes.ts`,
+  `protocol-routes.ts`, `protocol-settings-patch.ts`,
+  `model-routes.ts`, `logs-usage-routes.ts`,
+  `usage-timeline-routes.ts`, `management-api.ts` and the docs-site
+  `management-api.md` are **byte-identical** between the two commits.
+- `agent-settings-routes.ts` (4 lines): the `pickerOrder` 400 message
+  text changed, and native model ids now count as visible for that
+  validation. No client impact — this module never sends
+  `pickerOrder` (recorded refusal `picker_order_not_in_slice`).
+- `config-routes.ts` (14 lines): additive optional boolean
+  `showCodexCredits` on a general config endpoint this module does
+  not use. No impact.
+- `oauth-account-routes.ts` (10 lines): additive `browserLaunch`
+  field in the OAuth login response. This module does not use the
+  OAuth account routes. No impact.
+- `model-rows.ts` + `shared.ts`: internal catalog-gather/discovery
+  bookkeeping (new-model policy); the `/api/models` response row
+  shape is unchanged. The `CatalogGatherBusyError` → 503
+  `{code: "catalog_busy"}` mapping in `management-api.ts` exists
+  identically at the old baseline — not new in v2.75.0 — and the
+  module already degrades that section to `unknown` on 503.
+
+**Conclusion: no incompatible change in the Management API surface
+this module uses; no client-logic adaptation was needed.** Only
+fixture provenance labels and the recorded baseline version moved.
+
+### Changed files in this slice
+
+- `modules/opencodex/bridge.mjs` — artifact id / `UPSTREAM` bumped;
+  version gate removed; readiness decoupled from the version
+  comparison; `serviceVersion` facts on configure records.
+- `modules/opencodex/control.mjs` — header records the new baseline
+  (`compareVersion` itself unchanged: it records facts).
+- `modules/opencodex/fixtures/` — provenance strings re-based to
+  v2.75.0 / `ef0297f…`; `health.json` serves version `2.75.0`; the
+  fake server's differing-version scenario serves `2.99.0-fixture`
+  (a version ahead of any baseline, modelling the operator updating
+  first). Fixtures remain reconstructions, labelled as such.
+- `modules/opencodex/selftest.mjs` — baseline `2.75.0`; tests 6/27
+  rewritten to the observation semantics (28 tests, as before).
+- `modules/opencodex/module.example.json`, `package.json` (0.3.0),
+  `README.md`, this file.
+- Host: `src/doctor.rs` — finding severity/text + known-gap note +
+  test; root `README.md` capability row and OpenCodex paragraph;
+  `THIRD_PARTY_NOTICES.md`; `docs/agent_swarm.donors-20260929.toml`
+  (`pinned_in_code` / `pinned_commit` / qualification).
+
+### Verification
+
+```sh
+node --check modules/opencodex/bridge.mjs modules/opencodex/control.mjs \
+  modules/opencodex/selftest.mjs modules/opencodex/fixtures/fake-management-server.mjs
+node modules/opencodex/selftest.mjs   # 28/28 fixture tests
+cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked --lib             # 55/55
+```
+
+**Live verification is still NOT performed.** No opencodex 2.75.0
+service was installed or run for this slice; behaviour above is
+verified against the fake server's reconstructions of the v2.75.0
+contracts. Live qualification remains issue #1 slice 4.
+
+### Activation and rollback (slice 3)
+
+- **Activation:** re-point the binding config at `bridge.3`
+  (`moduleArtifactId` must match; `expectedVersion` records the new
+  baseline `2.75.0`). A binding whose `expectedVersion` still names an
+  older baseline keeps working — the value is now only the recorded
+  baseline the observed version is compared against.
+- **Rollback:** return the config to the previous artifact. Recorded
+  snapshots and Operation records from bridge.3 remain readable;
+  `serviceVersion` on configure records is additive.

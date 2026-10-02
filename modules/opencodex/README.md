@@ -1,7 +1,6 @@
-# OpenCodex provider-service module — observer + saved-Operation configuration (slices 1–2)
+# OpenCodex provider-service module — observer + saved-Operation configuration (slices 1–2; bridge.3 re-baseline)
 
-OpenCodex (`lidge-jun/opencodex`, pinned **v2.73.0**, commit
-`569e3e7dae48bafc54b8a1a7e3a85129befe2d98`, MIT) is a provider/protocol
+OpenCodex (`lidge-jun/opencodex`, MIT) is a provider/protocol
 proxy with an authenticated Management API. It is **not** a session
 owner and not a replacement for the native Codex lifecycle: execution —
 threads, turns, goals, steering, replies, resume, family — stays with
@@ -13,19 +12,26 @@ Operations with preview/confirmation and readback. It is disabled by
 default: the shipped route example is `enabled = false`, and the
 module config lives outside the repository.
 
-Artifact: **`opencodex-2.73.0-bridge.2`** — Node.js, standard library
+Artifact: **`opencodex-2.75.0-bridge.3`** — Node.js, standard library
 only, no dependencies, no vendored upstream code.
+
+The service is **not pinned** by this project: the operator runs and
+updates OpenCodex himself at upstream current. The adapter's contract
+baseline — the upstream release the contracts in this module were last
+verified against — is **v2.75.0** (commit
+`ef0297f86c4540c7d757c8595170d66f9c584aec`) and follows upstream
+current; see [UPDATE.md](UPDATE.md) for the re-baseline record.
 
 ## What it does
 
-- `describe` — entrypoint, upstream pin, capability matrix, observed
+- `describe` — entrypoint, upstream baseline, capability matrix, observed
   service identity after an attach.
 - `open` / `attach` — probe only: `GET /api/system/health` then
   `GET /api/system/memory`. Attach creates nothing; the service binding
   identity is *endpoint + observed pid + observed version* (the pid is
   an observation, never an identity to act on).
 - `snapshot` — one bounded JSON object assembled from read-only
-  Management reads: system health (with the pinned spend-ledger
+  Management reads: system health (with the documented spend-ledger
   scalars), system memory, providers, per-provider protocols, models,
   usage aggregates, and a `configuration` section (resolved protocol
   settings, per-client integration states, Aside profile aggregates,
@@ -70,10 +76,13 @@ are never inferred from each other.
 
 Rules that hold for every kind:
 
-- **Version gate.** A preview/configure runs only against an attached
-  service whose observed version matches the pin exactly. Under a
-  mismatch the record is `unknown`/`version_mismatch` and **no write
-  is sent** — the mutation contracts are pinned to this release.
+- **Versions are observations, not gates.** A preview/configure runs
+  against any attached service. An observed version that differs from
+  the adapter's contract baseline is recorded on the record
+  (`serviceVersion`) and in snapshots (`observedVersion` /
+  `expectedVersion` / `versionComparison`) as a fact — it is not a
+  failure, not a pass, never degrades readiness and never blocks a
+  write. The service version is the operator's to move.
 - **One mutation, never replayed.** An unknown (lost) mutation
   response is reconciled by readback GETs inside the same Operation;
   the mutation itself is never re-sent.
@@ -83,15 +92,15 @@ Rules that hold for every kind:
 - **Strict requests.** Unknown fields, wrong types and out-of-range
   values are refused locally with the reason recorded and no request
   sent — including the places where upstream is lax (a subagent
-  roster over five, which the pin would silently truncate).
+  roster over five, which upstream would silently truncate).
 
 Kinds, in the audit's order:
 
 | Kind | Upstream writer | Notes |
 | --- | --- | --- |
-| `protocol_settings` | `PATCH /api/protocols/settings` | The only writer in the protocols family. `preview` lists the differing leaves; a `managedMessagesNativeOAuth` without the native lane is refused locally, mirroring the pin's 400. Closing Messages also closes `claudeCode` upstream in the same save — an upstream fact, recorded via readback. |
-| `model_settings` | `PUT /api/model-settings` | One routed provider + one exact model per Operation (`openai`/`combo` are refused locally — not routed). Receipt `saved`/`changed`/`hasOverrides`/`catalogRefresh` is recorded; readback compares the stored declarations (`contextWindowDeclared`, `inputModalitiesDeclared`) and lists per-client integration states. Empty `reasoningEfforts: []` is the pin's explicit "no rungs" override, never read as a clear; `null` clears. |
-| `subagent_v2` | `PUT /api/v2` | Sub-agent surface settings as one Operation. Applies to **new sessions only**; existing sessions keep their binding/surface. The pin's `enabled`↔mode conflicts are checked locally against the merged state. Upstream warnings are recorded verbatim. |
+| `protocol_settings` | `PATCH /api/protocols/settings` | The only writer in the protocols family. `preview` lists the differing leaves; a `managedMessagesNativeOAuth` without the native lane is refused locally, mirroring upstream's 400. Closing Messages also closes `claudeCode` upstream in the same save — an upstream fact, recorded via readback. |
+| `model_settings` | `PUT /api/model-settings` | One routed provider + one exact model per Operation (`openai`/`combo` are refused locally — not routed). Receipt `saved`/`changed`/`hasOverrides`/`catalogRefresh` is recorded; readback compares the stored declarations (`contextWindowDeclared`, `inputModalitiesDeclared`) and lists per-client integration states. Empty `reasoningEfforts: []` is upstream's explicit "no rungs" override, never read as a clear; `null` clears. |
+| `subagent_v2` | `PUT /api/v2` | Sub-agent surface settings as one Operation. Applies to **new sessions only**; existing sessions keep their binding/surface. Upstream's `enabled`↔mode conflicts are checked locally against the merged state. Upstream warnings are recorded verbatim. |
 | `injection_model` | `PUT /api/injection-model` | Effort is validated against the ladder the GET serves before any write. The prompt is operator prose: only set/unset is recorded. |
 | `effort_caps` | `PUT /api/effort-caps` | Global + sub-agent ceilings, ladder-validated. `modelPinnedEfforts` is **not** written by this Operation (recorded refusal `model_pinned_efforts_not_in_slice`). |
 | `subagent_models` | `PUT /api/subagent-models` | The featured roster (max five — enforced locally). Picker order is not written by this Operation (`picker_order_not_in_slice`). |
@@ -120,7 +129,7 @@ so they are never sent unbound:
    the record's outcome is `stale`, the fresh plan is included for a
    new operator decision, and the mutation is **never blind-retried**.
 4. A `409 integration_preview_unavailable` (no usable model roster
-   retained) is recorded as `unknown` with the pin's documented remedy
+   retained) is recorded as `unknown` with upstream's documented remedy
    read — `GET /api/client-integrations` — included as evidence.
 5. Writer refusals (conflict/unsafe/drift/expired snapshot) keep their
    code, state, `reason` and `residual`; a snapshot's **existence** is
@@ -129,13 +138,13 @@ so they are never sent unbound:
    `conflictPaths`), is never copied into a record or snapshot.
 
 The Aside **bulk** PUT (`PUT /api/client-integrations/aside/profiles`)
-is never sent: the pin refuses plan bindings for it ("a confirmed plan
+is never sent: upstream refuses plan bindings for it ("a confirmed plan
 applies to one profile"), so it cannot meet the issue's confirmation
 rule. The 200/207 partial-envelope shape is still handled by the
 shared per-element parser (`clientIntegrations[]`/`results[]`
 envelopes wherever an upstream answer carries them — an element
 missing outcome fields does not establish success), and the fake
-server pins that envelope contract in the selftest.
+server records that envelope contract in the selftest.
 
 ### What stays out of this slice (recorded, not silent)
 
@@ -173,9 +182,12 @@ lifecycle owner are four separate facts:
 
 - `endpoint` — the existing service (documented default listener
   `http://127.0.0.1:10100`; always operator-configured, never assumed).
-- `expectedVersion` — compared by exact string. A mismatch is
-  readiness `unknown` with the observed version recorded — not an
-  attach failure and not a pass; for mutations it is a hard gate.
+- `expectedVersion` — the adapter's contract baseline: the upstream
+  release the contracts were last verified against. It is compared by
+  exact string and the result is recorded (`versionComparison`) as an
+  observation only — a difference is not an attach failure, does not
+  degrade readiness and does not gate mutations. The service itself
+  is operator-managed and is not pinned by this binding.
 - `adminTokenEnv` — the **name** of the environment variable holding
   the service's Management (admin) credential. That credential is
   separate from any data-plane/proxy admission key and from the Codex
@@ -233,7 +245,9 @@ newest recorded snapshot per binding into `services.opencodex[]`
 draining, RSS, continuation-retention scalars, provider labels, usage
 incompleteness, staleness) and raises addressed findings
 (`opencodex_unobserved`, `opencodex_stale`,
-`opencodex_version_mismatch`, `opencodex_unavailable`). From bridge.2
+`opencodex_version_mismatch`, `opencodex_unavailable`). The
+`opencodex_version_mismatch` finding is informational: it records
+the observed/baseline pair and asks for no alignment. From bridge.2+
 snapshots it additionally projects a `configuration` summary (protocol
 Messages surface + unrepresentable policy, integration totals/current,
 Aside profile totals/applied, sub-agent mode and chosen roster) taken
@@ -247,14 +261,15 @@ OpenCodex binding recorded, the section is absent, not empty.
 
 ## Fixtures and self-test
 
-Fixtures under `fixtures/` are **reconstructions from the pinned
-upstream contracts** (docs-site Management API reference and the
-management route sources at the pin), each carrying its provenance —
-they are **not** captures from a live 2.73.0 service, and no live
+Fixtures under `fixtures/` are **reconstructions from the upstream
+contracts** last verified against the current baseline (docs-site
+Management API reference and the management route sources at that
+release), each carrying its provenance —
+they are **not** captures from a live 2.75.0 service, and no live
 service has been installed or qualified by these slices (Windows
 behaviour likewise unverified). The fake Management server is stateful
 for the configuration surface (initial state in
-`fixtures/configuration-state.json`) and reproduces the pin's
+`fixtures/configuration-state.json`) and reproduces upstream's
 documented behaviours: plan fingerprints that go stale after an
 intervening change, preview-unavailable, a lost mutation response, a
 failed catalog refresh, and the Aside 200/207 partial envelope.
@@ -267,8 +282,8 @@ The load-bearing tests: a full attach+snapshot cycle issues **GET
 requests only**; mutations happen only inside `configure`, exactly
 once per Operation; the admin token appears in no snapshot, no record
 and no bridge stdout; a stale plan is returned, never retried; a lost
-response is reconciled by reading; the version gate blocks every
-write; detach leaves the fake service answering; zero data-plane
+response is reconciled by reading; a version difference is recorded
+and never blocks a write; detach leaves the fake service answering; zero data-plane
 (`/v1/*`) requests are made — small health reads consume no model call.
 
 ## Activation and rollback
@@ -281,5 +296,5 @@ Disabling or removing the module/binding leaves the baseline Muse,
 OpenCode and Codex routes unchanged and leaves the OpenCodex service
 itself untouched — rollback of the *module* is removing the binding.
 Rollback of a *configuration change* is a new saved Operation (above),
-never an automatic restore. See [UPDATE.md](UPDATE.md) for the pinned
-update procedure.
+never an automatic restore. See [UPDATE.md](UPDATE.md) for the
+baseline update procedure.
