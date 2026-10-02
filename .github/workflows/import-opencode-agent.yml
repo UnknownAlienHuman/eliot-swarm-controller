@@ -1,0 +1,123 @@
+name: Import OpenCode session-agent slice
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/import-opencode-agent/**'
+      - '.github/workflows/import-opencode-agent.yml'
+permissions:
+  contents: write
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+      - name: Verify and materialize exact source
+        shell: bash
+        env:
+          EXPECTED_PARENT: 26da2a096e885693f6b7da80e83023baafce2acf
+          EXPECTED_ARCHIVE_SHA256: a913325f2b2967dec2082a650fb2e188625b09e807da3cba21c31e1a2bc2d65c
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "$EXPECTED_PARENT"
+          git rev-parse HEAD > /tmp/staging-sha
+          cat > /tmp/chunk-hashes <<'EOF'
+          ead87534d9bffe1828e7542b00615efe9b74eccb  .github/import-opencode-agent/chunk-000
+          89774eb1da47952752b6a2945247a67d2d874242  .github/import-opencode-agent/chunk-001
+          41fb5f0390d733c7c18c551159f0fb95e11133df  .github/import-opencode-agent/chunk-002
+          4949af54be1bf8c4ee4fa1fb486b6f94c20da1bb  .github/import-opencode-agent/chunk-003
+          b4c09dfc5d986a7d17ff358d9f0af6033158b54c  .github/import-opencode-agent/chunk-004
+          f144976649feb6996f46aaa390700f549d01cd84  .github/import-opencode-agent/chunk-005
+          b1af7d8252def565f78ed5c9ca97010fb4d5a2f6  .github/import-opencode-agent/chunk-006
+          c5277dfa8110221f5accb2b65a62d932966a1dc2  .github/import-opencode-agent/chunk-007
+          ada4e2348a67ffa6a6a7084559cb4070559583aa  .github/import-opencode-agent/chunk-008
+          02a3e84eff029fc5046e0f207990197be0dd49bc  .github/import-opencode-agent/chunk-009
+          a55831e070d9b7076af55674b6dd06fcf1baa4c1  .github/import-opencode-agent/chunk-010
+          2f2c3822abb6129fdb4dd97fe1f165e52bcca7de  .github/import-opencode-agent/chunk-011
+          a8e5ac4d83146009c54d11ec16354bd211e704be  .github/import-opencode-agent/chunk-012
+          7541d3ad7d4fca0e5115a648b3b545829e9888b7  .github/import-opencode-agent/chunk-013
+          83f9806ae5f3169838142d4239bea2122fe0a86d  .github/import-opencode-agent/chunk-014
+          c58042e021acb7b58f40990dc3aa53fcf4396371  .github/import-opencode-agent/chunk-015
+          c11050fca1f9e4ae4129f536d2a87ce8f87bd786  .github/import-opencode-agent/chunk-016
+          06089c989090326c42cb5088a4f83e33f849b69c  .github/import-opencode-agent/chunk-017
+          f5e097818dac2aa3eeb7ce9176671bd6d546be65  .github/import-opencode-agent/chunk-018
+          3d0ee2c59426e151e997fddc9c3a2bd6a556b407  .github/import-opencode-agent/chunk-019
+          EOF
+          while read -r expected path; do
+            test "$(git hash-object "$path")" = "$expected"
+          done < /tmp/chunk-hashes
+          cat .github/import-opencode-agent/chunk-* > /tmp/opencode-agent.tar.gz
+          printf '%s  %s\n' "$EXPECTED_ARCHIVE_SHA256" /tmp/opencode-agent.tar.gz | sha256sum -c -
+          cat > /tmp/expected-product-paths <<'EOF'
+          README.md
+          modules/opencode/README.md
+          modules/opencode/switch-agent.example.json
+          src/runtime/opencode_v2.rs
+          src/runtime/opencode_v2/configuration.rs
+          src/runtime/opencode_v2/effects.rs
+          src/runtime/opencode_v2/snapshot.rs
+          src/store/operations.rs
+          src/store/prerequisites.rs
+          src/store/runtime.rs
+          EOF
+          sort -o /tmp/expected-product-paths /tmp/expected-product-paths
+          tar -tzf /tmp/opencode-agent.tar.gz | sort > /tmp/archive-product-paths
+          diff -u /tmp/expected-product-paths /tmp/archive-product-paths
+          tar -xzf /tmp/opencode-agent.tar.gz --no-same-owner --no-same-permissions
+          cat > /tmp/source-sha256 <<'EOF'
+          4489f27765ac4ecc787096394c0bdfd37d066795c4f55f1cee3696652cc61d55  README.md
+          52a51e0ab95abf064f8bd142396104bf256579f57d67522306a8ece2e8d153de  modules/opencode/README.md
+          75834c422ac297ee522760474eff5939c5902df3b45329fa7ee85d58075b0b5a  modules/opencode/switch-agent.example.json
+          e16aee3acfeb40db656eda8fc9d0e001d450eaca26a501f6d41f65a7ce606f8f  src/runtime/opencode_v2.rs
+          b2e4905a4be566d62487e72b2bdec2be8245db0f56683c509a0c1474eed616dc  src/runtime/opencode_v2/configuration.rs
+          00d5e557a04eaf319d609814e830d25f55d13788287f5f47456da0bb81fb6d5b  src/runtime/opencode_v2/effects.rs
+          a94246bc184bca55d5297a760a11cd33dff81317f58ea875fbe091d02fb9ad83  src/runtime/opencode_v2/snapshot.rs
+          084c78b7ed794ee15336fa82a92b034d13553201532fa8e772d88a5cf91d0b1d  src/store/operations.rs
+          6ef83ff61d388832622786be7ce808e2f47c5e7b49aa1c5c71496a16e7eae1d2  src/store/prerequisites.rs
+          272e84e100ae6eedeb9796e77aa98d1b191b9cf0add4fb82f3f426a2c65f0146  src/store/runtime.rs
+          EOF
+          sha256sum -c /tmp/source-sha256
+          git diff --check
+      - name: Pinned toolchain
+        shell: bash
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy --no-self-update
+          rustc --version
+          cargo --version
+      - name: Formatting
+        run: |
+          cargo fmt -p eliot-swarm-controller
+          cargo fmt -p eliot-swarm-controller -- --check
+          git diff --check
+      - name: Verify Atlas donor snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(find vendor/atlas -type l -print -quit)"
+          test "$(find vendor/atlas -type f | wc -l)" -eq 24
+          (cd vendor/atlas && sha256sum -c SHA256SUMS)
+      - name: Clippy
+        run: cargo clippy --locked --lib --bins --no-deps -- -D warnings
+      - name: Publish checked source to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGING_SHA="$(cat /tmp/staging-sha)"
+          rm -rf .github/import-opencode-agent
+          rm .github/workflows/import-opencode-agent.yml
+          git add -A
+          git diff --cached --check
+          { printf '%s\n' .github/workflows/import-opencode-agent.yml; sed 's#^#.github/import-opencode-agent/chunk-#' < <(seq -w 000 019); cat /tmp/expected-product-paths; } | sort > /tmp/expected-staged-paths
+          git diff --cached --name-only | sort > /tmp/actual-staged-paths
+          diff -u /tmp/expected-staged-paths /tmp/actual-staged-paths
+          git config user.name 'Iurii Lisenkov'
+          git config user.email '71514792+UnknownAlienHuman@users.noreply.github.com'
+          git commit -m 'feat: switch OpenCode session agent with exact native readback' \
+            -m 'Implement the documented session.switchAgent control through the native agent catalog and session projection. Validate the selected agent, permissions and route-model compatibility, send at most one mutation, and require repeated exact post-readback before reporting applied.' \
+            -m 'Persist catalog, definition and settings revisions without copying raw agent definitions. Reconcile with GET only, expose the compact native observation, and extend the existing configure-to-input prerequisite barrier so later catalog or session changes cannot silently satisfy stale setup evidence.' \
+            -m 'Preserve the pinned provider/model/variant route: agents that override it incompatibly are rejected. Goal and model controls remain separate unfinished slices. Rust 1.98.1 formatting and locked warnings-denied Clippy passed; Atlas donor files are unchanged. No tests, live model/service calls, dependencies, migrations or permanent workflow changes.'
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = "$STAGING_SHA"
+          git push origin HEAD:main
