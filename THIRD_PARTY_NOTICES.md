@@ -16,4 +16,8 @@ The existing Muse module uses the complete `@muse-code/sdk` 1.3.0 package throug
 
 The C02 MCP facade uses the official `rmcp` 3.5.0 crate (modelcontextprotocol/rust-sdk, Apache-2.0) as an ordinary Cargo dependency with only the `server` and `transport-io` (stdio) features enabled; it is not vendored or modified, and no optional MCP features are enabled by default. The exact version and checksum are locked in `Cargo.lock`.
 
+## Codex Python SDK — pinned donor unit under `modules/codex/vendor_bridge`
+
+The Codex bridge keeps the complete upstream Python SDK unit (`sdk/python` from `openai/codex` at `18194bfd3534ca567d886eac454028dafaa68b6c`, package `openai-codex`, version `0.0.0-dev`, Apache-2.0) byte-identical under `modules/codex/vendor_bridge`, with the upstream repo-root license, an `UPSTREAM_COMMIT` file and a `SHA256SUMS` manifest covering every vendored file (`modules/codex/verify_vendor.py` checks both the file set and the hashes). The SDK is a dev snapshot and is used from source in the module-local environment; it is never installed from a registry. The donor's matching binary pin is `openai-codex-cli-bin==0.153.4`. ELIOT's WebSocket transport adaptation for the shared app-server lives entirely outside the donor, in `modules/codex/bridge.py`. See [Codex bridge](modules/codex/README.md) and its [update record](modules/codex/UPDATE.md).
+
 Other ordinary Rust dependencies are identified, versioned and checksum-locked in `Cargo.lock`; their package licenses remain with their upstream distributions. No new CCCC, ACP, agent scheduler, UI or model loop was copied in the OpenCode HTTP implementation.
