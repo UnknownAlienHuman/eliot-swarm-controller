@@ -34,6 +34,68 @@ pub fn canonical(value: &Value) -> Result<String> {
     }
     Ok(serde_json::to_string(&ordered(value))?)
 }
+
+/// The payload a mailbox delivery commits to: the two parties and the text.
+/// The digest is SHA-256 over the canonical JSON of exactly this object, so
+/// key order in any reconstruction cannot change the digest. Deadlines,
+/// scopes and generations are delivery facts recorded next to the digest;
+/// they are not part of the payload the digest binds.
+pub fn message_payload_digest(sender: &str, recipient: &str, text: &str) -> Result<String> {
+    let payload = json!({"recipient": recipient, "sender": sender, "text": text});
+    Ok(digest(canonical(&payload)?.as_bytes()))
+}
+
+/// Actor identity for a mailbox record, taken from the durable client
+/// registration. The generation is the module binding generation where one
+/// is tracked; a client without a binding has no generation (explicit null),
+/// never an invented one.
+pub fn message_actor(registration: &Value, client_id: &str) -> Value {
+    json!({"client_id":client_id,"role":registration.get("role").cloned().unwrap_or(Value::Null),"generation":registration.get("binding_generation").cloned().unwrap_or(Value::Null)})
+}
+
+/// Source/target scope of a delivery: the registered scope the client acts
+/// under, read from the same durable registration as the actor identity.
+/// Binding fields are explicit nulls for clients without a module binding.
+pub fn message_scope(registration: &Value, client_id: &str) -> Value {
+    json!({"client_id":client_id,"role":registration.get("role").cloned().unwrap_or(Value::Null),"binding_id":registration.get("binding_id").cloned().unwrap_or(Value::Null),"binding_generation":registration.get("binding_generation").cloned().unwrap_or(Value::Null)})
+}
+
+/// Structured reference to an original delivery, projected from its recorded
+/// result. Records written before delivery identity existed carry neither a
+/// delivery_id nor a payload digest; the reference projects explicit nulls
+/// for them — nothing is reconstructed or fabricated.
+pub fn message_reply_reference(original_result: &Value) -> Value {
+    json!({"delivery_id":original_result.get("delivery_id").cloned().unwrap_or(Value::Null),"payload_digest":original_result.get("payload_digest").cloned().unwrap_or(Value::Null)})
+}
+
+/// A caller-supplied digest claim about an original delivery must match the
+/// recorded digest. A claim against a record that predates digest recording
+/// cannot be verified and is rejected rather than silently dropped.
+pub fn verify_payload_digest_claim(recorded: Option<&str>, claimed: Option<&str>) -> Result<()> {
+    match (recorded, claimed) {
+        (_, None) => Ok(()),
+        (Some(recorded), Some(claimed)) if recorded == claimed => Ok(()),
+        (Some(_), Some(_)) => Err(Error::new(
+            "DIGEST_MISMATCH",
+            "payload digest does not match the original delivery",
+        )),
+        (None, Some(_)) => Err(Error::new(
+            "DIGEST_UNVERIFIABLE",
+            "the original delivery has no recorded payload digest; the claimed digest cannot be verified",
+        )),
+    }
+}
+
+/// An optional epoch-ms deadline supplied by a call contract: absent or null
+/// stays an explicit null, a supplied value must be a positive integer.
+/// Deadlines are recorded facts only — none is ever invented here, and
+/// nothing in the mailbox acts on them.
+pub fn deadline(value: &Value, field: &str) -> Result<Value> {
+    match value.get(field) {
+        None | Some(Value::Null) => Ok(Value::Null),
+        Some(_) => Ok(json!(positive(value, field)?)),
+    }
+}
 pub fn text<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
     value
         .get(field)
@@ -384,7 +446,22 @@ pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
             "binding_id",
             "binding_generation",
         ],
-        "message.send" => &["client_request_id", "recipient", "text", "in_reply_to"],
+        "message.send" => &[
+            "client_request_id",
+            "recipient",
+            "text",
+            "in_reply_to",
+            "in_reply_to_digest",
+            "admission_deadline_ms",
+            "delivery_deadline_ms",
+            "reply_deadline_ms",
+        ],
+        "message.cancel" => &[
+            "client_request_id",
+            "delivery_id",
+            "payload_digest",
+            "reason",
+        ],
         _ => return Err(Error::new("METHOD_NOT_FOUND", method)),
     };
     fields(params, allowed)?;
@@ -404,6 +481,33 @@ pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
         _ => {}
     }
     text(params, "client_request_id")?;
+    if method == "message.send" {
+        for field in [
+            "admission_deadline_ms",
+            "delivery_deadline_ms",
+            "reply_deadline_ms",
+        ] {
+            if let Some(value) = params.get(field)
+                && !value.is_null()
+            {
+                positive(params, field)?;
+            }
+        }
+        if let Some(value) = params.get("in_reply_to_digest")
+            && !value.is_null()
+        {
+            text(params, "in_reply_to_digest")?;
+        }
+    }
+    if method == "message.cancel" {
+        text(params, "delivery_id")?;
+        text(params, "payload_digest")?;
+        if let Some(value) = params.get("reason")
+            && !value.is_null()
+        {
+            text(params, "reason")?;
+        }
+    }
     if params.get("prerequisite_operation_id").is_some() {
         let operation_id = text(params, "prerequisite_operation_id")?;
         if operation_id.is_empty()
@@ -471,4 +575,98 @@ pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn message_payload_digest_uses_the_canonical_payload() {
+        // The canonical payload is exactly {recipient, sender, text} with
+        // recursively sorted keys, so the digest is a plain SHA-256 of it.
+        let expected = digest(b"{\"recipient\":\"bob\",\"sender\":\"alice\",\"text\":\"hello\"}");
+        assert_eq!(
+            message_payload_digest("alice", "bob", "hello").unwrap(),
+            expected
+        );
+        // Both parties and the text are bound: changing any of them changes
+        // the digest a reply or cancellation must cite.
+        assert_ne!(
+            message_payload_digest("alice", "bob", "hello").unwrap(),
+            message_payload_digest("alice", "carol", "hello").unwrap()
+        );
+        assert_ne!(
+            message_payload_digest("alice", "bob", "hello").unwrap(),
+            message_payload_digest("alice", "bob", "hello!").unwrap()
+        );
+    }
+
+    #[test]
+    fn digest_claims_are_checked_against_recorded_evidence() {
+        assert!(verify_payload_digest_claim(None, None).is_ok());
+        assert!(verify_payload_digest_claim(Some("abc"), None).is_ok());
+        assert!(verify_payload_digest_claim(Some("abc"), Some("abc")).is_ok());
+        let mismatch = verify_payload_digest_claim(Some("abc"), Some("def")).unwrap_err();
+        assert_eq!(mismatch.code, "DIGEST_MISMATCH");
+        let unverifiable = verify_payload_digest_claim(None, Some("abc")).unwrap_err();
+        assert_eq!(unverifiable.code, "DIGEST_UNVERIFIABLE");
+    }
+
+    #[test]
+    fn reply_reference_projects_unknowns_for_legacy_records() {
+        let current = json!({"delivery_id":"d-1","payload_digest":"abc"});
+        assert_eq!(
+            message_reply_reference(&current),
+            json!({"delivery_id":"d-1","payload_digest":"abc"})
+        );
+        // A record written before delivery identity existed: explicit nulls,
+        // never a reconstructed delivery_id or digest.
+        let legacy =
+            json!({"operation_id":"op-1","message_id":"op-1","sender":"alice","recipient":"bob"});
+        assert_eq!(
+            message_reply_reference(&legacy),
+            json!({"delivery_id":Value::Null,"payload_digest":Value::Null})
+        );
+    }
+
+    #[test]
+    fn actor_and_scope_take_generation_from_the_registration() {
+        let module = json!({"role":"module","binding_id":"b-1","binding_generation":3});
+        assert_eq!(
+            message_actor(&module, "mod-1"),
+            json!({"client_id":"mod-1","role":"module","generation":3})
+        );
+        assert_eq!(
+            message_scope(&module, "mod-1"),
+            json!({"client_id":"mod-1","role":"module","binding_id":"b-1","binding_generation":3})
+        );
+        let plain = json!({"role":"manager"});
+        assert_eq!(
+            message_actor(&plain, "alice"),
+            json!({"client_id":"alice","role":"manager","generation":Value::Null})
+        );
+        assert_eq!(
+            message_scope(&plain, "alice"),
+            json!({"client_id":"alice","role":"manager","binding_id":Value::Null,"binding_generation":Value::Null})
+        );
+    }
+
+    #[test]
+    fn deadlines_are_explicit_nulls_unless_the_caller_supplies_one() {
+        let none = json!({"text":"x"});
+        assert_eq!(deadline(&none, "reply_deadline_ms").unwrap(), Value::Null);
+        let explicit_null = json!({"reply_deadline_ms":Value::Null});
+        assert_eq!(
+            deadline(&explicit_null, "reply_deadline_ms").unwrap(),
+            Value::Null
+        );
+        let supplied = json!({"reply_deadline_ms":4102444800000i64});
+        assert_eq!(
+            deadline(&supplied, "reply_deadline_ms").unwrap(),
+            json!(4102444800000i64)
+        );
+        assert!(deadline(&json!({"reply_deadline_ms":0}), "reply_deadline_ms").is_err());
+        assert!(deadline(&json!({"reply_deadline_ms":"soon"}), "reply_deadline_ms").is_err());
+    }
 }
