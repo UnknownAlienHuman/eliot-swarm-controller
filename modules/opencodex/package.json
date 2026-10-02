@@ -1,10 +1,10 @@
 {
-  "description": "Local OpenCodex provider-service bridge: read-only observation snapshots plus saved-Operation configuration changes through the pinned Management API; no SDK, no dependencies",
+  "description": "Local OpenCodex provider-service bridge: read-only observation snapshots plus saved-Operation configuration changes through the documented Management API; no SDK, no dependencies",
   "engines": {
     "node": ">=22"
   },
   "name": "@eliot/swarm-opencodex-bridge",
   "private": true,
   "type": "module",
-  "version": "0.2.0"
+  "version": "0.3.0"
 }

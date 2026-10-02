@@ -3,12 +3,15 @@
 // comparison, redaction and honest-unknown mapping. No I/O — the fixture
 // selftest exercises these through the real adapter in bridge.mjs.
 //
-// Contracts come from the pinned upstream lidge-jun/opencodex v2.73.0
-// (commit 569e3e7dae48bafc54b8a1a7e3a85129befe2d98): the Management API is
-// documented in the pin's docs-site management-api reference and
-// src/server/management/system-routes.ts. Upstream responses are
-// untrusted display data: normalisers copy only named scalar fields and
-// never pass a raw body through.
+// Contracts come from upstream lidge-jun/opencodex, last verified
+// against v2.75.0 (commit ef0297f86c4540c7d757c8595170d66f9c584aec):
+// the Management API is documented in upstream's docs-site
+// management-api reference and src/server/management/system-routes.ts.
+// The operator's service is not pinned by this project; the baseline
+// named here is the upstream release the contracts were last verified
+// against and it follows upstream current (see UPDATE.md). Upstream
+// responses are untrusted display data: normalisers copy only named
+// scalar fields and never pass a raw body through.
 
 export function isObject(value) {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -86,8 +89,8 @@ function pickScalars(value) {
   return out;
 }
 
-/// GET /api/system/health — source-only contract at the pin
-/// (system-routes.ts). spendLedger is forwarded only as its six pinned
+/// GET /api/system/health — source-only contract at the baseline
+/// (system-routes.ts). spendLedger is forwarded only as its six documented
 /// scalars from spendLedgerDiagnosticsSnapshot().
 export function normalizeHealth(body) {
   if (!isObject(body)) return null;
@@ -190,7 +193,7 @@ export function normalizeProviders(body) {
 
 /// GET /api/protocols?provider=<name> — adapter, adapterSource, authMode,
 /// upstream; the billing-evidence read. No credential, no base URL is
-/// served by this route at the pin.
+/// served by this route at the baseline.
 export function normalizeProtocol(body) {
   if (!isObject(body)) return null;
   return {
@@ -204,7 +207,7 @@ export function normalizeProtocol(body) {
   };
 }
 
-/// GET /api/models — only the fields named in the pin's docs are kept;
+/// GET /api/models — only the fields named in upstream's docs are kept;
 /// the full row schema was not read from source. Stored declared context
 /// window stays separate from the effective one; cacheHitRate is null
 /// (never 0) when there is no cache telemetry.
@@ -313,7 +316,7 @@ export function normalizeCatalogRefresh(value) {
 }
 
 /// GET /api/protocols and the PATCH /api/protocols/settings response
-/// share one shape (protocolInfo at the pin): resolved surfaces +
+/// share one shape (protocolInfo at the baseline): resolved surfaces +
 /// resolved settings. Readback compares against these resolved values.
 export function normalizeProtocolSettings(body) {
   if (!isObject(body) || !isObject(body.settings) || !isObject(body.surfaces)) return null;

@@ -11,7 +11,7 @@
 // Boundaries (issue #1, module contract, audit):
 // - Reads never start, restart, install or reconfigure the service.
 //   Mutations happen only inside `configure`, only for the one change
-//   named by the operator's request file, and only through the pinned
+//   named by the operator's request file, and only through the documented
 //   Management API writers. No request is ever sent to the data plane.
 // - Client-integration changes (apply/disable/overwrite/restore,
 //   including single Aside profiles) are applied ONLY through the
@@ -20,7 +20,7 @@
 //   operation + planFingerprint (both-or-neither, enforced locally
 //   before any mutation is sent), and a 409 integration_preview_stale
 //   is returned with the fresh plan for a new operator decision —
-//   never retried blindly. The Aside bulk PUT is never sent: the pin
+//   never retried blindly. The Aside bulk PUT is never sent: upstream
 //   refuses plan bindings for it ("a confirmed plan applies to one
 //   profile"), so it cannot meet the issue's confirmation rule.
 // - Partial results are parsed per element; `saved` is never read as
@@ -41,10 +41,14 @@
 //   time, held in memory only, sent only as X-OpenCodex-API-Key, and
 //   never passed to Codex/model tools, never persisted, never printed.
 // - Failed or absent observation is `unknown`, never an empty healthy
-//   fleet; a version mismatch is readiness `unknown`, not a failure and
-//   not a pass — and for mutations it is a hard gate: no write is sent
-//   to a service whose observed version differs from the pin, because
-//   the mutation contracts are pinned to this exact release.
+//   fleet. The service version is operator-managed and is NOT pinned
+//   by this project: the operator runs and updates the service himself
+//   at upstream current, and this adapter's contract baseline follows
+//   upstream current (UPDATE.md). An observed version that differs
+//   from the baseline is recorded as a fact — `observedVersion` vs
+//   `expectedVersion`, `versionComparison` — and nothing more: it is
+//   not a failure, not a pass, never a gate; it neither degrades
+//   readiness nor blocks a mutation.
 //   activeTurnCount is forwarded as observed (0 is not proof that
 //   native Codex children stopped).
 // - send/reply stay honestly unavailable: execution and replies
@@ -65,12 +69,12 @@ import {
   redactValue, str, stringList, unknownSection,
 } from './control.mjs';
 
-export const MODULE_ARTIFACT_ID = 'opencodex-2.73.0-bridge.2';
+export const MODULE_ARTIFACT_ID = 'opencodex-2.75.0-bridge.3';
 export const ENTRYPOINT = 'opencodex_management_api';
 export const UPSTREAM = {
   repo: 'lidge-jun/opencodex',
-  release: 'v2.73.0',
-  commit: '569e3e7dae48bafc54b8a1a7e3a85129befe2d98',
+  release: 'v2.75.0',
+  commit: 'ef0297f86c4540c7d757c8595170d66f9c584aec',
   license: 'MIT',
 };
 const REQUEST_TIMEOUT_MS = 5000;
@@ -139,8 +143,8 @@ export function validateConfig(raw) {
 // ---------------------------------------------------------------------------
 // Configure request validation. One request file names exactly one
 // operator-selected change. Validation is strict (unknown keys are
-// refused, never silently dropped) and mirrors the pin's own request
-// rules where the pin states them, so a rejected request is refused
+// refused, never silently dropped) and mirrors upstream's own request
+// rules where upstream states them, so a rejected request is refused
 // locally with the reason recorded and no mutation is sent.
 
 const ROLLOUT_KEYS = ['nativeChatCombos', 'managedMessagesNative', 'managedMessagesNativeOAuth', 'directEncoders', 'shadowPlan'];
@@ -232,7 +236,7 @@ export function validateRequest(raw, mode) {
     const provider = str(raw.provider);
     const modelId = str(raw.modelId);
     if (!provider || !modelId) return rejected('provider_and_model_required');
-    // The pin addresses per-model settings only on routed providers:
+    // Upstream addresses per-model settings only on routed providers:
     // "openai" is the native passthrough lane, "combo" synthetic.
     if (provider === 'openai' || provider === 'combo') return rejected('provider_not_routed');
     const request = { kind, provider, modelId };
@@ -258,7 +262,7 @@ export function validateRequest(raw, mode) {
       if (raw.reasoningEfforts !== null) {
         const ladder = stringList(raw.reasoningEfforts, 16);
         if (!ladder || ladder.length !== raw.reasoningEfforts.length) return rejected('invalid_reasoning_efforts');
-        // An empty array is the pin's explicit "no rungs" override, NOT
+        // An empty array is upstream's explicit "no rungs" override, NOT
         // a clear; it is preserved as-is.
         request.reasoningEfforts = raw.reasoningEfforts.slice();
       } else request.reasoningEfforts = null;
@@ -366,7 +370,7 @@ export function validateRequest(raw, mode) {
     }
     const models = modelList(raw.models);
     if (!models) return rejected('invalid_models');
-    // The pin truncates a longer roster to five SILENTLY; this client
+    // Upstream truncates a longer roster to five SILENTLY; this client
     // refuses instead of letting a deliberate roster lose entries.
     if (models.length > 5) return rejected('roster_over_limit');
     return accepted({ kind, models });
@@ -608,7 +612,7 @@ export function createAdapter(config, env = process.env) {
       expectedVersion: config.expectedVersion,
       observedVersion: health.version,
       versionComparison,
-      readiness: versionComparison === 'match' && memory ? 'observed' : 'unknown',
+      readiness: memory ? 'observed' : 'unknown',
       health,
       memory: memory ?? unknownSection(memoryResult.reason ?? 'memory_schema', {
         status: memoryResult.status, code: memoryResult.code,
@@ -762,9 +766,7 @@ export function createAdapter(config, env = process.env) {
 
     const configuration = await configurationSection(evidence);
 
-    const readiness = attached.state !== 'attached'
-      ? 'unknown'
-      : attached.versionComparison === 'match' ? 'observed' : 'unknown';
+    const readiness = attached.state !== 'attached' ? 'unknown' : 'observed';
     return redactValue({
       ...base, readiness, health, memory, providers, models, usage, configuration, evidence,
     }, [token]);
@@ -821,16 +823,22 @@ export function createAdapter(config, env = process.env) {
     return redactValue(record, [token]);
   }
 
-  // The mutation gate: a configure/preview runs only against an
-  // attached service whose observed version matches the pin exactly.
-  // Mutation contracts are pin-exact; writing under a mismatch would
-  // be writing against an unverified contract.
+  // The attach gate: a configure/preview runs only against an
+  // attached service with a resolved admin credential. The observed
+  // service version is NOT part of the gate: the service is
+  // operator-managed and unpinned, and a version differing from the
+  // contract baseline is recorded on the record as an observation
+  // (serviceVersion), never treated as a defect or a blocker.
   async function gate(record) {
     const attached = await attach();
     record.evidence.push(...attached.evidence);
+    record.serviceVersion = {
+      observed: attached.observedVersion,
+      baseline: config.expectedVersion,
+      comparison: attached.versionComparison,
+    };
     if (!token) return 'admin_token_env_missing';
     if (attached.state !== 'attached') return attached.reason ?? 'not_attached';
-    if (attached.versionComparison !== 'match') return 'version_mismatch';
     return null;
   }
 
@@ -965,7 +973,7 @@ export function createAdapter(config, env = process.env) {
         .map(([leaf]) => leaf);
       return finish(record);
     }
-    // The pin refuses managedMessagesNativeOAuth=true unless the merged
+    // Upstream refuses managedMessagesNativeOAuth=true unless the merged
     // rollout keeps managedMessagesNative on; check against the merged
     // state locally so the refusal is recorded without a wasted write.
     if (request.patch.rollout?.managedMessagesNativeOAuth === true) {
@@ -1077,7 +1085,7 @@ export function createAdapter(config, env = process.env) {
       return finish(record);
     }
     if (result.status !== 200) {
-      // e.g. 500: the pin states the save failed and live config is
+      // e.g. 500: upstream states the save failed and live config is
       // unchanged; the refusal is recorded, nothing is retried.
       return finish(refuseFromResponse(record, result));
     }
@@ -1128,7 +1136,7 @@ export function createAdapter(config, env = process.env) {
       return finish(record);
     }
     const settings = request.settings;
-    // The pin's own enabled/mode consistency rules, checked against
+    // Upstream's own enabled/mode consistency rules, checked against
     // the merged state so the refusal is recorded without a write.
     const effectiveMode = settings.multiAgentMode ?? before?.multiAgentMode ?? 'default';
     const effectiveKeepNative = settings.keepNativeChatGptOnV1 !== undefined
@@ -1190,7 +1198,7 @@ export function createAdapter(config, env = process.env) {
     }
     if (result.status === 502) {
       // A mid-sequence write failure: earlier fields may already have
-      // landed (the pin's error names them). The record shows the
+      // landed (upstream's error names them). The record shows the
       // readback, never the upstream prose.
       refuseFromResponse(record, result);
       const afterResult = await readFor(record, '/api/v2');
@@ -1224,7 +1232,7 @@ export function createAdapter(config, env = process.env) {
     }
     const settings = request.settings;
     // The effort ladder is served by the GET; an effort outside it is
-    // refused locally (the pin answers the same request with a 400).
+    // refused locally (upstream answers the same request with a 400).
     if (typeof settings.effort === 'string' && before?.efforts
       && !before.efforts.includes(settings.effort)) {
       record.outcome = 'rejected';
@@ -1548,7 +1556,7 @@ export function createAdapter(config, env = process.env) {
       const { reason, code } = mutationFailure(result);
       record.mutation.code = code;
       if (code === 'integration_preview_unavailable') {
-        // The pin's documented remedy is a state read; include it as
+        // Upstream's documented remedy is a state read; include it as
         // evidence for the operator's next decision.
         record.outcome = 'unknown';
         record.reason = reason;

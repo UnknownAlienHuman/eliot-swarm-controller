@@ -1,16 +1,16 @@
 // Fake OpenCodex Management API server for the fixture selftest. Node
-// stdlib only; serves the pinned-contract fixture reconstructions on an
+// stdlib only; serves the baseline-contract fixture reconstructions on an
 // ephemeral loopback port and records every request (method + path +
 // parsed body) so the selftest can prove what the adapter did and did
 // not send. Fixtures are reconstructions from the pinned upstream
 // contracts (see each fixture's provenance field), not captures from
-// a live opencodex 2.73.0 service.
+// a live opencodex 2.75.0 service.
 //
 // Slice 2: the server is stateful for the configuration surface. Its
 // initial state is fixtures/configuration-state.json; plans carry
 // deterministic fixture fingerprints derived from a state version, so
 // the stale-plan, preview-unavailable, lost-response and partial
-// scenarios reproduce the pin's documented behaviours.
+// scenarios reproduce upstream's documented behaviours.
 import http from 'node:http';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -44,7 +44,7 @@ export async function createFakeManagementServer({ scenario = 'happy', token = '
     },
   };
   if (scenario === 'version_mismatch') {
-    files.health = { ...files.health, body: { ...files.health.body, version: '2.74.0-fixture' } };
+    files.health = { ...files.health, body: { ...files.health.body, version: '2.99.0-fixture' } };
   }
   const initial = await fixture('configuration-state.json');
   const state = JSON.parse(JSON.stringify(initial));
@@ -191,7 +191,7 @@ export async function createFakeManagementServer({ scenario = 'happy', token = '
     }
   }
 
-  // Validate + check a plan binding the way the pin does: both fields
+  // Validate + check a plan binding the way upstream does: both fields
   // or neither, the operation must agree, and a fingerprint that no
   // longer matches the freshly computed plan is a stale 409 carrying
   // that fresh plan. Returns true when a response was sent.
@@ -505,7 +505,7 @@ export async function createFakeManagementServer({ scenario = 'happy', token = '
         return send({ status: 200, body: asideListBody() });
       }
       if (pathname === '/api/client-integrations/aside/profiles' && req.method === 'PUT') {
-        // Bulk set: the pin refuses plan bindings here ("a confirmed
+        // Bulk set: upstream refuses plan bindings here ("a confirmed
         // plan applies to one profile"), which is why the bridge never
         // sends this request. The fake still serves it so the
         // selftest can pin the 200/207 partial-envelope contract the

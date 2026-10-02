@@ -2,7 +2,8 @@
 // Fixture selftest for the OpenCodex provider-service adapter, run
 // against the fake Management API server (fixtures/fake-management-server.mjs).
 // No live opencodex service, account or model call is involved: fixtures
-// are reconstructions from the pinned v2.73.0 contracts, not captures.
+// are reconstructions from the upstream contracts last verified
+// against v2.75.0, not captures.
 // Run:  node selftest.mjs
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
@@ -27,7 +28,7 @@ async function configFor(endpoint) {
   await writeFile(file, JSON.stringify({
     endpoint,
     moduleArtifactId: MODULE_ARTIFACT_ID,
-    expectedVersion: '2.73.0',
+    expectedVersion: '2.75.0',
     adminTokenEnv: TOKEN_ENV,
   }));
   return loadConfig(file);
@@ -62,12 +63,12 @@ function assertNoToken(record, label) {
 await withServer('happy', async (fake, adapter) => {
   const attached = await adapter.attach();
   assert.equal(attached.state, 'attached');
-  assert.deepEqual(attached.identity, { endpoint: fake.endpoint, pid: 4242, version: '2.73.0' });
+  assert.deepEqual(attached.identity, { endpoint: fake.endpoint, pid: 4242, version: '2.75.0' });
   assert.equal(attached.readiness, 'observed');
   const snap = await adapter.snapshot();
   assert.equal(snap.readiness, 'observed');
   assert.equal(snap.lifecycleOwner, 'external');
-  assert.equal(snap.health.version, '2.73.0');
+  assert.equal(snap.health.version, '2.75.0');
   assert.equal(snap.health.spendLedger.degraded, false);
   assert.equal(snap.health.spendLedger.persistFailures, 0);
   assert.equal(snap.memory.activeTurnCount, 2);
@@ -122,7 +123,7 @@ await withServer('happy', async (fake, adapter) => {
   const file = path.join(dir, 'module.json');
   await writeFile(file, JSON.stringify({
     endpoint: fake.endpoint, moduleArtifactId: MODULE_ARTIFACT_ID,
-    expectedVersion: '2.73.0', adminTokenEnv: TOKEN_ENV,
+    expectedVersion: '2.75.0', adminTokenEnv: TOKEN_ENV,
   }));
   const { stdout } = await execFileAsync(process.execPath,
     [path.join(here, 'bridge.mjs'), '--config', file, 'snapshot'],
@@ -159,16 +160,18 @@ await withServer('sibling', async (fake, adapter) => {
   console.log('PASS sibling: 409 sibling_instance recorded as unknown without retries');
 });
 
-// 6. Version mismatch: readiness unknown, observed version recorded,
-// snapshot still produced.
+// 6. Version difference: a recorded observation only. Readiness stays
+// observed — the service is operator-managed and unpinned, and the
+// adapter baseline follows upstream current — while both versions
+// are recorded and the snapshot is produced in full.
 await withServer('version_mismatch', async (fake, adapter) => {
   const snap = await adapter.snapshot();
-  assert.equal(snap.readiness, 'unknown');
+  assert.equal(snap.readiness, 'observed');
   assert.equal(snap.versionComparison, 'mismatch');
-  assert.equal(snap.observedVersion, '2.74.0-fixture');
-  assert.equal(snap.expectedVersion, '2.73.0');
-  assert.equal(snap.health.version, '2.74.0-fixture');
-  console.log('PASS version-mismatch: readiness unknown with observed version recorded');
+  assert.equal(snap.observedVersion, '2.99.0-fixture');
+  assert.equal(snap.expectedVersion, '2.75.0');
+  assert.equal(snap.health.version, '2.99.0-fixture');
+  console.log('PASS version-difference: readiness stays observed, both versions recorded as facts');
 });
 
 // 7. Absent launch marker: bunRuntimeSource is unknown, never guessed.
@@ -184,7 +187,7 @@ await withServer('catalog_busy', async (fake, adapter) => {
   const snap = await adapter.snapshot();
   assert.equal(snap.models.state, 'unknown');
   assert.equal(snap.models.reason, 'catalog_busy');
-  assert.equal(snap.health.version, '2.73.0');
+  assert.equal(snap.health.version, '2.75.0');
   assert.ok(Array.isArray(snap.providers));
   assert.equal(snap.usage.state, 'observed');
   assert.equal(snap.configuration.protocols.messagesEnabled, true,
@@ -273,8 +276,8 @@ await withServer('happy', async (fake, adapter) => {
   console.log('PASS protocol-settings: preview diff, one PATCH, readback verified');
 });
 
-// 13. Protocol rollout dependency is refused locally (mirrors the
-// pin's 400) — no PATCH is sent.
+// 13. Protocol rollout dependency is refused locally (mirrors
+// upstream's 400) — no PATCH is sent.
 await withServer('happy', async (fake, adapter) => {
   const record = await adapter.configure({
     kind: 'protocol_settings',
@@ -346,7 +349,7 @@ await withServer('refresh_failed', async (fake, adapter) => {
 });
 
 // 17. Sub-agent v2 surface: mode change applies at the new-sessions
-// boundary; the pin's enabled/mode conflict is refused locally.
+// boundary; upstream's enabled/mode conflict is refused locally.
 await withServer('happy', async (fake, adapter) => {
   const record = await adapter.configure({
     kind: 'subagent_v2', settings: { multiAgentMode: 'v2' },
@@ -396,8 +399,8 @@ await withServer('happy', async (fake, adapter) => {
   console.log('PASS effort-caps: caps applied and read back; pin map refused as out-of-slice');
 });
 
-// 20. Subagent roster: more than five models is refused locally (the
-// pin would truncate silently); a valid roster round-trips.
+// 20. Subagent roster: more than five models is refused locally
+// (upstream would truncate silently); a valid roster round-trips.
 await withServer('happy', async (fake, adapter) => {
   const over = await adapter.configure({
     kind: 'subagent_models',
@@ -512,7 +515,7 @@ await withServer('stale_plan', async (fake, adapter) => {
 });
 
 // 24. Preview unavailable (no usable roster retained): recorded as
-// unknown with the pin's remedy read as evidence; nothing is written.
+// unknown with upstream's remedy read as evidence; nothing is written.
 await withServer('preview_unavailable', async (fake, adapter) => {
   const preview = await adapter.preview({ kind: 'client_integration', clientId: 'cline', enabled: true });
   assert.equal(preview.outcome, 'unknown');
@@ -540,8 +543,8 @@ await withServer('happy', async (fake, adapter) => {
 
 // 26. Partial envelope: a single-profile refusal surfaces its code and
 // recovery facts without the snapshot path; the bulk 207 envelope —
-// which the bridge never sends, because the pin refuses plan
-// bindings for it — is pinned here as the contract the module's
+// which the bridge never sends, because upstream refuses plan
+// bindings for it — is recorded here as the contract the module's
 // per-element parser is built against.
 await withServer('partial', async (fake, adapter) => {
   const preview = await adapter.preview({ kind: 'aside_profile', profileId: 2, enabled: true });
@@ -573,17 +576,23 @@ await withServer('partial', async (fake, adapter) => {
   console.log('PASS partial-envelope: refusal facts kept, paths dropped, 207 parsed per element');
 });
 
-// 27. Version gate: under a version mismatch no mutation of any kind
-// is sent; the Operation records unknown/version_mismatch.
+// 27. No version gate: under a version difference the write proceeds
+// — the service is operator-managed and unpinned — and the record
+// carries the version facts as an observation (serviceVersion).
 await withServer('version_mismatch', async (fake, adapter) => {
   const record = await adapter.configure({
     kind: 'protocol_settings', patch: { messagesEnabled: false },
   });
-  assert.equal(record.outcome, 'unknown');
-  assert.equal(record.reason, 'version_mismatch');
-  assert.equal(record.mutation.performed, false);
-  assertGetOnly(fake, 'version-gate');
-  console.log('PASS version-gate: mismatch blocks every write, reads still honest');
+  assert.equal(record.outcome, 'applied');
+  assert.deepEqual(record.serviceVersion, {
+    observed: '2.99.0-fixture', baseline: '2.75.0', comparison: 'mismatch',
+  });
+  assert.equal(record.mutation.performed, true);
+  assert.equal(record.verification.state, 'verified');
+  assert.equal(record.readback.after.messagesEnabled, false);
+  assert.equal(mutations(fake, 'PATCH', '/api/protocols/settings').length, 1, 'exactly one PATCH under a version difference');
+  assertNoToken(record, 'version-difference');
+  console.log('PASS version-difference: write proceeds under a differing version, facts recorded');
 });
 
 // 28. The configure seam works through the CLI exactly as the host
@@ -593,7 +602,7 @@ await withServer('happy', async (fake) => {
   const configFile = path.join(dir, 'module.json');
   await writeFile(configFile, JSON.stringify({
     endpoint: fake.endpoint, moduleArtifactId: MODULE_ARTIFACT_ID,
-    expectedVersion: '2.73.0', adminTokenEnv: TOKEN_ENV,
+    expectedVersion: '2.75.0', adminTokenEnv: TOKEN_ENV,
   }));
   const requestFile = path.join(dir, 'request.json');
   await writeFile(requestFile, JSON.stringify({ kind: 'effort_caps', effortCap: 'high' }));
