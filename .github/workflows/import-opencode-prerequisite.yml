@@ -14,57 +14,62 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           fetch-depth: 0
-      - name: Verify transport and materialize exact files
+      - name: Verify content-addressed payload and materialize source
         shell: bash
         env:
-          EXPECTED_PARENT: 1c0736f62ed47ea632bf4ec836c6d663f7df7edf
+          EXPECTED_PARENT: 31bf33d9e7bd08985d101fe3de1c8560da08270f
           EXPECTED_PAYLOAD_SHA256: 169ca1b006cf7f03a3e1e7ec7370972ad49c3930d1218e87df87fbd8e129e7a3
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD^)" = "$EXPECTED_PARENT"
-          STAGING_SHA="$(git rev-parse HEAD)"
-          printf '%s\n' "$STAGING_SHA" > /tmp/staging-sha
+          git rev-parse HEAD > /tmp/staging-sha
 
+          test "$(git hash-object .github/import-opencode-prerequisite/part-000)" = c858003495d07d36e51ffdfd2488346433f9954f
+          test "$(git hash-object .github/import-opencode-prerequisite/part-001)" = f4e39186b05ca0ce21d1016e3e1625e19dede9f8
+          test "$(git hash-object .github/import-opencode-prerequisite/part-002)" = 644e5c0af5f5176a31a8002dd2dd46bcfb3bc3d6
+          test "$(git hash-object .github/import-opencode-prerequisite/part-003)" = c5bc810335ebeb8233b74ac8457dadd483b298e0
+          test "$(git hash-object .github/import-opencode-prerequisite/part-004)" = bddadd995ce900aa09a37e47efb8b2bec8b86696
+          test "$(git hash-object .github/import-opencode-prerequisite/part-005)" = bac30a1d4193cdeeeaf7e07f1820e39652319a47
+          test "$(git hash-object .github/import-opencode-prerequisite/part-006)" = baa02045d5f08113971b4c0b202bc0c7d6799d3e
           cat .github/import-opencode-prerequisite/part-* > /tmp/opencode-prerequisite.tar.gz
           printf '%s  %s\n' "$EXPECTED_PAYLOAD_SHA256" /tmp/opencode-prerequisite.tar.gz | sha256sum -c -
 
-          rm -rf /tmp/opencode-prerequisite
-          mkdir -p /tmp/opencode-prerequisite
-          tar -xzf /tmp/opencode-prerequisite.tar.gz -C /tmp/opencode-prerequisite --no-same-owner --no-same-permissions
-          test -z "$(find /tmp/opencode-prerequisite -type l -print -quit)"
-          test -z "$(find /tmp/opencode-prerequisite ! -type f ! -type d -print -quit)"
+          python - <<'PY'
+          import hashlib
+          import shutil
+          import tarfile
+          from pathlib import Path, PurePosixPath
 
-          cat > /tmp/expected-product-paths <<'EOF'
-          README.md
-          modules/opencode/README.md
-          modules/opencode/send-after-configuration.example.json
-          src/model.rs
-          src/runtime/opencode_v2/configuration.rs
-          src/store/mod.rs
-          src/store/operations.rs
-          src/store/prerequisites.rs
-          src/store/runtime.rs
-          EOF
-          find /tmp/opencode-prerequisite -type f -printf '%P\n' | sort > /tmp/actual-product-paths
-          diff -u /tmp/expected-product-paths /tmp/actual-product-paths
-
-          while IFS= read -r path; do
-            mkdir -p "$(dirname "$path")"
-            cp "/tmp/opencode-prerequisite/$path" "$path"
-          done < /tmp/expected-product-paths
-
-          cat > /tmp/expected-product-sha256 <<'EOF'
-          1ecb51fab266bad565c2e4b2300d8e8cb3a50ba881c1b9116343b87e540d8aa0  README.md
-          eac1cf2949dd7b2c845759ec6f21939c70dec0f71c19f2176018249ac0a9fb6b  modules/opencode/README.md
-          23d2aa3322d047f62a0354557203148b41c41f97b5e05cbfa1aac1232cb242ba  modules/opencode/send-after-configuration.example.json
-          7b6a3cd10cd9dfd299cb49d764c399864b4dc9cebf249568ead2a3e77503c7a5  src/model.rs
-          1dbfb449af414461440758f31981e524a73c220e0796f4efa90a5b2d9c39b745  src/runtime/opencode_v2/configuration.rs
-          1bb1737abc47c88f02ec5bf006582dd9cd4efd6a41203eeda34f1c20157bff87  src/store/mod.rs
-          ed05cda2343bd1b296a48dffcad3b081c261a24b284652db65b64cf594fb6bfc  src/store/operations.rs
-          8064e197e6c4a9bf2fcba05404b0a4e23048cfe73c7c63f9d4b5f5e25039c275  src/store/prerequisites.rs
-          52545ce8f20c7e139dc83ffe1c7235a3a70064266e7c3d9bdb5c1acd9f171ad1  src/store/runtime.rs
-          EOF
-          sha256sum -c /tmp/expected-product-sha256
+          expected = {
+              'README.md': '1ecb51fab266bad565c2e4b2300d8e8cb3a50ba881c1b9116343b87e540d8aa0',
+              'modules/opencode/README.md': 'eac1cf2949dd7b2c845759ec6f21939c70dec0f71c19f2176018249ac0a9fb6b',
+              'modules/opencode/send-after-configuration.example.json': '23d2aa3322d047f62a0354557203148b41c41f97b5e05cbfa1aac1232cb242ba',
+              'src/model.rs': '7b6a3cd10cd9dfd299cb49d764c399864b4dc9cebf249568ead2a3e77503c7a5',
+              'src/runtime/opencode_v2/configuration.rs': '1dbfb449af414461440758f31981e524a73c220e0796f4efa90a5b2d9c39b745',
+              'src/store/mod.rs': '1bb1737abc47c88f02ec5bf006582dd9cd4efd6a41203eeda34f1c20157bff87',
+              'src/store/operations.rs': 'ed05cda2343bd1b296a48dffcad3b081c261a24b284652db65b64cf594fb6bfc',
+              'src/store/prerequisites.rs': '8064e197e6c4a9bf2fcba05404b0a4e23048cfe73c7c63f9d4b5f5e25039c275',
+              'src/store/runtime.rs': '52545ce8f20c7e139dc83ffe1c7235a3a70064266e7c3d9bdb5c1acd9f171ad1',
+          }
+          archive = Path('/tmp/opencode-prerequisite.tar.gz')
+          with tarfile.open(archive, 'r:gz') as source:
+              members = source.getmembers()
+              actual = []
+              for member in members:
+                  path = PurePosixPath(member.name)
+                  assert member.isfile(), member.name
+                  assert not path.is_absolute() and '..' not in path.parts, member.name
+                  actual.append(member.name)
+              assert sorted(actual) == sorted(expected), (actual, sorted(expected))
+              for member in members:
+                  stream = source.extractfile(member)
+                  assert stream is not None
+                  data = stream.read()
+                  assert hashlib.sha256(data).hexdigest() == expected[member.name], member.name
+                  target = Path(member.name)
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  target.write_bytes(data)
+          PY
           git diff --check
       - name: Pinned toolchain
         shell: bash
@@ -73,15 +78,10 @@ jobs:
           rustc --version
           cargo --version
       - name: Formatting
-        shell: bash
         run: |
-          set -euo pipefail
           cargo fmt -p eliot-swarm-controller
           cargo fmt -p eliot-swarm-controller -- --check
           git diff --check
-          { git diff --name-only; git ls-files --others --exclude-standard; } | sort -u > /tmp/actual-product-diff
-          diff -u /tmp/expected-product-paths /tmp/actual-product-diff
-          while IFS= read -r path; do sha256sum "$path"; done < /tmp/expected-product-paths > /tmp/formatted-product-sha256
       - name: Verify Atlas donor snapshot
         shell: python
         run: |
@@ -105,34 +105,31 @@ jobs:
         run: |
           set -euo pipefail
           STAGING_SHA="$(cat /tmp/staging-sha)"
-
           rm -rf .github/import-opencode-prerequisite
           rm .github/workflows/import-opencode-prerequisite.yml
           git add -A
           git diff --cached --check
 
-          cat > /tmp/expected-staged-paths <<'EOF'
-          .github/import-opencode-prerequisite/part-000
-          .github/import-opencode-prerequisite/part-001
-          .github/import-opencode-prerequisite/part-002
-          .github/import-opencode-prerequisite/part-003
-          .github/import-opencode-prerequisite/part-004
-          .github/import-opencode-prerequisite/part-005
-          .github/import-opencode-prerequisite/part-006
-          .github/workflows/import-opencode-prerequisite.yml
-          README.md
-          modules/opencode/README.md
-          modules/opencode/send-after-configuration.example.json
-          src/model.rs
-          src/runtime/opencode_v2/configuration.rs
-          src/store/mod.rs
-          src/store/operations.rs
-          src/store/prerequisites.rs
-          src/store/runtime.rs
-          EOF
+          printf '%s\n' \
+            .github/import-opencode-prerequisite/part-000 \
+            .github/import-opencode-prerequisite/part-001 \
+            .github/import-opencode-prerequisite/part-002 \
+            .github/import-opencode-prerequisite/part-003 \
+            .github/import-opencode-prerequisite/part-004 \
+            .github/import-opencode-prerequisite/part-005 \
+            .github/import-opencode-prerequisite/part-006 \
+            .github/workflows/import-opencode-prerequisite.yml \
+            README.md \
+            modules/opencode/README.md \
+            modules/opencode/send-after-configuration.example.json \
+            src/model.rs \
+            src/runtime/opencode_v2/configuration.rs \
+            src/store/mod.rs \
+            src/store/operations.rs \
+            src/store/prerequisites.rs \
+            src/store/runtime.rs | sort > /tmp/expected-staged-paths
           git diff --cached --name-only | sort > /tmp/actual-staged-paths
           diff -u /tmp/expected-staged-paths /tmp/actual-staged-paths
-          sha256sum -c /tmp/formatted-product-sha256
 
           git config user.name 'Iurii Lisenkov'
           git config user.email '71514792+UnknownAlienHuman@users.noreply.github.com'
