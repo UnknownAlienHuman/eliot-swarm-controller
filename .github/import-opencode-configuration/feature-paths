@@ -1,0 +1,9 @@
+README.md
+modules/opencode/README.md
+src/runtime/opencode_v2.rs
+src/runtime/opencode_v2/configuration.rs
+src/runtime/opencode_v2/effects.rs
+src/runtime/opencode_v2/http.rs
+src/runtime/opencode_v2/snapshot.rs
+src/store/opencode.rs
+src/store/runtime.rs

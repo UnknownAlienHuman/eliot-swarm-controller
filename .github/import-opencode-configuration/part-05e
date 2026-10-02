@@ -1,0 +1,10 @@
+ration_applied",
++            "application_boundary":"next_step_boundary",
++            "replay_policy":"readback_only_no_mutation_replay",
++            "fallback_used":false,
++            "contract_revision":"opencode-instruction-entry-v1"
++        });
++    }
++    tx.execute("UPDATE operations SET binding_id=?2,binding_generation=?3,effective_request_json=?4 WHERE operation_id=?1",params![op,id,generation,model::canonical(&effective)?])?;
+     Ok(json!({"operation_id":op,"state":"queued","native_admission":"not_observed"}))
+ }
