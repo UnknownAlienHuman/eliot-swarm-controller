@@ -17,7 +17,7 @@ jobs:
       - name: Verify and materialize exact source
         shell: bash
         env:
-          EXPECTED_PARENT: 26da2a096e885693f6b7da80e83023baafce2acf
+          EXPECTED_PARENT: 245358702bcaae6f0beec5bfd8162d0f27eb35a2
           EXPECTED_ARCHIVE_SHA256: a913325f2b2967dec2082a650fb2e188625b09e807da3cba21c31e1a2bc2d65c
         run: |
           set -euo pipefail
@@ -80,6 +80,35 @@ jobs:
           EOF
           sha256sum -c /tmp/source-sha256
           git diff --check
+      - name: Repair typed JSON comparisons
+        shell: python
+        run: |
+          from hashlib import sha256
+          from pathlib import Path
+
+          path = Path("src/store/prerequisites.rs")
+          source = path.read_text()
+          replacements = [
+              (
+                  '            if details["action"] != action || details["key"] != key {',
+                  '            if details["action"].as_str() != Some(action.as_str())\n'
+                  '                || details["key"].as_str() != Some(key.as_str())\n'
+                  '            {',
+              ),
+              (
+                  '            if details["agent_id"] != agent_id',
+                  '            if details["agent_id"].as_str() != Some(agent_id.as_str())',
+              ),
+              (
+                  '                agent["agent_id"] == agent_id',
+                  '                agent["agent_id"].as_str() == Some(agent_id.as_str())',
+              ),
+          ]
+          for old, new in replacements:
+              assert source.count(old) == 1, old
+              source = source.replace(old, new)
+          path.write_text(source)
+          assert sha256(path.read_bytes()).hexdigest() == "9e1049d98a549f2ea7b9935e2f117ce48437e96d64543f697d18f290a646dd7b"
       - name: Pinned toolchain
         shell: bash
         run: |
