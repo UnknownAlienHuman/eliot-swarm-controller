@@ -5,11 +5,14 @@
 //! goal therefore lives in the native durable instruction-entry backend under
 //! the controller-owned `eliot.goal` key, and activation reuses the existing
 //! single prompt admission. This is not a native goal, not automatic
-//! continuation after a terminal turn and not Task acceptance. A lost
+//! continuation after a terminal turn and not Task acceptance. The goal
+//! result keeps admission and execution start as separate facts: an admitted
+//! activation input never by itself proves the model started; start is proven
+//! only by the durable execution log (see `execution.rs`). A lost
 //! mutation response reconciles by GET/readback only; no PUT, DELETE or
 //! prompt is ever replayed.
 use super::{
-    Options, Service,
+    ExecutionScan, NativeInputDescriptor, Options, Service,
     configuration::{digest_json, owned_projection, projection_revision},
     effects::{failed, marker, no_attachments, outcome},
     http::{Data, decode},
@@ -192,13 +195,29 @@ fn goal_inbox_matches(item: &Value, root: &str, id: &str, text: &str, marker: &V
         && no_attachments(&item["payload"])
 }
 
+/// The split activation facts of one goal Operation. Admission and execution
+/// start are different native facts and are never conflated: an admitted
+/// activation input proves the input exists (inbox/message readback or the
+/// durable log's exact `session.inbox.enqueued` event), while execution start
+/// is proven only by the durable execution log correlating the input's
+/// `inbox.delivered` to an active `session.execution.started` event. Neither
+/// fact is Task acceptance or family completion, and neither rewrites the
+/// Operation's completion boundary, which stays `native_goal_recorded`.
+#[derive(Default)]
+struct GoalActivation {
+    input_id: Option<String>,
+    admitted: bool,
+    execution_started: bool,
+    execution_ref: Option<Value>,
+}
+
 fn goal_details(
     action: GoalAction,
     record: Option<&GoalRecord>,
     readback: &GoalReadback,
     evidence: &str,
     mutation_sent: bool,
-    activation_input_id: Option<&str>,
+    activation: &GoalActivation,
 ) -> Result<Value> {
     let objective_digest = record.map(GoalRecord::objective_digest).transpose()?;
     Ok(json!({
@@ -215,8 +234,11 @@ fn goal_details(
             "application_scope":"session",
             "continuation_owner":"controller_record",
             "native_goal_api":false,
-            "activation_input_id":activation_input_id,
-            "model_work_started":activation_input_id.is_some(),
+            "record_applied":true,
+            "activation_input_id":activation.input_id,
+            "activation_admitted":activation.admitted,
+            "activation_execution_started":activation.execution_started,
+            "activation_execution_ref":activation.execution_ref,
             "mutation_sent":mutation_sent,
             "evidence":evidence,
             "contract_revision":GOAL_CONTRACT_REVISION,
@@ -385,6 +407,51 @@ impl Service {
         delivered.then_some(id)
     }
 
+    /// Activation evidence for reconciliation: the exact input's admission
+    /// from inbox/message readback or from the durable log, and — from the
+    /// log only — whether that input's delivery correlated to an active
+    /// `session.execution.started`. Strictly best-effort and additive: the
+    /// record readback has already settled the Operation at
+    /// `native_goal_recorded`, so any log failure, gap or uncertainty only
+    /// leaves the execution facts unproven (`activation_execution_started:
+    /// false`); it never fails reconciliation and never replays a mutation
+    /// or a prompt.
+    async fn goal_activation_evidence(
+        &self,
+        root: &str,
+        command: &RuntimeCommand,
+        record: &GoalRecord,
+    ) -> GoalActivation {
+        let mut activation = GoalActivation::default();
+        if let Some(id) = self.goal_activation_observed(root, command, record).await {
+            activation.input_id = Some(id);
+            activation.admitted = true;
+        }
+        let descriptor = NativeInputDescriptor::for_goal_activation(
+            command,
+            &goal_prompt_text(record),
+            goal_marker(command, record),
+        );
+        if let Ok(descriptor) = descriptor
+            && let Ok(session) = self.session(root).await
+            && session["fork"].is_null()
+            && session["revert"].is_null()
+            && let Ok(scan) = ExecutionScan::for_goal(&descriptor)
+            && let Ok(read) = self.execution_log(&descriptor, scan).await
+            && read.synced
+        {
+            if read.scan.input_admitted() {
+                activation.admitted = true;
+                activation.input_id = Some(descriptor.input_id().to_owned());
+            }
+            if let Some(started) = read.scan.execution_started() {
+                activation.execution_started = true;
+                activation.execution_ref = Some(started);
+            }
+        }
+        activation
+    }
+
     pub(super) async fn execute_goal(
         &self,
         command: &RuntimeCommand,
@@ -425,7 +492,7 @@ impl Service {
                 &before,
                 "preexisting_exact_readback",
                 false,
-                None,
+                &GoalActivation::default(),
             ) {
                 Ok(details) => outcome(command, EffectOutcome::Applied, options, details),
                 Err(error) => failed(command, options, &error, false),
@@ -476,13 +543,23 @@ impl Service {
                 Err(error) => return failed(command, options, &error, true),
             }
         }
+        let activation = GoalActivation {
+            input_id: activation_input_id.clone(),
+            admitted: activation_input_id.is_some(),
+            // The Operation completes at `native_goal_recorded`; the verified
+            // admission receipt proves admission only. Execution start is a
+            // later fact, proven solely by the durable log when the Operation
+            // is reconciled, so it is honestly false at this boundary.
+            execution_started: false,
+            execution_ref: None,
+        };
         let details = match goal_details(
             request.action,
             desired.as_ref(),
             &after,
             "post_mutation_exact_readback",
             true,
-            activation_input_id.as_deref(),
+            &activation,
         ) {
             Ok(details) => details,
             Err(error) => return failed(command, options, &error, true),
@@ -521,7 +598,7 @@ impl Service {
                     &current,
                     "exact_state_reconciliation",
                     false,
-                    None,
+                    &GoalActivation::default(),
                 )?;
                 return Ok((details, None));
             }
@@ -555,14 +632,15 @@ impl Service {
             if !recorded {
                 return Err(unresolved("the goal record does not match this operation"));
             }
-            let activation_input_id = self.goal_activation_observed(root, command, record).await;
+            let activation = self.goal_activation_evidence(root, command, record).await;
+            let activation_input_id = activation.input_id.clone();
             let details = goal_details(
                 request.action,
                 Some(record),
                 &current,
                 "exact_state_reconciliation",
                 false,
-                activation_input_id.as_deref(),
+                &activation,
             )?;
             Ok((details, activation_input_id))
         }

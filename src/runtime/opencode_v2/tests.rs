@@ -819,6 +819,101 @@ fn stored_goal(f: &Fixture, root: &str) -> Option<Value> {
         .cloned()
 }
 
+/// One durable root-log event in the full native envelope the execution
+/// reader verifies: durable version, per-event sessionID, finite time.
+fn root_log_event(id: &str, kind: &str, seq: u64, root: &str, data: Value) -> Value {
+    json!({"id":id,"type":kind,"version":1,"created":1.0,
+    "durable":{"aggregateID":root,"seq":seq,"version":1},"data":data})
+}
+
+/// The root session's creation event carrying the origin facts a
+/// `NativeInputDescriptor` binds: the controller binding/generation marker
+/// and the route's creation model.
+fn root_log_created(root: &str) -> Value {
+    root_log_event(
+        "evt_root_created",
+        "session.created",
+        1,
+        root,
+        json!({"sessionID":root,"parentID":Value::Null,
+        "metadata":{"eliot":{"binding":"fixture-binding","generation":1}},
+        "model":{"id":"fixture-model","providerID":"fixture-provider","variant":"explicit-variant"}}),
+    )
+}
+
+fn root_log_enqueued(root: &str, seq: u64, input: &str, text: &str, marker: &Value) -> Value {
+    root_log_event(
+        &format!("evt_{input}_enqueued"),
+        "session.inbox.enqueued",
+        seq,
+        root,
+        json!({"sessionID":root,"inboxID":input,
+        "item":{"id":input,"sessionID":root,"type":"user","delivery":"queue",
+        "payload":{"text":text,"metadata":{"eliot":marker}}}}),
+    )
+}
+
+fn root_log_delivered(root: &str, seq: u64, input: &str) -> Value {
+    root_log_event(
+        &format!("evt_{input}_delivered"),
+        "session.inbox.delivered",
+        seq,
+        root,
+        json!({"sessionID":root,"inboxID":input}),
+    )
+}
+
+fn root_log_started(root: &str, seq: u64, id: &str) -> Value {
+    root_log_event(
+        id,
+        "session.execution.started",
+        seq,
+        root,
+        json!({"sessionID":root}),
+    )
+}
+
+/// The exact activation prompt text and marker a first-revision goal `set`
+/// places on the wire; replicated here so the log fixture carries the same
+/// bytes the descriptor digests.
+fn goal_activation_facts(c: &RuntimeCommand, objective: &str) -> (String, Value) {
+    let text = format!(
+        "ELIOT controller-recorded goal (revision 1): {objective}\n\nThis objective is recorded by the controller in this session's durable \"eliot.goal\" instruction entry. OpenCode has no native goal API: this prompt is the goal's activation, not a native goal admission and not Task acceptance."
+    );
+    let marker = json!({"binding":"fixture-binding","generation":1,
+    "operation":c.operation_id,"goal_revision":1,"goal_operation":c.operation_id});
+    (text, marker)
+}
+
+/// Seeds the fixture's durable root log with the goal activation lifecycle:
+/// creation, the exact enqueued input, then per `stage` nothing more
+/// (`"enqueued"`), a delivery with no start event (`"delivered_no_start"`),
+/// or a started busy period the delivery correlates to (`"started"`).
+fn seed_goal_activation_log(
+    f: &Fixture,
+    root: &str,
+    c: &RuntimeCommand,
+    objective: &str,
+    stage: &str,
+) {
+    let (text, marker) = goal_activation_facts(c, objective);
+    let input = input_id(&c.operation_id);
+    let mut events = vec![
+        root_log_created(root),
+        root_log_enqueued(root, 2, &input, &text, &marker),
+    ];
+    match stage {
+        "enqueued" => {}
+        "delivered_no_start" => events.push(root_log_delivered(root, 3, &input)),
+        "started" => {
+            events.push(root_log_started(root, 3, "evt_goal_started"));
+            events.push(root_log_delivered(root, 4, &input));
+        }
+        _ => unreachable!(),
+    }
+    f.world.lock().unwrap().logs.insert(root.into(), events);
+}
+
 #[tokio::test]
 async fn goal_set_records_entry_and_admits_one_activation_prompt() {
     let f = Fixture::new().await;
@@ -834,7 +929,18 @@ async fn goal_set_records_entry_and_admits_one_activation_prompt() {
     assert_eq!(r.details["goal"]["revision"], 1);
     assert_eq!(r.details["goal"]["native_goal_api"], false);
     assert_eq!(r.details["goal"]["mutation_sent"], true);
-    assert_eq!(r.details["goal"]["model_work_started"], true);
+    // The verified admission receipt proves admission only. The Operation
+    // completes at `native_goal_recorded`; execution start is a separate,
+    // later fact and is not claimed here.
+    assert_eq!(r.details["goal"]["record_applied"], true);
+    assert_eq!(
+        r.details["goal"]["activation_input_id"],
+        input_id(&c.operation_id)
+    );
+    assert_eq!(r.details["goal"]["activation_admitted"], true);
+    assert_eq!(r.details["goal"]["activation_execution_started"], false);
+    assert_eq!(r.details["goal"]["activation_execution_ref"], Value::Null);
+    assert!(r.details["goal"].get("model_work_started").is_none());
     assert_eq!(
         r.native_input_id.as_deref(),
         Some(input_id(&c.operation_id).as_str())
@@ -880,7 +986,8 @@ async fn goal_pause_changes_only_status_and_never_prompts_or_interrupts() {
     assert!(matches!(r.outcome, EffectOutcome::Applied), "{r:?}");
     assert_eq!(r.details["goal"]["status"], "paused");
     assert_eq!(r.details["goal"]["revision"], 2);
-    assert_eq!(r.details["goal"]["model_work_started"], false);
+    assert_eq!(r.details["goal"]["activation_admitted"], false);
+    assert_eq!(r.details["goal"]["activation_execution_started"], false);
     assert_eq!(f.puts(&goal_entry_path(&root)), 2);
     assert_eq!(f.posts(&goal_prompt_path(&root)), 1);
     assert!(
@@ -1011,7 +1118,10 @@ async fn lost_goal_put_reconciles_by_readback_only() {
     // The record is the completion condition; the never-sent activation is
     // honestly reported as absent instead of being replayed.
     assert_eq!(r.details["goal"]["activation_input_id"], Value::Null);
-    assert_eq!(r.details["goal"]["model_work_started"], false);
+    assert_eq!(r.details["goal"]["record_applied"], true);
+    assert_eq!(r.details["goal"]["activation_admitted"], false);
+    assert_eq!(r.details["goal"]["activation_execution_started"], false);
+    assert_eq!(r.details["goal"]["activation_execution_ref"], Value::Null);
     assert_eq!(f.puts(&goal_entry_path(&root)), 1);
     assert_eq!(f.posts(&goal_prompt_path(&root)), 0);
 }
@@ -1032,9 +1142,197 @@ async fn lost_activation_prompt_reconciles_from_inbox_without_resend() {
         r.native_input_id.as_deref(),
         Some(input_id(&c.operation_id).as_str())
     );
-    assert_eq!(r.details["goal"]["model_work_started"], true);
+    // Admission is proven by the exact inbox readback. The fixture serves no
+    // durable root log, so no execution start is proven: admitted, not started.
+    assert_eq!(r.details["goal"]["activation_admitted"], true);
+    assert_eq!(r.details["goal"]["activation_execution_started"], false);
+    assert_eq!(r.details["goal"]["activation_execution_ref"], Value::Null);
     assert_eq!(f.puts(&goal_entry_path(&root)), 1);
     assert_eq!(f.posts(&goal_prompt_path(&root)), 1);
+}
+
+#[tokio::test]
+async fn goal_reconcile_admitted_but_not_delivered_stays_not_started() {
+    let f = Fixture::new().await;
+    let s = f.service().await;
+    f.open(&s).await;
+    let root = root_id("fixture-binding", 1);
+    let c = f.goal_command(json!({"action":"set","objective":"queued objective"}));
+    assert_applied(s.execute(&c, &f.options).await);
+    // The durable log proves the exact input was admitted (enqueued) and
+    // nothing else: no delivery, no execution start.
+    seed_goal_activation_log(&f, &root, &c, "queued objective", "enqueued");
+    let r = s.reconcile(&c, &f.options).await;
+    assert!(matches!(r.outcome, EffectOutcome::Applied), "{r:?}");
+    assert_eq!(r.details["goal"]["record_applied"], true);
+    assert_eq!(r.details["goal"]["activation_admitted"], true);
+    assert_eq!(r.details["goal"]["activation_execution_started"], false);
+    assert_eq!(r.details["goal"]["activation_execution_ref"], Value::Null);
+}
+
+#[tokio::test]
+async fn goal_reconcile_delivered_without_start_event_is_uncertainty_not_started() {
+    let f = Fixture::new().await;
+    let s = f.service().await;
+    f.open(&s).await;
+    let root = root_id("fixture-binding", 1);
+    let c = f.goal_command(json!({"action":"set","objective":"missing start objective"}));
+    assert_applied(s.execute(&c, &f.options).await);
+    // Enqueued and delivered, but the log holds no `session.execution.started`
+    // for the busy period: the reader marks the start missing (uncertainty),
+    // which must surface as not-started, never as a start and never as a
+    // failed reconciliation.
+    seed_goal_activation_log(
+        &f,
+        &root,
+        &c,
+        "missing start objective",
+        "delivered_no_start",
+    );
+    let r = s.reconcile(&c, &f.options).await;
+    assert!(matches!(r.outcome, EffectOutcome::Applied), "{r:?}");
+    assert_eq!(r.details["goal"]["activation_admitted"], true);
+    assert_eq!(r.details["goal"]["activation_execution_started"], false);
+    assert_eq!(r.details["goal"]["activation_execution_ref"], Value::Null);
+}
+
+#[tokio::test]
+async fn lost_activation_with_message_and_log_proves_admission_and_start_separately() {
+    let f = Fixture::new().await;
+    let s = f.service().await;
+    f.open(&s).await;
+    let root = root_id("fixture-binding", 1);
+    {
+        let mut w = f.world.lock().unwrap();
+        w.consume_prompt = true;
+        w.lose_prompt = true;
+    }
+    let c = f.goal_command(json!({"action":"set","objective":"lost prompt objective"}));
+    let r = s.execute(&c, &f.options).await;
+    assert!(matches!(r.outcome, EffectOutcome::Unknown), "{r:?}");
+    // The prompt response was lost, but the input was consumed to a message
+    // and the durable log records its full lifecycle: enqueued, a started
+    // busy period, delivered.
+    seed_goal_activation_log(&f, &root, &c, "lost prompt objective", "started");
+    let r = s.reconcile(&c, &f.options).await;
+    assert!(matches!(r.outcome, EffectOutcome::Applied), "{r:?}");
+    // The completion boundary is unchanged: the record, not the execution.
+    assert_eq!(r.details["completion_condition"], "native_goal_recorded");
+    assert_eq!(r.details["goal"]["record_applied"], true);
+    assert_eq!(r.details["goal"]["activation_admitted"], true);
+    assert_eq!(r.details["goal"]["activation_execution_started"], true);
+    assert_eq!(
+        r.details["goal"]["activation_execution_ref"]["id"],
+        "evt_goal_started"
+    );
+    assert_eq!(r.details["goal"]["activation_execution_ref"]["seq"], 3);
+    assert_eq!(
+        r.native_input_id.as_deref(),
+        Some(input_id(&c.operation_id).as_str())
+    );
+    // No Task acceptance or family completion is synthesized anywhere.
+    assert!(r.details["goal"].get("family_complete").is_none());
+    assert!(r.details["goal"].get("task_accepted").is_none());
+    // Reconciliation read back only: no prompt or entry write was replayed.
+    assert_eq!(f.posts(&goal_prompt_path(&root)), 1);
+    assert_eq!(f.puts(&goal_entry_path(&root)), 1);
+}
+
+#[test]
+fn execution_scan_correlates_start_through_the_exact_input_only() {
+    let root = root_id("fixture-binding", 1);
+    let command = |operation: &str, text: &str| RuntimeCommand {
+        operation_id: operation.into(),
+        method: "agent.goal".into(),
+        created_at_ms: 1,
+        binding_id: "fixture-binding".into(),
+        generation: 1,
+        native_root_id: Some(root.clone()),
+        route: json!({"runtime":RUNTIME,"module_artifact_id":ARTIFACT_ID,
+        "native_options":{"model":{"id":"fixture-model","providerID":"fixture-provider","variant":"explicit-variant"}}}),
+        input: json!({"text":text}),
+    };
+    let descriptor = |operation: &str, text: &str| {
+        let c = command(operation, text);
+        NativeInputDescriptor::for_goal_activation(
+            &c,
+            text,
+            json!({"binding":"fixture-binding","generation":1,"operation":operation}),
+        )
+        .unwrap()
+    };
+    let marker = json!({"binding":"fixture-binding","generation":1,"operation":"op_a"});
+    let a = descriptor("op_a", "alpha instruction");
+    let input_a = input_id("op_a");
+
+    // Admitted but not delivered: admission only, no start.
+    let mut scan = ExecutionScan::for_goal(&a).unwrap();
+    for e in [
+        root_log_created(&root),
+        root_log_enqueued(&root, 2, &input_a, "alpha instruction", &marker),
+    ] {
+        scan.consume(&e, &a).unwrap();
+    }
+    assert!(scan.input_admitted());
+    assert!(scan.execution_started().is_none());
+
+    // Delivered with the start event missing: uncertainty, never a start.
+    let mut scan = ExecutionScan::for_goal(&a).unwrap();
+    for e in [
+        root_log_created(&root),
+        root_log_enqueued(&root, 2, &input_a, "alpha instruction", &marker),
+        root_log_delivered(&root, 3, &input_a),
+    ] {
+        scan.consume(&e, &a).unwrap();
+    }
+    assert!(scan.input_admitted());
+    assert!(scan.execution_started().is_none());
+
+    // The exact started event, active when this input is delivered: started,
+    // with the started event itself as the ref.
+    let mut scan = ExecutionScan::for_goal(&a).unwrap();
+    for e in [
+        root_log_created(&root),
+        root_log_enqueued(&root, 2, &input_a, "alpha instruction", &marker),
+        root_log_started(&root, 3, "evt_run_a_started"),
+        root_log_delivered(&root, 4, &input_a),
+    ] {
+        scan.consume(&e, &a).unwrap();
+    }
+    let started = scan.execution_started().unwrap();
+    assert_eq!(started["id"], "evt_run_a_started");
+    assert_eq!(started["seq"], 3);
+
+    // One busy period may serve several inputs: a second input delivered
+    // while the same period is active correlates to the same started event.
+    let b = descriptor("op_b", "beta instruction");
+    let input_b = input_id("op_b");
+    let marker_b = json!({"binding":"fixture-binding","generation":1,"operation":"op_b"});
+    let stream = [
+        root_log_created(&root),
+        root_log_enqueued(&root, 2, &input_a, "alpha instruction", &marker),
+        root_log_started(&root, 3, "evt_shared_started"),
+        root_log_delivered(&root, 4, &input_a),
+        root_log_enqueued(&root, 5, &input_b, "beta instruction", &marker_b),
+        root_log_delivered(&root, 6, &input_b),
+    ];
+    let mut scan_b = ExecutionScan::for_goal(&b).unwrap();
+    for e in &stream {
+        scan_b.consume(e, &b).unwrap();
+    }
+    assert!(scan_b.input_admitted());
+    assert_eq!(
+        scan_b.execution_started().unwrap()["id"],
+        "evt_shared_started"
+    );
+
+    // An enqueued event carrying this input's ID but different prompt bytes
+    // is a hard mismatch, not a match: correlation is exact or nothing.
+    let mut scan = ExecutionScan::for_goal(&a).unwrap();
+    scan.consume(&root_log_created(&root), &a).unwrap();
+    let forged = root_log_enqueued(&root, 2, &input_a, "forged instruction", &marker);
+    assert!(scan.consume(&forged, &a).is_err());
+    assert!(!scan.input_admitted());
 }
 
 #[tokio::test]
