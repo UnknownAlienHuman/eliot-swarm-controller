@@ -1,5 +1,7 @@
 //! Exact, on-demand projected result reads. Timeline adjacency is deliberately
 //! not native run identity and never supplies Task/producer terminal evidence.
+mod diffs;
+
 use super::{
     Options, Service,
     effects::delivered_matches,
@@ -161,13 +163,19 @@ impl Service {
     /// Find the exact user ID in an unfiltered ordered projection. Moving past
     /// a newer idle replaces the candidate boundary, so an old input cannot
     /// acquire the latest turn's output. No timestamp/content search is used.
-    async fn input_interval(&self, original: &RuntimeCommand, session: &str) -> Result<Vec<Value>> {
+    async fn input_interval(
+        &self,
+        original: &RuntimeCommand,
+        session: &str,
+        isolate_turn: bool,
+    ) -> Result<Vec<Value>> {
         let input = input_id(&original.operation_id);
         let mut cursor: Option<String> = None;
         let mut cursors = BTreeSet::new();
         let mut ids = BTreeSet::new();
         let mut scanned_bytes = 0usize;
         let mut interval = Vec::new();
+        let mut isolated = None;
         for _ in 0..MAX_TIMELINE_PAGES {
             let mut query = vec![("limit", PAGE_MESSAGES.to_string())];
             if let Some(cursor) = &cursor {
@@ -194,6 +202,26 @@ impl Service {
                 if !ids.insert(id.clone()) {
                     return Err(unavailable("NATIVE_MESSAGE_DUPLICATE"));
                 }
+                if message["type"] == "idle"
+                    && !matches!(
+                        message["outcome"].as_str(),
+                        Some("succeeded" | "failed" | "interrupted")
+                    )
+                {
+                    return Err(unavailable("NATIVE_IDLE_SCHEMA"));
+                }
+                if isolated.is_some() {
+                    // Native diff starts at the FIRST prompt after the prior idle,
+                    // not necessarily the requested prompt. Do not export another
+                    // assignment's edits under this input's identity.
+                    if message["type"] == "user" {
+                        return Err(unavailable("RESULT_TURN_NOT_ISOLATED"));
+                    }
+                    if message["type"] == "idle" {
+                        return isolated.ok_or_else(|| unavailable("RESULT_INTERVAL_NOT_CLOSED"));
+                    }
+                    continue;
+                }
                 if id == input {
                     if !delivered_matches(&message, original)? {
                         return Err(unavailable("NATIVE_INPUT_MISMATCH"));
@@ -211,15 +239,13 @@ impl Service {
                             return Err(unavailable("RESULT_MODEL_CHANGED"));
                         }
                     }
-                    return Ok(interval);
+                    if !isolate_turn {
+                        return Ok(interval);
+                    }
+                    isolated = Some(std::mem::take(&mut interval));
+                    continue;
                 }
                 if message["type"] == "idle" {
-                    if !matches!(
-                        message["outcome"].as_str(),
-                        Some("succeeded" | "failed" | "interrupted")
-                    ) {
-                        return Err(unavailable("NATIVE_IDLE_SCHEMA"));
-                    }
                     interval.clear();
                     interval.push(message);
                 } else if !interval.is_empty() {
@@ -227,7 +253,7 @@ impl Service {
                 }
             }
             match page.cursor.next {
-                None => return Err(unavailable("RESULT_INPUT_NOT_FOUND")),
+                None => return isolated.ok_or_else(|| unavailable("RESULT_INPUT_NOT_FOUND")),
                 Some(next)
                     if !next.is_empty() && next.len() <= 4096 && cursors.insert(next.clone()) =>
                 {
@@ -256,10 +282,10 @@ impl Service {
             ],
         )?;
         let kind = model::text(selector, "kind")?;
-        if !matches!(kind, "message" | "input_interval") {
+        if !matches!(kind, "message" | "input_interval" | "turn_diff") {
             return Err(Error::new(
                 "UNSUPPORTED_RESULT_KIND",
-                "use message or input_interval",
+                "use message, input_interval or turn_diff",
             ));
         }
         let session = model::text(selector, "session_id")?;
@@ -286,7 +312,7 @@ impl Service {
             "message" => {
                 if selector.get("input_operation_id").is_some() {
                     return Err(Error::invalid(
-                        "input_operation_id is only valid for input_interval",
+                        "input_operation_id is only valid for input_interval or turn_diff",
                     ));
                 }
                 let id = model::text(selector, "message_id")?;
@@ -304,7 +330,7 @@ impl Service {
                     "finish":message["finish"],"read_method":"session.message.get"});
                 (message, source)
             }
-            "input_interval" => {
+            "input_interval" | "turn_diff" => {
                 if selector.get("message_id").is_some() {
                     return Err(Error::invalid("message_id is only valid for message"));
                 }
@@ -322,22 +348,40 @@ impl Service {
                         "input operation is outside the selected binding/session",
                     ));
                 }
-                let interval = self.input_interval(original, session).await?;
-                if self.input_interval(original, session).await? != interval {
+                let interval = self
+                    .input_interval(original, session, kind == "turn_diff")
+                    .await?;
+                let diff = if kind == "turn_diff" {
+                    Some(self.turn_diff(session, original, &interval).await?)
+                } else {
+                    None
+                };
+                if self
+                    .input_interval(original, session, kind == "turn_diff")
+                    .await?
+                    != interval
+                {
                     return Err(unavailable("RESULT_SOURCE_CHANGED"));
                 }
                 let idle = interval
                     .last()
                     .ok_or_else(|| unavailable("RESULT_INTERVAL_NOT_CLOSED"))?;
-                let source = json!({"kind":kind,"native_session_id":session,"input_operation_id":original.operation_id,
+                let mut source = json!({"kind":kind,"native_session_id":session,"input_operation_id":original.operation_id,
                     "native_input_id":input_id(&original.operation_id),"idle_message_id":idle["id"],"idle_outcome":idle["outcome"],
                     "message_count":interval.len(),"read_method":"session.message.list","correlation":"projected_order_only"});
-                (json!({"session_id":session,"messages":interval}), source)
+                match diff {
+                    Some(diff) => {
+                        source["read_method"] = json!("session.diff");
+                        source["diff"] = diff.source;
+                        (diff.document, source)
+                    }
+                    None => (json!({"session_id":session,"messages":interval}), source),
+                }
             }
             _ => {
                 return Err(Error::new(
                     "UNSUPPORTED_RESULT_KIND",
-                    "use message or input_interval",
+                    "use message, input_interval or turn_diff",
                 ));
             }
         };
@@ -370,7 +414,11 @@ impl Service {
         source["content_digest"] = json!(digest);
         source["digest_basis"] = json!("canonical_projected_json");
         source["native_service_version"] = json!(self.version);
-        source["reader_revision"] = json!("opencode-projected-result-v1");
+        source["reader_revision"] = json!(if kind == "turn_diff" {
+            "opencode-turn-diff-v1"
+        } else {
+            "opencode-projected-result-v1"
+        });
         source["read_consistency"] = json!("repeated_equal_projection_not_atomic_snapshot");
         source["execution_complete"] = json!(false);
         source["family_complete"] = json!(false);

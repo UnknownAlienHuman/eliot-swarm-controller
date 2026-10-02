@@ -38,7 +38,10 @@ impl Store {
         options: &Options,
         command: &RuntimeCommand,
     ) -> Result<()> {
-        let source = if command.input["selector"]["kind"] == "input_interval" {
+        let source = if matches!(
+            command.input["selector"]["kind"].as_str(),
+            Some("input_interval" | "turn_diff")
+        ) {
             let target =
                 crate::model::text(&command.input["selector"], "input_operation_id")?.to_owned();
             let p = p.clone();

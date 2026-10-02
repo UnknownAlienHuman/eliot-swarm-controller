@@ -4,7 +4,7 @@ Built-in Rust adapter for an **already running, externally owned** OpenCode V2 H
 
 ## Contract and exact scope
 
-Implements the HTTP/inbox/readback part of C04: native session creation, immutable Task delivery, next-turn input, family snapshots, addressed form/permission replies, refresh, read-only reconciliation and scoped projected-result export. One connection pool and volatile SSE reader serve bindings with the same configured `service_id`. Aliases must share that namespace, connection file and exact version. Do not assign different service IDs/files to the same service: physical endpoint aliases are not automatically discovered.
+Implements the HTTP/inbox/readback part of C04: native session creation, immutable Task delivery, next-turn input, family snapshots, addressed form/permission replies, refresh, read-only reconciliation, scoped projected-result export and native per-turn patch export. One connection pool and volatile SSE reader serve bindings with the same configured `service_id`. Aliases must share that namespace, connection file and exact version. Do not assign different service IDs/files to the same service: physical endpoint aliases are not automatically discovered.
 
 Canonical requirements: [architecture §8](../../docs/agent_swarm.md), [implementation C04](../../docs/agent_swarm.implementation-v6.md), [module contract §§4–7](../../docs/agent_swarm.module-contract-v2.md). Wire contract reviewed against the [official V2 API](https://opencode.ai/v2/docs/api) and [OpenAPI document](https://opencode.ai/v2/openapi.json), captured 2026-10-01. These documents move; they are not proof that a particular installed server has been qualified.
 
@@ -61,7 +61,7 @@ Per-response body cap: 4 MiB; connection file: 64 KiB; family: 256 retained sess
 
 ## Read-only results
 
-`agent.result` uses the existing `swarm result` → `operation` → `artifact assemble/export` path. The selector file supports either an exact completed assistant message (root or a child with a verified parent chain):
+`agent.result` uses the existing `swarm result` → `operation` → `artifact assemble/export` path. The selector file supports an exact completed assistant message (root or a child with a verified parent chain):
 
 ```json
 {"kind":"message","session_id":"ses_EXACT_NATIVE_ID","message_id":"msg_EXACT_NATIVE_ID"}
@@ -73,6 +73,12 @@ or a projected interval anchored to an already-sent input Operation on this exac
 {"kind":"input_interval","session_id":"ses_EXACT_NATIVE_ROOT","input_operation_id":"EXACT_DISPATCH_OR_SEND_OPERATION_ID"}
 ```
 
+or the native per-file patches for the same input's isolated, closed projected turn:
+
+```json
+{"kind":"turn_diff","session_id":"ses_EXACT_NATIVE_ROOT","input_operation_id":"EXACT_DISPATCH_OR_SEND_OPERATION_ID"}
+```
+
 ```powershell
 swarm --data-dir C:\SwarmState --request-id result-page-0 result BINDING_ID --generation 1 --file selector.json --offset 0 --length 65536
 swarm --data-dir C:\SwarmState operation RESULT_OPERATION_ID
@@ -80,22 +86,26 @@ swarm --data-dir C:\SwarmState operation RESULT_OPERATION_ID
 
 The message body is canonical native JSON, preserving text, reasoning and tool/result references as **data**; references never trigger URL or filesystem reads. Completed tool states are required. Intervals use unfiltered ordered pagination to find the exact user ID and its first subsequent idle message, not the latest assistant or matching prompt text. Original text/metadata must match; an intervening additional input, compaction or settings switch is rejected. The root's selected model must match every included assistant. Forks, staged reverts, duplicate IDs/cursors, changed bodies and incomplete reads are not silently accepted. The body is read twice and scope checked before/after; this detects observed changes, not an atomic native snapshot.
 
-**Neither selector proves native run completion.** V2's projected idle message has an outcome but no input/run reference. Source metadata retains `correlation=projected_order_only` for intervals and `execution_complete=false`, `family_complete=false` for both kinds. No producer disposition, native turn ID, Task acceptance or release is synthesized.
+**None of these selectors proves native run completion.** V2's projected idle message has an outcome but no input/run reference. Source metadata retains `correlation=projected_order_only` for intervals/diffs and `execution_complete=false`, `family_complete=false` for every kind. No producer disposition, native turn ID, Task acceptance or release is synthesized.
+
+`turn_diff` calls `GET /api/session/{sessionID}/diff` with **both** `from` and `to` set to the original input's exact native ID. The native range starts at the first user after the preceding idle marker, so the reader also scans backward to that boundary (or the beginning of history) and refuses another user in the same turn. Missing first/last assistant snapshot endpoints report `RESULT_SNAPSHOT_UNAVAILABLE`, not an empty successful diff. Completed assistants and the closed interval exclude the documented active-step working-copy fallback. The diff is read twice, then the input interval and binding scope are rechecked. A changed source, duplicate file path, truncated response or unknown diff schema remains unresolved.
+
+The exported JSON contains `session_id`, `native_input_id`, both snapshot IDs, the interval digest and native `files` entries (`file`, `patch`, `additions`, `deletions`, `status`). It preserves the full-file patch context returned by the native default. Source metadata records both snapshot IDs, the interval digest and file count. Patches and paths remain **data**: no patch application, arbitrary URI/file download or live-checkout verification occurs. This is not a captured CheckRunner source; binary contents are not included. The native turn-range and working-copy behavior were reviewed against [OpenCode source `4c0d0ff4`, `session/diff.ts`](https://github.com/anomalyco/opencode/blob/4c0d0ff478ca9150c163fb8b04a76395e4dccafe/packages/core/src/session/diff.ts) and the 2026-10-01 OpenAPI capture, not a live installed service.
 
 Successful Operations return `result.details.artifact_ref`, `source.content_digest` and `next_offset_bytes`. Optional `expected_digest: "sha256:<64 hex digits>"` pins the complete canonical source body. Use the identical selector for all pages; after an unpinned discovery read, re-read page zero with the pinned selector before assembly. Every page and the assembled body are hashed. Native JSON stays in private artifact files, not in SQLite telemetry.
 
 Unfinished reads recover with GET only, at most one background retry per binding per five seconds, rotating past unresolved reads; queued commands have priority. Explicit `agent.reconcile` also retries the exact saved read. Publication uses the existing no-overwrite file/SQLite boundary. An orphan file can be registered after the same source is read again; changed or missing native data stays unresolved rather than overwriting the orphan or replaying a prompt. A settled request ID returns its saved receipt.
 
-Each timeline pass is bounded to 32 pages of at most 50 messages and 8 MiB of scanned JSON; one result read has a 20-second deadline and publishes at most 64 KiB. Large/old/unavailable results report their limit rather than partial success. Detached binary/output/patch reference retrieval remains unsupported.
+Each timeline pass is bounded to 32 pages of at most 50 messages and 8 MiB of scanned JSON; one result read has a 20-second deadline and publishes at most 64 KiB. Large/old/unavailable results report their limit rather than partial success. Native turn-diff responses also obey the 4 MiB per-response cap. Detached binary/tool-output reference retrieval remains unsupported.
 
 ## Remaining C04 work — do not declare end-to-end completion
 
-Exact input-to-native-run/terminal correlation, detached native output retrieval, configuration/goal controls and complete family reconstruction are not implemented by this artifact. An admitted inbox producer remains unresolved and blocks release until genuine native disposition can be established; parent idle or the latest assistant outcome cannot discharge it. Unsupported methods report an explicit capability error.
+Exact input-to-native-run/terminal correlation, detached binary/tool-output retrieval, configuration/goal controls and complete family reconstruction are not implemented by this artifact. An admitted inbox producer remains unresolved and blocks release until genuine native disposition can be established; parent idle or the latest assistant outcome cannot discharge it. Unsupported methods report an explicit capability error.
 
 Live installed OpenCode, actual inference/subscription behavior and native Windows service interoperability remain unqualified. This adapter must not be presented as a fully qualified automatic Task-completion route yet. It does not require or install the optional OpenCodex provider proxy (Issue #1).
 
 ## Focused implementation evidence
 
-The projected-result reader was compiled locally with Rust 1.98.1 using locked offline dependencies; owned-crate formatting and warnings-denied lib/bin Clippy passed. No new tests or live native calls were run for this addition.
+The projected-result baseline `e88a0fb7` passed [Windows/Linux CI 36954512403](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/36954512403). The subsequent turn-diff reader passed local Rust 1.98.1 owned-crate formatting and locked offline lib/bin Clippy with warnings denied. Its exact Windows/Linux CI must be checked separately. No tests or live native calls were run for this addition; dependencies, migrations and the Atlas donor are unchanged.
 
 The interrupted 2026-10-01 implementation retained 16 protocol/Store fixtures. They were preserved, not rerun during source recovery. Fresh Rust 1.98.1 package formatting and minimal warnings-denied Clippy passed; the Windows/Linux workflow checks the exact commit's formatting, Clippy, donor hashes, release build and existing Muse SDK import. Tests remain deferred while the product code is being completed. Fixture HTTP servers are not OpenCode, and compilation is not live service, model, billing or subscription qualification.
