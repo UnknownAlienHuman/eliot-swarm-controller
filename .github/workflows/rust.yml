@@ -41,6 +41,8 @@ jobs:
           assert actual == set(expected) | {'SHA256SUMS'}, 'donor file set changed'
       - name: Clippy
         run: cargo clippy --locked --lib --bins --no-deps -- -D warnings
+      - name: OpenCode protocol and Store fixtures
+        run: cargo test --locked opencode -- --nocapture
       - name: Muse bridge syntax and pinned SDK import
         shell: bash
         run: |
