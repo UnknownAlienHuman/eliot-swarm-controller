@@ -1,6 +1,7 @@
 //! External modules share this command boundary, not vendor request schemas.
 pub mod opencode_v2;
 pub mod owner;
+pub mod zed;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
