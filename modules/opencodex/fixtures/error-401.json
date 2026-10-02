@@ -1,0 +1,7 @@
+{
+  "provenance": "Reconstruction from the pinned upstream contracts (lidge-jun/opencodex v2.73.0, commit 569e3e7dae48bafc54b8a1a7e3a85129befe2d98; docs-site management-api reference and src/server/management/system-routes.ts at the pin) - NOT a capture from a live service.",
+  "status": 401,
+  "body": {
+    "error": "opencodex admin token required"
+  }
+}

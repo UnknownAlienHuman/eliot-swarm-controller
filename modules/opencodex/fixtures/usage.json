@@ -1,0 +1,33 @@
+{
+  "provenance": "Reconstruction from the pinned upstream contracts (lidge-jun/opencodex v2.73.0, commit 569e3e7dae48bafc54b8a1a7e3a85129befe2d98; docs-site management-api reference and src/server/management/system-routes.ts at the pin) - NOT a capture from a live service.",
+  "status": 200,
+  "body": {
+    "usageIncomplete": true,
+    "usageIncompleteReason": "oversized_rows",
+    "estimatedCostUsd": 1.25,
+    "providers": [
+      {
+        "provider": "anthropic",
+        "attempts": 3,
+        "servedModel": "claude-sonnet-fixture",
+        "wireModel": "claude-sonnet-wire-fixture"
+      },
+      {
+        "provider": "xai",
+        "attempts": 2
+      },
+      {
+        "provider": "openai",
+        "attempts": 5,
+        "servedModel": "gpt-native-fixture"
+      }
+    ],
+    "accounts": {
+      "codex": {
+        "main": {
+          "attempts": 5
+        }
+      }
+    }
+  }
+}

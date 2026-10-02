@@ -1,0 +1,1 @@
+{"description":"Local OpenCodex provider-service observer bridge; no SDK, no dependencies, read-only Management API client","engines":{"node":">=22"},"name":"@eliot/swarm-opencodex-bridge","private":true,"type":"module","version":"0.1.0"}

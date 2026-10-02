@@ -1,0 +1,39 @@
+{
+  "provenance": "Reconstruction from the pinned upstream contracts (lidge-jun/opencodex v2.73.0, commit 569e3e7dae48bafc54b8a1a7e3a85129befe2d98; docs-site management-api reference and src/server/management/system-routes.ts at the pin) - NOT a capture from a live service.",
+  "status": 200,
+  "body": {
+    "pid": 4242,
+    "bunVersion": "1.3.14-fixture",
+    "bunRevision": "fixture-revision",
+    "bunRuntimeSource": "bun",
+    "platform": "linux",
+    "uptimeSeconds": 3725,
+    "rss": 73400320,
+    "heapUsed": 41287680,
+    "heapTotal": 58720256,
+    "external": 5242880,
+    "arrayBuffers": 1048576,
+    "observedBytes": 78643200,
+    "observedMetric": "rss+external",
+    "jscHeap": null,
+    "responseState": {
+      "entries": 12,
+      "spills": 1,
+      "spillFailures": 0,
+      "health": "ok"
+    },
+    "responseSpill": {
+      "files": 1,
+      "bytes": 2048
+    },
+    "appOwnedBytes": 1048576,
+    "inspectionCounters": {
+      "requests": 128
+    },
+    "streamMode": "relay",
+    "eagerRelay": false,
+    "watchdog": null,
+    "activeTurnCount": 2,
+    "isDraining": false
+  }
+}
