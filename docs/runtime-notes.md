@@ -8,7 +8,7 @@
 
 ## 1. OpenCode V2
 
-**Статус реализации:** документированный ниже `/background` — research-факт о native API, а не capability адаптера. В текущем адаптере операция `session.background` **не реализована**; `agent.send` поддерживает только `delivery=next_turn`, а exact-turn steer отклонён (см. [modules/opencode/README.md](../modules/opencode/README.md)). Не документировать `/background` как доступную операцию, пока она не реализована.
+**Статус реализации:** документированный ниже `/background` исследован как native API и реализован в адаптере операцией `agent.background` (контракт и честная квалификация — fixture-уровень, live против установленного сервиса не проведена — в [modules/opencode/README.md](../modules/opencode/README.md)); `agent.send` поддерживает только `delivery=next_turn`, а exact-turn steer отклонён (см. тот же README). До live-квалификации `/background` не заявляется как live-доступная операция установленного сервиса.
 
 **Документированный путь (OC-API/INSTR/MODELS):** direct HTTP существующего service; session creation, inbox prompt, `resume:false`, queue/steer и адресный `/background` для поддержанных foreground tools. `/session/active` — drains процесса, не полная семья. Потомки — отдельная paginated выборка по `parentID`; event stream volatile. Experimental session stats не равны балансу подписки.
 

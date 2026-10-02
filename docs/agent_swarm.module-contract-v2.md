@@ -220,7 +220,7 @@ Attention item адресует текущий native request/tool и Task: фо
 
 Отдельная операция перевода foreground backgroundable tool в native background (`session.background`) заявляется только adapter, у которого endpoint подтверждён native контрактом. Она работает с foreground-инструментами, допускающими background, а не с любой активностью; ей не приписывается выдуманный expected-turn CAS, и она не считается прочитанным steer. Успех подтверждается native границей и последующим наблюдением, а не фактом отправленного запроса.
 
-Статус: адресный reply со stale-guard — `implemented` (OpenCode: exact request ID, fingerprint текущего pending body, проверенная принадлежность корню семьи); обобщённая модель attention item — норма контракта, единого отдельного реестра attention в коде нет. `session.background` — `proposed`: ни один adapter её сейчас не реализует (в OpenCode она не заявлена как capability).
+Статус: адресный reply со stale-guard — `implemented` (OpenCode: exact request ID, fingerprint текущего pending body, проверенная принадлежность корню семьи); обобщённая модель attention item — норма контракта, единого отдельного реестра attention в коде нет. `session.background` — `implemented` для OpenCode adapter (`agent.background`: точный binding/session target с проверкой принадлежности семье, pre-read foreground inventory, ровно одна native мутация, успех подтверждается native границей и последующим наблюдением notice, а не POST; квалификация — fixture-уровень, live против установленного сервиса не проведена).
 
 ### Lifecycle, drain и postconditions (R13)
 
