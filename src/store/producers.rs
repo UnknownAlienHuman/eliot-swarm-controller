@@ -95,16 +95,46 @@ pub(super) fn family(db: &Connection, v: &Value) -> Result<Value> {
         return Err(Error::invalid("after exceeds this observation's inventory"));
     }
     let end = children.len().min(after.saturating_add(limit as usize));
-    let page = &children[after..end];
+    // Post-projection limits (§8.1) apply to the projected member page:
+    // an oversized member becomes an explicit gap reference at its own
+    // position, and a budget stop shrinks the page — next_after then
+    // resumes exactly at the first unemitted member.
+    let entries: Vec<Value> = children[after..end].to_vec();
+    let limited = super::projection::limit_items(entries, super::projection::family_gap_reference)?;
+    let end = after + limited.consumed;
+    let page = &limited.items;
     let turns: Vec<&Value> = state["turns"]
         .as_array()
         .into_iter()
         .flatten()
         .filter(|t| {
             t["sessionId"] == state["native_root_id"]
-                || page.iter().any(|c| c["sessionId"] == t["sessionId"])
+                || page
+                    .iter()
+                    .filter(|c| c.get("gap").is_none())
+                    .any(|c| c["sessionId"] == t["sessionId"])
         })
         .collect();
+    // §13 #10: a member that disappeared from the newest native
+    // enumeration is retained by the snapshot with observed_now=false.
+    // The frame names those members as retained stale — retained and
+    // unknown, never silently dropped and never marked terminal.
+    let retained_stale_members: Vec<Value> = children
+        .iter()
+        .filter(|c| c["observed_now"] == false)
+        .filter_map(|c| c["sessionId"].as_str().map(|s| json!(s)))
+        .collect();
+    let frame = super::projection::frame(
+        "family_observation",
+        json!({"observation_id": id, "after": after,
+               "next_after": if end < children.len() { Some(end) } else { None }}),
+        &limited,
+        limit,
+        after > 0,
+        end < children.len(),
+        state["family_completeness"] == "complete" && limited.gap_count == 0,
+        retained_stale_members,
+    )?;
     Ok(
         json!({"available":true,"observation_id":id,"observed_at_ms":at,
         "binding_id":binding["binding_id"],"generation":binding["generation"],
@@ -113,7 +143,8 @@ pub(super) fn family(db: &Connection, v: &Value) -> Result<Value> {
         "native_root_id":state["native_root_id"],"root":state["session"],
         "items":page,"turns":turns,"retained_child_count":children.len(),
         "enumeration_complete":end==children.len(),
-        "next_after":if end<children.len(){Some(end)}else{None}}),
+        "next_after":if end<children.len(){Some(end)}else{None},
+        "projection":frame}),
     )
 }
 

@@ -243,7 +243,7 @@ pub(super) fn family_gap_reference(
 
 #[cfg(test)]
 mod tests {
-    use super::super::read;
+    use super::super::{producers, read};
     use super::*;
     use crate::{config::Config, model::Role};
     use rusqlite::{Connection, params};
@@ -404,4 +404,85 @@ mod tests {
         assert_eq!(page["projection"]["limits"]["max_source_rows"], 50);
     }
 
+    fn family_fixture(children: Value, completeness: &str) -> (Connection, Value) {
+        let db = fixture_db();
+        db.execute(
+            "INSERT INTO bindings(binding_id,generation,lane_id,module_instance_id,module_artifact_id,state,route_json,state_json,created_at_ms) VALUES('b1',1,'lane-1','inst-1','art-1','ready','{}','{}',1000)",
+            [],
+        )
+        .unwrap();
+        let state = json!({
+            "native_root_id": "ses_root",
+            "session": {"sessionId": "ses_root"},
+            "observed_children": children,
+            "turns": [],
+            "family_completeness": completeness,
+            "gaps": 1,
+        });
+        db.execute(
+            "INSERT INTO observations(observation_id,source_stream_id,source_event_key,binding_id,binding_generation,kind,payload_json,recorded_at_ms) VALUES(7,'test','fam','b1',1,'runtime.state',?1,5000)",
+            params![model::canonical(&state).unwrap()],
+        )
+        .unwrap();
+        let request = json!({"binding_id": "b1", "generation": 1, "observation_id": 7});
+        (db, request)
+    }
+
+    #[test]
+    fn family_frame_carries_retained_stale_members_not_terminal() {
+        // ses_gone disappeared from the newest native enumeration; the
+        // retained snapshot keeps it with observed_now=false (§13 #10):
+        // the projection frame must carry it as retained stale, and the
+        // member itself must stay in the page, never marked terminal.
+        let children = json!([
+            {"sessionId": "ses_now", "observed_now": true},
+            {"sessionId": "ses_gone", "observed_now": false},
+        ]);
+        let (db, request) = family_fixture(children, "partial");
+        let page = producers::family(&db, &request).unwrap();
+        assert_eq!(page["family_completeness"], "partial");
+        let frame = &page["projection"];
+        assert_eq!(frame["source_kind"], "family_observation");
+        assert_eq!(frame["coverage_complete"], false, "{frame}");
+        assert_eq!(
+            frame["retained_stale_members"],
+            json!(["ses_gone"]),
+            "{frame}"
+        );
+        let items = page["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        let gone = items
+            .iter()
+            .find(|c| c["sessionId"] == "ses_gone")
+            .expect("retained member stays in the page");
+        assert_eq!(gone["observed_now"], false);
+        assert!(gone.get("terminal").is_none(), "{gone}");
+        assert!(gone.get("gap").is_none(), "{gone}");
+    }
+
+    #[test]
+    fn family_oversized_member_becomes_gap_reference() {
+        let big = "z".repeat(MAX_SINGLE_ITEM_BYTES);
+        let children = json!([
+            {"sessionId": "ses_big", "observed_now": true, "blob": big},
+            {"sessionId": "ses_small", "observed_now": false},
+        ]);
+        let (db, request) = family_fixture(children, "partial");
+        let page = producers::family(&db, &request).unwrap();
+        let items = page["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2, "{page}");
+        assert_eq!(items[0]["sessionId"], "ses_big");
+        assert_eq!(items[0]["gap"]["reason"], GAP_ITEM_EXCEEDS_SINGLE);
+        assert_eq!(items[1]["sessionId"], "ses_small");
+        assert_eq!(page["projection"]["coverage_complete"], false);
+        assert_eq!(page["projection"]["gap_count"], 1);
+        // The whole retained inventory was still represented, so the
+        // page range closed over it.
+        assert_eq!(page["enumeration_complete"], true);
+        assert_eq!(page["next_after"], Value::Null);
+        assert_eq!(
+            page["projection"]["retained_stale_members"],
+            json!(["ses_small"])
+        );
+    }
 }
