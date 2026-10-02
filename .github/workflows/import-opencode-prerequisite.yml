@@ -17,7 +17,7 @@ jobs:
       - name: Verify transport and materialize exact files
         shell: bash
         env:
-          EXPECTED_PARENT: b11a24a6eb6860ec4c06ce2482c082cdbe655a03
+          EXPECTED_PARENT: 1c0736f62ed47ea632bf4ec836c6d663f7df7edf
           EXPECTED_PAYLOAD_SHA256: 169ca1b006cf7f03a3e1e7ec7370972ad49c3930d1218e87df87fbd8e129e7a3
         run: |
           set -euo pipefail
@@ -35,15 +35,15 @@ jobs:
           test -z "$(find /tmp/opencode-prerequisite ! -type f ! -type d -print -quit)"
 
           cat > /tmp/expected-product-paths <<'EOF'
-README.md
-modules/opencode/README.md
-modules/opencode/send-after-configuration.example.json
-src/model.rs
-src/runtime/opencode_v2/configuration.rs
-src/store/mod.rs
-src/store/operations.rs
-src/store/prerequisites.rs
-src/store/runtime.rs
+          README.md
+          modules/opencode/README.md
+          modules/opencode/send-after-configuration.example.json
+          src/model.rs
+          src/runtime/opencode_v2/configuration.rs
+          src/store/mod.rs
+          src/store/operations.rs
+          src/store/prerequisites.rs
+          src/store/runtime.rs
           EOF
           find /tmp/opencode-prerequisite -type f -printf '%P\n' | sort > /tmp/actual-product-paths
           diff -u /tmp/expected-product-paths /tmp/actual-product-paths
@@ -54,15 +54,15 @@ src/store/runtime.rs
           done < /tmp/expected-product-paths
 
           cat > /tmp/expected-product-sha256 <<'EOF'
-1ecb51fab266bad565c2e4b2300d8e8cb3a50ba881c1b9116343b87e540d8aa0  README.md
-eac1cf2949dd7b2c845759ec6f21939c70dec0f71c19f2176018249ac0a9fb6b  modules/opencode/README.md
-23d2aa3322d047f62a0354557203148b41c41f97b5e05cbfa1aac1232cb242ba  modules/opencode/send-after-configuration.example.json
-7b6a3cd10cd9dfd299cb49d764c399864b4dc9cebf249568ead2a3e77503c7a5  src/model.rs
-1dbfb449af414461440758f31981e524a73c220e0796f4efa90a5b2d9c39b745  src/runtime/opencode_v2/configuration.rs
-1bb1737abc47c88f02ec5bf006582dd9cd4efd6a41203eeda34f1c20157bff87  src/store/mod.rs
-ed05cda2343bd1b296a48dffcad3b081c261a24b284652db65b64cf594fb6bfc  src/store/operations.rs
-8064e197e6c4a9bf2fcba05404b0a4e23048cfe73c7c63f9d4b5f5e25039c275  src/store/prerequisites.rs
-52545ce8f20c7e139dc83ffe1c7235a3a70064266e7c3d9bdb5c1acd9f171ad1  src/store/runtime.rs
+          1ecb51fab266bad565c2e4b2300d8e8cb3a50ba881c1b9116343b87e540d8aa0  README.md
+          eac1cf2949dd7b2c845759ec6f21939c70dec0f71c19f2176018249ac0a9fb6b  modules/opencode/README.md
+          23d2aa3322d047f62a0354557203148b41c41f97b5e05cbfa1aac1232cb242ba  modules/opencode/send-after-configuration.example.json
+          7b6a3cd10cd9dfd299cb49d764c399864b4dc9cebf249568ead2a3e77503c7a5  src/model.rs
+          1dbfb449af414461440758f31981e524a73c220e0796f4efa90a5b2d9c39b745  src/runtime/opencode_v2/configuration.rs
+          1bb1737abc47c88f02ec5bf006582dd9cd4efd6a41203eeda34f1c20157bff87  src/store/mod.rs
+          ed05cda2343bd1b296a48dffcad3b081c261a24b284652db65b64cf594fb6bfc  src/store/operations.rs
+          8064e197e6c4a9bf2fcba05404b0a4e23048cfe73c7c63f9d4b5f5e25039c275  src/store/prerequisites.rs
+          52545ce8f20c7e139dc83ffe1c7235a3a70064266e7c3d9bdb5c1acd9f171ad1  src/store/runtime.rs
           EOF
           sha256sum -c /tmp/expected-product-sha256
           git diff --check
@@ -112,23 +112,23 @@ ed05cda2343bd1b296a48dffcad3b081c261a24b284652db65b64cf594fb6bfc  src/store/oper
           git diff --cached --check
 
           cat > /tmp/expected-staged-paths <<'EOF'
-.github/import-opencode-prerequisite/part-000
-.github/import-opencode-prerequisite/part-001
-.github/import-opencode-prerequisite/part-002
-.github/import-opencode-prerequisite/part-003
-.github/import-opencode-prerequisite/part-004
-.github/import-opencode-prerequisite/part-005
-.github/import-opencode-prerequisite/part-006
-.github/workflows/import-opencode-prerequisite.yml
-README.md
-modules/opencode/README.md
-modules/opencode/send-after-configuration.example.json
-src/model.rs
-src/runtime/opencode_v2/configuration.rs
-src/store/mod.rs
-src/store/operations.rs
-src/store/prerequisites.rs
-src/store/runtime.rs
+          .github/import-opencode-prerequisite/part-000
+          .github/import-opencode-prerequisite/part-001
+          .github/import-opencode-prerequisite/part-002
+          .github/import-opencode-prerequisite/part-003
+          .github/import-opencode-prerequisite/part-004
+          .github/import-opencode-prerequisite/part-005
+          .github/import-opencode-prerequisite/part-006
+          .github/workflows/import-opencode-prerequisite.yml
+          README.md
+          modules/opencode/README.md
+          modules/opencode/send-after-configuration.example.json
+          src/model.rs
+          src/runtime/opencode_v2/configuration.rs
+          src/store/mod.rs
+          src/store/operations.rs
+          src/store/prerequisites.rs
+          src/store/runtime.rs
           EOF
           git diff --cached --name-only | sort > /tmp/actual-staged-paths
           diff -u /tmp/expected-staged-paths /tmp/actual-staged-paths
