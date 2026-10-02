@@ -16,7 +16,7 @@ The worker materializes captured files, verifies them, executes the command, wai
 
 Use [checks.example.toml](../config/checks.example.toml). Its target names are for this repository; adjust the trusted profile for another project. Normal configuration leaves checks disabled. `swarm check profiles` lists loaded profiles/revisions.
 
-Create/claim a Task. Required machine evidence uses [task-checked.example.json](../config/task-checked.example.json). Commit the work to main, then fill [source-capture.example.json](../config/source-capture.example.json) with Attempt, revision, absolute local repository and exact full commit SHA.
+Create/claim a Task. Required machine evidence uses [task-checked.example.json](../config/task-checked.example.json). The candidate does not have to be `main`: capture reads one exact commit from any project or repository, and CheckRunner semantics attach to that exact commit, not to a branch name. Committing the work to `main` is a development rule of this repository, not a CheckRunner requirement. Fill [source-capture.example.json](../config/source-capture.example.json) with Attempt, revision, absolute local repository and exact full commit SHA.
 
 ```powershell
 swarm --request-id capture-1 source capture --file capture.json
@@ -28,7 +28,27 @@ swarm check get CHECK_ID
 
 Supply normal config/data-dir/credential options. [check-run.example.json](../config/check-run.example.json) names the same candidate/profile. The original Operation holds the final result reference; artifact.get/read/export exposes the machine report and its output references. Ranges verify touched log segments; export verifies the whole digest. Full diagnostics remain on disk, compact summaries in reports/mailbox.
 
-A separate decision owner includes the actual CheckRun in the acceptance JSON. Record identity, candidate, profile revision, coverage and execution receipt are checked. Passing Clippy does not itself accept a Task, publish code or close an Issue. Active repeats coalesce within one Attempt; completed-cache reuse and automatic reverse-dependency scope remain pending.
+A separate decision owner includes the actual CheckRun in the acceptance JSON. Record identity, candidate, profile revision, coverage and execution receipt are checked. Passing Clippy does not itself accept a Task, publish code or close an Issue. Active repeats coalesce within one Attempt; completed-cache reuse and automatic reverse-dependency scope remain pending (see the pending contract below).
+
+## Effective build inputs
+
+Before a run starts, its effective build inputs are fixed and recorded with the run: the exact source identity plus the declared toolchain, target, features, profile/config and allowed environment. A result — and any future reuse of it — relates to those inputs, not only to the source SHA. Changing any effective input invalidates reuse under the input contract, not merely because a cache directory name changed: the same SHA run under a different effective profile must not consume the old receipt.
+
+## Resource lease
+
+A build target is held under an exclusive lease for the duration of a run: no second check writes to the same target concurrently. An active worker holds its target, and so does a worker whose disposition is unknown — a live or unknown-disposition group retains only that target resource while unrelated resources continue (see Process ownership and recovery). The lease is released only after the worker's group is known to be empty or its disposition is otherwise established; requesting termination, observing elapsed time or finding a free lock does not by itself release it.
+
+## Baseline and reuse — contract, status PENDING
+
+**Status: PENDING — not implemented.** Completed-cache reuse and automatic reverse-dependency scope are not current behaviour; the paragraph above and this section record the contract they must satisfy when implemented, not a capability available now (tracked with the C06 cache/scope remainder, issue #6).
+
+Under that contract: a pre-existing baseline failure is stored with its cause and source identity; it is not presented as a regression introduced by the candidate, and it does not excuse a new defect in a changed guarantee. The reuse/scope unit is the reverse-dependency closure of the change where that closure is defined; a change to a shared config, lockfile or other common build input widens the scope beyond the named crate or package. Scope is not inferred from a crate name, file extension or substring alone.
+
+## Evidence publication and protected acceptance inputs
+
+Evidence is published before a pass: the verified artifacts and execution receipt for a run are published and retrievable before any pass verdict for that run is relied on, and on timeout or worker loss the retained stdout/stderr and the incomplete receipt (unknown exit/coverage, never a guessed pass) are the published evidence (see Process ownership and recovery).
+
+Acceptance inputs are protected. Check profiles are trusted configuration selected by the controller, not arbitrary writer-supplied argv or verdicts; the writer whose candidate is being checked does not edit the profile, its revision, or the protected test baseline that judge that candidate. Changing a profile or baseline is a separate trusted change, recorded with its own identity — it is not part of the candidate under check.
 
 ## Cancellation: request, effect and release are separate
 
