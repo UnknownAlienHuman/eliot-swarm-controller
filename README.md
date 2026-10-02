@@ -10,7 +10,7 @@ The Muse SDK bridge opens an explicitly selected native executable, delivers Tas
 
 **CheckRunner executes configured commands on captured Git sources. Active cancellation and recovery of a recorded departed check worker are now implemented.** Cancellation does not stop the host or native agents. Recovery uses the worker lock and OS group identity; it does not infer success or replay a command.
 
-**Still pending:** live Muse resume qualification, native-outcome recovery for unrecorded effects, complete native family reconstruction, automatic handoff, reverse-dependency scope/cache reuse, OpenCode cross-restart execution continuation, other native adapters and automatic module/service installation. Live Muse/Max inference and Windows native launch remain unqualified. Do not mark all C01-C03 complete.
+**Still pending:** live Muse resume qualification, native-outcome recovery for unrecorded effects, complete native family reconstruction, automatic handoff, reverse-dependency scope/cache reuse, OpenCode cross-restart execution continuation, other native adapters and automatic module/service installation. Live Muse/Max inference and Windows native launch remain unqualified. Do not mark all C01–C03 complete.
 
 ## Build and run
 
