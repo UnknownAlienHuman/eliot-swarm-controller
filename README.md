@@ -192,7 +192,7 @@ Public methods: `source.capture`, `check.run/get/profiles/cancel`, `host.status/
 
 ## Evidence and development
 
-**OpenCode HTTP slice, 2026-10-01:** 16 focused local Rust fixtures passed, including two bindings sharing an SSE reader, a real Store restart, lost creation/delivery readback with no duplicate POST, disabled new-work admission, unresolved-producer release protection, foreign-family rejection and actual Atlas redaction. Rust 1.98.1 compilation, package formatting and all-target warnings-denied Clippy passed. The fixture HTTP server is not the installed vendor; no model, billing, native Windows service or subscription qualification is claimed. CI repeats these focused tests on Windows/Linux; exact run status is separate evidence.
+**OpenCode source recovery, 2026-10-01 (New York):** the interrupted implementation's 49 staged source files were recovered from tree `f54b9259dbc052c942e089aea95a130166916a01` and published in `b1ff71ff`. Fresh package formatting and minimal warnings-denied Clippy passed on Rust 1.98.1. The retained 16 protocol/Store fixtures were not rerun during recovery; their earlier reported result is not new qualification evidence. Normal CI checks formatting, Clippy, the unchanged Atlas snapshot, Muse syntax/SDK import and release builds on Windows/Linux. Consult the exact commit's run before claiming a platform pass. No tests, native model calls or subscription qualification are run by this recovery workflow.
 
 
 **Previous Muse recovery baseline: `d385498b00fe1a049c357613a7777cc4a1c83f72`.** The interrupted continuation saved the module owner, checkpoint and controlled session-recovery implementation through `8a84e6be`; it was not lost. Recovery reconstructed its exact 104-file source tree from the CI artifact. A bounded invocation then found an actual runtime defect: changed-boot admission used nonexistent `operations.generation` instead of `binding_generation`. The single-query correction is in `d385498b`; schema, dependencies and native-module source are unchanged by that correction.
@@ -207,7 +207,7 @@ The exact corrected Linux binary passed 13 directed assertions through the real 
 
 Historical baselines: C06 `c56f50a4` passed [CI 36828917649](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/36828917649) and a real-command invocation of capture, output, failure/source-change rejection, host restart and checked acceptance. Acceptance `01212a4e` passed [CI 36816310704](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/36816310704). Those are earlier evidence, not substitutes for this cancellation/recovery run.
 
-The read-only workflow pins Rust 1.98.1/Cargo.lock and checks formatting, Clippy, release builds and Muse syntax/import. It runs only the focused `cargo test --locked --lib opencode` fixtures, not a broad qualification suite, vendor sessions, login or global installation. Artifacts include exact source SHA and a source archive.
+The read-only workflow pins Rust 1.98.1/Cargo.lock and checks formatting, Clippy, release builds and Muse syntax/import. Tests remain deferred during code completion; the workflow does not run `cargo test`, vendor sessions, login or global installation. Artifacts include exact source SHA and a source archive.
 
 | Document | Purpose |
 | --- | --- |

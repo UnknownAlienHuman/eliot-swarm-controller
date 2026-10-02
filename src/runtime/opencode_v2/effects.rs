@@ -9,7 +9,7 @@ use crate::{
     runtime::{EffectOutcome, RuntimeCommand, RuntimeOutcome},
 };
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, path::Path};
 
 fn outcome(
     command: &RuntimeCommand,
@@ -61,6 +61,49 @@ fn prompt(command: &RuntimeCommand) -> Result<String> {
         Ok(text.to_owned())
     }
 }
+/// A server fallback to its default workspace must not redirect an assignment.
+/// Native canonicalization (case, separators, symlinks) is allowed only when the
+/// two paths actually resolve to the same local directory. No I/O runs in Store.
+async fn verify_directory(expected: &Path, observed: &Value) -> Result<()> {
+    let observed = Path::new(model::text(observed, "directory")?);
+    if !observed.is_absolute() {
+        return Err(Error::new(
+            "NATIVE_LOCATION_MISMATCH",
+            "native workspace is not an absolute directory",
+        ));
+    }
+    if observed == expected {
+        return Ok(());
+    }
+    let expected = expected.to_owned();
+    let observed = observed.to_owned();
+    let same = tokio::task::spawn_blocking(move || {
+        match (
+            std::fs::canonicalize(&expected),
+            std::fs::canonicalize(&observed),
+        ) {
+            (Ok(expected), Ok(observed)) => {
+                expected == observed && std::fs::metadata(&expected).is_ok_and(|m| m.is_dir())
+            }
+            _ => false,
+        }
+    })
+    .await
+    .map_err(|_| {
+        Error::new(
+            "NATIVE_LOCATION_UNAVAILABLE",
+            "workspace verification stopped",
+        )
+    })?;
+    if !same {
+        return Err(Error::new(
+            "NATIVE_LOCATION_MISMATCH",
+            "native workspace differs from the explicitly selected directory",
+        ));
+    }
+    Ok(())
+}
+
 impl Service {
     async fn location(&self, options: &Options) -> Result<Value> {
         let value = self
@@ -72,7 +115,7 @@ impl Service {
                 )],
             )
             .await?;
-        model::text(&value, "directory")?;
+        verify_directory(&options.directory, &value).await?;
         model::text(&value["project"], "id")?;
         Ok(json!({"directory":value["directory"]}))
     }
@@ -110,6 +153,7 @@ impl Service {
                 )],
             )
             .await?;
+        verify_directory(&options.directory, &catalog["location"]).await?;
         let models = catalog["data"]
             .as_array()
             .ok_or_else(|| Error::new("NATIVE_SCHEMA_ERROR", "missing model catalog"))?;
@@ -132,6 +176,12 @@ impl Service {
     async fn check_root(&self, root: &str, options: &Options) -> Result<Value> {
         let session = self.session(root).await?;
         let location = self.location(options).await?;
+        if !session["parentID"].is_null() || !session["fork"].is_null() {
+            return Err(Error::new(
+                "NATIVE_SCOPE_MISMATCH",
+                "controller-created root became a child or a fork",
+            ));
+        }
         if session["model"] != json!(options.model) || session["location"] != location {
             return Err(Error::new(
                 "NATIVE_SETTINGS_MISMATCH",
@@ -180,6 +230,8 @@ impl Service {
         let mut result = match result.and_then(decode::<Data<Value>>) {
             Ok(response) => {
                 let valid = super::snapshot::validate_session(&response.data, Some(&root)).is_ok()
+                    && response.data["parentID"].is_null()
+                    && response.data["fork"].is_null()
                     && response.data["metadata"]["eliot"] == marker(command)
                     && response.data["model"] == json!(options.model)
                     && response.data["location"] == location;

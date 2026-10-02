@@ -10,7 +10,7 @@ Canonical requirements: [architecture §8](../../docs/agent_swarm.md), [implemen
 
 ## Explicit configuration
 
-Keep the shipped route disabled until these values are filled for the intended installation. Use absolute native paths for `connection_file` and `directory`, an exact `/api/info` version, and the exact provider/model/**variant** from the installed model catalog. The adapter refuses missing/disabled variants and verifies resolved location and native settings; it never silently downgrades reasoning or changes provider.
+Keep the shipped route disabled until these values are filled for the intended installation. Use absolute native paths for `connection_file` and `directory`, an exact `/api/info` version, and the exact provider/model/**variant** from the installed model catalog. The adapter refuses missing/disabled variants and verifies resolved location and native settings; it never silently downgrades reasoning or changes provider. A fallback to another workspace is rejected. Native path normalization is accepted only for the same local directory; a controller-created root may not become a child or fork.
 
 ```toml
 [[routes]]
@@ -67,4 +67,4 @@ Live installed OpenCode, actual inference/subscription behavior and native Windo
 
 ## Focused implementation evidence
 
-On 2026-10-01, 16 local Rust fixture tests passed after the code compiled, including a real Store restart, two bindings sharing one SSE reader, lost response readback without a second POST, disabled new-work admission, unresolved-producer release protection, foreign-family rejection and actual Atlas scrubbing. The local loopback server is a protocol fixture, **not OpenCode**. Formatting and all-target warnings-denied Clippy passed on Rust 1.98.1. The ordinary Windows/Linux workflow repeats this focused set, preserves source/build identity and separately checks the existing Muse SDK import. See its exact run result before claiming a platform pass.
+The interrupted 2026-10-01 implementation retained 16 protocol/Store fixtures. They were preserved, not rerun during source recovery. Fresh Rust 1.98.1 package formatting and minimal warnings-denied Clippy passed; the Windows/Linux workflow checks the exact commit's formatting, Clippy, donor hashes, release build and existing Muse SDK import. Tests remain deferred while the product code is being completed. Fixture HTTP servers are not OpenCode, and compilation is not live service, model, billing or subscription qualification.
