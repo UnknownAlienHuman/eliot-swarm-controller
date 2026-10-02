@@ -8,7 +8,7 @@ use crate::{
     artifacts::{ArtifactFiles, ArtifactRecord},
     error::{Error, Result},
     model,
-    platform::process_group::{Group, departed_empty},
+    platform::process_group::{Group, departed_empty, spawned_departed, spawned_identity},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -36,6 +36,12 @@ pub struct Work {
     pub cancel_request: Option<CancelRequest>,
     #[serde(default)]
     pub expected_worker: Option<Value>,
+    /// Host-recorded evidence of the spawned worker process, captured by the
+    /// launcher at spawn time. Present only for workers spawned by a host that
+    /// records launch receipts; the sole evidence available if the worker dies
+    /// before publishing its own identity.
+    #[serde(default)]
+    pub launch: Option<Value>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -110,7 +116,7 @@ fn read_value(path: &Path) -> Result<Value> {
     }
     Ok(serde_json::from_slice(&bytes)?)
 }
-pub fn prepare_and_spawn(work: &Work) -> Result<()> {
+pub fn prepare_and_spawn(work: &Work) -> Result<Value> {
     let dir = directory(&work.data_dir, &work.check_id)?;
     fs::create_dir_all(
         dir.parent()
@@ -144,6 +150,24 @@ pub fn prepare_and_spawn(work: &Work) -> Result<()> {
         cmd.creation_flags(0x08000000);
     }
     let mut child = cmd.spawn()?;
+    let pid = child.id();
+    // Record the launch before anything else can happen to the worker. A bare
+    // PID proves nothing; the platform record pins this process instance. If
+    // the process already exited, keep the partial record: departure of that
+    // PID/group may still be provable, absence never is.
+    let process = match spawned_identity(pid) {
+        Ok(v) => v,
+        Err(e) if e.code == "PROCESS_GONE" => {
+            json!({"pid":pid,"scope":"launcher_spawned_process","purpose":"check"})
+        }
+        Err(e) => {
+            return Err(Error::new(
+                "CHECK_LAUNCH_UNKNOWN",
+                format!("worker spawned without a recordable launch identity: {e}"),
+            ));
+        }
+    };
+    let launch = json!({"spawned_at_ms":model::now_ms()?,"process":process});
     // Reap our worker on Unix without tying its life to an async task/host link.
     std::thread::Builder::new()
         .name("check-reaper".into())
@@ -156,7 +180,7 @@ pub fn prepare_and_spawn(work: &Work) -> Result<()> {
                 format!("worker started; reaper unavailable: {e}"),
             )
         })?;
-    Ok(()) // Deliberately independent of a host/CLI disconnect.
+    Ok(launch) // Deliberately independent of a host/CLI disconnect.
 }
 pub fn ready(work: &Work) -> Result<Option<Value>> {
     let p = directory(&work.data_dir, &work.check_id)?.join("worker.json");
@@ -342,15 +366,24 @@ pub fn failure(work: &Work, files: &ArtifactFiles, error: Value) -> Result<Compl
 /// or signals a numeric PID from an old snapshot. Unknown/live groups retain ownership.
 pub fn recover(work: &Work, files: &ArtifactFiles) -> Result<Option<Completion>> {
     let dir = directory(&work.data_dir, &work.check_id)?;
-    let lock = OpenOptions::new()
+    // A missing lock file is not proof of departure either; group disposition
+    // below is. When the file exists, hold it so no new worker can start.
+    let _lock = match OpenOptions::new()
         .read(true)
         .write(true)
-        .open(dir.join("worker.lock"))?;
-    match lock.try_lock() {
-        Ok(()) => {}
-        Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
-        Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
-    }
+        .open(dir.join("worker.lock"))
+    {
+        Ok(lock) => {
+            match lock.try_lock() {
+                Ok(()) => {}
+                Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+                Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+            }
+            Some(lock)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.into()),
+    };
     if let Some(c) = completion(work, files)? {
         return Ok(Some(c));
     }
@@ -411,6 +444,79 @@ pub fn recover(work: &Work, files: &ArtifactFiles) -> Result<Option<Completion>>
         json!({"check_id":work.check_id,"candidate_ref":work.candidate.artifact_id,"state":"incomplete"}),
     )?;
     files.publish(&record, &bytes)?;
+    let c = Completion {
+        check_id: work.check_id.clone(),
+        operation_id: work.operation_id.clone(),
+        token: work.token.clone(),
+        state: "incomplete".into(),
+        exit_code: None,
+        resource_released: true,
+        coverage,
+        result: record,
+        outputs,
+        cancellation: None,
+    };
+    write_once(&dir.join("completion.json"), &json!(c))?;
+    Ok(Some(c))
+}
+
+/// Terminal fixation for a launch that never produced a worker identity: the
+/// worker died before publishing `worker.json`, so the admitted-worker
+/// recovery path has nothing to verify. This is not that path run loosely —
+/// it requires the host's own launch receipt and proof that the spawned
+/// process and its prospective group are departed. Before identity
+/// publication the worker spawns nothing and the tool never runs, so a proven
+/// departure closes the launch as incomplete with unknown exit/coverage —
+/// never a guessed pass and never a replayed command. Without a launch
+/// receipt, or with any doubt about departure, the check stays held.
+pub fn recover_pre_identity(work: &Work, files: &ArtifactFiles) -> Result<Option<Completion>> {
+    let Some(launch) = &work.launch else {
+        return Ok(None);
+    };
+    let dir = directory(&work.data_dir, &work.check_id)?;
+    if !dir.try_exists()? {
+        return Ok(None);
+    }
+    if dir.join("worker.json").try_exists()? || dir.join("completion.json").try_exists()? {
+        return Ok(None); // The identity/completion paths own this check.
+    }
+    if !spawned_departed(&launch["process"], &work.token)? {
+        return Ok(None);
+    }
+    let mut outputs = Vec::new();
+    for stream in ["stdout", "stderr"] {
+        let path = dir.join(stream);
+        if path.try_exists()? {
+            outputs.push(files.seal_file(
+                &format!("{}:{stream}", work.operation_id),
+                &path,
+                json!({"check_id":work.check_id,"stream":stream}),
+            )?);
+        }
+    }
+    let coverage = json!({"requested":work.profile.expected_targets,"checked":[],"gaps":["worker_lost_before_identity"]});
+    let report = json!({"version":1,"check_id":work.check_id,"operation_id":work.operation_id,
+        "candidate_ref":work.candidate.artifact_id,"profile":work.profile,"state":"incomplete",
+        "exit_code":null,"resource_released":true,"source_checkout_verified":false,"coverage":coverage,
+        "process":launch["process"],"launch":launch,
+        "recovery":{"disposition":"pre_identity_launch_departed","command_replayed":false,"worker_identity_recorded":false},
+        "outputs":outputs.iter().map(|r|json!({"artifact_ref":r.artifact_id,"stream":r.metadata["stream"],"sha256":r.content_digest,"length":r.byte_length})).collect::<Vec<_>>()});
+    let id = format!(
+        "check-{}",
+        model::digest(format!("pre-identity:{}", work.operation_id).as_bytes())
+    );
+    let (record, bytes) = ArtifactFiles::document(
+        "check_result",
+        &id,
+        &report,
+        json!({"check_id":work.check_id,"candidate_ref":work.candidate.artifact_id,"state":"incomplete"}),
+    )?;
+    files.publish(&record, &bytes)?;
+    // Recheck at publication time: a worker that published its identity (or a
+    // terminal receipt) after the scan above owns this check, not this path.
+    if dir.join("worker.json").try_exists()? || dir.join("terminal.json").try_exists()? {
+        return Ok(None);
+    }
     let c = Completion {
         check_id: work.check_id.clone(),
         operation_id: work.operation_id.clone(),
@@ -832,4 +938,112 @@ pub fn run(file: &Path) -> Result<()> {
 
 fn waiting_identity(group: &Group, token: &str) -> Value {
     json!({"token":token,"process":group.identity,"ready_at_ms":model::now_ms().unwrap_or(0),"control_version":2})
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use crate::checks::model::Parser;
+
+    fn fixture(launch: Option<Value>) -> (PathBuf, Work) {
+        let root = std::env::temp_dir().join(format!("swarm-check-{}", model::new_id()));
+        fs::create_dir_all(&root).unwrap();
+        let w = Work {
+            check_id: model::new_id(),
+            operation_id: model::new_id(),
+            token: model::new_id(),
+            data_dir: root.clone(),
+            candidate: ArtifactRecord {
+                kind: "source_snapshot".into(),
+                artifact_id: "candidate-1".into(),
+                relative_path: "artifacts/candidate-1".into(),
+                byte_length: 0,
+                content_digest: "digest".into(),
+                metadata: json!({}),
+            },
+            profile: CheckProfile {
+                profile_id: "profile".into(),
+                profile_revision: "1".into(),
+                executable: "/bin/true".into(),
+                args: Vec::new(),
+                parser: Parser::ExitCode,
+                resource: "target".into(),
+                environment: Default::default(),
+                inherit_env: Vec::new(),
+                expected_targets: Vec::new(),
+            },
+            preflight_error: None,
+            cancel_request: None,
+            expected_worker: None,
+            launch,
+        };
+        fs::create_dir_all(directory(&root, &w.check_id).unwrap()).unwrap();
+        (root, w)
+    }
+
+    #[test]
+    fn pre_identity_departed_launch_is_fixed_incomplete() {
+        let mut child = Command::new("/bin/true").spawn().unwrap();
+        let pid = child.id();
+        // The process may exit before capture; the partial record is by design.
+        let process = spawned_identity(pid).unwrap_or_else(
+            |_| json!({"pid":pid,"scope":"launcher_spawned_process","purpose":"check"}),
+        );
+        child.wait().unwrap();
+        let (root, w) = fixture(Some(json!({"spawned_at_ms":0,"process":process})));
+        let files = ArtifactFiles::new(&w.data_dir).unwrap();
+        let c = recover_pre_identity(&w, &files)
+            .unwrap()
+            .expect("departed pre-identity launch must be fixed");
+        assert_eq!(c.state, "incomplete");
+        assert_eq!(c.exit_code, None);
+        assert!(c.resource_released);
+        // The written receipt passes the ordinary completion validation.
+        let validated = completion(&w, &files)
+            .unwrap()
+            .expect("validated completion");
+        assert_eq!(validated.state, "incomplete");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pre_identity_live_launch_is_not_fixed() {
+        let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let process = spawned_identity(child.id()).unwrap();
+        let (root, w) = fixture(Some(json!({"spawned_at_ms":0,"process":process})));
+        let files = ArtifactFiles::new(&w.data_dir).unwrap();
+        assert!(recover_pre_identity(&w, &files).unwrap().is_none());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pre_identity_without_launch_receipt_is_held() {
+        let (root, w) = fixture(None);
+        let files = ArtifactFiles::new(&w.data_dir).unwrap();
+        assert!(recover_pre_identity(&w, &files).unwrap().is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pre_identity_with_worker_identity_is_not_fixed() {
+        let mut child = Command::new("/bin/true").spawn().unwrap();
+        let pid = child.id();
+        let process = spawned_identity(pid).unwrap_or_else(
+            |_| json!({"pid":pid,"scope":"launcher_spawned_process","purpose":"check"}),
+        );
+        child.wait().unwrap();
+        let (root, w) = fixture(Some(json!({"spawned_at_ms":0,"process":process})));
+        write_once(
+            &directory(&w.data_dir, &w.check_id)
+                .unwrap()
+                .join("worker.json"),
+            &json!({"token":w.token}),
+        )
+        .unwrap();
+        let files = ArtifactFiles::new(&w.data_dir).unwrap();
+        assert!(recover_pre_identity(&w, &files).unwrap().is_none());
+        let _ = fs::remove_dir_all(root);
+    }
 }

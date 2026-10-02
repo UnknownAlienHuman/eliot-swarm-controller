@@ -241,6 +241,7 @@ fn work(db: &Connection, id: &str, root: PathBuf) -> Result<Work> {
             .map(serde_json::from_value)
             .transpose()?,
         expected_worker: identity.map(|raw| serde_json::from_str(&raw)).transpose()?,
+        launch: spec.get("launch").filter(|v| !v.is_null()).cloned(),
     })
 }
 fn next(db: &mut Connection, config: &Config, root: PathBuf) -> Result<Option<Work>> {
@@ -425,6 +426,17 @@ impl Store {
                             let done = w.clone();
                             return self.run(move |db| finish(db, &done, c)).await;
                         }
+                        // A launch whose worker died before publishing an
+                        // identity has no admitted worker to recover; only the
+                        // host's launch receipt can prove it departed.
+                        let scan = w.clone();
+                        if let Some(c) = self
+                            .file_io(move |files| worker::recover_pre_identity(&scan, &files))
+                            .await?
+                        {
+                            let done = w.clone();
+                            return self.run(move |db| finish(db, &done, c)).await;
+                        }
                         let scan = w.clone();
                         match self.file_io(move |_| worker::ready(&scan)).await {
                             Ok(Some(identity)) => {
@@ -473,7 +485,19 @@ impl Store {
                             .file_io(move |_| worker::prepare_and_spawn(&launch))
                             .await
                         {
-                            Ok(()) => None,
+                            Ok(receipt) => {
+                                // Persist the launch receipt before relying on
+                                // it: a host restart must not erase the only
+                                // pre-identity evidence this launch will get.
+                                let id = w.check_id.clone();
+                                let _ = self
+                                    .run(move |db| {
+                                        db.execute("UPDATE check_runs SET spec_json=json_set(spec_json,'$.launch',json(?2)) WHERE check_id=?1",params![id,model::canonical(&receipt)?])?;
+                                        Ok(())
+                                    })
+                                    .await;
+                                None
+                            }
                             Err(e) if e.code == "CHECK_LAUNCH_UNKNOWN" => {
                                 let key = format!("check-launch:{}", w.check_id);
                                 let _ = self.run(move |db| incident(db, &key, e)).await;

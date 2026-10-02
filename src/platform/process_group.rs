@@ -331,6 +331,62 @@ mod os {
             Ok(count.ActiveProcesses == 0)
         }
     }
+    pub fn spawned_identity(pid: u32) -> Result<Value> {
+        // Host-side evidence for a worker it just created, captured before the
+        // worker can publish its own identity. A bare PID is never enough: the
+        // creation time pins this exact process instance against PID reuse.
+        unsafe {
+            let process = OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                0,
+                pid,
+            );
+            if process.is_null() {
+                let error = std::io::Error::last_os_error();
+                return if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+                    Err(Error::new(
+                        "PROCESS_GONE",
+                        "spawned process exited before its launch identity was captured",
+                    ))
+                } else {
+                    Err(error.into())
+                };
+            }
+            let result = (|| -> Result<Value> {
+                let mut creation: FILETIME = std::mem::zeroed();
+                let mut exit: FILETIME = std::mem::zeroed();
+                let mut kernel: FILETIME = std::mem::zeroed();
+                let mut user: FILETIME = std::mem::zeroed();
+                if GetProcessTimes(process, &mut creation, &mut exit, &mut kernel, &mut user) == 0 {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+                if WaitForSingleObject(process, 0) == WAIT_OBJECT_0 {
+                    return Err(Error::new(
+                        "PROCESS_GONE",
+                        "spawned process exited before its launch identity was captured",
+                    ));
+                }
+                Ok(
+                    json!({"pid":pid,"creation_filetime":((creation.dwHighDateTime as u64)<<32)|creation.dwLowDateTime as u64,"scope":"launcher_spawned_process","purpose":"check"}),
+                )
+            })();
+            CloseHandle(process);
+            result
+        }
+    }
+    pub fn spawned_departed(identity: &Value, token: &str) -> Result<bool> {
+        if identity["scope"] != "launcher_spawned_process" || identity["purpose"] != "check" {
+            return Err(Error::invalid(
+                "not a launcher-spawned check process record",
+            ));
+        }
+        // Before publishing worker.json the worker spawns nothing: its only
+        // possible descendants enter the token-named Job when it creates its
+        // group, and the tool spawns only after identity publication. Reuse the
+        // exact named-Job accounting with the launch record's pid/birth.
+        let shim = json!({"pid":identity["pid"],"creation_filetime":identity["creation_filetime"],"scope":"windows_job","purpose":"check","job_name":format!("Global\\EliotSwarmCheck-{token}"),"disposition_source":"job_accounting"});
+        departed_empty(&shim, token)
+    }
     impl Drop for Group {
         fn drop(&mut self) {
             unsafe {
@@ -550,6 +606,75 @@ mod os {
         }
         Ok(true)
     }
+    pub fn spawned_identity(pid: u32) -> Result<Value> {
+        // Host-side evidence for a worker it just created, captured before the
+        // worker can publish its own identity. The boot ID and start ticks pin
+        // this exact process instance against PID reuse.
+        let (state, pgid, start) = stat(pid)?;
+        if !live(pid, state)? {
+            return Err(Error::new(
+                "PROCESS_GONE",
+                "spawned process exited before its launch identity was captured",
+            ));
+        }
+        let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+        Ok(
+            json!({"pid":pid,"spawned_pgid":pgid,"start_ticks":start,"boot_id":boot.trim(),"scope":"launcher_spawned_process","purpose":"check"}),
+        )
+    }
+    pub fn spawned_departed(identity: &Value, _token: &str) -> Result<bool> {
+        if identity["scope"] != "launcher_spawned_process" || identity["purpose"] != "check" {
+            return Err(Error::invalid(
+                "not a launcher-spawned check process record",
+            ));
+        }
+        let pid = u32::try_from(model::positive(identity, "pid")?)
+            .map_err(|_| Error::invalid("invalid spawned PID"))?;
+        if let Some(boot) = identity["boot_id"].as_str()
+            && fs::read_to_string("/proc/sys/kernel/random/boot_id")?.trim() != boot
+        {
+            return Ok(true);
+        }
+        let birth = identity["start_ticks"].as_str();
+        match stat(pid) {
+            Ok((state, _, start)) => {
+                if birth == Some(start.as_str()) {
+                    if live(pid, state)? {
+                        return Ok(false);
+                    }
+                } else if birth.is_some() {
+                    // The PID was recycled: the recorded process is gone. Fall
+                    // through to the group scan before calling it departed.
+                } else if live(pid, state)? {
+                    // Without a recorded birth, a live process at this PID
+                    // cannot be excluded as the spawned worker.
+                    return Err(Error::new(
+                        "CHECK_RECOVERY_UNSUPPORTED",
+                        "spawned process birth was not recorded; departure is unprovable while its PID is occupied",
+                    ));
+                }
+            }
+            Err(e) if e.code == "PROCESS_GONE" => {}
+            Err(e) => return Err(e),
+        }
+        // Before publishing worker.json the worker spawns nothing, and it can
+        // only create descendants after entering its own group (pgid == its
+        // PID). Any live member of that prospective group retains the launch.
+        let group = i32::try_from(pid).map_err(|_| Error::invalid("invalid spawned PID"))?;
+        for e in fs::read_dir("/proc")? {
+            let e = e?;
+            let Some(member) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
+                continue;
+            };
+            match stat(member) {
+                Ok((s, g, _)) if g == group && live(member, s)? => return Ok(false),
+                Ok(_) => {}
+                Err(e) if e.code == "PROCESS_GONE" => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(true)
+    }
 }
 #[cfg(not(any(windows, target_os = "linux")))]
 mod os {
@@ -589,5 +714,17 @@ mod os {
             "no process disposition",
         ))
     }
+    pub fn spawned_identity(_pid: u32) -> Result<Value> {
+        Err(Error::new(
+            "CHECK_PLATFORM_UNSUPPORTED",
+            "no spawned process identity",
+        ))
+    }
+    pub fn spawned_departed(_identity: &Value, _token: &str) -> Result<bool> {
+        Err(Error::new(
+            "CHECK_PLATFORM_UNSUPPORTED",
+            "no spawned process disposition",
+        ))
+    }
 }
-pub use os::{Group, departed_empty};
+pub use os::{Group, departed_empty, spawned_departed, spawned_identity};
