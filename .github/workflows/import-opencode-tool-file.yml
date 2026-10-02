@@ -1,0 +1,126 @@
+name: Import OpenCode tool-file slice
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/import-opencode-tool-file/**'
+      - '.github/workflows/import-opencode-tool-file.yml'
+permissions:
+  contents: write
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+      - name: Verify transport and materialize exact files
+        shell: bash
+        env:
+          EXPECTED_PARENT: 0c854556f831672fc282f1a170835ecb2e3af9ba
+          EXPECTED_PAYLOAD_SHA256: ae71f26eaededf008772f34e4606b3210bfdfd685b91b03f839358238b3cd6c9
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "$EXPECTED_PARENT"
+          STAGING_SHA="$(git rev-parse HEAD)"
+          printf '%s\n' "$STAGING_SHA" > /tmp/staging-sha
+
+          cat .github/import-opencode-tool-file/part-* > /tmp/tool-file-slice.tar.gz
+          printf '%s  %s\n' "$EXPECTED_PAYLOAD_SHA256" /tmp/tool-file-slice.tar.gz | sha256sum -c -
+
+          rm -rf /tmp/tool-file-slice
+          mkdir -p /tmp/tool-file-slice
+          tar -xzf /tmp/tool-file-slice.tar.gz -C /tmp/tool-file-slice --no-same-owner --no-same-permissions
+          test -z "$(find /tmp/tool-file-slice -type l -print -quit)"
+          test -z "$(find /tmp/tool-file-slice ! -type f ! -type d -print -quit)"
+
+          cat > /tmp/expected-product-paths <<'EOF'
+          README.md
+          modules/opencode/README.md
+          src/runtime/opencode_v2/http.rs
+          src/runtime/opencode_v2/results.rs
+          src/runtime/opencode_v2/results/tool_files.rs
+          EOF
+          find /tmp/tool-file-slice -type f -printf '%P\n' | sort > /tmp/actual-product-paths
+          diff -u /tmp/expected-product-paths /tmp/actual-product-paths
+
+          while IFS= read -r path; do
+            mkdir -p "$(dirname "$path")"
+            cp "/tmp/tool-file-slice/$path" "$path"
+          done < /tmp/expected-product-paths
+
+          cat > /tmp/expected-product-sha256 <<'EOF'
+          eed36843f30ec93840cedd5e2b1f7a14c84e18e188b618a4ce47e4fc6ccb4fa9  README.md
+          47ce246de422a5f3180c5ca01ee6b18ff48dde1233003372ec9dc49a0c4a6af6  modules/opencode/README.md
+          88b376b90890ca9b421f9cde1853ec39123a970ccd65ad01f3d4a39912c6e0b9  src/runtime/opencode_v2/http.rs
+          278c9d199f2a659a13d9ce48bbb1e5e54861bf98e41e53ab437576df29c4c0db  src/runtime/opencode_v2/results.rs
+          49c2b5c171ba41ac114c80ea91bf2070f379f3fa62012b27cd96309baa7cd258  src/runtime/opencode_v2/results/tool_files.rs
+          EOF
+          sha256sum -c /tmp/expected-product-sha256
+          git diff --check
+      - name: Pinned toolchain
+        shell: bash
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy --no-self-update
+          rustc --version
+          cargo --version
+      - name: Formatting
+        run: cargo fmt -p eliot-swarm-controller -- --check
+      - name: Verify Atlas donor snapshot
+        shell: python
+        run: |
+          import hashlib
+          from pathlib import Path
+          root = Path('vendor/atlas')
+          expected = {}
+          for line in (root / 'SHA256SUMS').read_text().splitlines():
+              digest, name = line.split('  ', 1)
+              assert name not in expected, name
+              path = root / name
+              assert not path.is_symlink() and path.is_file(), name
+              assert hashlib.sha256(path.read_bytes()).hexdigest() == digest, name
+              expected[name] = digest
+          actual = {p.relative_to(root).as_posix() for p in root.rglob('*') if p.is_file()}
+          assert actual == set(expected) | {'SHA256SUMS'}, 'donor file set changed'
+      - name: Clippy
+        run: cargo clippy --locked --lib --bins --no-deps -- -D warnings
+      - name: Publish checked source to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGING_SHA="$(cat /tmp/staging-sha)"
+
+          rm -rf .github/import-opencode-tool-file
+          rm .github/workflows/import-opencode-tool-file.yml
+          git add -A
+          git diff --cached --check
+
+          cat > /tmp/expected-staged-paths <<'EOF'
+          .github/import-opencode-tool-file/part-000
+          .github/import-opencode-tool-file/part-001
+          .github/import-opencode-tool-file/part-002
+          .github/import-opencode-tool-file/part-003
+          .github/import-opencode-tool-file/part-004
+          .github/import-opencode-tool-file/part-005
+          .github/import-opencode-tool-file/part-006
+          .github/workflows/import-opencode-tool-file.yml
+          README.md
+          modules/opencode/README.md
+          src/runtime/opencode_v2/http.rs
+          src/runtime/opencode_v2/results.rs
+          src/runtime/opencode_v2/results/tool_files.rs
+          EOF
+          git diff --cached --name-only | sort > /tmp/actual-staged-paths
+          diff -u /tmp/expected-staged-paths /tmp/actual-staged-paths
+
+          sha256sum -c /tmp/expected-product-sha256
+          git config user.name 'Iurii Lisenkov'
+          git config user.email '71514792+UnknownAlienHuman@users.noreply.github.com'
+          git commit -m 'feat: export exact OpenCode tool files through native result descriptors' \
+            -m 'Read one exact file item from a terminal native tool result without accepting a caller-supplied path or URL. Decode canonical inline data URIs or use OpenCode location-confined fs.read for file URIs, then repeat the descriptor and byte read before immutable artifact publication.' \
+            -m 'Preserve MIME and digests while withholding raw URI/path metadata. Reject unsupported schemes, outside-location paths, MIME drift, changed bytes and sources above 64 MiB. This remains separate from execution, family and Task acceptance.' \
+            -m 'Rust 1.98.1 formatting and locked warnings-denied minimal Clippy passed. All 23 Atlas donor files/checksums are unchanged. No tests, model calls, dependencies, migrations, service mutation or permanent workflow changes.'
+
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = "$STAGING_SHA"
+          git push origin HEAD:main
