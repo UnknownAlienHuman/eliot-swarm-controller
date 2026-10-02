@@ -1,0 +1,50 @@
+# Exact references for modules/command. No secrets. This file pins the
+# module's own source units and the documented vendor surface they are
+# written against; it is not an installation lock for the vendor CLI.
+schema_version = 1
+module = "runtime.command"
+module_artifact_id = "command-mod-0.1.0-glue.1"
+status = "fixture_verified_live_unqualified"
+installed_runtime_verified = false
+
+# The mod and glue are this project's own code (no upstream code copied).
+# The sha256 values below pin the exact shipped units; UPDATE.md describes
+# how a change re-pins them under a new module artifact id.
+[[units]]
+id = "eliot-command-mod"
+path = "mod/eliot-command.ts"
+sha256 = "513eaa7d6034cc22b5abf14d080888cdd3e8782133e39f859b7703db123e1f80"
+role = "Pinned Command Code mod: readiness, native event journal, inbox admission, tool readback"
+
+[[units]]
+id = "eliot-command-glue"
+path = "glue.mjs"
+sha256 = "2af38e4b327af03c471ae18149158c79d61c7ebb3b8d1a8d2a3c0505bf1ce5df"
+role = "Headless NDJSON driver: describe / open / snapshot over one run"
+
+# Documented vendor surface used above (official docs, accessed 2026-10-02).
+# A moving web reference does not prove a function exists in an installed
+# binary; the runtime matrix records the same basis.
+[[native_references]]
+id = "CC-MODS"
+title = "Command Code Mods"
+url = "https://commandcode.ai/docs/mods"
+basis = "Experimental ModApi: factory file, cmd.on events, queueMessage (void), tool controls, mod_error, reload restarts the process"
+
+[[native_references]]
+id = "CC-HEADLESS"
+title = "Command Code headless"
+url = "https://commandcode.ai/docs/headless"
+basis = "-p --output-format json NDJSON stream, final result line fields, documented exit codes"
+
+[[native_references]]
+id = "CC-AGENTS"
+title = "Command Code custom agents"
+url = "https://commandcode.ai/docs/agents"
+basis = "Definitions re-read before the next turn; omitted tools mean an empty set"
+
+[[native]]
+name = "Command Code CLI (cmd)"
+basis_version = "1.66 (manager brief); installed binary not present on the development machine"
+installation = "Operator-installed native executable; this module installs nothing globally and downloads nothing"
+license_note = "Vendor CLI under its own terms; no vendor code is vendored here"

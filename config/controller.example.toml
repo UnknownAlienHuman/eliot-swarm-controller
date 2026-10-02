@@ -50,3 +50,16 @@ directory = 'C:\Projects\YourRepository'
 id = 'REPLACE_WITH_NATIVE_MODEL_ID'
 providerID = 'REPLACE_WITH_NATIVE_PROVIDER_ID'
 variant = 'REPLACE_WITH_EXACT_VARIANT'
+
+# Disabled. See modules/command/README.md. The Command Code module (pinned
+# mod + headless NDJSON glue) is fixture-verified but not yet wired behind
+# the host RuntimePort, and no installed Command Code binary is qualified;
+# enabling this route alone does not launch or control anything.
+[[routes]]
+alias = 'command-manager'
+runtime = 'command'
+module_artifact_id = 'command-mod-0.1.0-glue.1'
+enabled = false
+[routes.native_options]
+workspaceRoot = 'C:\Projects\YourRepository'
+controlRoot = 'C:\SwarmState\command-runs'
