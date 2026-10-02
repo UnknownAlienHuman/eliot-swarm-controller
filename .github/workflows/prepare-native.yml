@@ -18,8 +18,9 @@ jobs:
           BASE=8745e3334ed638ff98d09b00909a7b562e081b06
           test "$GITHUB_REF_NAME" = "feat/opencode-terminal-results"
           test "$(git merge-base HEAD "$BASE")" = "$BASE"
-          printf '%s  %s\n' 32f1beae0248910ea48c2d10387d60b138768acbf61396646b86b3e3ecd18b55 .github/import/opencode-terminal-results.patch.gz | sha256sum -c -
-          gzip -dc .github/import/opencode-terminal-results.patch.gz > "$RUNNER_TEMP/opencode-terminal-results.patch"
+          cat .github/import/opencode-terminal-results.patch.gz.b64.* | base64 --decode > "$RUNNER_TEMP/opencode-terminal-results.patch.gz"
+          printf '%s  %s\n' 32f1beae0248910ea48c2d10387d60b138768acbf61396646b86b3e3ecd18b55 "$RUNNER_TEMP/opencode-terminal-results.patch.gz" | sha256sum -c -
+          gzip -dc "$RUNNER_TEMP/opencode-terminal-results.patch.gz" > "$RUNNER_TEMP/opencode-terminal-results.patch"
           printf '%s  %s\n' 2d3c230bbc61ff1cffc0143af4ba48f31da3da2078e046e4700cc67bea7ea454 "$RUNNER_TEMP/opencode-terminal-results.patch" | sha256sum -c -
           git apply --check "$RUNNER_TEMP/opencode-terminal-results.patch"
           git apply "$RUNNER_TEMP/opencode-terminal-results.patch"
@@ -32,7 +33,7 @@ jobs:
           test "$(git hash-object src/store/opencode/tests.rs)" = 54ca429e4d091d70f05082b0f2640b516777d093
           test "$(git hash-object src/store/producers.rs)" = 1a1efa0e70b8dcd307cc176ac3fb42f8cea25f8f
           git show "$BASE:.github/workflows/prepare-native.yml" > .github/workflows/prepare-native.yml
-          rm .github/import/opencode-terminal-results.patch.gz
+          rm .github/import/opencode-terminal-results.patch.gz.b64.*
           git diff --check
       - name: Pinned Rust checks before publication
         shell: bash
