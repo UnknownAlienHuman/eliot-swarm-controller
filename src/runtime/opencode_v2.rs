@@ -1,5 +1,6 @@
 //! OpenCode V2 attaches to an explicitly configured, externally owned HTTP service.
 //! No CLI, process launch, service restart, implicit model choice or POST replay.
+mod background;
 mod configuration;
 mod effects;
 mod execution;
@@ -12,6 +13,7 @@ mod snapshot;
 pub(crate) mod tests;
 
 use crate::error::{Error, Result};
+pub(crate) use background::BACKGROUND_CONTRACT_REVISION;
 pub(crate) use configuration::{
     ConfigurationExpectation, ValidatedConfiguration, configuration_contract,
     configuration_expectation,

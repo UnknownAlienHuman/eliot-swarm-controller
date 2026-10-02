@@ -224,6 +224,7 @@ impl Service {
             "agent.reply" => self.reply(command, options).await,
             "agent.configure" => self.configure(command, options).await,
             "agent.goal" => self.execute_goal(command, options).await,
+            "agent.background" => self.execute_background(command, options).await,
             _ => failed(
                 command,
                 options,
@@ -434,6 +435,9 @@ impl Service {
             }
             if original.method=="agent.goal" {
                 return Ok(self.reconcile_goal(original, options).await);
+            }
+            if original.method=="agent.background" {
+                return Ok(self.reconcile_background(original, options).await);
             }
             if original.method=="agent.open" {
                 let id=root_id(&original.binding_id,original.generation);

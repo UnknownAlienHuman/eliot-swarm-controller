@@ -167,15 +167,15 @@ pub(super) fn next(db: &mut Connection, p: &Principal) -> Result<Value> {
             "SELECT operation_id,method,original_request_json,created_at_ms FROM operations AS candidate
              WHERE binding_id=?1 AND binding_generation=?2 AND state='queued' AND due_at_ms<=?3
                AND (COALESCE(json_extract(?4,'$.recovery_required'),0)=0 OR method IN ('agent.recover','agent.reconcile'))
-               AND method IN ('agent.open','task.dispatch','agent.send','agent.reply','agent.configure','agent.goal','agent.refresh','agent.reconcile','agent.result','agent.recover')
-               AND (method IN ('agent.reply','agent.refresh','agent.reconcile','agent.result','agent.recover')
+               AND method IN ('agent.open','task.dispatch','agent.send','agent.reply','agent.configure','agent.goal','agent.background','agent.refresh','agent.reconcile','agent.result','agent.recover')
+               AND (method IN ('agent.reply','agent.background','agent.refresh','agent.reconcile','agent.result','agent.recover')
                  OR (method='agent.send' AND json_extract(original_request_json,'$.delivery')='steer')
                  OR (method='agent.goal' AND json_extract(original_request_json,'$.action') IN ('pause','clear'))
                  OR NOT EXISTS (SELECT 1 FROM operations AS pending
                    WHERE pending.binding_id=?1 AND pending.binding_generation=?2
                      AND pending.state IN ('sending','native_accepted','outcome_unknown')
                      AND pending.method IN ('agent.open','task.dispatch','agent.send','agent.configure','agent.goal','agent.recover')))
-             ORDER BY CASE WHEN method='agent.reply' THEN 0
+             ORDER BY CASE WHEN method IN ('agent.reply','agent.background') THEN 0
                            WHEN method='agent.send' AND json_extract(original_request_json,'$.delivery')='steer' THEN 1
                            WHEN method='agent.goal' AND json_extract(original_request_json,'$.action') IN ('pause','clear') THEN 1
                            WHEN method IN ('agent.refresh','agent.reconcile','agent.result','agent.recover') THEN 2 ELSE 3 END, due_at_ms, rowid LIMIT 1",
@@ -624,7 +624,12 @@ fn is_recovery_control(method: &str, input: &Value, binding: &Value) -> bool {
         && binding["native_root_id"].is_string()
         && (matches!(
             method,
-            "agent.refresh" | "agent.reply" | "agent.reconcile" | "agent.result" | "agent.recover"
+            "agent.refresh"
+                | "agent.reply"
+                | "agent.background"
+                | "agent.reconcile"
+                | "agent.result"
+                | "agent.recover"
         ) || (method == "agent.goal"
             && matches!(input["action"].as_str(), Some("pause" | "clear"))))
 }
@@ -704,6 +709,11 @@ pub(super) fn user_command(
                 ));
             }
         }
+    } else if method == "agent.background" && v.get("session_id").is_some() {
+        // Optional addressed target: an owned family member session. The
+        // adapter re-proves ownership against the native parent chain
+        // before any native call; without it the binding root is targeted.
+        model::text(v, "session_id")?;
     }
     if method == "agent.reconcile" {
         let target = operations::get_operation(tx, model::text(v, "operation_id")?)?;
@@ -754,6 +764,21 @@ pub(super) fn user_command(
             "continuation_owner":"controller_record",
             "native_goal_api":false,
             "contract_revision":crate::runtime::opencode_v2::GOAL_CONTRACT_REVISION
+        });
+    } else if method == "agent.background"
+        && b["route"]["runtime"] == crate::runtime::opencode_v2::RUNTIME
+    {
+        // Native `session.background`: the boundary is the native POST plus
+        // the durable synthetic notice it admits; a lost response is
+        // reconciled by notice readback only, never by replaying the POST.
+        effective["operation_contract"] = json!({
+            "effect_scope":"native_session",
+            "order_scope":{"binding_id":id,"generation":generation},
+            "completion_condition":"native_foreground_tools_backgrounded",
+            "application_boundary":"native_background_boundary+notice_readback",
+            "replay_policy":"readback_only_no_mutation_replay",
+            "fallback_used":false,
+            "contract_revision":crate::runtime::opencode_v2::BACKGROUND_CONTRACT_REVISION
         });
     } else if method == "agent.send"
         && v["delivery"] == "next_turn"

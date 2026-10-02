@@ -220,6 +220,7 @@ impl Store {
                 | "agent.reply"
                 | "agent.configure"
                 | "agent.goal"
+                | "agent.background"
                 | "agent.refresh"
                 | "agent.reconcile"
                 | "agent.result"
@@ -871,8 +872,8 @@ fn apply(
         "attempt.bind_producer" => producers::bind(tx, p, v, id, now).map(|v| (v, false)),
         "attempt.release" => tasks::release(tx, p, v, id, now).map(|v| (v, false)),
         "task.dispatch" => operations::dispatch(tx, p, v, id, now),
-        "agent.send" | "agent.reply" | "agent.configure" | "agent.goal" | "agent.refresh"
-        | "agent.reconcile" | "agent.result" | "agent.recover" => {
+        "agent.send" | "agent.reply" | "agent.configure" | "agent.goal" | "agent.background"
+        | "agent.refresh" | "agent.reconcile" | "agent.result" | "agent.recover" => {
             runtime::user_command(tx, p, method, v, id).map(|v| (v, true))
         }
         "agent.open" => operations::open(tx, p, v, config, id, now).map(|v| (v, true)),

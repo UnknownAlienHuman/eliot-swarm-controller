@@ -802,3 +802,69 @@ async fn bound_child_producers_close_only_from_their_own_logs() {
     worker.await.unwrap();
     owner.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn background_operation_settles_from_the_native_notice() {
+    let f = Fixture::new().await;
+    let (owner, p) = start(&f).await;
+    let (stop, receiver) = watch::channel(false);
+    let worker = tokio::spawn(owner.store.clone().supervise_opencode(receiver));
+    let open = write(
+        &owner.store,
+        &p,
+        "agent.open",
+        json!({"lane_id":"background","route":"fixture"}),
+    )
+    .await
+    .unwrap();
+    wait_operation(&owner.store, &p, &open, "settled").await;
+    let root = oc::root_id(open["binding_id"].as_str().unwrap(), 1);
+    {
+        let mut w = f.world.lock().unwrap();
+        w.timeline.insert(
+            root.clone(),
+            vec![json!({"id":"msg_assistant_1","sessionID":root,"type":"assistant","time":{"created":2},
+              "agent":"build","model":{"id":"fixture-model","providerID":"fixture-provider","variant":"explicit-variant"},
+              "content":[{"type":"tool","id":"call_fixture_1","name":"task","state":{"status":"running","input":{"description":"fixture child"},"metadata":{}}}]})],
+        );
+        w.background_jobs.insert(
+            root.clone(),
+            vec![json!({"id":"job_fixture_1","type":"task","title":"fixture child"})],
+        );
+    }
+    let background = write(
+        &owner.store,
+        &p,
+        "agent.background",
+        json!({"binding_id":open["binding_id"],"generation":1}),
+    )
+    .await
+    .unwrap();
+    let background = wait_operation(&owner.store, &p, &background, "settled").await;
+    assert_eq!(background["result"]["outcome"], "applied");
+    assert_eq!(
+        background["result"]["details"]["completion_condition"],
+        "native_foreground_tools_backgrounded"
+    );
+    assert_eq!(
+        background["result"]["details"]["backgrounded"],
+        json!([{"type":"task","label":"fixture child"}])
+    );
+    assert_eq!(
+        background["operation_contract"]["completion_condition"],
+        "native_foreground_tools_backgrounded"
+    );
+    assert_eq!(
+        background["operation_contract"]["contract_revision"],
+        "opencode-background-v1"
+    );
+    assert_eq!(
+        background["operation_contract"]["replay_policy"],
+        "readback_only_no_mutation_replay"
+    );
+    assert_eq!(f.posts(&format!("/api/session/{root}/background")), 1);
+    assert_eq!(f.posts(&format!("/api/session/{root}/prompt")), 0);
+    stop.send(true).unwrap();
+    worker.await.unwrap();
+    owner.close().await.unwrap();
+}

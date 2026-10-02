@@ -204,6 +204,11 @@ impl Service {
     pub(super) async fn post(&self, path: &str, body: Value) -> Result<Value> {
         self.request(Method::POST, path, &[], Some(body)).await
     }
+    /// POST for native endpoints whose contract declares no payload at all
+    /// (e.g. `session.background`): never invent a body shape.
+    pub(super) async fn post_no_body(&self, path: &str) -> Result<Value> {
+        self.request(Method::POST, path, &[], None).await
+    }
     pub(super) async fn put(&self, path: &str, body: Value) -> Result<Value> {
         self.request(Method::PUT, path, &[], Some(body)).await
     }

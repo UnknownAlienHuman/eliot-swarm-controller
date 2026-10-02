@@ -359,7 +359,7 @@ impl Store {
                             let principal = p.clone();
                             let pending=self.run(move|db|{
                             let (id,generation,_)=runtime::scope(db,&principal,true)?;
-                            let mut stmt=db.prepare("SELECT operation_id FROM operations WHERE binding_id=?1 AND binding_generation=?2 AND state IN ('sending','native_accepted','outcome_unknown') AND method IN ('agent.open','task.dispatch','agent.send','agent.configure','agent.goal') ORDER BY created_at_ms LIMIT 16")?;
+                            let mut stmt=db.prepare("SELECT operation_id FROM operations WHERE binding_id=?1 AND binding_generation=?2 AND state IN ('sending','native_accepted','outcome_unknown') AND method IN ('agent.open','task.dispatch','agent.send','agent.configure','agent.goal','agent.background') ORDER BY created_at_ms LIMIT 16")?;
                             let ids=stmt.query_map(params![id,generation],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
                             ids.into_iter().map(|id|original(db,&principal,&id)).collect::<Result<Vec<_>>>()
                         }).await;

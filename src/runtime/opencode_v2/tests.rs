@@ -51,6 +51,14 @@ pub(crate) struct World {
     pub lose_entry_put: bool,
     pub consume_prompt: bool,
     pub event_connections: usize,
+    /// Native `session.background` fixture state: jobs currently blocking a
+    /// session (drained by the background POST), the projected message
+    /// timeline served by the list endpoint, and loss/placement switches.
+    pub background_jobs: BTreeMap<String, Vec<Value>>,
+    pub timeline: BTreeMap<String, Vec<Value>>,
+    pub background_notice_inbox: bool,
+    pub lose_background: bool,
+    pub background_seq: u64,
 }
 pub(crate) struct Fixture {
     pub options: Options,
@@ -354,6 +362,59 @@ fn respond(w: &mut World, o: &Options, origin: &str, r: &Request) -> Reply {
                     return Reply::Json(
                         200,
                         json!({"data":w.permissions.get(id).cloned().unwrap_or_default()}),
+                    );
+                }
+                ("POST", "background") => {
+                    // Native `session.background`: move every job blocking
+                    // this session to background observation; only a call
+                    // that moved work admits the durable synthetic notice.
+                    let jobs = w.background_jobs.remove(id).unwrap_or_default();
+                    if !jobs.is_empty() {
+                        w.background_seq += 1;
+                        let notice_id = format!("msg_background_notice_{}", w.background_seq);
+                        let mut text = String::from(
+                            "User requested that active blocking work be moved to the background.\n\nBackgrounded work:\n",
+                        );
+                        for job in &jobs {
+                            let label = job["title"]
+                                .as_str()
+                                .filter(|t| !t.is_empty())
+                                .unwrap_or_else(|| job["id"].as_str().unwrap_or_default());
+                            text.push_str(&format!(
+                                "- {}: {}\n",
+                                job["type"].as_str().unwrap_or_default(),
+                                label
+                            ));
+                        }
+                        text.push_str("\nThe backgrounded work is still unfinished. Move on to other work if you can. If there is nothing else useful to do, finish your response. Do not wait, sleep, poll, or report the backgrounded work as complete until a later completion notification is added to the conversation.");
+                        if w.background_notice_inbox {
+                            w.inbox.insert(notice_id.clone(),json!({"id":notice_id,"sessionID":id,"type":"synthetic","time":{"created":3},"delivery":"steer","payload":{"text":text}}));
+                        } else {
+                            w.timeline.entry(id.into()).or_default().push(json!({"id":notice_id,"sessionID":id,"type":"synthetic","time":{"created":3},"text":text}));
+                        }
+                    }
+                    if std::mem::take(&mut w.lose_background) {
+                        return Reply::Drop;
+                    }
+                    return Reply::Empty(204);
+                }
+                ("GET", "message") => {
+                    let url =
+                        reqwest::Url::parse(&format!("http://localhost{}", r.target)).unwrap();
+                    let limit = url
+                        .query_pairs()
+                        .find(|(k, _)| k == "limit")
+                        .and_then(|(_, v)| v.parse::<usize>().ok())
+                        .unwrap_or(50);
+                    let asc = url.query_pairs().any(|(k, v)| k == "order" && v == "asc");
+                    let mut items = w.timeline.get(id).cloned().unwrap_or_default();
+                    if !asc {
+                        items.reverse();
+                    }
+                    items.truncate(limit);
+                    return Reply::Json(
+                        200,
+                        json!({"data":items,"cursor":{"next":null,"previous":null}}),
                     );
                 }
                 _ => {}
@@ -1561,4 +1622,238 @@ async fn child_logs_bind_terminal_and_coverage_without_completeness() {
         "cancelled"
     );
     assert_eq!(st["execution"], "not_observed_active");
+}
+
+fn background_command(f: &Fixture, input: Value) -> RuntimeCommand {
+    let mut c = f.command("agent.background");
+    c.input = input;
+    c
+}
+fn running_task_message(session: &str) -> Value {
+    json!({"id":"msg_assistant_1","sessionID":session,"type":"assistant","time":{"created":2},
+      "agent":"build","model":{"id":"fixture-model","providerID":"fixture-provider","variant":"explicit-variant"},
+      "content":[{"type":"tool","id":"call_fixture_1","name":"task","state":{"status":"running","input":{"description":"fixture child"},"metadata":{}}}]})
+}
+fn seed_blocking_child(f: &Fixture, root: &str, child: &str) {
+    let mut w = f.world.lock().unwrap();
+    w.sessions.insert(
+        child.into(),
+        json!({"id":child,"parentID":root,"projectID":"prj_fixture","time":{"created":1,"updated":1}}),
+    );
+    w.active.insert(child.into(), json!({"type":"running"}));
+    w.active.insert(root.into(), json!({"type":"running"}));
+    w.timeline
+        .insert(root.into(), vec![running_task_message(root)]);
+    w.background_jobs.insert(
+        root.into(),
+        vec![json!({"id":"job_fixture_1","type":"task","title":"fixture child"})],
+    );
+}
+
+/// Program §13 scenario: a foreground backgroundable tool holds the
+/// manager. Backgrounding moves it to background observation, proven by the
+/// native notice readback; the child keeps running — no interrupt, no
+/// Task cancellation, no prompt replay, no steer-consumption claim.
+#[tokio::test]
+async fn background_moves_foreground_tool_and_child_continues() {
+    let f = Fixture::new().await;
+    let s = f.service().await;
+    let open = f.open(&s).await;
+    let root = root_id(&open.binding_id, open.generation);
+    seed_blocking_child(&f, &root, "ses_child_fixture");
+    let c = background_command(&f, json!({}));
+    let r = s.execute(&c, &f.options).await;
+    assert!(matches!(r.outcome, EffectOutcome::Applied), "{r:?}");
+    assert_eq!(
+        r.details["completion_condition"],
+        "native_foreground_tools_backgrounded"
+    );
+    assert_eq!(r.details["evidence"], "background_notice_readback");
+    assert_eq!(
+        r.details["backgrounded"],
+        json!([{"type":"task","label":"fixture child"}])
+    );
+    assert_eq!(
+        r.details["foreground_tools_before"],
+        json!([{"message_id":"msg_assistant_1","tool_call_id":"call_fixture_1","name":"task"}])
+    );
+    assert_eq!(r.details["session_active_before"], true);
+    assert_eq!(r.details["execution_complete"], false);
+    // Nothing in the outcome claims a queued steer was consumed.
+    assert!(r.details.get("steer_consumed").is_none());
+    assert!(r.details.get("steer").is_none());
+    // Exactly one native mutation: the background POST itself.
+    assert_eq!(f.posts(&format!("/api/session/{root}/background")), 1);
+    assert_eq!(f.posts(&format!("/api/session/{root}/prompt")), 0);
+    assert_eq!(f.deletes(&format!("/api/session/{root}")), 0);
+    {
+        let w = f.world.lock().unwrap();
+        assert!(
+            w.requests
+                .iter()
+                .all(|request| !request.path.contains("interrupt")),
+            "background must never interrupt: {:?}",
+            w.requests.iter().map(|r| &r.path).collect::<Vec<_>>()
+        );
+        // The child continues: still a family member, still active.
+        assert!(w.sessions.contains_key("ses_child_fixture"));
+        assert_eq!(w.active["ses_child_fixture"]["type"], "running");
+        assert_eq!(w.active[root.as_str()]["type"], "running");
+    }
+}
+
+#[tokio::test]
+async fn background_idle_session_is_the_documented_native_noop() {
+    let f = Fixture::new().await;
+    let s = f.service().await;
+    let open = f.open(&s).await;
+    let root = root_id(&open.binding_id, open.generation);
+    let c = background_command(&f, json!({}));
+    let r = s.execute(&c, &f.options).await;
+    assert!(matches!(r.outcome, EffectOutcome::Applied), "{r:?}");
+    assert_eq!(r.details["completion_condition"], "native_background_noop");
+    assert_eq!(r.details["backgrounded"], json!([]));
+    assert_eq!(r.details["foreground_tools_before"], json!([]));
+    assert_eq!(f.posts(&format!("/api/session/{root}/background")), 1);
+}
+
+#[tokio::test]
+async fn background_reports_unsupported_when_route_is_absent() {
+    let f = Fixture::new().await;
+    let s = f.service().await;
+    let open = f.open(&s).await;
+    let root = root_id(&open.binding_id, open.generation);
+    let path = format!("/api/session/{root}/background");
+    f.world.lock().unwrap().overrides.insert(
+        ("POST".into(), path.clone()),
+        Reply::Json(404, json!({"missing":true})),
+    );
+    let c = background_command(&f, json!({}));
+    let r = s.execute(&c, &f.options).await;
+    assert!(matches!(r.outcome, EffectOutcome::Rejected), "{r:?}");
+    assert_eq!(r.details["code"], "UNSUPPORTED_CAPABILITY");
+    assert_eq!(
+        r.details["completion_condition"],
+        "native_background_unsupported"
+    );
+    assert_eq!(f.posts(&path), 1);
+}
+
+#[tokio::test]
+async fn lost_background_response_reconciles_by_notice_without_replay() {
+    let f = Fixture::new().await;
+    let s = f.service().await;
+    let open = f.open(&s).await;
+    let root = root_id(&open.binding_id, open.generation);
+    seed_blocking_child(&f, &root, "ses_child_fixture");
+    f.world.lock().unwrap().lose_background = true;
+    let c = background_command(&f, json!({}));
+    assert!(matches!(
+        s.execute(&c, &f.options).await.outcome,
+        EffectOutcome::Unknown
+    ));
+    let r = s.reconcile(&c, &f.options).await;
+    assert!(matches!(r.outcome, EffectOutcome::Applied), "{r:?}");
+    assert_eq!(
+        r.details["completion_condition"],
+        "native_foreground_tools_backgrounded"
+    );
+    assert_eq!(
+        r.details["backgrounded"],
+        json!([{"type":"task","label":"fixture child"}])
+    );
+    assert_eq!(
+        r.details["attribution"],
+        "session_notice_presence_no_operation_marker"
+    );
+    assert_eq!(f.posts(&format!("/api/session/{root}/background")), 1);
+}
+
+#[tokio::test]
+async fn background_reconcile_without_notice_stays_unknown() {
+    let f = Fixture::new().await;
+    let s = f.service().await;
+    let open = f.open(&s).await;
+    let root = root_id(&open.binding_id, open.generation);
+    // A running tool is observed, but no job exists natively, so the POST
+    // admits no notice: absence of a notice must never settle the operation.
+    f.world
+        .lock()
+        .unwrap()
+        .timeline
+        .insert(root.clone(), vec![running_task_message(&root)]);
+    f.world.lock().unwrap().lose_background = true;
+    let c = background_command(&f, json!({}));
+    assert!(matches!(
+        s.execute(&c, &f.options).await.outcome,
+        EffectOutcome::Unknown
+    ));
+    let r = s.reconcile(&c, &f.options).await;
+    assert!(matches!(r.outcome, EffectOutcome::Unknown), "{r:?}");
+    assert_eq!(r.details["code"], "NATIVE_EVIDENCE_UNAVAILABLE");
+    assert_eq!(f.posts(&format!("/api/session/{root}/background")), 1);
+}
+
+#[tokio::test]
+async fn background_targets_owned_member_and_never_a_foreign_session() {
+    let f = Fixture::new().await;
+    let s = f.service().await;
+    let open = f.open(&s).await;
+    let root = root_id(&open.binding_id, open.generation);
+    {
+        let mut w = f.world.lock().unwrap();
+        w.sessions.insert(
+            "ses_child_fixture".into(),
+            json!({"id":"ses_child_fixture","parentID":root,"projectID":"prj_fixture","time":{"created":1,"updated":1}}),
+        );
+        w.timeline.insert(
+            "ses_child_fixture".into(),
+            vec![running_task_message("ses_child_fixture")],
+        );
+        w.background_jobs.insert(
+            "ses_child_fixture".into(),
+            vec![json!({"id":"job_fixture_2","type":"shell","title":""})],
+        );
+        w.sessions.insert(
+            "ses_foreign".into(),
+            json!({"id":"ses_foreign","projectID":"prj_foreign","time":{"created":1,"updated":1}}),
+        );
+    }
+    let c = background_command(&f, json!({"session_id":"ses_child_fixture"}));
+    let r = s.execute(&c, &f.options).await;
+    assert!(matches!(r.outcome, EffectOutcome::Applied), "{r:?}");
+    assert_eq!(r.details["session_id"], "ses_child_fixture");
+    assert_eq!(r.details["target_is_root"], false);
+    // An untitled job is named by its native id, as the native notice does.
+    assert_eq!(
+        r.details["backgrounded"],
+        json!([{"type":"shell","label":"job_fixture_2"}])
+    );
+    assert_eq!(f.posts("/api/session/ses_child_fixture/background"), 1);
+    assert_eq!(f.posts(&format!("/api/session/{root}/background")), 0);
+    let foreign = background_command(&f, json!({"session_id":"ses_foreign"}));
+    assert!(matches!(
+        s.execute(&foreign, &f.options).await.outcome,
+        EffectOutcome::Rejected
+    ));
+    assert_eq!(f.posts("/api/session/ses_foreign/background"), 0);
+}
+
+#[tokio::test]
+async fn background_notice_may_be_observed_in_the_inbox_before_projection() {
+    let f = Fixture::new().await;
+    let s = f.service().await;
+    let open = f.open(&s).await;
+    let root = root_id(&open.binding_id, open.generation);
+    seed_blocking_child(&f, &root, "ses_child_fixture");
+    f.world.lock().unwrap().background_notice_inbox = true;
+    let c = background_command(&f, json!({}));
+    let r = s.execute(&c, &f.options).await;
+    assert!(matches!(r.outcome, EffectOutcome::Applied), "{r:?}");
+    assert_eq!(
+        r.details["completion_condition"],
+        "native_foreground_tools_backgrounded"
+    );
+    assert_eq!(r.details["background_notice_source"], "inbox");
+    assert_eq!(f.posts(&format!("/api/session/{root}/background")), 1);
 }
