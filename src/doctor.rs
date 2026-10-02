@@ -259,6 +259,46 @@ pub fn inspect(db: &Connection, config: &Config) -> Result<Inspection> {
             ),
             None => Value::Null,
         };
+        // Applied-configuration evidence, projected only from the
+        // recorded snapshot's configuration section (bridge.2+). Older
+        // snapshots carry no such section: the field stays null and no
+        // finding is derived from its absence. Doctor never calls the
+        // service to fill this in.
+        let configuration = &native["configuration"];
+        let mut integration_attention: Vec<(String, String)> = Vec::new();
+        let configuration_summary = if configuration.is_object() {
+            let integrations = configuration["clientIntegrations"].as_array();
+            let (total, current) = match integrations {
+                Some(rows) => (
+                    rows.len(),
+                    rows.iter().filter(|row| row["state"] == "current").count(),
+                ),
+                None => (0, 0),
+            };
+            if let Some(rows) = integrations {
+                for row in rows {
+                    let state = row["state"].as_str().unwrap_or("");
+                    if state == "conflict" || state == "unsafe" {
+                        integration_attention.push((
+                            row["clientId"].as_str().unwrap_or("unknown").to_string(),
+                            state.to_string(),
+                        ));
+                    }
+                }
+            }
+            json!({
+                "protocol_messages_enabled": configuration["protocols"]["messagesEnabled"],
+                "protocol_unrepresentable": configuration["protocols"]["unrepresentable"],
+                "integrations_total": total,
+                "integrations_current": current,
+                "aside_profiles_total": configuration["asideProfiles"]["total"],
+                "aside_profiles_applied": configuration["asideProfiles"]["appliedCount"],
+                "subagent_mode": configuration["subagentSurface"]["v2"]["multiAgentMode"],
+                "subagent_models_chosen": configuration["subagentSurface"]["subagentModels"]["chosen"],
+            })
+        } else {
+            Value::Null
+        };
         let age_ms = observed_at_ms.map(|at| now - at);
         let stale = age_ms.is_some_and(|age| age > OPENCODEX_STALE_AFTER_MS);
         opencodex_services.push(json!({
@@ -277,6 +317,7 @@ pub fn inspect(db: &Connection, config: &Config) -> Result<Inspection> {
             "rss_bytes": memory["rssBytes"],
             "continuation": memory["responseState"],
             "providers": providers,
+            "configuration": configuration_summary,
             "usage_incomplete": native["usage"]["usageIncomplete"],
             "observed_at": native["observedAt"],
             "observed_at_ms": observed_at_ms,
@@ -315,6 +356,16 @@ pub fn inspect(db: &Connection, config: &Config) -> Result<Inspection> {
                     OPENCODEX_STALE_AFTER_MS / 60_000,
                 ),
                 "Record a fresh snapshot through the opencodex module if current service facts are needed; doctor reports recorded facts only.",
+            ));
+        }
+        for (client_id, state) in &integration_attention {
+            findings.push(finding(
+                "opencodex_integration_attention",
+                "attention",
+                format!(
+                    "OpenCodex binding {binding_id} last recorded client integration {client_id} in state {state}"
+                ),
+                "Ask the operator to review that client integration in OpenCodex and, if a change is wanted, confirm it through the module's preview + planFingerprint Operation; ELIOT never rewrites client configs on its own and never restarts the shared service.",
             ));
         }
     }
@@ -870,5 +921,87 @@ mod tests {
         // Without any OpenCodex binding the section is absent, not empty.
         let inspection = inspect(&fixture_db(), &Config::default()).unwrap();
         assert_eq!(inspection.report["services"], Value::Null);
+    }
+
+    #[test]
+    fn opencodex_configuration_projects_recorded_applied_evidence() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let state = json!({
+            "connection": "connected",
+            "observed_at_ms": now_ms,
+            "native": {
+                "endpoint": "http://127.0.0.1:10100",
+                "lifecycleOwner": "external",
+                "expectedVersion": "2.73.0",
+                "observedVersion": "2.73.0",
+                "readiness": "observed",
+                "observedAt": "2026-10-02T00:00:00.000Z",
+                "health": {"version": "2.73.0", "pid": 4242},
+                "memory": {"uptimeSeconds": 60, "activeTurnCount": 0},
+                "providers": [],
+                "usage": {"usageIncomplete": false},
+                "configuration": {
+                    "protocols": {"messagesEnabled": false, "unrepresentable": "reject"},
+                    "clientIntegrations": [
+                        {"clientId": "codex", "state": "current"},
+                        {"clientId": "cline", "state": "conflict"},
+                    ],
+                    "asideProfiles": {"total": 2, "appliedCount": 1},
+                    "subagentSurface": {
+                        "v2": {"multiAgentMode": "v2"},
+                        "subagentModels": {"chosen": ["anthropic/claude-sonnet-fixture"]},
+                    },
+                },
+            },
+        });
+        let db = opencodex_db(&state.to_string());
+        let inspection = inspect(&db, &Config::default()).unwrap();
+        let service = &inspection.report["services"]["opencodex"][0];
+        let configuration = &service["configuration"];
+        assert_eq!(configuration["protocol_messages_enabled"], false);
+        assert_eq!(configuration["protocol_unrepresentable"], "reject");
+        assert_eq!(configuration["integrations_total"], 2);
+        assert_eq!(configuration["integrations_current"], 1);
+        assert_eq!(configuration["aside_profiles_total"], 2);
+        assert_eq!(configuration["aside_profiles_applied"], 1);
+        assert_eq!(configuration["subagent_mode"], "v2");
+        assert_eq!(
+            configuration["subagent_models_chosen"][0],
+            "anthropic/claude-sonnet-fixture"
+        );
+        let codes = finding_codes(&inspection.report);
+        assert!(
+            codes.contains(&"opencodex_integration_attention".to_string()),
+            "{codes:?}"
+        );
+
+        // A bridge.1-era snapshot without a configuration section keeps
+        // the field null and raises no integration finding from absence.
+        let legacy = json!({
+            "observed_at_ms": now_ms,
+            "native": {
+                "endpoint": "http://127.0.0.1:10100",
+                "lifecycleOwner": "external",
+                "expectedVersion": "2.73.0",
+                "observedVersion": "2.73.0",
+                "readiness": "observed",
+                "health": {"version": "2.73.0", "pid": 4242},
+                "memory": {},
+                "providers": [],
+                "usage": {"usageIncomplete": false},
+            },
+        });
+        let db = opencodex_db(&legacy.to_string());
+        let inspection = inspect(&db, &Config::default()).unwrap();
+        let service = &inspection.report["services"]["opencodex"][0];
+        assert_eq!(service["configuration"], Value::Null);
+        let codes = finding_codes(&inspection.report);
+        assert!(
+            !codes.contains(&"opencodex_integration_attention".to_string()),
+            "{codes:?}"
+        );
     }
 }
