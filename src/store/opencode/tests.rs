@@ -202,3 +202,237 @@ async fn builtin_identity_cannot_authenticate_over_external_ipc() {
     assert_eq!(result.unwrap_err().code, "UNAUTHORIZED");
     owner.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn goal_receipts_survive_host_restart_without_replaying_native_work() {
+    let f = Fixture::new().await;
+    let (owner, p) = start(&f).await;
+    let (stop, receiver) = watch::channel(false);
+    let worker = tokio::spawn(owner.store.clone().supervise_opencode(receiver));
+    let open = write(
+        &owner.store,
+        &p,
+        "agent.open",
+        json!({"lane_id":"goal-restart","route":"fixture"}),
+    )
+    .await
+    .unwrap();
+    wait_operation(&owner.store, &p, &open, "settled").await;
+    let root = oc::root_id(open["binding_id"].as_str().unwrap(), 1);
+    f.world.lock().unwrap().lose_entry_put = true;
+    let goal = write(
+        &owner.store,
+        &p,
+        "agent.goal",
+        json!({"binding_id":open["binding_id"],"generation":1,"action":"set","objective":"restart-safe goal"}),
+    )
+    .await
+    .unwrap();
+    wait_operation(&owner.store, &p, &goal, "outcome_unknown").await;
+    write(
+        &owner.store,
+        &p,
+        "host.mode",
+        json!({"new_work":"disabled"}),
+    )
+    .await
+    .unwrap();
+    stop.send(true).unwrap();
+    worker.await.unwrap();
+    owner.close().await.unwrap();
+    // Restart recovery must pick up agent.goal and reconcile by readback only:
+    // the entry PUT and the (never sent) activation prompt are not replayed.
+    let (owner, p) = start(&f).await;
+    let (stop, receiver) = watch::channel(false);
+    let worker = tokio::spawn(owner.store.clone().supervise_opencode(receiver));
+    let operation = wait_operation(&owner.store, &p, &goal, "settled").await;
+    assert_eq!(operation["result"]["outcome"], "applied");
+    assert_eq!(
+        operation["result"]["details"]["completion_condition"],
+        "native_goal_recorded"
+    );
+    assert_eq!(
+        operation["result"]["details"]["goal"]["activation_input_id"],
+        Value::Null
+    );
+    {
+        let world = f.world.lock().unwrap();
+        assert_eq!(
+            world
+                .requests
+                .iter()
+                .filter(
+                    |r| r.method == "PUT" && r.path.ends_with("/instructions/entries/eliot.goal")
+                )
+                .count(),
+            1
+        );
+        assert_eq!(
+            world
+                .requests
+                .iter()
+                .filter(|r| r.method == "POST" && r.path == format!("/api/session/{root}/prompt"))
+                .count(),
+            0
+        );
+    }
+    stop.send(true).unwrap();
+    worker.await.unwrap();
+    owner.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn configure_prerequisite_gates_goal_start() {
+    let f = Fixture::new().await;
+    let (owner, p) = start(&f).await;
+    let (stop, receiver) = watch::channel(false);
+    let worker = tokio::spawn(owner.store.clone().supervise_opencode(receiver));
+    let open = write(
+        &owner.store,
+        &p,
+        "agent.open",
+        json!({"lane_id":"goal-prerequisite","route":"fixture"}),
+    )
+    .await
+    .unwrap();
+    wait_operation(&owner.store, &p, &open, "settled").await;
+    let root = oc::root_id(open["binding_id"].as_str().unwrap(), 1);
+    let configure = write(
+        &owner.store,
+        &p,
+        "agent.configure",
+        json!({"binding_id":open["binding_id"],"generation":1,"settings":{"instruction_entry":{"action":"put","key":"eliot.policy","value":{"review_before_submit":true}}}}),
+    )
+    .await
+    .unwrap();
+    let configure = wait_operation(&owner.store, &p, &configure, "settled").await;
+    assert_eq!(configure["result"]["outcome"], "applied");
+    assert_eq!(
+        configure["result"]["details"]["completion_condition"],
+        "native_configuration_applied"
+    );
+    let goal = write(
+        &owner.store,
+        &p,
+        "agent.goal",
+        json!({"binding_id":open["binding_id"],"generation":1,"action":"set","objective":"gated goal","prerequisite_operation_id":configure["operation_id"]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(goal["prerequisite_state"], "satisfied");
+    let goal = wait_operation(&owner.store, &p, &goal, "settled").await;
+    assert_eq!(goal["result"]["outcome"], "applied");
+    assert_eq!(
+        goal["result"]["details"]["completion_condition"],
+        "native_goal_recorded"
+    );
+    assert_eq!(
+        goal["operation_contract"]["completion_condition"],
+        "native_goal_recorded"
+    );
+    assert_eq!(goal["operation_contract"]["native_goal_api"], false);
+    assert_eq!(
+        goal["operation_contract"]["continuation_owner"],
+        "controller_record"
+    );
+    assert_eq!(
+        f.puts(&format!(
+            "/api/experimental/session/{root}/instructions/entries/eliot.goal"
+        )),
+        1
+    );
+    assert_eq!(f.posts(&format!("/api/session/{root}/prompt")), 1);
+    // A goal Operation can be a dependent, never a prerequisite: the gate
+    // still requires an agent.configure Operation.
+    let invalid = write(
+        &owner.store,
+        &p,
+        "agent.goal",
+        json!({"binding_id":open["binding_id"],"generation":1,"action":"set","objective":"ungated goal","prerequisite_operation_id":goal["operation_id"]}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(invalid.code, "INVALID_PREREQUISITE");
+    stop.send(true).unwrap();
+    worker.await.unwrap();
+    owner.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn goal_pause_cancels_queued_goal_set_on_same_binding() {
+    let f = Fixture::new().await;
+    let (owner, p) = start(&f).await;
+    let (stop, receiver) = watch::channel(false);
+    let worker = tokio::spawn(owner.store.clone().supervise_opencode(receiver));
+    let open = write(
+        &owner.store,
+        &p,
+        "agent.open",
+        json!({"lane_id":"goal-stop","route":"fixture"}),
+    )
+    .await
+    .unwrap();
+    wait_operation(&owner.store, &p, &open, "settled").await;
+    let root = oc::root_id(open["binding_id"].as_str().unwrap(), 1);
+    // A configure whose PUT response is lost without landing stays
+    // outcome_unknown, so a goal naming it as prerequisite stays queued.
+    f.world.lock().unwrap().overrides.insert(
+        (
+            "PUT".into(),
+            format!("/api/experimental/session/{root}/instructions/entries/eliot.policy"),
+        ),
+        crate::runtime::opencode_v2::tests::Reply::Drop,
+    );
+    let configure = write(
+        &owner.store,
+        &p,
+        "agent.configure",
+        json!({"binding_id":open["binding_id"],"generation":1,"settings":{"instruction_entry":{"action":"put","key":"eliot.policy","value":{"review_before_submit":true}}}}),
+    )
+    .await
+    .unwrap();
+    wait_operation(&owner.store, &p, &configure, "outcome_unknown").await;
+    let set = write(
+        &owner.store,
+        &p,
+        "agent.goal",
+        json!({"binding_id":open["binding_id"],"generation":1,"action":"set","objective":"queued goal","prerequisite_operation_id":configure["operation_id"]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(set["prerequisite_state"], "pending");
+    let queued = read(
+        &owner.store,
+        &p,
+        "operation.get",
+        json!({"operation_id":set["operation_id"]}),
+    )
+    .await;
+    assert_eq!(queued["state"], "queued");
+    // The pause admission itself cancels the queued goal start in the same
+    // Store transaction, before the pause is dispatched.
+    let pause = write(
+        &owner.store,
+        &p,
+        "agent.goal",
+        json!({"binding_id":open["binding_id"],"generation":1,"action":"pause"}),
+    )
+    .await
+    .unwrap();
+    let cancelled = read(
+        &owner.store,
+        &p,
+        "operation.get",
+        json!({"operation_id":set["operation_id"]}),
+    )
+    .await;
+    assert_eq!(cancelled["state"], "cancelled");
+    assert_eq!(cancelled["result"]["reason"], "superseded_by_goal_stop");
+    assert_eq!(
+        cancelled["result"]["stop_operation_id"],
+        pause["operation_id"]
+    );
+    stop.send(true).unwrap();
+    worker.await.unwrap();
+    owner.close().await.unwrap();
+}

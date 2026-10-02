@@ -44,8 +44,10 @@ pub(crate) struct World {
     pub permissions: BTreeMap<String, Vec<Value>>,
     pub active: BTreeMap<String, Value>,
     pub overrides: BTreeMap<(String, String), Reply>,
+    pub entries: BTreeMap<String, BTreeMap<String, Value>>,
     pub lose_create: bool,
     pub lose_prompt: bool,
+    pub lose_entry_put: bool,
     pub consume_prompt: bool,
     pub event_connections: usize,
 }
@@ -134,6 +136,29 @@ impl Fixture {
             .filter(|r| r.method == "POST" && r.path == path)
             .count()
     }
+    pub(crate) fn puts(&self, path: &str) -> usize {
+        self.world
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|r| r.method == "PUT" && r.path == path)
+            .count()
+    }
+    pub(crate) fn deletes(&self, path: &str) -> usize {
+        self.world
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|r| r.method == "DELETE" && r.path == path)
+            .count()
+    }
+    pub(crate) fn goal_command(&self, input: Value) -> RuntimeCommand {
+        let mut c = self.command("agent.goal");
+        c.input = input;
+        c
+    }
     pub(crate) fn override_get(&self, path: &str, reply: Reply) {
         self.world
             .lock()
@@ -174,8 +199,11 @@ fn respond(w: &mut World, o: &Options, origin: &str, r: &Request) -> Reply {
         ("GET", "/api/model") => {
             return Reply::Json(
                 200,
-                json!({"location":{"directory":o.directory},"data":[{"id":o.model.id,"providerID":o.model.provider_id,"enabled":true,"variants":[{"id":o.model.variant}]}]}),
+                json!({"location":{"directory":o.directory},"data":[{"id":o.model.id,"modelID":o.model.id,"providerID":o.model.provider_id,"name":"Fixture Model","capabilities":{"tools":true,"input":["text"],"output":["text"]},"variants":[{"id":o.model.variant,"settings":{}}],"time":{"released":1},"cost":[],"status":"active","enabled":true,"limit":{"context":1000,"output":100}}]}),
             );
+        }
+        ("GET", "/api/agent") => {
+            return Reply::Json(200, json!({"location":{"directory":o.directory},"data":[]}));
         }
         ("GET", "/api/event") => {
             w.event_connections += 1;
@@ -212,6 +240,49 @@ fn respond(w: &mut World, o: &Options, origin: &str, r: &Request) -> Reply {
         .trim_start_matches('/')
         .split('/')
         .collect::<Vec<_>>();
+    if parts.len() >= 4 && parts[0] == "api" && parts[1] == "experimental" && parts[2] == "session"
+    {
+        let id = parts[3];
+        if parts.len() == 6
+            && parts[4] == "instructions"
+            && parts[5] == "entries"
+            && r.method == "GET"
+        {
+            let entries = w
+                .entries
+                .get(id)
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .map(|(key, value)| json!({"key":key,"value":value}))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            return Reply::Json(200, json!({"data":entries}));
+        }
+        if parts.len() == 7 && parts[4] == "instructions" && parts[5] == "entries" {
+            let key = parts[6];
+            match r.method.as_str() {
+                "PUT" => {
+                    w.entries
+                        .entry(id.into())
+                        .or_default()
+                        .insert(key.into(), r.body["value"].clone());
+                    if std::mem::take(&mut w.lose_entry_put) {
+                        return Reply::Drop;
+                    }
+                    return Reply::Empty(204);
+                }
+                "DELETE" => {
+                    if let Some(entries) = w.entries.get_mut(id) {
+                        entries.remove(key);
+                    }
+                    return Reply::Empty(204);
+                }
+                _ => {}
+            }
+        }
+    }
     if parts.len() >= 3 && parts[0] == "api" && parts[1] == "session" {
         let id = parts[2];
         if parts.len() == 3 && r.method == "GET" {
@@ -685,5 +756,308 @@ async fn sse_failure_records_a_gap_without_native_mutation() {
             .requests
             .iter()
             .all(|r| r.method == "GET")
+    );
+}
+
+fn goal_entry_path(root: &str) -> String {
+    format!("/api/experimental/session/{root}/instructions/entries/eliot.goal")
+}
+fn goal_prompt_path(root: &str) -> String {
+    format!("/api/session/{root}/prompt")
+}
+fn stored_goal(f: &Fixture, root: &str) -> Option<Value> {
+    f.world
+        .lock()
+        .unwrap()
+        .entries
+        .get(root)
+        .and_then(|entries| entries.get("eliot.goal"))
+        .cloned()
+}
+
+#[tokio::test]
+async fn goal_set_records_entry_and_admits_one_activation_prompt() {
+    let f = Fixture::new().await;
+    let s = f.service().await;
+    f.open(&s).await;
+    let root = root_id("fixture-binding", 1);
+    let c = f.goal_command(json!({"action":"set","objective":"fixture goal objective"}));
+    let r = s.execute(&c, &f.options).await;
+    assert!(matches!(r.outcome, EffectOutcome::Applied), "{r:?}");
+    assert_eq!(r.details["completion_condition"], "native_goal_recorded");
+    assert_eq!(r.details["goal"]["action"], "set");
+    assert_eq!(r.details["goal"]["status"], "active");
+    assert_eq!(r.details["goal"]["revision"], 1);
+    assert_eq!(r.details["goal"]["native_goal_api"], false);
+    assert_eq!(r.details["goal"]["mutation_sent"], true);
+    assert_eq!(r.details["goal"]["model_work_started"], true);
+    assert_eq!(
+        r.native_input_id.as_deref(),
+        Some(input_id(&c.operation_id).as_str())
+    );
+    assert_eq!(f.puts(&goal_entry_path(&root)), 1);
+    assert_eq!(f.posts(&goal_prompt_path(&root)), 1);
+    let stored = stored_goal(&f, &root).unwrap();
+    assert_eq!(stored["objective"], "fixture goal objective");
+    assert_eq!(stored["status"], "active");
+    assert_eq!(stored["revision"], 1);
+    assert_eq!(stored["updated_by_operation_id"], c.operation_id);
+}
+
+#[tokio::test]
+async fn goal_set_with_same_objective_is_noop_without_second_prompt() {
+    let f = Fixture::new().await;
+    let s = f.service().await;
+    f.open(&s).await;
+    let root = root_id("fixture-binding", 1);
+    let first = f.goal_command(json!({"action":"set","objective":"same objective"}));
+    assert_applied(s.execute(&first, &f.options).await);
+    let second = f.goal_command(json!({"action":"set","objective":"same objective"}));
+    let r = s.execute(&second, &f.options).await;
+    assert!(matches!(r.outcome, EffectOutcome::Applied), "{r:?}");
+    assert_eq!(r.details["goal"]["evidence"], "preexisting_exact_readback");
+    assert_eq!(r.details["goal"]["mutation_sent"], false);
+    assert_eq!(r.details["goal"]["revision"], 1);
+    assert!(r.native_input_id.is_none());
+    assert_eq!(f.puts(&goal_entry_path(&root)), 1);
+    assert_eq!(f.posts(&goal_prompt_path(&root)), 1);
+}
+
+#[tokio::test]
+async fn goal_pause_changes_only_status_and_never_prompts_or_interrupts() {
+    let f = Fixture::new().await;
+    let s = f.service().await;
+    f.open(&s).await;
+    let root = root_id("fixture-binding", 1);
+    let set = f.goal_command(json!({"action":"set","objective":"pausable objective"}));
+    assert_applied(s.execute(&set, &f.options).await);
+    let pause = f.goal_command(json!({"action":"pause"}));
+    let r = s.execute(&pause, &f.options).await;
+    assert!(matches!(r.outcome, EffectOutcome::Applied), "{r:?}");
+    assert_eq!(r.details["goal"]["status"], "paused");
+    assert_eq!(r.details["goal"]["revision"], 2);
+    assert_eq!(r.details["goal"]["model_work_started"], false);
+    assert_eq!(f.puts(&goal_entry_path(&root)), 2);
+    assert_eq!(f.posts(&goal_prompt_path(&root)), 1);
+    assert!(
+        f.world
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .all(|request| !request.path.contains("interrupt"))
+    );
+    // A second pause is an exact no-op: no further PUT.
+    let pause_again = f.goal_command(json!({"action":"pause"}));
+    assert_applied(s.execute(&pause_again, &f.options).await);
+    assert_eq!(f.puts(&goal_entry_path(&root)), 2);
+}
+
+#[tokio::test]
+async fn goal_resume_reactivates_and_admits_one_prompt() {
+    let f = Fixture::new().await;
+    let s = f.service().await;
+    f.open(&s).await;
+    let root = root_id("fixture-binding", 1);
+    let set = f.goal_command(json!({"action":"set","objective":"resumable objective"}));
+    assert_applied(s.execute(&set, &f.options).await);
+    let pause = f.goal_command(json!({"action":"pause"}));
+    assert_applied(s.execute(&pause, &f.options).await);
+    let resume = f.goal_command(json!({"action":"resume"}));
+    let r = s.execute(&resume, &f.options).await;
+    assert!(matches!(r.outcome, EffectOutcome::Applied), "{r:?}");
+    assert_eq!(r.details["goal"]["status"], "active");
+    assert_eq!(r.details["goal"]["revision"], 3);
+    assert_eq!(
+        r.native_input_id.as_deref(),
+        Some(input_id(&resume.operation_id).as_str())
+    );
+    assert_eq!(f.posts(&goal_prompt_path(&root)), 2);
+    // Resuming an already active goal is a no-op without another prompt.
+    let resume_again = f.goal_command(json!({"action":"resume"}));
+    assert_applied(s.execute(&resume_again, &f.options).await);
+    assert_eq!(f.posts(&goal_prompt_path(&root)), 2);
+    assert_eq!(f.puts(&goal_entry_path(&root)), 3);
+}
+
+#[tokio::test]
+async fn goal_edit_replaces_objective_and_bumps_revision() {
+    let f = Fixture::new().await;
+    let s = f.service().await;
+    f.open(&s).await;
+    let root = root_id("fixture-binding", 1);
+    let set = f.goal_command(json!({"action":"set","objective":"first objective"}));
+    assert_applied(s.execute(&set, &f.options).await);
+    let edit = f.goal_command(json!({"action":"edit","objective":"second objective"}));
+    let r = s.execute(&edit, &f.options).await;
+    assert!(matches!(r.outcome, EffectOutcome::Applied), "{r:?}");
+    assert_eq!(r.details["goal"]["revision"], 2);
+    assert_eq!(
+        stored_goal(&f, &root).unwrap()["objective"],
+        "second objective"
+    );
+    assert_eq!(f.posts(&goal_prompt_path(&root)), 2);
+    // Editing to the same objective is a no-op.
+    let edit_same = f.goal_command(json!({"action":"edit","objective":"second objective"}));
+    let r = s.execute(&edit_same, &f.options).await;
+    assert!(matches!(r.outcome, EffectOutcome::Applied), "{r:?}");
+    assert_eq!(r.details["goal"]["evidence"], "preexisting_exact_readback");
+    assert_eq!(f.puts(&goal_entry_path(&root)), 2);
+    assert_eq!(f.posts(&goal_prompt_path(&root)), 2);
+}
+
+#[tokio::test]
+async fn goal_clear_removes_entry_and_clear_when_absent_is_noop() {
+    let f = Fixture::new().await;
+    let s = f.service().await;
+    f.open(&s).await;
+    let root = root_id("fixture-binding", 1);
+    let set = f.goal_command(json!({"action":"set","objective":"clearable objective"}));
+    assert_applied(s.execute(&set, &f.options).await);
+    let clear = f.goal_command(json!({"action":"clear"}));
+    let r = s.execute(&clear, &f.options).await;
+    assert!(matches!(r.outcome, EffectOutcome::Applied), "{r:?}");
+    assert_eq!(r.details["goal"]["present"], false);
+    assert_eq!(f.deletes(&goal_entry_path(&root)), 1);
+    assert!(stored_goal(&f, &root).is_none());
+    let clear_again = f.goal_command(json!({"action":"clear"}));
+    let r = s.execute(&clear_again, &f.options).await;
+    assert!(matches!(r.outcome, EffectOutcome::Applied), "{r:?}");
+    assert_eq!(r.details["goal"]["evidence"], "preexisting_exact_readback");
+    assert_eq!(f.deletes(&goal_entry_path(&root)), 1);
+}
+
+#[tokio::test]
+async fn goal_edit_pause_resume_without_record_are_rejected_without_mutation() {
+    let f = Fixture::new().await;
+    let s = f.service().await;
+    f.open(&s).await;
+    let root = root_id("fixture-binding", 1);
+    for input in [
+        json!({"action":"edit","objective":"nothing to edit"}),
+        json!({"action":"pause"}),
+        json!({"action":"resume"}),
+    ] {
+        let c = f.goal_command(input);
+        let r = s.execute(&c, &f.options).await;
+        assert!(matches!(r.outcome, EffectOutcome::Rejected), "{r:?}");
+        assert_eq!(r.details["code"], "NATIVE_GOAL_ABSENT");
+    }
+    assert_eq!(f.puts(&goal_entry_path(&root)), 0);
+    assert_eq!(f.deletes(&goal_entry_path(&root)), 0);
+    assert_eq!(f.posts(&goal_prompt_path(&root)), 0);
+}
+
+#[tokio::test]
+async fn lost_goal_put_reconciles_by_readback_only() {
+    let f = Fixture::new().await;
+    let s = f.service().await;
+    f.open(&s).await;
+    let root = root_id("fixture-binding", 1);
+    f.world.lock().unwrap().lose_entry_put = true;
+    let c = f.goal_command(json!({"action":"set","objective":"lost put objective"}));
+    let r = s.execute(&c, &f.options).await;
+    assert!(matches!(r.outcome, EffectOutcome::Unknown), "{r:?}");
+    // The lost response stopped execution before any activation prompt.
+    assert_eq!(f.posts(&goal_prompt_path(&root)), 0);
+    let r = s.reconcile(&c, &f.options).await;
+    assert!(matches!(r.outcome, EffectOutcome::Applied), "{r:?}");
+    assert_eq!(r.details["completion_condition"], "native_goal_recorded");
+    assert_eq!(r.details["goal"]["evidence"], "exact_state_reconciliation");
+    // The record is the completion condition; the never-sent activation is
+    // honestly reported as absent instead of being replayed.
+    assert_eq!(r.details["goal"]["activation_input_id"], Value::Null);
+    assert_eq!(r.details["goal"]["model_work_started"], false);
+    assert_eq!(f.puts(&goal_entry_path(&root)), 1);
+    assert_eq!(f.posts(&goal_prompt_path(&root)), 0);
+}
+
+#[tokio::test]
+async fn lost_activation_prompt_reconciles_from_inbox_without_resend() {
+    let f = Fixture::new().await;
+    let s = f.service().await;
+    f.open(&s).await;
+    let root = root_id("fixture-binding", 1);
+    f.world.lock().unwrap().lose_prompt = true;
+    let c = f.goal_command(json!({"action":"set","objective":"lost prompt objective"}));
+    let r = s.execute(&c, &f.options).await;
+    assert!(matches!(r.outcome, EffectOutcome::Unknown), "{r:?}");
+    let r = s.reconcile(&c, &f.options).await;
+    assert!(matches!(r.outcome, EffectOutcome::Applied), "{r:?}");
+    assert_eq!(
+        r.native_input_id.as_deref(),
+        Some(input_id(&c.operation_id).as_str())
+    );
+    assert_eq!(r.details["goal"]["model_work_started"], true);
+    assert_eq!(f.puts(&goal_entry_path(&root)), 1);
+    assert_eq!(f.posts(&goal_prompt_path(&root)), 1);
+}
+
+#[tokio::test]
+async fn goal_reconcile_stays_unknown_when_entry_was_changed_externally() {
+    let f = Fixture::new().await;
+    let s = f.service().await;
+    f.open(&s).await;
+    let root = root_id("fixture-binding", 1);
+    f.world.lock().unwrap().lose_entry_put = true;
+    let c = f.goal_command(json!({"action":"set","objective":"original objective"}));
+    assert!(matches!(
+        s.execute(&c, &f.options).await.outcome,
+        EffectOutcome::Unknown
+    ));
+    // An external writer replaced the record between execute and reconcile.
+    f.world.lock().unwrap().entries.get_mut(&root).unwrap().insert(
+        "eliot.goal".into(),
+        json!({"objective":"external objective","status":"active","revision":9,"updated_by_operation_id":"external-writer"}),
+    );
+    let r = s.reconcile(&c, &f.options).await;
+    assert!(matches!(r.outcome, EffectOutcome::Unknown), "{r:?}");
+    assert_eq!(f.puts(&goal_entry_path(&root)), 1);
+    assert_eq!(f.posts(&goal_prompt_path(&root)), 0);
+}
+
+#[tokio::test]
+async fn changed_binding_or_model_blocks_goal_before_any_mutation() {
+    let f = Fixture::new().await;
+    let s = f.service().await;
+    f.open(&s).await;
+    let root = root_id("fixture-binding", 1);
+    let c = f.goal_command(json!({"action":"set","objective":"blocked objective"}));
+    f.world.lock().unwrap().sessions.get_mut(&root).unwrap()["metadata"]["eliot"]["binding"] =
+        json!("stranger");
+    let r = s.execute(&c, &f.options).await;
+    assert!(matches!(r.outcome, EffectOutcome::Rejected), "{r:?}");
+    assert_eq!(r.details["code"], "NATIVE_IDENTITY_MISMATCH");
+    assert_eq!(f.puts(&goal_entry_path(&root)), 0);
+    assert_eq!(f.posts(&goal_prompt_path(&root)), 0);
+}
+
+#[tokio::test]
+async fn snapshot_exposes_goal_axis_with_digest_only() {
+    let f = Fixture::new().await;
+    let s = f.service().await;
+    f.open(&s).await;
+    let root = root_id("fixture-binding", 1);
+    let c = f.goal_command(json!({"action":"set","objective":"snapshot secret objective"}));
+    assert_applied(s.execute(&c, &f.options).await);
+    let snapshot = s.snapshot(&root, &Value::Null).await.unwrap();
+    let goal = &snapshot.state["goal_configuration"];
+    assert_eq!(goal["complete"], true);
+    assert_eq!(goal["present"], true);
+    assert_eq!(goal["status"], "active");
+    assert_eq!(goal["revision"], 1);
+    assert_eq!(goal["objective_content_persisted"], false);
+    assert_eq!(goal["native_goal_api"], false);
+    assert_eq!(goal["continuation_owner"], "controller_record");
+    assert!(
+        goal["objective_digest"]
+            .as_str()
+            .is_some_and(|digest| digest.starts_with("sha256:"))
+    );
+    assert!(
+        !snapshot
+            .state
+            .to_string()
+            .contains("snapshot secret objective")
     );
 }
