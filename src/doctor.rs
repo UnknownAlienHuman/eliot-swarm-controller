@@ -29,6 +29,11 @@ const SCHEMA: &str = include_str!("../migrations/001_core.sql");
 const ARTIFACT_FILE_CHECK_LIMIT: i64 = 1024;
 const OPEN_INCIDENTS_LIMIT: i64 = 10;
 const UNRELEASED_BINDINGS_LIMIT: i64 = 20;
+/// A recorded OpenCodex snapshot older than this is reported stale. The
+/// bound is a reporting threshold only: doctor never refreshes a snapshot
+/// itself and never calls the service.
+const OPENCODEX_STALE_AFTER_MS: i64 = 900_000;
+const OPENCODEX_BINDINGS_LIMIT: i64 = 8;
 
 /// Database/config report plus the artifact paths the caller must still
 /// cross-check against the data directory (see `attach_filesystem`).
@@ -195,6 +200,125 @@ pub fn inspect(db: &Connection, config: &Config) -> Result<Inspection> {
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
+    // --- OpenCodex provider service (recorded snapshots only) ----------------
+    // Doctor never calls the service: this section projects the snapshot
+    // each OpenCodex binding already recorded through the module path
+    // (bindings.state_json $.native, the bridge snapshot object) together
+    // with its observation time ($.observed_at_ms). With no OpenCodex
+    // binding recorded the section is absent from the report, not empty.
+    let mut statement = db.prepare(
+        "SELECT binding_id,module_artifact_id,state_json FROM bindings WHERE released_at_ms IS NULL AND module_artifact_id LIKE 'opencodex-%' ORDER BY created_at_ms,binding_id LIMIT ?1",
+    )?;
+    let opencodex_rows = statement
+        .query_map([OPENCODEX_BINDINGS_LIMIT], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut opencodex_services: Vec<Value> = Vec::new();
+    for (binding_id, artifact_id, state_json) in &opencodex_rows {
+        let state: Value = serde_json::from_str(state_json).unwrap_or(Value::Null);
+        let native = &state["native"];
+        let observed_at_ms = state["observed_at_ms"].as_i64();
+        if !native.is_object() {
+            findings.push(finding(
+                "opencodex_unobserved",
+                "gap",
+                format!("OpenCodex binding {binding_id} has no recorded service snapshot"),
+                "Record a snapshot through the opencodex module (attach/snapshot) or remove the binding; doctor does not call the service itself.",
+            ));
+            opencodex_services.push(json!({
+                "binding_id": binding_id,
+                "module_artifact_id": artifact_id,
+                "observed": false,
+            }));
+            continue;
+        }
+        let health = &native["health"];
+        let memory = &native["memory"];
+        let observed_version = health["version"]
+            .as_str()
+            .map(str::to_string)
+            .or_else(|| native["observedVersion"].as_str().map(str::to_string));
+        let expected_version = native["expectedVersion"].as_str().map(str::to_string);
+        let providers = match native["providers"].as_array() {
+            Some(rows) => Value::Array(
+                rows.iter()
+                    .map(|p| {
+                        json!({
+                            "id": p["id"],
+                            "adapter": p["adapter"],
+                            "auth_mode": p["authMode"],
+                            "billing": p["billing"],
+                        })
+                    })
+                    .collect(),
+            ),
+            None => Value::Null,
+        };
+        let age_ms = observed_at_ms.map(|at| now - at);
+        let stale = age_ms.is_some_and(|age| age > OPENCODEX_STALE_AFTER_MS);
+        opencodex_services.push(json!({
+            "binding_id": binding_id,
+            "module_artifact_id": artifact_id,
+            "observed": true,
+            "endpoint": native["endpoint"],
+            "lifecycle_owner": native["lifecycleOwner"],
+            "readiness": native["readiness"],
+            "expected_version": expected_version,
+            "observed_version": observed_version,
+            "pid": health["pid"],
+            "uptime_seconds": memory["uptimeSeconds"],
+            "active_turn_count": memory["activeTurnCount"],
+            "is_draining": memory["isDraining"],
+            "rss_bytes": memory["rssBytes"],
+            "continuation": memory["responseState"],
+            "providers": providers,
+            "usage_incomplete": native["usage"]["usageIncomplete"],
+            "observed_at": native["observedAt"],
+            "observed_at_ms": observed_at_ms,
+            "age_ms": age_ms,
+            "stale": stale,
+        }));
+        if health["state"] == "unknown" {
+            findings.push(finding(
+                "opencodex_unavailable",
+                "attention",
+                format!(
+                    "OpenCodex binding {binding_id} last recorded the service as unknown ({})",
+                    health["reason"].as_str().unwrap_or("reason not recorded"),
+                ),
+                "Ask the service owner to check the externally owned OpenCodex service and its Management credential; ELIOT never starts or restarts the shared service.",
+            ));
+        }
+        if let (Some(observed), Some(expected)) = (&observed_version, &expected_version)
+            && observed != expected
+        {
+            findings.push(finding(
+                "opencodex_version_mismatch",
+                "attention",
+                format!(
+                    "OpenCodex binding {binding_id} observed service version {observed}, expected {expected}"
+                ),
+                "Treat the binding's readiness as unknown until the operator aligns the service version or the binding's expectedVersion; a mismatch is neither a failure nor a pass.",
+            ));
+        }
+        if stale {
+            findings.push(finding(
+                "opencodex_stale",
+                "attention",
+                format!(
+                    "OpenCodex binding {binding_id}'s newest recorded snapshot is older than {} minutes",
+                    OPENCODEX_STALE_AFTER_MS / 60_000,
+                ),
+                "Record a fresh snapshot through the opencodex module if current service facts are needed; doctor reports recorded facts only.",
+            ));
+        }
+    }
+
     // --- attempts ------------------------------------------------------------
     let attempts_by_state = counts_by(db, "attempts", "state")?;
     let recovery_pending = attempts_by_state["recovery_pending"].as_i64().unwrap_or(0);
@@ -316,7 +440,7 @@ pub fn inspect(db: &Connection, config: &Config) -> Result<Inspection> {
         "incidents": count(db, "SELECT count(*) FROM incidents")?,
     });
 
-    let report = json!({
+    let mut report = json!({
         "method": "doctor.inspect",
         "version": env!("CARGO_PKG_VERSION"),
         "read_only": true,
@@ -417,9 +541,17 @@ pub fn inspect(db: &Connection, config: &Config) -> Result<Inspection> {
                 "status": "not_performed",
                 "note": "Fixture and CI evidence is not a live vendor run; routes therefore report live_qualification=false.",
             },
+            {
+                "area": "opencodex_provider_service",
+                "status": "not_performed",
+                "note": "opencodex_live_qualification: not_performed — OpenCodex facts come from module snapshots verified against pinned-contract fixture reconstructions (v2.73.0); no live opencodex service has been installed or qualified.",
+            },
         ],
         "findings": findings,
     });
+    if !opencodex_services.is_empty() {
+        report["services"] = json!({ "opencodex": opencodex_services });
+    }
     Ok(Inspection {
         report,
         artifact_paths,
@@ -603,5 +735,140 @@ mod tests {
         attach_filesystem(&mut inspection, &dir);
         assert_eq!(inspection.report["artifacts"]["files"]["missing"], 0);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn opencodex_db(state_json: &str) -> Connection {
+        let db = fixture_db();
+        db.execute(
+            "INSERT INTO bindings(binding_id,generation,lane_id,module_instance_id,module_artifact_id,state,route_json,state_json,created_at_ms) VALUES('b-ocx',1,'lane-ocx','inst-ocx','opencodex-2.73.0-bridge.1','ready','{}',?1,2000)",
+            params![state_json],
+        )
+        .unwrap();
+        db
+    }
+
+    fn finding_codes(report: &Value) -> Vec<String> {
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["code"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn opencodex_section_projects_recorded_snapshot_and_flags_mismatch() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let state = json!({
+            "connection": "connected",
+            "observed_at_ms": now_ms,
+            "native": {
+                "endpoint": "http://127.0.0.1:10100",
+                "lifecycleOwner": "external",
+                "expectedVersion": "2.73.0",
+                "observedVersion": "2.74.0-fixture",
+                "readiness": "unknown",
+                "observedAt": "2026-10-02T00:00:00.000Z",
+                "health": {"version": "2.74.0-fixture", "pid": 4242},
+                "memory": {
+                    "uptimeSeconds": 3725,
+                    "activeTurnCount": 2,
+                    "isDraining": false,
+                    "rssBytes": 73400320,
+                    "responseState": {"entries": 12, "health": "ok"},
+                },
+                "providers": [{
+                    "id": "anthropic",
+                    "adapter": "anthropic",
+                    "authMode": "oauth",
+                    "billing": "claude-subscription-via-opencodex",
+                }],
+                "usage": {"usageIncomplete": true},
+            },
+        });
+        let db = opencodex_db(&state.to_string());
+        let inspection = inspect(&db, &Config::default()).unwrap();
+        let service = &inspection.report["services"]["opencodex"][0];
+        assert_eq!(service["observed"], true);
+        assert_eq!(service["endpoint"], "http://127.0.0.1:10100");
+        assert_eq!(service["observed_version"], "2.74.0-fixture");
+        assert_eq!(service["expected_version"], "2.73.0");
+        assert_eq!(service["pid"], 4242);
+        assert_eq!(service["active_turn_count"], 2);
+        assert_eq!(service["rss_bytes"], 73400320);
+        assert_eq!(service["stale"], false);
+        assert_eq!(service["usage_incomplete"], true);
+        assert_eq!(
+            service["providers"][0]["billing"],
+            "claude-subscription-via-opencodex"
+        );
+        let codes = finding_codes(&inspection.report);
+        assert!(
+            codes.contains(&"opencodex_version_mismatch".to_string()),
+            "{codes:?}"
+        );
+        assert!(!codes.contains(&"opencodex_stale".to_string()), "{codes:?}");
+        assert!(
+            !codes.contains(&"opencodex_unavailable".to_string()),
+            "{codes:?}"
+        );
+        let gaps = inspection.report["known_gaps"].as_array().unwrap();
+        assert!(
+            gaps.iter().any(
+                |g| g["area"] == "opencodex_provider_service" && g["status"] == "not_performed"
+            )
+        );
+    }
+
+    #[test]
+    fn opencodex_unobserved_stale_and_unavailable_findings() {
+        // No recorded snapshot at all: unobserved, section still present.
+        let db = opencodex_db("{\"connection\":\"connected\"}");
+        let inspection = inspect(&db, &Config::default()).unwrap();
+        assert_eq!(
+            inspection.report["services"]["opencodex"][0]["observed"],
+            false
+        );
+        let codes = finding_codes(&inspection.report);
+        assert!(
+            codes.contains(&"opencodex_unobserved".to_string()),
+            "{codes:?}"
+        );
+
+        // Recorded unknown health + ancient observation time: unavailable
+        // and stale, projected from the recording alone (no live call).
+        let state = json!({
+            "observed_at_ms": 1000,
+            "native": {
+                "endpoint": "http://127.0.0.1:10100",
+                "lifecycleOwner": "external",
+                "expectedVersion": "2.73.0",
+                "observedVersion": null,
+                "readiness": "unknown",
+                "health": {"state": "unknown", "reason": "management_unavailable"},
+                "memory": {"state": "unknown", "reason": "management_unavailable"},
+                "providers": {"state": "unknown", "reason": "management_unavailable"},
+                "usage": {"state": "unknown", "reason": "management_unavailable"},
+            },
+        });
+        let db = opencodex_db(&state.to_string());
+        let inspection = inspect(&db, &Config::default()).unwrap();
+        let service = &inspection.report["services"]["opencodex"][0];
+        assert_eq!(service["observed"], true);
+        assert_eq!(service["stale"], true);
+        assert_eq!(service["providers"], Value::Null);
+        let codes = finding_codes(&inspection.report);
+        assert!(
+            codes.contains(&"opencodex_unavailable".to_string()),
+            "{codes:?}"
+        );
+        assert!(codes.contains(&"opencodex_stale".to_string()), "{codes:?}");
+
+        // Without any OpenCodex binding the section is absent, not empty.
+        let inspection = inspect(&fixture_db(), &Config::default()).unwrap();
+        assert_eq!(inspection.report["services"], Value::Null);
     }
 }
