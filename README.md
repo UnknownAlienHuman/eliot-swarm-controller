@@ -21,7 +21,7 @@ Capability states use the Documentation Program vocabulary (`implemented`, `fixt
 | Core / Store | — (built-in Rust core) | implemented | Durable Tasks, Attempts, Operations, request receipts, immutable artifacts, submissions, review and acceptance. | [Architecture](docs/agent_swarm.md) |
 | CheckRunner | — (built-in Rust core) | implemented | Fixed-source execution, active cancellation and recorded-worker recovery; reverse-dependency scope/cache reuse is still pending (see Still pending). | [CheckRunner](docs/check-runner.md) |
 | OpenCode | `eliot-opencode-v2.http.1` | fixture_checked | Implemented HTTP adapter; live installed OpenCode remains unqualified. | [OpenCode guide](modules/opencode/README.md) |
-| Muse | `muse-sdk-1.3.0-bridge.5` | fixture_checked | Steer, settings, goal/replies, retained result reads and recorded-session recovery implemented; live Muse resume, live Max inference and Windows launch remain unqualified. | [Muse guide](modules/muse/README.md) |
+| Muse | `muse-sdk-1.3.0-bridge.6` | fixture_checked | Steer, settings, goal/replies, retained result reads, recorded-session recovery and R18 durability/host-death/gap-fill observations implemented; live Muse resume, live Max inference and Windows launch remain unqualified. | [Muse guide](modules/muse/README.md) |
 | Codex | `codex-sdk-18194bf-bridge.1` | fixture_checked | Module only, no controller route registered yet. | [Codex guide](modules/codex/README.md) |
 | Claude | `claude-agent-sdk-0.3.287-bridge.1` | fixture_checked | First slice only (describe/open, next-turn send, snapshots); attach/resume, configure, goal, steer, reply, result pages and recovery are `unavailable` in this artifact. | [Claude guide](modules/claude/README.md) |
 | Antigravity | `antigravity-cli-warm-bridge.1` | fixture_checked | Implemented warm bridge; live Antigravity and Windows launch remain unqualified. | [Antigravity guide](modules/antigravity/README.md) |
@@ -73,7 +73,7 @@ The complete pinned `atlas-redact` donor is now used to scrub retained native qu
 
 ## Native Muse, clients and task-specific children
 
-Follow [modules/muse/README.md](modules/muse/README.md). Enable a private route, reserve `agent.open`, register its scoped module credential, install the locked module-local SDK and independently launch the bridge using the installed native executable. The shipped route is disabled; its artifact version is **`muse-sdk-1.3.0-bridge.5`**. Local check changes do not require replacing a running bridge. Version updates and rollback follow [modules/muse/UPDATE.md](modules/muse/UPDATE.md).
+Follow [modules/muse/README.md](modules/muse/README.md). Enable a private route, reserve `agent.open`, register its scoped module credential, install the locked module-local SDK and independently launch the bridge using the installed native executable. The shipped route is disabled; its artifact version is **`muse-sdk-1.3.0-bridge.6`**. Local check changes do not require replacing a running bridge. Version updates and rollback follow [modules/muse/UPDATE.md](modules/muse/UPDATE.md).
 
 Native subscription/auth and effort remain in the harness. Requested effort, effective setting and observed inference are different evidence. No Go/API route silently substitutes for Muse Code Max. Full conversation history stays native.
 

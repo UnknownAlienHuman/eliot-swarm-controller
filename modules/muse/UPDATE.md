@@ -9,7 +9,7 @@ the new version is activated for new bindings, and how to roll back.
 
 | Fact | Value |
 |---|---|
-| Module artifact | `muse-sdk-1.3.0-bridge.5` (route `module_artifact_id`, module config `moduleArtifactId`, `config/controller.example.toml`) |
+| Module artifact | `muse-sdk-1.3.0-bridge.6` (route `module_artifact_id`, module config `moduleArtifactId`, `config/controller.example.toml`) |
 | SDK package | `@muse-code/sdk` **1.3.0**, exact, via `package.json` + `package-lock.json`; installed module-locally with `npm ci`, never globally |
 | SDK canonical source | `meta-models/muse-code-sdk@a7c10c5dd3f66be412077d29f9d11111af70317b` (MIT); the MSP schema is pinned at that commit |
 | Bridge code | ELIOT-owned `*.mjs` in this directory (`bridge`, `checkpoint`, `control`, `owned`, `results`, `settings`) |
@@ -50,8 +50,19 @@ npm ci --ignore-scripts --no-audit --no-fund
 node --input-type=module -e 'import { spawnMspConnection, Connection } from "@muse-code/sdk"; if (typeof spawnMspConnection !== "function" || typeof Connection !== "function") throw new Error("SDK export mismatch");'
 ```
 
-If bridge behavior changed, also run the bounded fixture invocation
-described in the README. Syntax/import success is not live Muse, Max
+If bridge behavior changed, also run the fixture selftest and the
+bounded fixture invocation described in the README:
+
+```bash
+cd modules/muse
+node selftest.mjs
+```
+
+The selftest pins the R18 observation derivations (durability profile,
+host-death record, gap-fill record, failed-reconcile classification) and
+the checkpoint round-trip for same-ID reconciliation against fixtures
+authored from the pinned SDK sources; it involves no native executable
+or model call. Syntax/import success is not live Muse, Max
 or Windows qualification; live qualification of the new pin against the
 installed runtime is a separate step and never follows from these
 checks.
@@ -71,9 +82,9 @@ Activation is per binding, through the recorded artifact id:
    artifact id of its route at reservation; the bridge announces its id
    in `module.hello` and the host rejects a mismatch with
    `ARTIFACT_MISMATCH`. New bindings therefore run the new bridge;
-   existing bindings keep `muse-sdk-1.3.0-bridge.5` and are still
-   served by the old bridge. The two bridges never cross-serve a
-   binding.
+   existing bindings keep the artifact id they recorded (at the
+   bridge.6 update, `muse-sdk-1.3.0-bridge.5`) and are still served
+   by the old bridge. The two bridges never cross-serve a binding.
 4. Retire the old bridge only after its bindings are released and its
    managed process group has departed on its own. The module-run owner
    is never killed to make room for the new version.

@@ -1,6 +1,6 @@
 # Muse SDK bridge — native integration
 
-Uses the complete locked `@muse-code/sdk` **1.3.0** and pinned [MSP schema](https://github.com/meta-models/muse-code-sdk/blob/a7c10c5dd3f66be412077d29f9d11111af70317b/schema/msp/msp.d.ts). New bindings use **`muse-sdk-1.3.0-bridge.5`**. Live Muse/Max and Windows native launch remain unqualified; syntax/import and compilation do not attest model execution.
+Uses the complete locked `@muse-code/sdk` **1.3.0** and pinned [MSP schema](https://github.com/meta-models/muse-code-sdk/blob/a7c10c5dd3f66be412077d29f9d11111af70317b/schema/msp/msp.d.ts). New bindings use **`muse-sdk-1.3.0-bridge.6`**. Live Muse/Max and Windows native launch remain unqualified; syntax/import and compilation do not attest model execution.
 
 ## Ownership and setup
 
@@ -16,7 +16,7 @@ The bridge owns one `muse serve` connection. Host IPC exposes `module.hello/next
 [[routes]]
 alias = 'muse-manager'
 runtime = 'muse'
-module_artifact_id = 'muse-sdk-1.3.0-bridge.5'
+module_artifact_id = 'muse-sdk-1.3.0-bridge.6'
 enabled = true
 [routes.native_options]
 workspaceRoot = 'C:\Projects\YourRepository'
@@ -61,6 +61,30 @@ swarm call operation.get --file operation.json
 This is explicit native work, **not a healthcheck**. New-work-disabled prevents admission. It reads the exact recorded session/model in the original native namespace and uses `session/resume` with excludeItems; no `session/start`, fork or original-prompt replay is a fallback. The current connection becomes ready only upon its correlated resume result. Retained outcomes are reported without native resend. Unresolved commands require targeted `agent.reconcile` with their original IDs; nothing repeatedly replays them merely because the bridge restarted.
 
 Binding/generation denotes the same retained conversation here; bridge boot and managed process-group identity separately denote its replacement process owner. Historical run identities and Task-specific ownership are not erased. Root/known-child subscriptions and pending questions are refreshed, but family completeness stays partial and stale terminal evidence cannot close a newer run.
+
+## SDK delegation and recorded observations — bridge.6
+
+"Use the whole official SDK" is a supply-chain decision, not a delegation of every protocol state machine. The bridge imports only the SDK's low-level public surface (`spawnMspConnection`, `Connection`, `checkServedFingerprint`, `MspError`); the facade's `Session`, `PendingCommandSet` and `GapFiller` are not in this module. The exact split:
+
+| Concern | Owner |
+| --- | --- |
+| framing, generated types, request router, server-request plumbing | official SDK |
+| command ID and Operation mapping | ELIOT bridge |
+| durable checkpoint across bridge loss | ELIOT |
+| same-ID replay semantics | native protocol + SDK contract, driven by ELIOT explicit reconcile |
+| view gap fill | current ELIOT compact observation; SDK GapFiller is not automatically inherited |
+| host-death durability classification | SDK handshake facts + ELIOT module owner/recovery |
+| Task/Attempt/acceptance | ELIOT host |
+
+On an SDK upgrade, the fixture selftest (`node selftest.mjs`) must keep passing against these invariants, not only import/syntax checks: the derivations it pins live in `observe.mjs`, the checkpoint round-trip runs the real `checkpoint.mjs`.
+
+Bridge.6 records three observation facts that bridge.5 only implied:
+
+- **`host_durability`** — the initialize handshake's `sessionDurability` declaration, classified per SS2.13.1: absent or `durable` reads `durable`; `ephemeral` reads `ephemeral`; any other value is **`unrecognized`** and never collapses into `durable` — an unrecognized profile guarantees nothing. The raw declared value is kept beside the classification.
+- **`host_death`** — recorded when the native process exits or fails to spawn: the SS2.11 exit row (`cleanShutdown` is the only non-abnormal row; every other row, however tidy its name, left no `SessionEnd`), the exit evidence, and `session_survives`, which is true only for a `durable` profile. Recording a death invents no terminal turn or session event; a durable session's disposition stays native until explicit recovery, and an ephemeral session is gone with its host.
+- **`gap_fill`** — each `view/gap` is recorded as an `unfilled` hole with its opaque `after`/`next` bracket and session ID verbatim (cursors are relayed, never parsed, ordered or merged), distinct from the `gaps` counter and `view_health`. This bridge does not splice-fill: it holds no live fold, so the inability is the recorded fact, and re-anchoring happens only through the existing read paths (`session/read`, `view/page` result reads).
+
+One boundary stays explicit: transport EOF without process exit is not separately recorded. The SDK facade composes EOF into a host-death notification inside `MuseClient`, which this bridge does not use; on the bridge's transports, EOF surfaces as failed pending requests and `unknown` outcomes, and only the process exit produces a `host_death` record.
 
 **Remaining recovery gaps:** crash after the native session is created but before its first checkpoint write completes (the root identity is now persisted immediately after `session/start`, before readback verdicts — the remaining window is the write itself); loss of an admitted host delivery before the bridge journal received it; unknown old native effects; native resume behavior with all vendor background children. Missing or corrupt owner/checkpoint identity is classified explicitly (`MODULE_OWNER_IDENTITY_MISSING`/`MODULE_OWNER_IDENTITY_INVALID`, a persisted `recovery-gap.json` in the module state directory, and `MODULE_OWNER_RECORD_MISSING`/`MODULE_OWNER_RECORD_CORRUPT`/`CHECKPOINT_CORRUPT` on the bridge side) and remains a recovery gap, never an adopted checkpoint, a force-reset or a fresh start. These remain explicit unknown/reconciliation cases, not reasons to fabricate no-effect or start fresh. This is controlled recovery of recorded work, not an autonomous repair service or live qualification of every crash window.
 
