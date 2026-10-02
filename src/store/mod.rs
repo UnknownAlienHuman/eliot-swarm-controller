@@ -7,6 +7,7 @@ mod opencode;
 mod operations;
 mod prerequisites;
 mod producers;
+mod projection;
 mod results;
 mod runtime;
 mod submissions;
@@ -732,13 +733,50 @@ fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config
                     ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            let mut next = after;
-            let mut items = Vec::new();
+            // Projection first, limits after projection (§8.1): an
+            // oversized item becomes an explicit gap reference at its
+            // own cursor; the cursor below advances only over entries
+            // actually returned, so a limited page never replays or
+            // silently skips a source row.
+            let mut projected = Vec::with_capacity(rows.len());
             for (id, kind, raw, time) in rows {
-                next = id;
-                items.push(json!({"cursor":id,"kind":kind,"payload":serde_json::from_str::<Value>(&raw)?,"recorded_at_ms":time}));
+                projected.push(json!({"cursor":id,"kind":kind,"payload":serde_json::from_str::<Value>(&raw)?,"recorded_at_ms":time}));
             }
-            Ok(json!({"items":items,"next_cursor":next}))
+            let limited = projection::limit_items(projected, projection::timeline_gap_reference)?;
+            let next = limited
+                .items
+                .last()
+                .and_then(|item| item["cursor"].as_i64())
+                .unwrap_or(after);
+            // Newer source rows exist when a budget stopped this page
+            // early (fetched rows were left unemitted) or when the
+            // source itself continues past the last returned cursor.
+            let has_newer: bool = limited.stopped_early
+                || db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM observations WHERE observation_id>?1 AND (?2=0 OR (kind IN ('message.send','task.feedback','check.completed') AND json_extract(payload_json,'$.recipient')=?3)))",
+                    params![next, only_mail, p.client_id],
+                    |r| r.get::<_, bool>(0),
+                )?;
+            let has_older: bool = db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM observations WHERE observation_id<=?1 AND (?2=0 OR (kind IN ('message.send','task.feedback','check.completed') AND json_extract(payload_json,'$.recipient')=?3)))",
+                params![after, only_mail, p.client_id],
+                |r| r.get(0),
+            )?;
+            let frame = projection::frame(
+                if only_mail {
+                    "mailbox"
+                } else {
+                    "observation_timeline"
+                },
+                json!({"after": after, "next_cursor": next}),
+                &limited,
+                limit,
+                has_older,
+                has_newer,
+                limited.gap_count == 0,
+                Vec::new(),
+            )?;
+            Ok(json!({"items":limited.items,"next_cursor":next,"projection":frame}))
         }
         _ => Err(Error::new("METHOD_NOT_FOUND", method)),
     }
