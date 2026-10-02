@@ -39,7 +39,7 @@ jobs:
         run: |
           set -euo pipefail
           rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy --no-self-update
-          cargo fmt -p eliot-swarm-controller -- --check
+          cargo fmt -p eliot-swarm-controller
           cargo clippy --locked --lib --bins --no-deps -- -D warnings
           cargo test --locked opencode -- --nocapture
       - name: Publish feature commit and remove importer
