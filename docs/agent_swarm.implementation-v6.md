@@ -418,7 +418,7 @@ SQL и небольшие последовательные модели пров
 | R9 | Donor provenance: exact unit/revision/license, compilation ≠ qualification | `docs/agent_swarm.donors-20260929.toml`, `modules/*/UPDATE.md` | Норма; inventory — Фаза A |
 | R10 | Единый рабочий контракт Issue и роли; specification ≠ policy | TaskSpec/Task revision и application API (`src/store/tasks.rs`) | Норма / код в Фазе B; owner-policy — pending owner decision (см. архитектуру §4/R10) |
 | R11 | Доставка результата; ветка ≠ идентичность сдачи | `src/store/submissions.rs`, operations/results | Основа реализована; остаток — норма / код в Фазе B; порядок publication vs acceptance — policy-selected |
-| R12 | Scoped observations, capacity, адресное внимание | native mapper/snapshot в `src/runtime/`, `report.delta`/doctor (`src/doctor.rs`) | Норма / код в Фазе B |
+| R12 | Scoped observations, capacity, адресное внимание | native mapper/snapshot в `src/runtime/`, `report.delta`/doctor (`src/doctor.rs`); единая attention-проекция — `report.attention` и секция doctor (`src/store/capacity.rs`) | Норма; capacity/attention код — Фаза B (S6); `session.background` — отдельный слайс S4 |
 | R13 | Native delivery, recovery и drain без дублей | runtime effects/reconcile, adapters (`src/runtime/`) | Норма / код в Фазе B |
 | R14 | Проверки, baseline, cache, build resources; effective inputs | `src/checks/`, `src/store/checks.rs` | Норма, статус pending — issue #6; код в Фазе B |
 | R15 | Writer result и безопасный lifecycle ресурсов | resources/artifacts/Attempt в `src/store/`, `src/platform/` | Норма / код в Фазе B |
@@ -429,7 +429,7 @@ SQL и небольшие последовательные модели пров
 | R20 | MCP-фасад, Tasks и subscriptions | `src/mcp.rs` | Фасад реализован; Operation-as-Task projection и subscriptions — proposed, норма / код в Фазе B |
 | R21 | Решение по ACP-route (ACPX whole) | Владельца в коде нет (`runtime.acp` отсутствует) | Proposed; только при реальном потребителе, Фаза B |
 | R22 | Контракты timeline, family и коммуникации (Paseo/CCCC паттерны) | mailbox/family в `src/store/`, adapters | Паттерны приняты как нормы; код в Фазе B |
-| R23 | Capacity, permissions и supply chain модулей | `src/config.rs`, Store accounting, `modules/*/UPDATE.md` | Норма / код в Фазе B |
+| R23 | Capacity, permissions и supply chain модулей | `src/config.rs`, Store accounting (`src/store/capacity.rs`: durable active+reserved ledger по provider/account/service scope, quota-инциденты в `incidents`), `modules/*/UPDATE.md` | Норма; capacity accounting — Фаза B (S6); install/update как Operations — решение оператора (issue #15) |
 | R24 | Handoff агенту и создание Issue после ревью Фазы A | Процесс, не код | Норма Фазы A/B; code issues создаются только после ревью Фазы A |
 
 ## Источники
