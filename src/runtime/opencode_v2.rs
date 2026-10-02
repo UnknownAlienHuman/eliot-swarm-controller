@@ -3,6 +3,7 @@
 mod configuration;
 mod effects;
 mod execution;
+mod goal;
 mod http;
 mod results;
 mod snapshot;
@@ -15,6 +16,7 @@ pub(crate) use configuration::{
     MODEL_SETTINGS_REVISION_KIND, configuration_contract, configuration_expectation,
 };
 pub(crate) use execution::{ExecutionRead, ExecutionScan};
+pub(crate) use goal::GOAL_CONTRACT_REVISION;
 pub(crate) use http::{EventReader, EventState, Service};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;

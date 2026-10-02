@@ -44,7 +44,7 @@ pub(super) fn failed(
         diagnostic(error),
     )
 }
-fn marker(command: &RuntimeCommand) -> Value {
+pub(super) fn marker(command: &RuntimeCommand) -> Value {
     json!({"binding":command.binding_id,"generation":command.generation,"operation":command.operation_id})
 }
 fn prompt(command: &RuntimeCommand) -> Result<String> {
@@ -223,6 +223,7 @@ impl Service {
             "task.dispatch" | "agent.send" => self.send(command, options).await,
             "agent.reply" => self.reply(command, options).await,
             "agent.configure" => self.configure(command, options).await,
+            "agent.goal" => self.execute_goal(command, options).await,
             _ => failed(
                 command,
                 options,
@@ -431,6 +432,9 @@ impl Service {
             if original.method=="agent.configure" {
                 return Ok(self.reconcile_configuration(original, options).await);
             }
+            if original.method=="agent.goal" {
+                return Ok(self.reconcile_goal(original, options).await);
+            }
             if original.method=="agent.open" {
                 let id=root_id(&original.binding_id,original.generation);
                 let session=self.check_root(&id,options).await?;
@@ -469,7 +473,7 @@ fn inbox_matches(item: &Value, root: &str, id: &str, text: &str, command: &Runti
 
 // Exact IDs and the original content/metadata are necessary, not a substring or
 // equal text alone. Extra native attachments change the admitted assignment.
-fn no_attachments(value: &Value) -> bool {
+pub(super) fn no_attachments(value: &Value) -> bool {
     ["files", "agents", "skills"].iter().all(|key| {
         value
             .get(*key)

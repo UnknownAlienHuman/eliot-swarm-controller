@@ -754,6 +754,22 @@ pub(super) fn user_command(
             generation,
             &b["route"]["native_options"],
         )?;
+    } else if method == "agent.goal"
+        && b["route"]["runtime"] == crate::runtime::opencode_v2::RUNTIME
+    {
+        // OpenCode has no native goal API: the goal is a controller record in
+        // the native instruction-entry backend, never `native_goal_admitted`.
+        effective["operation_contract"] = json!({
+            "effect_scope":"native_session",
+            "order_scope":{"binding_id":id,"generation":generation},
+            "completion_condition":"native_goal_recorded",
+            "application_boundary":"next_step_boundary+prompt_admission",
+            "replay_policy":"readback_only_no_mutation_replay",
+            "fallback_used":false,
+            "continuation_owner":"controller_record",
+            "native_goal_api":false,
+            "contract_revision":crate::runtime::opencode_v2::GOAL_CONTRACT_REVISION
+        });
     } else if method == "agent.send"
         && v["delivery"] == "next_turn"
         && b["route"]["runtime"] == crate::runtime::opencode_v2::RUNTIME

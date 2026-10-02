@@ -219,7 +219,7 @@ struct ModelReadback {
     variant_digest: String,
 }
 
-fn digest_json(value: &Value) -> Result<String> {
+pub(super) fn digest_json(value: &Value) -> Result<String> {
     Ok(format!(
         "sha256:{}",
         model::digest(model::canonical(value)?.as_bytes())
@@ -571,7 +571,7 @@ fn validate_entries(entries: Vec<Value>) -> Result<Vec<Value>> {
     Ok(entries)
 }
 
-fn owned_projection(entries: &[Value]) -> Result<Vec<Value>> {
+pub(super) fn owned_projection(entries: &[Value]) -> Result<Vec<Value>> {
     let mut owned = Vec::new();
     for entry in entries.iter().filter(|entry| {
         entry["key"]
@@ -594,7 +594,7 @@ fn owned_projection(entries: &[Value]) -> Result<Vec<Value>> {
     Ok(owned)
 }
 
-fn projection_revision(projection: &[Value]) -> Result<String> {
+pub(super) fn projection_revision(projection: &[Value]) -> Result<String> {
     digest_json(&Value::Array(projection.to_vec()))
 }
 
@@ -965,7 +965,7 @@ fn validate_model_definition(value: &Value) -> Result<(String, ModelDefinition)>
 }
 
 impl Service {
-    async fn instruction_entries(&self, root: &str) -> Result<Vec<Value>> {
+    pub(super) async fn instruction_entries(&self, root: &str) -> Result<Vec<Value>> {
         let response: Data<Vec<Value>> = decode(
             self.get(
                 &format!("/api/experimental/session/{root}/instructions/entries"),

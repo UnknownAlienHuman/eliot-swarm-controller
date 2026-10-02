@@ -347,6 +347,7 @@ pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
             "generation",
             "action",
             "objective",
+            "prerequisite_operation_id",
         ],
         "agent.refresh" => &[
             "client_request_id",
