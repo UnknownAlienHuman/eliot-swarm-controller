@@ -2,7 +2,7 @@
 // SDK-owned native execution. Host IPC reconnect never closes Muse or repeats input.
 import { readFile, realpath } from 'node:fs/promises';
 import path from 'node:path';
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { spawnMspConnection, MspError } from '@muse-code/sdk';
 import { Control } from './control.mjs';
@@ -10,18 +10,16 @@ import { configuration, modelMatches, goalCommand } from './settings.mjs';
 import { readResult } from './results.mjs';
 import { spawnOwned } from './owned.mjs';
 import { recoveryState } from './checkpoint.mjs';
+import { commandIdFor, durabilityProfile, gapFillObservation, hostDeathObservation, failedReconcileOutcome } from './observe.mjs';
 
 function required(object, key) {
   if (typeof object?.[key] !== 'string' || !object[key].trim()) throw new Error(`MISSING_${key}`);
   return object[key];
 }
 function commandId(command) {
-  // A stable UUIDv7-shaped native ID, distinct from our transport request IDs.
-  // The native schema requires UUIDv7; the controller operation ID is UUIDv4.
-  const bytes = createHash('sha256').update(command.operation_id).digest().subarray(0, 16);
-  bytes.writeUIntBE(command.created_at_ms, 0, 6);
-  bytes[6] = (bytes[6] & 15) | 0x70; bytes[8] = (bytes[8] & 63) | 0x80;
-  const h = bytes.toString('hex'); return `${h.slice(0,8)}-${h.slice(8,12)}-${h.slice(12,16)}-${h.slice(16,20)}-${h.slice(20)}`;
+  // Minted once per Operation and persisted before native I/O; the
+  // derivation itself lives in observe.mjs so fixtures can pin it.
+  return commandIdFor(command.operation_id, command.created_at_ms);
 }
 function compactSession(s) {
   if (!s || typeof s.sessionId !== 'string' || typeof s.status !== 'string') throw new Error('INVALID_SESSION');
@@ -123,6 +121,11 @@ function onNotification(n) {
   }
   if (n.method === 'view/gap' || n.method === 'session/viewHealthChanged') {
     latest.gaps++; latest.view_health = { method:n.method, sessionId:p.sessionId, status:p.status ?? p.health ?? 'unknown' };
+    // A gap is also recorded as an unfilled hole in its own right: this
+    // bridge runs the compact-observation path, not the SDK facade's
+    // splice-fill, so the inability and its opaque bracket are facts the
+    // operator can see instead of only a counter going up.
+    if (n.method === 'view/gap') latest.gap_fill = gapFillObservation(p, Date.now());
   }
   if (['turn/started','turn/completed','turn/unqueued'].includes(n.method)) {
     if (typeof p.sessionId !== 'string' || typeof p.turnId !== 'string' || !p.turnId) { latest.gaps++; changed(); return; }
@@ -287,8 +290,7 @@ async function reconcileNative(target) {
     const ack = await msp.connection.command(entry.method, entry.params, {maxAttempts:1,commandId:entry.id});
     await completeNative(entry, ack);
   } catch (error) {
-    const rejected = error instanceof MspError && ['invalidParams','commandRejected','overloaded','backpressured'].includes(error.kind);
-    saveOutcome(target, {outcome:entry.ack?'accepted':rejected?'rejected':'unknown',native_root_id:rootId,native_scope_key:nativeScope,
+    saveOutcome(target, {outcome:failedReconcileOutcome(error instanceof MspError?error.kind:null, Boolean(entry.ack)),native_root_id:rootId,native_scope_key:nativeScope,
       details:{evidence_kind:'explicit_same_command_reconciliation',native_code:error instanceof MspError?error.code:null,native_kind:error instanceof MspError?error.kind:null}});
     throw error;
   }
@@ -348,7 +350,10 @@ async function launchConnection(options) {
     pendingRequests.set(key,{view:{method:request.method,params:p}}); changed();
     return {};
   });
-  handshake.exited.then(exit=>{nativeReady=false;latest.execution='native_exited';latest.exit=exit;changed();},()=>{nativeReady=false;latest.execution='native_failed';changed();});
+  handshake.exited.then(exit=>{nativeReady=false;latest.execution='native_exited';latest.exit=exit;
+    latest.host_death=hostDeathObservation(latest.host_durability?.profile,exit,Date.now());changed();},
+    ()=>{nativeReady=false;latest.execution='native_failed';
+    latest.host_death=hostDeathObservation(latest.host_durability?.profile,null,Date.now());changed();});
   msp=await handshake.initialize({clientInfo:{name:'eliot-swarm-controller',version:'0.1.0'}});
   const init=msp.initializeResult;
   const home=await realpath(required(init,'museHome'));
@@ -356,6 +361,10 @@ async function launchConnection(options) {
   if(nativeScope && nativeScope!==scope)throw new Error('RECOVERY_NAMESPACE_MISMATCH');
   nativeScope=scope;
   latest.server=init.serverInfo; latest.schema=init.schema;
+  // The handshake's own durability declaration, classified per SS2.13.1.
+  // Recorded at every launch; a restored checkpoint keeps the previous
+  // connection's profile until a new handshake replaces it.
+  latest.host_durability=durabilityProfile(init);
   latest.fingerprint_warning=Boolean(msp.fingerprintWarning);
   return init;
 }
