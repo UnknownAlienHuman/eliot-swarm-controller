@@ -1,6 +1,6 @@
 # ELIOT Swarm — план реализации v6 к архитектуре v18
 
-**Уточнено 30.09.2026. Проект контрактов и последовательности работ. Rust-сервис ещё не реализован.**
+**Уточнено 2 октября 2026. Реализовано на baseline `b0d27f4`: этот документ — карта реализации и порядок работ R0–R24, а не pre-implementation план. Исторические проектные формулировки v18 сохранены в теле как дизайн-обоснование; где тело противоречит текущему факту, действуют эта рамка, inventory §13 и раздел R0–R24 (§15).**
 
 Заменяет implementation-v5 как действующий план. Входная v17 доступна в [истории](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/b5a437f57488f8ddcdcc3f4aaea24746a3ea1f62/docs/review-v18/source-v17/agent_swarm.md). [Контракт модулей](agent_swarm.module-contract-v2.md) — общая граница adapters; vendor mappings из v16 сохраняются. [Reference v18](agent_swarm.spec-v18/README.md) уточняет initial SQL: origin, canonical dispatch и resource release; [сводка семи native-контрактов](runtime-notes.md) уточняет mappings. Наблюдения deployment сведены в [runtime notes](runtime-notes.md) и не заменяют документацию vendor.
 
@@ -99,7 +99,7 @@ CLI и MCP используют один API. MCP не обязан публик
 
 ## 5. Хранилище и локальная идемпотентность
 
-[001_core.sql](agent_swarm.spec-v18/migrations/001_core.sql) — новый reference DDL девяти таблиц. Runtime migrations ещё не реализованы. JSON shape и переходы проверяет Store; не делаем вторую state machine из SQL-триггеров.
+[001_core.sql](agent_swarm.spec-v18/migrations/001_core.sql) — reference DDL девяти таблиц, проектный источник действующей initial schema. Runtime применяет `migrations/001_core.sql` в корне репозитория (`include_str!` в Store): файл существует и используется, это не отсутствующая миграция. JSON shape и переходы проверяет Store; не делаем вторую state machine из SQL-триггеров.
 
 `bindings` имеет ключ `(binding_id, generation)`: старое поколение не исчезает при замене процесса. `native_scope_key` вместе с `native_root_id` имеет partial unique index для unreleased rows: два lane aliases не получают второго control owner одной сессии. Namespace разрешает adapter по реальному runtime/store/account domain, не по lane/model/port/PID. Два поля либо NULL вместе, либо заданы вместе. Если exact identity недоступна, не обещать safe attach. Unique index `one_live_root_per_lane` включает `opening` и `reconciling`, не только ready. `attempts` имеет один unreleased owner на Task независимо от revision. NULL-pairs и accepted candidate проверяются явно.
 
@@ -251,6 +251,8 @@ Cache hit сохраняется как отдельная completed Operation �
 
 Cache разрешён только для объявленных воспроизводимых проверок при совпавших существенных inputs. Наличие network/time/external state без их версии выключает cache reuse, но не запрещает запуск диагностики. Новый profile revision меняет cache key; повтор старого запроса использует старый resolved profile.
 
+**Effective build inputs (R14) — норма, статус pending.** Перед началом проверки закрепляются source identity и объявленные effective входы: toolchain, target/features, profile/config и допустимое окружение. Изменение входов инвалидирует reuse по контракту входов, а не только по имени cache directory; одинаковый SHA с изменённым effective profile не использует старый receipt. Это норма с честным статусом pending, а не сделанное: completed-cache reuse и reverse-dependency scope в полном объёме остаются открыты — issue #6. Exit status, полнота наблюдения и ожидаемый scope проверяются независимо от извлечённых diagnostic строк; неудачный spawn/read/parser/timeout не превращается в успешный пустой результат, а baseline failure сохраняется с причиной и source и не выдаётся за regression.
+
 Changed+reverse compile scope вычисляется из versioned metadata для source/profile. `--no-deps`
 возвращает `resolve=null`; допустима conservative workspace declaration closure с корректными
 rename/path/build/target edges. Unknown graph не равен пустому. Shared config/codegen inputs расширяют
@@ -273,7 +275,7 @@ Result хранит exit code, process disposition, parser status, coverage, fin
 
 Artifacts: own temporary file → завершить запись/flush → publish в новое неизменяемое имя без перезаписи → DB reference. Повтор имени допустим только для тех же проверенных байтов. Store принимает собственные artifact handles, не произвольный путь с выходом из artifact root. Это порядок снижения риска, не общая атомарная транзакция filesystem+SQLite. Перед использованием load-bearing artifact проверяется его доступность и digest, когда digest входит в идентичность candidate/cache. Потеря файла после crash даёт evidence gap, не fabricated PASS. Evidence, snapshot submissions и Operation receipts сохраняются; FK не видит ссылки в JSON. В C01–C09 не реализуем generic graph-GC: автоматический retention только у явно отмеченной disposable telemetry и закрытых tmp, с grace и проверкой активного writer. Request-id records не удаляются вместе с payload логами: их потеря снова разрешила бы исполнить старый запрос. Для live проекта сохраняются compact identity/outcome и исходный нормализованный запрос; закрытый проект архивируется явно. Новому data-dir не разрешён автоматический replay старых request IDs. Ни секреты, ни полный унаследованный env не копируются в эти records: persisted routes содержат credential refs и не секретные влияющие настройки.
 
-SQLite `foreign_keys=ON` задаётся до транзакции и проверяется readback. WAL/FULL — для prototype-owned локальной БД, не для чужого OpenCode/codebase-memory. Проверяется фактически связанная SQLite с исправлением WAL-reset; библиотека host ещё не выбрана/собрана [N4–N5].
+SQLite `foreign_keys=ON` задаётся до транзакции и проверяется readback. WAL/FULL — для prototype-owned локальной БД, не для чужого OpenCode/codebase-memory. Проверяется фактически связанная SQLite с исправлением WAL-reset; библиотека host выбрана и собрана: `rusqlite =0.40.2` с feature `bundled` в `Cargo.toml` [N4–N5].
 
 Backup — SQLite backup API, не копия одного живого `.db` без WAL. Миграция выполняется единственным host до рабочего admission, после backup. Бинарник не открывает более новую неизвестную schema. Rollback binary разрешён при совместимой schema; откат старой DB при живых bridges запрещён без reconciliation сохранённых внешних эффектов. Не строим универсальный автоматический downgrade [N6].
 
@@ -283,13 +285,16 @@ Backup — SQLite backup API, не копия одного живого `.db` б
 
 | Срез / файл | Что написать | Проверка именно этой границы |
 |---|---|---|
-| C03 `modules/muse/vendor_bridge` | Публичные SDK Connection/spawn, commandId, один pump, настройки до goal; reply, view cursor и child provenance | Правильные admission/outcome, opaque replay gap, model/effort readback; SDK.close не на конце turn |
+| C03 `modules/muse` (плоские `*.mjs`: bridge/checkpoint/control/owned/results; каталога `vendor_bridge` нет) | Публичные SDK Connection/spawn, commandId, один pump, настройки до goal; reply, view cursor и child provenance | Правильные admission/outcome, opaque replay gap, model/effort readback; SDK.close не на конце turn |
 | C04 `runtime/opencode_v2.rs` | One HTTP reader/service; inbox send, конкретный model variant, parent-filtered pages; event gap recovery | Active drains не вся семья; unknown schema не empty list; no CLI recovery; background только supported tools |
-| C07 `modules/codex/vendor_bridge` | Existing shared WebSocket attach, типы версии server; root/child/goal и ответы RPC | JSONL SDK не подходит proxy без transport adaptation; read не resume; sourceKinds/family filters по installed schema |
+| C07 `modules/codex/bridge.py` (собственный код; `modules/codex/vendor_bridge` — отдельно vendored SDK unit, не наш код) | Existing shared WebSocket attach, типы версии server; root/child/goal и ответы RPC | JSONL SDK не подходит proxy без transport adaptation; read не resume; sourceKinds/family filters по installed schema |
 | C08 `modules/claude` | Native stream + minimum hooks; complete child messages и content blocks | Не терять block с повторным message.id; init failures отдельно; system-prompt snapshot не объявлять обновлённым при resume |
 | C08 `modules/command` | Native mod readiness, queueMessage, events, set tools/model | Void queue не durable applied; mod_error не process death; definition refresh не mod reload; actual tool argument schema |
 | C08 `modules/antigravity` | Native event codec, warm sequential input, result/step_update, conversation ID | Claude control messages не отправляются; soft-denied tool не пропадает при SUCCESS; child idle ≠ released |
 | C11 `runtime/zed` | Batch executor и result artifacts с явной границей | Нет выдуманных live goal/steer; native Zed не external ACP editor и не Delta |
+| OpenCodex `modules/opencodex` (bridge.1/bridge.2) | Read-only observer запущенного внешнего сервиса + конфигурационные Operations через preview/planFingerprint и readback; doctor projection записанных snapshots | Selftest модуля; live service не квалифицирован — остаток в issue #1 (slices 3–4) |
+| MCP `src/mcp.rs` | Stdio RMCP-фасад поверх существующего application API; caller-known `client_request_id` до dispatch | Tool-table тесты; live GM tool discovery не квалифицировано |
+| Zed wiring (строка статуса, не модуль) | Unit `src/runtime/zed.rs` (artifact `eliot-zed.eval-cli.1`) реализован и протестирован, но через controller operations недостижим: wiring sessionless batch в session-oriented operations не определён | Открыто — issue #12 (W1–W4); не выдавать unit за подключённый runtime |
 
 Все mappings используют один RuntimePort. Runtime-specific параметры живут в модуле и сохранённом route, не разносятся по scheduler/Task. Функция, не нужная текущему заданию, не становится обязательным gate.
 
@@ -356,21 +361,23 @@ Operation использует устойчивый schedule+slot key. Посл�
 
 200 observed agents / 1 000 small events per second / p95 host <100 ms — прежние **цели измерения**, не benchmark. Счётчики host, bridges, native runtimes, Cargo и model quota измеряются отдельно.
 
-## 13. C01–C11: законченные возможности, не каркас
+## 13. C01–C11: inventory реализации на baseline
 
-| Пакет | Результат | Проверяемая граница |
-|---|---|---|
-| C01 | model/config/Store + initial 001 schema v18 | create→origin/claim/start owner→одна queued Operation; guards/конфликты ID. Native-send проверяется в C03/C04, не требуется на C01. |
-| C02 | host/CLI/IPC | singleton, durable ack/status, reader/writer, disconnect клиента |
-| C03 | Muse SDK bridge | Max/setup, family, reply/steer, reconnect без SDK.close |
-| C04 | OpenCode V2 | та же API-семантика, volatile events+snapshot, без CLI observer |
-| C05 | mailbox/reports/GM wake | адресный вопрос/ответ; независимые cursors и delta |
-| C06 | command-check/Cargo | fixed candidate, dedupe, error coverage, возврат владельцу |
-| C07 | Codex shared attach | proxy/WebSocket, goal/turn/family, readback модели/effort, версия actual executor |
-| C08 | Claude/Command/agy | по одному native adapter, честные возможности |
-| C09 | forge/doctor/artifacts | remote applied отдельно от bookkeeping, narrow audit, safe recovery |
-| C10 | updates/logon/SCM | versioned modules, console/Job profile, persistent schedule catch-up и drain |
-| C11 | qualification/export | нагрузка и реальные incidents; Zed/ACP по готовности |
+Статусы — по словарю программы: `implemented` / `fixture_checked` / `live_observed` / `qualified` / `unavailable` / `unknown` на поверхность. Сданное не переделывается и не планируется заново; остаток каждого пакета — ссылка на его issue, а не новая работа в этом документе.
+
+| Пакет | Статус | Владелец в коде | Evidence | Остаток |
+|---|---|---|---|---|
+| C01 | implemented | `src/model.rs`, `src/config.rs`, `src/store/`, `migrations/001_core.sql` | cargo test --locked --lib; Store/API guards и конфликты ID | Нет; landed, не переделывать |
+| C02 | implemented | `src/host.rs`, `src/ipc.rs`, `src/main.rs`, `src/platform/` | singleton, durable ack/status, disconnect клиента в тестах host/IPC | Нет |
+| C03 | implemented, fixture_checked; live resume не квалифицирован | `modules/muse/` (плоские `*.mjs`) + `src/runtime/mod.rs` | bridge.5: steering, goal/replies, recorded-session recovery; module selftest | Live Muse resume qualification — issue #5 |
+| C04 | implemented | `src/runtime/opencode_v2.rs`, `src/runtime/opencode_v2/`, `modules/opencode/` | readback конфигурации, recorded goal, durable log correlation, child reads, immutable export | Cross-restart continuation — issue #3 |
+| C05 | implemented | `src/store/gm.rs`, mailbox/reports в application API (`src/main.rs`, `src/mcp.rs`) | адресный вопрос/ответ, независимые cursors и delta, GM designation/handover | Роль handover-цели — issue #8 |
+| C06 | implemented, кроме cache/scope reuse | `src/checks/`, `src/store/checks.rs` | fixed candidate, dedupe, error coverage, active cancellation и recovery worker | Cache/reverse-dependency scope reuse и effective-inputs контракт R14 — issue #6 (pending) |
+| C07 | slice 1 implemented (read-only), module only — controller route не зарегистрирован | `modules/codex/bridge.py`; vendored SDK — `modules/codex/vendor_bridge/` | fixture checks bridge; executor version в каждом outcome | Подключение через RuntimePort/Operation и остаток — issue #9 |
+| C08 | implemented, fixture_checked | `modules/claude/`, `modules/command/`, `modules/antigravity/` | bridge.1 Claude, Command glue tests, Antigravity warm bridge fixtures | Live qualification поверхностей — issue #5 |
+| C09 | doctor implemented; forge не реализован | `src/doctor.rs` (doctor.inspect, OpenCodex projection) | doctor projections на записанных фактах; узкий аудит | Forge API contract — issue #10 |
+| C10 | частично: updates/activation по модульным UPDATE.md; catch-up не закрыт | модульные `UPDATE.md`, host schedule/drain в `src/host.rs` и Store | versioned activation существующих модулей | Catch-up D1–D8 — issue #7 |
+| C11 | частично: Zed unit implemented, но не wired; load — измерение выполнено на не тихой машине | `src/runtime/zed.rs`, `tools/host-load.py`, `docs/host-load-qualification.md` | unit-тесты Zed 10/10 у писателя слайса; host-load result зафиксирован | Zed wiring W1–W4 — issue #12; load qualification на тихой машине — issue #11 |
 
 Донор fixtures сохраняются. При реализации — сначала рабочий путь, форматирование и минимальный Clippy; широкие тесты после готового среза. Никаких worktrees для собственной разработки. Нельзя отмечать C01 готовым только по существованию reference SQL: требуются реальные Store и API.
 
@@ -387,9 +394,43 @@ sccache override. Проверяется конкретный модуль пр�
 
 ## 14. Область проверки этой редакции
 
-v18 проверяет собственные v17/plan-v5/module-v1 и конкретные reference SQL-сценарии. Не повторный общий поиск vendor-платформ. В DDL по-прежнему девять таблиц; добавлены origin_key, start_operation_id, resource claim/release. Runtime migrations отсутствуют: это изменение initial reference ещё не реализованного продукта.
+Историческая область v18: проверка собственных v17/plan-v5/module-v1 и конкретных reference SQL-сценариев по состоянию на редакцию 30.09.2026; повторного общего поиска vendor-платформ не было. Текущий статус на 02.10.2026 иной: продукт реализован на baseline `b0d27f4`, в DDL по-прежнему девять таблиц (добавлены origin_key, start_operation_id, resource claim/release), runtime применяет `migrations/001_core.sql`. Этот раздел — рамка проверки исторической редакции, а не утверждение о текущем сервисе.
 
-SQL и небольшие последовательные модели проверены отдельно; их результаты не являются тестами многопоточного Rust-host, Windows Job, native SDK или API провайдера. Нет установки доноров, модельных вызовов, изменений GitHub/текущего роя. Пины сохранены. [Сохранённые контрпримеры](lessons-learned.md#3-исправленные-ошибки-собственной-спецификации) ссылаются на исходные воспроизведения в Git history. После чистки уточнены контракты старта, cache reuse и отрицательного review. [Lessons §3.1](lessons-learned.md#31-проверка-согласованности-контрактов-30092026) отделяет DDL-контрпример от последовательных моделей. Текущие уточнения не являются реализованным Store.
+SQL и небольшие последовательные модели проверены отдельно; их результаты не являются тестами многопоточного Rust-host, Windows Job, native SDK или API провайдера. Нет установки доноров, модельных вызовов, изменений GitHub/текущего роя. Пины сохранены. [Сохранённые контрпримеры](lessons-learned.md#3-исправленные-ошибки-собственной-спецификации) ссылаются на исходные воспроизведения в Git history. После чистки уточнены контракты старта, cache reuse и отрицательного review. [Lessons §3.1](lessons-learned.md#31-проверка-согласованности-контрактов-30092026) отделяет DDL-контрпример от последовательных моделей. На baseline эти уточнения реализованы в Store (см. inventory §13); историческая фраза исходной редакции об их нереализованности снята статусной рамкой этого документа.
+
+## 15. R0–R24: причинный порядок и владельцы
+
+Порядок — причинный (§12 программы), а не календарный: сначала одна опубликованная policy и корректный source index (R0/R10), иначе новый код снова будет соблюдать противоречивые правила; затем идентичности запросов и сдач (R1/R11); затем family/attention/delivery/drain (R2/R12/R13); внутренние доработки R3–R6 не замораживают весь проект; владение проверками и ресурсами (R7/R14/R15); host scheduling и снятие legacy authority (R16/R17). R18–R24 идут по своим владельцам. Приоритеты Фазы C (§21 программы): P0 — documentation hygiene + truthful capability matrix; P1 — request/submission identity + evidence boundaries + owner semantics; P2 — attention/family/history/recovery; P3 — typed configuration prerequisites + MCP task/subscription projection; P4 — verifier protected inputs + capacity/resource retention; P5 — optional ACPX route + external-effect operations; P6 — live Windows/native qualification and soak.
+
+Для каждого R пометка одна из двух: «основа реализована» — механизм уже на baseline, допустимы точечные доработки; «норма / код в Фазе B» — предложение программы, кодом не выдаётся за сделанное.
+
+| R | Тема | Владелец кода | Пометка |
+|---|---|---|---|
+| R0 | Статус и документация, source index | `README.md`, `docs/` | Норма; выполняется Фазой A, не код |
+| R1 | MCP logical request ID: caller знает ID до dispatch | `src/mcp.rs`, request receipts в `src/store/operations.rs` | Основа реализована; остаток — норма / код в Фазе B |
+| R2 | OpenCode goal: recorded / admitted / started — разные факты; drain-граница legacy goals | `src/runtime/opencode_v2.rs`, `modules/opencode/` | Основа реализована; drain-граница — норма / код в Фазе B |
+| R3 | Typed preparation evidence; digest не создаёт native CAS; короткий admission barrier | `src/store/prerequisites.rs`, adapters | Основа реализована (OpenCode-only парсер — именованное исключение контракта); извлечение adapter-validation из Store — норма / кандидат в Фазу B |
+| R4 | Codex bridge на pinned SDK и shared transport | `modules/codex/bridge.py` | Основа реализована (read-only); proxy/Unix endpoint — Фаза B, issue #9 |
+| R5 | Native history: sparse sequence/watermark, отсутствие события не terminal | `src/runtime/opencode_v2/` (execution log) | Основа реализована; норма |
+| R6 | Projection/results: bounded preview отдельно от полных artifact bytes, лимит до parsing | `src/store/results.rs`, `src/artifacts/` | Основа реализована; остаток лимитов — норма / код в Фазе B |
+| R7 | Process owner: owner-first Job; checks killing / modules non-killing | `src/platform/`, `src/runtime/owner.rs`, `src/checks/` | Основа реализована; норма |
+| R8 | Optional ACPX whole backend только для ACP-route | Владельца в коде нет | Норма / код в Фазе B, только при реальном потребителе |
+| R9 | Donor provenance: exact unit/revision/license, compilation ≠ qualification | `docs/agent_swarm.donors-20260929.toml`, `modules/*/UPDATE.md` | Норма; inventory — Фаза A |
+| R10 | Единый рабочий контракт Issue и роли; specification ≠ policy | TaskSpec/Task revision и application API (`src/store/tasks.rs`) | Норма / код в Фазе B; owner-policy — pending owner decision (см. архитектуру §4/R10) |
+| R11 | Доставка результата; ветка ≠ идентичность сдачи | `src/store/submissions.rs`, operations/results | Основа реализована; остаток — норма / код в Фазе B; порядок publication vs acceptance — policy-selected |
+| R12 | Scoped observations, capacity, адресное внимание | native mapper/snapshot в `src/runtime/`, `report.delta`/doctor (`src/doctor.rs`) | Норма / код в Фазе B |
+| R13 | Native delivery, recovery и drain без дублей | runtime effects/reconcile, adapters (`src/runtime/`) | Норма / код в Фазе B |
+| R14 | Проверки, baseline, cache, build resources; effective inputs | `src/checks/`, `src/store/checks.rs` | Норма, статус pending — issue #6; код в Фазе B |
+| R15 | Writer result и безопасный lifecycle ресурсов | resources/artifacts/Attempt в `src/store/`, `src/platform/` | Норма / код в Фазе B |
+| R16 | Host scheduling, quota state, полезные отчёты | host loop и Store (`src/host.rs`, `src/store/gm.rs`) | Норма / код в Фазе B |
+| R17 | Миграция без двойной authority | Отдельного владельца нет; existing application API | Норма; этапы — Фаза B, в коде не начаты |
+| R18 | Muse command/replay/gap семантика SDK | `modules/muse/` | Частично в коде (pending-before-send, explicit reconcile тем же ID); аудит checkpoint и host-profile запись — норма / код в Фазе B |
+| R19 | Граница Codex SDK и shared app-server | `modules/codex/bridge.py` | Read-only срез реализован; подключение через RuntimePort — Фаза B, issue #9 |
+| R20 | MCP-фасад, Tasks и subscriptions | `src/mcp.rs` | Фасад реализован; Operation-as-Task projection и subscriptions — proposed, норма / код в Фазе B |
+| R21 | Решение по ACP-route (ACPX whole) | Владельца в коде нет (`runtime.acp` отсутствует) | Proposed; только при реальном потребителе, Фаза B |
+| R22 | Контракты timeline, family и коммуникации (Paseo/CCCC паттерны) | mailbox/family в `src/store/`, adapters | Паттерны приняты как нормы; код в Фазе B |
+| R23 | Capacity, permissions и supply chain модулей | `src/config.rs`, Store accounting, `modules/*/UPDATE.md` | Норма / код в Фазе B |
+| R24 | Handoff агенту и создание Issue после ревью Фазы A | Процесс, не код | Норма Фазы A/B; code issues создаются только после ревью Фазы A |
 
 ## Источники
 
