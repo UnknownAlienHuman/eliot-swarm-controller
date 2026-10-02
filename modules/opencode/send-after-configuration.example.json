@@ -2,7 +2,7 @@
   "client_request_id": "oc-send-after-policy-1",
   "binding_id": "BINDING_ID",
   "generation": 1,
-  "text": "Continue under the applied controller policy.",
+  "text": "Continue only after the controller-confirmed native configuration prerequisite.",
   "delivery": "next_turn",
   "prerequisite_operation_id": "CONFIGURE_OPERATION_ID"
 }
