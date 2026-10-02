@@ -12,6 +12,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { createAdapter, loadConfig, MODULE_ARTIFACT_ID } from './bridge.mjs';
+import { normalizeIntegrationOutcomes } from './control.mjs';
 import { createFakeManagementServer } from './fixtures/fake-management-server.mjs';
 
 const execFileAsync = promisify(execFile);
@@ -49,6 +50,14 @@ function assertGetOnly(fake, label) {
     `${label}: zero data-plane requests`);
 }
 
+function mutations(fake, method, pathname) {
+  return fake.requests.filter((r) => r.method === method && r.path === pathname);
+}
+
+function assertNoToken(record, label) {
+  assert.ok(!JSON.stringify(record).includes(TOKEN), `${label}: token absent from record`);
+}
+
 // 1. Attach + snapshot happy path: every section observed, version match.
 await withServer('happy', async (fake, adapter) => {
   const attached = await adapter.attach();
@@ -79,6 +88,19 @@ await withServer('happy', async (fake, adapter) => {
   assert.equal(snap.models[0].contextWindowDeclared, 200000);
   assert.equal(snap.models[0].contextWindow, 180000);
   assert.equal(snap.usage.state, 'observed');
+  // Slice 2: the read-only configuration section rides in the snapshot
+  // (this is the recorded applied-evidence doctor projects).
+  assert.equal(snap.configuration.protocols.messagesEnabled, true);
+  assert.equal(snap.configuration.protocols.unrepresentable, 'legacy');
+  const cline = snap.configuration.clientIntegrations.find((c) => c.clientId === 'cline');
+  assert.equal(cline.state, 'absent');
+  assert.ok(!('configPath' in cline), 'integration file locations are never recorded');
+  const aside = snap.configuration.clientIntegrations.find((c) => c.clientId === 'aside');
+  assert.equal(aside.profilesTotal, 2);
+  assert.equal(snap.configuration.asideProfiles.total, 2);
+  assert.equal(snap.configuration.subagentSurface.v2.multiAgentMode, 'v1');
+  assert.equal(snap.configuration.subagentSurface.injectionModel.model, null);
+  assert.equal(snap.configuration.subagentSurface.subagentModelFallback.pollMs, 60000);
   console.log('PASS happy: attach + snapshot sections observed, honest routed-model labels');
 });
 
@@ -165,6 +187,8 @@ await withServer('catalog_busy', async (fake, adapter) => {
   assert.equal(snap.health.version, '2.73.0');
   assert.ok(Array.isArray(snap.providers));
   assert.equal(snap.usage.state, 'observed');
+  assert.equal(snap.configuration.protocols.messagesEnabled, true,
+    'configuration section degrades independently of the models read');
   console.log('PASS catalog-busy: models section degrades alone');
 });
 
@@ -200,17 +224,388 @@ await withServer('happy', async (fake, adapter) => {
   console.log('PASS detach: service untouched and still answering; fresh attach succeeds');
 });
 
-// Honest capability matrix: send/configure/reply are unavailable and
-// issue no request.
+// Honest capability matrix: send/reply are unavailable and issue no
+// request; configure/preview are implemented but a missing or unknown
+// request is rejected locally, again with no request issued.
 await withServer('happy', async (fake, adapter) => {
-  for (const op of ['send', 'configure', 'reply']) {
+  for (const op of ['send', 'reply']) {
     assert.equal(adapter[op]().outcome, 'unavailable', `${op} unavailable`);
   }
-  assert.equal(fake.requests.length, 0, 'unavailable operations issue no request');
+  const noRequest = await adapter.configure();
+  assert.equal(noRequest.outcome, 'rejected');
+  assert.equal(noRequest.reason, 'request_required');
+  const badKind = await adapter.preview({ kind: 'nonsense' });
+  assert.equal(badKind.outcome, 'rejected');
+  assert.equal(badKind.reason, 'unknown_kind');
+  assert.equal(fake.requests.length, 0, 'unavailable/rejected operations issue no request');
   const facts = adapter.describe();
   assert.equal(facts.capabilities.snapshot, 'implemented');
+  assert.equal(facts.capabilities.configure, 'implemented');
   assert.equal(facts.capabilities.shutdown, 'detach_only');
-  console.log('PASS capabilities: send/configure/reply honestly unavailable, no requests issued');
+  console.log('PASS capabilities: send/reply honestly unavailable; configure rejects empty requests locally');
+});
+
+// --- Slice 2: saved configuration Operations -------------------------------
+
+// 12. Protocol settings: preview shows the diff without writing; the
+// configure applies exactly one PATCH and verifies by readback GET.
+await withServer('happy', async (fake, adapter) => {
+  const request = {
+    kind: 'protocol_settings',
+    patch: { messagesEnabled: false, unrepresentable: 'reject', rollout: { shadowPlan: true } },
+  };
+  const preview = await adapter.preview(request);
+  assert.equal(preview.outcome, 'preview');
+  assert.deepEqual(preview.differingFields, ['messagesEnabled', 'unrepresentable', 'rollout.shadowPlan']);
+  assert.equal(mutations(fake, 'PATCH', '/api/protocols/settings').length, 0, 'preview never writes');
+  const record = await adapter.configure(request);
+  assert.equal(record.outcome, 'applied');
+  assert.equal(record.operation_contract.completion_condition, 'native_configuration_applied');
+  assert.equal(record.operation_contract.replay_policy, 'readback_only_no_mutation_replay');
+  assert.equal(record.operation_contract.fallback_used, false);
+  assert.equal(record.verification.state, 'verified');
+  assert.equal(record.readback.after.messagesEnabled, false);
+  assert.equal(record.readback.after.unrepresentable, 'reject');
+  assert.equal(record.readback.after.rollout.shadowPlan, true);
+  assert.equal(mutations(fake, 'PATCH', '/api/protocols/settings').length, 1, 'exactly one PATCH');
+  assert.ok(fake.requests.every((r) => r.authed), 'mutation carried the admin key header');
+  assertNoToken(record, 'protocol-settings');
+  console.log('PASS protocol-settings: preview diff, one PATCH, readback verified');
+});
+
+// 13. Protocol rollout dependency is refused locally (mirrors the
+// pin's 400) — no PATCH is sent.
+await withServer('happy', async (fake, adapter) => {
+  const record = await adapter.configure({
+    kind: 'protocol_settings',
+    patch: { rollout: { managedMessagesNativeOAuth: true } },
+  });
+  assert.equal(record.outcome, 'rejected');
+  assert.equal(record.reason, 'rollout_dependency');
+  assert.equal(mutations(fake, 'PATCH', '/api/protocols/settings').length, 0);
+  console.log('PASS protocol-dependency: OAuth-without-native refused locally, no write');
+});
+
+// 14. Model settings for one routed provider: receipt (saved) and
+// readback (declared fields + per-client integration states) are
+// separate facts; a no-op answers saved:false honestly.
+await withServer('happy', async (fake, adapter) => {
+  const record = await adapter.configure({
+    kind: 'model_settings', provider: 'anthropic', modelId: 'claude-sonnet-fixture',
+    contextWindow: 262144, reasoningEfforts: ['low', 'high'], defaultReasoningEffort: 'high',
+  });
+  assert.equal(record.outcome, 'applied');
+  assert.equal(record.receipt.saved, true);
+  assert.equal(record.receipt.changed, true);
+  assert.equal(record.savedVsApplied.saved, true);
+  assert.equal(record.savedVsApplied.clientIntegrationsObserved, true);
+  assert.equal(record.readback.model.contextWindowDeclared, 262144);
+  assert.equal(record.verification.state, 'verified');
+  assert.equal(mutations(fake, 'PUT', '/api/model-settings').length, 1);
+  assertNoToken(record, 'model-settings');
+
+  const noop = await adapter.configure({
+    kind: 'model_settings', provider: 'anthropic', modelId: 'claude-sonnet-fixture',
+    contextWindow: 262144,
+  });
+  assert.equal(noop.outcome, 'applied');
+  assert.equal(noop.receipt.changed, false);
+  assert.equal(noop.receipt.saved, false, 'a no-op publishes nothing and says so');
+  assert.equal(noop.receipt.hasOverrides, true, 'stored declarations remain reported');
+  console.log('PASS model-settings: saved receipt + declared readback verified; no-op saved:false');
+});
+
+// 15. Lost mutation response: the write landed but the answer never
+// arrived. The Operation is unknown, reconciled by reading — the PUT
+// is sent exactly once.
+await withServer('lost_response', async (fake, adapter) => {
+  const record = await adapter.configure({
+    kind: 'model_settings', provider: 'anthropic', modelId: 'claude-sonnet-fixture',
+    contextWindow: 300000,
+  });
+  assert.equal(record.outcome, 'unknown');
+  assert.equal(record.reason, 'mutation_response_lost');
+  assert.equal(record.verification.reconciledByRead, true);
+  assert.equal(record.verification.state, 'verified', 'readback proves the landed value');
+  assert.equal(record.readback.model.contextWindowDeclared, 300000);
+  assert.equal(mutations(fake, 'PUT', '/api/model-settings').length, 1, 'never re-sent');
+  console.log('PASS lost-response: unknown outcome reconciled by readback, mutation sent once');
+});
+
+// 16. Saved but catalog refresh failed: the record is partial, the
+// saved fact is not inflated into applied.
+await withServer('refresh_failed', async (fake, adapter) => {
+  const record = await adapter.configure({
+    kind: 'model_settings', provider: 'anthropic', modelId: 'claude-sonnet-fixture',
+    contextWindow: 262144,
+  });
+  assert.equal(record.outcome, 'partial');
+  assert.equal(record.receipt.saved, true);
+  assert.equal(record.receipt.catalogRefresh.status, 'failed');
+  console.log('PASS refresh-failed: saved=true with failed convergence is partial, not applied');
+});
+
+// 17. Sub-agent v2 surface: mode change applies at the new-sessions
+// boundary; the pin's enabled/mode conflict is refused locally.
+await withServer('happy', async (fake, adapter) => {
+  const record = await adapter.configure({
+    kind: 'subagent_v2', settings: { multiAgentMode: 'v2' },
+  });
+  assert.equal(record.outcome, 'applied');
+  assert.equal(record.operation_contract.application_boundary, 'new_sessions_only');
+  assert.equal(record.readback.after.multiAgentMode, 'v2');
+  assert.ok(record.receipt.warnings.some((w) => w.includes('Applies to new sessions')));
+  const conflict = await adapter.configure({
+    kind: 'subagent_v2', settings: { enabled: true, multiAgentMode: 'v1' },
+  });
+  assert.equal(conflict.outcome, 'rejected');
+  assert.equal(conflict.reason, 'enabled_mode_conflict');
+  assert.equal(mutations(fake, 'PUT', '/api/v2').length, 1, 'the conflict added no write');
+  console.log('PASS subagent-v2: mode applied with new-sessions boundary; conflict refused locally');
+});
+
+// 18. Injection model: effort validated against the GET ladder before
+// any write; a bogus effort is refused locally.
+await withServer('happy', async (fake, adapter) => {
+  const bogus = await adapter.configure({
+    kind: 'injection_model', settings: { model: 'anthropic/claude-sonnet-fixture', effort: 'bogus' },
+  });
+  assert.equal(bogus.outcome, 'rejected');
+  assert.equal(bogus.reason, 'invalid_effort');
+  assert.equal(mutations(fake, 'PUT', '/api/injection-model').length, 0);
+  const record = await adapter.configure({
+    kind: 'injection_model', settings: { model: 'anthropic/claude-sonnet-fixture', effort: 'high' },
+  });
+  assert.equal(record.outcome, 'applied');
+  assert.equal(record.readback.after.model, 'anthropic/claude-sonnet-fixture');
+  assert.equal(record.readback.after.effort, 'high');
+  console.log('PASS injection-model: ladder-validated effort applied and read back');
+});
+
+// 19. Effort caps applied + read back; the per-model pin map is a
+// recorded out-of-slice refusal, never silently dropped.
+await withServer('happy', async (fake, adapter) => {
+  const pins = await adapter.configure({ kind: 'effort_caps', effortCap: 'high', modelPinnedEfforts: {} });
+  assert.equal(pins.outcome, 'rejected');
+  assert.equal(pins.reason, 'model_pinned_efforts_not_in_slice');
+  const record = await adapter.configure({ kind: 'effort_caps', effortCap: 'high', subagentEffortCap: 'medium' });
+  assert.equal(record.outcome, 'applied');
+  assert.equal(record.readback.after.effortCap, 'high');
+  assert.equal(record.readback.after.subagentEffortCap, 'medium');
+  assert.equal(mutations(fake, 'PUT', '/api/effort-caps').length, 1);
+  console.log('PASS effort-caps: caps applied and read back; pin map refused as out-of-slice');
+});
+
+// 20. Subagent roster: more than five models is refused locally (the
+// pin would truncate silently); a valid roster round-trips.
+await withServer('happy', async (fake, adapter) => {
+  const over = await adapter.configure({
+    kind: 'subagent_models',
+    models: ['a/1', 'a/2', 'a/3', 'a/4', 'a/5', 'a/6'],
+  });
+  assert.equal(over.outcome, 'rejected');
+  assert.equal(over.reason, 'roster_over_limit');
+  assert.equal(mutations(fake, 'PUT', '/api/subagent-models').length, 0);
+  const record = await adapter.configure({
+    kind: 'subagent_models',
+    models: ['anthropic/claude-sonnet-fixture', 'xai/grok-fixture'],
+  });
+  assert.equal(record.outcome, 'applied');
+  assert.deepEqual(record.readback.after.chosen, ['anthropic/claude-sonnet-fixture', 'xai/grok-fixture']);
+  console.log('PASS subagent-models: >5 refused locally; roster applied and read back');
+});
+
+// 21. Upstream's own subagent fallback chain is upstream config, set
+// only as this explicitly selected Operation.
+await withServer('happy', async (fake, adapter) => {
+  const record = await adapter.configure({
+    kind: 'subagent_model_fallback',
+    models: ['anthropic/claude-sonnet-fixture'], pollMs: 30000,
+  });
+  assert.equal(record.outcome, 'applied');
+  assert.deepEqual(record.readback.after.models, ['anthropic/claude-sonnet-fixture']);
+  assert.equal(record.readback.after.pollMs, 30000);
+  console.log('PASS subagent-fallback: upstream chain set as an explicit Operation, read back');
+});
+
+// 22. Client integration: the full preview -> confirm -> apply ->
+// readback chain, then rollback through the upstream journal. Without
+// a binding (or with half of one) configure refuses locally and sends
+// no mutation.
+await withServer('happy', async (fake, adapter) => {
+  const unbound = await adapter.configure({ kind: 'client_integration', clientId: 'cline', enabled: true });
+  assert.equal(unbound.outcome, 'rejected');
+  assert.equal(unbound.reason, 'plan_binding_required');
+  const half = await adapter.configure({
+    kind: 'client_integration', clientId: 'cline', enabled: true, planFingerprint: 'fixture-fp-x',
+  });
+  assert.equal(half.outcome, 'rejected');
+  assert.equal(half.reason, 'plan_binding_both_or_neither');
+  assert.equal(mutations(fake, 'PUT', '/api/client-integrations/cline').length, 0, 'no unbound write');
+
+  const preview = await adapter.preview({ kind: 'client_integration', clientId: 'cline', enabled: true });
+  assert.equal(preview.outcome, 'preview');
+  assert.equal(preview.plan.clientId, 'cline');
+  assert.equal(preview.plan.operation, 'apply');
+  assert.equal(preview.plan.willChange, true);
+  assert.ok(preview.plan.fingerprint, 'plan carries the confirm fingerprint');
+  assert.equal(mutations(fake, 'PUT', '/api/client-integrations/cline').length, 0, 'preview writes nothing');
+
+  const record = await adapter.configure({
+    kind: 'client_integration', clientId: 'cline', enabled: true,
+    operation: 'apply', planFingerprint: preview.plan.fingerprint,
+  });
+  assert.equal(record.outcome, 'applied');
+  assert.equal(record.receipt.ok, true);
+  assert.equal(record.receipt.state, 'current');
+  assert.equal(record.readback.after.state, 'current');
+  assert.equal(record.verification.state, 'verified');
+  const sent = mutations(fake, 'PUT', '/api/client-integrations/cline');
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].body.operation, 'apply');
+  assert.equal(sent[0].body.planFingerprint, preview.plan.fingerprint, 'both binding fields sent together');
+  assertNoToken(record, 'client-integration');
+
+  const journal = await adapter.journal('cline');
+  const row = journal.operations.find((op) => op.opId === record.receipt.opId);
+  assert.ok(row, 'the apply is in the upstream journal');
+  assert.ok(!('configPath' in row), 'journal file locations are never recorded');
+
+  const restorePreview = await adapter.preview({
+    kind: 'client_integration_restore', clientId: 'cline', opId: record.receipt.opId,
+  });
+  assert.equal(restorePreview.outcome, 'preview');
+  assert.equal(restorePreview.plan.operation, 'restore');
+  const restored = await adapter.configure({
+    kind: 'client_integration_restore', clientId: 'cline', opId: record.receipt.opId,
+    operation: 'restore', planFingerprint: restorePreview.plan.fingerprint,
+  });
+  assert.equal(restored.outcome, 'applied');
+  assert.equal(restored.readback.after.state, 'absent', 'rollback returns the client to absent');
+  console.log('PASS client-integration: preview/binding/apply/readback + journal rollback');
+});
+
+// 23. Stale plan: the world moved between preview and confirm. The
+// 409 is returned with the FRESH plan for a new operator decision;
+// the stale fingerprint is never retried.
+await withServer('stale_plan', async (fake, adapter) => {
+  const preview = await adapter.preview({ kind: 'client_integration', clientId: 'cline', enabled: true });
+  const record = await adapter.configure({
+    kind: 'client_integration', clientId: 'cline', enabled: true,
+    operation: 'apply', planFingerprint: preview.plan.fingerprint,
+  });
+  assert.equal(record.outcome, 'stale');
+  assert.equal(record.code, 'integration_preview_stale');
+  assert.ok(record.plan, 'fresh plan returned');
+  assert.notEqual(record.plan.fingerprint, preview.plan.fingerprint, 'the fresh plan differs');
+  assert.ok(record.nextStep, 'operator next step recorded');
+  assert.equal(mutations(fake, 'PUT', '/api/client-integrations/cline').length, 1, 'exactly one confirm attempt, no blind retry');
+
+  // A fresh operator decision on the new plan succeeds.
+  const preview2 = await adapter.preview({ kind: 'client_integration', clientId: 'cline', enabled: true });
+  const applied = await adapter.configure({
+    kind: 'client_integration', clientId: 'cline', enabled: true,
+    operation: 'apply', planFingerprint: preview2.plan.fingerprint,
+  });
+  assert.equal(applied.outcome, 'applied');
+  console.log('PASS stale-plan: 409 returned with fresh plan, never retried; re-preview applies');
+});
+
+// 24. Preview unavailable (no usable roster retained): recorded as
+// unknown with the pin's remedy read as evidence; nothing is written.
+await withServer('preview_unavailable', async (fake, adapter) => {
+  const preview = await adapter.preview({ kind: 'client_integration', clientId: 'cline', enabled: true });
+  assert.equal(preview.outcome, 'unknown');
+  assert.equal(preview.code, 'integration_preview_unavailable');
+  assert.ok(Array.isArray(preview.readback.clientIntegrations), 'remedy read included as evidence');
+  assert.equal(fake.requests.filter((r) => r.method === 'PUT').length, 0, 'nothing written');
+  console.log('PASS preview-unavailable: unknown with remedy readback, no write attempted');
+});
+
+// 25. Aside profile: canonical per-profile preview/binding flow.
+await withServer('happy', async (fake, adapter) => {
+  const preview = await adapter.preview({ kind: 'aside_profile', profileId: 1, enabled: true });
+  assert.equal(preview.outcome, 'preview');
+  assert.equal(preview.plan.profileId, 1);
+  const record = await adapter.configure({
+    kind: 'aside_profile', profileId: 1, enabled: true,
+    operation: 'apply', planFingerprint: preview.plan.fingerprint,
+  });
+  assert.equal(record.outcome, 'applied');
+  assert.equal(record.readback.after.state, 'current');
+  assert.equal(record.readback.after.enabled, true);
+  assertNoToken(record, 'aside-profile');
+  console.log('PASS aside-profile: per-profile preview/binding/apply/readback');
+});
+
+// 26. Partial envelope: a single-profile refusal surfaces its code and
+// recovery facts without the snapshot path; the bulk 207 envelope —
+// which the bridge never sends, because the pin refuses plan
+// bindings for it — is pinned here as the contract the module's
+// per-element parser is built against.
+await withServer('partial', async (fake, adapter) => {
+  const preview = await adapter.preview({ kind: 'aside_profile', profileId: 2, enabled: true });
+  const record = await adapter.configure({
+    kind: 'aside_profile', profileId: 2, enabled: true,
+    operation: 'apply', planFingerprint: preview.plan.fingerprint,
+  });
+  assert.equal(record.outcome, 'refused');
+  assert.equal(record.code, 'integration_conflict');
+  assert.equal(record.receipt.state, 'conflict');
+  assert.equal(record.receipt.snapshotRecorded, true, 'a recoverable snapshot exists (boolean only)');
+  assert.ok(!JSON.stringify(record).includes('/fixture/'), 'no file location leaks into the record');
+
+  const response = await fetch(`${fake.endpoint}/api/client-integrations/aside/profiles`, {
+    method: 'PUT',
+    headers: { 'X-OpenCodex-API-Key': TOKEN, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled: true }),
+  });
+  assert.equal(response.status, 207, 'bulk refusal is a partial 207, not a failure status');
+  const envelope = await response.json();
+  assert.equal(envelope.ok, false);
+  const elements = normalizeIntegrationOutcomes(envelope);
+  assert.equal(elements.length, 2, 'envelope parsed per element');
+  assert.equal(elements[0].ok, true);
+  assert.equal(elements[1].ok, false);
+  assert.equal(elements[1].reason, 'conflict');
+  assert.equal(elements[1].snapshotRecorded, true);
+  assert.ok(!JSON.stringify(elements).includes('/fixture/'), 'element paths are reduced to booleans');
+  console.log('PASS partial-envelope: refusal facts kept, paths dropped, 207 parsed per element');
+});
+
+// 27. Version gate: under a version mismatch no mutation of any kind
+// is sent; the Operation records unknown/version_mismatch.
+await withServer('version_mismatch', async (fake, adapter) => {
+  const record = await adapter.configure({
+    kind: 'protocol_settings', patch: { messagesEnabled: false },
+  });
+  assert.equal(record.outcome, 'unknown');
+  assert.equal(record.reason, 'version_mismatch');
+  assert.equal(record.mutation.performed, false);
+  assertGetOnly(fake, 'version-gate');
+  console.log('PASS version-gate: mismatch blocks every write, reads still honest');
+});
+
+// 28. The configure seam works through the CLI exactly as the host
+// invokes it, and the token stays out of stdout there too.
+await withServer('happy', async (fake) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'opencodex-cli-configure-'));
+  const configFile = path.join(dir, 'module.json');
+  await writeFile(configFile, JSON.stringify({
+    endpoint: fake.endpoint, moduleArtifactId: MODULE_ARTIFACT_ID,
+    expectedVersion: '2.73.0', adminTokenEnv: TOKEN_ENV,
+  }));
+  const requestFile = path.join(dir, 'request.json');
+  await writeFile(requestFile, JSON.stringify({ kind: 'effort_caps', effortCap: 'high' }));
+  const { stdout } = await execFileAsync(process.execPath,
+    [path.join(here, 'bridge.mjs'), '--config', configFile, 'configure', requestFile],
+    { env: { ...process.env } });
+  assert.ok(!stdout.includes(TOKEN), 'token absent from configure stdout');
+  const parsed = JSON.parse(stdout);
+  assert.equal(parsed.operation, 'configure');
+  assert.equal(parsed.result.outcome, 'applied');
+  assert.equal(parsed.result.readback.after.effortCap, 'high');
+  console.log('PASS cli-configure: saved Operation executed via CLI, token absent from stdout');
 });
 
 console.log('OpenCodex bridge self-test: all fixture assertions passed');

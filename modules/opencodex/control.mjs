@@ -284,6 +284,348 @@ function pickScalarsShallow(value) {
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// Slice 2: configuration-operation normalisers. Same rule as slice 1:
+// upstream responses are untrusted display data; only named fields are
+// copied, upstream free-text messages are never forwarded (writer
+// messages can name files and backup locations), and file paths served
+// by the integration routes (configPath, snapshotPath, conflictPaths)
+// are reduced to booleans/counts or dropped entirely.
+
+export function stringList(value, limit = 64) {
+  if (!Array.isArray(value)) return null;
+  const out = [];
+  for (const entry of value) {
+    const text = str(entry);
+    if (text) out.push(text);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+export function normalizeCatalogRefresh(value) {
+  if (!isObject(value)) return null;
+  return {
+    status: str(value.status),
+    reason: str(value.reason),
+    retryable: bool(value.retryable),
+  };
+}
+
+/// GET /api/protocols and the PATCH /api/protocols/settings response
+/// share one shape (protocolInfo at the pin): resolved surfaces +
+/// resolved settings. Readback compares against these resolved values.
+export function normalizeProtocolSettings(body) {
+  if (!isObject(body) || !isObject(body.settings) || !isObject(body.surfaces)) return null;
+  const rollout = isObject(body.settings.rollout) ? body.settings.rollout : {};
+  return {
+    messagesEnabled: bool(isObject(body.surfaces.messages) ? body.surfaces.messages.enabled : null),
+    unrepresentable: str(body.settings.unrepresentable),
+    rollout: {
+      nativeChatCombos: bool(rollout.nativeChatCombos),
+      managedMessagesNative: bool(rollout.managedMessagesNative),
+      managedMessagesNativeOAuth: bool(rollout.managedMessagesNativeOAuth),
+      directEncoders: bool(rollout.directEncoders),
+      shadowPlan: bool(rollout.shadowPlan),
+    },
+    policyRevision: str(body.policyRevision),
+  };
+}
+
+/// PUT /api/model-settings receipt: the stored-state echo. `saved`
+/// reports whether THIS request published config; a no-op answers
+/// changed:false/saved:false with the stored state still reported.
+export function normalizeModelSettingsReceipt(body) {
+  if (!isObject(body) || body.ok !== true) return null;
+  return {
+    provider: str(body.provider),
+    modelId: str(body.modelId),
+    changed: bool(body.changed),
+    saved: bool(body.saved),
+    hasOverrides: bool(body.hasOverrides),
+    contextWindow: num(body.contextWindow),
+    inputModalities: stringList(body.inputModalities, 8),
+    reasoningEfforts: stringList(body.reasoningEfforts, 16),
+    defaultReasoningEffort: str(body.defaultReasoningEffort),
+    catalogRefresh: normalizeCatalogRefresh(body.catalogRefresh),
+  };
+}
+
+/// The stored-declaration evidence for one routed model out of
+/// GET /api/models: contextWindowDeclared and inputModalitiesDeclared
+/// are the stored declarations; reasoningEfforts/defaultReasoningEffort
+/// on a row are EFFECTIVE (resolved) values, reported as observed.
+export function findModelRowSettings(body, provider, modelId) {
+  const rows = rowsOf(body, ['models', 'data']);
+  if (!rows) return null;
+  for (const row of rows) {
+    if (!isObject(row)) continue;
+    const rowProvider = str(row.provider) ?? str(row.providerId);
+    const id = str(row.id) ?? str(row.model);
+    if (rowProvider !== provider) continue;
+    if (id !== modelId && id !== `${provider}/${modelId}` && str(row.namespaced) !== `${provider}/${modelId}`) continue;
+    return {
+      found: true,
+      contextWindowDeclared: num(row.contextWindowDeclared),
+      inputModalitiesDeclared: stringList(row.inputModalitiesDeclared, 8),
+      reasoningEfforts: stringList(row.reasoningEfforts, 16),
+      defaultReasoningEffort: str(row.defaultReasoningEffort),
+      reasoningOverridden: bool(row.reasoningOverridden),
+    };
+  }
+  return { found: false };
+}
+
+const INTEGRATION_STATES = ['absent', 'current', 'stale', 'conflict', 'unsafe'];
+
+export function integrationState(value) {
+  const text = str(value);
+  return text && INTEGRATION_STATES.includes(text) ? text : null;
+}
+
+/// An integration mutation plan. changes[] paths are managed schema
+/// paths or $snapshot/$ownership/$journal markers — never file
+/// locations — so they are copied; the fingerprint is an opaque
+/// optimistic-check string the operator confirms with, not a secret.
+export function normalizeIntegrationPlan(body) {
+  if (!isObject(body)) return null;
+  const changes = Array.isArray(body.changes)
+    ? body.changes
+        .filter((entry) => isObject(entry))
+        .slice(0, 64)
+        .map((entry) => ({ kind: str(entry.kind), path: str(entry.path) }))
+    : null;
+  return {
+    version: num(body.version),
+    clientId: str(body.clientId),
+    operation: str(body.operation),
+    state: integrationState(body.state),
+    foreignEdit: str(body.foreignEdit),
+    canApply: bool(body.canApply),
+    willChange: bool(body.willChange),
+    refusalReason: str(body.refusalReason),
+    profileId: num(body.profileId),
+    fingerprint: str(body.fingerprint),
+    changes,
+  };
+}
+
+/// One client-integration state (single read or one list entry). The
+/// upstream record also carries file locations (configPath and
+/// friends); those are never copied.
+export function normalizeIntegrationState(body) {
+  if (!isObject(body)) return null;
+  const clientId = str(body.clientId);
+  if (!clientId) return null;
+  if (clientId === 'aside' && Array.isArray(body.profiles)) {
+    // The collection read embeds the Aside aggregate in place of a
+    // single-file state; only counts are kept, never profile rows.
+    return {
+      clientId,
+      state: integrationState(body.state),
+      installed: bool(body.installed),
+      profilesTotal: num(body.total),
+      profilesEnabled: num(body.enabledCount),
+      profilesApplied: num(body.appliedCount),
+      snapshotCount: num(body.snapshotCount),
+      retentionDegraded: bool(body.retentionDegraded),
+    };
+  }
+  return {
+    clientId,
+    state: integrationState(body.state),
+    installed: bool(body.installed),
+    appliedAt: str(body.appliedAt),
+    lastOpId: str(body.lastOpId),
+    reason: str(body.reason),
+    snapshotCount: num(body.snapshotCount),
+    retentionDegraded: bool(body.retentionDegraded),
+  };
+}
+
+export function normalizeIntegrationStates(body) {
+  if (!isObject(body) || !Array.isArray(body.clients)) return null;
+  return body.clients.map((entry) => normalizeIntegrationState(entry)).filter(Boolean).slice(0, 32);
+}
+
+/// GET /api/client-integrations/aside/profiles — aggregate counts only;
+/// profile rows carry account identifiers and stay upstream.
+export function normalizeAsideProfiles(body) {
+  if (!isObject(body) || !Array.isArray(body.profiles)) return null;
+  return {
+    total: num(body.total),
+    enabledCount: num(body.enabledCount),
+    appliedCount: num(body.appliedCount),
+    allEnabled: bool(body.allEnabled),
+    state: integrationState(body.state),
+  };
+}
+
+/// One Aside profile's state for an operator-selected profile readback.
+export function normalizeAsideProfileState(body) {
+  if (!isObject(body)) return null;
+  return {
+    profileId: num(body.profileId),
+    enabled: bool(body.enabled),
+    state: integrationState(body.state),
+    installed: bool(body.installed),
+    snapshotCount: num(body.snapshotCount),
+    retentionDegraded: bool(body.retentionDegraded),
+  };
+}
+
+/// A single integration write outcome (toggle PUT, restore POST, one
+/// Aside profile PUT) or a writer-refusal error body. snapshotPath is
+/// reduced to a boolean: a recoverable snapshot exists or not — its
+/// location is never recorded.
+export function normalizeIntegrationOutcome(body) {
+  if (!isObject(body)) return null;
+  return {
+    ok: typeof body.ok === 'boolean' ? body.ok : null,
+    clientId: str(body.clientId),
+    profileId: num(body.profileId),
+    changed: bool(body.changed),
+    state: integrationState(body.state),
+    opId: str(body.opId),
+    reason: str(body.reason),
+    code: str(body.code),
+    residual: bool(body.residual),
+    snapshotRecorded: typeof body.snapshotPath === 'string' ? true : null,
+  };
+}
+
+/// Per-element outcomes of a partial envelope: `results[]` (Aside
+/// mutation/sync envelopes) or `clientIntegrations[]` (catalog
+/// convergence on visibility/selection writes). HTTP 200 with ok:true
+/// on the envelope confirms the save only; each element is judged on
+/// its own fields, and an element missing outcome fields does not
+/// establish success.
+export function normalizeIntegrationOutcomes(body) {
+  if (!isObject(body)) return null;
+  const rows = Array.isArray(body.results) ? body.results
+    : Array.isArray(body.clientIntegrations) ? body.clientIntegrations
+    : null;
+  if (!rows) return null;
+  const out = [];
+  for (const row of rows) {
+    if (!isObject(row)) continue;
+    out.push({
+      client: str(row.client) ?? str(row.clientId),
+      profileId: num(row.profileId),
+      ok: typeof row.ok === 'boolean' ? row.ok : null,
+      changed: bool(row.changed),
+      state: integrationState(row.state) ?? str(row.state),
+      reason: str(row.reason) ?? str(row.refusalReason),
+      residual: bool(row.residual),
+      snapshotRecorded: typeof row.snapshotPath === 'string' ? true : null,
+    });
+    if (out.length >= 64) break;
+  }
+  return out;
+}
+
+/// The upstream integration journal (rollback source). configPath is
+/// dropped; opId/kind/snapshot/undoable/deletable are the facts an
+/// operator decides a restore from.
+export function normalizeIntegrationJournal(body) {
+  if (!isObject(body) || !Array.isArray(body.operations)) return null;
+  return body.operations.slice(0, 64).map((row) => (isObject(row) ? {
+    opId: str(row.opId),
+    clientId: str(row.clientId),
+    kind: str(row.kind),
+    at: str(row.at),
+    snapshot: str(row.snapshot),
+    undoable: bool(row.undoable),
+    deletable: bool(row.deletable),
+    profileId: num(row.profileId),
+  } : null)).filter(Boolean);
+}
+
+/// GET/PUT /api/v2 shared state. The two free-text fields
+/// (subagentDeveloperInstructions, multiAgentModeHintText) are
+/// operator-authored prose: only set/unset and length are recorded,
+/// never the text.
+export function normalizeV2State(body) {
+  if (!isObject(body)) return null;
+  const text = (value) => (typeof value === 'string'
+    ? { set: value.length > 0, length: value.length }
+    : { set: false, length: 0 });
+  return {
+    enabled: bool(body.enabled),
+    agentsMaxThreadsConflict: bool(body.agentsMaxThreadsConflict),
+    maxConcurrentThreadsPerSession: num(body.maxConcurrentThreadsPerSession),
+    multiAgentMode: str(body.multiAgentMode),
+    keepNativeChatGptOnV1: bool(body.keepNativeChatGptOnV1),
+    agentsEnabled: bool(body.agentsEnabled),
+    agentsMaxDepth: num(body.agentsMaxDepth),
+    agentsMaxDepthAppliesWhenV2Disabled: bool(body.agentsMaxDepthAppliesWhenV2Disabled),
+    subagentDeveloperInstructions: text(body.subagentDeveloperInstructions),
+    multiAgentModeHintText: text(body.multiAgentModeHintText),
+  };
+}
+
+export function normalizeV2Receipt(body) {
+  if (!isObject(body) || body.ok !== true) return null;
+  return {
+    state: normalizeV2State(body),
+    warnings: stringList(body.warnings, 16),
+    catalogRefresh: normalizeCatalogRefresh(body.catalogRefresh),
+  };
+}
+
+/// GET/PUT /api/injection-model. The prompt is operator prose: only
+/// set/unset is recorded. GET additionally serves the effort ladder
+/// and the available-model list; the ladder is kept (it validates an
+/// operator's effort before any write), the list is not.
+export function normalizeInjectionModel(body) {
+  if (!isObject(body)) return null;
+  return {
+    multiAgentGuidanceEnabled: bool(body.multiAgentGuidanceEnabled),
+    syncCodexSubagentDefaults: bool(body.syncCodexSubagentDefaults),
+    model: str(body.model),
+    effort: str(body.effort),
+    promptSet: typeof body.prompt === 'string' ? body.prompt.length > 0 : false,
+    efforts: stringList(body.efforts, 16),
+  };
+}
+
+/// GET/PUT /api/effort-caps. modelPinnedEfforts is reported as a count
+/// only — this slice's effort-caps Operation does not write it.
+export function normalizeEffortCaps(body) {
+  if (!isObject(body)) return null;
+  return {
+    effortCap: str(body.effortCap),
+    subagentEffortCap: str(body.subagentEffortCap),
+    modelPinnedEffortsCount: isObject(body.modelPinnedEfforts)
+      ? Object.keys(body.modelPinnedEfforts).length
+      : null,
+    efforts: stringList(body.efforts, 16),
+  };
+}
+
+/// GET /api/subagent-models (chosen roster) and the PUT receipt
+/// (applied roster). Picker-order fields are counted, not copied:
+/// this slice's roster Operation does not write picker order.
+export function normalizeSubagentModels(body) {
+  if (!isObject(body)) return null;
+  return {
+    chosen: stringList(body.chosen, 8) ?? stringList(body.applied, 8),
+    pickerOrderCount: Array.isArray(body.pickerOrder) ? body.pickerOrder.length : null,
+    pickerOrderMode: str(body.pickerOrderMode),
+    catalogRefresh: normalizeCatalogRefresh(body.catalogRefresh),
+  };
+}
+
+/// GET/PUT /api/subagent-model-fallback: upstream's own stored chain
+/// (ELIOT implements no fallback logic of its own).
+export function normalizeSubagentFallback(body) {
+  if (!isObject(body)) return null;
+  return {
+    models: stringList(body.models, 32),
+    pollMs: num(body.pollMs),
+  };
+}
+
 const SECRET_KEY = /token|secret|api[-_]?key|authorization|password|credential/i;
 
 /// Defense in depth for anything the module emits: the admin token is
