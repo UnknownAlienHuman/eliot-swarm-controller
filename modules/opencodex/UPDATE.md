@@ -14,7 +14,7 @@ there is nothing to merge and no license text ships inside the module.
 | Release | **v2.73.0** (published 2026-09-30) |
 | Source commit | `569e3e7dae48bafc54b8a1a7e3a85129befe2d98` |
 | Upstream license | **MIT**, © 2026 opencodex contributors (read from the pin's `LICENSE`) |
-| Module artifact | `opencodex-2.73.0-bridge.1` |
+| Module artifact | `opencodex-2.73.0-bridge.2` (slice 1 shipped as `bridge.1`) |
 | Runtime | Node.js ≥ 22, standard library only, zero dependencies |
 
 ## Contract sources (read at the pin)
@@ -102,3 +102,99 @@ unqualified until exercised against an operator-installed service.
   stopped or reconfigured it, so there is no service-side rollback to
   perform. Rolling back the bridge binary never rolls back any remote
   effect, because this artifact performs none.
+
+## Slice 2 — requested configuration changes via saved Operations
+
+Artifact bumped to **`opencodex-2.73.0-bridge.2`** (same upstream pin;
+`bridge.mjs`, `module.example.json` and this file updated together per
+the procedure below). Capability change: `configure`/`preview` are
+implemented for the pinned configuration families; `send`/`reply`
+remain unavailable.
+
+### Contract sources (read at the pin, in full)
+
+- `src/server/management/protocol-routes.ts` +
+  `protocol-settings-patch.ts` — `PATCH /api/protocols/settings` body,
+  merged-state rollout rule, 400/409/500 semantics, and the
+  `GET /api/protocols` response shape (`surfaces`/`settings` from
+  `src/protocols/settings.ts`) used for readback.
+- `src/server/management/model-routes.ts` — `PUT /api/model-settings`
+  validation (unknown fields named, routed providers only, exact
+  modelId), the stored-state receipt (`saved`, `changed`,
+  `hasOverrides`, `catalogRefresh`), and
+  `src/server/management/model-rows.ts` for the readback row fields
+  (`contextWindowDeclared`, `inputModalitiesDeclared` stored;
+  `reasoningEfforts`/`defaultReasoningEffort` effective).
+- `src/server/management/agent-settings-routes.ts` — the five
+  sub-agent surface GET/PUT pairs (`/api/v2`, `/api/injection-model`,
+  `/api/effort-caps`, `/api/subagent-models`,
+  `/api/subagent-model-fallback`), their validation rules,
+  partial-write 502 behaviour on `/api/v2`, and the "applies to new
+  sessions" warnings; `src/reasoning-effort.ts` for the effort ladder.
+- `src/server/management/integration-routes.ts`,
+  `aside-profile-routes.ts`, `src/integrations/mutation-plan.ts`,
+  `state.ts`, `writer.ts`, `aside-profiles.ts`, `owned-refresh.ts` —
+  the preview/plan/`planFingerprint` binding (both-or-neither,
+  operation agreement), `409 integration_preview_stale` with a fresh
+  plan, `409 integration_preview_unavailable` and its remedy read,
+  writer refusal mapping (409/410/500 with `reason`, `residual`,
+  `snapshotPath`), state/journal shapes, the Aside per-profile
+  canonical paths, and why the bulk PUT takes no binding ("a confirmed
+  plan applies to one profile").
+- Audit §B.1 (slice-2 scope and order) and issue #1 point 4.
+
+### Changed files in this slice
+
+- `modules/opencodex/bridge.mjs` — request validation per kind, the
+  version-gated configure/preview executors (one mutation per
+  Operation, lost-response reconcile by readback, stale-plan return
+  without retry), the snapshot `configuration` section, the `journal`
+  read, CLI `configure <request.json>` / `preview <request.json>`.
+- `modules/opencodex/control.mjs` — normalisers for protocol
+  settings, model-settings receipts and model rows, integration
+  plans/states/outcomes/journal, per-element partial envelopes, and
+  the five sub-agent surface states. File locations and upstream free
+  text are never copied.
+- `modules/opencodex/fixtures/fake-management-server.mjs` — stateful
+  slice-2 surface with `stale_plan`, `preview_unavailable`,
+  `lost_response`, `refresh_failed` and `partial` scenarios;
+  `fixtures/configuration-state.json` — the initial mutable state
+  (labelled reconstruction).
+- `modules/opencodex/selftest.mjs` — 28 fixture tests (17 new).
+- `modules/opencodex/README.md`, `module.example.json`,
+  `package.json`, this file.
+- Host: `src/doctor.rs` — `services.opencodex[].configuration`
+  projection from recorded snapshots only + the
+  `opencodex_integration_attention` finding (+1 test); root `README.md`
+  pointer updated to bridge.2.
+
+### Verification
+
+```sh
+node --check modules/opencodex/bridge.mjs modules/opencodex/control.mjs \
+  modules/opencodex/selftest.mjs modules/opencodex/fixtures/fake-management-server.mjs
+node modules/opencodex/selftest.mjs   # 28/28 fixture tests
+cargo test --locked --lib doctor      # host doctor section tests
+```
+
+**Live verification is still NOT performed.** No opencodex 2.73.0
+service was installed or run for this slice; the mutation behaviours
+above are verified against the fake server's reconstructions of the
+pinned contracts, not against a live service.
+
+### Activation and rollback (slice 2)
+
+- **Activation:** existing bindings keep working after re-pointing
+  their config at `bridge.2` (the config's `moduleArtifactId` must
+  match). No configuration change is applied by the upgrade itself;
+  changes happen only when an operator saves a request file and runs
+  `configure`.
+- **Rollback of the module:** remove the binding / return the config
+  to a bridge.1 artifact. Doctor keeps projecting recorded snapshots;
+  bridge.1 snapshots simply have no `configuration` section.
+- **Rollback of a configuration change:** a new saved Operation — an
+  inverse settings Operation, or an integration restore through the
+  upstream journal. The bridge never restores anything automatically.
+  (This supersedes the slice-1 note above for bridge.2: the artifact
+  now performs exactly the remote effects an operator requested, one
+  per saved Operation, each with its readback evidence recorded.)
