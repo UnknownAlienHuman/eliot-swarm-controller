@@ -13,11 +13,24 @@
 //! application method, and the application layer keeps validating the
 //! original request (field allow-lists, idempotency, role checks).
 //!
-//! Mutations follow the CLI's request-ID discipline. A caller may pass a
-//! stable `client_request_id` and reuse it after a lost reply; when it is
-//! omitted, one is generated for that call and echoed back in the result
-//! object, so the caller can still correlate a retry. A failed transport is
-//! dropped, never silently retried: the next tool call reconnects first.
+//! Mutations follow the CLI's request-ID discipline. Only a caller-known
+//! `client_request_id`, chosen and retained by the caller **before**
+//! dispatch, makes a mutation safely retryable after a lost reply: the
+//! retry reuses that same ID and the host returns the retained receipt.
+//! When the caller omits it, one is generated for that call and echoed
+//! back in the result object — but that generated ID is correlation only
+//! for a response the caller actually received. It cannot rescue a call
+//! whose response itself was lost, because the caller never learns the
+//! generated ID in that case, so such a mutation cannot be safely
+//! retried. A failed transport is dropped, never silently retried: the
+//! next tool call reconnects first.
+//!
+//! Proposed, **not implemented** (R20): an MCP Tasks projection of
+//! Operations — this facade returns Operation handles for polling with
+//! `operation_get` instead — and RMCP subscriptions; bounded-lag and
+//! resync semantics for subscriptions are a future contract, not current
+//! behavior. Fact: the facade keeps no cache; authoritative reads are
+//! forwarded to the host with no stale-on-error caching.
 
 use crate::{
     config::{Config, Ipc},
@@ -637,8 +650,12 @@ impl ServerHandler for McpFacade {
             .with_instructions(
                 "Tools map one-to-one onto the swarm controller's application API and are \
                  executed against the running host over local IPC with the configured \
-                 credential. Mutations accept a stable client_request_id; operations \
-                 returned by mutations are durable handles to poll with operation_get.",
+                 credential. Mutations accept a stable client_request_id: supply and \
+                 retain your own before dispatch if a mutation must be safely retryable \
+                 after a lost reply. When it is omitted, a generated ID is echoed only \
+                 in a received result and cannot make a retry safe if that response \
+                 itself was lost. Operations returned by mutations are durable handles \
+                 to poll with operation_get.",
             )
     }
 
