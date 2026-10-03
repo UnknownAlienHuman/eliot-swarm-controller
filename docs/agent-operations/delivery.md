@@ -1,12 +1,10 @@
 # Delivery — Manual Commands and Manager-Owned Automations
 
-Revision 4 · 2026-10-03 · proposed Rust implementation, not shipped behavior.
+Revision 5 · 2026-10-03 · proposed Rust implementation, not shipped behavior.
 
-[Configuration](configuration.md) defines each manager-owned enabled automation; [Architecture](architecture.md) defines its on-behalf execution and recovery. [Donor map](donor-map.md) records external evidence.
+[Configuration](configuration.md) owns manager settings; [Architecture](architecture.md) owns admission, durable dispatch and readback. One set of handlers serves manual commands and enabled automations.
 
-## 1. One delivery path
-
-The manager can choose every step manually. They can also enable any selected handoffs to run on their behalf. There is no separate operating mode, second Task ledger or service-only shortcut.
+## 1. Delivery without another Task ledger
 
 ```text
 ready -> assigned -> working -> applied immutable submission -> reviewing
@@ -22,75 +20,80 @@ ready -> assigned -> working -> applied immutable submission -> reviewing
                                           remote readback
 ```
 
-Each arrow is requested directly by the authorized manager or by a matching enabled automation owned by that manager. Omitted automatic steps remain manager decisions. Successful result recording does not implicitly turn on the following arrow.
+These names are projections over existing Task/Attempt/Operation/submission records. The manager chooses each action, or enables the particular handoffs they want performed on their behalf. Missing steps remain manual. No global mode or automatic increase in autonomy with agent count.
 
-These names are projections over existing Task/Attempt/Operation/submission facts. Waiting for a manager, auditor capacity or remote readback is not a defect in the implementation. Silence never means approval.
+Normal waiting for the manager, auditor capacity, a peer fact or remote readback is not a code defect. The system must provide the next useful action without repetitively prompting Root.
 
-## 2. Useful manual controls
+## 2. Manual controls and automatic equivalents
 
-| Explicit action | Finite effect |
+| Explicit method/action | Finite effect; no implicit downstream workflow |
 |---|---|
 | Queue/Task/assignment read | Current source, status and ownership; no claim. |
-| `swarm.launch` or the corresponding existing Task/runtime command | One selected assignment and declared workspace/runtime prerequisites. |
-| Inspect streams, exact steer/reply | Observe or direct that work; no unrelated session restart. |
-| Submit/capture integrated candidate | One applied immutable submission when publication succeeds. |
-| `review.assign` | One named candidate review slot and its requested review work. |
-| Assigned `review.submit` | Retained auditor verdict/evidence; no implicit repair or remote write. |
-| Authorized `task.request_changes` | Applicable exact-candidate feedback. |
-| Explicit owner continuation | Work on that correction, not an unbounded repair loop. |
-| Exact-candidate acceptance and forge operation | The requested accepted effect and readback, not every subsequent Task. |
+| `swarm.launch` or existing Task/runtime command | One selected assignment and its declared prerequisites. |
+| Inspect stream, exact steer/reply | Observe/direct named work; no unrelated restart. |
+| Source capture and `task.submit` | One retained candidate/submission when the operation applies. |
+| `review.assign` | One exact review slot and explicitly requested review work. |
+| Assigned `review.submit` | Authenticated findings/verdict, not Task feedback, repair or push. |
+| Manager `task.request_changes` | Applicable exact-candidate disposition. |
+| Owner continuation | Work on the correction, not an unbounded default repair loop. |
+| Exact acceptance and forge method | The permitted effect and its readback, not the next Task. |
 
-These methods do not require an enabled automation or a cron/Goal/preset object. A small local team can work without a GitHub App; the selected remote action naturally requires its own configured transport and credentials.
+Manual use needs no automation object or GitHub App when the action is local. Existing role, scope, candidate and host guards still apply. Automatic callers exercise the owning manager's current rights through the same handlers, never a stronger internal-service role.
 
-An enabled automation invokes these same handlers on behalf of its manager. It does not inhibit manual actions on other work. If both paths reach the same work/review/publication slot, shared admission returns the existing operation or a precise conflict, not duplicate execution.
+## 3. Queue and ownership
 
-## 3. Pool import and work distribution
+Task source identity is `(forge instance, immutable repository ID, external item ID, item kind)`. Issue and PR kinds remain distinct. Selected source changes make revisions, not duplicate Tasks per webhook; `updated_at` is not a CAS version.
 
-Stable source identity is `(forge instance, immutable repository ID, external item ID, item kind)`. Issue and PR kinds are distinct even when numbers share a namespace. Selected source changes create revisions, not duplicate Tasks per webhook or timestamp; `updated_at` is not a CAS token.
+Keep the Issue body, selected normative comments and named canonical documents addressable. A generated brief is a projection, not a substitute specification. Preserve unknown potentially normative comments as gaps. Source prose, bot output and labels do not choose credentials or configuration.
 
-Keep the Issue body, selected source comments and canonical documents addressable. Generated briefs are bounded projections, not new specifications. Unknown potentially normative comments remain visible; comment prose cannot alter automation configuration.
+`github.work_pool.preview/apply` selects/orders existing Tasks. Import and queue reads do not dispatch. The manager may enable distribution for that pool, not arbitrary repository work.
 
-`github.work_pool.preview/apply` selects/order existing Tasks. Import and `swarm.queue.get` do not dispatch. If the manager enables a distribution automation, it acts within that selected pool; it does not consume arbitrary new Issues from the repository.
+For direct or automatic dispatch, recheck current Task/revision, relevant pool membership, dependencies, owner, route and capacity, then reserve the existing Task/Attempt, manager and workspace slot before external launch. The assignment packet states exact work, sources, relevant peers and constraints. A stale queue snapshot or heartbeat does not steal ownership.
 
-For explicit manual dispatch or a matching automatic action:
+One manager owns one mutable worktree and one in-flight product candidate. Writers work on non-overlapping parts of that Issue and return their changes for integration; they do not publish separate fragments. A pool may contain several authorized managers without merging their workspace ownership.
 
-1. Recheck Task revision, pool membership where relevant, dependencies and current ownership.
-2. Resolve the selected manager/executor profile and actual available capacity.
-3. Reserve Task/Attempt, manager slot and mutable workspace ownership atomically.
-4. Commit the existing launch/dispatch Operation and bounded assignment context.
-5. Execute outside the transaction after the same owner/action checks.
+Filter readiness before page limits and keep manager order unless they chose ranking. Capacity waits retain the subject and wake when capacity changes, not repeatedly start rejected jobs. Routes sharing a provider account share its budget. Ordinary local review/delivery must work without GitHub setup or optional script interpreters.
 
-Filter readiness before page limits so blocked rows do not hide ready work. Preserve manager order unless configured ranking says otherwise. A stale queue page or heartbeat expiration cannot steal another owner's work. Unknown prior native/child disposition requires reconciliation before replacement.
+## 4. Exact triggers, not a chain that must have started automatically
 
-One manager owns one mutable worktree and one in-flight product candidate. Writers implement non-overlapping portions of that Issue and return results for manager integration; their fragments do not become independently published product submissions. A dispatcher may assign multiple authorized managers without merging their workspace ownership.
+Each selected step observes its committed prerequisite independently:
 
-## 4. Submission is the audit boundary
+| Step | Trigger/subject | Result |
+|---|---|---|
+| `review_dispatch` | Applied submission; unfilled required review slot | `review.assign` for that candidate. |
+| `review_disposition` | Assigned actionable findings applicable to the current candidate | Existing guarded feedback transition. |
+| `repair_dispatch` | Applied current feedback and reconciled owner/continuation | One correction delivery to the actual owner. |
+| `acceptance` | Complete required audit/check evidence | Exact-candidate acceptance under current rights. |
+| `publication` | Actual exact acceptance and eligible target | Selected forge effect/readback. |
+| `github_projection` | Retained audit/acceptance/publication fact | Only configured remote labels/Checks/summary. |
 
-Source anchors: `src/store/submissions.rs::reserve/begin/finish/document/describe`. A queued `task.submit` is not an applied submission. Only retained applied `task.submission` with exact candidate references makes the work reviewable.
+Thus a manual submission can trigger an enabled audit handoff. A manual acceptance can trigger enabled publication without automatic acceptance. A repaired candidate can trigger re-review even though it descends from the same automation. No step can synthesize an absent prerequisite or enable an omitted step.
 
-The manager integrates writers, captures/commits the intended complete Issue candidate and runs only the configured current-phase gate. Every requirement has a disposition. Exceptional partial delivery follows explicit project policy; missing production wiring is not automatically acceptable.
+Atomically retain each considered subject plus its Operation/reservation or pending reason and cursor. On restart, a missed in-memory notification cannot lose the submission. Including existing eligible work at enablement uses the same slots as new events. Local Git and webhook reports of the same verified commit coalesce for the same intended notification; commit observation is not submission success.
 
-Candidate evidence includes source tree, baseline, relevant untracked-source treatment, claims and checks. It is not a mutable branch pointer. Freeze the worktree while its candidate is reviewed/published; auditors use retained source or a controlled read-only view.
+## 5. Submission and source freeze
 
-Without a matching enabled automation, submission updates the dashboard and waits for a manager's review assignment. With automatic `review_dispatch`, the server reserves the configured auditor slots on behalf of that automation's manager. Failed submit or free-text commit message launches no audit.
+Source anchors are `src/store/submissions.rs::reserve/begin/finish/document/describe`. Queued `task.submit` is not applied `task.submission`; failed/partial publication of the submission document starts no audit.
 
-A verified commit can separately trigger a manager-enabled notification automation. WIP notification does not imply a completed candidate or costly review. Local Git hook and GitHub event for the same commit coalesce by verified repository/OID and intended action.
+The manager integrates the complete intended Issue candidate and executes only its configured phase gate. Every requirement retains a disposition. Missing wiring is not an excuse for a nominally complete fragment. Partial delivery follows explicit project policy, not an automatic escape hatch.
 
-## 5. Review assignment and verdict
+Candidate evidence identifies retained source/tree, baseline, relevant untracked treatment, claims and checks, not a branch name. Freeze the candidate worktree during review/publication. Auditors use retained source or a controlled read-only view, never mutable latest branch state selected by name.
 
-### 5.1 `review.assign`
+An applied return opens a correction phase for the current owner. Capture the old candidate/evidence first. Ensure processes inspecting a mutable checkout have been safely finished or moved to retained read-only inputs before changing it. An auditor still reading immutable candidate A may finish historically; it cannot approve later B. No forced session kill is implied. After correction, capture and apply a new submission before reviewing the changed code.
 
-The direct manager and the automatic caller share the same authorization and logical slot `(submission_ref, review_policy_generation, review_slot)`. An enabled automation is sufficient standing instruction if its owner already has review-assignment rights; there is no additional mandatory automation grant.
+## 6. Review assignment, verdict and audited state
 
-A review assignment contains exact Task revision, Attempt, submission/candidate, commit/tree, acceptance phase, canonical source index, coverage, relevant prior findings and result schema. No whole-fleet history or mutable source pointer is included.
+### 6.1 Assignment and retries
 
-Record both who assigned it and who performs it. The owning manager gets the assignment/cost attribution; the auditor remains a distinct authenticated participant. A script or service cannot submit a pass merely because it arranged the review.
+Direct manager and automation reserve the same `(submission_ref, review_policy_generation, review_slot)`. The policy generation identifies coverage/acceptance semantics, not the preferred model string. A profile rename, extra automation or random request ID cannot start a second auditor for that slot.
 
-Multiple auditors have separate slots. Check producer-lineage and permission separation where required. A different actor ID or the same model under a different display name is not proof of independent statistical evidence. Model diversity may be a preference, not a fixed-version requirement.
+Assignment contains exact Task revision, Attempt, submission/candidate, commit/tree, phase, canonical sources, required coverage and output schema. Record manager sponsor and actual assigned auditor separately. Several auditors occupy declared separate slots, not cloned identities used to simulate independent evidence.
 
-### 5.2 `review.submit`
+A failed/inconclusive attempt is not a permanently occupied slot, but timeout alone is not proof the worker stopped. A manager or configured recovery action may replace it only after actual prior native/process/continuation disposition is known. The replacement is a new recorded review attempt in the same logical slot, preserving earlier output and rejecting late output as the replacement's result.
 
-The assigned auditor supplies an anchored result, for example:
+### 6.2 Result
+
+Example proposed payload; identifiers must match the authenticated review assignment:
 
 ```json
 {
@@ -113,117 +116,78 @@ The assigned auditor supplies an anchored result, for example:
 }
 ```
 
-Body identities must match the authenticated assignment. `pass`, `changes_requested` and `inconclusive` are distinct; valid JSON alone proves no substantive correctness.
+`pass`, `changes_requested` and `inconclusive` are distinct. Valid JSON is not proof of correctness. A pass needs complete assigned coverage and no unresolved blocker. Missing sources, unexecuted required checks, empty evidence, provider failure or unknown candidate cannot pass.
 
-Pass requires complete assigned coverage and no unresolved blocker. Missing source/evidence, unexecuted required checks, quota failure or unknown candidate cannot pass. Change requests identify actual requirement violations, not invented requirements or unconfigured style demands. Inconclusive preserves the gap without asking a writer to rewrite correct code.
+A change request names a demonstrated violation of real requirements, with actionable evidence, not invented style demands or mechanisms. Inconclusive preserves uncertainty rather than sending correct code back for pointless rewriting. A supported critique inside a nominally positive narrative must not be discarded merely because its summary says pass.
 
-Retain late results for their original candidate. They cannot return, approve or publish a newer submission. Findings are explicitly retracted/superseded; do not erase their original evidence. Disabled audit dispatch does not prevent an already assigned auditor from delivering its result.
+A completed assigned review may report after automation disable. Retain late findings against their original candidate and mark historical applicability. Explicit credential revocation still applies; trusted adapter recovery must not impersonate the auditor. Retraction/supersession is explicit history, never deletion of the original finding.
 
-### 5.3 Local `audited` fact
+### 6.3 Audited
 
-The server derives audited state from all required review slots/coverage/checks for the exact submission and phase. Required count must not silently become zero. A code-phase audit does not claim later integration/live tests ran.
+The server derives `audited` from all required slots, coverage and checks for the exact candidate and audit phase. Count cannot silently become zero. Code review does not claim deferred integration/live tests were executed. Review retraction, invalidated evidence or changed candidate updates eligibility while preserving history.
 
-Review retraction, changed source, new candidate or invalidated evidence updates current eligibility while preserving history. Corrected source with unchanged checklist bytes is reviewable; whitespace-only checklist edits cannot remove a defect.
+A new submission ID containing the same relevant source/evidence does not remove an old defect. Corrected source with unchanged checklist text is eligible for re-review. Link the finding to its affected source/evidence, not checklist bytes or timestamps alone. A manual diagnostic rerun remains possible and is explicitly labelled; it cannot manufacture a green verdict.
 
-Local audited state may update without automation. Remote labels/Checks and publication are separate effects and require a manager command or an enabled matching automation.
+Local audit aggregation works without enabled automation. Labels, acceptance and publication remain separate actions. The manager-owned handoff cannot fabricate the auditor's signed/authenticated result.
 
-## 6. Findings, return and repair
+## 7. Return and repair
 
-Current `request_changes` requires GM/operator and creates mail, not native input. Where the product intends scoped manager feedback, implement that shared capability for manual managers and their automations using existing exact Task/Attempt/submission/candidate guards. Do not create an internal service bypass or give reviewers GM credentials.
+Current `task.request_changes` uses GM/operator authority and stores mail, not native input. Add intended scoped manager feedback rights in that existing guarded path for both manual and automatic callers. Do not give auditors GM credentials or treat an MCP tool annotation as permission.
 
-The manager can read the findings, apply relevant feedback and then request correction. Alternatively, an enabled reviewed-delivery automation may include `review_disposition` and/or `repair_dispatch`. These are selections inside that definition, not globally gated stages. Selecting disposition alone does not start repair.
+The auditor calls `review.submit`. The manager or selected `review_disposition` applies relevant findings. Only explicit owner input or selected `repair_dispatch` starts correction. Feedback admission alone is not proof the correction reached the model; retain exact delivery/readback and retry semantics.
 
-The automation's owner remains responsible for the handoff. Repair goes to the actual owning manager with exact findings/requirements; that manager directs their writers. Do not overwrite work ownership with the automation sponsor's ID. A dispatcher authorized for a managed pool still must respect current Task/Attempt ownership.
+Repair targets the actual current Attempt owner with exact findings and requirement IDs, not the automation sponsor as a replacement owner. The owner manages internal writers. Keep a valid unreleased Attempt; new submission references the prior submission. Changed Task revision/owner follows normal new-Attempt policy.
 
-Preserve an unreleased valid Attempt; a new submission references the prior submission. Changed Task revision or ownership uses the existing new-Attempt path. Fallback to another route/manager occurs only as configured and after prior native work, children, lease and useful partial output are reconciled.
+A configured fallback/reassignment requires prior native family and workspace disposition plus preserved partial output. Infrastructure failure is not a source defect. Repeated unchanged findings yield one focused pending diagnostic, not identical model prompts. Corrected source, new relevant evidence or an explicit permitted diagnostic decision can proceed; there is no arbitrary number of returns that declares unfinished work complete.
 
-Infrastructure and provider failures are not code defects. Repeated unchanged findings yield one focused diagnostic/manager decision rather than identical prompts. New evidence or corrected code permits progress. No arbitrary fixed retry-round limit declares unfinished work complete.
+## 8. Acceptance, upload and publication
 
-Re-review after a correction uses the currently enabled audit handoff, or a manual review assignment. Disabling a handoff does not remove existing findings or permit acceptance of a known unresolved defect.
+Selecting/omitting acceptance and publication steps expresses the manager's choices; no extra manager-gate mode. Publication can be automatic after manual acceptance, or accepted work can wait for a manual push. Both use the same exact-candidate, current rights, GM/epoch and repository policy checks.
 
-## 7. Acceptance and publication choices
+A local audit requires no first push. When remote CI is selected, `forge.upload_candidate` performs an explicitly permitted pre-review upload into its configured review namespace. It is not accepted publication and cannot write protected output refs, close Issues or bypass checks. Later CI output is evidence, not auto-merge authority by itself.
 
-The manager decides which automatic steps to include. With `publication` absent, publication stays manual. With it present in an enabled automation, the server publishes on the owner's behalf only after all actual candidate, audit, acceptance, permission and repository checks pass. No separate `manager_gate/auto_after_audit` switch or global mode is needed.
+A manual approval binds one candidate, target and effect. Head/evidence changes require revalidation. An equivalent sending/unknown effect returns its retained reference, never a blind replacement. Disabling/re-enabling or changing model preferences does not reset its slot.
 
-Acceptance can remain manual while publication is automated after that exact acceptance. Conversely, valid accepted work can wait for a manual push. Editing the automation does not falsify audited/accepted evidence.
+Audit, acceptance, upload, push, PR merge, Issue closure and cleanup remain separate facts. Failure to write an audited label cannot rerun publication or ask the writer to rebuild valid code.
 
-The automation may use only the rights its owning manager has. Existing GM/operator-only paths are not made available by an enabled flag. When scoped publication delegation is part of accepted policy, manual and automatic callers share that capability and current epoch check; otherwise return the specific missing right.
+## 9. GitHub boundary
 
-A manual approval addresses exact candidate, target and effect. Changes to head/evidence require reevaluation. An already-started or uncertain equivalent push returns its retained reference; disabling/re-enabling cannot generate a fresh identity for it.
+### Intake and feedback loops
 
-Audit, acceptance, upload, merge, publication and Issue closure remain different facts. A failed label update cannot rerun push. A publication problem does not turn correctly audited code into another implementation task.
+Use one Rust client/rate boundary with private local repository/credential handles. Inventory actual read/Issue/PR/Check/Contents permissions. Raw-body HMAC, repository/installation validation, durable intake before ACK, dedupe and conditional paged reconciliation handle missing/duplicate/unordered webhooks. Permission failure is not proven deletion.
 
-## 8. Local-first review and remote CI
+The event does not choose its owner, credentials or executable policy. ELIOT-generated labels/Checks/comments are correlated projections; their webhook echoes must not revise Task requirements or trigger another identical action. Do not ignore every bot/user comment by username: preserve genuinely new selected normative content and uncertain-source gaps. Frozen requirements change only through the normal authorized Task revision path.
 
-Local reviewers can inspect captured source before any push. There is no first-push/audit circular dependency.
+External GitHub author is the authenticated App/user. Internal on-behalf attribution is not a forged human actor or multiple independent GitHub approvals.
 
-If the manager selects remote CI, `forge.upload_candidate` uploads the captured candidate only to a configured review-branch namespace, under its actual upload right. It is transport, not accepted publication. It cannot target protected output refs, bypass checks, close Issues or claim acceptance.
+### Projection writes
 
-A manual upload is one requested command. Automatic upload must be an explicit action of an enabled automation. Show that remote review needs this pre-review write; do not hide it as read-only setup. Later CI results are recorded, but only a configured valid publication action can merge/publish.
+Only configured manager commands/automation write managed labels, commit-specific Checks, summaries and annotations. Preserve unrelated labels/comments. Use exact head SHA, retained remote IDs and batch/readback identity. `external_id` is correlation, not an exactly-once guarantee; annotation updates can append.
 
-These paths are Rust implementations; no internal Python/PowerShell or shell `gh` control daemon is required.
+Map only complete positive evidence to success. Neutral/skipped GitHub conclusions are not a passed ELIOT audit. Stale labels cannot authorize a new candidate. Code audit alone cannot close an Issue; closure needs its explicit completion policy/action.
 
-## 9. GitHub integration
+### Push, merge and retries
 
-### 9.1 Observation and credential identity
+Reuse accepted non-force `forge.publish_ref` and owned Git process readback. Its preflight old-ref check is not atomic CAS. Refresh integration on incompatible movement rather than force-push or weaken verification. A local mutex cannot exclude independent remote writers.
 
-Use one Rust API/rate boundary and trusted local repository/credential handles. Reads, labels, PRs, Checks and Contents permissions are distinct. Inventory what the selected App/token can actually do; local work need not wait for unused integrations.
+PR merge uses the actual supported endpoint/strategy, expected head where available and no protection bypass. Expected PR head is not an arbitrary base guard. Strict integrated-candidate evidence needs the selected qualified up-to-date/merge-group mechanism; optional GitHub merge queue availability is not a prerequisite for local work. Never claim a guarantee an endpoint cannot enforce.
 
-Verify webhook HMAC over raw bytes, validate source context, durably ingest before ACK and deduplicate. Reconcile unordered/missing events with conditional paged reads and shared account rate budgets. Header strings alone cannot authorize actions. Permission errors are not proof of deletion.
+Accepted/enqueued remote requests are not merged. Retain exact options/IDs and reconcile actual ref/PR/commit state; a synthetic pre-merge SHA is not landed evidence. Do not include unapproved stacked work or dismiss required human reviews automatically.
 
-A source event matches a manager's configured trigger; it never chooses its owner or credentials. Source text cannot change frozen Task requirements or automations. A bot quota warning is not a failed code review.
+There is one retry decision owner per external effect. Review the Rust HTTP client's middleware as well as the action worker: it must not invisibly resend ambiguous non-idempotent requests underneath Store. Safe read retries may be bounded/shared; write timeout or disconnect requires effect-specific reconciliation. Marker text and client request IDs do not create a universal GitHub exactly-once guarantee.
 
-"On behalf of manager M" is ELIOT's execution/authorization attribution. GitHub still records its actual authenticated App/user/token actor. Do not forge a human commit author, disguise the App as M, or claim several internal auditors are several independent GitHub user approvals.
+Account-level rate pacing uses actual response/reset information. Do not treat every HTTP 429 as the same quota condition or issue a new model job for a provider/account outage. Actions workflow triggering depends on credential/event semantics; missing expected checks remain visible. Never run untrusted PR code with privileged workflow credentials to force a green check.
 
-### 9.2 Optional projections
+### Disable and recovery
 
-Managed audited labels, exact-commit audit/acceptance Checks, PR summary and actionable annotations are writes. They follow explicit manager commands or an enabled `github_projection` step on that manager's behalf. Preserve unrelated labels/comments.
+Local disable does not cancel a remote workflow, auto-merge or native Goal already accepted elsewhere. Track actual IDs and ownership; read-only reconciliation continues. Supported cancellation is a separate manager decision.
 
-Only complete positive evidence maps to success. GitHub's handling of neutral/skipped required checks is not an ELIOT pass; do not use those conclusions to hide an inconclusive audit. Use only conclusions allowed by the selected API.
+Retain intent before I/O and preserve unknown process-tree/effect state. New automatic/manual requests cannot clear uncertainty by inventing a new ID. Isolate an unresolved target; unrelated local work and observation remain usable.
 
-Retain exact head SHA, Check Run IDs and correlation. `external_id` is not guaranteed uniqueness. Reconcile ambiguous creation; annotation updates may append, requiring batch identity/readback. Labels are not atomically commit-bound and never authorize publication. Show projection lag instead of trusting a stale label on a new head.
+## 10. Next task and complete handoff
 
-Issue closure needs the manager's explicit configured completion/closure action. Code review alone is insufficient.
+Record already-issued outcomes regardless of enabled state. Further bookkeeping, closure, cleanup and next-task distribution require an explicit command or the corresponding currently enabled choice.
 
-### 9.3 Push, merge and integration base
+Only after its candidate and conflicting native family/continuation are settled may the manager prepare the next Task in the same worktree. No age-based cleanup or branch disappearance removes pending submissions. Writers' useful output must be integrated into the candidate or explicitly retained/dispositioned, not silently abandoned.
 
-Native GitHub merge queue is optional and repository/plan-dependent. ELIOT's own Rust admission queue must work without it. Run expensive integration/check/review work outside Store transactions; serialize only the relevant final effect target.
-
-Existing `forge.publish_ref` publishes the exact accepted candidate with ordinary non-force Git behavior. Its old-ref preflight is not atomic CAS. Incompatible movement requires refreshed integration/validation, not force-push. Readback proves observed remote state, not global ordering over all external writers.
-
-PR merge must use the actual supported endpoint/strategy, expected head where supported and no protection bypass. Expected head does not guard arbitrary base movement. Verify the actual integration candidate through the selected qualified strict-up-to-date/merge-group path. A local mutex or manager click cannot create a missing base-CAS guarantee.
-
-Where an asynchronous request or native queue is supported, retain request/options and distinguish accepted/enqueued from merged. Expired or conflicting request state needs PR/ref/commit reconciliation, not blind re-merge. Do not count a synthetic pre-merge commit as landed or include unapproved stacked PRs.
-
-GitHub Actions trigger behavior depends on token and event; missing expected checks stay visible. Never execute untrusted PR code with privileged workflow credentials to force a green gate. Validate current endpoint schemas/capabilities when implementing rather than freeze research-era assumptions.
-
-### 9.4 Disable and recovery
-
-Disabling an ELIOT automation stops its future local starts, not an already accepted external workflow, auto-merge or native Goal. Keep exact IDs and actual owner/disposition visible. Read-only reconciliation continues; supported cancellation is a separate requested operation.
-
-Persist effect intent before I/O. Timeout, lost response or unknown process-tree disposition is not evidence that nothing happened. New manual/automatic requests cannot repeat an unknown effect under another ID.
-
-PR/comment/check creation has no general exactly-once guarantee. Retain remote IDs, serialize equivalent local intent and reconcile ambiguity; do not claim a marker excludes all duplicates from external actors. A partial failure blocks only the affected effect, not the entire project.
-
-## 10. Completion and next work
-
-Recording an already issued result continues regardless of enabled state. Further bookkeeping, closure, cleanup and next-task dispatch occur only when directly requested or included in a currently enabled automation. No branch disappearance authorizes deletion of live/unresolved work.
-
-After its candidate and native children/continuation are settled, the owning manager may prepare the next task in the same worktree. An enabled distribution automation can make that next assignment for its owner; otherwise the manager chooses it. Do not modify a candidate still in review.
-
-## 11. Required scenarios
-
-- With no enabled entries, a manager completes the full manual review/repair/publication path.
-- One manager enables only audit assignment in one configuration request; no Root/control-mode/grant-creation round is introduced.
-- Automatic handoff records its manager, while auditor results retain their real author.
-- Manager commands remain usable alongside enabled automations; equivalent concurrent slots execute once.
-- A scope-limited manager cannot publish or modify another manager's work by enabling an automation.
-- Applied submission triggers the selected review; queued/failed submit or duplicate Git events do not.
-- Disabling stops unstarted/follow-up automatic effects while started work and result recording remain visible.
-- A held never-started step can be handled manually without enabling its automation or duplicating it.
-- Restart preserves saved choices, reviews current ownership and reconciles uncertainty before continuing.
-- Late candidate A feedback cannot mutate candidate B; corrected code remains reviewable with unchanged checklist text.
-- Inconclusive or provider failure never becomes pass or pointless code repair.
-- Local-first audit has no push dependency cycle; remote-review upload is an explicit distinct action.
-- Stale labels cannot authorize publication, and projection failure cannot rerun it.
-- Built-in delivery requires neither an external-script interpreter nor a fixed software release or native GitHub merge queue.
+A correct first product path is one local manager -> writer -> applied submission -> assigned auditor -> actionable return -> repaired submission -> pass -> authorized acceptance/publication. Every arrow has an actual producer, handler and result reader. Remote GitHub, scripts, cron and larger fleets are additional adapters/triggers, not prerequisites for this path.

@@ -1,132 +1,135 @@
-# Donor Map — Rust Operations and Automation on Behalf of a Manager
+# Donor Map — Rust Operations and Manager-Owned Automation
 
-Revision 4 · reviewed 2026-10-03.
+Revision 5 · reviewed 2026-10-03.
 
-`CODE` means source inspected in the indicated review; `DOC` official/library documentation; `OWNER_AUDIT` supplied operating evidence; `DESIGN` ELIOT's choice. Earlier source-review observations are not new live tests. Dates, commits and blob IDs identify evidence, never installation requirements or software-version pins.
+`CODE` means an inspected source behavior; `DOC` means official/library documentation; `OWNER_AUDIT` means supplied operating evidence; `DESIGN` means an ELIOT proposal. Earlier inspections are not new live qualification. Commit/blob identities locate evidence, not required installed versions.
 
-## 1. Product choice versus donor evidence
+## 1. Product decisions are not inferred from donors
 
-**DESIGN, current owner direction:** manual management is the baseline; each manager can enable automations that act on their behalf. There is no global assisted/delegated mode or extra approval layer for actions that manager already controls. This is the product rule, not a benchmark finding or a donor default to be inferred.
+**DESIGN, owner direction:** management is manual by default. Each manager enables the helpers they want, acting on their behalf inside existing rights. No global operating modes, extra stage-activation ledger or Root approval for already permitted actions. Rust owns every internal subsystem; Python/PowerShell are optional external extensions.
 
-The previous Revision 3 added unnecessary separate mode/stage/control state. Revision 4 replaces those prescriptions in the six existing documents. Useful receipt, concurrency, revocation and unknown-effect protections remain implementation details of the same action path.
+Current revision reviews the complete six-file operations program against its related communication/MCP contracts and current source anchors. It corrects seams in the existing files, not through another precedence appendix. Source study does not prove the proposed combined system works.
 
-## 2. ELIOT source anchors
+## 2. Current ELIOT evidence
 
-Original inspection used `35e499ae73b622d873c44873f6993ee3fcbea87b`; the current review uses main `504199d14135c030ad3951a3c5023a098a3d03f0`. Inspect current main when implementation starts.
+Inspected main baseline: `504199d14135c030ad3951a3c5023a098a3d03f0`. Recheck current symbols when implementation starts.
 
-| Existing unit | Source finding | Adaptation |
+| Unit | Source fact | Reuse/required change |
 |---|---|---|
-| [`src/store/submissions.rs`](../../src/store/submissions.rs) | Queued reserve; applied `task.submission` in finish; `request_changes` uses GM/operator authority and stores mail | Trigger review only from applied evidence. Add intended scoped manager capabilities to the common handler, not an automation-only bypass. |
-| [`src/policy.rs`](../../src/policy.rs) | Compiled current edition/digest | Keep historical Attempts recognizable when adopting explicit policy changes. |
-| [`src/scheduler.rs`](../../src/scheduler.rs), [`src/store/schedules.rs`](../../src/store/schedules.rs) | Once/interval CheckRuns with transactional receipts | Extend the existing Rust scheduler with manager-owned definitions; preserve considered occurrences. |
-| [`src/mcp/subscriptions.rs`](../../src/mcp/subscriptions.rs) | Bounded committed-fact polling and lag/resync | Share readers/projectors; keep native live presentation separate. |
-| [`docs/forge-publication.md`](../forge-publication.md) | Accepted-candidate non-force push; uncertain-effect readback; preflight not atomic old-ref CAS | Manual and automatic callers retain these same limits. |
-| [`docs/owner-decisions.md`](../owner-decisions.md) | Manager workspace ownership, observational reads and separate GM/host gates | Automation exercises its owning manager's rights, not all permissions of the host process. |
-| Runtime/process ownership and [`modules`](../../modules) | Some owned bridges are non-Rust; lifecycle ownership already matters | Port owned translation to Rust without heuristic live-session replacement. |
+| [`src/model.rs`](../../src/model.rs) | Manager actor has no invented generation; internal Scheduler has a special ownership path; negative not-observer is not a complete capability model. | Keep identity semantics; new on-behalf actions resolve their manager, not the Scheduler shortcut. |
+| [`src/store/mod.rs`](../../src/store/mod.rs) | Store owns serialized DB work and shared change notification; several effects use dedicated outer methods. | One common action/authorization boundary, no recursive public IPC in a transaction; notification is not durable delivery. |
+| [`src/store/schedules.rs`](../../src/store/schedules.rs), [`docs/schedules.md`](../schedules.md) | Considered cursor, request identity and scheduled check admission are coupled in one transaction. | Extend this property to event routing/pending subjects; preserve legacy slots and receipts. |
+| [`src/store/submissions.rs`](../../src/store/submissions.rs) | Reserve is queued; finish commits applied `task.submission`; feedback is guarded and not a native prompt. | Applied-submission triggers; explicit auditor result versus manager disposition versus repair delivery. |
+| [`docs/task-policy.md`](../task-policy.md), [`docs/owner-decisions.md`](../owner-decisions.md) | Frozen policy/source/Attempt evidence, one manager worktree, GM-fenced effects and current first-slice restrictions. | Add accepted policy and shared code deliberately; keep earlier evidence recognizable. A design document does not silently grant rights. |
+| [`docs/forge-publication.md`](../forge-publication.md) | Accepted non-force publication, process disposition and readback; preflight is not atomic remote old-ref CAS. | Preserve actual guarantees for manual/automatic callers and separate upload/merge. |
+| [`src/mcp/subscriptions.rs`](../../src/mcp/subscriptions.rs) | Existing bounded committed-fact polling and lag/resync. | Shared projectors plus separate live-native rings, not a transcript per subscriber. |
 
-The current submissions source was reread in this pass. It confirms that simply adding an auditor MCP tool would not create a working scoped feedback path; that needs a real shared authorization change. A retained review finding also does not itself send native input.
+PR #22's proposed reviewer core included `task.request_changes`, while its Participant path forbids Task transitions. PR #23 supplies `review.assign/submit`. **DESIGN:** reconcile the two at implementation: assigned auditor submits its anchored verdict; manager or manager-owned automation applies guarded feedback. No role escalation by MCP visibility.
 
 ## 3. Whole Rust libraries
 
-| Component | Maintained source | Reuse | Keep in ELIOT |
+| Component | Maintained source | Take | ELIOT remains responsible for |
 |---|---|---|---|
-| Octocrab | [API](https://docs.rs/octocrab/latest/octocrab/) | Complete Rust GitHub client and narrow lower-level transport where needed | Credentials, current manager permissions, shared rate budgets and effect recovery. |
-| Croner | [API](https://docs.rs/croner/latest/croner/) | Complete expression evaluation and compatible timezone integration | Enabled owner, due identity, catch-up, overlap and persistence. |
-| sysinfo | [API](https://docs.rs/sysinfo/latest/sysinfo/) | Shared selective resource/process sampling | Actual lifecycle ownership; metrics never authorize killing. |
-| notify | [API](https://docs.rs/notify/latest/notify/) | Platform watcher and supported fallback | Exact readback, revisions and source-health reporting. |
-| Existing Tokio/rusqlite/RMCP/serde | Project manifest and maintained documentation | Existing async/Store/protocol machinery | One authority, not a parallel controller per feature. |
+| Octocrab | [API](https://docs.rs/octocrab/latest/octocrab/), [builder](https://docs.rs/octocrab/latest/octocrab/struct.OctocrabBuilder.html) | Complete Rust GitHub client with narrow low-level endpoint access when needed. | Credentials, action rights, durable intent, shared rate pacing, retry/readback policy. |
+| Croner | [API](https://docs.rs/croner/latest/croner/) | Complete expression evaluator and supported timezone integration. | Manager enabled choice, due identity, overlap/catch-up and persistence. |
+| sysinfo | [API](https://docs.rs/sysinfo/latest/sysinfo/) | Shared selective process/resource observations. | Real process ownership and safe decisions; metrics do not authorize kill. |
+| notify | [API](https://docs.rs/notify/latest/notify/) | Platform file-change hints/fallback. | Exact readback, invalidation and source-health gaps. |
+| Existing Tokio/rusqlite/RMCP/serde | Project manifest and library documentation. | Existing asynchronous, transactional and typed protocol machinery. | One authority and bounded application semantics. |
 
-Octocrab is a community client, not GitHub authority. Missing typed endpoints do not justify a Python/`gh` control daemon. Metrics and file events have platform limitations; unknown coverage is not an empty successful result or an exactly-once event stream.
+No old release, fixed CLI/model equality or callback-time package installation is prescribed. Ordinary compatible requirements and recorded build resolution are not a policy freezing future software. [Cargo's dependency documentation](https://doc.rust-lang.org/cargo/reference/specifying-dependencies.html) distinguishes dependency requirements from a particular resolved build.
 
-**DOC:** [Cargo dependency requirements](https://doc.rust-lang.org/cargo/reference/specifying-dependencies.html). Use ordinary compatible requirements and explicit integration/toolchain changes when needed. No obsolete release recommendation, exact-version runtime gate, uncontrolled wildcard download or callback-time installer. Recorded build resolution is not a policy freezing future compatible software.
+### Retry ownership
 
-## 4. Windmill: the directly relevant on-behalf pattern
+**DOC, rechecked 2026-10-03:** Octocrab's builder documents retry-capable middleware and selectable transport behavior. This does not prove every endpoint/request is safe to resend.
 
-**DOC, rechecked 2026-10-03:** [Roles and run on behalf](https://www.windmill.dev/docs/core_concepts/roles_and_permissions), [Jobs](https://www.windmill.dev/docs/core_concepts/jobs), [Schedules](https://www.windmill.dev/docs/core_concepts/scheduling), [Draft/deploy](https://www.windmill.dev/docs/core_concepts/draft_and_deploy).
+**DESIGN:** inspect the chosen library configuration and actual method before use. Safe reads may retry under a shared bounded policy; ambiguous non-idempotent writes must not be invisibly replayed by middleware underneath Store. One effect has one retry/readback owner. Do not replace the whole client with a second handwritten GitHub stack merely to control this boundary.
 
-Windmill distinguishes the creator of a job from its permission-bearing identity. Its documented on-behalf setting uses that selected identity's access and makes attribution visible. Schedules/triggers associate executions with an owner; schedules can be enabled independently and scripts resolve deployed content.
+## 4. Tokio change notification is not an event log
 
-**DESIGN:** adopt explicit owner, enabled setting and permission/technical-executor attribution. A manager enables their helper once; no per-trigger approval is needed. Reuse ELIOT's existing authorization and Operations rather than Windmill's queues or database.
+**DOC, rechecked 2026-10-03:** [`tokio::sync::watch`](https://docs.rs/tokio/latest/tokio/sync/watch/) retains the latest value, with receiver-local seen state. It is suitable for revision/freshness notification, not guaranteed delivery of every intermediate event.
 
-Do not copy ownership changes based merely on the last editor. In ELIOT, editing a script or imported file cannot quietly make a run act for a more privileged identity. Owner changes use authenticated management authority. Script runs receive scoped invocation access, not an unrestricted copy of the manager credential.
+**DESIGN:** committed Observations/Operations and per-consumer cursors are the durable source. Commit routing/Operation or pending-subject state with cursor advancement. Notify only afterward, and recover even if the notification is lost. Snapshot/cursor subscriptions must cover events racing with reconnect. This uses the existing Store pattern rather than adding a message broker.
 
-Windmill documentation supports the pattern, not the claim that ELIOT's Rust implementation, external effects or isolation have already been qualified. Its other implementation languages and defaults do not override Rust-only internals or ELIOT's default-off choices.
+## 5. Windmill on-behalf execution
 
-## 5. Focused Rust donor: OpenCnid/Symphony
+**DOC, rechecked 2026-10-03:** [roles/run on behalf](https://www.windmill.dev/docs/core_concepts/roles_and_permissions), [jobs](https://www.windmill.dev/docs/core_concepts/jobs), [scheduling](https://www.windmill.dev/docs/core_concepts/scheduling), [draft/deploy](https://www.windmill.dev/docs/core_concepts/draft_and_deploy).
 
-[OpenCnid/symphony](https://github.com/OpenCnid/symphony) is an independent Rust implementation, not a claim about the language of OpenAI's reference. These units were inspected in the preceding source pass:
+Windmill distinguishes permission-bearing execution identity and other job metadata. Its documented schedules/triggers associate execution ownership with their editor. Deployed content and a particular invocation are different objects.
 
-| Unit and evidence identity | Useful behavior | Do not inherit blindly |
+**DESIGN:** take visible execution ownership, independent enablement and retained invocation inputs. Do not inherit last-editor ownership changes, another queue/database or unrestricted privileged tokens. In ELIOT, editing a script never silently changes its manager. Current rights are checked for new effects, and the actual assigned auditor remains the verdict author.
+
+The source supports individual patterns, not full ELIOT correctness, external-script isolation or exact GitHub delivery.
+
+## 6. Temporal schedule semantics
+
+**DOC, rechecked 2026-10-03:** [Schedules](https://docs.temporal.io/schedule) distinguishes a schedule from its already started executions, manual triggering, overlap, catch-up/backfill and calendar semantics.
+
+**DESIGN:** use the distinction, not a Temporal cluster or all its defaults. Disabling future starts does not cancel running work. One-shot manual execution remains possible. Keep intentional re-enable separate from ordinary outage recovery; ordinary ELIOT missed-run handling is latest-only. Never import unlimited historical replay, automatic terminate-and-replace or a new Task graph as an incidental feature.
+
+A repaired candidate returning to audit is legitimate business progression, not timer replay. Generic loop controls must preserve that path while suppressing repeated actions on unchanged evidence.
+
+## 7. MCP discovery and actual capability
+
+**DOC, rechecked 2026-10-03:** [MCP Tools](https://modelcontextprotocol.io/specification/2025-06-18/server/tools) defines paged discovery, schemas and list-change notification. The cited protocol edition locates the reviewed contract; it is not a requirement to freeze negotiated protocol support.
+
+**DESIGN:** catalogue visibility, authorization, harness discovery and model use are different facts. A server listing a tool or emitting `list_changed` does not prove that a client loaded it into the model context. Capture only observed readiness levels; do not launch extra paid model turns to manufacture a probe result. Missing mandatory reporting capability affects its launch, not the whole fleet.
+
+Keep hard server/application authorization and small role surfaces with deferred groups. The normal reviewer result surface is `review.submit` when implemented, not automatic Task mutation merely because a schema is visible.
+
+## 8. Source-level donors retained
+
+### OpenCnid/Symphony
+
+[Repository](https://github.com/OpenCnid/symphony); independent Rust implementation, not the language of OpenAI's reference. The following were inspected in an earlier source pass, not rerun or compiled in this review:
+
+| Unit | Useful pattern | Boundary |
 |---|---|---|
-| [`src/watch.rs`](https://github.com/OpenCnid/symphony/blob/main/src/watch.rs), blob `4a41dbf7c25cda53a61e9c40e4623e3b5e302664` | Parent-directory watching, atomic-save handling, debounce and owner-triggered revalidation | Ignored watcher errors; ELIOT reports gaps and rejects stale revisions. |
-| [`src/workflow.rs`](https://github.com/OpenCnid/symphony/blob/main/src/workflow.rs), blob `c968e53123f311720bd23a34d0822f95337270b1` | Separate configuration, prompt and source directory | Unbounded file read and an unnecessary new YAML/prompt authority. |
-| [`src/agent/claude_code.rs`](https://github.com/OpenCnid/symphony/blob/main/src/agent/claude_code.rs), blob `fa76bcffe0eeda62a6f270491c164978dbfda5b4` | Rust structured process/stdio path and workspace validation | Requested ID mistaken for observed identity, optional bridge failure masking missing reporting, root exit mistaken for child cleanup. |
+| `src/watch.rs`, blob `4a41dbf7c25cda53a61e9c40e4623e3b5e302664` | Parent-directory observation, atomic-save handling and debounce. | Ignored watcher errors must become visible gaps; use shared revision validation. |
+| `src/workflow.rs`, blob `c968e53123f311720bd23a34d0822f95337270b1` | Configuration, source directory and prompt separation. | Do not copy unbounded reads or introduce YAML/prompt authority. |
+| `src/agent/claude_code.rs`, blob `fa76bcffe0eeda62a6f270491c164978dbfda5b4` | Rust structured process/stdio with workspace context. | Requested identity is not observed native identity; root exit is not child cleanup. |
 
-Reuse only after complete unit/license/notices review and ELIOT-specific qualification. This source pass establishes no whole-project fleet or Windows reliability guarantee.
+Complete unit/license/notices review and live ELIOT qualification are required before code reuse.
 
-## 6. Paseo profiles
+### Paseo
 
-**DOC, previously inspected source:** [Agent profiles](https://github.com/getpaseo/paseo/blob/5375f43a051c724d080e41efd73e84ccb6082ff5/public-docs/agent-profiles.md), [Hub workflows](https://github.com/getpaseo/paseo/blob/5375f43a051c724d080e41efd73e84ccb6082ff5/public-docs/hub/workflows.md).
+Previously inspected [profiles](https://github.com/getpaseo/paseo/blob/5375f43a051c724d080e41efd73e84ccb6082ff5/public-docs/agent-profiles.md) and [Hub workflows](https://github.com/getpaseo/paseo/blob/5375f43a051c724d080e41efd73e84ccb6082ff5/public-docs/hub/workflows.md) package provider/model/options and when-to-use guidance.
 
-Profiles group provider/model/native options and when-to-use notes; choices can be whole named configurations rather than incompatible fragments. New defaults concern future selections, not silently mutated running sessions.
-
-**DESIGN:** take this UX for Rust runtime profiles and expose requested/effective route values. Manager model preferences do not turn on unrelated automations. Notes guide choice, not scope or permission. Do not import the TypeScript control plane or attribute main-only source to an installed stable product. Source commits here are evidence, not dependency pins.
-
-## 7. Pause, manual invocation and external owners
-
-### Temporal
-
-**DOC, preceding recheck:** [Schedules](https://docs.temporal.io/schedule). Schedule definition, manual invocation, already-started execution, overlap and catch-up are distinct.
-
-**DESIGN:** disabling recurrence stops future starts, not the existing execution; direct manual actions stay usable. Reuse semantics, not a Temporal cluster or its defaults. ELIOT settings persist across normal restart; current ownership/unknown-effect checks still precede new effects. Intentional re-enable does not replay all historical events.
-
-### GitHub Actions
-
-**DOC, preceding recheck:** [Disable/enable workflows](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/disable-and-enable-workflows), [Cancel a run](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/cancel-a-workflow-run).
-
-**DESIGN:** maintain exact external request/run identity. Disabling a local automation does not modify repository settings or cancel a remote merge/run. Offer supported cancellation separately and read back the result; do not display quiescence while another owner can still act.
-
-### Claude Agent Teams
-
-**DOC, preceding recheck:** [Agent Teams](https://code.claude.com/docs/en/agent-teams). The documented opt-in feature and lighter alternatives support a useful manually managed path rather than requiring every project to run a workflow engine.
-
-**DESIGN:** retain direct peer collaboration and visibility. Native team availability and agent count do not enable ELIOT automations. Backend tool/stream/continuation capabilities still need real qualification.
+**DESIGN:** take complete named choices and future-assignment updates, not TypeScript internals, silent rerouting or profile text as authority. The evidence commit is not an install requirement; main-only source is not proof of installed release parity.
 
 ### Goose
 
-**CODE, prior pass:** [scheduler/common.rs](https://github.com/aaif-goose/goose/blob/591edd47cf2cfea4957d720c607cf2a4def8673d/crates/goose/src/scheduler/common.rs). Bounded recipe capture and its source base directory are useful for external-script invocation integrity. Do not import another schedule registry, assume the entrypoint captures imported dependencies, or require that old commit for installation.
+Previously inspected [scheduler/common.rs](https://github.com/aaif-goose/goose/blob/591edd47cf2cfea4957d720c607cf2a4def8673d/crates/goose/src/scheduler/common.rs) provides useful bounded recipe capture and source-base-directory handling.
 
-## 8. Native interfaces
+**DESIGN:** retain invocation inputs and relevant dependencies. Do not import its independent schedule registry or assume capturing one entrypoint freezes every imported support file.
 
-**DOC:** [Codex app-server](https://developers.openai.com/codex/app-server/), [Claude CLI](https://code.claude.com/docs/en/cli-reference), [Claude hooks](https://code.claude.com/docs/en/hooks), [Gemini CLI hooks](https://geminicli.com/docs/hooks/reference/), [OpenCode plugins](https://opencode.ai/docs/plugins/).
+## 9. Native and GitHub boundaries
 
-These are integration references, not proof of installed support. Use documented protocols from Rust; verify required reports/tools/callbacks. Public OpenCode APIs must match the actual V2 route. Gemini CLI does not establish Spark support. Missing private/non-Rust-only capabilities are named gaps.
+Native references: [Codex app-server](https://developers.openai.com/codex/app-server/), [Claude CLI](https://code.claude.com/docs/en/cli-reference), [Claude hooks](https://code.claude.com/docs/en/hooks), [Gemini CLI hooks](https://geminicli.com/docs/hooks/reference/), [OpenCode plugins](https://opencode.ai/docs/plugins/). These are integration references, not assertions of installed support. Read actual protocols from Rust and preserve exact native lifecycle ownership. Async after-hooks are not vetoes; wrapper exit is not proof native Goal/children stopped.
 
-Async after-hooks are not vetoes. Native Goal/Stop/child events may continue work independently of the observing client. Preserve actual continuation/lifecycle ownership and do not infer completion from wrapper exit.
+GitHub references:
 
-## 9. GitHub contracts retained
+- [Webhook practices](https://docs.github.com/en/webhooks/using-webhooks/best-practices-for-using-webhooks), [signature validation](https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries), [REST practices](https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api): durable authenticated intake, paging, dedupe and reconciliation.
+- [Check runs](https://docs.github.com/en/rest/checks/runs), [protected branches](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches): exact candidate evidence, remote IDs and truthful conclusions; labels are not acceptance.
+- [PR endpoints](https://docs.github.com/en/rest/pulls/pulls), [merge queue](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue): head/base/actual merged result differ; queue capability is optional, not a local distributor dependency.
+- [Disable workflows](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/disable-and-enable-workflows), [cancel a run](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/cancel-a-workflow-run), [trigger workflows](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow): trigger settings, live execution and credential behavior differ. A local disable does not alter remote settings or prove cancellation.
 
-- **Intake:** [webhook practices](https://docs.github.com/en/webhooks/using-webhooks/best-practices-for-using-webhooks), [signature validation](https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries), [REST practices](https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api). Authenticate raw delivery/context; deduplicate, page and reconcile. Source content is not a manager command.
-- **Review:** [Check runs](https://docs.github.com/en/rest/checks/runs), [protected branches](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches). Exact commit and remote IDs matter. Append-style annotations require readback-aware retry. Neutral/skipped behavior is not evidence of an ELIOT pass; labels never carry exact-candidate authority.
-- **Merge:** [PR endpoints](https://docs.github.com/en/rest/pulls/pulls), [merge queue](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue). Head, base and actual integrated result are different. Queue/async acknowledgements are not landed commits. Qualify available repository/endpoint behavior; a native merge queue is not a product prerequisite.
-- **Workflow triggers:** [Trigger workflows](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow). Token/event combinations affect expected checks. Do not fix a missing check by running untrusted code with privileged workflow credentials.
-
-**DESIGN:** one Rust GitHub/effect boundary, actual authenticated App/user attribution, explicit on-behalf manager context internally, no protection bypass and no blind external-effect replay. ELIOT cannot fabricate a human author or global base-CAS exclusion from a local lock. Revalidate endpoint schemas while implementing; prior research is not a permanent API-version constraint.
+Revalidate endpoint and installed-native schemas during implementation; prior source review is not a permanent API-version requirement. No bypass of protections, forged human GitHub actor or privileged untrusted-code workaround.
 
 ## 10. Owner operating evidence
 
-The supplied MANAGER-BRIEF/control-plane audits describe past incidents and changing historical decisions. Current user instructions govern this program; do not copy old pins, mandatory timers or fixed launch counts.
+The supplied MANAGER-BRIEF and control-plane audit are historical evidence with changing instructions, not current product defaults. Do not copy old fixed versions, mandatory counts/timers, stage policies or cleanup commands.
 
-| Incident | Design response |
+| Incident | ELIOT contract response |
 |---|---|
-| Stale queues caused duplicate work | One current reservation across manual and automatic callers. |
-| Late review A changed submission B | Exact candidate anchoring and retained historical late findings. |
-| Native children/Goal revived an old manager | One lifecycle owner; not client/wrapper-based termination. |
-| Stop ended wrappers but left writers | Honest in-flight/unknown ownership and addressed cancellation. |
-| Reminder replaced the current task | Notification is information, not implicit assignment. |
-| Live script edits changed execution | Retain admitted bundle; next independent run resolves active content. |
-| Malformed data stalled every queue | Isolate that source/definition and keep last valid state. |
-| Old deliveries overwhelmed fresh work | Current eligibility and semantic dedupe, not global history replay. |
-| Scripts became the only usable work path | First-class manual handlers in Rust, with optional automatic callers. |
+| Stale queue snapshots created duplicate ownership. | Current shared manual/automatic reservation. |
+| Late A review/return changed B. | Candidate/review-attempt anchors and historical late results. |
+| Deliveries were lost behind marker variants/backlogs. | Durable routing cursor coupled with action or pending state; bounded current-work inclusion. |
+| Native Goal/children revived an old manager. | One real continuation/lifecycle owner, not wrapper-based detection. |
+| Reminders became a model's entire assignment. | Notices are information; separate authorized work delivery. |
+| Same checklist blocked repaired code; new whitespace bypassed old defects. | Relevant source/evidence progression rather than bytes of checklist or random event IDs. |
+| Scripts changed while executing. | Captured invocation inputs; future admissions use new settings. |
+| Malformed data or failed Git read broke every queue. | Scoped gaps, last valid state and fair pending-subject reevaluation. |
+| GitBookkeeping failure repeated real work. | Separate projections/effects and retained remote result. |
+| Long shared logs/tool catalog overwhelmed participants. | Bounded streams/current context and deferred schemas; no transcript copies per observer. |
 
-No donor proves the complete combination already works. Future qualification must cover owner attribution/current permissions, independently enabled entries, manual coexistence, disable/start races, restart recovery, stale candidate handling, actual native capabilities, Windows process ownership and GitHub readback. This documentation PR runs none of those live workflows.
+These failures motivate the changes. They do not prove any ELIOT throughput, model quality or Windows soak result. The integrated qualification matrix remains future work; this PR executes no live automation.
