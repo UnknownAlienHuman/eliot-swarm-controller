@@ -1,7 +1,7 @@
 # ELIOT Agent Communication Program
 ## Start here
 
-**Revision:** 1 — 2026-10-03  
+**Revision:** 2 — 2026-10-03  
 **Repository baseline:** `3ecdf52707731e3f85e85827a88fbdb28d784f3e`  
 **Status:** documentation/implementation handoff. No communication feature is implemented merely because these documents exist.
 
@@ -25,6 +25,16 @@ participants discover owners and current contracts
 
 Peers may coordinate existing assignments. They may not assign work, change Task authority, wake another model automatically or turn consensus into acceptance.
 
+The desired operating result is:
+
+```text
+most seams resolved through current facts, one direct question or one deterministic handshake
+Root/General Manager sees exceptions rather than relaying ordinary engineering mail
+auditor verifies durable agreements/evidence rather than approving routine conversation
+```
+
+This is a design target, not a measured current capability.
+
 ## 2. Required reading and precedence
 
 Implementation agents read in this order:
@@ -36,7 +46,8 @@ Implementation agents read in this order:
 5. [Implementation Issue Plan](agent-communication-implementation-issues.md) — execution policy and the unchanged mailbox/scope/Git/Concilium/verification slices; use the amended sequence below.
 6. [Agent Communication and Concilium](agent-communication-concilium.md) — complete architecture and non-goals.
 7. [Tool Contracts](agent-communication-tool-contracts.md) — expanded schemas and recovery examples.
-8. [Field Evidence and Donor Map](agent-communication-field-evidence.md) — rationale and negative cases, not product authority.
+8. [Peer Autonomy Source Map](agent-communication-peer-autonomy-sources.md) — official Agent Teams/OpenAI/Gas Town/Overstory/Agency Swarm behavior and fleet lessons.
+9. [Field Evidence and Donor Map](agent-communication-field-evidence.md) — broader donor, issue and research evidence, not product authority.
 
 When examples disagree, use the highest applicable item in this list. Do not reconcile by inventing a third mechanism.
 
@@ -82,6 +93,19 @@ git.who_works_here
 ```
 
 The participant should not manually orchestrate many low-level calls for an ordinary seam.
+
+The cheapest operation that can answer the question must be used:
+
+```text
+current card field
+  before quick ask
+quick ask
+  before full thread
+integration handshake
+  before manager decision
+manager decision
+  before Concilium
+```
 
 ## 5. Authority summary
 
@@ -133,7 +157,9 @@ Otherwise it becomes one `pending_manager` digest item. The auditor is not a rou
 - no durable liveness/status mail;
 - no all-agent directory as ordinary UX;
 - no manager copy of compatible handshakes;
-- no automatic escalation timer that creates model work.
+- no automatic escalation timer that creates model work;
+- no message body interpreted as `assign`, `dispatch`, `accept`, `merge`, `publish` or role change;
+- no full conversation transcript sent by default.
 
 ## 8. Concilium boundary
 
@@ -165,6 +191,8 @@ local IPC and typed MCP facade
 ```
 
 It adds no second database, broker, event store, daemon, shared chat server or per-agent background polling task.
+
+Registered inactive participants consume no model turn and no dedicated Tokio task. Current cards and manager digest are revisioned projections; ordinary liveness is not durable mail.
 
 ## 10. Privacy
 
