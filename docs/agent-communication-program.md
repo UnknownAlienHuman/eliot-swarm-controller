@@ -1,9 +1,9 @@
-# ELIOT Agent Communication Program
+# ELIOT Agent Communication, Launcher and MCP Program
 ## Start here
 
-**Revision:** 4 — 2026-10-03  
-**Repository baseline:** `3ecdf52707731e3f85e85827a88fbdb28d784f3e`  
-**Status:** documentation/implementation handoff. No communication feature is implemented merely because these documents exist.
+**Revision:** 5 — 2026-10-03  
+**Source baseline:** `main` at `35e499ae73b622d873c44873f6993ee3fcbea87b`  
+**Status:** documentation/implementation handoff. No communication, launcher or deferred-catalog capability is implemented merely because these documents exist.
 
 ## 1. Product decision
 
@@ -16,21 +16,25 @@ manager assigns Task/Attempt  ->    discover, publish, ask, compare, coordinate,
 scoped identity/workspace           volunteer, assume, negotiate and record             external effects/policy
 ```
 
-The controller is a capability and coordination service, not an approval machine.
-
-Participants may coordinate existing assignments directly. They may not turn communication into Task assignment, recursive model spawning, scope expansion, merge, acceptance, policy change or an irreversible external effect.
+The controller is a capability and coordination service, not an approval machine or a chat room.
 
 The desired common path is:
 
 ```text
-manager assigns work once
+manager sees dashboard + ranked queue
         │
         ▼
-local relevant-neighborhood context
+launch.preview resolves exact Task, workspace, peers, overlap, route and MCP surface
+        │
+        ▼
+launcher establishes one manager-owned work context and verifies actual capabilities
+        │
+        ▼
+participant sees only its bounded relevant neighborhood
         │
         ├── current card/fact ───────────────────────────► continue
-        ├── one precise owner ask ───────────────────────► continue
-        ├── integration cell + deterministic comparison ► peer-local agreement
+        ├── one precise owner consultation ─────────────► continue
+        ├── integration cell + pure comparison ─────────► peer-local agreement
         ├── reversible recorded assumption ─────────────► continue and revalidate later
         └── authority/global conflict ──────────────────► one manager exception
                                                              │
@@ -39,11 +43,7 @@ local relevant-neighborhood context
 
 Root/General Manager sees exceptions rather than relaying routine engineering mail. The auditor verifies durable agreements and implementation evidence rather than approving conversation.
 
-This is a design target, not a measured current capability.
-
-## 2. Fleet-scale model
-
-Keep four quantities separate:
+## 2. Four quantities that must remain separate
 
 ```text
 P = registered/discoverable participants
@@ -52,7 +52,7 @@ E = current material coordination edges
 X = unresolved exceptions requiring manager authority
 ```
 
-A correct large fleet may have thousands of registered participants while active turns remain bounded by runtime/provider/host capacity. Normal coordination is sparse and local. Manager attention follows real exceptions, not population size.
+A correct fleet may have thousands of registered participants while active turns remain bounded by runtime/provider/host capacity. Normal coordination is sparse and local. Manager attention follows real exceptions, not population size.
 
 Never equate:
 
@@ -62,6 +62,9 @@ stored message with a started or informed model turn
 one project with one shared room
 P participants with P² communication edges
 participant count with manager authority
+visible tool with authorized tool
+configured tool with runtime-visible working tool
+loaded schema with expanded application authority
 ```
 
 ## 3. Required reading and precedence
@@ -69,79 +72,207 @@ participant count with manager authority
 Implementation agents read in this order:
 
 1. Product architecture, module contract and [Owner Decisions](owner-decisions.md).
-2. [Fleet-Scale Freedom](agent-communication-fleet-scale-freedom.md) — current product law for large populations, sparse relevance, integration cells, delivery truth, backpressure, active-turn separation and qualification. **This file supersedes older count-based sponsorship, global-directory, auto-expiry and multi-party-chat examples.**
-3. [Peer Autonomy Implementation Amendment](agent-communication-peer-autonomy-implementation.md) — `Role::Participant`, scoped credentials and source-exact routing. It remains authoritative except where fleet-scale methods/sequence are amended above.
-4. [Peer Autonomy and Integration Handshake](agent-communication-peer-autonomy.md) — self-service coordination and the autonomy envelope.
-5. [Implementation Checklist](agent-communication-implementation-checklist.md) — current Store/mailbox/Git constraints except where amended above.
-6. [Implementation Issue Plan](agent-communication-implementation-issues.md) — execution policy and unchanged mailbox/scope/Git/Concilium/verification slices; use the amended sequence below.
-7. [Agent Communication and Concilium](agent-communication-concilium.md) — broader architecture and Concilium. Older illustrative schemas are non-normative when corrected by items 2–5.
-8. [Tool Contracts](agent-communication-tool-contracts.md) — expanded schemas and recovery examples subject to the same precedence.
-9. [Fleet-Scale Source Map](agent-communication-fleet-scale-sources.md) — Agensh, Anthropic/OpenAI/Claude, topology research, donor and user field evidence. Evidence only; not product authority.
-10. [Peer Autonomy Source Map](agent-communication-peer-autonomy-sources.md) — official system behavior and earlier fleet lessons.
-11. [Field Evidence and Donor Map](agent-communication-field-evidence.md) — broader evidence, not product authority.
+2. [Fleet-Scale Freedom](agent-communication-fleet-scale-freedom.md) — fleet law, sparse relevance, integration cells, delivery truth, backpressure and active-turn separation.
+3. [MCP Tool Catalog and Deferred Loading](mcp-tool-catalog-and-loading.md) — hard profiles, small role surfaces, searchable groups, pagination and runtime capability receipts.
+4. [Swarm Launcher and Assignment Context](swarm-launcher-assignment-context.md) — manager dashboard/queue, launch preview, compact assignment packet, Git overlap and event-driven reminders.
+5. [Peer Autonomy Implementation Amendment](agent-communication-peer-autonomy-implementation.md) — scoped `Role::Participant`, credentials and source-exact routing.
+6. [Peer Autonomy and Integration Handshake](agent-communication-peer-autonomy.md) — self-service coordination and autonomy envelope.
+7. [Implementation Checklist](agent-communication-implementation-checklist.md) — current Store/mailbox/Git constraints except where amended above.
+8. [Implementation Issue Plan](agent-communication-implementation-issues.md) — execution policy and older slice templates; use the current sequence in §4.
+9. [Agent Communication and Concilium](agent-communication-concilium.md) — broader architecture and Concilium. Older illustrative schemas are non-normative where corrected above.
+10. [Tool Contracts](agent-communication-tool-contracts.md) — expanded schemas/recovery examples subject to the same precedence.
+11. [Fleet-Scale Source Map](agent-communication-fleet-scale-sources.md), [MCP/Launcher Source Map](mcp-tool-catalog-sources.md), [Peer Autonomy Source Map](agent-communication-peer-autonomy-sources.md) and [Field Evidence](agent-communication-field-evidence.md) — evidence only, not product authority.
 
-When examples disagree, use the highest applicable item. Do not reconcile them by inventing a third mechanism.
+When examples disagree, use the highest applicable item. Do not reconcile them by inventing another identity, queue, role, task store, delivery path, tool authority or model loop.
 
 ## 4. Current implementation sequence
 
 ```text
-A1  extract existing mailbox primitive without behavior change
+A1  extract/reuse the existing mailbox primitive without behavior change
+
 A2  add scoped Participant role/registration, verified coordination profile,
     sparse relevance indexes and current work/contract cards
-A3  add exact card-field lookup, quick ask/answer, reversible assumptions,
-    truthful delivery dispositions and inbound policy without model wake
+
+A3  add exact field lookup, quick ask/answer/consultation, reversible assumptions,
+    watches/reminders, truthful delivery dispositions and inbound policy
+
 A4  add producer/consumer comparator, revisioned integration cells,
     voluntary local coordination and peer-local autonomy classifier
+
 A5  add irreducible bilateral negotiation and manager-required/global contract path
-A6  add advisory code scopes
-A7  add bounded read-only Git inspection
-A8  add durable manager-sponsored Concilium state without automatic model execution
-A9  expose CLI/MCP convenience tools, deferred low-level tools,
-    local-neighborhood/fleet views, subscriptions and metrics
-A10 run integrated correctness, sparse-graph scale, staged active-turn,
-    recovery, cost and live qualification
+
+A6  add advisory code scopes and bounded read-only Git/worktree inspection
+
+A7  add high-level read projections:
+    swarm.dashboard / queue.get / assignment.get+preview / context.get /
+    agent.inspect / exceptions.get / capacity.get / overlap.check
+
+A8  add launch.preview and manager-owned launch orchestration using existing
+    Task/Attempt/Operation/binding/workspace authorities plus capability receipt
+
+A9  refactor MCP registry metadata; add grouped role surfaces, deterministic paged
+    tools/list, deferred searchable groups and catalog revision
+
+A10 add durable manager-sponsored Concilium state without automatic model execution
+
+A11 expose typed CLI/MCP/UI surfaces, subscriptions, compact rendering and status
+
+A12 run integrated correctness, sparse-graph/catalog scale, staged active-turn,
+    recovery, cost, wrong-tool and live qualification
 ```
 
-One Issue implements one complete slice. One manager owns its worktree/candidate. Writers do not run Cargo. The manager integrates/reviews all diffs and runs the current scoped formatting/minimal warnings-denied Clippy gate once on the final candidate. Integrated tests/load/live model work belong to A10 unless the owner explicitly advances a named check.
+One Issue implements one complete slice. One manager owns its worktree/candidate. Writers do not run Cargo. The manager integrates/reviews all diffs and runs the current scoped formatting/minimal warnings-denied Clippy gate once on the final candidate. Integrated tests/load/live model work belong to A12 unless the owner explicitly advances a named check.
 
-## 5. Common agent UX
+## 5. Three-layer MCP model
 
-The ordinary participant sees five primary affordances:
+MCP configuration has three independent layers:
 
 ```text
-coordination.context.get
-coordination.ask_owner
+hard profile     maximum methods the credential may ever discover/call
+surface          small role-specific initial tool set
+catalog/groups   authorized deferred tools searchable on demand
+```
+
+Rules:
+
+- profile denial hides a method from list/search and rejects manual call before IPC;
+- deferred loading never widens role, Task ownership, project scope or GM authority;
+- the application method rechecks authorization after MCP dispatch;
+- the normal role starts with approximately 5–9 high-level tools;
+- low-level, rare and authority-sensitive methods remain searchable or manual-only;
+- `full` remains explicit local compatibility/debug surface, not the default;
+- unsupported tool search never silently falls back to the full profile.
+
+Current `main` already provides closed `observer/reviewer/manager/gm/full` MCP profiles, profile-bound client identity, pre-dispatch filtering and caller-owned mutation IDs. The implementation extends that sound boundary; it does not replace it.
+
+## 6. Common role surfaces
+
+### Participant core
+
+```text
+swarm.context.get
+swarm.tools.search
+coordination.send
+coordination.inbox
+coordination.consult
+coordination.sync_integration
+coordination.watch.create
+swarm.overlap.check
+operation.get
+```
+
+### Manager core
+
+```text
+swarm.dashboard
+swarm.queue.get
+swarm.launch.preview
+swarm.launch
+swarm.agent.inspect
+swarm.agent.steer
+swarm.exceptions.get
+operation.get
+swarm.tools.search
+```
+
+### Reviewer core
+
+```text
+swarm.review.context
+task.submission
+artifact.read
+check.get
+task.request_changes
+operation.get
+swarm.tools.search
+```
+
+GM/operator uses the manager core. Acceptance, publication and administration remain deferred/manual-only even for a powerful identity.
+
+## 7. Tool groups
+
+The catalog is grouped by intent. Each model-facing group should normally contain about 4–9 methods:
+
+```text
+core
+participant-coordination
+assignment-read
+manager-core
+runtime-control
+runtime-recovery
+monitoring
+git-read
+task-management
+review
+acceptance-effects
+administration
+schedules
+mailbox-raw
+```
+
+A high-level common-path method should replace several manual low-level calls. Raw methods remain available for precise diagnostics where authorized.
+
+## 8. Launcher contract
+
+`swarm.launch.preview` is read-only. It resolves:
+
+```text
+exact Task revision/policy/source index/dependencies
+queue rank and reason
+current Attempt/owner
+manager-owned workspace/branch/write lease
+related assignments and contract owners
+scope/Git overlap and coverage gaps
+route/model/effort/budget enforceability
+MCP hard profile/surface/deferred groups/catalog revision
+hard blocks and warnings
+```
+
+`swarm.launch` accepts the exact preview digest and a caller-owned request ID. It revalidates every mutable input, commits intent before external effects, prepares/verifies the workspace before the model starts, reuses existing Task/Attempt/Agent Operations, registers a scoped Participant, starts the exact runtime and records actual MCP capabilities.
+
+A lost reply never creates a replacement Attempt, worktree, binding or native session. Unknown effects are reconciled by exact readback.
+
+## 9. Assignment packet
+
+The launched model receives a compact revisioned packet, not a copied project history:
+
+```text
+Task/Attempt/assignment identity and freshness
+objective, non-goals and exact current requirements
+canonical source index and gaps
+workspace/baseline/allowed mutation scope/write lease
+queue/dependency reason relevant to this work
+related peers and why they are relevant
+provided/required contracts and integration cells
+scope/Git overlap summary
+runtime route/model/effort/budget facts and enforcement gaps
+MCP core/deferred capability receipt
+output/submission/evidence/stop/escalation contract
+coverage and gaps
+```
+
+Full sources, messages, queue pages, diffs, logs and artifacts remain pullable on demand.
+
+## 10. Common agent UX
+
+The ordinary participant should need five conceptual affordances:
+
+```text
+swarm.context.get
+coordination.consult
 coordination.publish_contract
 coordination.sync_integration
 coordination.peer_agree
 ```
 
-`sync_integration` is the high-level operation. It reads current cards, resolves exact affected owners, updates the caller's offer/requirement, updates/coalesces a revisioned integration cell, runs the pure comparator and returns the next useful action. It does not invoke another model.
-
-Supporting tools are deferred/discoverable:
-
-```text
-coordination.peer.find
-coordination.inbox
-coordination.work_card.get/list
-coordination.contract_card.get/list
-coordination.ask.get/list
-coordination.cell.open/get/list/update/ack/supersede
-coordination.integration.check/get
-coordination.agreement.get/list
-coordination.assumption.record/get/list
-code.scope.inspect/conflicts
-git.who_works_here
-```
-
-The participant should not manually orchestrate many low-level calls for an ordinary seam.
+`context.get` also shows pending messages/watches, own Task/submission state, relevant peers and overlap.
 
 The cheapest operation that can answer the question is used:
 
 ```text
 current structured field
-  before quick ask
-quick ask
+  before consultation/message
+one exact consultation
   before integration cell/thread
 pure comparison + integration cell
   before manager decision
@@ -149,167 +280,189 @@ manager decision
   before Concilium
 ```
 
-## 6. Authority summary
+## 11. Watches and reminders
 
-### Participant may
+A reminder observes an exact existing fact and produces a small freshness hint. It does not start work.
 
-- read the exact current Task/Attempt neighborhood relevant to its assignment;
-- publish its own material work/contract card;
-- discover the exact current owner of a contract/path/symbol;
+Examples:
+
+```text
+ask answered
+contract/cell revision changed
+scope released/changed
+Task/Attempt revision changed
+Operation terminal
+owner available
+exact deadline reached
+```
+
+Watches are bounded, coalesced and normally one-shot. They create no per-agent polling task and no model turn. A schedule is different: it may admit a future typed Operation under scheduler authority. Arbitrary scheduled prompts are not a reminder implementation.
+
+## 12. Git and current ownership
+
+`swarm.overlap.check` and the deferred `git-read` group combine:
+
+```text
+current ELIOT Task/Attempt/scope ownership
+manager worktree/branch/write lease
+uncommitted/changed paths
+baseline-to-candidate paths
+contract/path/symbol relations
+optional history/blame labelled as provenance only
+coverage and gaps
+```
+
+ELIOT records decide current owner. Branch names, commit authors and blame do not.
+
+One manager owns one mutable candidate/worktree/write-lease lineage. Many read-only peers may inspect, coordinate and review. Independent writers require independent authorized scopes/worktrees or a manager decision.
+
+## 13. Peer-local authority
+
+Participant may:
+
+- read its exact work neighborhood;
+- publish work/contract cards;
+- find exact owners;
 - ask, answer, redirect, abstain or report unknown;
-- publish producer/consumer/carrier offers and requirements;
-- join/update a relevant integration cell;
-- coordinate sequencing or volunteer as an integrator/reviewer inside existing scope;
-- record a reversible local assumption and continue;
-- acknowledge or object to a compatible peer-local agreement;
-- propose advisory scope and inspect overlap;
-- propose a bilateral thread or Concilium escalation.
+- join/update relevant integration cells;
+- volunteer as integrator/reviewer inside existing scope;
+- record a reversible local assumption;
+- acknowledge/object to a compatible local agreement;
+- inspect scope/Git overlap;
+- propose escalation or Concilium.
 
-### Participant may not
+Participant may not:
 
 - create/revise/claim/dispatch/accept Tasks;
 - bind/release Attempts;
 - spawn, wake, resume or control another model/session;
-- run checks or publish/merge through communication authority;
+- expand scope or displace an owner;
+- publish/merge/accept;
 - change roles, credentials, GM epoch, security or project policy;
-- expand scope or displace another mutation owner;
-- ratify a manager-required/global contract;
-- open/advance/close Concilium;
-- turn prose, consensus, a voluntary intent or silence into assignment/acceptance.
+- turn prose, consensus, silence, a watch or tool activation into authority.
 
-## 7. Peer-local agreement boundary
+## 14. Peer-local agreement boundary
 
-Peer-local agreement is allowed when it:
+A local agreement is allowed when:
 
-- involves all directly affected current owners, not every observer/member;
-- stays inside existing scopes and canonical Task/documentation;
-- changes no public/global interface beyond represented assignments;
-- changes no persistence, security, identity, retry/fencing/lifecycle owner, external effect, provider/model/billing or project acceptance policy;
-- has a complete deterministic compatibility result with no required unknown dimension;
-- is acknowledged against exact revisions/digests;
-- has no unresolved affected-owner objection.
+- all directly affected current owners are represented;
+- it stays inside existing scopes and canonical Task/documentation;
+- required compatibility dimensions are known;
+- exact revisions/digests are acknowledged;
+- no affected owner has an unresolved objection;
+- it changes no global/public interface outside represented assignments;
+- it changes no persistence, security, identity, retry/fencing/lifecycle owner, provider/billing/acceptance policy or irreversible external effect.
 
-Otherwise it becomes one coalesced `pending_manager` digest item.
+Otherwise it becomes one coalesced manager exception. Participant count alone is not a manager boundary.
 
-**Participant count alone is not a manager boundary.** A large justified seam may use a revisioned integration cell. Count creates a warning/partition suggestion; authority, relevance, unknowns and affected ownership decide escalation.
-
-Several peers agreeing does not make a claim verified. Verification/acceptance remains protected and separate.
-
-## 8. Integration cells, not multi-party chat
-
-A multi-party integration cell contains revisioned structured state for one exact seam:
+Agreement is not verification:
 
 ```text
-affected current owners and bases
-offers and requirements
-carrier constraints
+asserted -> peer_agreed -> manager_ratified -> implemented -> verified
+```
+
+A counterexample may refute or supersede any unverified claim.
+
+## 15. Integration cells, not multi-party chat
+
+A revisioned integration cell contains:
+
+```text
+affected owners and participation bases
+producer offers / consumer requirements / carrier constraints
 comparison per dimension
 unknowns/evidence gaps
 assumptions and invalidation conditions
-voluntary implementation/integration intents
+voluntary integration intents
 acknowledgements and objections
 peer-local agreement or pending-manager result
 ```
 
-It is not a shared transcript and does not schedule speakers or turns.
+It is not a transcript and schedules no speakers. Only affected owners block the relevant decision. Observers do not create a barrier.
 
-Membership is derived from exact current relations and immutable for one lineage. A changed affected-owner set creates a successor cell. Only affected owners block the relevant decision; observers do not create barrier synchronization.
+## 16. Delivery truth and anti-spam
 
-## 9. Delivery truth and no-spam rules
-
-Delivery states are distinct:
+Delivery states remain distinct:
 
 ```text
-stored
-available
-presented
-consumed
-held
-refused
-cancelled
-stale
+stored / available / presented / consumed / held / refused / cancelled / stale
 ```
 
 `stored` never implies `presented`; `presented` never implies agreement or verification.
 
 Rules:
 
+- one exact recipient, no default broadcast/reply-all;
 - current card/field before message;
-- one exact recipient, never default broadcast;
-- local-neighborhood query instead of all-agent directory injection;
-- one unresolved ask fingerprint, not repeated reminders;
-- no mandatory thanks/acknowledgement turn;
+- one unresolved ask/watch fingerprint;
+- no mandatory thanks/ack turn;
 - no automatic model wake or peer-recursive spawn;
 - safe-boundary header, body on explicit read;
 - no durable liveness/status chatter;
 - no manager copy of compatible local coordination;
-- no automatic escalation timer that creates model work;
-- no message body interpreted as `assign`, `dispatch`, `accept`, `merge`, `publish` or role change;
-- no full conversation transcript sent by default;
-- no authority/security boilerplate rendered repeatedly as human chat.
+- no automatic escalation/model work from timers;
+- no full transcript or full tool catalog injected by default;
+- no repeated authority boilerplate rendered as human chat;
+- backpressure preserves unique facts and degrades presentation to pull/digest;
+- partial/truncated data returns explicit coverage/gaps, never empty success.
 
-Under load, unique useful facts remain durable while presentation may degrade to pull-only/digest. Duplicate asks and unchanged material cards coalesce. Pressure/truncation returns explicit dispositions/gaps; it never becomes empty success.
+## 17. Concilium boundary
 
-## 10. Assumptions and momentum
-
-An unanswered question does not automatically block development.
-
-A participant may record and proceed under a `local_reversible` assumption when it stays inside current authority/scope, is reversible in the candidate and is not sensitive to security, identity, persistence, lifecycle or external effects. It records affected contract/path/symbol and an invalidation condition.
-
-A later contradictory answer marks dependent cards/cells/work stale. It does not silently rewrite or roll back code.
-
-Authority-sensitive or irreversible assumptions remain `manager_required`.
-
-## 11. Concilium boundary
-
-Concilium is the last escalation level, not the normal way to stitch code.
+Concilium is the last escalation level:
 
 - participant may propose;
 - manager/current GM previews and confirms reasonability;
 - `open` creates immutable slots and starts no model;
-- positions are independent and claim/evidence based;
+- positions are independent and evidence based;
 - manager explicitly advances rounds;
 - dissent, correlation and unknowns are retained;
 - result is advisory;
 - manager separately decides;
 - verification/acceptance remain separate.
 
-## 12. Storage/runtime decision
+## 18. Storage/runtime decision
 
 V1 reuses:
 
 ```text
 existing Store/SQLite owner
+existing Task/Attempt/Operation authority
 existing client registrations/meta
 existing Operations and Observations
 existing mailbox delivery/reply/cancellation
-revisioned namespaced per-object current projections
+revisioned per-object current projections
 existing immutable artifacts
 bounded Tokio mpsc/oneshot/watch
 local IPC and typed MCP facade
 ```
 
-It adds no second database, broker, event store, daemon, shared chat server or per-agent background polling task.
+It adds no second task store, database, event log, broker, daemon, shared chat server or per-agent polling task.
 
-Registered inactive participants consume no model turn and no dedicated Tokio task. Do not store the entire fleet/graph/cell set in one giant `meta` value or reconstruct current state with a full unbounded Observation scan. A reviewed table migration is evidence-triggered by measured contention/scan/hot-row cost.
+Registered inactive participants consume no model turn and no dedicated Tokio task. Do not store the whole fleet/catalog/graph/cell set in one giant value or rebuild current state through a full unbounded history scan. A schema migration is evidence-triggered by measured contention/scan/hot-row cost.
 
-## 13. Fleet qualification
+## 19. Qualification
 
-A10 validates separately:
+A12 validates separately:
 
 ```text
-large registered population and sparse indexed state
-simulated active runtime identities without paid calls
-staged live active turns: 4 -> 16 -> 32 -> 64 -> 128
-restart/recovery, stale generations and malformed actors
-useful output/cost, duplicate work, conflicts and manager attention
-cards/cells versus free-form chat and manager relay
+10,000 registered Participants
+thousands of current cards/cells/watches
+100,000 mixed coordination/catalog mutations
+500 bounded readers
+zero automatic model invocations
+paged/searchable catalog with hidden-tool non-disclosure
+prompt/schema token cost by role
+search hit and wrong-tool rate
+launch capability receipt and missing-core failures
+simulated active runtime identities
+staged live turns: 4 -> 16 -> 32 -> 64 -> 128
+restart/recovery/stale generations/malformed actors
+useful output per cost, duplicate work, conflicts and manager attention
+cards/cells/launcher packet versus shared chat and manager relay
 ```
 
-The storage contour includes 10,000 Participant registrations, thousands of current cards/cells and 100,000 mixed coordination mutations with zero automatic model invocations. These are qualification targets, not current capacity claims.
+These are qualification targets, not current capacity claims. A later 1,024-agent experiment requires distributed capacity, explicit cost approval and a factorizable benchmark.
 
-A later 1,024-agent live experiment requires distributed capacity, explicit cost approval and a factorizable benchmark. It is not a first-host acceptance target.
+## 20. Privacy
 
-## 14. Privacy
-
-Repository documentation and examples contain placeholders only. Real domains, infrastructure IDs, credentials, local usernames and private paths remain local installation data and never enter Git, prompts or coordination records.
+Repository documentation and examples contain placeholders only. Real domains, infrastructure IDs, credentials, local usernames and private paths remain local installation data and never enter Git, prompts, catalog schemas, launch packets or coordination records.
