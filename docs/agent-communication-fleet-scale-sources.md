@@ -1,11 +1,11 @@
 # ELIOT Agent Communication — Fleet-Scale Source Map
-## Donor implementations, official guidance and field reports for tens to 1,024 agents
+## Donor implementations, official guidance, scaling research and field reports
 
-**Revision:** 1 — 2026-10-03  
+**Revision:** 2 — 2026-10-03  
 **Companion to:** [Fleet-Scale Freedom](agent-communication-fleet-scale-freedom.md)  
 **Purpose:** preserve the evidence behind the product decisions. This file is not product authority and does not override the normative documents.
 
-## 1. Evidence labels
+## 1. Evidence labels and rules
 
 ```text
 PAPER       peer-reviewed/preprint research result
@@ -21,9 +21,10 @@ Rules:
 
 - a benchmark result is not a production guarantee;
 - a feature on `main` is not silently attributed to a stable release;
-- a GitHub issue is evidence that a failure occurred, not its population frequency;
-- a large registered population is not evidence for the same number of simultaneous model turns;
-- stars, ratings and dashboard activity do not prove correctness, cleanup or economical coordination.
+- a GitHub issue proves that a failure occurred, not its population frequency;
+- large registered population is not evidence for the same number of simultaneous model turns;
+- stars, ratings and dashboard activity do not prove correctness, cleanup or economical coordination;
+- research numbers are carried with their task, topology, model and budget limitations.
 
 ## 2. Microsoft Agensh — direct 1,024-agent research evidence
 
@@ -53,7 +54,7 @@ message interface
 shared reusable context
 ```
 
-The paper's shared context distinguishes work/findings such as observations, facts, failures, claims and patch summaries. Direct messages resolve overlaps/conflicts; shared context carries reusable state.
+Shared context distinguishes observations, facts, failures, claims and patch summaries. Direct messages resolve overlaps/conflicts; shared context carries reusable state.
 
 ### Reported results
 
@@ -70,7 +71,7 @@ pandoc, six-hour/no-Internet budget
 
 The 128 → 1,024 increase is 4.12 points. Returns are clearly diminishing even though they remain positive on this task.
 
-### Observed cooperation described by the authors
+### Cooperation described by the authors
 
 ```text
 8 agents      interface agreement and component splitting
@@ -108,19 +109,19 @@ Do not take:
 
 Reported:
 
-- multi-agent system outperformed a single-agent baseline by 90.2% on an internal research evaluation;
-- multi-agent research consumed approximately 15× the tokens of ordinary chat;
-- early failures included spawning about 50 subagents for simple queries, endless search and excessive status updates;
-- practical prompts bound objectives, outputs, tools/sources and work boundaries;
-- coding work with shared state is less naturally parallel than breadth-first research;
+- 90.2% improvement over a single-agent baseline on an internal research evaluation;
+- approximately 15× ordinary chat token usage;
+- early failures that spawned about 50 subagents for simple queries, searched indefinitely or produced excessive updates;
+- better behavior with explicit objective/output/tool/source/boundary instructions;
+- less natural parallelism for coding with shared state than breadth-first research;
 - direct artifact output can avoid coordinator summarization loss;
 - stateful agents require checkpoints/resume and compound failures.
 
 ELIOT decision:
 
 - active-turn count is a separately governed runtime resource;
-- a coordinator is not a message relay;
-- state and artifacts bypass telephone-game summaries;
+- coordinator is not a message relay;
+- state/artifacts bypass telephone-game summaries;
 - topology/status is observable without full-transcript surveillance;
 - communication never recursively spawns agents.
 
@@ -133,24 +134,24 @@ Reported:
 - 16 agents, roughly 2,000 sessions, about two billion input tokens and 140 million output tokens;
 - separate containers and a shared Git repository;
 - frequent merge conflicts;
-- fresh sessions used durable progress files;
+- fresh sessions oriented through durable progress files;
 - strong tests/oracles were essential;
-- parallelism failed when every worker converged on one monolithic kernel/verifier issue;
-- refactoring the oracle/problem into independently verifiable subsets restored useful parallel work;
+- parallelism failed when all workers converged on one monolithic kernel/verifier issue;
+- independently verifiable partitions restored useful parallel work;
 - output still required review and had quality limitations.
 
 ELIOT decision:
 
 - expose hotspots and allow one integrator instead of forcing parallel writers;
 - preserve one writer/lease per mutable candidate scope;
-- maximize collaboration before the protected verifier, not after it;
-- make compact durable state more important than preserving long model context.
+- maximize collaboration before protected verification, not after it;
+- prefer compact durable state over preserving long model context.
 
 ### 3.3 Automated Alignment Researchers
 
 - OFFICIAL: [Automated Alignment Researchers](https://www.anthropic.com/research/automated-alignment-researchers).
 
-Nine agents received different starting directions, shared a forum and code storage, and self-directed experiments over 800 cumulative agent-hours. This supports a bounded form of free collaboration and differentiated exploration, but it is a research setting with explicit infrastructure and high cost, not evidence for unbounded coding swarms.
+Nine agents received different starting directions, shared a forum and code storage, and self-directed experiments over 800 cumulative agent-hours. This supports bounded free collaboration and differentiated exploration, but it is a high-cost research setting, not evidence for unbounded coding swarms.
 
 ## 4. OpenAI official multi-agent semantics
 
@@ -172,7 +173,81 @@ ELIOT decision:
 - registered participant population does not determine active-turn concurrency;
 - no peer message can silently become a runtime operation.
 
-## 5. Claude Code Agent Teams and cross-session messaging
+## 5. Scaling and communication-topology research
+
+### 5.1 Coordination does not scale monotonically
+
+- PAPER: [Towards a Science of Scaling Agent Systems](https://arxiv.org/abs/2512.08296).
+
+Across 180 controlled configurations, the authors report:
+
+- tool-heavy tasks suffer disproportionately from multi-agent overhead under fixed budgets;
+- coordination shows diminishing/negative returns once the single-agent baseline is already strong;
+- independent-agent error propagation was much larger than centralized containment in their setup;
+- all tested multi-agent variants degraded sequential-reasoning tasks by 39–70%;
+- optimal architecture depends on measurable task properties.
+
+ELIOT implication: do not treat agent count as a universal improvement knob. Preserve central assignment/verification while allowing local peer coordination only where the work graph is actually parallel.
+
+### 5.2 Direct messaging tends toward quadratic growth
+
+- PAPER: [When Agents Coordinate: Measuring Coordination in Multi-Agent AI Coding](https://arxiv.org/abs/2608.16801).
+
+Across 1,902 runs, the paper reports:
+
+- direct messages initially grow close to quadratically with team size;
+- much growth is an early introduction/coordination round;
+- shared files reduced output tokens by about 42% at eight agents on message-heavy work;
+- shared files add overhead when the task already carries coordination naturally;
+- shared-spec tasks form dense networks, while pipeline tasks form sparse local-interface networks;
+- merely naming one coordinator created no reliable hub or success gain.
+
+ELIOT implication:
+
+- structured cards/cells should replace repeated introductions and 1:1 restatement;
+- topology must follow the task/dependency graph;
+- a manager role alone does not solve coordination unless current state and authority are mechanical;
+- ordinary pipeline integration should be sparse around local seams.
+
+### 5.3 Dynamic topology can reduce cost
+
+- PAPER: [Adaptive Graph Pruning for Multi-Agent Communication](https://journals.sagepub.com/doi/10.3233/FAIA251326).
+- PAPER: [GoAgent: Group-of-Agents Communication Topology Generation](https://arxiv.org/abs/2603.19677).
+- PAPER: [AgentConductor: Topology Evolution for Multi-Agent Code Generation](https://arxiv.org/abs/2602.17100).
+
+These systems report performance/cost improvements from adapting agent count, groups and communication density to the task rather than using a complete/static graph. Their learned benchmark topologies are not directly reusable as ELIOT production policy.
+
+ELIOT implication: build a deterministic sparse relevance graph from current Tasks/contracts/scopes first. Later learned ranking/pruning is optional and must never become authority or hide coverage gaps.
+
+### 5.4 Dense coupling can collapse diversity
+
+- PAPER: [Diversity Collapse in Multi-Agent LLM Systems](https://aclanthology.org/2026.findings-acl.13/).
+
+The paper reports diminishing group-size returns and faster premature convergence under dense communication topology.
+
+ELIOT implication:
+
+- do not broadcast all peer reasoning to all models;
+- preserve independent exploration/review contexts;
+- Concilium round 1 remains blind/independent;
+- agreement is revisioned and can be refuted by a later counterexample;
+- shared state contains claims/evidence, not everyone's full reasoning transcript.
+
+### 5.5 Internal communication is a security surface
+
+- PAPER: [AgentLeak: A Full-Stack Benchmark for Privacy Leakage in Multi-Agent LLM Systems](https://arxiv.org/abs/2602.11510).
+
+The benchmark reports substantial leakage through internal inter-agent channels that output-only auditing misses. Exact percentages are benchmark/model specific and are not treated as ELIOT production rates.
+
+ELIOT implication:
+
+- participant visibility stays Task/Attempt/scope constrained;
+- a message/cell never widens artifact or secret access;
+- cards/messages avoid credentials and unnecessary private data;
+- internal coordination is included in audit/redaction policy;
+- a global searchable roster is metadata-minimal and never a global readable transcript.
+
+## 6. Claude Code Agent Teams and cross-session messaging
 
 ### Official sources
 
@@ -183,50 +258,50 @@ Useful behavior:
 
 - independent teammate contexts;
 - direct addressed peer messages;
-- compact message previews;
+- compact previews;
 - explicit accept/hold/refuse policy;
-- mailbox admission can be distinct from later presentation;
-- messages from peers carry no user authority.
+- mailbox admission distinct from later presentation;
+- peer messages carry no user authority.
 
-Rejected behavior for ELIOT:
+Rejected for ELIOT:
 
 - automatic idle-session wake;
 - automatic team formation;
 - shared Task authority;
-- full message/authority envelope in human-visible chat;
+- full authority envelope in human-visible chat;
 - assuming a mailbox write means a busy model saw the correction.
 
 ### Field reports
 
 #### Recursive fan-out
 
-- ISSUE: [#68110 — General-purpose sub-agents recursively spawn unbounded child agents](https://github.com/anthropics/claude-code/issues/68110).
+- ISSUE: [#68110 — recursive unbounded child-agent fan-out](https://github.com/anthropics/claude-code/issues/68110).
 
-One request reportedly produced 48+ agents and roughly 1.5 million tokens; the useful research was complete within the first few workers. This is direct evidence for removing spawn/delegation from the participant communication surface.
+One request reportedly produced 48+ agents and roughly 1.5 million tokens; the useful research was complete within the first few workers. This supports removing spawn/delegation from the participant communication surface.
 
 #### Fleet failure visibility
 
-- ISSUE: [#66686 — workflow subagents need first-class visibility](https://github.com/anthropics/claude-code/issues/66686).
+- ISSUE: [#66686 — large workflow agents need first-class visibility](https://github.com/anthropics/claude-code/issues/66686).
 
-A roughly 70-agent repository review reportedly lost 26 workers after a network failure, including most finder agents; diagnosis required manual transcript inspection. This supports durable agent/edge/status topology and explicit lost/stale outcomes.
+A roughly 70-agent repository review reportedly lost 26 workers after a network failure, including 10 of 12 finder agents; diagnosis required raw transcript inspection. This supports durable agent/edge/status topology and explicit lost/stale outcomes.
 
 #### Delayed presentation to busy peers
 
-- ISSUE: [#99111 — interactive Agent Teams message arrives after the turn ends](https://github.com/anthropics/claude-code/issues/99111).
+- ISSUE: [#99111 — interactive Agent Teams message withheld until turn end](https://github.com/anthropics/claude-code/issues/99111).
 - ISSUE: [#98998 — running teammate sees message only after idle](https://github.com/anthropics/claude-code/issues/98998).
 
 These distinguish `stored` from `presented`. ELIOT must never tell the sender that the recipient has seen a message merely because mailbox admission succeeded.
 
-#### Agent cannot report because coordination tool is missing
+#### Coordination tool missing
 
-- ISSUE: [#81185 — restricted teammate has no SendMessage/ToolSearch](https://github.com/anthropics/claude-code/issues/81185).
-- ISSUE: [#68408 — Agent description advertises unavailable SendMessage](https://github.com/anthropics/claude-code/issues/68408).
+- ISSUE: [#81185 — restricted teammate cannot SendMessage its report](https://github.com/anthropics/claude-code/issues/81185).
+- ISSUE: [#68408 — agent description advertises unavailable SendMessage](https://github.com/anthropics/claude-code/issues/68408).
 
-ELIOT therefore verifies the actual coordination capability profile at registration and exposes only tools that the client/runtime can use.
+ELIOT verifies the actual coordination capability profile at registration and exposes only tools that the client/runtime can use.
 
 #### Peer-message UI/authority spam
 
-- ISSUE: [#80454 — peer security envelope rendered as full chat bubbles](https://github.com/anthropics/claude-code/issues/80454).
+- ISSUE: [#80454 — peer authority envelope rendered as repeated full chat bubbles](https://github.com/anthropics/claude-code/issues/80454).
 - ISSUE: [#80625 — remote control shows reminder boxes instead of useful peer content](https://github.com/anthropics/claude-code/issues/80625).
 
 ELIOT keeps authority metadata machine-readable and renders one compact sender/subject/disposition row to humans.
@@ -235,59 +310,53 @@ ELIOT keeps authority metadata machine-readable and renders one compact sender/s
 
 - ISSUE/REQUEST: [#28300 — multi-agent collaboration across machines](https://github.com/anthropics/claude-code/issues/28300).
 
-The request accurately describes the product need: independently owned services need to negotiate schemas and integration points without making the human copy every decision between sessions.
+The request describes the product need accurately: independently owned services should negotiate schemas/integration points without making the human copy every decision between sessions.
 
-## 6. Donor implementations
+## 7. Donor implementations
 
-### 6.1 Overstory
+### 7.1 Overstory
 
 - CODE/DOC: [Nokodoko/overstory](https://github.com/Nokodoko/overstory).
 
-Useful:
+Take:
 
 - capability/state/parent discovery;
-- SQLite typed mail;
+- SQLite typed mail concepts;
 - separate worktrees;
-- current fleet status, trace/replay and cost metrics;
-- explicit warning that merge conflicts, compounding error and cost amplification are normal risks.
+- fleet status, trace/replay and cost metrics;
+- explicit recognition that merge conflicts, error compounding and cost amplification are normal risks.
 
-Rejected:
+Reject:
 
-- broadcast group addresses as the normal coordination path;
+- broadcast groups as normal coordination;
 - peer `assign`/`dispatch` semantics;
 - urgent mail auto-nudging a model;
 - a second mail database inside ELIOT.
 
-### 6.2 Gas Town
+### 7.2 Gas Town
 
 - CODE/DOC: [gastownhall/gastown](https://github.com/gastownhall/gastown).
 
-Useful:
+Take:
 
 - durable identities/work state;
-- one-shot predecessor-session query (`seance` pattern);
+- one-shot predecessor query (`seance` pattern);
 - tiered escalation where ordinary information queries should not escalate;
 - explicit runtime-capacity governor.
 
-Rejected:
+Reject:
 
 - another Beads/work graph as ELIOT authority;
 - Mayor as relay for every peer fact;
-- stale timers that automatically generate new model work.
+- stale timers that automatically create model work.
 
-### 6.3 Agency Swarm
+### 7.3 Agency Swarm
 
 - CODE/DOC: [VRSEN/agency-swarm](https://github.com/VRSEN/agency-swarm).
 
-Useful:
+Take typed directional communication flows, custom decision/context fields and explicit handoff separated from ordinary send. ELIOT derives flows dynamically from current Task/contract/scope relations rather than one global static graph.
 
-- typed directional communication flows;
-- custom message fields carrying exact decisions/context;
-- explicit handoff separated from ordinary send.
-
-ELIOT derives flows dynamically from current Task/contract/scope relations instead of maintaining one global static graph.
-
-### 6.4 CCCC, Multica, MCP Agent Mail, Claw, AutoGen
+### 7.4 CCCC, Multica, MCP Agent Mail, Claw, AutoGen
 
 Detailed source paths/issues are already classified in:
 
@@ -295,29 +364,29 @@ Detailed source paths/issues are already classified in:
 - [Field Evidence and Donor Map](agent-communication-field-evidence.md);
 - [Communication and Concilium](agent-communication-concilium.md).
 
-Fleet-relevant conclusions:
+Fleet conclusions:
 
-- CCCC demonstrates strong delivery identity/reply/cancel/cursor semantics but current per-actor bridge/runtime scaling and resume failures make it unsuitable as ELIOT's default fleet process model.
-- Multica demonstrates why comments and mentions must not be both human communication and execution routing; one reported workflow processed about 18 million tokens through ping-pong.
-- MCP Agent Mail demonstrates good mail/reservation UX but adds a separate authority/storage product and has restrictive licensing concerns.
-- Claw demonstrates bounded advisory councils and protected verification separation.
+- CCCC has strong delivery/reply/cancel/cursor semantics but current per-actor bridge/runtime scaling and resume failures make it unsuitable as ELIOT's default fleet process model.
+- Multica shows why comments/mentions cannot be both communication and execution routing; one reported workflow processed about 18 million tokens through ping-pong.
+- MCP Agent Mail has good mail/reservation UX but adds a separate authority/storage product and restrictive licensing concerns.
+- Claw supports bounded advisory councils and protected verification separation.
 - AutoGen reports reinforce termination, full-history, speaker-selection, backpressure and malformed-message failure cases.
 
-## 7. Owner ELIOT fleet evidence
+## 8. Owner ELIOT fleet evidence
 
-OWNER evidence from the current local swarm includes:
+OWNER evidence from the current swarm includes:
 
 - several managers receiving the same stale queue and duplicating work;
-- activity metrics overstating actual writers by aggregating unrelated child sessions;
-- long-lived contexts and repeated full histories consuming extreme tokens;
-- many partial submissions producing more review/merge cost than completed work;
+- activity metrics overstating writers by aggregating unrelated child sessions;
+- long-lived contexts/repeated full histories consuming extreme tokens;
+- partial submissions producing more review/merge cost than completed work;
 - mass replay of old submissions flooding acceptance and causing negative progress;
 - global reminders/status messages consuming context without changing code;
-- one shared file/contract becoming a hotspot that needed one owner;
+- one shared file/contract becoming a hotspot needing one owner;
 - agents blocked because they could not directly ask the current contract owner;
 - independent components diverging because producer/consumer seams were not agreed before implementation.
 
-ELIOT product requirements derived from this evidence:
+Derived requirements:
 
 ```text
 fresh indexed ownership
@@ -332,21 +401,22 @@ protected verification and acceptance
 small-sample measurement before mass fleet action
 ```
 
-## 8. What the evidence does not support
+## 9. What the evidence does not support
 
 Do not claim:
 
 - that 1,024 agents are economical at equal compute;
 - that the Agensh result transfers to arbitrary repositories;
 - that thousands of model processes fit one Windows host;
-- that self-organization removes the need for assignment/acceptance authority;
+- that self-organization removes assignment/acceptance authority;
 - that peer consensus establishes correctness;
 - that a bigger team improves a monolithic/shared-state task;
-- that a successfully stored message was presented to a busy model;
+- that a stored message was presented to a busy model;
 - that user issue counts provide a failure rate;
-- that the current ELIOT implementation already meets the fleet contour.
+- that learned topology papers are production policy;
+- that current ELIOT already meets the fleet contour.
 
-## 9. Final evidence-based balance
+## 10. Evidence-based balance
 
 ```text
 maximum freedom:
@@ -361,13 +431,14 @@ maximum freedom:
   agree inside current authority
 
 mechanical structure:
-  scoped identity
+  scoped identity and visibility
   sparse relevance graph
   revisioned cards/cells
   explicit delivery disposition
   one mutable owner
   bounded presentation/backpressure
   no recursive spawn
+  independent disagreement preserved
 
 central authority only for:
   new work/active turn
@@ -383,4 +454,4 @@ strict proof at the edge:
   protected acceptance
 ```
 
-This is the target balance: communication is a tool agents can use whenever it helps, not a mandatory ceremony and not a second uncontrolled workflow engine.
+Communication is a tool agents can use whenever it helps, not a mandatory ceremony and not a second uncontrolled workflow engine.
