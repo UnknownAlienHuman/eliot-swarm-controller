@@ -2,7 +2,7 @@
 ## OpenAI Dot, Meta Muse Agent and Cloudflare integration program
 
 **Revision:** 1 — 2026-10-02  
-**Repository baseline:** `55a00250b2efc68a82e2911eeb806ef2fbe8fe16`  
+**Repository baseline:** `0ff7129d11a15a71a94e1ed2c265f7a3eeb0e1db`  
 **Status:** documentation and implementation handoff. No remote control path described here is qualified merely because this document exists.
 
 ## 0. Decision
@@ -53,6 +53,8 @@ The following product boundaries exist on the baseline and must not be rewritten
 - fixed-source CheckRunner with process-group ownership and conservative recovery;
 - local authenticated IPC; no public controller listener;
 - stdio RMCP facade over the same application API as the CLI;
+- MCP Tasks projection over existing Operations, without a second task authority;
+- bounded session subscriptions over committed report/mailbox/Operation facts, with explicit lag and read-resync;
 - GM designation, epoch and explicit handover;
 - OpenCode V2 direct HTTP adapter, exact input/log correlation, child reads, result export and addressed `agent.background`;
 - Muse Code SDK bridge with exact steer, settings, goal/replies, recovery checkpoint and recorded durability/host-death/gap observations;
@@ -587,7 +589,7 @@ gm.handover.required
 quota.changed
 ```
 
-MCP Events require a current protocol implementation, durable subscriptions, verified HTTPS callbacks, signing, expiration/refresh, retry/backoff and replay/gap semantics. Current ELIOT RMCP stdio facade does not implement that contract.
+MCP Events require the standard event catalog/subscription contract, durable webhook subscriptions, verified HTTPS callbacks, signing, expiration/refresh, retry/backoff and replay/gap semantics. Current ELIOT RMCP stdio facade implements its own bounded session-scoped freshness subscriptions over committed facts; those are useful for connected MCP clients but are not the OpenAI MCP Events webhook contract.
 
 Event delivery is notification, not acceptance or a new Operation.
 
