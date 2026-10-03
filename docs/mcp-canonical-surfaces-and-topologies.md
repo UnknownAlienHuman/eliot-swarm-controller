@@ -1,43 +1,29 @@
 # ELIOT MCP Canonical Surfaces and Client Topologies
-## Exact public names, role cores and deployment patterns for OpenAI, Copilot, Claude and fallback clients
 
-**Revision:** 1 — 2026-10-03  
-**Source baseline:** `main` at `35e499ae73b622d873c44873f6993ee3fcbea87b`  
-**Applies to:** [MCP Tool Catalog and Deferred Loading](mcp-tool-catalog-and-loading.md), [Swarm Launcher and Assignment Context](swarm-launcher-assignment-context.md), [Communication Program](agent-communication-program.md)  
-**Status:** normative naming/topology amendment. It does not claim these methods are implemented.  
-**Precedence:** this file governs canonical convenience-tool names and the mapping from one logical catalog to client-specific MCP deployments. Older `coordination.context.get`, eager `coordination.ask_owner`, `coordination.notify_when_available`, global-roster and one-monolithic-eager-server examples are superseded.
+**Revision:** 2 — 2026-10-03  
+**Integration review:** main `504199d14135c030ad3951a3c5023a098a3d03f0` and [Agent Operations PR #23](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/23).  
+**Status:** proposed public names and presentation contracts, not implemented capability claims.
 
-## 0. Decision
+This is the canonical convenience-tool list for the [Communication Program](agent-communication-program.md). [Catalog and Loading](mcp-tool-catalog-and-loading.md) owns registry metadata; [Launcher](swarm-launcher-assignment-context.md) owns work context. Older aliases and reviewer examples are corrected here rather than exposed as competing APIs.
 
-ELIOT has one logical application/catalog authority, but it may present that catalog through several client-specific MCP layouts.
+## 1. One catalog, separate permission and presentation
 
 ```text
 one application method registry
-one hard profile decision
-one catalog revision
-        │
-        ├── OpenAI Responses: eager core + deferred logical group servers/namespaces
-        ├── OpenAI Agents: role-filtered MCP + automatic discovery where supported
-        ├── Copilot CLI: core server deferTools=never + deferred catalog/group servers
-        ├── Claude Code: verified core coordination server + deferred optional domains
-        └── simple MCP client: generated fixed role surface; reconnect to change surface
+  -> hard profile and object authorization
+  -> small role core and authorized deferred groups
+  -> client-compatible presentation
 ```
 
-No layout changes Task, role, project or method authority.
+Group loading never changes the caller's role, Task ownership, repository scope or GM authority. An unavailable/denied method stays rejected even if an old schema is cached. The manager may enable individual automations that exercise their existing rights; tool loading is not that enablement.
 
-## 1. Canonical public convenience tools
+`Core`, `Searchable` and `ManualOnly` are catalog presentation tiers. `ManualOnly` means an explicitly selected schema, not a second rule forbidding the manager from automating an otherwise authorized action. Actions still use the shared application checks and the selected manager-owned definition.
 
-The ordinary model-facing surface uses the names below. Lower-level methods remain deferred implementation/detail tools and must not compete with the convenience name in the eager catalog.
+## 2. Exact role cores
 
-## 1.1 Common core
+The list below applies as its application methods are implemented. Do not expose proposed names with missing handlers or silently broaden a current legacy profile.
 
-```text
-swarm.context.get
-swarm.tools.search
-operation.get
-```
-
-## 1.2 Participant core
+### Participant
 
 ```text
 swarm.context.get
@@ -51,7 +37,7 @@ swarm.overlap.check
 operation.get
 ```
 
-## 1.3 Manager core
+### Manager
 
 ```text
 swarm.dashboard
@@ -65,7 +51,7 @@ operation.get
 swarm.tools.search
 ```
 
-## 1.4 Reviewer core
+### Assigned reviewer
 
 ```text
 swarm.review.context
@@ -73,11 +59,15 @@ swarm.tools.search
 task.submission
 artifact.read
 check.get
-task.request_changes
+review.submit
 operation.get
 ```
 
-## 1.5 Observer core
+`review.submit` records the assigned auditor's exact-slot verdict/evidence. It does not apply Task feedback, start repair or publish. `task.request_changes` is the guarded manager disposition and is not part of the normal assigned-reviewer core. O7 of the operations program must wire the review assignment scope, result handler and profile together; a plain Participant cannot submit arbitrary audits.
+
+Any previously implemented reviewer profile behavior is a separately identified legacy surface until deliberately migrated. A tool's existence or read/write annotation never overrides application authorization. Missing new review support is an explicit capability gap, not a silent substitution of a manager tool.
+
+### Observer
 
 ```text
 swarm.dashboard
@@ -86,282 +76,128 @@ swarm.tools.search
 operation.get
 ```
 
-Results remain profile/application filtered. Observer dashboard is read-only and bounded.
+All reads are scoped and bounded. GM/operator uses the manager core, with rare authority-sensitive tools deferred. Having more rights is not a reason to preload the entire catalog.
 
-## 2. Canonical versus lower-level names
+## 3. Names and groups
 
-| Canonical model-facing tool | Lower-level/deferred implementation methods | Decision |
-|---|---|---|
-| `swarm.context.get` | old `coordination.context.get`, Task/Attempt/card list reads | only `swarm.context.get` is eager/public convenience name |
-| `coordination.consult` | `coordination.ask_owner`, peer find, card field lookup, addressed ask | `ask_owner` is a lower-level exact step, not a competing eager alias |
-| `coordination.watch.create/list/cancel` | old `coordination.notify_when_available` | watches are the canonical general mechanism; notify-when-available is a watch kind, not another public concept |
-| `coordination.send` | `coordination.message.send`, `message.send` | typed coordination send is ordinary UX; raw mailbox remains diagnostic/compatibility |
-| `swarm.overlap.check` | scope inspect/conflicts, `git.who_works_here`, Git changed paths/history | one convenience read returns labelled ownership/worktree/provenance sources |
-| `swarm.agent.steer` | `agent.send` with exact binding/generation/turn | manager convenience wrapper; peer mail never uses it |
-| `swarm.agent.inspect` | `agent.state/list/family`, operation/report reads | one bounded current work/runtime/capability view |
-| `swarm.launch` | Task claim, workspace preparation, `agent.open`, Participant registration and runtime start Operations | high-level linked admission; lower-level authorities remain intact |
-| `swarm.tools.search` | client-native tool search, catalog lookup, surface activation | compatibility method for harnesses without native search; denied tools remain invisible |
+| Convenience name | Lower-level implementation/detail |
+|---|---|
+| `swarm.context.get` | Task/Attempt/cards; supersedes old `coordination.context.get` examples. |
+| `coordination.consult` | Card field lookup, exact owner discovery and addressed ask; `ask_owner` is not a competing eager alias. |
+| `coordination.watch.create/list/cancel` | One shared watch service; availability is a watch kind, not a separate `notify_when_available` API. |
+| `coordination.send` | Typed peer delivery over coordination/raw mailbox primitives. |
+| `swarm.overlap.check` | ELIOT ownership, scope and bounded Git evidence; history is not current ownership. |
+| `swarm.agent.steer` | Manager-owned exact `agent.send` semantics, not peer mail. |
+| `swarm.agent.inspect` | One current scoped work/runtime/capability projection. |
+| `swarm.launch` | Linked existing Task/workspace/binding/Participant/runtime admissions, not an MCP-only macro. |
+| `swarm.tools.search` | Authorized catalog lookup and loading guidance, not a generic execute-method endpoint. |
 
-Do not create multiple public aliases merely to support prompt vocabulary. Put synonyms in `search_terms`.
+Put prompt vocabulary synonyms in search metadata, not additional eager public aliases. Slash notation denotes separate typed methods.
 
-## 3. Logical tool groups
+Groups remain `core`, `participant-coordination`, `assignment-read`, `manager-core`, `runtime-control`, `runtime-recovery`, `monitoring`, `git-read`, `task-management`, `review`, `acceptance-effects`, `administration`, `schedules`, and `mailbox-raw`. The operations program adds its deferred configuration, runtime-profile, stream, hook, script and Goal groups to the same registry.
 
-Canonical groups:
+Each group has a stable ID, short discriminative purpose, profile eligibility, loading tier, catalog revision and search terms. Roughly 4–9 model-facing methods is a usability target, not a permission limit. A group is not a process or a new authority.
 
-```text
-core
-participant-coordination
-assignment-read
-manager-core
-runtime-control
-runtime-recovery
-monitoring
-git-read
-task-management
-review
-acceptance-effects
-administration
-schedules
-mailbox-raw
-```
+## 4. Discovery is not proof of model access
 
-Each group has:
+Record only what was observed:
 
 ```text
-group ID
-title
-short discriminative description
-hard-profile eligibility
-core/searchable/manual load tier
-4–9 model-facing methods where practical
-catalog revision
-deterministic search terms
+configured               the trusted launch configuration requested it
+listed_by_transport      the authenticated MCP session listed its schema
+acknowledged_by_harness   the native client explicitly reports discovery/loading
+successfully_used        a real authorized call returned through this path
+unknown / unsupported    the relevant evidence is absent
 ```
 
-A logical group is not necessarily a separate process. It may be one filtered view of the same local MCP facade.
+MCP `tools/list` and `notifications/tools/list_changed` describe server inventory. They do not prove that a particular harness loaded a schema into model context. Do not label server-side activation `model_ready` or create extra paid model turns merely to fill a readiness record.
 
-## 4. Why one monolithic server is insufficient
+Use actual native inventory/readback or a harmless call during already requested work where supported. A proven missing required reporting tool makes that launch incompatible or explicitly relay-only. Unknown client visibility is a precise gap, not proof of either success or failure, and does not disable unrelated tools or agents.
 
-Different clients defer at different layers:
+Overall launch states remain `ready`, `ready_with_gaps`, `relay_only` and `incompatible`, derived from the actual required capability contract. Reconnection and capability discovery must never start a second productive session.
 
-- OpenAI Responses can defer an MCP server definition; loading that server imports its visible tool list.
-- OpenAI client-executed tool search can instead load selected functions/namespaces under application control.
-- Copilot CLI can defer MCP tools and mark a frequently used server `deferTools: "never"`.
-- some Claude/custom-agent paths dynamically search tools but have had backend-specific missing-tool behavior;
-- simple MCP clients may only list tools at initialization and ignore list-changed notifications.
+## 5. Client-compatible loading
 
-Therefore:
+One logical catalog can have several presentations. Qualify the installed client/model path rather than require an old software release or infer support from a product name.
+
+| Client path | Presentation |
+|---|---|
+| OpenAI Responses | Small eager core plus deferred logical MCP group views, or client-executed tool search over the authorized catalog. |
+| OpenAI managed agent tooling where supported | Role-filtered MCP and the documented discovery mechanism; record actual support rather than assume automatic deferral. |
+| GitHub Copilot CLI/custom agents | Core server `deferTools: "never"`; optional catalog/domains use supported automatic deferral and exact custom-agent subsets. |
+| Claude Code/Agent Teams | Explicit local role core, optional searchable domains and native capability evidence for the actual teammate backend. |
+| Simple MCP client | Generated fixed role core plus a relevant optional group; safe client-supported relist/reconnect when a different surface is needed. |
+
+OpenAI client-executed search is useful when availability depends on current project/Task/permission state. Logical core, participant, manager, Git, review, runtime and effect views may expose the same application through narrow inventories. Never mark one huge server eager merely to make missing discovery appear to work.
+
+For Copilot/Claude, configuration/frontmatter narrows requested tools but is not proof of runtime parity. Do not silently drop required tools or treat a different in-process/separate-process backend as equivalent. An agent without a usable result path must not start productive work under a false-ready claim.
+
+Native tool search, server-side surface selection and ELIOT `swarm.tools.search` are different mechanisms. The search tool returns matches/loading disposition; printing a schema in text is not dynamically registering a callable tool. The harness must use its supported loader or refresh path. Unsupported clients get an explicit gap or generated surface, not a generic arbitrary RPC tool.
+
+## 6. Relist and reconnect
+
+Search/loading dispositions are `already_loaded`, `auto_activatable`, `reconnect_surface_required` and `unsupported`. Do not reveal denied names or hidden inventory counts through search; exact denied calls remain rejected by the existing protocol/application path.
+
+If the session supports safe refresh, an explicit group selection changes its authorized presentation and emits one list-changed notification. The client relists; record the actual server-visible revision separately from client acknowledgement. Do not emit list-changed for message arrival, liveness, queue motion or Task state.
+
+If refresh is unsupported, use a supported safe MCP reconnect/surface change without restarting native work. Do not promise a non-disruptive reconnect for a harness that cannot do it: report that limitation and prepare the next permitted connection instead. No silent full-profile fallback, dropped in-flight request, provider restart or replacement model session.
+
+Static catalog pagination is deterministic at its catalog/profile/surface revision. Filter before paging; reject stale/invalid cursors explicitly. Reads and search do not execute work or change manager automation settings. Tool annotations remain descriptive hints, not enforcement.
+
+## 7. Process and transport layout
+
+The shared component is the ELIOT host/application/Store, not an imaginary shared stdin stream.
 
 ```text
-one eager remote MCP containing every authorized method
+stdio-only native client -> small Rust MCP facade child -> authenticated local IPC
+another native client    -> its isolated facade/connection -> the same ELIOT host
+
+HTTP-capable clients     -> authenticated Streamable HTTP sessions
+                            -> the same ELIOT application
 ```
 
-is not the default. It defeats the context-saving goal on clients that load a whole MCP server at once.
+Standard stdio commonly means a server subprocess per connected client. Do not promise one stdio child multiplexes unrelated clients without a qualified transport. Keep those children thin: bounded protocol buffers, no SQLite ownership, no native session ownership and no full-ledger/transcript bootstrap. Reuse immutable catalog metadata where possible. Registered but disconnected/inactive participants require no facade process.
 
-## 5. Topology A — OpenAI Responses API
+Streamable HTTP can support multiple authenticated sessions in one service when implemented. That does not permit cross-session credential, tool-surface or event leakage. Server/client session cleanup releases only its transport resources; closing a viewer does not stop the shared host or native work.
 
-### 5.1 Preferred for a known role/session
+Do not create one heavy wrapper per logical group. Measure actual connected-facade count, memory and teardown separately from registered agents and active model turns. All owned facades/gateways are Rust. Native stdio clients need no external Cloudflare hop; remote tunneling is transport, never policy.
 
-```text
-eliot-core          eager, 3–9 tools
-eliot-participant   deferred when participant needs detail
-eliot-manager       deferred manager detail
-eliot-git           deferred
-eliot-review        deferred
-eliot-runtime       deferred manager-only
-eliot-effects       deferred/manual GM-only
-```
+## 8. Catalog search example
 
-These are **logical MCP server views** of the same controller/application, not independent authorities or databases.
-
-Repository examples use names and placeholder endpoints only. Local deployment binds each logical view to an exact credential/profile/surface.
-
-### 5.2 Alternative: client-executed tool search
-
-Where the application constructs Responses requests, expose:
-
-```text
-small eager ELIOT core functions/namespace
-client-executed tool_search
-trusted catalog lookup filtered by profile/project/work context
-selected additional tools/namespaces returned by ELIOT
-```
-
-This gives the finest group/tool selection and is preferred when available tools depend on the current Task, project or participant grant.
-
-### 5.3 Never
-
-- never return a schema outside the hard profile;
-- never use a generic JSON-RPC passthrough as one deferred tool;
-- never place a private endpoint/token in repository config;
-- never interpret loaded tool schemas as approval for effects.
-
-## 6. Topology B — OpenAI Agents API
-
-Current Agents API can automatically discover/defer supported MCP tools. Use:
-
-```text
-one role-filtered ELIOT MCP connection
-small explicit eager high-level functions only when actually used on most turns
-automatic MCP discovery for searchable groups
-launcher-recorded actual capability receipt
-```
-
-The connection is still bound to one hard profile and expected client identity.
-
-Qualification must verify the exact model/provider path; do not assume every configured model performs automatic MCP search identically.
-
-## 7. Topology C — GitHub Copilot CLI/custom agents
-
-Recommended layout:
-
-```text
-eliot-core MCP        deferTools: "never"
-eliot-catalog MCP     deferTools: "auto"
-optional domain MCPs  auto unless used constantly
-custom agent tools    exact role subset or namespace patterns
-deferred-tool-loading true for a large named subset
-```
-
-The custom agent definition narrows availability; ELIOT server-side profile/application checks remain authoritative.
-
-Launch validation checks that core coordination/reporting tools are actually present in the custom agent's visible or searchable inventory. If not, fail or mark `relay_only`.
-
-## 8. Topology D — Claude Code and Agent Teams
-
-Recommended layout:
-
-```text
-project/local ELIOT core MCP with participant/manager credential
-core coordination/reporting tools explicitly available to the role
-optional heavy domains deferred/discoverable where the runtime supports it
-one capability probe/receipt after teammate/session launch
-```
-
-Do not rely solely on plugin/custom-agent frontmatter. Field reports show differences between in-process and separate-process teammates and cases where definitions or coordination tools were silently absent.
-
-Required launch outcome:
-
-```text
-ready
-ready_with_gaps
-relay_only
-incompatible
-```
-
-An agent without a working result-delivery path is not `ready`.
-
-Peer `SendMessage`-style communication remains information only. It cannot grant user authority, spawn peers or start an idle ELIOT participant model.
-
-## 9. Topology E — client without dynamic tool search
-
-Generate a fixed MCP surface at connection time:
-
-```text
-role core
-+ at most one assignment-relevant optional group
-```
-
-`swarm.tools.search` may return matches and one of:
-
-```text
-already_loaded
-auto_activatable
-reconnect_surface_required
-forbidden
-unsupported
-```
-
-If the client supports safe tool-list refresh:
-
-1. activate selected group in session presentation state;
-2. emit `notifications/tools/list_changed`;
-3. require client to relist;
-4. record visible catalog revision.
-
-If not, the launcher reconnects/replaces only the MCP client surface at a safe boundary. It does not restart the native work/session and never silently widens to the full profile.
-
-## 10. Server/process layout
-
-Logical group views should normally share one local ELIOT host/facade process:
-
-```text
-one Store/application authority
-one local IPC endpoint
-one or a small bounded set of MCP facade processes
-many authenticated logical profile/surface sessions
-```
-
-Avoid one heavy MCP child process per registered participant. Registered inactive participants consume no process or dedicated Tokio task.
-
-For remote access:
-
-```text
-Cloudflare/other tunnel = transport only
-Agent Gateway/MCP facade = authentication/profile/surface filter
-ELIOT application = object/work authorization
-```
-
-Local trusted coding agents use local transport; they do not need to traverse the remote tunnel.
-
-## 11. Catalog search contract
-
-Search input:
+Request and response are illustrative proposed schemas; placeholder IDs are not live invocation values.
 
 ```json
 {
-  "query": "find who is changing this Rust symbol",
-  "purpose": "implementation | review | diagnosis | recovery",
-  "task_id": "optional exact current Task",
-  "loaded_catalog_revision": "sha256:...",
+  "query": "compare changed paths with my code scope",
+  "purpose": "implementation",
+  "task_id": "CURRENT_TASK_ID",
+  "loaded_catalog_revision": "CURRENT_CATALOG_REVISION",
   "max_results": 5
 }
 ```
 
-Search result:
-
 ```json
 {
-  "catalog_revision": "sha256:...",
+  "catalog_revision": "CURRENT_CATALOG_REVISION",
   "matches": [
     {
       "group": "git-read",
-      "tool": "swarm.overlap.check",
-      "title": "Check current ownership and Git overlap",
-      "why": ["symbol_overlap", "current_task_relation"],
-      "activation": "already_loaded | auto_activatable | reconnect_surface_required"
+      "tool": "git.overlap",
+      "title": "Compare candidate paths with current scopes",
+      "why": ["path_overlap", "current_task_relation"],
+      "activation": "auto_activatable"
     }
   ],
-  "coverage": "complete | partial | unknown",
+  "coverage": "complete",
   "gaps": []
 }
 ```
 
-Search is deterministic for the same catalog/profile/work-context revision. It never returns denied names or counts.
+Same query plus catalog/profile/work-context revision produces deterministic ordering. Loading changes presentation only; it cannot grant another repository, create a Task, start a model or authorize a network/push/merge effect.
 
-## 12. Surface activation
+## 9. Local profile examples
 
-Activation changes session presentation only.
-
-It may:
-
-- make an authorized schema visible/callable in this MCP session;
-- update loaded catalog revision;
-- emit one list-changed notification;
-- append a capability-receipt fact.
-
-It may not:
-
-- change role/profile;
-- add Task/Attempt ownership;
-- grant another project/repository;
-- start a model turn;
-- create work;
-- authorize a network/merge/publication effect.
-
-## 13. Configuration examples
-
-### 13.1 ELIOT local profiles
+These are planned additions to current configuration; private credentials remain local and are not included.
 
 ```toml
 [mcp.profiles.participant_local]
@@ -374,69 +210,17 @@ deferred_groups = ["assignment-read", "git-read", "mailbox-raw"]
 tool_profile = "manager"
 expected_client_id = "manager-example"
 surface = "manager-core"
-deferred_groups = [
-  "monitoring",
-  "task-management",
-  "runtime-control",
-  "runtime-recovery",
-  "git-read",
-  "review"
-]
+deferred_groups = ["monitoring", "task-management", "runtime-control", "runtime-recovery", "git-read", "review"]
 ```
 
-These fields are planned extensions to current profile config.
+For a remote client, use locally configured endpoint/credential handles and an exact role/tool subset. Documentation uses placeholder endpoints only. Endpoint path or server label cannot choose a privileged identity on its own. Actual flat MCP tool names must come from the registry's single reversible naming map, not manually invented dotted/underscore aliases.
 
-### 13.2 Remote placeholder
+## 10. Qualification and primary references
 
-```json
-{
-  "type": "mcp",
-  "server_label": "eliot_git",
-  "server_url": "https://YOUR_DOMAIN/eliot/git/mcp",
-  "defer_loading": true,
-  "allowed_tools": ["swarm_overlap_check"]
-}
-```
+Verify hard-profile non-disclosure, manual hidden-call rejection, pagination, schema token cost, search misses/wrong-tool rate, cache/first-load latency, real client relist/reconnect behavior, missing-core diagnosis, per-connection credentials, thin-facade memory/cleanup and zero model wake from ordinary message/watch/surface changes.
 
-Real domains/tokens remain local. A remote URL does not select a privileged profile by itself.
+Review cases must prove an assigned auditor can submit its own evidence but cannot invoke manager disposition or another review slot. Manager-owned automated effects remain visible to their manager even with a technical service requester.
 
-## 14. Qualification matrix
+Protocol references rechecked 2026-10-03: [MCP transports](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports), [MCP tools](https://modelcontextprotocol.io/specification/2025-06-18/server/tools), [OpenAI tool search](https://developers.openai.com/api/docs/guides/tools-tool-search), [Copilot tool search](https://docs.github.com/en/copilot/concepts/agents/copilot-cli/tool-search). A dated specification link identifies reviewed semantics; negotiated support is not frozen to that edition. Other donor evidence remains in [MCP Source Map](mcp-tool-catalog-sources.md).
 
-For every supported client/runtime verify:
-
-```text
-hard profile non-disclosure
-initial eager tool count/schema tokens
-catalog search hit/miss/wrong-tool rate
-first-load latency and later-turn cache behavior
-list pagination
-list_changed or reconnect behavior
-missing core tool detection
-manual hidden method rejection before IPC
-same catalog revision after restart
-result/report delivery path
-MCP child/process cleanup
-no model wake from activation/watch/message
-```
-
-Client-specific scenarios:
-
-```text
-OpenAI Responses: group MCP loading versus client-executed search
-OpenAI Agents: automatic MCP discovery and exact loaded inventory
-Copilot: deferTools auto/never and custom-agent deferred-tool-loading
-Claude: in-process/separate-process custom teammate capability parity
-fallback: fixed surface and safe reconnect
-```
-
-## 15. Final invariant
-
-```text
-One logical catalog.
-Several client-compatible presentations.
-One hard authority boundary.
-No eager mega-server by default.
-No missing core tool hidden behind a successful process launch.
-```
-
-The agent gets a small reliable toolbox immediately and can reach the rest without asking Root, while denied or dangerous capabilities remain undiscoverable and uncallable.
+**Invariant:** one logical catalog and one application authority, several truthful client presentations, a small immediately useful toolbox, and no unsupported promises about schema loading or process sharing.

@@ -1,308 +1,84 @@
 # ELIOT Agent Communication, Launcher and MCP Program
 ## Start here
 
-**Revision:** 6 — 2026-10-03  
-**Source baseline:** `main` at `35e499ae73b622d873c44873f6993ee3fcbea87b`  
-**Status:** documentation/implementation handoff. No communication, launcher or deferred-catalog capability is implemented merely because these documents exist.
+**Revision:** 7 — 2026-10-03  
+**Latest integration review:** main `504199d14135c030ad3951a3c5023a098a3d03f0` and the manager-owned operations program in [PR #23](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/23).  
+**Status:** documentation and implementation handoff, not a claim of implemented or live-qualified features.
 
-## 1. Product decision
+## 1. Product rule
 
-ELIOT centralizes **assignment, authority and acceptance**, not every engineering conversation.
-
-```text
-strict edge                         free collaborative middle                         strict edge
------------                         -------------------------                         -----------
-manager assigns Task/Attempt  ->    discover, publish, ask, compare, coordinate, ->   protected verify/merge/accept
-scoped identity/workspace           volunteer, assume, negotiate and record             external effects/policy
-```
-
-The controller is a capability and coordination service, not an approval queue, shared chat room or implicit model-spawning workflow.
-
-Normal path:
+ELIOT centralizes assignment, authority and acceptance, not every engineering conversation. Managers work manually by default and may enable individual automations that act on their behalf. Ordinary peer communication is neither assignment nor permission to start another model.
 
 ```text
-manager sees dashboard + ranked queue
-        │
-        ▼
-launch.preview resolves exact Task, workspace, peers, overlap, route and MCP surface
-        │
-        ▼
-launcher establishes one manager-owned work context and verifies actual capabilities
-        │
-        ▼
-participant sees only its relevant neighborhood
-        │
-        ├── current fact/card ───────────────────────────► continue
-        ├── one exact consultation ─────────────────────► continue
-        ├── integration cell + pure comparison ─────────► peer-local agreement
-        ├── reversible recorded assumption ─────────────► continue and revalidate
-        └── authority/global conflict ──────────────────► one manager exception
-                                                             │
-                                                             └── Concilium only if justified
+manager selects work and scope
+  -> launcher establishes the work context
+  -> participants read current facts, contact exact owners and coordinate
+  -> only real authority/global conflicts reach the manager
+  -> exact-candidate review and protected acceptance/publication
 ```
 
-Root/General Manager sees exceptions rather than relaying ordinary mail. The auditor verifies durable agreements and implementation evidence rather than approving conversation.
+Peers can ask, answer, publish current contracts, compare producer/consumer seams, record reversible assumptions and agree inside existing scope. Root and the auditor do not relay every message. Neither messages, silence, consensus, a watch nor a loaded tool schema grants authority.
 
-## 2. Keep four quantities separate
+## 2. Read the owner document for the change
+
+Read the canonical product/module contract and [Owner Decisions](owner-decisions.md), then the relevant document below. This entrypoint is a routing index, not another copy of every schema/tool list. Do not load all research and historical examples into every writer's prompt.
+
+| Responsibility | Current design owner |
+|---|---|
+| Fleet behavior, sparse relevance, integration cells, delivery states/backpressure | [Fleet-Scale Freedom](agent-communication-fleet-scale-freedom.md) |
+| Exact high-level tool names, role palettes and client topology | [Canonical MCP Surfaces](mcp-canonical-surfaces-and-topologies.md) |
+| Registry metadata, groups, paged discovery and deferred loading | [MCP Tool Catalog](mcp-tool-catalog-and-loading.md) |
+| Dashboard, queue, launch/assignment context, Git overlap | [Swarm Launcher](swarm-launcher-assignment-context.md) |
+| Scoped Participant registration and authorization routing | [Peer Autonomy Implementation](agent-communication-peer-autonomy-implementation.md) |
+| Self-service communication and agreement envelope | [Peer Autonomy](agent-communication-peer-autonomy.md) |
+| Existing mailbox/Store/Git source constraints | [Implementation Checklist](agent-communication-implementation-checklist.md) |
+| Manager-owned automations, review results, cron, hooks, Goal and scripts | [Agent Operations PR #23](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/23), `docs/agent-operations/` |
+
+The fleet and canonical-surface documents replace old count-based sponsorship, eager aliases and full-directory examples. The operations program supplies `review.assign/submit` and manager-owned execution; implement those shared capabilities once. The exact reviewer tool is `review.submit` when implemented, not an implicit right to perform the manager's `task.request_changes` transition.
+
+Expanded [Concilium](agent-communication-concilium.md), [Tool Contracts](agent-communication-tool-contracts.md) and [Issue Plan](agent-communication-implementation-issues.md) remain useful detail/history, subject to these current owners. Their older example names, role restrictions and numbered implementation sequences are not parallel APIs or another work plan. Resolve an actual cross-document discrepancy in its owning documents; do not invent a new precedence appendix, authority or compatibility alias.
+
+Read evidence only as needed: [MCP sources](mcp-tool-catalog-sources.md), [fleet sources](agent-communication-fleet-scale-sources.md), [peer sources](agent-communication-peer-autonomy-sources.md), [field evidence](agent-communication-field-evidence.md). Reports and research are not shipped ELIOT capabilities or mandatory software versions.
+
+## 3. Core invariants
+
+Keep these quantities separate:
 
 ```text
-P = registered/discoverable participants
-A = concurrently active model turns/processes
-E = current material coordination edges
-X = unresolved exceptions requiring manager authority
+P registered participants
+A active model turns/processes
+E material coordination edges
+X manager-required exceptions
 ```
 
-A correct fleet may have thousands of registered participants while active turns remain bounded by runtime/provider/host capacity. Normal coordination is sparse and local.
+Registration is not a running model; a project is not a shared room; thousands of participants do not require all-to-all communication or one polling task per identity.
 
-Never equate:
+The MCP contract has three independent layers: hard permission profile, small initial role surface, and authorized deferred catalogue. The application checks object/action rights again. Search or loading cannot widen role, Task ownership, repository scope or GM authority. Unsupported discovery does not silently fall back to the full profile.
+
+The canonical surface document is the only exact convenience-tool list. Keep names and schemas there and in the shared code registry, not duplicated in this index. Configure all owned internal services/adapters in Rust; Python/PowerShell are optional external scripts, not required internal controllers. Do not prescribe old fixed crate/CLI/model releases.
+
+One manager owns one mutable worktree/candidate and one in-flight product submission. Internal writers receive non-overlapping work inside that Issue; they do not independently assign work, publish fragments or run Cargo. Git history/blame corroborates provenance, not current assignment ownership.
+
+## 4. Useful path before optional machinery
+
+The launched agent gets a bounded assignment context: exact Task/Attempt, requirements/sources, workspace/scope, relevant peers/contracts, known overlap, runtime/tool capabilities and required result. Full source, history, queue, transcripts and tool schemas are read on demand.
+
+Prefer the cheapest sufficient operation:
 
 ```text
-registration with a running model
-stored message with a started or informed model turn
-one project with one shared room
-P participants with P² communication edges
-participant count with manager authority
-visible tool with authorized tool
-configured tool with a runtime-visible working tool
-loaded schema with expanded application authority
+current card/field
+  -> exact consultation
+  -> integration comparison/cell
+  -> irreducible bilateral negotiation
+  -> manager decision
+  -> Concilium only when justified
 ```
 
-## 3. Required reading and precedence
+A local agreement is not verification. Required unknowns, absent affected owners or changes to global/security/persistence/identity/lifecycle authority remain explicit. Participant count alone does not require manager approval. Only actually affected owners block the relevant decision.
 
-Implementation agents read in this order:
+Watch notices and inbox messages do not wake idle agents or replace their task. Preserve distinct stored/available/presented/consumed/held/refused/cancelled/stale delivery facts. Backend `tools/list` does not prove the model loaded the schema. Keep real evidence levels and gaps rather than generating extra model calls to claim readiness.
 
-1. Product architecture, module contract and [Owner Decisions](owner-decisions.md).
-2. [Fleet-Scale Freedom](agent-communication-fleet-scale-freedom.md) — fleet law, sparse relevance, integration cells, delivery truth and backpressure.
-3. [Canonical MCP Surfaces and Client Topologies](mcp-canonical-surfaces-and-topologies.md) — exact public convenience names and OpenAI/Copilot/Claude/fallback layouts.
-4. [MCP Tool Catalog and Deferred Loading](mcp-tool-catalog-and-loading.md) — profile/surface/catalog layers, groups, schemas, pagination and capability receipts.
-5. [Swarm Launcher and Assignment Context](swarm-launcher-assignment-context.md) — dashboard/queue, launch preview, assignment packet, Git overlap and watches.
-6. [Peer Autonomy Implementation Amendment](agent-communication-peer-autonomy-implementation.md) — scoped `Role::Participant`, credentials and source-exact routing.
-7. [Peer Autonomy and Integration Handshake](agent-communication-peer-autonomy.md) — self-service coordination and autonomy envelope.
-8. [Implementation Checklist](agent-communication-implementation-checklist.md) — Store/mailbox/Git constraints except where amended above.
-9. [Implementation Issue Plan](agent-communication-implementation-issues.md) — execution policy and older Issue templates; use the current sequence in §12.
-10. [Agent Communication and Concilium](agent-communication-concilium.md) and [Tool Contracts](agent-communication-tool-contracts.md) — broader architecture, schemas and recovery. Older examples are non-normative where corrected above.
-11. [MCP/Launcher Source Map](mcp-tool-catalog-sources.md), fleet/peer source maps and [Field Evidence](agent-communication-field-evidence.md) — evidence only.
-
-When examples disagree, use the highest applicable item. Do not invent another identity, role, Task store, queue, delivery path, tool authority or model loop.
-
-## 4. MCP has three independent layers
-
-```text
-hard profile     maximum methods a credential may ever discover/call
-surface          small role-specific initial tool set
-catalog/groups   authorized deferred tools searchable on demand
-```
-
-Rules:
-
-- profile denial hides a method from list/search and rejects manual call before IPC;
-- deferred loading never widens role, Task ownership, repository scope or GM authority;
-- the application method rechecks authorization after MCP dispatch;
-- normal roles start with approximately 5–9 high-level tools;
-- rare, low-level and authority-sensitive methods remain deferred/manual-only;
-- unsupported search never silently falls back to the full profile;
-- launch records the **actual** runtime-visible capability set rather than trusting declarations.
-
-Current `main` already provides a sound hard layer: one typed tool per application method, no generic passthrough/shell tool, closed `observer/reviewer/manager/gm/full` profiles, profile-bound client identity, filtering on `tools/list` and `tools/call`, and caller-owned mutation IDs. The program extends this boundary; it does not replace or weaken it.
-
-## 5. Canonical role surfaces
-
-### Participant
-
-```text
-swarm.context.get
-swarm.tools.search
-coordination.send
-coordination.inbox
-coordination.consult
-coordination.sync_integration
-coordination.watch.create
-swarm.overlap.check
-operation.get
-```
-
-### Manager
-
-```text
-swarm.dashboard
-swarm.queue.get
-swarm.launch.preview
-swarm.launch
-swarm.agent.inspect
-swarm.agent.steer
-swarm.exceptions.get
-operation.get
-swarm.tools.search
-```
-
-### Reviewer
-
-```text
-swarm.review.context
-swarm.tools.search
-task.submission
-artifact.read
-check.get
-task.request_changes
-operation.get
-```
-
-GM/operator uses the manager core. Acceptance, publication and administration remain deferred/manual-only even for a high-authority identity.
-
-Canonical naming rules:
-
-```text
-swarm.context.get          replaces old coordination.context.get examples
-coordination.consult       is the high-level path; ask_owner is a lower-level step
-coordination.watch.*       replaces notify_when_available as a separate concept
-coordination.send          wraps raw message.send for ordinary peer use
-swarm.overlap.check        wraps scope + bounded Git ownership/overlap reads
-swarm.agent.steer          wraps exact manager-owned agent.send semantics
-```
-
-Put synonyms in catalog search terms; do not expose competing eager aliases.
-
-## 6. Tool groups and client layouts
-
-Logical groups:
-
-```text
-core
-participant-coordination
-assignment-read
-manager-core
-runtime-control
-runtime-recovery
-monitoring
-git-read
-task-management
-review
-acceptance-effects
-administration
-schedules
-mailbox-raw
-```
-
-Keep groups near 4–9 model-facing methods where practical.
-
-One logical catalog may be presented differently:
-
-```text
-OpenAI Responses    eager core + deferred logical MCP group views or client tool search
-OpenAI Agents       role-filtered MCP + supported automatic discovery
-Copilot CLI         core deferTools=never + deferred catalog/domain servers
-Claude Code         verified core MCP + deferred optional domains
-simple MCP client   fixed role surface; safe reconnect to change surface
-```
-
-No layout creates another database or authority. Logical group views normally share one local ELIOT host/facade and local IPC.
-
-## 7. Launcher contract
-
-`swarm.launch.preview` is read-only and resolves:
-
-```text
-exact Task revision/policy/source index/dependencies
-queue rank and reason
-current Attempt/owner
-manager-owned workspace/branch/write lease
-related assignments and contract owners
-scope/Git overlap and coverage gaps
-route/model/effort/budget enforceability
-MCP hard profile/surface/deferred groups/catalog revision
-hard blocks and warnings
-```
-
-`swarm.launch` accepts the exact preview digest and a caller-owned request ID. It revalidates mutable inputs, commits intent before external effects, prepares/verifies the workspace before the model starts, reuses existing Task/Attempt/Agent Operations, registers a scoped Participant, starts the exact runtime and records an actual capability receipt.
-
-A lost reply never creates a replacement Attempt, worktree, binding or native session. Unknown effects are reconciled by exact readback.
-
-## 8. Compact assignment packet
-
-The model receives:
-
-```text
-Task/Attempt/assignment identity and freshness
-objective, non-goals and exact current requirements
-canonical source index and gaps
-workspace/baseline/allowed mutation scope/write lease
-queue/dependency reason relevant to this work
-related peers and exact relevance reasons
-provided/required contracts and integration cells
-scope/Git overlap summary
-runtime route/model/effort/budget facts and enforcement gaps
-MCP core/deferred capability receipt
-output/submission/evidence/stop/escalation contract
-coverage and gaps
-```
-
-It does not receive the full queue, roster, history, transcript, diff, logs or tool catalog. Those remain pullable on demand.
-
-## 9. Agent self-service
-
-Participant may:
-
-- inspect its exact current assignment;
-- find the current owner of a contract/path/symbol;
-- send, answer, redirect, abstain or report unknown;
-- publish work/contract cards;
-- synchronize a producer/carrier/consumer integration cell;
-- inspect scope/Git overlap;
-- record a reversible assumption;
-- acknowledge or object to a peer-local agreement;
-- create a one-shot watch for an exact durable fact.
-
-Participant may not:
-
-- create/revise/claim/dispatch/accept Tasks;
-- bind/release Attempts;
-- spawn, wake, resume or control another model/session;
-- expand scope or displace an owner;
-- publish/merge/accept;
-- change security, identity, persistence, lifecycle or project policy;
-- turn prose, consensus, silence, a watch or tool activation into authority.
-
-## 10. Watches, Git and integration
-
-A watch observes a named existing fact and emits a small freshness hint. It creates no per-agent polling task, model turn or arbitrary scheduled prompt. Schedules remain separate typed future-Operation authority.
-
-`swarm.overlap.check` combines:
-
-```text
-current ELIOT Task/Attempt/scope ownership
-manager worktree/branch/write lease
-uncommitted and changed paths
-baseline-to-candidate paths
-contract/path/symbol relations
-optional history/blame labelled as provenance only
-coverage and gaps
-```
-
-ELIOT records decide current ownership. Branch names, commit authors and blame do not.
-
-Routine multi-party integration uses revisioned integration cells, not rooms or transcripts. Only directly affected owners block the relevant decision. Participant count alone is not a manager boundary.
-
-## 11. Delivery and anti-spam
-
-```text
-stored / available / presented / consumed / held / refused / cancelled / stale
-```
-
-Stored never implies presented; presented never implies agreement or verification.
-
-- one exact recipient, no default broadcast/reply-all;
-- current structured field before a message;
-- identical asks/watches/cards coalesce;
-- no required politeness turn;
-- no automatic model wake or recursive spawn;
-- safe-boundary header, body on pull;
-- no durable liveness/status chatter;
-- no manager copy of successful local coordination;
-- no full transcript or full catalog injected by default;
-- backpressure preserves useful facts and degrades presentation to pull/digest;
-- partial/truncated state returns explicit coverage/gaps.
-
-## 12. Current implementation sequence
+## 5. Current implementation sequence
 
 ```text
 A1  mailbox primitive extraction/reuse
@@ -312,68 +88,27 @@ A4  comparator, integration cells and peer-local autonomy
 A5  irreducible negotiation and manager-required contracts
 A6  advisory scopes and bounded Git inspection
 A7  dashboard/queue/context/overlap read projections
-A8  launch preview/orchestration and capability receipt
-A9  grouped/paged/deferred MCP catalog and role surfaces
+A8  launch preview/orchestration and capability evidence
+A9  grouped/paged/deferred MCP catalogue and role surfaces
 A10 durable Concilium state
-A11 CLI/MCP/UI wiring, compact rendering and status
-A12 correctness, catalog/fleet scale, recovery, cost and live qualification
+A11 CLI/MCP/UI parity, compact rendering and status
+A12 correctness, catalogue/fleet scale, recovery, cost and live qualification
 ```
 
-One Issue implements one complete slice. One manager owns its worktree/candidate. Writers do not run Cargo. The manager integrates/reviews and runs the current scoped formatting/minimal warnings-denied Clippy gate once. Integrated tests/load/live model work belong to A12 unless the owner explicitly advances a named check.
+Align the shared authorization, watcher, launcher and review paths with the operations program; do not implement a second copy under its O1–O11 labels. Each production increment has a real producer, consumer, registration and result reader. Local manual work must not wait for optional remote GitHub, cron or external-script setup.
 
-## 13. Concilium
+One implementation Issue has one manager/worktree/candidate. The manager reviews/integrates and runs scoped formatting/minimal warnings-denied Clippy once on the complete candidate. Broad test/load/live work follows the completed-product or explicit acceptance phase. Test targets in research are future qualification, not repeated writer Cargo work.
 
-Concilium is the last escalation level:
+## 6. Concilium and acceptance
 
-- participant may propose;
-- manager/current GM previews and confirms reasonability;
-- `open` creates immutable slots and starts no model;
-- positions are independent and evidence based;
-- manager explicitly advances rounds;
-- dissent, correlation and unknowns are retained;
-- result is advisory;
-- manager separately decides;
-- verification/acceptance remain separate.
+Concilium is manager-sponsored, bounded and advisory. Peers may propose; the authorized manager opens and advances rounds. Open commits slots, not model work. Preserve independent initial positions, evidence, minority objections and missing knowledge. No nested free-running chat or majority-vote acceptance.
 
-## 14. Storage/runtime decision
+Exact-candidate audit, Task acceptance and publication remain distinct. A reviewer submits findings; a manager or enabled manager-owned automation applies disposition. The same candidate/rights/epoch checks serve manual and automatic actions. Late results about A never authorize or modify B.
 
-V1 reuses:
+## 7. Qualification and privacy
 
-```text
-existing Store/SQLite owner
-existing Task/Attempt/Operation authority
-existing client registrations/meta
-existing Operations and Observations
-existing mailbox delivery/reply/cancellation
-revisioned per-object current projections
-existing immutable artifacts
-bounded Tokio mpsc/oneshot/watch
-local IPC and typed MCP facade
-```
+Measure synthetic registered populations separately from active paid models. Existing contours for thousands of cards/participants, bounded readers and staged active turns are targets, not current capacity claims. Test lost notifications, stale identities, concurrent replies, actual tool availability, missing reporting capability, process cleanup, wrong-tool/token cost and useful completion per cost.
 
-It adds no second Task store, database, event log, broker, daemon, shared chat server or per-agent polling task.
+No second Store, Task graph, event authority, broker or per-agent polling service. Reuse durable Operations/Observations and bounded Rust machinery; in-memory signals are freshness hints.
 
-## 15. Qualification
-
-A12 measures:
-
-```text
-10,000 registered Participants
-thousands of current cards/cells/watches
-100,000 mixed coordination/catalog mutations
-500 bounded readers
-zero automatic model invocations
-paged/searchable catalog with hidden-tool non-disclosure
-initial schema tokens by role
-search hit/miss/wrong-tool rate and first-load latency
-launch capability receipt and missing-core failures
-MCP process cleanup and list-change/reconnect behavior
-staged live active turns: 4 -> 16 -> 32 -> 64 -> 128
-useful output per cost, duplicate work, conflicts and manager attention
-```
-
-These are qualification targets, not current capacity claims. A later 1,024-agent experiment requires distributed capacity, explicit cost approval and a factorizable benchmark.
-
-## 16. Privacy
-
-Repository documentation and examples use placeholders only. Real domains, infrastructure IDs, credentials, local usernames and private paths remain local installation data and never enter Git, prompts, catalogs, launch packets or coordination records.
+Repository examples use placeholders only. Real deployment endpoints, credentials, infrastructure IDs and private paths stay local. This program itself activates nothing, changes no machine and makes no claim of runtime qualification.
