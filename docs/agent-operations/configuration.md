@@ -1,101 +1,183 @@
-# Configuration Contract — Agent-Friendly Automation and Runtime Preferences
+# Configuration Contract — Manual First, Manager-Enabled Automation
 
-Revision 2 · 2026-10-03 · proposed Rust application/MCP contract.
+Revision 3 · 2026-10-03 · proposed Rust application/MCP contract.
 
-This document defines configuration for [Architecture](architecture.md) and the [Delivery preset](delivery.md). All examples are design schemas, not claims that current main accepts these fields. Logical handles and catalogue placeholders are resolved during local setup.
+[Architecture](architecture.md) owns admission and recovery; [Delivery](delivery.md) owns work transitions. Examples below are design schemas, not claims that current main implements these fields. Runtime/model placeholders must be resolved from the installed catalogue.
 
-## 1. The small configuration path
-
-An authorized agent should not have to wire a scheduler, six callbacks and three credentials merely to get code reviewed and published.
+## 1. Three independent decisions
 
 ```text
-swarm.tools.search: configure reviewed delivery
+configuration     how an action would run
+permission        whether this principal may request the action
+control           whether the manager wants this scope to act unattended now
+```
+
+A saved profile, installed plugin, granted capability, imported queue or available preset does not activate automation. Agent count and queue length never select a mode automatically.
+
+New projects/scopes default to `manual`, with no automatic stages or enabled automation definitions. Missing legacy activation evidence also defaults to manual pending a manager decision. The product must work usefully in that state; it is not a setup error.
+
+| Mode | Automatic execution | Manager experience |
+|---|---|---|
+| `manual` | None | Choose each action directly; dashboard, streams, peer collaboration and retained results remain available. |
+| `assisted` | None | Manual controls plus optional bounded deterministic recommendations; no extra model call to produce them. |
+| `delegated` | Only explicitly selected stages/definitions | The server executes eligible transitions inside the chosen scope and grant. Every other stage remains manual. |
+
+`paused` suspends unattended execution without erasing the saved mode or selected stages. Setting `mode=manual` returns the scope to manual operation. Neither action kills active agents.
+
+## 2. Configure without starting work
+
+The definition-editing path remains small:
+
+```text
+swarm.tools.search
   -> automation.config.get + runtime.catalog
   -> automation.config.preview
   -> automation.config.apply
-  -> automation.explain / swarm.dashboard
 ```
 
-`automation.config.get` returns the active project definition, its revision, permitted editable fields, source/provenance, available presets and a bounded summary of grants/gaps. It never returns secrets or the complete fleet inventory.
+`automation.config.get` returns the active definition, revision, editable fields, provenance, available presets and bounded gaps. It also references the separate effective control state. It exposes no secrets or global fleet dump.
 
-`automation.config.preview` validates a typed desired configuration against the caller, project, selected pool, available runtimes/models, required checks and publication capabilities. It returns the effective diff, chosen routes, denied changes, future-versus-active effects and a plan digest. It makes no assignments, installs nothing and spends no model tokens. Catalogue refresh, when requested, uses only qualified read-only discovery.
+`automation.config.preview` validates desired definitions, profiles and routing against current scope, capabilities and permission. It returns an effective diff, validation errors, future-versus-active effects and plan digest. It launches nothing, installs nothing and spends no model tokens. A requested catalogue refresh is a qualified read-only query.
 
-`automation.config.apply` accepts the desired definition, `expected_revision`, `plan_digest` and caller-owned request ID. It rechecks mutable facts and atomically activates the valid project revision. Retry returns the original receipt. A stale preview returns a conflict and a fresh diff, not a silent merge over another agent's settings.
+`automation.config.apply` requires desired definition, `expected_revision`, preview digest and caller-owned request ID. It atomically saves the valid definition. **It does not enable, resume or expand automation.** Same-request retry returns the original receipt. A stale preview returns current revisions and an actionable conflict.
 
-`automation.explain` answers why an item is running, waiting, returned, audited or awaiting publication, with its exact next eligible step and required permission/evidence. It does not ask another agent for an explanation or mutate the queue.
+`runtime.profile.get/list/preview/apply` edits execution preferences, not security profiles or control state. Project-owned profiles may be included in one configuration plan; no separate approval round is required for each harmless field. Only future assignments use a changed default.
 
-Runtime profiles have the analogous `runtime.profile.get/list/preview/apply` operations. They are independent configuration objects referenced by the project definition, not new MCP security profiles. A project configuration may atomically create/update its owned profiles as part of the same preview/apply plan; the small path must not require a separate round trip for every field.
+An executor/auditor may propose settings or edit explicitly delegated fields. Only a manager with control authority over the scope, or an authorized operator/current GM, changes effective unattended behavior. Authoring a rule/script and activating its unattended execution are different capabilities.
 
-## 2. One logical configuration authority
+## 3. Explicit control path
 
-The existing Store owns activated configuration. A local TOML/JSON file is an import/export representation of the same typed document, not a second scheduler database. The user chooses MCP-managed configuration or an authorized file-managed source for that project. The source mode, revision and authority are explicit; two competing watchers must not overwrite each other.
+Use `automation.control.get`, `automation.control.preview` and `automation.control.apply` in a small deferred MCP group.
 
-A trusted file edit goes through the same validation and activation path. The watcher observes the parent directory so atomic replacement is detected; missed events are repaired by bounded readback. Invalid input preserves the last valid revision and publishes a diagnostic identifying the field. Never crash the host, silently set defaults, or stop all running agents because a file was temporarily half-written.
+A control scope identifies one project and the manager-owned work pool or managed project area. A Task/action has at most one effective automation owner. Overlapping active ownership is reported for that item, not resolved by whichever rule runs first. Separate managers can keep their pools in different modes. A project-wide operator stop remains an upper bound.
 
-A repository file edited by a writer is a proposed configuration change, not automatic authority. Source selection, watched path and activation rights are setup-owned or delegated. Untrusted Issue text, PR content and tool output cannot select executables, grant network access or change audit/publication policy.
+The control record contains:
 
-`expected_revision` protects editing concurrency. It is not a prescribed software release. An already admitted job retains its execution snapshot; the active configuration determines subsequent jobs.
+```text
+scope_id / project_id / work_pool_id when applicable
+control_revision / management authority / sponsor
+mode: manual | assisted | delegated
+paused and reason
+selected automatic_stages
+selected rule_ids / schedule_ids / goal_ids
+execution_grant and bounded target/effect envelope
+manual Task/stage holds
+activation cut and inclusion choice
+resume_after_restart
+last control Operation
+```
 
-## 3. Standard preset
+These are per-scope indexed records, not one fleet-wide hot JSON object. IDs and revisions are work/control identity, not software-version pins.
 
-`reviewed_delivery` installs a fixed typed path: eligible Task -> manager/executors -> applied submission -> required auditor slots -> repair or audited -> acceptance/publication policy -> bookkeeping. It starts no work until enabled and an applicable standing grant exists.
+### 3.1 Activate or widen
 
-Users can set work order, profiles, review coverage, concurrency, eligible triggers, repair routing and publication mode without writing code. Scripts/custom rules extend it but are not necessary for the ordinary path. A custom rule cannot bypass its required candidate/audit checks.
+`automation.control.preview` resolves the exact requested change against current definitions, grants, pool membership and native/external execution state. It shows what may start, what remains manual, affected held/queued work, cost/capacity limits, restart behavior and any unobserved external continuations.
 
-Illustrative project configuration:
+`automation.control.apply` for enable/resume/widen requires the matching preview digest, expected control/configuration revisions, caller-owned request ID and an explicit desired control document. A single manager decision can enable multiple listed stages; there is no per-event Root approval afterward. Unknown or unauthorized fields/actions are rejected, not silently ignored.
+
+Example **explicit opt-in request**, after the definition has been saved:
+
+```json
+{
+  "client_request_id": "enable-selected-delivery-stages",
+  "scope_id": "project-a-managed-pool",
+  "expected_control_revision": 1,
+  "expected_config_revision": 2,
+  "plan_digest": "sha256:FROM_CONTROL_PREVIEW",
+  "desired": {
+    "mode": "delegated",
+    "paused": false,
+    "automatic_stages": ["work_dispatch", "review_dispatch"],
+    "rule_ids": [],
+    "schedule_ids": [],
+    "goal_ids": [],
+    "execution_grant": "project-a-delivery",
+    "resume_after_restart": false
+  },
+  "start_from": "current_eligible",
+  "reason": "Delegate queue distribution and audit assignment; keep repair and publication manual."
+}
+```
+
+`start_from` is `future_only` or `current_eligible`. It is required when enabling/resuming; the preview names its current eligible work and source cut. Neither value replays every historical event. The manager may intentionally include current waiting submissions instead of waiting for a new commit/event. Dispatch still rechecks current identity, ownership, dedupe and capacity.
+
+### 3.2 Disable or pause immediately
+
+A restrictive `automation.control.apply` may set `mode=manual`, `paused=true`, remove allowed stages/definitions, or add a manual hold without a remote preview. It requires current scope authority and `expected_control_revision`, but must not depend on a healthy GitHub connection, runtime catalogue or valid proposed configuration file.
+
+Return the new control revision plus held-not-started, started, outcome-unknown and externally delegated action references. A revision conflict returns the current local control view so the manager can retry the restriction. Do not run event scripts or notifications requiring remote work inline with this operation.
+
+Pausing and manual control block future unattended effect starts. They do not revoke direct authorized manager commands. `host.mode`/`new_work=disabled`, security policy, resource exclusion and candidate checks remain independent bounds; switching to manual is not a way around them.
+
+## 4. Select stages, not all-or-nothing autonomy
+
+All automatic stages default off. The closed registry initially distinguishes:
+
+| Stage | Unattended action permitted when selected |
+|---|---|
+| `work_dispatch` | Assign/start eligible work from the manager-selected pool. |
+| `review_dispatch` | Assign an auditor for an applied submission, including an eligible corrected submission. |
+| `review_disposition` | Apply actionable review feedback through the guarded Task transition. |
+| `repair_dispatch` | Deliver the correction to the owner/start the authorized repair work. |
+| `acceptance` | Apply exact-candidate acceptance under a separate acceptance grant. |
+| `publication` | Perform configured upload/push/merge effects within their exact effect grants. |
+| `github_projection` | Update the specifically configured managed labels, summaries and Checks. |
+| `scheduled_check` | Start a configured CheckRunner action from an unattended trigger. |
+| `script_run` | Start a named authorized external script from an unattended trigger. |
+| `goal_continue` | Start an additional supported native input under server continuation ownership. |
+| `notification` | Send configured unsolicited automation notices; not ordinary direct mail or an explicitly requested watch. |
+
+An automatic effect from a preset, rule, schedule, Goal or script child must satisfy its stage and current grant. Selecting a rule does not bypass an off publication stage; selecting a stage does not enable every existing rule/schedule/Goal. Non-preset trigger definitions must also be explicitly selected and enabled. Administration, changing control and expanding grants are not automatic action kinds.
+
+Hybrid examples:
+
+- automatic work/audit assignment; manager decides returns, continuation, acceptance and publication;
+- manager assigns all work; only auditor dispatch is automatic;
+- all delivery transitions manual; one selected diagnostic schedule is enabled by an explicit manager control decision;
+- fully delegated eligible delivery, with human/GM gates only where the actual project policy requires them.
+
+The third example is `delegated` for the selected scheduled-check stage, not falsely displayed as globally manual. Dashboard shows effective stages, not just a friendly preset name.
+
+`publication.mode=manager_gate` is an effect policy. It does not disable automatic upstream distribution or repair. `auto_after_audit` likewise cannot activate publication on its own.
+
+## 5. Manual configuration example
+
+The first-run configuration contains no activation or enabled field:
 
 ```toml
 schema = "eliot-agent-operations"
 project = "project-a"
-preset = "reviewed_delivery"
-enabled = true
-execution_grant = "project-a-delivery"
+preset = "manual_control"
 
 [work]
-pool = "manager-selected-issues"
 order = "manager_order"
-manager_profile = "implementation-manager"
-writer_profile = "writer"
-max_active_managers = 4
 max_in_flight_per_manager = 1
 
 [review]
-profile = "auditor"
 required_reviewers = 1
-max_parallel_reviews = 2
 coverage_policy = "project-current-phase"
-repair_route = "original_owner_first"
 
 [publication]
-mode = "auto_after_audit"
-route = "project-a-publication"
+mode = "manager_gate"
 review_transport = "local_candidate"
 close_issue = false
+```
 
-[notifications]
-audit_submissions = true
-wip_commit_notices = false
-manager_exceptions_only = true
+The control record is separately `manual`, with empty automatic stages/definitions. A standalone manually launched Task does not require a pool, an automation execution grant or a saved delivery preset. Its ordinary role, Task policy and action authority still apply.
 
-[profiles.implementation-manager]
-role = "manager"
-when_to_use = "Own one Issue, integrate writers, review diffs and submit the candidate."
-apply_changes = "next_assignment"
-fallback_on = ["capacity_unavailable"]
-[[profiles.implementation-manager.candidates]]
-route = "manager-primary"
-model = "MODEL_FROM_MANAGER_CATALOG"
-[profiles.implementation-manager.candidates.native_options]
-effort = "EFFORT_FROM_MANAGER_CATALOG"
+To prepare optional larger-team delivery, save a definition with `preset=reviewed_delivery`, the selected pool, manager/writer/auditor profiles and desired capacities. This does not change control state. Runtime profiles may be included:
 
+```toml
 [profiles.writer]
 role = "executor"
-when_to_use = "Implement the manager's assigned non-overlapping code change."
+when_to_use = "Implement the manager's assigned non-overlapping change."
 apply_changes = "next_assignment"
-fallback_on = ["capacity_unavailable"]
+fallback_on = []
+
 [[profiles.writer.candidates]]
 route = "writer-primary"
 model = "MODEL_FROM_WRITER_CATALOG"
+
 [profiles.writer.candidates.native_options]
 effort = "EFFORT_FROM_WRITER_CATALOG"
 
@@ -103,105 +185,77 @@ effort = "EFFORT_FROM_WRITER_CATALOG"
 role = "auditor"
 when_to_use = "Review the captured candidate against the assigned requirements."
 apply_changes = "next_assignment"
-fallback_on = ["capacity_unavailable"]
+fallback_on = []
+
 [[profiles.auditor.candidates]]
 route = "review-primary"
 model = "MODEL_FROM_REVIEW_CATALOG"
+
 [profiles.auditor.candidates.native_options]
 effort = "EFFORT_FROM_REVIEW_CATALOG"
 ```
 
-The example is syntactically complete but catalogue placeholders are not launchable model IDs. Setup/agent catalogue selection replaces them with a provider's actual accepted ID or alias. `4`, `1` and `2` are editable example capacities, not fixed fleet limits; one in-flight mutable product candidate per manager is an ownership rule.
+These are syntactically valid fragments of the typed definition, but model/effort placeholders are not launchable IDs. Catalogue selection replaces them. The one-in-flight value is the manager's ownership invariant; other capacities are explicit editable choices, not a reason to change mode.
 
-`publication.mode = "manager_gate"` changes only the final decision path. `route` references a locally configured publication target/method and permitted repository scope; it is not an arbitrary URL, refspec or shell command. `review_transport = "local_candidate"` audits before push. The optional `review_branch` mode requires the distinct candidate-upload permission from Delivery.
+## 6. Files, templates and upgrades cannot reactivate automation
 
-`close_issue = false` avoids equating code audit with full project closure. Projects may enable closure with an explicit completion contract and permission; this is a visible setting, not a hardcoded prohibition.
+Store is the authority for saved definitions and control decisions. TOML/JSON is their import/export format, not a second scheduler database. MCP-managed or trusted file-managed definition editing is explicit per project. Parent-directory watching survives atomic replacement; invalid input retains the last valid definition and records a field-level error.
 
-## 4. Runtime catalogue and preference resolution
+Watched files edit definitions only. They cannot enable/resume control, remove manual holds, expand its selected effect envelope or override a newer stop decision. Installing a plugin, creating a rule, copying an example or restoring a configuration backup does not constitute activation. A writer's repository change remains a proposal unless its edit rights explicitly cover that field.
 
-`runtime.catalog` returns bounded pages of installed/configured executors and their observed capabilities, models/aliases, native options, transport, effective privilege/trust, account-capacity group and freshness. Discover from installed protocols/manifests and qualified read-only inventory, not a hardcoded model list in Rust.
+Compatible definition/model/script changes within an already enabled envelope affect future admissions. A new action kind, target, trigger definition, grant, cost ceiling or publication scope requires a manager control preview. Existing selected rules cannot quietly broaden their effects through a hot reload.
 
-Keep separate:
+Migration preserves legacy schedule receipts and records, but a legacy `enabled=true` without an attributable manager activation is imported inactive with `activation_required`. Setup may offer a manager preview to adopt it; it must not silently start it or destroy its history.
 
-```text
-ELIOT role                  responsibility and application permissions
-route / executor            chosen native harness and Rust adapter
-model / provider            requested model, alias and billing path
-native_options              harness-native effort/mode/tool settings
-MCP profile / surface       authorized tools and their presentation
-OS execution profile        actual filesystem/network/process authority
-```
+## 7. Pause, manual takeover and restart
 
-The same model through two providers can have different quota, pricing and semantics. Neither a role label nor a model name determines transport or permission.
+Control changes serialize with the effect-start boundary described in Architecture. Queued autonomous actions that have not crossed it are held; their Operations/evidence are not deleted. An action that already crossed it is listed as in-flight and may complete. No promise is made that a remote write already in transit can be recalled.
 
-Resolution order is host security ceiling -> activated project policy -> role profile -> authorized per-Task overrides. Lower levels cannot relax higher-level restrictions. Model/effort options remain native values; do not pretend `high`, `xhigh` or `max` mean the same thing in every harness.
+A manager may execute a specific held transition through its normal typed manual command. It competes for the same semantic action/review slot as automation. The source `manual` versus `automatic` is not a new dedupe identity. The caller cannot forge that source; it is derived from authenticated request/cause lineage.
 
-A profile's candidate list is ordered. Each entry is a complete compatible route/model/options tuple, not fragments blended across providers. The resolver records requested and effective values, selection reason, fallback used, catalogue freshness and missing capabilities. Human-readable `when_to_use` guides selection; it cannot grant capabilities or add Task requirements.
+Manual execution authorizes only the named action and its documented finite prerequisites, not the entire downstream workflow. A manual review assignment can complete and record evidence, but cannot silently start repair or publication. A manual launch can prepare its workspace and start its selected agent without requiring automation to be enabled.
 
-A caller may choose an explicit native model ID or provider-supported alias. No default profile contains a frozen product-version requirement. Preferred aliases are resolved again for a new assignment; a running assignment's model is never silently switched because the alias changed upstream.
+Task/stage manual holds narrow enabled control without stopping unrelated pool work. Resume/release of a hold requires a manager decision and fresh eligibility; already manually handled work is not repeated. Expired deadlines are not approvals, and held work never becomes successful merely because the manager waits.
 
-Fallback is opt-in and limited to named eligible causes and candidate routes. Default examples allow unavailable capacity, not all errors. An authentication failure, unknown delivery or missing security capability never silently reroutes to another provider. No fallback buys credits, changes billing source, lowers required review coverage or enables a paid model outside the grant.
+Manager-client disconnect does not undo an intentionally active delegation. Host restart is separate: `resume_after_restart=false` is the default and produces `paused_for_restart`. The manager may explicitly enable unattended restart continuity. Then only still-valid recorded control/grants/targets resume; unresolved effects are read back and stale work is not relaunchable. An uncertain restored control record needs confirmation, not inferred consent.
 
-Rate limits and subscription quotas are tracked by their actual shared account/provider scope. Two routes using the same account do not obtain two independent budgets. Unknown quota is not infinite capacity. Use native reset/retry evidence; do not classify every HTTP 429 as the same condition.
+Native Goals, pending native inputs and external GitHub auto-merge/queue requests have their own execution owners. A local pause reports them. Cancellation/clear is a separately authorized supported action with readback; an unavailable cancel path leaves a visible `external_continuation_unresolved` restriction on that scope. Do not label a takeover complete while such activity can still mutate it.
 
-## 5. Choosing and updating executables without pins
+## 8. Runtime preferences without software pins
 
-The local runtime registry resolves installed executables through trusted installation locations or documented vendor discovery. Remote tools normally select the resulting logical handle, not a hash-named path or command string. An agent with explicit local setup rights can select another installed executable/transport through preview/apply; routine preference changes do not require reinstalling anything.
+`runtime.catalog` returns bounded installed/configured executor models, aliases, native options, capabilities, trust, shared account-capacity group and freshness. Discover from qualified native protocols/manifests rather than embedding a permanent model list.
 
-Accept a newer compatible native runtime based on documented protocol and capability evidence, not exact version equality. Retain observed versions for diagnosis. Tolerate additive native event fields; unknown consequential variants remain unsupported for that operation. ELIOT-authored configuration is stricter: unknown keys are errors to catch typos rather than silently ignore them.
+Keep role, executor route, provider/model/billing, native options, MCP security profile/surface and OS identity distinct. An ordered candidate entry is a complete route/model/options tuple; never blend fragments across providers. Native `high`, `xhigh` and `max` are not assumed equivalent.
 
-New transport/core feature requirements must be satisfied before launch. A process starting successfully is not proof that result delivery, required MCP tools or hook callbacks work. The launcher records actual capabilities. Optional stream gaps do not block unrelated implementation; missing required submission/reporting paths do.
+Resolution uses the host security ceiling, project policy, role profile and authorized Task overrides. `when_to_use` guides selection but grants no rights. Models/aliases are resolved for each new assignment; live work is not silently switched. Fallback is off unless named causes and alternatives are configured. Authentication failure, unknown input outcome or missing security capability is not permission to reroute. No implicit billing change, credit purchase or reduced review coverage.
 
-There is no automatic downgrade to an old CLI or crate to make an outdated document true. Update the Rust adapter and build/toolchain support as an explicit code delivery. Dependencies use normal compatible release requirements; exact `=version`/Git revision restrictions are not the default. Do not replace them with unchecked wildcard downloads at runtime. Cargo's recorded build resolution and diagnostic provenance do not become a runtime restriction forbidding newer compatible installations.
+Installed executable handles come from trusted local discovery. Accept newer compatible runtimes by protocol/capability evidence, not version equality; preserve observed versions for diagnosis. Additive native data is tolerated where safe; consequential unsupported behavior is reported. No exact dependency/CLI/model pins, runtime wildcard downloads, automatic downgrades or installer activity in hook/timer paths.
 
-No installer runs at a timer/hook event. The owner controls system-level installations and services. Updating preferences does not restart native services, change PATH or rewrite an active process's dependencies.
+Preference changes affect the next assignment. In manual mode, the manager can select an allowed explicit route for the one launch without enabling fallback or automation. A supported live model/options change remains a separate explicit `agent.configure` with actual readback.
 
-## 6. Safe changes while work is running
+## 9. Scripts, Goals and reminders
 
-| Change | Effect |
+New rules/schedules/Goals are inactive. Script activation selects runnable content, not a trigger; an authorized manual `script.run` or `schedule.run_now` executes only that invocation even when autonomous scheduling is paused. A Goal created to track progress stays draft/observational until the manager explicitly delegates continuation.
+
+Schedules normally select the active script definition. Each occurrence records resolved bytes/environment; updates do not mutate active runs or replay old receipts. Script authors may edit within their grant, but cannot enable a schedule or widen control. An automatic script's child actions retain automatic lineage and pass the same current stage/control checks.
+
+An explicitly requested one-shot `coordination.watch.create` is a bounded notification request and works in manual mode. Ordinary peer mail and delivery of already assigned results also remain available. Unsolicited recurring nudges, model wake, auto-answering permission prompts and scheduled prompts are not default reminders. They need their specific manager-selected action/definition and applicable capability.
+
+## 10. MCP and explanations
+
+Keep #22's small manager/participant cores. Deferred groups include:
+
+| Group | Methods |
 |---|---|
-| Queue priority within authorized pool | Future admission; existing ownership is preserved |
-| Writer/auditor preferred model or executor | Next assignment; live work keeps its actual route |
-| Parallelism increased | Additional eligible starts within grant/capacity |
-| Parallelism decreased or project paused | Drain future admission; no heuristic termination |
-| Active script changed | Next new invocation resolves new content; old request retries keep their original receipt |
-| New/stronger required audit | Applies according to explicit transition preview; an old verdict is not silently reused |
-| Grant/credential revoked | New calls/effects recheck immediately; uncertain effects are read back |
-| Optional display/retention setting | May apply immediately without deleting referenced evidence |
-| Existing native Goal owner changed | Supported pause/clear and reconciliation before new continuation owner |
+| automation-config | `automation.config.get/preview/apply`, `automation.explain` |
+| automation-control | `automation.control.get/preview/apply` |
+| runtime-profiles | `runtime.catalog`, `runtime.profile.get/list/preview/apply` |
+| review-delivery | `review.assign/get/submit`, ordinary guarded feedback/acceptance methods |
+| hooks / scripts / schedules / goals | Typed management and one-shot execution methods |
+| GitHub / forge | Read-only work context and separately authorized remote effects |
 
-The preview must list affected queued work and which operations are already beyond cancellation. A config change cannot retroactively undo a push, invalidate evidence by deleting it or turn an unknown model delivery into a safe retry.
+Slash notation denotes separate exact tools, not a generic dispatcher. Loading a deferred tool cannot activate automation. Disabling automation cannot hide or disable an otherwise authorized manual tool.
 
-Native hot model/options updates, where genuinely supported, remain a separate explicit `agent.configure` operation with its own effective-boundary/readback contract. They are not a side effect of editing a future-default profile.
+`automation.explain` reports mode, management owner, configuration/control revision, selected stage, grant, relevant manual hold, native/external execution, next manual action and exact missing prerequisite. Use `awaiting_manager`/`held_by_control`, not a code-defect status, for deliberately manual steps. Dashboard distinguishes zero automation by choice from broken automation.
 
-## 7. Scripts and schedules use active selectors
-
-A normal schedule action references `script_id = "project-a/report-changes"` and `selector = "active"`, not a permanently frozen script release. At each new occurrence, ELIOT resolves the active definition and records the content/environment used for that invocation. Script updates do not replay completed occurrences.
-
-Users may stage script revisions, validate them and activate them inside their authorized trust envelope. Support files are captured for running-code integrity. No mandatory approval for every harmless edit within an existing grant; increasing OS/network/secret/publication authority requires the corresponding delegable right.
-
-Built-in notify/review/publish actions are selected by registered action kind and typed arguments. They do not need a script file. New schedules, event rules and Goal settings follow the same preview/apply validation and current scope checks. A reminder remains a notice unless an explicit granted execution action is attached.
-
-## 8. Custom roles without permission surprises
-
-Role presets are editable capability bundles within grant limits. Managers can choose profiles for executors and auditors, assign multiple auditors and define project-local specialist roles when delegated to do so. An auditor cannot lower its own required coverage, replace its immutable candidate or turn a pass into a publication right.
-
-Configuration tools return `editable_fields` and precise denied changes. A request within existing rights applies without another human turn. An expansion returns the smallest missing capability/scope and its appropriate approver, not a generic instruction to ask Root about everything.
-
-Approval is bound to the requested scope/effects, not a model's friendly role name. Loading a deferred tool, changing a profile, selecting another CLI or following a repository-supplied workflow never widens the grant.
-
-## 9. Deferred tool groups
-
-Normal eager cores remain those from PR #22. Discover these only as needed:
-
-| Group | Canonical convenience methods |
-|---|---|
-| automation-config | `automation.config.get`, `automation.config.preview`, `automation.config.apply`, `automation.explain` |
-| runtime-profiles | `runtime.catalog`, `runtime.profile.get`, `runtime.profile.list`, `runtime.profile.preview`, `runtime.profile.apply` |
-| review-delivery | `review.assign`, `review.get`, `review.submit`, plus existing submission/acceptance methods when authorized |
-| schedules / scripts / hooks / goals | Existing proposed typed management operations from Architecture |
-| GitHub / forge | Work-pool/source reads and separately authorized projection/upload/publication operations |
-
-One application method has one MCP tool mapping. Dot-form names in these documents are application names; use the existing facade's validated wire-name mapping consistently, without introducing duplicate public aliases. No `execute_arbitrary_tool` or mode-switching mega-tool.
-
-Configuration objects are small enough to inspect, diff and edit in one exchange. Long history, logs, source documents and full model/tool catalogues remain paged or referenced. The agent receives actionable validation errors and can repair its proposed configuration without triggering work while experimenting.
+Preview/assisted recommendations are deterministic bounded reads. Clicking a specific next action issues that action's normal typed command; there is no generic `execute_any_action` MCP endpoint.
