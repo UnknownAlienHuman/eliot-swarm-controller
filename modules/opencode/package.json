@@ -1,0 +1,16 @@
+{
+  "name": "eliot-opencode-service-owner",
+  "private": true,
+  "type": "module",
+  "overrides": {
+    "@effect/platform-node-shared": "$@effect/platform-node-shared"
+  },
+  "dependencies": {
+    "@effect/platform-node": "4.0.0-rc.112",
+    "@effect/platform-node-shared": "4.0.0-rc.112",
+    "@opencode/core": "2.0.7",
+    "@opencode/server": "2.0.7",
+    "@opencode/util": "2.0.7",
+    "effect": "4.0.0-rc.112"
+  }
+}

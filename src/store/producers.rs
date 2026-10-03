@@ -3,6 +3,7 @@ use super::{operations, tasks};
 use crate::{
     error::{Error, Result},
     model::{self, Principal},
+    runtime::{RuntimeOutcome, batch},
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
@@ -158,16 +159,55 @@ fn matching_run<'a>(state: &'a Value, session: &str, run: &str) -> Option<&'a Va
     let mut observed = None;
     for t in turns.chain(child_turns) {
         if t["sessionId"] == session && t["turnId"] == run {
-            if matches!(
-                t["terminal"].as_str(),
-                Some("completed" | "failed" | "cancelled")
-            ) {
-                return Some(t);
+            // A child can appear both in `turns` and `last_turn`. Identical
+            // copies are one fact; conflicting copies cannot select a terminal
+            // disposition by array order or discharge the producer.
+            if observed.is_some_and(|previous| previous != t) {
+                return None;
             }
             observed = Some(t);
         }
     }
     observed
+}
+
+#[cfg(test)]
+mod receipt_ambiguity_tests {
+    use super::*;
+
+    #[test]
+    fn identical_run_copies_settle_once_but_conflicts_remain_unresolved() {
+        let terminal = json!({"sessionId":"session","turnId":"turn",
+            "terminal":"completed","event":"turn.completed","viewCursor":"cursor"});
+        let producer =
+            json!({"native_session_id":"session","native_run_id":"turn","disposition":"admitted"});
+        let mut consistent = producer.clone();
+        apply_evidence(
+            &mut consistent,
+            &json!({"turns":[terminal.clone()],
+            "observed_children":[{"sessionId":"session","last_turn":terminal.clone()}]}),
+            Some(1),
+        );
+        assert_eq!(consistent["disposition"], "completed");
+        let mut conflicted = terminal.clone();
+        conflicted["terminal"] = json!("failed");
+        for turns in [
+            json!([terminal.clone(), conflicted.clone()]),
+            json!([conflicted.clone(), terminal.clone()]),
+        ] {
+            let mut unresolved = producer.clone();
+            apply_evidence(&mut unresolved, &json!({"turns":turns}), Some(2));
+            assert_eq!(unresolved["disposition"], "admitted");
+        }
+        let mut unresolved = producer;
+        apply_evidence(
+            &mut unresolved,
+            &json!({"turns":[terminal],
+            "observed_children":[{"sessionId":"session","last_turn":conflicted}]}),
+            Some(3),
+        );
+        assert_eq!(unresolved["disposition"], "admitted");
+    }
 }
 fn run_observed(state: &Value, session: &str, run: &str) -> bool {
     let member = state["native_root_id"] == session
@@ -192,6 +232,7 @@ fn run_observed(state: &Value, session: &str, run: &str) -> bool {
 /// Terminal facts address an exact run; missing IDs never compare equal as null.
 /// A terminal fact does not accept a Task or release a native session.
 pub(super) fn apply_evidence(producer: &mut Value, state: &Value, observation_id: Option<i64>) {
+    crate::runtime::prepared::apply_input_execution(producer, state, observation_id);
     let Some(session) = producer["native_session_id"]
         .as_str()
         .filter(|x| !x.is_empty())
@@ -218,6 +259,55 @@ pub(super) fn apply_evidence(producer: &mut Value, state: &Value, observation_id
     }
     producer["disposition"] = json!(terminal);
     producer["terminal_evidence"] = json!({"observation_id":observation_id,"event":event["event"],"view_cursor":event["viewCursor"]});
+}
+
+/// Record a one-shot producer by its dispatch Operation, without pretending
+/// that a vendor session is a native root or that a batch has a turn ID.
+pub(super) fn record_batch(
+    tx: &Transaction<'_>,
+    operation: &Value,
+    outcome: &RuntimeOutcome,
+    now: i64,
+) -> Result<Value> {
+    if operation["method"] != "task.dispatch"
+        || outcome.operation_id != model::text(operation, "operation_id")?
+    {
+        return Err(Error::invalid(
+            "batch producer must belong to its exact task.dispatch Operation",
+        ));
+    }
+    let attempt_id = model::text(operation, "attempt_id")?;
+    let attempt = tasks::get_attempt(tx, attempt_id)?;
+    if !attempt["released_at_ms"].is_null()
+        || matches!(
+            attempt["state"].as_str(),
+            Some("accepted" | "failed" | "cancelled" | "superseded")
+        )
+        || attempt["start_operation_id"] != outcome.operation_id
+    {
+        return Err(Error::conflict(
+            "batch terminal evidence cannot be attached to a resolved or differently started Attempt",
+        ));
+    }
+    let producer = batch::dispatch_producer(outcome);
+    let mut producers: Vec<Value> = serde_json::from_value(attempt["producers"].clone())?;
+    if let Some(existing) = producers
+        .iter()
+        .find(|item| item["dispatch_operation_id"] == outcome.operation_id)
+    {
+        if model::canonical(existing)? != model::canonical(&producer)? {
+            return Err(Error::conflict(
+                "batch dispatch Operation already has different producer evidence",
+            ));
+        }
+        return Ok(existing.clone());
+    }
+    producers.push(producer.clone());
+    tx.execute(
+        "UPDATE attempts SET state=CASE WHEN state='reserved' THEN 'running' ELSE state END,producers_json=?2,updated_at_ms=?3 WHERE attempt_id=?1 AND released_at_ms IS NULL",
+        params![attempt_id, model::canonical(&json!(producers))?, now],
+    )?;
+    Ok(producer)
 }
 
 pub(super) fn bind(

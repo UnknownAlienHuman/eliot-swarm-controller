@@ -5,7 +5,7 @@
 // owns exactly one CLI process per binding, feeds it sequential user events
 // and maps its native event stream through codec.mjs. Host IPC reconnect
 // never closes the CLI process or repeats input.
-// Artifact scope (bridge.1): describe, agent.open (fresh or exact
+// Artifact scope (bridge.2): describe, agent.open (fresh or exact
 // conversation resume), next-turn agent.send/task.dispatch and observation
 // snapshots. Durable goal control is not established for this entrypoint,
 // mid-session configure/steer/reply and attach are reported unavailable,
@@ -19,11 +19,16 @@ import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { Control } from './control.mjs';
 import {
+  bindPendingLocalResults, localResultMatches, snapshotObservation,
+} from './receipt-state.mjs';
+import {
   createStreamState, applyNativeEvent, encodeUserMessage, noteMalformedLine,
   noteStderr, noteStreamEnd, noteStreamFailure, noteProcessExit, snapshot,
+  terminalResultDisposition,
 } from './codec.mjs';
 
 const ENTRYPOINT = 'antigravity_cli_warm_stream';
+const ARTIFACT_ID = 'antigravity-cli-warm-bridge.2';
 const EFFORTS = ['low', 'medium', 'high'];
 const CAPABILITIES = {
   describe: 'implemented',
@@ -64,7 +69,8 @@ if (argv.length !== 2 || argv[0] !== '--config') {
 }
 const config = JSON.parse(await readFile(argv[1], 'utf8'));
 const credential = JSON.parse(await readFile(required(config, 'credentialFile'), 'utf8'));
-required(config, 'endpoint'); required(config, 'moduleArtifactId');
+required(config, 'endpoint');
+if (required(config, 'moduleArtifactId') !== ARTIFACT_ID) throw new Error('MODULE_ARTIFACT_MISMATCH');
 if (typeof config.command !== 'string' || !path.isAbsolute(config.command)) throw new Error('NATIVE_EXECUTABLE_MUST_BE_ABSOLUTE');
 if (process.platform === 'win32' && /\.(cmd|bat)$/i.test(config.command)) throw new Error('USE_NATIVE_EXE_NOT_SHELL_WRAPPER');
 if (config.args !== undefined) throw new Error('ARGS_NOT_CONFIGURABLE_BRIDGE_OWNS_ARGV');
@@ -107,6 +113,9 @@ let lastSentRevision = -1;
 const outcomes = new Map(); // operation_id -> RuntimeOutcome awaiting host report
 const journal = new Map(); // operation_id -> settled summary for agent.reconcile
 const active = new Set(); // operation_ids currently executing
+let resultOrdinal = 0; // monotonic for this bridge boot, including warm-process resumes
+const localExecutionResults = []; // terminal results awaiting an acknowledged Store outcome
+let lastObservedLocalResults = null; // { observation_id, state } from this bridge boot
 
 function changed() { revision++; }
 function saveOutcome(operationId, result, method) {
@@ -132,6 +141,7 @@ function currentState() {
 function describeFacts(state) {
   return {
     entrypoint: ENTRYPOINT,
+    module_artifact_id: ARTIFACT_ID,
     protocol_basis: 'antigravity.google/docs/cli/headless (AG-HEADLESS, accessed 2026-10-02)',
     // The native stream carries no executor version and no version readback
     // is documented for this entrypoint; the field stays null, not guessed.
@@ -144,29 +154,97 @@ function describeFacts(state) {
 }
 function observation() {
   const state = currentState();
-  return {
+  return snapshotObservation({
     ...snapshot(state),
     describe: describeFacts(state),
     native_root_id: session?.rootId ?? null,
     native_scope_key: session?.scopeKey ?? null,
     boot_id: bootId,
-  };
+    local_execution_results: localExecutionResults,
+  });
+}
+
+function hasLocalResult(outcome) {
+  return outcome?.details?.local_execution_ref
+    && typeof outcome.details.local_execution_ref === 'object';
+}
+
+function removeLocalResult(operationId) {
+  for (let i = localExecutionResults.length - 1; i >= 0; i--) {
+    if (localExecutionResults[i].input_operation_id === operationId) localExecutionResults.splice(i, 1);
+  }
+}
+
+async function sendOutcome(link, operationId, outcome) {
+  await link.call('module.outcome', outcome);
+  if (outcomes.get(operationId) === outcome) {
+    outcomes.delete(operationId);
+    if (hasLocalResult(outcome)) removeLocalResult(operationId);
+  }
+}
+
+async function observeForLocalResult(link) {
+  const at = revision;
+  const state = observation();
+  const result = await link.call('module.observe', {
+    event_id: `${bootId}:${at}`,
+    sequence: at,
+    state,
+  });
+  const id = result?.observation_id;
+  if (result?.recorded !== true || result?.stale === true
+      || !Number.isSafeInteger(id) || id <= 0) {
+    // A replay response has no row ID. Use a fresh monotonic event key before
+    // allowing any Operation to cite the evidence.
+    if (result?.replayed === true || result?.stale === true) {
+      changed();
+      return null;
+    }
+    throw new Error('WARM_RESULT_OBSERVATION_ID_REQUIRED');
+  }
+  lastSentRevision = at;
+  lastObservedLocalResults = { observation_id: id, state };
+  return lastObservedLocalResults;
 }
 
 function settleSendForResult(sess, turn) {
-  // Warm turns are sequential and each admitted prompt yields exactly one
-  // result event in order (vendor docs), so the oldest pending send is the
-  // one this result proves. Admission alone never settled a send.
-  const entry = sess.pendingSends.shift();
+  // Warm prompts are sequential and result events are consumed in order. The
+  // native conversation must match init, and only a terminal result settles.
+  const entry = sess.pendingSends[0];
   if (!entry) return;
+  if (turn.conversation_id !== sess.rootId) return;
+  const disposition = terminalResultDisposition(turn.status);
+  if (!disposition) return;
+  sess.pendingSends.shift();
+  if (!turn.response_sha256) {
+    saveOutcome(entry.operation_id, {
+      outcome: 'unknown',
+      native_root_id: sess.rootId,
+      native_scope_key: sess.scopeKey,
+      details: { diagnostic_code: 'NATIVE_RESULT_FINGERPRINT_UNAVAILABLE' },
+    }, entry.method);
+    return;
+  }
+  const receipt = {
+    input_operation_id: entry.operation_id,
+    native_conversation_id: sess.rootId,
+    bridge_boot_id: bootId,
+    result_ordinal: turn.result_ordinal,
+    response_sha256: turn.response_sha256,
+    status: turn.status,
+  };
+  // Keep the observed list independent from the reference carried by the
+  // outcome; citing an observation must never mutate that captured receipt.
+  localExecutionResults.push({ ...receipt });
   saveOutcome(entry.operation_id, {
-    outcome: 'applied',
+    outcome: disposition === 'completed' ? 'applied' : 'rejected',
     native_root_id: sess.rootId,
     native_scope_key: sess.scopeKey,
     details: {
-      completion_condition: 'native_result_observed',
+      completion_condition: 'native_terminal_result_observed',
       turn_status: turn.status,
       num_turns: turn.num_turns,
+      local_execution_ref: receipt,
     },
   }, entry.method);
 }
@@ -199,7 +277,7 @@ async function pump(sess) {
       if (!line.trim()) continue;
       let event;
       try { event = JSON.parse(line); } catch { noteMalformedLine(sess.state); changed(); continue; }
-      const turnsBefore = sess.state.turns.length;
+      const ordinalBefore = sess.state.result_ordinal;
       applyNativeEvent(sess.state, event);
       if (!sess.rootId && sess.state.init?.conversation_id) {
         sess.rootId = sess.state.init.conversation_id;
@@ -212,7 +290,11 @@ async function pump(sess) {
         sess.openWait.reject(error);
         sess.openWait = null;
       }
-      for (let i = turnsBefore; i < sess.state.turns.length; i++) settleSendForResult(sess, sess.state.turns[i]);
+      if (sess.state.result_ordinal > ordinalBefore) {
+        resultOrdinal = sess.state.result_ordinal;
+        const turn = sess.state.turns.at(-1);
+        if (turn?.result_ordinal === resultOrdinal) settleSendForResult(sess, turn);
+      }
       changed();
     }
   } catch (error) {
@@ -239,7 +321,7 @@ async function startNative(command) {
   if (resumeId !== undefined) args.push('--conversation', required(command.input ?? {}, 'resume_conversation_id'));
   if (nativeOptions.dangerouslySkipPermissions === true) args.push('--dangerously-skip-permissions');
 
-  const state = createStreamState();
+  const state = createStreamState(resultOrdinal);
   const sess = {
     state, child: null, rootId: null, scopeKey: nativeScopeKey(),
     pendingSends: [], openWait: null, ended: false,
@@ -372,15 +454,47 @@ async function execute(command) {
 }
 
 async function report(link = control) {
+  // Store the opened identity before any result-backed task dispatch.
   for (const [id, outcome] of outcomes) {
-    await link.call('module.outcome', outcome);
-    // A native frame may have superseded this outcome while IPC awaited.
-    if (outcomes.get(id) === outcome) outcomes.delete(id);
+    if (!hasLocalResult(outcome)) await sendOutcome(link, id, outcome);
   }
+
+  // Retry acknowledged receipts before advancing the Store's materialized
+  // observation pointer; the cited row must still be the current one.
+  for (const [id, outcome] of outcomes) {
+    if (!hasLocalResult(outcome)) continue;
+    const ref = outcome.details.local_execution_ref;
+    if (Number.isSafeInteger(ref.observation_id) && ref.observation_id > 0) {
+      await sendOutcome(link, id, outcome);
+    }
+  }
+
+  let unbound = [...outcomes].filter(([, outcome]) => hasLocalResult(outcome)
+    && !(Number.isSafeInteger(outcome.details.local_execution_ref.observation_id)
+      && outcome.details.local_execution_ref.observation_id > 0));
+  if (unbound.length) {
+    const acknowledged = await bindPendingLocalResults(
+      unbound,
+      lastObservedLocalResults,
+      () => observeForLocalResult(link),
+      (id, outcome) => sendOutcome(link, id, outcome),
+    );
+    if (!acknowledged) return;
+    lastObservedLocalResults = acknowledged;
+  }
+
   if (lastSentRevision !== revision) {
     const at = revision;
-    await link.call('module.observe', { event_id: `${bootId}:${at}`, sequence: at, state: observation() });
+    const state = observation();
+    const result = await link.call('module.observe', { event_id: `${bootId}:${at}`, sequence: at, state });
+    if (result?.stale === true) {
+      changed();
+      return;
+    }
     lastSentRevision = at;
+    if (Number.isSafeInteger(result?.observation_id) && result.observation_id > 0) {
+      lastObservedLocalResults = { observation_id: result.observation_id, state };
+    }
   }
 }
 let reportBusy = false;

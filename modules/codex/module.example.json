@@ -1,1 +1,8 @@
-{"endpoint":"ws://127.0.0.1:4500","moduleArtifactId":"codex-sdk-18194bf-bridge.1","note":"Copy outside the repository and keep it untracked. endpoint is an EXISTING shared Codex app-server started by the operator (for example `codex app-server --listen ws://127.0.0.1:4500`); this bridge never starts, stops or owns it. tokenEnv, when set, names the environment variable holding the server's bearer capability token; the token itself never appears in this file or in bridge output.","tokenEnv":"CODEX_REMOTE_TOKEN"}
+{
+  "endpoint": "ws://127.0.0.1:4500",
+  "hostEndpoint": "\\\\.\\pipe\\REPLACE_WITH_HOST_ENDPOINT",
+  "credentialFile": "C:\\SwarmState\\codex-MC.credential.json",
+  "moduleArtifactId": "codex-sdk-18194bf-bridge.2",
+  "tokenEnv": "CODEX_REMOTE_TOKEN",
+  "note": "Copy outside the repository and keep it untracked. endpoint is an already-running operator-owned Codex app-server; this module never starts, stops or restarts it. hostEndpoint and credentialFile refer to the Rust module host IPC. tokenEnv is optional and names the environment variable holding the app-server bearer token; the token itself is never stored here or logged. The host supplies ELIOT_SWARM_MODULE_STATE and ELIOT_SWARM_MODULE_OWNER."
+}

@@ -214,6 +214,104 @@ pub(crate) struct ExecutionRead {
     pub gap: Option<&'static str>,
 }
 
+/// Unsaved evidence that one exact root's durable aggregate contains the
+/// controller-created origin event. This probe deliberately has no input
+/// checkpoint: it is a capability check before an inference-producing write.
+pub(crate) struct RootCreationScan {
+    session_id: String,
+    binding_id: String,
+    generation: i64,
+    model: Value,
+    anchor: Option<EventRef>,
+    watermark: Option<u64>,
+    creation: Option<EventRef>,
+}
+
+pub(crate) struct RootCreationRead {
+    pub scan: RootCreationScan,
+    pub synced: bool,
+    pub gap: Option<&'static str>,
+}
+
+impl RootCreationScan {
+    pub(crate) fn new(
+        session_id: &str,
+        binding_id: &str,
+        generation: i64,
+        model: Value,
+    ) -> Result<Self> {
+        valid_id(session_id, "ses")?;
+        if binding_id.trim().is_empty() || generation < 1 || !model.is_object() {
+            return Err(gap("NATIVE_LOG_ORIGIN"));
+        }
+        Ok(Self {
+            session_id: session_id.into(),
+            binding_id: binding_id.into(),
+            generation,
+            model,
+            anchor: None,
+            watermark: None,
+            creation: None,
+        })
+    }
+
+    pub(crate) fn created(&self) -> bool {
+        self.creation.is_some()
+    }
+
+    pub(crate) fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub(crate) fn consume(&mut self, value: &Value) -> Result<()> {
+        let event = envelope_for(value, &self.session_id)?;
+        if self
+            .anchor
+            .as_ref()
+            .is_some_and(|anchor| event.seq <= anchor.seq || event.id == anchor.id)
+            || self
+                .watermark
+                .is_some_and(|watermark| event.seq <= watermark)
+        {
+            return Err(gap("NATIVE_LOG_ORDER"));
+        }
+        let kind = model::text(value, "type").map_err(|_| gap("NATIVE_LOG_SCHEMA"))?;
+        if self.creation.is_none() {
+            let data = &value["data"];
+            if kind != "session.created"
+                || value["durable"]["version"] != 1
+                || data.get("parentID").is_some_and(|parent| !parent.is_null())
+                || data["metadata"]["eliot"]["binding"] != self.binding_id
+                || data["metadata"]["eliot"]["generation"] != self.generation
+                || data["model"] != self.model
+            {
+                return Err(gap("NATIVE_LOG_ORIGIN"));
+            }
+            self.creation = Some(event.clone());
+        } else if kind == "session.created" {
+            return Err(gap("NATIVE_LOG_ORIGIN_CHANGED"));
+        }
+        self.anchor = Some(event);
+        Ok(())
+    }
+
+    pub(crate) fn verify_anchor(&self, value: &Value) -> Result<()> {
+        if self.anchor.as_ref() != Some(&envelope_for(value, &self.session_id)?) {
+            return Err(gap("NATIVE_LOG_ANCHOR_CHANGED"));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn synchronize(&mut self, value: &Value) -> Result<()> {
+        self.watermark = watermark_for(value, &self.session_id, &self.anchor, &self.watermark)?;
+        Ok(())
+    }
+
+    pub(crate) fn has_anchor(&self) -> bool {
+        self.anchor.is_some()
+    }
+}
+
 impl ExecutionScan {
     pub(crate) fn restore(command: &RuntimeCommand, saved: Option<&Value>) -> Result<Self> {
         if !matches!(command.method.as_str(), "task.dispatch" | "agent.send") {
@@ -320,7 +418,7 @@ impl ExecutionScan {
         if self.creation.is_none() {
             if kind != "session.created"
                 || version != 1
-                || !data["parentID"].is_null()
+                || data.get("parentID").is_some_and(|parent| !parent.is_null())
                 || data["metadata"]["eliot"]["binding"] != descriptor.binding_id
                 || data["metadata"]["eliot"]["generation"] != descriptor.generation
                 || data["model"] != descriptor.model

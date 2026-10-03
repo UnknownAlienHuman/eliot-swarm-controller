@@ -2,7 +2,7 @@ use super::{meta, prerequisites, tasks};
 use crate::{
     config::Config,
     error::{Error, Result},
-    model::{self, Principal},
+    model::{self, Principal, Role},
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
@@ -164,19 +164,54 @@ pub(super) fn cancel(
     let reason = model::text(v, "reason")?;
     let o = get_operation(tx, target)?;
     p.owns(model::text(&o, "caller_id")?)?;
+    let stale_publication = o["method"] == "forge.publish_ref"
+        && o["state"] == "settled"
+        && o["result"]["outcome"] == "stale_gm_epoch";
+    if o["method"] == "forge.publish_ref" && p.role != Role::Operator {
+        let admitted_epoch: Option<i64> = tx.query_row(
+            "SELECT json_extract(effective_request_json,'$.publication_intent.admitted_gm_epoch') FROM operations WHERE operation_id=?1",
+            [target],
+            |row| row.get(0),
+        )?;
+        let current_epoch = match super::gm::record(tx)? {
+            None => 0,
+            Some(gm) => model::positive(&gm, "epoch")?,
+        };
+        if stale_publication || admitted_epoch != Some(current_epoch) {
+            return Err(Error::new(
+                "FORBIDDEN",
+                "only the local operator may cancel a publication from a stale GM epoch",
+            ));
+        }
+    }
     if o["method"] == "check.run" {
         return Err(Error::new(
             "CHECK_CANCEL_METHOD",
             "use check.cancel with the CheckRun ID",
         ));
     }
-    if o["state"] != "queued" {
+    if o["state"] != "queued" && !stale_publication {
         return Err(Error::new(
             "NOT_QUEUED",
             "already-sent operations require native cancellation/reconciliation, not local deletion",
         ));
     }
-    let count=tx.execute("UPDATE operations SET state='cancelled',settled_at_ms=?2,updated_at_ms=?2,result_json=?3 WHERE operation_id=?1 AND state='queued'",params![target,now,model::canonical(&json!({"reason":reason,"cancelled_by":id}))?])?;
+    let cancellation = if stale_publication {
+        json!({"reason":reason,"cancelled_by":id,"previous_result":o["result"]})
+    } else {
+        json!({"reason":reason,"cancelled_by":id})
+    };
+    let count = if stale_publication {
+        tx.execute(
+            "UPDATE operations SET state='cancelled',settled_at_ms=?2,updated_at_ms=?2,result_json=?3 WHERE operation_id=?1 AND state='settled' AND method='forge.publish_ref' AND json_extract(result_json,'$.outcome')='stale_gm_epoch'",
+            params![target, now, model::canonical(&cancellation)?],
+        )?
+    } else {
+        tx.execute(
+            "UPDATE operations SET state='cancelled',settled_at_ms=?2,updated_at_ms=?2,result_json=?3 WHERE operation_id=?1 AND state='queued'",
+            params![target, now, model::canonical(&cancellation)?],
+        )?
+    };
     if count != 1 {
         return Err(Error::conflict("operation changed before cancellation"));
     }

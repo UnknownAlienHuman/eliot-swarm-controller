@@ -5,10 +5,18 @@
 *.json text eol=lf
 *.toml text eol=lf
 *.py text eol=lf
+*.mjs text eol=lf
+Justfile text eol=lf
 *.ps1 text eol=lf
 *.sh text eol=lf
 *.cmd text eol=crlf
 *.zip binary
+
+# Upstream Codex SDK text assets use LF in SHA256SUMS on every platform.
+modules/codex/vendor_bridge/LICENSE text eol=lf
+modules/codex/vendor_bridge/UPSTREAM_COMMIT text eol=lf
+modules/codex/vendor_bridge/notebooks/sdk_walkthrough.ipynb text eol=lf
+modules/codex/vendor_bridge/uv.lock text eol=lf
 
 # Preserve the audited upstream snapshot byte-for-byte on every platform.
 vendor/atlas/** -text

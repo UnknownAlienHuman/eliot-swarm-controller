@@ -1,1 +1,10 @@
-{"command":"C:\\Tools\\CommandCode\\REPLACE_WITH_INSTALLED_CMD.exe","controlRoot":"C:\\SwarmState\\command-runs","cwd":"C:\\Projects\\YourRepository","moduleArtifactId":"command-mod-0.1.0-glue.1"}
+{
+  "credentialFile": "C:\\SwarmState\\command-MC.credential.json",
+  "endpoint": "\\\\.\\pipe\\REPLACE_WITH_HOST_ENDPOINT",
+  "command": "C:\\Program Files\\nodejs\\node.exe",
+  "commandArgs": [
+    "C:\\Path\\To\\command-code\\dist\\index.mjs"
+  ],
+  "controlRoot": "C:\\SwarmState\\command-runs",
+  "moduleArtifactId": "command-mod-0.1.0-glue.3"
+}

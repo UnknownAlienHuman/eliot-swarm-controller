@@ -7,7 +7,7 @@ stream entrypoint: one owned process per binding, launched as
 (`init` / `step_update` / `result`, discriminated by `event`) mapped by
 `codec.mjs`. There is no vendor SDK for this runtime and no shared server to
 attach to; the bridge owns the CLI process it starts and nothing else. New
-bindings use **`antigravity-cli-warm-bridge.1`**. Live Antigravity and
+bindings use **`antigravity-cli-warm-bridge.2`**. Live Antigravity and
 Windows native launch remain unqualified; syntax, fixtures and compilation
 do not attest model execution.
 
@@ -49,7 +49,7 @@ module opens.
 [[routes]]
 alias = 'antigravity-manager'
 runtime = 'antigravity'
-module_artifact_id = 'antigravity-cli-warm-bridge.1'
+module_artifact_id = 'antigravity-cli-warm-bridge.2'
 enabled = true
 [routes.native_options]
 workspaceRoot = 'C:\Projects\YourRepository'
@@ -67,7 +67,7 @@ has host-reconnect behavior, but no recorded process ownership/checkpoint.
 Do not overwrite its executable/scripts in place; use a new artifact/binding
 for changed module code.
 
-## Capability matrix (bridge.1)
+## Capability matrix (bridge.2)
 
 Readiness terms follow the module contract: `implemented` is code in this
 artifact, `documented` is the vendor contract it maps, `observed` requires
@@ -78,7 +78,7 @@ a live run, `unavailable` is an honest absence — never an emulation.
 | `describe` | implemented | Actual entrypoint, launch selection and known limits. Executor version is `null`: the native stream reports none and no version readback is documented for this entrypoint. |
 | `agent.open` | implemented | Spawns the warm stream; identity is the `conversation_id` of the native `init` event, proven before any prompt is admitted. |
 | `agent.open` with `resume_conversation_id` | implemented | Exact native resume via `--conversation <id>` in a new process (the documented resume path). It is an explicit open, never an automatic replay after bridge loss. |
-| `agent.send` / `task.dispatch` | implemented, next-turn only | One `user` event per prompt; the outcome settles `applied` only when that turn's native `result` event arrives (`native_result_observed`). Stream end first → `unknown`. |
+| `agent.send` / `task.dispatch` | implemented, next-turn only | One `user` event per prompt. Terminal `SUCCESS` is applied; terminal `ERROR`, `CANCELED`, or `INTERRUPTED` is rejected. The Store receipt binds the exact operation, conversation, bridge boot, result ordinal, response SHA-256 and acknowledged observation. `WAITING`, `RUNNING`, unknown statuses, missing response bytes, or stream end do not become Applied. |
 | `agent.refresh` (snapshot) | implemented | Codec observation of the root conversation or one observed child by its conversation_id. Family completeness stays `partial`. |
 | `agent.attach` | unavailable | No shared server or external attach surface exists for this runtime; a live owned session is checked by identity on send/refresh instead. |
 | `agent.configure` (model/effort) | unavailable mid-session | Model/effort/agent are launch flags (route `native_options`, applied at open). The stream documents no live setter — in-stream `/model` ends the session with an ERROR result — so nothing is emulated. |
@@ -89,6 +89,20 @@ a live run, `unavailable` is an honest absence — never an emulation.
 | `agent.recover` | unavailable | This artifact keeps no checkpoint. After bridge loss the binding stays reconciling; a new explicit open (optionally resuming the recorded conversation_id) is the operator's decision. |
 
 ## Observation boundaries
+
+- **A warm result is local execution evidence, not a native turn ID.** Each
+  terminal result is associated with the oldest sequentially admitted
+  operation and carries the native conversation ID, bridge boot ID, a
+  per-boot monotonic result ordinal, and SHA-256 of the exact UTF-8
+  `result.response`. The bridge first records an observation containing that
+  same operation ID and fingerprint, then sends the outcome with the returned
+  Store `observation_id`. No `turn_id` or inbox ID is fabricated. The ordinal
+  is adapter-local and never derived from cumulative `num_turns`; warm-process
+  resumes under one bridge boot keep it increasing.
+- **Only terminal statuses settle.** `SUCCESS` maps to Applied/completed;
+  `ERROR` maps to Rejected/failed; `CANCELED` and `INTERRUPTED` map to
+  Rejected/cancelled. `WAITING`, `RUNNING`, future statuses, or a terminal
+  result without response bytes remain unresolved; stream end reports Unknown.
 
 - **Soft-denied tools survive SUCCESS.** In headless mode a tool that
   cannot obtain approval is soft-denied: the run continues and can end

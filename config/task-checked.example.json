@@ -7,5 +7,6 @@
   ],
   "acceptance": {"required_check_profiles": [{"profile_id": "clippy-lib-bin", "profile_revision": "1"}]},
   "dependencies": [],
+  "owner_policy_id": "owner-policy-v1",
   "source_refs": ["docs/agent_swarm.implementation-v6.md#10-checks-artifacts-миграции"]
 }

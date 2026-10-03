@@ -9,7 +9,11 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as codec from './codec.mjs';
 import {
+  bindPendingLocalResults, localResultMatches, snapshotObservation,
+} from './receipt-state.mjs';
+import {
   createStreamState, applyNativeEvent, encodeUserMessage, snapshot,
+  terminalResultDisposition,
 } from './codec.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -36,6 +40,9 @@ function feed(messages) {
   assert.equal(snap.execution, 'turn_completed');
   assert.equal(snap.turns.length, 1);
   assert.equal(snap.turns[0].status, 'SUCCESS');
+  assert.equal(snap.turns[0].result_ordinal, 1);
+  assert.equal(snap.turns[0].conversation_id, 'c3b66b04-872b-4fbe-a3a4-058a026ef20a');
+  assert.match(snap.turns[0].response_sha256, /^[a-f0-9]{64}$/);
   assert.equal(snap.usage.total_tokens, 11007, 'usage comes from the result event');
   assert.equal(snap.usage.basis, 'native_cumulative_session');
   const response = snap.steps.find(s => s.step_index === 3);
@@ -53,6 +60,9 @@ function feed(messages) {
   const snap = snapshot(feed(await load('warm-two-turns.stream.json')));
   assert.equal(snap.turns.length, 2);
   assert.deepEqual(snap.turns.map(t => t.num_turns), [1, 2], 'num_turns is cumulative');
+  assert.deepEqual(snap.turns.map(t => t.result_ordinal), [1, 2], 'result ordinal is per bridge boot');
+  assert.equal(snap.turns[0].response_sha256, snap.turns[1].response_sha256,
+    'identical native response bytes have the same SHA-256 fingerprint');
   assert.equal(snap.usage.total_tokens, 30670, 'latest cumulative usage replaces, never sums');
   const step2 = snap.steps.find(s => s.step_index === 2);
   assert.equal(step2.state, 'DONE', 'ACTIVE then DONE updates one step record');
@@ -112,7 +122,7 @@ function feed(messages) {
   assert.deepEqual(exported, [
     'applyNativeEvent', 'createStreamState', 'encodeUserMessage',
     'noteMalformedLine', 'noteProcessExit', 'noteStderr', 'noteStreamEnd',
-    'noteStreamFailure', 'snapshot',
+    'noteStreamFailure', 'snapshot', 'terminalResultDisposition',
   ], 'no control_request/control_response or slash encoder exists in the codec');
   const state = createStreamState();
   applyNativeEvent(state, { event: 'future_thing', payload: {} });
@@ -120,7 +130,63 @@ function feed(messages) {
   const snap = snapshot(state);
   assert.equal(snap.other_events, 1, 'unknown event names are skipped, not fatal');
   assert.equal(snap.gaps, 1, 'a frame without the event discriminator is a gap');
+  assert.equal(terminalResultDisposition('SUCCESS'), 'completed');
+  assert.equal(terminalResultDisposition('ERROR'), 'failed');
+  assert.equal(terminalResultDisposition('CANCELED'), 'cancelled');
+  assert.equal(terminalResultDisposition('INTERRUPTED'), 'cancelled');
+  assert.equal(terminalResultDisposition('WAITING'), null, 'WAITING is not terminal evidence');
+  assert.equal(terminalResultDisposition('RUNNING'), null, 'RUNNING is not terminal evidence');
+  assert.equal(terminalResultDisposition('FUTURE_STATUS'), null, 'unknown status is never terminal proof');
   console.log('PASS encoder: user event only; unknown events skipped like the native CLI');
+}
+
+// 7. A later terminal result cannot mutate an earlier acknowledged snapshot.
+// The fake IPC calls prove module.observe precedes module.outcome and that the
+// outcome cites the newly recorded observation, without launching agy.
+{
+  const liveResults = [];
+  const previous = {
+    observation_id: 9,
+    state: snapshotObservation({ local_execution_results: liveResults }),
+  };
+  const receipt = {
+    input_operation_id: 'op_fixture',
+    native_conversation_id: 'conv_fixture',
+    bridge_boot_id: 'boot_fixture',
+    result_ordinal: 1,
+    response_sha256: 'a'.repeat(64),
+    status: 'SUCCESS',
+  };
+  liveResults.push({ ...receipt });
+  assert.equal(previous.state.local_execution_results.length, 0,
+    'an acknowledged observation is detached from later native results');
+  assert.equal(localResultMatches(receipt, previous.state.local_execution_results[0]), false,
+    'a result arriving later cannot be backdated onto the old observation');
+
+  const outcome = { details: { local_execution_ref: { ...receipt } } };
+  const calls = [];
+  const acknowledged = await bindPendingLocalResults(
+    [['op_fixture', outcome]],
+    previous,
+    async () => {
+      calls.push('module.observe');
+      return {
+        observation_id: 10,
+        state: snapshotObservation({ local_execution_results: liveResults }),
+      };
+    },
+    async (id, sent) => {
+      calls.push({ method: 'module.outcome', id, observation_id: sent.details.local_execution_ref.observation_id });
+    },
+  );
+  assert.equal(acknowledged.observation_id, 10);
+  assert.deepEqual(calls, [
+    'module.observe',
+    { method: 'module.outcome', id: 'op_fixture', observation_id: 10 },
+  ]);
+  assert.equal(liveResults[0].observation_id, undefined,
+    'citing an observation does not mutate the captured native receipt');
+  console.log('PASS receipt binding: new result gets a fresh immutable observation before outcome');
 }
 
 console.log('Antigravity bridge self-test: all fixture assertions passed');

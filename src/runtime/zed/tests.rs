@@ -203,6 +203,15 @@ exit 9
             .map(|r| r.metadata["native_output"].as_str().unwrap())
             .collect();
         assert_eq!(names, ["result.json", "thread.md", "thread.json"]);
+        let result_page = outcome
+            .artifacts
+            .iter()
+            .find(|record| record.metadata["native_output"] == "result.json")
+            .unwrap();
+        assert_eq!(
+            outcome.native_result_sha256.as_deref(),
+            Some(result_page.content_digest.as_str())
+        );
     }
 
     #[test]
@@ -230,8 +239,16 @@ exit 9
         assert_eq!(outcome.disposition, BatchDisposition::Error);
         assert_eq!(outcome.exit_code, Some(1));
         assert_eq!(
-            outcome.native_result.as_ref().unwrap()["error"],
-            "model auth failed"
+            outcome.native_result.as_ref().unwrap()["error_reported"],
+            true
+        );
+        assert!(
+            outcome
+                .native_result
+                .as_ref()
+                .unwrap()
+                .get("error")
+                .is_none()
         );
 
         let timeout = Fixture::new("timeout");
@@ -299,5 +316,233 @@ exit 9
         let fixture = Fixture::new("completed");
         fixture.run(5, "op-zed-once").unwrap();
         assert_eq!(fixture.run(5, "op-zed-once").unwrap_err().code, "CONFLICT");
+    }
+
+    #[test]
+    fn terminal_receipt_binds_artifacts_to_exact_operation_and_frozen_prompt() {
+        let fixture = Fixture::new("big_thread");
+        let options = fixture.options(5);
+        let route = json!({
+            "runtime":RUNTIME,
+            "module_artifact_id":ARTIFACT_ID,
+            "native_options":{
+                "scope_id":"fixture",
+                "executable":fixture.bin,
+                "workdir":fixture.workdir,
+                "model":"anthropic/claude-sonnet-4-6",
+                "timeout_seconds":5,
+                "env_keys":["ANTHROPIC_API_KEY"]
+            }
+        });
+        let input = json!({
+            "text":"Fix the fixture bug",
+            "task_snapshot":{"task_id":"task-1","revision":4,"requirements":[]}
+        });
+        let command = RuntimeCommand {
+            operation_id: "op-zed-receipt".into(),
+            method: "task.dispatch".into(),
+            created_at_ms: 1,
+            binding_id: "binding-1".into(),
+            generation: 1,
+            native_root_id: None,
+            route: route.clone(),
+            input: input.clone(),
+        };
+        let instruction = crate::runtime::batch::instruction(&input).unwrap();
+        let artifact_files = ArtifactFiles::new(&fixture.data_dir).unwrap();
+        let (batch, intent) = run_batch_command(
+            &options,
+            &command,
+            &instruction,
+            &fixture.out_root,
+            &artifact_files,
+        )
+        .unwrap();
+        fn sync_manifest(value: &mut Value) {
+            let artifacts = value["artifacts"].as_array().unwrap();
+            let refs = artifacts
+                .iter()
+                .map(|record| record["artifact_id"].clone())
+                .collect::<Vec<_>>();
+            let mut outputs = serde_json::Map::new();
+            for record in artifacts {
+                let output = record["metadata"]["native_output"].as_str().unwrap();
+                outputs
+                    .entry(output.to_owned())
+                    .or_insert_with(|| json!([]))
+                    .as_array_mut()
+                    .unwrap()
+                    .push(record["artifact_id"].clone());
+            }
+            value["outcome"]["details"]["artifact_refs"] = json!(refs);
+            value["outcome"]["details"]["output_artifact_refs"] = json!(outputs);
+        }
+
+        let artifact_refs = batch
+            .artifacts
+            .iter()
+            .map(|record| json!(record.artifact_id))
+            .collect::<Vec<_>>();
+        let mut output_artifact_refs = serde_json::Map::new();
+        for record in &batch.artifacts {
+            let output = record.metadata["native_output"].as_str().unwrap();
+            let refs = output_artifact_refs
+                .entry(output.to_owned())
+                .or_insert_with(|| json!([]));
+            refs.as_array_mut().unwrap().push(json!(record.artifact_id));
+        }
+        let receipt = BatchReceipt {
+            version: 1,
+            intent: intent.clone(),
+            outcome: RuntimeOutcome {
+                operation_id: command.operation_id.clone(),
+                outcome: crate::runtime::EffectOutcome::Applied,
+                native_scope_key: None,
+                native_root_id: None,
+                turn_id: None,
+                native_input_id: None,
+                details: json!({
+                    "execution_shape":crate::runtime::batch::EXECUTION_SHAPE,
+                    "completion_condition":"native_result_observed",
+                    "batch_run_id":intent.run_id,
+                    "requested_model":"anthropic/claude-sonnet-4-6",
+                    "effective_model":"anthropic/claude-sonnet-4-6",
+                    "effective_model_status":"observed",
+                    "exit_code":batch.exit_code,
+                    "native_result":batch.native_result,
+                    "native_result_sha256":batch.native_result_sha256,
+                    "artifact_refs":artifact_refs,
+                    "output_artifact_refs":output_artifact_refs
+                }),
+            },
+            artifacts: batch.artifacts,
+        };
+        persist_receipt(&fixture.out_root, &artifact_files, &route, &receipt).unwrap();
+        persist_receipt(&fixture.out_root, &artifact_files, &route, &receipt).unwrap();
+        let saved = read_receipt(
+            &fixture.out_root,
+            BatchReadContext {
+                operation_id: &command.operation_id,
+                binding_id: &command.binding_id,
+                generation: command.generation,
+                route: &route,
+                instruction: &instruction,
+                task_snapshot: &input["task_snapshot"],
+            },
+            &artifact_files,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(saved.intent, intent);
+        assert_eq!(saved.artifacts.len(), 6);
+
+        let terminal_path =
+            run_directory(&fixture.out_root, &command.operation_id).join("terminal.json");
+        let reject_tampered_receipt = |value: Value| {
+            let malformed: BatchReceipt = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(
+                persist_receipt(&fixture.out_root, &artifact_files, &route, &malformed)
+                    .unwrap_err()
+                    .code,
+                "BATCH_RECEIPT_MISMATCH"
+            );
+            std::fs::write(&terminal_path, model::canonical(&value).unwrap()).unwrap();
+            assert_eq!(
+                read_receipt(
+                    &fixture.out_root,
+                    BatchReadContext {
+                        operation_id: &command.operation_id,
+                        binding_id: &command.binding_id,
+                        generation: command.generation,
+                        route: &route,
+                        instruction: &instruction,
+                        task_snapshot: &input["task_snapshot"],
+                    },
+                    &artifact_files,
+                )
+                .unwrap_err()
+                .code,
+                "BATCH_RECEIPT_MISMATCH"
+            );
+        };
+        let original = serde_json::to_value(&receipt).unwrap();
+        assert!(!original["outcome"]["details"]["native_result"].is_null());
+        let mut wrong_result_digest = original.clone();
+        wrong_result_digest["outcome"]["details"]["native_result_sha256"] = json!("0".repeat(64));
+        reject_tampered_receipt(wrong_result_digest);
+
+        let mut wrong_projection = original.clone();
+        wrong_projection["outcome"]["details"]["native_result"]["model"] =
+            json!("provider/other-model");
+        reject_tampered_receipt(wrong_projection);
+
+        let mut wrong_run = original.clone();
+        wrong_run["outcome"]["details"]["batch_run_id"] = json!("foreign-run");
+        reject_tampered_receipt(wrong_run);
+
+        let mut wrong_ref = original.clone();
+        wrong_ref["outcome"]["details"]["artifact_refs"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("unregistered-page"));
+        reject_tampered_receipt(wrong_ref);
+
+        let mut wrong_group = original.clone();
+        wrong_group["outcome"]["details"]["output_artifact_refs"]["result.json"] =
+            json!(["unregistered-page"]);
+        reject_tampered_receipt(wrong_group);
+
+        let mut missing_page = original.clone();
+        missing_page["artifacts"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|record| {
+                !(record["metadata"]["native_output"] == "thread.md"
+                    && record["metadata"]["page"] == 3)
+            });
+        sync_manifest(&mut missing_page);
+        reject_tampered_receipt(missing_page);
+
+        let mut missing_result = original.clone();
+        missing_result["artifacts"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|record| record["metadata"]["native_output"] != "result.json");
+        sync_manifest(&mut missing_result);
+        reject_tampered_receipt(missing_result);
+
+        let mut relabelled_pages = original.clone();
+        let artifacts = relabelled_pages["artifacts"].as_array_mut().unwrap();
+        let result_index = artifacts
+            .iter()
+            .position(|record| record["metadata"]["native_output"] == "result.json")
+            .unwrap();
+        let json_thread_index = artifacts
+            .iter()
+            .position(|record| record["metadata"]["native_output"] == "thread.json")
+            .unwrap();
+        artifacts[result_index]["metadata"]["native_output"] = json!("thread.json");
+        artifacts[json_thread_index]["metadata"]["native_output"] = json!("result.json");
+        sync_manifest(&mut relabelled_pages);
+        reject_tampered_receipt(relabelled_pages);
+
+        std::fs::write(&terminal_path, model::canonical(&original).unwrap()).unwrap();
+        assert_eq!(
+            read_receipt(
+                &fixture.out_root,
+                BatchReadContext {
+                    operation_id: &command.operation_id,
+                    binding_id: &command.binding_id,
+                    generation: command.generation,
+                    route: &route,
+                    instruction: "different frozen text",
+                    task_snapshot: &input["task_snapshot"],
+                },
+                &artifact_files,
+            )
+            .unwrap_err()
+            .code,
+            "BATCH_RECEIPT_MISMATCH"
+        );
     }
 }

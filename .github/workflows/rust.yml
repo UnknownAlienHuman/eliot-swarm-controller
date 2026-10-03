@@ -41,6 +41,8 @@ jobs:
           assert actual == set(expected) | {'SHA256SUMS'}, 'donor file set changed'
       - name: Clippy
         run: cargo clippy --locked --lib --bins --no-deps -- -D warnings
+      - name: Rust application and protocol tests
+        run: cargo test --locked -p eliot-swarm-controller --lib --bins
       - name: Muse bridge syntax and pinned SDK import
         shell: bash
         run: |
@@ -55,6 +57,34 @@ jobs:
           node --version
           for file in modules/claude/*.mjs; do node --check "$file"; done
           cd modules/claude
+          npm ci --ignore-scripts --no-audit --no-fund
+          node selftest.mjs
+      - name: Remaining native module fixture tests (no accounts or model calls)
+        shell: bash
+        run: |
+          node modules/muse/selftest.mjs
+          node modules/antigravity/selftest.mjs
+          node modules/command/test-glue.mjs
+          node modules/command/test-bridge.mjs
+          node modules/opencodex/selftest.mjs
+      - name: Codex SDK provenance and attach protocol fixtures
+        shell: bash
+        run: |
+          python --version
+          python -m pip install --disable-pip-version-check -r modules/codex/requirements.txt
+          python modules/codex/verify_vendor.py
+          python modules/codex/test_bridge.py
+      - name: Pinned OpenCode owner runtime
+        id: opencode-bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: '1.4.0'
+      - name: OpenCode durable owner smoke (offline, no model calls)
+        shell: bash
+        env:
+          ELIOT_OPENCODE_BUN_EXE: ${{ steps.opencode-bun.outputs.bun-path }}
+        run: |
+          cd modules/opencode
           npm ci --ignore-scripts --no-audit --no-fund
           node selftest.mjs
       - name: Build
@@ -91,6 +121,8 @@ jobs:
             modules/*/UPDATE.md
             modules/claude/fixtures/
             modules/opencode/README.md
+            modules/opencode/*.mjs
+            modules/opencode/package*.json
             vendor/atlas/
             build-info/
             target/release/swarm

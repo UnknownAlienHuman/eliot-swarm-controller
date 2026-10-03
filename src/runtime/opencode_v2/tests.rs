@@ -43,10 +43,14 @@ pub(crate) struct World {
     pub forms: BTreeMap<String, Vec<Value>>,
     pub permissions: BTreeMap<String, Vec<Value>>,
     pub logs: BTreeMap<String, Vec<Value>>,
+    pub log_watermarks: BTreeMap<String, u64>,
     pub active: BTreeMap<String, Value>,
     pub overrides: BTreeMap<(String, String), Reply>,
     pub entries: BTreeMap<String, BTreeMap<String, Value>>,
     pub lose_create: bool,
+    /// Simulate a native server that advances the sequence but retains no
+    /// durable events (OpenCode 2.0.7's standard bus persistence default).
+    pub omit_created_log: bool,
     pub lose_prompt: bool,
     pub lose_entry_put: bool,
     pub consume_prompt: bool,
@@ -223,8 +227,18 @@ fn respond(w: &mut World, o: &Options, origin: &str, r: &Request) -> Reply {
             let mut session = r.body.clone();
             session["projectID"] = json!("prj_fixture");
             session["time"] = json!({"created":1,"updated":2});
-            w.sessions
-                .insert(session["id"].as_str().unwrap().into(), session.clone());
+            let id = session["id"].as_str().unwrap().to_owned();
+            w.sessions.insert(id.clone(), session.clone());
+            if std::mem::take(&mut w.omit_created_log) {
+                w.logs.insert(id.clone(), Vec::new());
+                w.log_watermarks.insert(id, 9);
+            } else {
+                w.log_watermarks.remove(&id);
+                w.logs.insert(
+                    id.clone(),
+                    vec![root_log_created_from_session(&id, &session)],
+                );
+            }
             if std::mem::take(&mut w.lose_create) {
                 return Reply::Drop;
             }
@@ -308,7 +322,7 @@ fn respond(w: &mut World, o: &Options, origin: &str, r: &Request) -> Reply {
             .find(|(k, _)| k == "after")
             .and_then(|(_, v)| v.parse::<u64>().ok());
         let mut body = String::new();
-        let mut max = 0u64;
+        let mut max = w.log_watermarks.get(parts[3]).copied().unwrap_or(0);
         for e in events {
             let seq = e["durable"]["seq"].as_u64().unwrap_or(0);
             max = max.max(seq);
@@ -616,6 +630,114 @@ async fn lost_creation_is_resolved_by_exact_read_without_create_replay() {
     assert_applied(s.reconcile(&c, &f.options).await);
     assert_eq!(f.posts("/api/session"), 1);
 }
+
+#[tokio::test]
+async fn synced_empty_creation_log_keeps_root_unknown_and_blocks_every_input_post() {
+    let f = Fixture::new().await;
+    let s = f.service().await;
+    f.world.lock().unwrap().omit_created_log = true;
+    let open = f.command("agent.open");
+    let root = root_id(&open.binding_id, open.generation);
+    let scope = f.options.scope();
+
+    let r = s.execute(&open, &f.options).await;
+    assert!(matches!(r.outcome, EffectOutcome::Unknown), "{r:?}");
+    assert_eq!(r.details["code"], "DURABLE_EVENT_PERSISTENCE_UNAVAILABLE");
+    assert_eq!(r.native_root_id.as_deref(), Some(root.as_str()));
+    assert_eq!(r.native_scope_key.as_deref(), Some(scope.as_str()));
+    assert!(f.world.lock().unwrap().requests.iter().any(|request| {
+        request.method == "GET"
+            && request.target == format!("/api/experimental/session/{root}/log?follow=false")
+    }));
+
+    let reconciled = s.reconcile(&open, &f.options).await;
+    assert!(
+        matches!(reconciled.outcome, EffectOutcome::Unknown),
+        "{reconciled:?}"
+    );
+    assert_eq!(
+        reconciled.details["code"],
+        "DURABLE_EVENT_PERSISTENCE_UNAVAILABLE"
+    );
+    assert_eq!(reconciled.native_root_id.as_deref(), Some(root.as_str()));
+    assert_eq!(reconciled.native_scope_key.as_deref(), Some(scope.as_str()));
+
+    let send = f.command("agent.send");
+    let rejected = s.execute(&send, &f.options).await;
+    assert!(
+        matches!(rejected.outcome, EffectOutcome::Rejected),
+        "{rejected:?}"
+    );
+    assert_eq!(
+        rejected.details["code"],
+        "DURABLE_EVENT_PERSISTENCE_UNAVAILABLE"
+    );
+
+    let mut dispatch = f.command("task.dispatch");
+    dispatch.input["task_snapshot"] = json!({"task_id":"task_fixture"});
+    let rejected = s.execute(&dispatch, &f.options).await;
+    assert!(
+        matches!(rejected.outcome, EffectOutcome::Rejected),
+        "{rejected:?}"
+    );
+    assert_eq!(
+        rejected.details["code"],
+        "DURABLE_EVENT_PERSISTENCE_UNAVAILABLE"
+    );
+
+    let goal = f.goal_command(json!({"action":"set","objective":"must not activate"}));
+    let unresolved = s.execute(&goal, &f.options).await;
+    assert!(
+        matches!(unresolved.outcome, EffectOutcome::Unknown),
+        "{unresolved:?}"
+    );
+    assert_eq!(
+        unresolved.details["code"],
+        "DURABLE_EVENT_PERSISTENCE_UNAVAILABLE"
+    );
+
+    let request = json!({"id":"per_fixture","sessionID":root,"action":"shell"});
+    f.world
+        .lock()
+        .unwrap()
+        .permissions
+        .insert(root.clone(), vec![request.clone()]);
+    let mut reply = f.command("agent.reply");
+    reply.input = json!({"reply":{"kind":"permission","session_id":root,
+        "request_id":"per_fixture",
+        "fingerprint":model::digest(model::canonical(&request).unwrap().as_bytes()),
+        "body":{"decision":"once"}}});
+    let rejected = s.execute(&reply, &f.options).await;
+    assert!(
+        matches!(rejected.outcome, EffectOutcome::Rejected),
+        "{rejected:?}"
+    );
+    assert_eq!(
+        rejected.details["code"],
+        "DURABLE_EVENT_PERSISTENCE_UNAVAILABLE"
+    );
+
+    let background = background_command(&f, json!({}));
+    let rejected = s.execute(&background, &f.options).await;
+    assert!(
+        matches!(rejected.outcome, EffectOutcome::Rejected),
+        "{rejected:?}"
+    );
+    assert_eq!(
+        rejected.details["code"],
+        "DURABLE_EVENT_PERSISTENCE_UNAVAILABLE"
+    );
+
+    assert_eq!(f.posts("/api/session"), 1);
+    assert_eq!(f.posts(&format!("/api/session/{root}/prompt")), 0);
+    assert_eq!(
+        f.posts(&format!("/api/session/{root}/permission/per_fixture/reply")),
+        0
+    );
+    assert_eq!(f.posts(&format!("/api/session/{root}/background")), 0);
+    assert!(f.world.lock().unwrap().inbox.is_empty());
+}
+
 #[tokio::test]
 async fn lost_prompt_is_read_back_from_inbox_without_resend() {
     let f = Fixture::new().await;
@@ -899,6 +1021,30 @@ fn root_log_created(root: &str) -> Value {
         json!({"sessionID":root,"parentID":Value::Null,
         "metadata":{"eliot":{"binding":"fixture-binding","generation":1}},
         "model":{"id":"fixture-model","providerID":"fixture-provider","variant":"explicit-variant"}}),
+    )
+}
+
+fn root_log_created_without_parent(root: &str) -> Value {
+    let mut event = root_log_created(root);
+    event["data"].as_object_mut().unwrap().remove("parentID");
+    event
+}
+
+/// Persist the exact origin facts from the native create request. Store-level
+/// tests use generated binding IDs, so the default unit-test binding above is
+/// not a valid origin for them.
+fn root_log_created_from_session(root: &str, session: &Value) -> Value {
+    root_log_event(
+        "evt_root_created",
+        "session.created",
+        1,
+        root,
+        json!({
+            "sessionID":root,
+            "parentID":session.get("parentID").cloned().unwrap_or(Value::Null),
+            "metadata":session.get("metadata").cloned().unwrap_or(Value::Null),
+            "model":session.get("model").cloned().unwrap_or(Value::Null)
+        }),
     )
 }
 
@@ -1203,8 +1349,9 @@ async fn lost_activation_prompt_reconciles_from_inbox_without_resend() {
         r.native_input_id.as_deref(),
         Some(input_id(&c.operation_id).as_str())
     );
-    // Admission is proven by the exact inbox readback. The fixture serves no
-    // durable root log, so no execution start is proven: admitted, not started.
+    // Admission is proven by the exact inbox readback. The fixture has the
+    // root-origin event but no activation lifecycle events, so no execution
+    // start is proven: admitted, not started.
     assert_eq!(r.details["goal"]["activation_admitted"], true);
     assert_eq!(r.details["goal"]["activation_execution_started"], false);
     assert_eq!(r.details["goal"]["activation_execution_ref"], Value::Null);
@@ -1297,6 +1444,63 @@ async fn lost_activation_with_message_and_log_proves_admission_and_start_separat
     // Reconciliation read back only: no prompt or entry write was replayed.
     assert_eq!(f.posts(&goal_prompt_path(&root)), 1);
     assert_eq!(f.puts(&goal_entry_path(&root)), 1);
+}
+
+#[test]
+fn root_creation_and_input_scans_accept_native_omitted_parent_id_only() {
+    let root = root_id("fixture-binding", 1);
+    let model =
+        json!({"id":"fixture-model","providerID":"fixture-provider","variant":"explicit-variant"});
+    let created = root_log_created_without_parent(&root);
+
+    // OpenCode 2.0.7's native session.created schema makes parentID optional.
+    let mut origin = RootCreationScan::new(&root, "fixture-binding", 1, model.clone()).unwrap();
+    origin.consume(&created).unwrap();
+    assert!(origin.created());
+
+    let operation = "op_parentless_root";
+    let text = "verify parentless native root";
+    let marker = json!({"binding":"fixture-binding","generation":1,"operation":operation});
+    let command = RuntimeCommand {
+        operation_id: operation.into(),
+        method: "agent.goal".into(),
+        created_at_ms: 1,
+        binding_id: "fixture-binding".into(),
+        generation: 1,
+        native_root_id: Some(root.clone()),
+        route: json!({"runtime":RUNTIME,"module_artifact_id":ARTIFACT_ID,
+        "native_options":{"model":model.clone()}}),
+        input: json!({"text":text}),
+    };
+    let descriptor =
+        NativeInputDescriptor::for_goal_activation(&command, text, marker.clone()).unwrap();
+    let mut scan = ExecutionScan::for_goal(&descriptor).unwrap();
+    scan.consume(&created, &descriptor).unwrap();
+    let input = input_id(operation);
+    scan.consume(
+        &root_log_enqueued(&root, 2, &input, text, &marker),
+        &descriptor,
+    )
+    .unwrap();
+    assert!(scan.input_admitted());
+
+    // Absence is allowed for roots; any present parent remains a mismatch.
+    for parent in [json!("ses_foreign"), json!({"unexpected":"ses_foreign"})] {
+        let mut foreign = created.clone();
+        foreign["data"]["parentID"] = parent;
+
+        let mut origin = RootCreationScan::new(&root, "fixture-binding", 1, model.clone()).unwrap();
+        assert_eq!(
+            origin.consume(&foreign).unwrap_err().code,
+            "NATIVE_LOG_ORIGIN"
+        );
+
+        let mut scan = ExecutionScan::for_goal(&descriptor).unwrap();
+        assert_eq!(
+            scan.consume(&foreign, &descriptor).unwrap_err().code,
+            "NATIVE_LOG_ORIGIN"
+        );
+    }
 }
 
 #[test]

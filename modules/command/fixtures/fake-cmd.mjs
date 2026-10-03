@@ -20,19 +20,21 @@
 //
 // Scenario selection: FAKE_CMD_SCENARIO env var.
 //   success | auth-error | max-turns | mod-error | crash-no-result |
-//   no-session-id        (default: success)
+//   no-session-id | success-exit-mismatch  (default: success)
 
 import { pathToFileURL } from "node:url";
+import { appendFileSync } from "node:fs";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function parseArgs(argv) {
-  const parsed = { print: false, outputFormat: "text", mods: [], prompt: null, version: false };
+  const parsed = { print: false, outputFormat: "text", model: null, mods: [], prompt: null, version: false };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === "--version") parsed.version = true;
     else if (arg === "-p" || arg === "--print") parsed.print = true;
     else if (arg === "--output-format") parsed.outputFormat = argv[++i];
+    else if (arg === "--model") parsed.model = argv[++i];
     else if (arg === "--mod") parsed.mods.push(argv[++i]);
     else if (arg === "--resume" || arg === "-r") i += 1; // value unused by fixtures
     else if (arg === "--continue" || arg === "-c") { /* flag */ }
@@ -43,6 +45,20 @@ function parseArgs(argv) {
 
 function printLine(value) {
   process.stdout.write(JSON.stringify(value) + "\n");
+}
+
+function recordFilteredEnvironment() {
+  const output = process.env.FAKE_CMD_ENV_PROBE_FILE;
+  if (!output) return;
+  appendFileSync(output, JSON.stringify({
+    owner_present: Object.hasOwn(process.env, "ELIOT_SWARM_MODULE_OWNER"),
+    state_present: Object.hasOwn(process.env, "ELIOT_SWARM_MODULE_STATE"),
+    command_control_dir: process.env.ELIOT_COMMAND_CONTROL_DIR ?? null,
+    qual_capture_present: Object.keys(process.env).some((name) => name.startsWith("SWARM_QUAL_")),
+    capture_present: Object.keys(process.env).some((name) => name.toUpperCase().includes("CAPTURE")),
+    path_present: typeof process.env.PATH === "string",
+    vendor_auth_present: Object.hasOwn(process.env, "ANTHROPIC_API_KEY"),
+  }) + "\n");
 }
 
 function createModHost() {
@@ -113,15 +129,20 @@ async function loadMods(paths, host) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
+  recordFilteredEnvironment();
   if (args.version) {
     process.stdout.write("cmd version 1.66.0 (fixture)\n");
     return;
   }
-  if (!args.print || args.outputFormat !== "json") {
-    process.stderr.write("fixture supports only: -p --output-format json\n");
+  if (process.env.FAKE_CMD_INVOCATION_FILE) {
+    appendFileSync(process.env.FAKE_CMD_INVOCATION_FILE, "native-run\n");
+  }
+  if (!args.print || args.outputFormat !== "json" || !args.model) {
+    process.stderr.write("fixture supports only: -p --output-format json --model <id>\n");
     process.exitCode = 2;
     return;
   }
+  process.stderr.write(`fixture observed --model ${args.model}\n`);
   const scenario = process.env.FAKE_CMD_SCENARIO ?? "success";
   const host = createModHost();
   await loadMods(args.mods, host);
@@ -232,7 +253,7 @@ async function main() {
         stopReason: "end_turn",
       });
       lifecycle("session_shutdown", { reason: "shutdown" });
-      process.exitCode = 0;
+      process.exitCode = scenario === "success-exit-mismatch" ? 1 : 0;
     }
   }
 }

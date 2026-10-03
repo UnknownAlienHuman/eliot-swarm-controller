@@ -129,7 +129,10 @@ pub enum Role {
     Manager,
     Observer,
     Module,
+    /// In-process schedule admission only; never an authenticatable client.
+    Scheduler,
 }
+pub const INTERNAL_SCHEDULER_CLIENT_ID: &str = "eliot-internal-scheduler-v1";
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Credential {
@@ -157,7 +160,10 @@ impl Principal {
         Ok(())
     }
     pub fn owns(&self, owner: &str) -> Result<()> {
-        if self.role == Role::Operator || (self.role == Role::Manager && self.client_id == owner) {
+        if self.role == Role::Operator
+            || (self.role == Role::Scheduler && self.client_id == INTERNAL_SCHEDULER_CLIENT_ID)
+            || (self.role == Role::Manager && self.client_id == owner)
+        {
             Ok(())
         } else {
             Err(Error::new(
@@ -191,6 +197,114 @@ pub struct Scope {
     #[serde(default)]
     pub prerequisite_policy: Option<String>,
 }
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceIndexStatus {
+    Selected,
+    Gap,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskSourceIndexEntry {
+    pub source_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    pub status: SourceIndexStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gap_reason: Option<String>,
+}
+
+impl TaskSourceIndexEntry {
+    pub fn validate(&self) -> Result<()> {
+        if self.source_ref.trim().is_empty() {
+            return Err(Error::invalid("source_index source_ref must be nonempty"));
+        }
+        if self
+            .revision
+            .as_ref()
+            .is_some_and(|revision| revision.trim().is_empty())
+        {
+            return Err(Error::invalid("source_index revision cannot be empty"));
+        }
+        if let Some(digest) = self.content_sha256.as_deref() {
+            if digest.len() != 64
+                || !digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(Error::invalid(
+                    "source_index content_sha256 must be 64 lowercase hexadecimal characters",
+                ));
+            }
+            if let Some(text) = self.text.as_deref()
+                && digest != crate::model::digest(text.as_bytes())
+            {
+                return Err(Error::invalid(
+                    "source_index content_sha256 does not match the exact UTF-8 text",
+                ));
+            }
+        }
+        match self.status {
+            SourceIndexStatus::Selected => {
+                if self.revision.is_none()
+                    || self.text.as_deref().is_none_or(str::is_empty)
+                    || self.content_sha256.is_none()
+                {
+                    return Err(Error::invalid(
+                        "selected source_index entries require revision, exact text and content_sha256",
+                    ));
+                }
+                if self.gap_reason.is_some() {
+                    return Err(Error::invalid(
+                        "selected source_index entries cannot have a gap_reason",
+                    ));
+                }
+            }
+            SourceIndexStatus::Gap => {
+                if self
+                    .gap_reason
+                    .as_deref()
+                    .is_none_or(|reason| reason.trim().is_empty())
+                {
+                    return Err(Error::invalid(
+                        "gap source_index entries require a nonempty gap_reason",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn legacy_gap(source_ref: &str) -> Self {
+        Self {
+            source_ref: source_ref.to_owned(),
+            revision: None,
+            content_sha256: None,
+            text: None,
+            status: SourceIndexStatus::Gap,
+            gap_reason: Some("legacy_source_ref_without_pinned_revision_or_content".to_owned()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskBrief {
+    pub objective: String,
+    pub phase: String,
+    pub requirements: Vec<Requirement>,
+    pub dependencies: Vec<Dependency>,
+    pub scope: Option<Scope>,
+    pub acceptance: Option<crate::acceptance::AcceptancePolicy>,
+    pub owner_policy_id: Option<String>,
+    pub source_index: Vec<TaskSourceIndexEntry>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TaskSpec {
@@ -206,11 +320,53 @@ pub struct TaskSpec {
     pub scope: Option<Scope>,
     #[serde(default)]
     pub source_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_policy_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_index: Vec<TaskSourceIndexEntry>,
 }
 impl TaskSpec {
+    pub fn brief(&self) -> TaskBrief {
+        let mut source_index = self.source_index.clone();
+        for entry in &mut source_index {
+            if entry.status == SourceIndexStatus::Gap
+                && entry.content_sha256.is_none()
+                && let Some(text) = entry.text.as_deref()
+            {
+                entry.content_sha256 = Some(digest(text.as_bytes()));
+            }
+        }
+        let indexed_refs: BTreeSet<String> = source_index
+            .iter()
+            .map(|entry| entry.source_ref.clone())
+            .collect();
+        for source_ref in &self.source_refs {
+            if !indexed_refs.contains(source_ref) {
+                source_index.push(TaskSourceIndexEntry::legacy_gap(source_ref));
+            }
+        }
+        TaskBrief {
+            objective: self.objective.clone(),
+            phase: self.phase.clone(),
+            requirements: self.requirements.clone(),
+            dependencies: self.dependencies.clone(),
+            scope: self.scope.clone(),
+            acceptance: self.acceptance.clone(),
+            owner_policy_id: self.owner_policy_id.clone(),
+            source_index,
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         if let Some(policy) = &self.acceptance {
             policy.validate()?;
+        }
+        if self
+            .owner_policy_id
+            .as_ref()
+            .is_some_and(|policy_id| policy_id.trim().is_empty())
+        {
+            return Err(Error::invalid("owner_policy_id cannot be empty"));
         }
         if self.objective.trim().is_empty()
             || self.phase.trim().is_empty()
@@ -237,6 +393,22 @@ impl TaskSpec {
             {
                 return Err(Error::invalid(
                     "dependencies require unique task IDs, revision and phase",
+                ));
+            }
+        }
+        for source_ref in &self.source_refs {
+            if source_ref.trim().is_empty() {
+                return Err(Error::invalid(
+                    "source_refs cannot contain empty references",
+                ));
+            }
+        }
+        let mut indexed_refs = BTreeSet::new();
+        for source in &self.source_index {
+            source.validate()?;
+            if !indexed_refs.insert(source.source_ref.as_str()) {
+                return Err(Error::invalid(
+                    "source_index source_ref values must be unique",
                 ));
             }
         }
@@ -297,6 +469,10 @@ pub fn response(id: Value, result: Result<Value>) -> Value {
 /// particular, an accidental client.hello/token must never become a receipt.
 pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
     let allowed: &[&str] = match method {
+        "forge.publish_ref" => {
+            crate::forge::PublishRefRequest::parse(params)?;
+            return Ok(());
+        }
         "source.capture" => {
             crate::checks::model::CaptureRequest::parse(params)?;
             return Ok(());

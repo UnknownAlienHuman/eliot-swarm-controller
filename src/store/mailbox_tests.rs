@@ -20,12 +20,21 @@ async fn start() -> (StoreOwner, Principal) {
 }
 
 async fn register(store: &Store, operator: &Principal, client_id: &str) -> Principal {
+    register_with_role(store, operator, client_id, "manager").await
+}
+
+async fn register_with_role(
+    store: &Store,
+    operator: &Principal,
+    client_id: &str,
+    role: &str,
+) -> Principal {
     let token = format!("token-for-{client_id}");
     let registered = write(
         store,
         operator,
         "client.register",
-        json!({"client_id":client_id,"role":"manager","token_hash":model::digest(token.as_bytes())}),
+        json!({"client_id":client_id,"role":role,"token_hash":model::digest(token.as_bytes())}),
     )
     .await
     .unwrap();
@@ -101,6 +110,559 @@ async fn send_records_the_full_communication_identity() {
     .unwrap_err();
     assert_eq!(err.code, "INVALID_PARAMS");
     owner.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn report_delta_scopes_mail_to_its_recipient_and_paginates_visible_rows() {
+    let (owner, operator) = start().await;
+    let sender = register(&owner.store, &operator, "sender").await;
+    let recipient = register_with_role(&owner.store, &operator, "recipient", "observer").await;
+    let other = register_with_role(&owner.store, &operator, "other", "observer").await;
+
+    // Start after setup observations so each page below contains only the
+    // deliberately interleaved directed deliveries.
+    let checkpoint = read(
+        &owner.store,
+        &recipient,
+        "report.delta",
+        json!({"limit":200}),
+    )
+    .await["next_cursor"]
+        .as_i64()
+        .unwrap();
+
+    let hidden_before = write(
+        &owner.store,
+        &sender,
+        "message.send",
+        json!({"recipient":"other","text":"private to other before"}),
+    )
+    .await
+    .unwrap();
+    let own_first = write(
+        &owner.store,
+        &sender,
+        "message.send",
+        json!({"recipient":"recipient","text":"first for recipient"}),
+    )
+    .await
+    .unwrap();
+    let hidden_middle = write(
+        &owner.store,
+        &sender,
+        "message.send",
+        json!({"recipient":"other","text":"private to other between"}),
+    )
+    .await
+    .unwrap();
+    let own_second = write(
+        &owner.store,
+        &sender,
+        "message.send",
+        json!({"recipient":"recipient","text":"second for recipient"}),
+    )
+    .await
+    .unwrap();
+    let hidden_tail = write(
+        &owner.store,
+        &sender,
+        "message.send",
+        json!({"recipient":"other","text":"private to other after"}),
+    )
+    .await
+    .unwrap();
+    let cancellation = write(
+        &owner.store,
+        &sender,
+        "message.cancel",
+        json!({
+            "delivery_id":hidden_before["delivery_id"],
+            "payload_digest":hidden_before["payload_digest"],
+            "reason":"private cancellation reason"
+        }),
+    )
+    .await
+    .unwrap();
+
+    // Make the relevant Operation order deterministic while keeping all
+    // fixture events inside the settled-time bound. Registrations precede
+    // the deliberately interleaved directed sends.
+    let ordered_ids = [
+        &hidden_before,
+        &own_first,
+        &hidden_middle,
+        &own_second,
+        &hidden_tail,
+        &cancellation,
+    ]
+    .into_iter()
+    .map(|operation| operation["operation_id"].as_str().unwrap().to_owned())
+    .collect::<Vec<_>>();
+    owner
+        .store
+        .run(move |db| {
+            let latest: i64 = db.query_row(
+                "SELECT COALESCE(MAX(updated_at_ms),0) FROM operations",
+                [],
+                |row| row.get(0),
+            )?;
+            let base = latest - 100;
+            db.execute(
+                "UPDATE operations SET created_at_ms=?1 WHERE method='client.register'",
+                [base],
+            )?;
+            for (index, operation_id) in ordered_ids.iter().enumerate() {
+                db.execute(
+                    "UPDATE operations SET created_at_ms=?2 WHERE operation_id=?1",
+                    params![operation_id, base + index as i64 + 1],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    // The send caller and recipient can recover the immutable receipt, while
+    // another client gets the same NOT_FOUND as for a nonexistent operation.
+    let own_operation = read(
+        &owner.store,
+        &recipient,
+        "operation.get",
+        json!({"operation_id":own_first["operation_id"]}),
+    )
+    .await;
+    assert_eq!(own_operation["result"]["text"], "first for recipient");
+    let sender_operation = read(
+        &owner.store,
+        &sender,
+        "operation.get",
+        json!({"operation_id":own_first["operation_id"]}),
+    )
+    .await;
+    assert_eq!(sender_operation, own_operation);
+    let foreign_send = owner
+        .store
+        .call(
+            recipient.clone(),
+            "operation.get".into(),
+            json!({"operation_id":hidden_before["operation_id"]}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(foreign_send.code, "NOT_FOUND");
+
+    // Operation pagination filters before applying LIMIT, so a hidden row
+    // between setup and the recipient's send does not shorten or shift page 1.
+    let first_operation_page = read(
+        &owner.store,
+        &recipient,
+        "operation.list",
+        json!({"state":"settled","limit":4}),
+    )
+    .await;
+    assert_eq!(first_operation_page["items"].as_array().unwrap().len(), 4);
+    assert_eq!(
+        first_operation_page["items"][3]["operation_id"],
+        own_first["operation_id"]
+    );
+    let recipient_operations = read(
+        &owner.store,
+        &recipient,
+        "operation.list",
+        json!({"limit":200}),
+    )
+    .await;
+    let recipient_operations_json = recipient_operations.to_string();
+    for hidden in [&hidden_before, &hidden_middle, &hidden_tail] {
+        assert!(!recipient_operations_json.contains(hidden["operation_id"].as_str().unwrap()));
+        assert!(!recipient_operations_json.contains(hidden["delivery_id"].as_str().unwrap()));
+    }
+    assert!(!recipient_operations_json.contains(cancellation["operation_id"].as_str().unwrap()));
+    assert!(!recipient_operations_json.contains("private cancellation reason"));
+    assert!(!recipient_operations_json.contains(hidden_before["payload_digest"].as_str().unwrap()));
+    let other_operations = read(&owner.store, &other, "operation.list", json!({"limit":200})).await;
+    let other_operations_json = other_operations.to_string();
+    assert!(other_operations_json.contains(hidden_before["operation_id"].as_str().unwrap()));
+    assert!(other_operations_json.contains(cancellation["operation_id"].as_str().unwrap()));
+    assert!(other_operations_json.contains("private cancellation reason"));
+    assert!(other_operations_json.contains(hidden_before["payload_digest"].as_str().unwrap()));
+
+    let foreign_cancel = owner
+        .store
+        .call(
+            recipient.clone(),
+            "operation.get".into(),
+            json!({"operation_id":cancellation["operation_id"]}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(foreign_cancel.code, "NOT_FOUND");
+    let recipient_cancel = read(
+        &owner.store,
+        &other,
+        "operation.get",
+        json!({"operation_id":cancellation["operation_id"]}),
+    )
+    .await;
+    assert_eq!(
+        recipient_cancel["result"]["reason"],
+        "private cancellation reason"
+    );
+    assert_eq!(
+        recipient_cancel["result"]["cancellation"]["payload_digest"],
+        hidden_before["payload_digest"]
+    );
+    let sender_cancel = read(
+        &owner.store,
+        &sender,
+        "operation.get",
+        json!({"operation_id":cancellation["operation_id"]}),
+    )
+    .await;
+    assert_eq!(sender_cancel, recipient_cancel);
+
+    let operator_receipt = read(
+        &owner.store,
+        &operator,
+        "operation.get",
+        json!({"operation_id":hidden_before["operation_id"]}),
+    )
+    .await;
+    assert_eq!(
+        operator_receipt["result"]["text"],
+        "private to other before"
+    );
+
+    let first = read(
+        &owner.store,
+        &recipient,
+        "report.delta",
+        json!({"after":checkpoint,"limit":1}),
+    )
+    .await;
+    assert_eq!(first["items"].as_array().unwrap().len(), 1);
+    assert_eq!(first["items"][0]["kind"], "message.send");
+    assert_eq!(first["items"][0]["payload"]["text"], "first for recipient");
+    assert_eq!(first["items"][0]["payload"]["recipient"], "recipient");
+    assert_eq!(
+        first["items"][0]["payload"]["delivery_id"],
+        own_first["delivery_id"]
+    );
+    assert_eq!(first["projection"]["has_newer"], true);
+    let first_cursor = first["next_cursor"].as_i64().unwrap();
+
+    let second = read(
+        &owner.store,
+        &recipient,
+        "report.delta",
+        json!({"after":first_cursor,"limit":1}),
+    )
+    .await;
+    assert_eq!(second["items"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        second["items"][0]["payload"]["text"],
+        "second for recipient"
+    );
+    assert_eq!(
+        second["items"][0]["payload"]["delivery_id"],
+        own_second["delivery_id"]
+    );
+    // A hidden-only tail does not leak through the pagination projection.
+    assert_eq!(second["projection"]["has_newer"], false);
+
+    let recipient_pages = json!([first, second]);
+    let recipient_json = recipient_pages.to_string();
+    for hidden in [&hidden_before, &hidden_middle, &hidden_tail] {
+        assert!(!recipient_json.contains(hidden["delivery_id"].as_str().unwrap()));
+    }
+    assert!(!recipient_json.contains("private to other"));
+    assert!(!recipient_json.contains("private cancellation reason"));
+    assert!(!recipient_json.contains(cancellation["operation_id"].as_str().unwrap()));
+    assert!(!recipient_json.contains(hidden_before["payload_digest"].as_str().unwrap()));
+
+    let other_page = read(
+        &owner.store,
+        &other,
+        "report.delta",
+        json!({"after":checkpoint,"limit":200}),
+    )
+    .await;
+    let other_items = other_page["items"].as_array().unwrap();
+    assert_eq!(other_items.len(), 4);
+    assert_eq!(
+        other_items
+            .iter()
+            .filter(|item| item["kind"] == "message.send")
+            .count(),
+        3
+    );
+    assert_eq!(
+        other_items
+            .iter()
+            .filter(|item| item["kind"] == "message.cancel")
+            .count(),
+        1
+    );
+    assert!(other_items.iter().any(|item| {
+        item["payload"]["delivery_id"] == hidden_before["delivery_id"]
+            && item["payload"]["text"] == "private to other before"
+    }));
+    assert!(other_items.iter().any(|item| {
+        item["payload"]["delivery_id"] == hidden_middle["delivery_id"]
+            && item["payload"]["text"] == "private to other between"
+    }));
+    assert!(other_items.iter().any(|item| {
+        item["payload"]["delivery_id"] == hidden_tail["delivery_id"]
+            && item["payload"]["text"] == "private to other after"
+    }));
+    assert!(other_items.iter().any(|item| {
+        item["kind"] == "message.cancel"
+            && item["operation_id"] == cancellation["operation_id"]
+            && item["payload"]["reason"] == "private cancellation reason"
+            && item["payload"]["cancellation"]["payload_digest"] == hidden_before["payload_digest"]
+    }));
+
+    let other_mail = read(
+        &owner.store,
+        &other,
+        "message.read",
+        json!({"after":checkpoint,"limit":200}),
+    )
+    .await;
+    let mailbox_items = other_mail["items"].as_array().unwrap();
+    assert_eq!(mailbox_items.len(), 3);
+    assert!(
+        mailbox_items
+            .iter()
+            .all(|item| item["kind"] == "message.send")
+    );
+    assert!(
+        !other_mail
+            .to_string()
+            .contains("private cancellation reason")
+    );
+
+    let sender_timeline = read(
+        &owner.store,
+        &sender,
+        "report.delta",
+        json!({"after":checkpoint,"limit":200}),
+    )
+    .await;
+    assert_eq!(sender_timeline["items"].as_array().unwrap().len(), 6);
+
+    let operator_timeline = read(
+        &owner.store,
+        &operator,
+        "report.delta",
+        json!({"after":checkpoint,"limit":200}),
+    )
+    .await;
+    assert_eq!(operator_timeline["items"].as_array().unwrap().len(), 6);
+    owner.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn malformed_legacy_cancel_links_fail_closed_for_recipients() {
+    let (owner, operator) = start().await;
+    let sender = register(&owner.store, &operator, "legacy-sender").await;
+    let recipient =
+        register_with_role(&owner.store, &operator, "legacy-recipient", "observer").await;
+    let checkpoint = read(
+        &owner.store,
+        &recipient,
+        "report.delta",
+        json!({"limit":200}),
+    )
+    .await["next_cursor"]
+        .as_i64()
+        .unwrap();
+
+    let cases = [
+        // A legacy source has a delivery ID and recipient but no digest, so
+        // a cancel's claimed digest cannot establish the original identity.
+        ("missing-digest", true, true, false),
+        // A well-formed-looking cancellation reference without any source is
+        // never sufficient to infer who the original recipient was.
+        ("orphan", false, false, false),
+        // Even a complete pair is ambiguous if legacy rows duplicate it.
+        ("duplicate", true, false, true),
+    ];
+    let mut cancel_refs = Vec::new();
+    for (label, has_source, omit_source_digest, duplicate_source) in cases {
+        let delivery_id = model::new_id();
+        let digest = model::digest(format!("payload-{label}").as_bytes());
+        let cancel_id = model::new_id();
+        let source_id = model::new_id();
+        let duplicate_id = model::new_id();
+        let label = label.to_owned();
+        let sender_id = sender.client_id.clone();
+        let result_digest = (!omit_source_digest).then_some(digest.clone());
+        let cancel_ref = (cancel_id.clone(), delivery_id.clone(), digest.clone());
+        owner
+            .store
+            .run(move |db| {
+                if has_source {
+                    let mut source_result = json!({
+                        "operation_id":source_id.clone(),
+                        "sender":sender_id.clone(),
+                        "recipient":"legacy-recipient",
+                        "delivery_id":delivery_id.clone(),
+                        "text":format!("legacy source {label}")
+                    });
+                    if let Some(source_digest) = result_digest {
+                        source_result["payload_digest"] = json!(source_digest);
+                    }
+                    let source_request = json!({"client_request_id":format!("source-{label}")});
+                    insert_legacy_operation(
+                        db,
+                        &source_id,
+                        &sender_id,
+                        &format!("source-{label}"),
+                        "message.send",
+                        &source_request,
+                        &source_result,
+                    )?;
+                }
+                if duplicate_source {
+                    let duplicate_result = json!({
+                        "operation_id":duplicate_id.clone(),
+                        "sender":sender_id.clone(),
+                        "recipient":"legacy-recipient",
+                        "delivery_id":delivery_id.clone(),
+                        "payload_digest":digest.clone(),
+                        "text":format!("duplicate legacy source {label}")
+                    });
+                    let duplicate_request = json!({"client_request_id":format!("duplicate-{label}")});
+                    insert_legacy_operation(
+                        db,
+                        &duplicate_id,
+                        &sender_id,
+                        &format!("duplicate-{label}"),
+                        "message.send",
+                        &duplicate_request,
+                        &duplicate_result,
+                    )?;
+                }
+                let cancel_result = json!({
+                    "operation_id":cancel_id.clone(),
+                    "cancellation":{
+                        "delivery_id":delivery_id.clone(),
+                        "payload_digest":digest.clone()
+                    },
+                    "reason":format!("legacy cancel diagnostic {label}")
+                });
+                let cancel_request = json!({
+                    "client_request_id":format!("cancel-{label}"),
+                    "delivery_id":delivery_id.clone(),
+                    "payload_digest":digest.clone()
+                });
+                insert_legacy_operation(
+                    db,
+                    &cancel_id,
+                    &sender_id,
+                    &format!("cancel-{label}"),
+                    "message.cancel",
+                    &cancel_request,
+                    &cancel_result,
+                )?;
+                let cancel_payload = json!({
+                    "delivery_id":delivery_id,
+                    "payload_digest":digest,
+                    "recipient":"legacy-recipient",
+                    "reason":format!("legacy cancel diagnostic {label}"),
+                    "cancellation":cancel_result["cancellation"]
+                });
+                db.execute(
+                    "INSERT INTO observations(source_stream_id,source_event_key,operation_id,kind,payload_json,recorded_at_ms) VALUES('legacy-cancel-test',?1,?1,'message.cancel',?2,1000)",
+                    params![cancel_id, model::canonical(&cancel_payload)?],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        cancel_refs.push(cancel_ref);
+    }
+
+    let recipient_events = read(
+        &owner.store,
+        &recipient,
+        "report.delta",
+        json!({"after":checkpoint,"limit":200}),
+    )
+    .await;
+    let recipient_events_json = recipient_events.to_string();
+    for (cancel_id, delivery_id, digest) in &cancel_refs {
+        let error = owner
+            .store
+            .call(
+                recipient.clone(),
+                "operation.get".into(),
+                json!({"operation_id":cancel_id}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "NOT_FOUND");
+        assert!(!recipient_events_json.contains(cancel_id));
+        assert!(!recipient_events_json.contains(delivery_id));
+        assert!(!recipient_events_json.contains(digest));
+    }
+    assert!(!recipient_events_json.contains("legacy cancel diagnostic"));
+
+    // The malformed recipient linkage does not erase the sender's own
+    // immutable receipts or the bootstrap operator's global diagnostics.
+    for principal in [&sender, &operator] {
+        let events = read(
+            &owner.store,
+            principal,
+            "report.delta",
+            json!({"after":checkpoint,"limit":200}),
+        )
+        .await;
+        let events_json = events.to_string();
+        for (cancel_id, delivery_id, digest) in &cancel_refs {
+            let receipt = read(
+                &owner.store,
+                principal,
+                "operation.get",
+                json!({"operation_id":cancel_id}),
+            )
+            .await;
+            assert_eq!(receipt["result"]["operation_id"], cancel_id.as_str());
+            assert_eq!(
+                receipt["result"]["cancellation"]["delivery_id"],
+                delivery_id.as_str()
+            );
+            assert_eq!(
+                receipt["result"]["cancellation"]["payload_digest"],
+                digest.as_str()
+            );
+            assert!(events_json.contains(cancel_id));
+            assert!(events_json.contains(delivery_id));
+            assert!(events_json.contains(digest));
+        }
+        assert!(events_json.contains("legacy cancel diagnostic"));
+    }
+    owner.close().await.unwrap();
+}
+
+fn insert_legacy_operation(
+    db: &rusqlite::Connection,
+    operation_id: &str,
+    caller_id: &str,
+    client_request_id: &str,
+    method: &str,
+    request: &Value,
+    result: &Value,
+) -> Result<()> {
+    let request = model::canonical(request)?;
+    let effective = model::canonical(&json!({"receipt":{"ok":true,"value":result}}))?;
+    let result = model::canonical(result)?;
+    db.execute(
+        "INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,effective_request_json,state,result_json,due_at_ms,settled_at_ms,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,?5,?6,'settled',?7,1000,1000,1000,1000)",
+        params![operation_id, caller_id, client_request_id, method, request, effective, result],
+    )?;
+    Ok(())
 }
 
 #[tokio::test]

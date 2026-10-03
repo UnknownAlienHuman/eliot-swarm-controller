@@ -316,6 +316,16 @@ impl Service {
             let target = target_session(command, root)?;
             self.verify_binding(root, options, &command.binding_id, command.generation)
                 .await?;
+            // Backgrounding can release native execution that was blocked on
+            // a foreground job, so require the same durable-origin capability
+            // before crossing this write boundary.
+            self.require_durable_root_creation(
+                root,
+                &command.binding_id,
+                command.generation,
+                options,
+            )
+            .await?;
             if target != root {
                 self.owns_member(root, &target).await?;
             }
