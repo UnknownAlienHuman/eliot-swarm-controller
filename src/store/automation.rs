@@ -1,7 +1,7 @@
 //! Revisioned manager-owned automation configuration stored in authenticated,
 //! schema-versioned per-record `meta` entries. No migration is required.
 
-use super::{automation_dispatch, operations, page};
+use super::{automation_dispatch, operations, page, review_disposition};
 use crate::{
     automation::{
         actions::AutomationStep,
@@ -141,6 +141,14 @@ pub(super) fn apply(
                 cut,
                 now_ms,
             )?;
+            review_disposition::configure_activation(
+                tx,
+                change.before.as_ref(),
+                &change.after,
+                change.include_existing,
+                cut,
+                now_ms,
+            )?;
             let removed_review_dispatch = change.before.as_ref().is_some_and(|before| {
                 (before.enabled && !change.after.enabled)
                     || (before.steps.contains(&AutomationStep::ReviewDispatch)
@@ -206,11 +214,13 @@ pub(super) fn explain(db: &Connection, p: &Principal, value: &Value) -> Result<V
     let entry = config::load_entry(db, &p.client_id, project, automation_id)?
         .ok_or_else(|| Error::new("NOT_FOUND", "automation entry was not found in this scope"))?;
     let state = automation_dispatch::dispatch_state(db, &entry)?;
+    let disposition = review_disposition::disposition_state(db, &entry)?;
     let work = operation_impacts(db, &p.client_id, project, automation_id)?;
     let operation_history = linked_operation_history(db, &p.client_id, project, automation_id)?;
     Ok(json!({
         "entry":entry_projection(&entry)?,
         "dispatch":state,
+        "review_disposition":disposition,
         "linked_operations":work,
         "linked_operation_history":operation_history
     }))

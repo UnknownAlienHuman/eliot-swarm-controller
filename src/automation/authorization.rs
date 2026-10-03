@@ -255,15 +255,19 @@ pub(crate) fn operation_link(
             "on-behalf operation link fields are invalid",
         )
     })?;
+    let expected_method = match (link.action.as_str(), link.cause["kind"].as_str()) {
+        ("review.assign", Some("applied_submission")) => "review.assign",
+        ("task.request_changes", Some("review_result")) => "task.request_changes",
+        _ => "",
+    };
     if link.schema_version != 1
         || link.operation_id != operation_id
         || link.technical_requester_id != AUTOMATION_TECHNICAL_REQUESTER_ID
-        || link.action != "review.assign"
+        || expected_method.is_empty()
         || link.automation_revision <= 0
         || link.effective_manager_id.is_empty()
         || link.project_id.is_empty()
         || link.automation_id.is_empty()
-        || link.cause["kind"] != "applied_submission"
         || link.cause["id"].as_str().is_none_or(str::is_empty)
     {
         return Err(Error::new(
@@ -279,14 +283,169 @@ pub(crate) fn operation_link(
         )
         .optional()?;
     if !operation.is_some_and(|(caller, method)| {
-        caller == link.technical_requester_id && method == "review.assign"
+        caller == link.technical_requester_id && method == expected_method
     }) {
         return Err(Error::new(
             "AUTOMATION_LINK_CORRUPT",
             "linked Operation was not admitted by the recorded technical requester",
         ));
     }
+    if link.action == "task.request_changes" {
+        validate_review_disposition_link(db, &link)?;
+    }
     Ok(Some(link))
+}
+
+fn validate_review_disposition_link(db: &Connection, link: &OnBehalfOperationLink) -> Result<()> {
+    let corrupt = || {
+        Error::new(
+            "AUTOMATION_LINK_CORRUPT",
+            "review disposition link does not match its retained assignment and result",
+        )
+    };
+    let assignment_id = link.cause["review_assignment_id"]
+        .as_str()
+        .ok_or_else(corrupt)?;
+    let result_operation_id = link.cause["operation_id"].as_str().ok_or_else(corrupt)?;
+    let identity = &link.cause["identity"];
+    if assignment_id.is_empty()
+        || result_operation_id.is_empty()
+        || link.cause["id"] != assignment_id
+        || !identity.is_object()
+    {
+        return Err(corrupt());
+    }
+
+    let assignment_key = format!("assignment:{assignment_id}");
+    let assignment_row: Option<(String, String)> = db
+        .query_row(
+            "SELECT payload_json,operation_id FROM observations \
+             WHERE source_stream_id='controller:review' AND source_event_key=?1 \
+               AND kind='review.assignment'",
+            [&assignment_key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((assignment_json, assignment_operation_id)) = assignment_row else {
+        return Err(corrupt());
+    };
+    let assignment: Value = serde_json::from_str(&assignment_json).map_err(|_| corrupt())?;
+    if assignment["review_assignment_id"] != assignment_id
+        || assignment["operation_id"] != assignment_operation_id
+        || assignment["identity"] != *identity
+        || assignment["sponsor_client_id"] != link.effective_manager_id
+    {
+        return Err(corrupt());
+    }
+    let assignment_operation: Option<(String, String, Option<String>)> = db
+        .query_row(
+            "SELECT method,state,result_json FROM operations WHERE operation_id=?1",
+            [&assignment_operation_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((method, state, result_json)) = assignment_operation else {
+        return Err(corrupt());
+    };
+    let assignment_result: Value =
+        serde_json::from_str(&result_json.ok_or_else(corrupt)?).map_err(|_| corrupt())?;
+    if method != "review.assign"
+        || state != "settled"
+        || assignment_result["review_assignment_id"] != assignment_id
+        || assignment_result["identity"] != *identity
+        || assignment_result["sponsor_client_id"] != link.effective_manager_id
+        || assignment["reviewer_client_id"]
+            .as_str()
+            .is_none_or(str::is_empty)
+    {
+        return Err(corrupt());
+    }
+
+    let result_key = format!("result:{assignment_id}");
+    let result_row: Option<(String, String)> = db
+        .query_row(
+            "SELECT payload_json,operation_id FROM observations \
+             WHERE source_stream_id='controller:review' AND source_event_key=?1 \
+               AND kind='review.result'",
+            [&result_key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((result_json, observed_result_operation_id)) = result_row else {
+        return Err(corrupt());
+    };
+    let record: Value = serde_json::from_str(&result_json).map_err(|_| corrupt())?;
+    if observed_result_operation_id != result_operation_id
+        || record["operation_id"] != result_operation_id
+        || record["review_assignment_id"] != assignment_id
+        || record["identity"] != *identity
+    {
+        return Err(corrupt());
+    }
+    let result_operation: Option<(String, String, String, Option<String>)> = db
+        .query_row(
+            "SELECT caller_id,method,state,result_json FROM operations WHERE operation_id=?1",
+            [result_operation_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((reviewer_id, method, state, result_json)) = result_operation else {
+        return Err(corrupt());
+    };
+    let result: Value =
+        serde_json::from_str(&result_json.ok_or_else(corrupt)?).map_err(|_| corrupt())?;
+    if reviewer_id != assignment["reviewer_client_id"]
+        || method != "review.submit"
+        || state != "settled"
+        || result != record["result"]
+        || result["review_assignment_id"] != assignment_id
+        || result["reviewer_client_id"] != assignment["reviewer_client_id"]
+        || result["sponsor_client_id"] != link.effective_manager_id
+        || result["task_id"] != identity["task_id"]
+        || result["attempt_id"] != identity["attempt_id"]
+        || result["task_revision"] != identity["task_revision"]
+        || result["submission_ref"] != identity["submission_ref"]
+        || result["candidate_ref"] != identity["candidate_ref"]
+        || result["verdict"] != "changes_requested"
+        || result["applicability"] != "current_candidate"
+    {
+        return Err(corrupt());
+    }
+
+    let feedback_operation: Option<(String, String, String, String)> = db
+        .query_row(
+            "SELECT caller_id,method,original_request_json,state FROM operations WHERE operation_id=?1",
+            [&link.operation_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((caller_id, method, original_json, state)) = feedback_operation else {
+        return Err(corrupt());
+    };
+    let request: Value = serde_json::from_str(&original_json).map_err(|_| corrupt())?;
+    let finding_id = request["finding_id"].as_str().ok_or_else(corrupt)?;
+    let finding = result["findings"]
+        .as_array()
+        .and_then(|findings| {
+            findings
+                .iter()
+                .find(|finding| finding["finding_id"] == finding_id)
+        })
+        .ok_or_else(corrupt)?;
+    if caller_id != AUTOMATION_TECHNICAL_REQUESTER_ID
+        || method != "task.request_changes"
+        || state != "settled"
+        || request["attempt_id"] != identity["attempt_id"]
+        || request["expected_revision"] != identity["task_revision"]
+        || request["submission_ref"] != identity["submission_ref"]
+        || request["candidate_ref"] != identity["candidate_ref"]
+        || request["reason"] != finding["reason"]
+        || request["requirement_ids"] != finding["requirement_ids"]
+        || request["evidence"] != finding["evidence_refs"]
+    {
+        return Err(corrupt());
+    }
+    Ok(())
 }
 
 pub(crate) fn save_operation_link(
@@ -375,7 +534,7 @@ pub(crate) fn entry_operation_links(
     Ok(links)
 }
 
-fn require_registered_manager(db: &Connection, manager_id: &str) -> Result<()> {
+pub(crate) fn require_registered_manager(db: &Connection, manager_id: &str) -> Result<()> {
     let key = format!("client:{manager_id}");
     let raw: Option<String> = db
         .query_row(

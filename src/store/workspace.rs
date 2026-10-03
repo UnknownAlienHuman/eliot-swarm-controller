@@ -150,7 +150,7 @@ pub(crate) fn sync_configured_registrations(
         // never deletes a worktree or treats it as safe to reuse.
         tx.execute(
             "UPDATE workspace_leases SET state='stale',
-                 clean_state_json=?3,updated_at_ms=?4
+                 clean_state_json=json_set(?3,'$.prior_lease_state',state),updated_at_ms=?4
              WHERE registration_id=?1 AND registration_generation<>?2
                AND state IN ('preparing','held','outcome_unknown')",
             params![
@@ -158,6 +158,9 @@ pub(crate) fn sync_configured_registrations(
                 registration.generation,
                 model::canonical(&json!({
                     "status":"registration_changed",
+                    "reason_code":"registration_changed",
+                    "native_effect_status":"possible_or_unknown",
+                    "runtime_observation":"not_performed",
                     "filesystem_cleanup":"not_attempted",
                 }))?,
                 now,
@@ -186,7 +189,8 @@ pub(crate) fn sync_configured_registrations(
             ],
         )?;
         tx.execute(
-            "UPDATE workspace_leases SET state='stale',clean_state_json=?3,updated_at_ms=?4
+            "UPDATE workspace_leases SET state='stale',
+                 clean_state_json=json_set(?3,'$.prior_lease_state',state),updated_at_ms=?4
              WHERE registration_id=?1 AND registration_generation<>?2
                AND state IN ('preparing','held','outcome_unknown')",
             params![
@@ -194,6 +198,9 @@ pub(crate) fn sync_configured_registrations(
                 next,
                 model::canonical(&json!({
                     "status":"registration_revoked",
+                    "reason_code":"registration_revoked",
+                    "native_effect_status":"possible_or_unknown",
+                    "runtime_observation":"not_performed",
                     "filesystem_cleanup":"not_attempted",
                 }))?,
                 now,
@@ -846,7 +853,7 @@ pub(crate) fn mark_lease_stale(
     }
     let changed = tx.execute(
         "UPDATE workspace_leases SET state='stale',
-             clean_state_json=?4,updated_at_ms=?5
+             clean_state_json=json_set(?4,'$.prior_lease_state',state),updated_at_ms=?5
          WHERE lease_id=?1 AND generation=?2 AND binding_digest=?3
            AND state IN ('preparing','outcome_unknown')",
         params![
@@ -856,6 +863,8 @@ pub(crate) fn mark_lease_stale(
             model::canonical(&json!({
                 "status":"preparation_failed",
                 "reason_code":reason_code,
+                "native_effect_status":"possible_or_unknown",
+                "runtime_observation":"not_performed",
                 "filesystem_cleanup":"not_attempted",
             }))?,
             now,
@@ -1079,21 +1088,18 @@ fn verify_launch_operation(db: &Connection, plan: &WorkspaceLeasePlan) -> Result
 fn reject_scope_conflicts(db: &Connection, plan: &WorkspaceLeasePlan) -> Result<()> {
     let mut statement = db.prepare(
         "SELECT task_id,allowed_paths_json,allowed_symbols_json FROM workspace_leases
-         WHERE project_id=?1 AND task_id<>?2
-           AND state IN ('preparing','held','outcome_unknown')
-         ORDER BY lease_id LIMIT ?3",
+         WHERE project_id=?1
+           AND state IN ('preparing','held','outcome_unknown','stale')
+         ORDER BY lease_id LIMIT ?2",
     )?;
     let rows = statement
-        .query_map(
-            params![plan.project_id, plan.task_id, MAX_ACTIVE_SCOPE_ROWS],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            },
-        )?
+        .query_map(params![plan.project_id, MAX_ACTIVE_SCOPE_ROWS], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     if rows.len() == MAX_ACTIVE_SCOPE_ROWS as usize {
         return Err(Error::new(

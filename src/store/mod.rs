@@ -3,6 +3,7 @@ mod acceptance;
 mod assembly;
 mod automation;
 mod automation_dispatch;
+mod automation_disposition;
 mod automation_intake;
 pub(crate) mod capacity;
 mod checks;
@@ -11,14 +12,21 @@ mod coordination_watch;
 mod forge;
 mod gm;
 mod integration;
+mod launch_registration;
 mod launcher;
+mod launcher_issuance;
+mod launcher_native_mcp;
+mod launcher_participant;
 mod message_batch;
+mod native_mcp;
 mod opencode;
 mod operations;
+pub(crate) mod participant_credentials;
 mod prerequisites;
 mod producers;
 mod projection;
 mod results;
+mod review_disposition;
 mod reviews;
 mod runtime;
 mod schedules;
@@ -26,6 +34,7 @@ mod status_reader;
 mod submissions;
 mod tasks;
 mod workspace;
+mod workspace_lifecycle;
 use crate::{
     artifacts::{ArtifactFiles, MAX_PAGE_BYTES, ResultPage},
     config::Config,
@@ -194,6 +203,22 @@ async fn join_store_thread(thread: JoinHandle<()>, name: &'static str) -> Result
         .map_err(|_| Error::new("STORE_PANIC", format!("{name} panicked")))
 }
 impl Store {
+    pub(crate) async fn reconcile_workspace_lifecycle_once(&self) -> Result<Value> {
+        let result = self.run(move |db| {
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let sweep = workspace_lifecycle::reconcile(&tx, model::now_ms()?, 32)?;
+            tx.commit()?;
+            Ok(json!({"examined":sweep.examined,"stale":sweep.stale,"released":sweep.released,"raced":sweep.raced}))
+        }).await?;
+        if result["stale"].as_u64().unwrap_or(0) != 0
+            || result["released"].as_u64().unwrap_or(0) != 0
+        {
+            self.changed
+                .send_modify(|revision| *revision = revision.wrapping_add(1));
+        }
+        Ok(result)
+    }
+
     /// Configuration is local Operator authority; filesystem checks happen in
     /// the later host-owned preparation phase, outside this transaction.
     pub(crate) async fn initialize_workspace_authority(&self) -> Result<Value> {
@@ -400,6 +425,16 @@ impl Store {
             let result = automation_dispatch::reconcile(&tx, 16, 64, model::now_ms()?)?;
             // The cursor, pending reasons, semantic slot and Operation are
             // durable before the host can observe an admitted action.
+            tx.commit()?;
+            Ok(result)
+        })
+        .await
+    }
+
+    pub(crate) async fn reconcile_review_dispositions_once(&self) -> Result<Value> {
+        self.run(move |db| {
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let result = review_disposition::reconcile(&tx, 16, 64, model::now_ms()?)?;
             tx.commit()?;
             Ok(result)
         })
@@ -1818,6 +1853,57 @@ fn mutate_in_transaction_with_check_plan(
     now: i64,
     check_plan: Option<&checks::CheckPlanResolution>,
 ) -> Result<Result<Value>> {
+    mutate_in_transaction_with_plan(
+        tx,
+        p,
+        method,
+        v,
+        config,
+        now,
+        MutationPlan {
+            check_plan,
+            launch_operation_id: None,
+        },
+    )
+}
+
+fn mutate_in_transaction_with_launch_admission(
+    tx: &Transaction<'_>,
+    p: &Principal,
+    v: &Value,
+    config: &Config,
+    now: i64,
+    launch_operation_id: &str,
+) -> Result<Result<Value>> {
+    mutate_in_transaction_with_plan(
+        tx,
+        p,
+        "coordination.participant.register",
+        v,
+        config,
+        now,
+        MutationPlan {
+            check_plan: None,
+            launch_operation_id: Some(launch_operation_id),
+        },
+    )
+}
+
+#[derive(Clone, Copy)]
+struct MutationPlan<'a> {
+    check_plan: Option<&'a checks::CheckPlanResolution>,
+    launch_operation_id: Option<&'a str>,
+}
+
+fn mutate_in_transaction_with_plan(
+    tx: &Transaction<'_>,
+    p: &Principal,
+    method: &str,
+    v: &Value,
+    config: &Config,
+    now: i64,
+    plan: MutationPlan<'_>,
+) -> Result<Result<Value>> {
     if p.role == Role::Scheduler
         && (p.client_id != model::INTERNAL_SCHEDULER_CLIENT_ID || method != "check.run")
     {
@@ -1838,10 +1924,50 @@ fn mutate_in_transaction_with_check_plan(
             ));
         }
         let receipt: Value = serde_json::from_str(&effective)?;
+        let retained_launch_id = match receipt.get("launch_registration") {
+            None => None,
+            Some(value) if value.as_object().is_some_and(|object| object.len() == 1) => {
+                Some(model::text(value, "launch_operation_id").map_err(|_| {
+                    Error::new(
+                        "INVALID_RECEIPT",
+                        "retained launch admission context is invalid",
+                    )
+                })?)
+            }
+            Some(_) => {
+                return Err(Error::new(
+                    "INVALID_RECEIPT",
+                    "retained launch admission context is invalid",
+                ));
+            }
+        };
+        if retained_launch_id != plan.launch_operation_id {
+            return Err(Error::new(
+                "REQUEST_ID_CONFLICT",
+                "request ID has a different launch admission context",
+            ));
+        }
+        if let Some(launch_operation_id) = plan.launch_operation_id {
+            // A retained successful registration cannot become a new rejected
+            // credential. Stale retry authority is an outer error, leaving
+            // any accepted secret intact for exact recovery.
+            if receipt["receipt"]["ok"] == true {
+                participant_credentials::validate_launch_registration(
+                    tx,
+                    p,
+                    launch_operation_id,
+                    config,
+                    v,
+                )?;
+            }
+        }
         return Ok(receipt_result(&receipt["receipt"]));
     }
     let id = model::new_id();
     tx.execute("INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,effective_request_json,state,due_at_ms,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,?5,'{}','queued',?6,?6,?6)",params![id,p.client_id,request_id,method,original,now])?;
+    if let Some(launch_operation_id) = plan.launch_operation_id {
+        tx.execute("UPDATE operations SET effective_request_json=json_set(effective_request_json,'$.launch_registration',json(?2)) WHERE operation_id=?1", params![id, model::canonical(&json!({"launch_operation_id":launch_operation_id}))?])?;
+    }
     tx.execute_batch("SAVEPOINT mutation_effect")?;
     let result = apply(
         tx,
@@ -1852,7 +1978,7 @@ fn mutate_in_transaction_with_check_plan(
         ApplyContext {
             operation_id: &id,
             now,
-            check_plan,
+            plan,
         },
     );
     let receipt = match &result {
@@ -1890,7 +2016,7 @@ fn receipt_result(value: &Value) -> Result<Value> {
 struct ApplyContext<'a> {
     operation_id: &'a str,
     now: i64,
-    check_plan: Option<&'a checks::CheckPlanResolution>,
+    plan: MutationPlan<'a>,
 }
 
 fn apply(
@@ -1904,8 +2030,23 @@ fn apply(
     let ApplyContext {
         operation_id: id,
         now,
-        check_plan,
+        plan,
     } = context;
+    if let Some(launch_operation_id) = plan.launch_operation_id {
+        if method != "coordination.participant.register" {
+            return Err(Error::new(
+                "FORBIDDEN",
+                "launch admission permits only scoped Participant registration",
+            ));
+        }
+        participant_credentials::validate_launch_registration(
+            tx,
+            p,
+            launch_operation_id,
+            config,
+            v,
+        )?;
+    }
     match method {
         "coordination.sync_integration" => integration::apply(tx, p, method, v, config, id, now),
         "swarm.launch" => launcher::launch(tx, p, v, config, id, now),
@@ -1934,7 +2075,7 @@ fn apply(
         }
         "forge.publish_ref" => forge::reserve(tx, p, v, id, config).map(|v| (v, true)),
         "source.capture" => checks::reserve_source(tx, p, v, id, config).map(|v| (v, true)),
-        "check.run" => checks::reserve(tx, p, v, id, config, check_plan),
+        "check.run" => checks::reserve(tx, p, v, id, config, plan.check_plan),
         "check.cancel" => checks::cancel(tx, p, v, id).map(|v| (v, false)),
 
         "artifact.assemble" => assembly::reserve(tx, p, v, id).map(|v| (v, true)),

@@ -3128,7 +3128,10 @@ fn send(
         super::ApplyContext {
             operation_id,
             now,
-            check_plan: None,
+            plan: super::MutationPlan {
+                check_plan: None,
+                launch_operation_id: None,
+            },
         },
     )?;
     if queued {

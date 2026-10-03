@@ -6,6 +6,7 @@ mod effects;
 mod execution;
 mod goal;
 mod http;
+mod mcp;
 mod prerequisites;
 mod results;
 mod snapshot;
@@ -89,6 +90,17 @@ impl Options {
     pub(crate) fn scope(&self) -> String {
         format!("opencode-v2:{}", self.service_id)
     }
+}
+
+/// Capture only the native MCP facts exposed by the pinned OpenCode HTTP API.
+/// The Store supplies an exact current assignment; native tool loading remains
+/// unknown unless a separate trusted producer proves it.
+pub(crate) async fn observe_mcp(
+    service: &Service,
+    options: &Options,
+    assignment: crate::native_mcp::AssignmentContext,
+) -> Result<crate::native_mcp::NativeMcpReadback> {
+    mcp::observe(service, options, assignment).await
 }
 
 /// Public API IDs are opaque, but they must remain a single safe path segment.

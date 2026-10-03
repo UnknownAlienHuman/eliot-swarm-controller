@@ -4,8 +4,8 @@ use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-/// Steps retained in the manager-owned configuration format. Only
-/// `review_dispatch` has an execution consumer in this implementation slice;
+/// Steps retained in the manager-owned configuration format.
+/// `review_dispatch` and bounded `review_disposition` have execution consumers;
 /// the others remain visible capability gaps rather than simulated effects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -46,7 +46,7 @@ impl AutomationStep {
     }
 
     pub(crate) fn has_consumer(self) -> bool {
-        matches!(self, Self::ReviewDispatch)
+        matches!(self, Self::ReviewDispatch | Self::ReviewDisposition)
     }
 
     pub(crate) fn capability_gap(self) -> Option<Value> {

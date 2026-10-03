@@ -127,22 +127,47 @@ mod os {
             }
         }
         pub fn children_empty(&self) -> Result<bool> {
-            // SAFETY: the Job is held throughout the accounting query. No notification
-            // or parent PID is substituted for the actual active process count.
-            unsafe {
-                let mut count: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = std::mem::zeroed();
-                if QueryInformationJobObject(
-                    self.job,
-                    JobObjectBasicAccountingInformation,
-                    (&mut count as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
-                    size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
-                    ptr::null_mut(),
-                ) == 0
-                {
-                    return Err(std::io::Error::last_os_error().into());
+            // ActiveProcesses can briefly lag a signaled child at leader exit.
+            // Enumerate this exact Job and pin each candidate process before
+            // deciding whether a live descendant remains. This also tolerates
+            // terminated PIDs retained in a just-updated Job inventory without
+            // treating a reused PID as owned.
+            for pid in members(self.job)? {
+                if pid == std::process::id() {
+                    continue;
                 }
-                Ok(count.ActiveProcesses == 1) // This worker is the sole remaining member.
+                // SAFETY: the process handle pins identity while its signal state
+                // and membership in this exact owned Job are checked.
+                unsafe {
+                    let handle = OpenProcess(
+                        PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                        0,
+                        pid,
+                    );
+                    if handle.is_null() {
+                        let error = std::io::Error::last_os_error();
+                        if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+                            continue;
+                        }
+                        return Err(error.into());
+                    }
+                    let is_live_member = (|| -> Result<bool> {
+                        if wait_process_signaled(handle, 0)? {
+                            return Ok(false);
+                        }
+                        let mut owned = 0;
+                        if IsProcessInJob(handle, self.job, &mut owned) == 0 {
+                            return Err(std::io::Error::last_os_error().into());
+                        }
+                        Ok(owned != 0)
+                    })();
+                    CloseHandle(handle);
+                    if is_live_member? {
+                        return Ok(false);
+                    }
+                }
             }
+            Ok(true)
         }
         /// Terminate only current members of this worker's Job, excluding the worker.
         /// Each process handle is checked against this exact Job, avoiding PID reuse.

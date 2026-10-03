@@ -15,6 +15,8 @@ pub mod ipc;
 pub mod launcher;
 pub mod mcp;
 pub mod model;
+mod native_mcp;
+mod participant_credentials;
 pub mod platform;
 pub mod policy;
 mod redaction;

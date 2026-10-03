@@ -54,6 +54,9 @@ pub async fn run(config: Config) -> Result<()> {
     supervisors.spawn(async move { ("launcher", supervise_launcher(store, stop).await) });
     let store = owner.store.clone();
     let stop = stopping.clone();
+    supervisors.spawn(async move { ("native-mcp", supervise_native_mcp(store, stop).await) });
+    let store = owner.store.clone();
+    let stop = stopping.clone();
     supervisors.spawn(async move { ("forge", supervise_forge(store, stop).await) });
     let semaphore = Arc::new(Semaphore::new(config.ipc.max_connections));
     let mut connections = JoinSet::new();
@@ -117,11 +120,13 @@ async fn supervise_automation(store: Store, mut stopping: watch::Receiver<bool>)
                 if result.is_err() { return Err(Error::new("STORE_CLOSED", "automation change stream ended")); }
                 if *stopping.borrow() { return Ok(()); }
                 store.reconcile_automations_once().await?;
+                store.reconcile_review_dispositions_once().await?;
                 store.reconcile_watches_once().await?;
             }
             _ = tick.tick() => {
                 if *stopping.borrow() { return Ok(()); }
                 store.reconcile_automations_once().await?;
+                store.reconcile_review_dispositions_once().await?;
                 store.reconcile_watches_once().await?;
             }
         }
@@ -142,6 +147,29 @@ async fn supervise_launcher(store: Store, mut stopping: watch::Receiver<bool>) -
             _ = tick.tick() => {
                 if *stopping.borrow() { return Ok(()); }
                 store.reconcile_launches_once().await?;
+                store.reconcile_launch_issuance_once().await?;
+                store.reconcile_workspace_lifecycle_once().await?;
+            }
+        }
+    }
+}
+
+async fn supervise_native_mcp(store: Store, mut stopping: watch::Receiver<bool>) -> Result<()> {
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        if *stopping.borrow() {
+            return Ok(());
+        }
+        tokio::select! {
+            result = stopping.changed() => {
+                if result.is_err() || *stopping.borrow() { return Ok(()); }
+            }
+            _ = tick.tick() => {
+                if *stopping.borrow() { return Ok(()); }
+                // Await the bounded readback through shutdown, independently
+                // of launch preparation and passive watch reconciliation.
+                store.reconcile_native_mcp_once().await?;
             }
         }
     }

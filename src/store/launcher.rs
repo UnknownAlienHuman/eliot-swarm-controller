@@ -1152,16 +1152,24 @@ fn launch_mcp_profile_projection(
         hard_blocks.push("review_purpose_requires_assigned_reviewer_profile");
     }
 
-    let identity = meta(db, &format!("client:{}", profile.expected_client_id))?;
-    let identity_state = match identity.as_ref() {
-        None => "not_registered",
-        Some(client) if client["disabled"] == true => "disabled",
-        Some(client) if client["role"] != "participant" => "role_mismatch",
-        Some(_) => "registered_enabled_participant",
+    // Ordinary work profiles are templates. Their expected identity becomes
+    // the freshly issued, exact assignment identity in a private profile;
+    // requiring that future Participant now would prevent initial launch.
+    let identity_state = if role == McpToolProfile::Participant {
+        "assignment_template"
+    } else {
+        let identity = meta(db, &format!("client:{}", profile.expected_client_id))?;
+        let state = match identity.as_ref() {
+            None => "not_registered",
+            Some(client) if client["disabled"] == true => "disabled",
+            Some(client) if client["role"] != "participant" => "role_mismatch",
+            Some(_) => "registered_enabled_participant",
+        };
+        if state != "registered_enabled_participant" {
+            hard_blocks.push("configured_mcp_identity_is_not_an_enabled_participant");
+        }
+        state
     };
-    if identity_state != "registered_enabled_participant" {
-        hard_blocks.push("configured_mcp_identity_is_not_an_enabled_participant");
-    }
 
     if profile
         .surface
@@ -1193,6 +1201,7 @@ fn launch_mcp_profile_projection(
         "profile_name":request.mcp_profile,
         "hard_profile":role,
         "identity":{"status":identity_state,"role":"participant"},
+        "credential_issuance":if role == McpToolProfile::Participant {"required_per_launch"} else {"existing_review_assignment_required"},
         "surface":request.mcp_surface,
         "surface_facts":surface,
         "runtime_loaded":"unknown",
@@ -2524,11 +2533,15 @@ pub(super) fn reconcile_launch(
     manifest["runtime"]["native_effect"] = json!("binding_ready_observed");
     manifest["progress"]["task_dispatch"] = json!("not_started");
     manifest["progress"]["capability_readback"] = json!("not_observed");
-    let participant_id = config
-        .mcp
-        .profiles
-        .get(model::text(&manifest["request"], "mcp_profile")?)
-        .map(|profile| profile.expected_client_id.as_str());
+    let mcp_profile = model::text(&manifest["request"], "mcp_profile")?;
+    let participant_id = manifest["participant"]["client_id"].as_str().or_else(|| {
+        config
+            .mcp
+            .profiles
+            .get(mcp_profile)
+            .filter(|profile| profile.tool_profile == McpToolProfile::AssignedReviewer)
+            .map(|profile| profile.expected_client_id.as_str())
+    });
     let participant = participant_id
         .map(|client_id| meta(tx, &format!("client:{client_id}")))
         .transpose()?
