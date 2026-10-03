@@ -1,444 +1,211 @@
-# Agent Operations: Architecture and Contracts
+# Agent Operations: Rust Architecture and Service Contracts
 
-Revision 1 · 2026-10-03 · proposed against `35e499ae73b622d873c44873f6993ee3fcbea87b`.
+Revision 2 · 2026-10-03 · design against main `35e499ae73b622d873c44873f6993ee3fcbea87b`.
 
-This is the normative design for the extension described in [README](README.md). Refer to the [donor map](donor-map.md) for external evidence and the [implementation plan](implementation.md) for delivery order. Method names below are proposed unless explicitly labelled existing.
+Read [Delivery](delivery.md) for queue/audit/publication transitions and [Configuration](configuration.md) for configuration semantics. Names here are proposed unless explicitly identified as existing. [Donor map](donor-map.md) separates external evidence from ELIOT design.
 
-## 1. One host, three different kinds of work
+## 1. Implementation boundary
 
-Separate these paths:
-
-1. **Observation:** consume native events, sample owned processes, reconcile Git/GitHub and maintain projections. No model prompt.
-2. **Decision:** evaluate a registered rule, deadline, Goal condition or capability grant using typed facts. No model is needed for ordinary routing.
-3. **Execution:** admit an authorized action as a normal durable Operation, then execute outside the Store transaction. A model runs only if the selected action explicitly starts/continues a permitted assignment.
-
-An observer disconnect does not stop native work. A hook callback is not another controller. A Python script is not a second scheduler. A model's text is not an accepted Task, a commit receipt or a permission grant.
-
-### 1.1 Shared action boundary
-
-Manual MCP calls, cron, hooks, Goal transitions and reminders use the same action admission path:
+All ELIOT-owned internal logic is Rust:
 
 ```text
-validated cause + pinned definition + execution grant
-    -> deduplicate
-    -> resolve exact target
-    -> recheck scope, revision, lifecycle, concurrency and permission
-    -> commit existing Operation and cause linkage
-    -> execute through native Rust handler / owned script / RuntimePort
-    -> retain outcome, evidence and actual resource disposition
+host / Store / authorization / configuration
+runtime adapters / native transport readers / process supervision
+source intake / monitoring / dashboard projections / streams
+Git inspection / GitHub API client / webhook validation
+assignment distributor / review router / publication controller
+hooks registry / hook ingress executable / action handlers
+cron / scheduler / Goal / shared reminder service
+MCP facade / local gateway / CLI / script runner
 ```
 
-A small closed `ActionSpec` enum is extended deliberately. Initial kinds:
+Python and PowerShell execute only optional external extension scripts. Normal startup, task handoff, audit, recovery and push must work without either interpreter. No internal JS/TS control daemon, Node gateway, shell merge loop or Python GitHub worker is introduced. Rust-produced protocol/configuration data is not an executable script.
 
-| Kind | Target implementation | Default effect |
+Native vendors still own their tools, model loops and services. Connect from Rust to documented HTTP/SSE, WebSocket, MCP/ACP or framed stdio interfaces that the selected runtime actually supports. A Rust SDK may be used whole where suitable. Do not manufacture a Rust SDK by translating commercial SDK internals or copying private protocol assumptions.
+
+Existing Python/JS bridges and the Command TS mod are historical implementation sources. Port their necessary ELIOT-owned behavior into Rust, retain source attribution and qualify the new path. A vendor surface available only through a non-Rust custom plugin is a named integration gap, not permission to hide another owned JS/TS subsystem. Use a supported native executable callback or externally supplied documented protocol when available; otherwise expose only the capabilities actually reachable from Rust. Do not claim old and new bindings are interchangeable without recovery evidence.
+
+Adapter upgrades affect future bindings. Existing bindings keep their recorded lifecycle owner until safe handover; missing compatibility never authorizes a replacement session while prior work may still run.
+
+## 2. One admission path
+
+Observation, deterministic decision and execution are separate:
+
+```text
+native/source event or deadline
+  -> validated fact / current projection
+  -> policy chooses a typed action
+  -> scope, lifecycle and concurrency checks
+  -> existing durable Operation + cause linkage committed
+  -> Rust worker performs effect outside Store transaction
+  -> result and actual resource disposition retained
+```
+
+The same action descriptor is used from manual MCP, a delivery preset, event rule, schedule or Goal. Initial action families are notification, source/check capture, assigned work dispatch, candidate review, repair handoff, registered script execution and explicitly authorized forge effects. Each maps to a typed application handler; no `call_any_method`, shell-command string, arbitrary remote URL or serialized closure is an action.
+
+An invocation's execution state is the existing Operation, not a second job state machine. Additional records identify definition, cause, resolved settings, grant, target and result references. Delivery phases are projections over those facts.
+
+Admission reads the currently active definition, resolves its settings once, and records that execution snapshot. An existing request ID always returns its original receipt even after configuration changes. Future independent work uses the new active definition. Do not bind every future occurrence forever to an old script/profile release.
+
+Uniqueness is `(project, semantic cause, action slot, deliberate replay generation)`. Record the definition revision used; editing a rule alone does not produce another execution for the same cause. Same request identity with different input conflicts. An explicit authorized re-run is a new logical request, not an attempt to conceal uncertain delivery.
+
+The workflow service executes under a scoped standing grant and retains its sponsor. It does not impersonate a model manager or hold a reusable GM credential. Recheck grants at admission and immediately before consequential effects. A revoked grant stops future starts; an already possibly-sent effect is reconciled, not reissued.
+
+## 3. Continuous observation
+
+### 3.1 Source contracts
+
+| Source | Rust path | Coverage limit |
 |---|---|---|
-| `notify` | Existing mailbox/attention with exact recipient or authorized role resolver | Durable notice, no model turn |
-| `run_script` | Versioned script registry and owned runner | Explicit script effects within selected trust/grant |
-| `run_check` | Existing CheckRunner admission | Exact candidate/profile check |
-| `dispatch_task` | Existing Task/Attempt dispatch, compatible with #22 launcher | New work within manager-assigned pool |
-| `continue_assignment` | Exact existing assignment via supported RuntimePort semantics | Explicit authorized continuation, never uncertain-input retry |
-| `publish_ref` | Existing `forge.publish_ref` | Existing protected publication semantics |
-| `merge_pr` | New qualified forge merge implementation | Protected merge; not a script shortcut |
+| Native stream | One adapter reader per supported connection/scope | An event belongs only to its verified binding, root/child and generation |
+| Native snapshot | Shared bounded read-only reconciliation | Partial absence is not termination |
+| OS processes | Recorded process ownership plus one selective sampler | PID alive is not model progress; failed enumeration is not an empty process set |
+| Git | Shared file/ref hints followed by exact object/status reads | File event or commit author does not assign work |
+| GitHub | Authenticated events plus paged conditional reads | Assignees, labels and comments are external facts, not controller authority |
+| Store | Committed Task/Attempt/Operation/submission facts | Admission is not completed work |
 
-There is no `call_any_method`, string shell command, arbitrary HTTP destination or serialized closure action. Small request/result/context transformations use reviewed typed mappings or a registered script, not an embedded unrestricted template language.
+Use events first. Source-specific read-only polling is an acceptable fallback when a native event stream is missing or unhealthy. It is paced centrally and shared across viewers. Never ask a model for status, launch a CLI with implicit service recovery to observe health, or start a poller per registered participant.
 
-## 2. Continuous monitoring, not model interrogation
+Process identity includes recorded start/boot/ownership facts, not just PID or executable name. A wrapper exit, quiet parent, closed tunnel or old mtime is not evidence that its children or native Goal stopped. No heuristic death detection grants a new writer access to the same worktree.
 
-### 2.1 Sources and ownership
+### 3.2 Dashboard row
 
-| Source | How to observe | What it does not prove |
-|---|---|---|
-| Native SDK/HTTP stream | Reuse the adapter's existing reader; route by exact native root/child and binding generation | Text activity is not Task progress or success |
-| Native snapshot API | Bounded shared reconciliation after a gap, reconnect or freshness deadline | Absence from one partial list is not death |
-| Owned process group | Existing recorded OS identity plus shared metrics sampler | PID alive is not a running model turn |
-| Git repository | File/ref hook hints, then bounded exact ref/status/object reads | Commit author is not current assignment owner |
-| GitHub | Signed webhooks plus conditional reconciliation reads | Assignee/label/PR merge is not ELIOT acceptance |
-| Store | Committed Task/Attempt/Operation/submission/check facts | A queued request is not a completed external effect |
-
-One reader per native connection/required stream scope, not one reader per dashboard viewer. Multiplex roots only where the native protocol permits it. A shared app-server event is assigned by its exact thread ancestry; never count all traffic in every manager's stream.
-
-The OS sampler is one long-lived collector with selective refresh and bounded work. PID reuse is checked using recorded start/boot identity and process ownership, not executable-name matching. Enumerate unknown external processes for diagnostics only; do not kill or adopt them automatically.
-
-Where event APIs are absent, controlled read-only polling is acceptable. It is performed by the server, paced by source health/capacity, shared among observers and labelled as polling. Do not spawn a CLI health check whose implementation may restart the native service. Never send a model a status question merely to populate the dashboard.
-
-### 2.2 Work row
-
-A dashboard row joins exact identities and retains separate state dimensions:
+Join these facts without merging their meanings:
 
 ```text
-project/repository + Issue + selected source revision
-Task + Task revision + Attempt + assignment/ProducerRef
-manager/executor/auditor + grant revision
-binding + generation + native root/child/run/turn when available
-manager worktree handle + current ref/OID + candidate/submission
-process state / transport state / execution state / work state
-current tool and pending native question
-last transport event / last native progress / last material project progress
-child-family coverage, source cursor, freshness and gaps
-CPU/RSS/owned descendant counts as observations
-quota/capacity and usage semantics (per-turn/cumulative/unknown)
-Goal/schedule/script/hook invocation references
+project / repository / Issue / source revision
+Task / Task revision / Attempt / assignment / submission
+manager / executor / assigned auditor(s)
+binding / generation / native root / child / run / turn when supplied
+worktree handle / branch / observed commit / candidate
+process state / connection state / execution state / delivery phase
+active tool / pending native question / child-family coverage
+last transport event / last material progress / source freshness
+CPU / RSS / process count / provider usage and capacity basis
+pending rule, script, Goal, audit and publication Operations
 ```
 
-Useful execution values include `queued`, `starting`, `model_running`, `tool_running`, `waiting_for_input`, `waiting_for_children`, `paused`, `terminal` and `unknown`. Preserve `native_status_raw` beside the normalized status.
+`queued`, `model_running`, `tool_running`, `waiting_for_input`, `waiting_for_children`, `paused`, `terminal` and `unknown` describe execution, not acceptance. Preserve unfamiliar native status as raw data with unknown mapping rather than guessing success.
 
-A state such as `tool_running` for a foreground child must not be displayed as a dead manager. Unknown source health does not turn a previously active child into completed. A diagnostic `suspected_stall` is advisory, with evidence and confidence; it never triggers a kill by itself.
+Dashboard, queue and inspect are maintained projections. Their reads do not serially interrogate every agent. A suspected stall is an explanation with evidence, not an automatic kill instruction. Supervisor failures, delayed audit and blocked publication remain visible separately from writer defects.
 
-### 2.3 Snapshot and delta
+### 3.3 Snapshot, delta and fairness
 
-`swarm.dashboard`, `swarm.agent.inspect` and `swarm.queue.get` retain the convenience names proposed in #22. They read host-maintained projections, not a series of agent prompts.
+Return a consistent committed snapshot plus its controller high-water cursor. Subscribe after that cursor. Preserve each upstream cursor independently; never promise a globally atomic GitHub/native/OS view. Source cursors remain opaque unless their protocol defines order.
 
-A snapshot returns a controller high-water cursor and separate source watermarks. The client subscribes after that controller cursor and receives bounded deltas. Snapshot construction and cursor selection must use one consistent committed cut. Live presentation has its own sequence and is explicitly non-authoritative; do not claim a globally atomic native/GitHub snapshot.
+The existing MCP subscription implementation polls committed facts per subscription. Preserve its lag/resync contract while moving shared intake/projection into the Rust host. Fanout must not repeat full scans for every viewer. Live content has a separate presentation sequence and is not the durable control stream.
 
-On overflow/disconnect: return `lagged` plus the missing range/resync address. Recovery is a bounded read from retained facts. On restart, rebuild only required indexed current state and resume cursors. A source that cannot replay reports a gap.
+Bound queues and bytes. Slow viewers receive one lag/gap indicator and resynchronize; they cannot backpressure native permission replies or terminal recording. Permission/reply and completion traffic have capacity reserved independently from text, Git scans and optional scripts. CPU-heavy parsing and OS enumeration use bounded blocking workers. No Store transaction waits on a network, process, callback or model.
 
-Current `src/mcp/subscriptions.rs` polls per subscription every 250 ms and carries only committed facts. Preserve its public lag/resync semantics, but share the pump/projector by source/filter and avoid multiplying scans with viewer count. Do not claim that it already streams provider text.
+## 4. Text and reasoning streams
 
-### 2.4 Streaming text, tools and reasoning
+`stream.open/read/close` select an authorized assignment/binding and content classes. Opening a stream starts observation, not a model. Support cursor reads as well as negotiated notifications; a client with no notification support still reads a bounded page, not a global transcript.
 
-`stream.open`, `stream.read`, `stream.close` use an exact authorized binding/assignment and content-class filter. `open` creates a read subscription, not a model execution. MCP clients without native notifications use bounded cursor reads; capable clients receive notifications or resources supported by their negotiated protocol.
+Classes are `assistant_text`, `reasoning_summary`, `native_reasoning_text`, `tool_progress`, `tool_result`, `lifecycle` and `usage`. Expose only content intentionally supplied by the native API. Hidden or encrypted reasoning is not decoded, reconstructed or claimed available. Return `unavailable`, `redacted`, `not_retained` or an explicit gap.
 
-Classes: `assistant_text`, `reasoning_summary`, `native_reasoning_text`, `tool_progress`, `tool_result`, `lifecycle`, `usage`. Only expose fields deliberately provided by the native API and permitted by local policy. Do not extract hidden chain-of-thought, decode opaque/encrypted reasoning state, synthesize a fake reasoning transcript, or ask another model to reconstruct it. Report `unavailable`, `redacted` or `not_retained` where appropriate.
+Retain item/part/native IDs and source order. Final content supersedes matching deltas without counting it twice. Cumulative usage replaces the preceding cumulative observation; it is not another charge. Unknown billing basis remains unknown.
 
-Every part carries native message/item/part identity, sequence/cursor, visibility and redaction status. Complete result objects supersede presentation deltas without double-counting bytes/tokens. Tool outputs remain untrusted data, not hook rules or instructions.
+Use shared bounded live rings and, when configured, capped artifact chunks. No Observation per token or transcript copy per viewer. Redaction must handle sensitive strings split across chunks; until a streaming redactor's guarantee is established, buffer bounded logical records or omit that sensitive content class. Tool output and reasoning are data, never rule definitions or authority.
 
-Use bounded shared rings for live deltas and capped spool chunks only when retention is enabled. Keep control/terminal facts durable; do not store one full Observation per token. Evict slow viewers rather than delaying the native reader. A large tool output is a paged artifact/reference with explicit byte coverage. Stateful redaction must cover secrets split across chunk boundaries; opaque authentication/reasoning fields are excluded rather than logged for debugging. Existing atlas-redact remains the redaction boundary; its current guarantees must be verified for streaming before claiming coverage.
+Retain active/referenced evidence by ownership and references, not by filesystem mtime. Under disk pressure shed optional presentation history, not unresolved-effect evidence.
 
-Retention protects active sessions and referenced evidence. A stale filesystem mtime is not permission to delete a live transcript.
+## 5. Hooks
 
-## 3. GitHub and Git integration
+### 5.1 Per-event capability report
 
-### 3.1 Work pool and source truth
+Every installed adapter reports native event name, before/after phase, input/correlation fields, callback lifetime, ordering, output/veto rules and installation readback. Distinguish:
 
-The manager selects repositories and a pool of Issues/PRs through `github.work_pool.preview` and `github.work_pool.apply`. A pool is a versioned selection/mapping to existing ELIOT Tasks, not another task ledger. Imports are idempotent by immutable repository ID, external item ID and source revision. Existing Task source-index and owner-policy rules decide what becomes specification.
+- `native_blocking`: actual supported pre-effect decision;
+- `native_observational`: notification only;
+- `wrapper`: only operations passing through ELIOT;
+- `external_hint`: a fact requiring confirmation.
 
-Observe Issues/comments/PR heads/reviews/check results through a GitHub App or another reviewed credential source. Credentials, webhook URLs and local roots are setup-only secrets/references. App installations request only required repository permissions. Repository settings/branch protection are never silently changed.
+Wire supported lifecycle, tool, permission, child, compaction and material-source events. Unknown optional events do not break the adapter. Missing a required protected pre-effect hook prevents that action, not the entire fleet.
 
-Webhook intake verifies HMAC on the raw request body, event/action and installation/repository allowlist before committing. Deduplicate by installation/repository/delivery identity and payload digest. Acknowledge only after durable intake, then process asynchronously. GitHub redelivery can retain the same delivery ID. Do not assume ordered or complete delivery; use paged conditional reads and bounded reconciliation after gaps, rate limits and reconnect.
+The public OpenCode plugin API is not automatically this repository's OpenCode V2 contract. Gemini CLI callbacks do not establish Gemini Spark or Antigravity capabilities. The existing Command ModApi listener is observational. A callback declaration does not prove installation or use.
 
-Provider `updated_at` timestamps are not unique CAS versions. Record external IDs, ETag/version where supplied, observed content digest and collection coverage. A missing item in an incomplete page is not deleted. GitHub assignees and labels are external facts; ELIOT's accepted Task/Attempt ownership remains separate.
+### 5.2 Rust ingress and fast path
 
-An Issue edit marks the selected specification stale and creates one relevant exception. It cannot rewrite a running assignment's frozen requirements or grant new script privileges automatically.
+`swarm hook emit` is a Rust executable using authenticated local IPC; Rust in-process adapters may call the same typed ingress. Scope is setup-issued, not a JSON field an agent invents. Bound input fields, bytes and callback lifetime; preserve real native IDs or explicitly source-local epoch/sequence.
 
-### 3.2 Local commit observation
+The callback does not run an audit, Python, GitHub write or model inline. Observational events enqueue compact facts and return according to native semantics. Optional telemetry loss becomes a gap; it cannot wedge compaction or productive work.
 
-Managed local Git hooks and filesystem events are hints. Verify the observed ref/OID in the exact manager worktree and registered repository before emitting `git.commit_observed`. Resolve linked worktree metadata and common Git directory through Git, not by assuming `.git` is a directory.
+A genuine blocking gate evaluates local bounded policy, without waiting on a script/model/remote API or a Store lock held by its caller. It may deny only the relevant protected effect when permission is unknown. Async callbacks cannot undo an action already performed.
 
-Do not use a regex matching `git commit` in model output as a commit receipt. A `push` webhook proves remote ref information, not which local agent typed the command. When ownership cannot be established, label the event unassigned and do not notify an arbitrary auditor.
+### 5.3 Configuration
 
-One shared Git observer services interested Tasks. Debounce path/ref changes and perform bounded read-only scans; never run full `git status` for every token/tool or per subscriber. File-watch overflow becomes a dirty scope requiring reconciliation, not silent completeness.
+`hook.install.preview/apply` preserves unrelated user and managed hooks, checks the source configuration, stages the change and records readback. No hidden global hooks-path replacement, service restart, PATH change or new interpreter. An authorized project-local installation grant can permit repeat changes without Root involvement; new global privileges still need the grantor.
 
-### 3.3 Commit -> auditor
+Protected forge actions continue to suppress uncontrolled Git hooks. Rust before/after action events provide their integration points. Hooks for native tools outside ELIOT need real native support; wrapper coverage is never advertised as universal.
 
-Built-in recipe, configurable without writing a script:
+## 6. Rules and causal loop control
 
-```text
-verified commit in a managed workspace
-  -> resolve exact Task/Attempt/worktree and new OID
-  -> persist one audit notice keyed by repository + work context + OID + rule revision
-  -> route to authorized auditor pool
-  -> optional pre-authorized review dispatch
-  -> findings tied to exact candidate/submission
-```
+Rules match a small typed predicate language over event kind, project, assignment, lifecycle and known fields. No shell interpolation, unrestricted template evaluation or method selection from prose. Configuration preview/simulation returns planned actions with no effects.
 
-Notice delivery never invokes a model by itself. The manager may grant automatic review dispatch once, with allowed projects, reviewer roles, cost/concurrency and candidate freshness rules. This enables useful unattended automation without turning every commit into a Root approval request.
+Persist root cause, parent invocation, semantic event key, action slot and ancestry. Default rules ignore their own descendants. Static cycles are rejected; dynamic ancestry and granted work budgets contain non-obvious cycles. Policy changes do not replay old comments or all retained events.
 
-WIP commits can send a cheap informational notice; a review requires captured immutable candidate evidence. Coalesce queued superseded WIP notices, but never erase an accepted review, objection or submitted candidate. Local hook and remote webhook for the same material OID must not launch duplicate audits. A late result can annotate its old candidate, not invalidate a newer submission by branch name alone.
+Automatic error handlers are subject to the same dedupe and authority. A failed notification must not spawn an agent to explain the notification failure. A meaningful new fact can re-enable work; unchanged failure parks only the affected rule/work item with an explanation. No universal arbitrary number of repair rounds becomes a product-completion limit.
 
-Multiple auditors may work independently. Scheduling chooses among authorized available auditors and records assignments; disagreement is preserved. Audit opinion is not automatic Task acceptance.
+## 7. Server cron and reminder service
 
-## 4. Hooks as adapters, not a universal fake guarantee
+Extend `src/scheduler.rs` and `src/store/schedules.rs`. There remains one scheduler and one durability authority. Preserve v1 configured CheckRun IDs/receipts; migrate definitions and due indexes without two owners for one schedule. Do not scale the old 64-entry JSON meta blob into a fleet-wide hot row.
 
-### 4.1 Capability matrix
+A schedule names `once`, anchored `interval` or `cron`, enabled state, timezone/calendar policy, lateness/catch-up, overlap, action selector and grant. Configuration stores the intended calendar semantics, not a prescribed cron-library release. Use a complete maintained Rust expression evaluator and one timezone library; no handwritten cron parser.
 
-Every installed module/plugin declares and reports per event:
+Cron preview states the grammar, next occurrences, timezone, spring-gap and repeated-time behavior. A timezone is explicit; host locale does not silently decide it. Any unsupported requested calendar behavior is a validation error. Detect semantic changes when the evaluator/timezone data is updated, keep already admitted occurrences intact, and recalculate future occurrences under the declared policy. Do not require the old binary indefinitely or silently duplicate a previously considered UTC occurrence.
 
-```text
-native event name + installed native version
-phase: before / after / lifecycle / stream
-class: native_blocking / native_observational / wrapper / external_hint
-available input fields and correlation IDs
-allowed outputs and veto/rewrite capability
-sync/async semantics and failure policy
-installation/readback revision
-status: documented / installed / observed / unsupported / unknown
-```
+Occurrence identity is schedule ID, logical schedule generation and due UTC instant. Actual start time/jitter is separate. Content/profile updates affect future admissions but do not re-run an already considered slot. Explicit `run_now` has its own request ID. Default catch-up is latest-only; bounded replay is opt-in and requires a repeat-safe action.
 
-Use all required supported events for lifecycle, tools, subagents, permissions, compaction and material file/commit activity. Missing optional events produce a named gap. A required pre-effect policy on an unsupported runtime blocks only that protected operation/route, not the whole fleet.
+Pause disables new starts, not active work. `new_work=disabled` is respected for execution. Read-only observation remains available. An uncertain earlier same-target effect prevents competing mutation, not unrelated work. Monotonic waits plus wall-clock rechecks handle sleep/reboot and clock jumps.
 
-Different native versions/products remain different adapters. Public OpenCode plugin documentation is not automatically the contract for the repository's OpenCode V2 service. Gemini CLI hooks are not proof that Gemini Spark or Antigravity exposes the same callbacks. Existing Command ModApi listeners observe; they do not veto a tool. SDK package presence does not prove ELIOT wires its hook options.
+Reminders reuse #22's `coordination.watch.*`, mailbox and subject indexes. One shared timer structure serves all watches; ordinary watches send notices and never start models. A separately configured action can dispatch authorized work on the same event. The distinction remains visible in the receipt.
 
-### 4.2 Hook ingress
+## 8. Server Goal
 
-A native hook delegates to a small `swarm hook emit` ingress helper or in-process adapter callback. Scope comes from a setup-issued binding/session grant, not a self-asserted JSON manager ID. Allowlist event types and bounded fields. Preserve native event IDs when supplied; otherwise generate a local source epoch/sequence and explicitly avoid claiming native replay identity.
+`goal.*` is ELIOT-owned; `agent.goal` remains a native adapter capability. A server Goal references the manager's existing Task pool and completion predicates, not another Task graph. It stores desired outcome, standing execution grant, route preferences, budgets, evidence, waiting reason and current continuation owner.
 
-The hook does not run Python, a full audit or network publication inline. It validates/adopts a fact or returns a native policy decision within a bounded deadline. Long actions are admitted to ELIOT's server queue.
+State is `draft`, `active`, `waiting`, `paused`, `achieved`, `cancelled` or `needs_attention`. Operation outcomes remain separate. A goal can advance assignments, review and repair automatically within its grant. It cannot enlarge its own work pool or change acceptance policy from generated text.
 
-Observational telemetry failure must not stop productive work or compaction. Return native success when permitted, record an ingress gap/loss counter and retry only transport delivery with the same event identity. A source without durable replay may lose telemetry; do not claim otherwise.
+Achievement checks the configured required evidence for exact Task revisions. Commit volume, tokens, running-agent count and an agent's statement that it is done are not completion. Unmachine-checkable objectives require the configured authorized evaluator.
 
-A blocking safety hook is different: its short local evaluator may deny the specific protected tool when policy cannot be established. That evaluator must not wait on a model, script, GitHub API, Store lock held by the caller or its own callback. Never label an async hook as prevention after the action already executed.
+Exactly one continuation owner is active for an assignment: server, native or manual. Switching from native Goal requires supported pause/clear and actual readback. Unknown input or active children prevents a competing continuation. Never re-prompt just because a wrapper ended or a manager went silent.
 
-### 4.3 Installation
+Pause/cancel changes future admission. Cancelling already running children is a separate addressed operation through their owner. Persist useful partial results; no timer invents permission to kill.
 
-`hook.install.preview/apply` operates on exact local configuration revisions. Preserve unrelated user/managed hooks, native ordering and entrypoint semantics. Managed restrictions are respected. Apply staged changes with readback and rollback plan. No silent service restart, global `core.hooksPath` replacement or edits of running scripts.
+## 9. Optional external scripts
 
-MCP wrapper before/after events cover ELIOT calls only. They do not cover tools executed wholly inside a native harness. For batch adapters without hooks, expose process-start/output/exit and the coverage gap instead of invented tool events.
+`script.register/revise/validate/activate/run/get/list` manage named Python or PowerShell extension bundles. The registry, validation, runner, result ingestion and scheduling are Rust. A script is not a mandatory wrapper for notification, push, merge, audit or queue operations.
 
-Protected forge publication currently skips arbitrary Git hooks. Keep that guarantee. Native ELIOT action before/after events provide extension points without executing uncontrolled repository Git hooks in a privileged push.
+The active definition is the normal selector for future runs. At admission resolve the bundle, installed interpreter, dependency environment, input schema, working scope and trust profile and retain that run's evidence. New edits apply to later invocations. An old request retry returns its prior result; it does not resolve the newly active script again.
 
-### 4.4 Rules and loop prevention
+Capture declared support files with the entrypoint so a running script cannot change halfway through from an edited import. No package installation in a hook or timer callback. Environment preparation is a separate explicitly authorized setup action. This is execution integrity, not a requirement to use one fixed Python/PowerShell/dependency version forever.
 
-A rule selects typed event fields, scope and phase, and pins an ActionSpec plus mapping revision. It cannot select a method from arbitrary event text. Replay/simulation performs no effects.
+Pass JSON stdin and separate argv. Do not interpolate Issue bodies, event text or branch names into source code. Use the installed `pwsh` with noninteractive/no-profile file execution, or the selected Python environment; no default ExecutionPolicy Bypass. These switches are hygiene, not sandboxing.
 
-Cause linkage includes root cause, parent invocation, rule revision, semantic event key, action slot and bounded ancestry. One trigger event/slot creates one retained Operation even when delivered twice. Rule edits do not reprocess old history unless explicit replay is requested.
+A result has typed status, evidence references and bounded optional progress. Drain stdout/stderr without blocking control. Script tokens are invocation-scoped, short-lived and unable to grant roles or accept their own work. Each authorized child effect has an action-slot identity.
 
-By default a rule does not react to its own descendants. Cycles are rejected where statically visible and stopped by ancestry/hop/rate bounds otherwise. Repeated no-progress or failures pause that rule and create one incident; they do not spawn explanatory agents. Bound automatic error/recovery actions too.
+`trusted_local` has the real permissions of the selected OS user; cwd, a manifest or an MCP allowlist do not prevent arbitrary local code accessing that user's files/network. `isolated` requires actual OS/container/VM enforcement; missing support never downgrades silently. Job Objects/process groups provide lifecycle containment, not permission isolation.
 
-## 5. Server scheduler, cron and reminders
+Scripts can be authored, activated and run by agents inside a standing local project grant. Untrusted repository changes cannot silently become trusted-local code or widen secrets/network/host access. Timeouts affect only the invocation's owned descendants. Unconfirmed surviving writers hold that mutation scope; exit zero alone is not sufficient. Unknown external effects are reconciled, not blindly retried.
 
-### 5.1 Extend the existing scheduler
+## 10. Roles, authority and MCP
 
-Keep one host scheduler and the existing Store transaction/Operation semantics. The v1 registry of at most 64 configured CheckRuns remains readable with unchanged IDs and receipts. New definitions use versioned records with due-time indexes; do not enlarge one global JSON blob into a hot row for thousands of timers.
+Separate principal, role capability bundle, object scope, standing execution grant, MCP profile/surface, current GM designation and OS identity. Presets include manager, executor/Participant, auditor, observer and GM candidate/operator. Several auditors are normal. A role named `gm` does not perform leadership handover.
 
-Definition fields:
+Custom roles contain finite registered capabilities and scope constraints, not arbitrary policy code or a wildcard covering future methods. Grantors delegate only rights they can delegate. Role/grant revocation invalidates cached authorization immediately for new calls/actions.
 
-```text
-schedule_id, revision, enabled, owner/grant reference
-trigger: once | interval | cron
-once: due_at_ms
-interval: anchor_ms, period_ms
-cron: expression, dialect, timezone, calendar_engine_revision
-start/end bounds, optional deterministic jitter
-misfire: skip | coalesce_latest | bounded_replay
-catchup_window_ms, overlap: skip | buffer_latest | allow_bounded
-max_concurrency, action revision, input, next_due_at
-```
+Current `task.request_changes` requires GM/operator. The new scoped workflow service must be allowed through an explicit audited-disposition authorization branch, retaining the existing candidate guards. Do not solve this by leaking GM credentials to reviewers or by adding a second review state machine. The same explicit principle applies to delegated acceptance/publication; see Delivery.
 
-`once` and legacy interval retain their existing timestamp rules; an old anchor of zero remains valid. Optional message deadlines are a separate type.
+Preserve #22's small core. Configuration, runtime profiles, streams, review/delivery, hooks, rules, schedules, goals, scripts and roles are deferred groups. No generic passthrough and no script-per-version tool explosion. `script.run` accepts a named active script and typed input; optional promotion requires normal catalog metadata and authorization.
 
-Cron uses a selected complete parser/evaluator, initially the reviewed Croner 3.0.1 API plus timezone support; no handwritten parser. Declare the accepted dialect explicitly. Preview shows the next occurrences, effective timezone and daylight-saving behavior. Do not infer timezone from whichever machine runs the host.
+Reads are side-effect-free with respect to work. Refresh may perform authorized read-only source I/O but cannot start a model or modify settings. `tools/list` pagination alone is not lazy model loading. Native search or verified surface refresh is used where supported, otherwise a bounded fixed role surface. Every call rechecks permission, including cached or manually addressed tools.
 
-The initial calendar behavior follows the selected Croner contract: fixed-time schedules advance past a spring gap and use the first repeated fixed time; wildcard schedules skip missing matches and can match both repeated occurrences. Exact timestamp identity is UTC. Record the engine/tzdata revision and show the behavior in preview. For effects requiring uniform intervals, recommend UTC/interval rather than silently changing local calendar semantics. A later engine update must not silently reinterpret an existing schedule.
+## 11. Persistence and recovery
 
-### 5.2 Occurrences and overlap
+Keep SQLite/Store, existing Operations, Observations and artifacts. Add only needed indexed metadata: active configuration, origins, work-pool membership, review assignments/results, due occurrences, grants and action/effect linkage. Use forward migrations, not edits of old schema history.
 
-Occurrence identity derives from schedule ID/revision and logical due UTC instant; actual launch time and jitter are separate. Persist consideration and admitted Operation linkage atomically. Manual `run_now` has its own request identity and does not impersonate a missed scheduled occurrence.
+Current indexes and bounded pages drive scheduling. No full event-history replay per viewer or per agent. Large script bundles and optional stream content use artifacts. Durable intake plus pending effect records form an outbox in the same Store; no second broker is needed.
 
-Default is `coalesce_latest` with one pending latest run and no overlapping mutation of the same target. Bound catch-up windows and replay counts. Replay requires a repeat-safe action; never backfill an uncertain push or prompt. One-shot missed work is eligible only within its configured lateness policy.
+A model/client exit does not stop server policy. Reboot reconciles queued/possibly-sent operations and recorded process ownership before new dispatch. Lost GitHub responses are read back. Ambiguous source data is retained as unknown. Service restart, host cleanup and repository-settings changes remain explicit operator actions, not automatic repairs for a failed observation.
 
-Use monotonic waits and periodic wall-clock rechecks. Handle sleep, restart and clock jumps. Disable/pause prevents new starts; it does not kill an active job. Resume considers policy-eligible work, not a burst of every old tick. A new definition revision does not rewrite an in-flight invocation; queued old work is cancelled/deferred or explicitly retained by revision policy.
-
-### 5.3 Model-independent operation
-
-Cron evaluation, due-time handling, notification and script dispatch run inside the long-lived ELIOT host even if no manager model is awake. No harness `CronCreate`, session loop or desktop timer is the durable authority.
-
-A scheduled model action requires an active standing execution grant and its exact target/pool. If no capacity exists, it waits or is skipped according to policy. Unknown quota is not infinite capacity. Repeated provider limits use provider-specific reset evidence/backoff; no universal hardcoded 429 interpretation.
-
-### 5.4 Reminder/watch service
-
-Use the `coordination.watch.*` service planned in #22, not another reminder table with unrelated semantics. A watch observes a named fact or deadline and produces a notice. One-shot is the default; recurrence is explicit and coalesced. One shared timer heap and indexed event matching serve all participants.
-
-Delivery states distinguish stored, available, presented and consumed. A reminder cannot replace the current Task prompt or wake an old session. A manager can deliberately attach an authorized `continue_assignment` action to a reminder rule; ordinary reminder delivery still starts no model.
-
-## 6. Server Goal
-
-### 6.1 Independent authority
-
-`goal.*` is an ELIOT object; `agent.goal` remains a native adapter operation. A server Goal works on runtimes with no native Goal feature.
-
-A Goal contains:
-
-```text
-goal_id, revision, owner and role/grant revision
-project/work-pool reference and allowed Task revisions
-objective and completion contract
-allowed action kinds and target-selection policy
-capacity, cost/turn budgets and optional deadline
-progress evidence and unresolved conditions
-continuation owner: server | native | manual
-state and last admitted action references
-```
-
-Goal is not a second Task. Its work is ordinary Tasks/Attempts and its effects are ordinary Operations. No hidden recursive decomposition: expanding the work pool or creating new Task definitions needs a manager grant explicitly permitting that operation.
-
-### 6.2 States and progression
-
-```text
-draft -> active -> waiting | paused | achieved | cancelled
-                      \-> needs_attention
-```
-
-`waiting` includes native work, dependency, capacity, budget reset and authority renewal. A distinct execution ledger contains attempts/outcomes; lifecycle state never doubles as proof of task success.
-
-For a development Goal, achievement is the declared set of required Task acceptance/evidence predicates at exact revisions. A textual objective without a machine-checkable completion predicate needs explicit authorized evaluation; it never becomes achieved from the model saying "done". Commit count, tokens and running-agent count are not completion criteria.
-
-The planner evaluates changed committed facts, selects at most the authorized next action and persists it. A standing manager grant can authorize continued work from an assigned pool, bounded repairs or review dispatch without a fresh manager approval each time. It cannot extend its own permissions, buy capacity, change provider/model or merge work unless those capabilities were explicitly delegated.
-
-No-progress detection compares material work/evidence revisions, not elapsed silence. Repeated unchanged failure yields waiting/needs_attention and a compact reason. It never creates unlimited re-prompt loops.
-
-### 6.3 One continuation owner
-
-When native Goal continuation is active for a binding, ELIOT observes it and does not run a second server continuation loop on the same assignment. Switching owner requires reconciliation and supported native pause/clear readback. Unknown prior continuation prevents a competing start, not unrelated Task work.
-
-Server continuation starts only after the preceding input outcome and relevant native execution/family disposition are established. A transport ACK or parent turn end with active children is insufficient. Never retry a possibly delivered input with a new ID.
-
-Pause stops future admissions; current work continues unless separately cancelled through its owner. Cancel records the Goal decision; cancelling child Operations is a distinct scope-explicit action. Native limitations are returned honestly.
-
-## 7. Named PowerShell and Python scripts
-
-### 7.1 Authoring and invocation
-
-Scripts are first-class versioned extension artifacts, not arbitrary command strings embedded in schedules.
-
-```text
-script.register/revise -> immutable content + manifest revision
-script.validate       -> schema/interpreter/dependency/grant checks, no execution
-script.activate       -> choose a version under existing authority
-script.run            -> existing durable Operation + owned process
-script.get/list       -> metadata, inputs, state, receipts
-```
-
-Users and agents with `scripts.author` may create/revise their own scripts. A grant may permit activation and runs within the current project/workspace without Root approval on every edit. It must explicitly state trust mode, allowed runtimes, resources and API effects. Widening that envelope requires authority; changing only implementation bytes creates a new revision rather than modifying a running file.
-
-### 7.2 Manifest
-
-```json
-{
-  "contract": "eliot-script-v1",
-  "script_id": "project-a/report-changes",
-  "runtime": "python",
-  "entrypoint": "main.py",
-  "content_ref": "registered-immutable-bundle",
-  "input_schema_ref": "registered-schema",
-  "result_schema_ref": "registered-schema",
-  "execution_profile": "project-a-tools",
-  "working_directory": "assigned-workspace",
-  "effect_class": "workspace_mutation",
-  "retry": "never_after_possible_start",
-  "timeout_ms": 120000,
-  "output_limit_bytes": 1048576
-}
-```
-
-The profile resolves an installed interpreter, dependency environment, private secret references, process limits and trust mode. No implicit `pip install`, npm download or online dependency resolution at hook time. A script bundle includes declared support files; execution uses a read-only captured version rather than rereading a changing worktree file. Source paths alone are not executable identity.
-
-### 7.3 Runtime contract
-
-PowerShell: selected `pwsh` executable, `-NoProfile -NonInteractive -File`, arguments as separated data. Respect OS policy; do not default to ExecutionPolicy Bypass. Python: selected interpreter/venv with configured isolation flags and entrypoint; flags and NoProfile are hygiene, not sandboxes.
-
-Pass bounded JSON on stdin and deterministic fixed argv, never interpolate event/branch/Issue text into shell code. UTF-8 output is a typed protocol: bounded progress records, final result, stderr diagnostics. Unknown fields/types fail validation; a line containing "success" is not a receipt. Large output is chunked/spooled under retention policy, not put in the manager prompt.
-
-A script receives only its minimal environment and optional invocation-scoped ELIOT token. The token permits specific child actions/targets and cannot administer clients, read unrelated secrets or accept its own work. Child action IDs derive from invocation plus declared action slot; scripts do not mint new retry identities to evade dedupe.
-
-### 7.4 OS trust is explicit
-
-`trusted_local` executes code with the selected local OS identity. Capability manifests, cwd, argv and API scopes do not prevent that code from opening other files or network connections allowed to that OS identity. Do not call this sandboxed.
-
-`isolated` requires a separately supported OS/container/VM runner with demonstrated filesystem/network/credential isolation. If the selected runner cannot enforce it, reject that mode; do not silently fall back to trusted local. A Job Object/process group contains lifecycle, not permissions.
-
-Untrusted remote or repository-supplied scripts may be authored/staged but cannot auto-activate as trusted local merely because an agent created a manifest. An operator can preauthorize a trusted local project for convenient agent-authored scripts after accepting that OS trust boundary.
-
-### 7.5 Lifecycle and retries
-
-Reuse existing owned-process patterns. On Windows, establish process ownership at creation; on Unix preserve the declared child-group owner. Concurrent stdout/stderr draining is bounded. Timeouts cancel only that script invocation's owned descendants, never a shared native server or unrelated manager.
-
-Success needs valid result, required evidence and confirmed owned-process disposition. A surviving/unknown descendant holds the relevant workspace/effect concurrency key. No automatic replacement writer starts there. Exit zero alone is insufficient.
-
-Read-only retry is allowed only by an explicit action contract. Arbitrary local mutation and external effects remain unknown after a possible start until reconciliation or operator decision. A script's self-declared `idempotent=true` is not enough.
-
-## 8. Native actions and protected forge
-
-Keep ordinary notification, state projections, cron evaluation, review-queue admission and existing CheckRunner/publication in Rust. Scripts are for additional behavior, not mandatory wrappers around every built-in action.
-
-`forge.publish_ref` remains the current exact accepted-candidate operation. Its preflight is not an atomic expected-old CAS; the current documentation explicitly records that race. This program does not upgrade the guarantee by renaming the operation.
-
-A new `forge.merge_pr` must pin repository, PR, head, merge strategy, accepted candidate/tree and required policy. GitHub's expected head SHA guards the head, not an arbitrary expected base. For merge/squash, verification must cover the actual integrated candidate under a qualified merge-queue or equivalent serialization/check mechanism. If that guarantee is unavailable, report the merge mode unsupported or require the documented operator-controlled path; never bypass branch protection or claim the PR head alone is a verified merged tree.
-
-A merge result lost in transport is reconciled by exact PR/ref/commit readback. Script output, a webhook or a GitHub comment cannot grant merge or acceptance authority. Accepted code, published code and merged code remain three facts.
-
-## 9. Roles and delegated automation
-
-### 9.1 Separation
-
-Keep distinct:
-
-```text
-principal identity (human, model participant, module, script invocation)
-role definition (finite capability set)
-object scope (project, Task, Attempt, workspace, repository)
-execution grant (who may start which actions, where and how often)
-MCP profile/surface (permission ceiling and loading presentation)
-current GM designation/epoch (one leadership owner)
-OS execution identity/trust mode
-```
-
-Built-in presets: executor, manager, auditor, general-manager candidate, operator and read-only observer. The executor builds on the scoped Participant design in #22. Auditor is a capability preset, not a privileged synonym for operator; several independent auditors can be assigned concurrently. Holding the GM preset does not make a principal the currently designated GM.
-
-### 9.2 Custom roles
-
-`role.define/update/get/list` stores immutable revisions of finite registered capabilities with scope constraints. No executable policy script and no wildcard granting future methods by default. Explicit custom role bindings attach to principals; readable labels never decide permission.
-
-Example: `build-observer` may read its project's status/streams and invoke one named diagnostic script, but cannot alter Task assignment, hooks, schedules or credentials.
-
-The grantor may delegate only its delegable capabilities within its own scope. Separate script author, script runner, rule author, rule activator, schedule editor, Goal editor, model-dispatcher and forge publisher rights. No script/agent self-promotion. Role/grant changes invalidate cached decisions; queued actions are checked again before effects. Already uncertain effects are reconciled without retrying them under a new identity.
-
-Before adding roles, audit every existing `require_writer`/role match/profile gate. A generic check that merely rejects observer must not accidentally authorize new roles. Keep module credentials restricted to their binding protocol; hook intake and script effect requests get separate narrowly scoped ingress contracts.
-
-### 9.3 Delegation without a Root queue
-
-A manager can approve once: "For this project and assigned work pool, run these script profiles, dispatch at most N reviewers, and notify this auditor pool on submitted candidates." Every invocation is still checked, but there is no model/human approval round for each eligible event.
-
-Escalate only a genuine scope/trust/policy change, missing required owner, unresolved effect or budget decision. Ordinary monitoring, peer questions, compatible local agreements, notices and already granted scripts continue independently.
-
-## 10. MCP and agent UX
-
-Use the small eager role cores from #22; do not add every operation below to the initial prompt. New domains are metadata in the same hard-authorized catalog:
-
-| Deferred group | Representative methods |
-|---|---|
-| Monitoring | `swarm.dashboard`, `swarm.agent.inspect`, `swarm.queue.get`, `swarm.exceptions.get` |
-| Streams | `stream.open`, `stream.read`, `stream.close` |
-| GitHub work pool | `github.work_pool.preview/apply`, `github.sync.status`, `github.item.get` |
-| Hook setup | `hook.capabilities`, `hook.install.preview/apply`, `hook.status` |
-| Event rules | `automation.rule.create/update/list/get/enable/disable`, `automation.simulate` |
-| Scheduler | `schedule.create/update/list/get/preview/pause/resume/run_now` |
-| Server goals | `goal.create/update/get/list/pause/resume/cancel/evaluate` |
-| Scripts | `script.register/revise/validate/activate/run/get/list` |
-| Roles/grants | `role.define/update/get/list`, `grant.create/revoke/get/list` |
-| Reminders | existing planned `coordination.watch.create/list/cancel` |
-| Forge | existing `forge.publish_ref`, new qualified `forge.merge_pr` |
-
-This table is a method inventory, not permission. Resolve exact signatures against the public registry before implementation; slash lists denote separate typed methods, not a string-dispatch API.
-
-All mutations require caller-owned request IDs. Reads do not trigger hidden scripts, refresh native work by prompting a model or perform network writes. Deferred schema activation changes presentation only, never roles or effect authority. Tool pagination alone does not guarantee model-side deferral; verify each client's native search/list-change behavior and use the fixed bounded surface fallback from #22.
-
-A script is not automatically a new MCP tool. `script.run` uses a named revision and typed input. Optional promotion of a script to a discoverable tool requires reviewed schema/risk metadata and the same permission gates, preventing script revisions from exploding or silently widening the catalog.
-
-## 11. Runtime, storage and fairness
-
-Keep one Store and SQLite durability authority. Permit forward migrations for indexed automation definitions, due occurrences and invocation linkage; do not force thousands of records into the old 64-schedule `meta` blob. Existing Operations remain execution outcomes; linkage tables do not duplicate that state machine.
-
-Suggested logical indexes: enabled definitions by kind/scope; next due time; source event plus rule revision/action slot unique key; invocation Operation ID; scope/concurrency key; outstanding watches by subject; Goal by affected Task. Records are paged, retention-aware and rebuilt only when necessary. Large streams/script bodies are not unbounded JSON columns.
-
-Use existing Tokio runtime, bounded channels and a small worker pool per workload class. Prioritize native permission/reply and control completion over optional Git scans, user scripts and observer rendering. Separate CPU-heavy parsing/process enumeration onto bounded blocking workers. Never hold Store transactions while waiting for Git, a script, a native callback or GitHub.
-
-Configuration declares per-host/project/definition concurrency and fairness. Raising a soft tuning value is possible within granted capacity; protocol byte caps, owner exclusion and external-effect safety remain hard. A slow or malformed source degrades its projection, not the entire swarm.
-
-## 12. Required recovery behavior
-
-| Failure | Required behavior |
-|---|---|
-| Manager/UI exits | Host monitoring, timers and authorized automation continue |
-| Native stream disconnect | Mark source stale; reconcile read-only; no service restart or model duplicate |
-| Reboot with queued job | Recheck grant/target; start once if still eligible |
-| Reboot after possible effect | Unknown + readback; no blind re-execution |
-| Webhook duplicate/out of order | Deduplicate; reconcile exact source object; no repeated audit |
-| Hook queue overload | Bounded gap/loss report; observational hook does not wedge native work |
-| Script malformed result/timeout | Retain partial evidence and owned-process disposition; isolate this invocation |
-| Role revoked or Task superseded | Stop new admissions under stale authority; preserve historical results |
-| Rule feedback loop | Suppress duplicate descendant cause, pause affected rule, emit one incident |
-| Goal has no progress | Wait/attention with exact missing evidence; no repeated identical prompts |
-| Viewer too slow | Lag/resync, not native backpressure |
-| Disk pressure | Reduce optional stream retention; never delete active/referenced evidence to fake success |
-
-The system is successful when it makes current work observable and useful automation cheap, without turning hooks, scripts, roles or cron into a second uncontrolled swarm.
+Useful autonomy is the goal: expensive effects are precisely authorized, ordinary eligible work is automatic, and one bad source, unavailable model or publication policy does not freeze unrelated tasks.

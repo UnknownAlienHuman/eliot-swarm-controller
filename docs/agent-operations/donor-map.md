@@ -1,181 +1,157 @@
-# Donor Map: Agent Operations
+# Donor Map — Rust Agent Operations and GitHub Delivery
 
-Research date: 2026-10-03. Source baseline: `35e499ae73b622d873c44873f6993ee3fcbea87b`.
+Revision 2 · research date 2026-10-03.
 
-`CODE` means inspected implementation, `DOC` official documentation, `OWNER_AUDIT` supplied operating evidence, `DESIGN` our proposed adaptation. No source review here establishes live ELIOT qualification. A moving documentation page is not a pin of an installed binary. Record exact package/source versions and lockfile checks when implementation starts.
+`CODE` identifies inspected source, `DOC` official documentation, `OWNER_AUDIT` supplied operating evidence, and `DESIGN` ELIOT's adaptation. Source review does not establish compiled or live qualification. Observed commits, blob IDs and dates below identify evidence; they are not installation requirements or dependency pins. No donor's implementation language overrides the owner's requirement that ELIOT's internal systems are Rust.
 
-## 1. Reuse ELIOT before importing another controller
+## 1. Reuse ELIOT's existing authority
 
-All links in this section are pinned to the inspected main commit.
+Inspected main: `35e499ae73b622d873c44873f6993ee3fcbea87b`. Use the current implementation when work starts; these source references explain this review's findings rather than freezing future main.
 
-| Unit | Inspected property | Reuse decision |
+| Existing unit | Source finding | Integration decision |
 |---|---|---|
-| [scheduler.rs](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/35e499ae73b622d873c44873f6993ee3fcbea87b/src/scheduler.rs) | `latest_due_slot`, `next_due_at_ms`, `run`; one-shot/interval, monotonic waiting, closed CheckRun action | Extend calendar/action types and registry indexing; do not install a second scheduler |
-| [schedules.md](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/35e499ae73b622d873c44873f6993ee3fcbea87b/docs/schedules.md) | Due-slot admission, receipts and schedule cursor share one transaction; unknown previous run prevents overlap | Preserve old occurrence semantics through migration |
-| [MCP subscriptions](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/35e499ae73b622d873c44873f6993ee3fcbea87b/src/mcp/subscriptions.rs) | Bounded queues and explicit lag; per-subscription 250-ms polling over committed facts | Preserve API/recovery; share polling/projector and add a separate live-content path |
-| [Command native mod](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/35e499ae73b622d873c44873f6993ee3fcbea87b/modules/command/mod/eliot-command.ts) | Native `cmd.on` event hooks; queue admission is not application; partial text/thinking events excluded | Extend this adapter, not another Command launcher. Bound synchronous journal writes and repeated whole-inbox reads; report telemetry loss |
-| [Muse observation helpers](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/35e499ae73b622d873c44873f6993ee3fcbea87b/modules/muse/observe.mjs) | Pure command-ID/death/durability facts; GapFiller deliberately not used on compact path | Keep native SDK and explicit unfilled gaps. Do not claim missing recovery is inherited automatically |
-| [Claude bridge contract](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/35e499ae73b622d873c44873f6993ee3fcbea87b/modules/claude/README.md) | Pinned SDK 0.3.287, compact child/tool/result mapping; token partials counted, not retained as transcript | Wire supported SDK hooks and separate live streams within this bridge. SDK is commercially licensed, not a permissive code donor |
-| [Forge publication](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/35e499ae73b622d873c44873f6993ee3fcbea87b/docs/forge-publication.md) | Exact accepted candidate, process-tree ownership, readback-only unknown recovery, documented non-atomic preflight | Reuse for push. Merge needs a new exact policy/operation, not a PowerShell shortcut |
-| [Cargo manifest](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/35e499ae73b622d873c44873f6993ee3fcbea87b/Cargo.toml) | Rust MSRV 1.89, Tokio, rusqlite, RMCP 3.5, reqwest, existing atlas-redact | Prefer current ecosystem and preserve immutable donor packages. No dependency change in this PR |
+| [`src/store/submissions.rs`](../../src/store/submissions.rs) | `reserve` returns queued admission; `finish` records applied `task.submission`; `request_changes` requires GM/operator and creates mail, not native input | Start review from applied submission. Add narrow delegated disposition and separate authorized repair dispatch through the same guarded transitions |
+| [`src/policy.rs`](../../src/policy.rs) | Accepted edition and source digest are compiled; the projection recognizes only the current edition | Preserve historical Attempt evidence while adding authorized configurable workflow policy. A renamed role or edited document does not bypass the existing gate |
+| [`src/scheduler.rs`](../../src/scheduler.rs), [`src/store/schedules.rs`](../../src/store/schedules.rs) | One-shot/interval CheckRun scheduling and transactional receipts | Extend the same Rust scheduler; do not add another scheduler database |
+| [`src/mcp/subscriptions.rs`](../../src/mcp/subscriptions.rs) | Bounded committed-fact polling, lag and resync; not provider token streaming | Preserve the contract, centralize source/projector work and add separate live content |
+| [`docs/forge-publication.md`](../forge-publication.md) | Accepted-candidate non-force publication, owned process cleanup, readback after uncertain writes; preflight is not atomic expected-old CAS | Reuse exact-candidate/effect handling. Review-branch upload and PR merge need explicit additional contracts |
+| [`src/runtime/owner.rs`](../../src/runtime/owner.rs), [`src/platform/process_group.rs`](../../src/platform/process_group.rs) | Recorded lifecycle/process ownership boundaries | Reuse ownership, not process-name heuristics; source-specific compatibility still requires verification |
+| Existing [`modules`](../../modules) and module contract | Some owned adapters are Python/JS/TS and source-specific SDK bindings | Port owned control/translation to Rust. These implementations are migration evidence, not permitted internal scripting shortcuts |
 
-A useful implementation distinction: the current universal module contract says native interpretations belong in adapters. Telemetry/automation core must not parse private Muse/Codex/OpenCode wire schemas in Store.
+The current source prevents automatic reviewer return unless the authorization path is extended. The design fixes that actual obstacle rather than only adding reviewer tools to MCP.
 
-## 2. Ready Rust building blocks
+## 2. Rust units to take whole
 
-### 2.1 Croner: adopt a complete expression evaluator, not its own scheduler
+Do not select an obsolete release merely to retain an old toolchain floor. Inspect current compatibility and update the Rust integration/toolchain policy explicitly when needed. Do not silently upgrade a user's installation or download dependencies at runtime.
 
-**DOC:** [Croner 3.0.1 API](https://docs.rs/croner/3.0.1/croner/) and [versioned crate documentation](https://docs.rs/crate/croner/3.0.1).
+| Unit | Source | Take | Keep in ELIOT |
+|---|---|---|---|
+| **Octocrab** | [Rust client documentation](https://docs.rs/octocrab/latest/octocrab/) | Complete GitHub client behind one narrow Rust GitHub port; typed endpoint handlers and controlled lower-level requests where needed | Credentials, permission checks, rate coordination, durable intent and reconciliation |
+| **Croner** | [Current crate API](https://docs.rs/croner/latest/croner/) | Complete expression evaluator with a selected supported timezone integration | Due occurrence identity, missed-run policy, overlap, action admission and persistence |
+| **sysinfo** | [Current crate API](https://docs.rs/sysinfo/latest/sysinfo/) | One shared selective metrics collector | Process ownership and decisions; metrics are observations, not permission to kill |
+| **notify** | [Current crate API](https://docs.rs/notify/latest/notify/) | Complete platform file watcher and supported fallback | Debounced invalidation, exact Git/config reads and source-health reporting |
+| Existing Tokio/rusqlite/RMCP/serde stack | Repository manifest and current library documentation | Existing runtime, Store, typed data and protocol building blocks | One control plane, not separate script/cron/chat services |
 
-The reviewed API supplies parse plus next/previous occurrence calculations and timezone-aware scheduling. Its fixed-time versus wildcard DST rules differ; that matters for a supposedly simple daily job. Use the whole library with its documented grammar and preview actual occurrences. ELIOT owns persistence, dedupe, authority and overlap.
+Octocrab is a Rust community client, not GitHub's authorization or job authority. Keep one GitHub request/rate boundary rather than a client per viewer or two competing GitHub loops. A missing typed endpoint can use that same client's narrow lower-level transport; it is not a reason to introduce Python or shell `gh` orchestration.
 
-The discovery result also advertised [Croner 4.0.0](https://docs.rs/crate/croner/latest), including a Jiff backend. Version-specific 4.0.0 API/source pages were not retrievable in this review. Therefore 4.0.0 is not an approved implementation pin. Initial candidate is 3.0.1 with one compatible timezone backend; a later upgrade needs an explicit comparison, not silent use of `latest`.
+`sysinfo` supports reusing `System` and selective refresh; some metrics require observations across time and some platforms are unsupported. Detect unsupported coverage rather than reporting empty healthy state. `notify` documents backend/filesystem limitations: events are hints, not an exactly-once change ledger.
 
-**DESIGN:** select one calendar ecosystem; do not bring both Chrono and Jiff merely for flexibility. Freeze exact dependencies/MSRV/license and DST behavior in the implementation PR. Do not fork or rewrite Croner's parser.
+**DOC:** [Cargo dependency requirements](https://doc.rust-lang.org/cargo/reference/specifying-dependencies.html). Use ordinary compatible requirements rather than mandatory exact release equality or commit dependencies. Build-resolution records and observed software versions are diagnostic evidence, not a policy forcing future work onto the same old release. Unchecked wildcard downloads are not the alternative.
 
-### 2.2 sysinfo: adopt a compatible sensor, not lifecycle authority
+## 3. Rust orchestration donor: OpenCnid/Symphony
 
-**DOC:** [sysinfo 0.39.6/current](https://docs.rs/sysinfo/latest/sysinfo/) requires Rust 1.95; [0.37.2](https://docs.rs/sysinfo/0.37.2/sysinfo/) states MSRV 1.88.
+This is the independent Rust implementation at [OpenCnid/symphony](https://github.com/OpenCnid/symphony), not a claim that OpenAI's reference implementation is Rust. The following files were inspected on 2026-10-03; source blob IDs identify what was read, not what ELIOT must install.
 
-That is a real incompatibility with ELIOT's declared 1.89 MSRV. Use 0.37.2 as the initial compatibility candidate unless the project explicitly changes toolchain policy. Keep a single long-lived `System`, refresh only needed fields and account for CPU sampling intervals. Unsupported platforms must not report healthy empty data.
+| Inspected unit | Concrete useful behavior | Do not inherit blindly |
+|---|---|---|
+| [`src/watch.rs`](https://github.com/OpenCnid/symphony/blob/main/src/watch.rs), blob `4a41dbf7c25cda53a61e9c40e4623e3b5e302664` | Watches the parent directory, tolerates atomic replacement, debounces and notifies the orchestrator to reread/validate | Callback ignores watcher errors; ELIOT must expose source health/gaps rather than silently lose monitoring |
+| [`src/workflow.rs`](https://github.com/OpenCnid/symphony/blob/main/src/workflow.rs), blob `c968e53123f311720bd23a34d0822f95337270b1` | Keeps parsed configuration, prompt and source location distinct; resolves relative paths against the source | The inspected load path uses an unbounded file read. Keep ELIOT's bounded typed configuration; do not import a new YAML/prompt authority unnecessarily |
+| [`src/agent/claude_code.rs`](https://github.com/OpenCnid/symphony/blob/main/src/agent/claude_code.rs), blob `fa76bcffe0eeda62a6f270491c164978dbfda5b4` | Rust Tokio process/stdio path builds Claude stream-JSON argv and validates workspace before launch | A requested session ID is not observed native identity; proceeding after optional tool-bridge failure cannot satisfy a required reporting capability; process-root exit is not Windows descendant cleanup |
 
-**DESIGN:** metrics augment recorded OS ownership. They must not decide that an arbitrary PID/name is safe to kill. Verify transitive MSRV, platform support and dependency advisories during integration; a versioned doc is not a compiled or security qualification.
+**DESIGN:** use these as focused Rust transport/configuration patterns, not another orchestrator or a finished GitHub delivery solution. Only the named portions were inspected; no fleet benchmark, installed Windows run or whole-project security review was performed. Any actual code reuse still requires complete unit/license/notices review and ELIOT-specific lifecycle qualification.
 
-### 2.3 notify: adopt whole file-event library, treat events as hints
+## 4. Paseo: convenient profiles and bounded routing
 
-**DOC:** [notify 8.2.0](https://docs.rs/notify/latest/notify/).
+**DOC, source inspected:**
 
-The library documents platform/backend gaps, editor-dependent event shapes, network-filesystem issues and event loss on large watched trees. It offers polling fallback.
+- [`public-docs/agent-profiles.md`](https://github.com/getpaseo/paseo/blob/5375f43a051c724d080e41efd73e84ccb6082ff5/public-docs/agent-profiles.md).
+- [`public-docs/hub/workflows.md`](https://github.com/getpaseo/paseo/blob/5375f43a051c724d080e41efd73e84ccb6082ff5/public-docs/hub/workflows.md).
 
-**DESIGN:** use a shared watcher to invalidate Git/workspace projections, followed by bounded exact reads. Do not derive a definitive commit or absent file from one event. Do not watch every file separately per agent. Exclude build/artifact directories where possible, preserve overflow evidence and qualify linked worktrees/Windows paths.
+The profile document combines provider, model, mode, thinking/features and `When to use`; changing a profile affects future selections, not launched agents. The workflow document restricts dynamic authority selection to finite complete named configurations rather than merging arbitrary provider/environment fragments. Capability declarations and the task prompt have separate jobs.
 
-### 2.4 Why not tokio-cron-scheduler as the primary runtime?
+**DESIGN:** adopt that UX in Rust as runtime profiles and explicit candidate tuples. Expose selection reasons and fallbacks through the catalogue. Keep native option values native. Use ELIOT's existing Task/Attempt and execution grant, not Paseo's workflow runtime or TypeScript server. The inspected documentation does not prove ELIOT compatibility or all features in an installed Paseo release.
 
-**DOC:** [tokio-cron-scheduler 0.15.1](https://docs.rs/crate/tokio-cron-scheduler/0.15.1).
+## 5. Windmill: active definitions instead of permanent script pins
 
-It is a credible async scheduler, with optional external persistence. ELIOT already has slot admission and Operation receipts in SQLite. Importing another scheduler/queue authority would require proving equivalence across two persistence paths. Choose a parser/evaluator dependency and retain ELIOT's owner instead.
+**DOC:** [Draft and deploy](https://www.windmill.dev/docs/core_concepts/draft_and_deploy), [Roles and permissions](https://www.windmill.dev/docs/core_concepts/roles_and_permissions).
 
-## 3. Native hook and stream sources
+Useful distinctions: editing a draft does not modify the deployed runnable; deployment conflict detection is explicit; a script path refers to its latest deployed content while previous execution content remains identifiable. Service accounts and scoped runnable permissions separate automation identity from interactive users.
 
-### 3.1 Claude Code / Agent SDK
+**DESIGN:** `get -> preview -> apply`, one active project configuration and named active scripts. Each new invocation resolves the active definition and records what it actually used; an existing invocation never changes underneath the process. Agents may author/configure inside a standing grant, with no Root approval round for every eligible edit. Permissions remain server-side: a limited UI does not stop API access.
 
-**DOC:** [official hooks reference](https://code.claude.com/docs/en/hooks).
+Take the data/UX pattern, not Windmill's server, queues, database or non-Rust extension machinery. Its product deployment-history guarantee is not evidence that arbitrary external effects execute exactly once.
 
-Native before/after/lifecycle events provide suitable integration points. Async hooks cannot veto completed work; the current docs also state that background hook firings are not deduplicated and have lifecycle/timeout caveats. Stop hooks can cause continuation, so they are not neutral observation callbacks.
+## 6. Temporal and Goose: narrower reusable ideas
 
-**DESIGN:** adapt hooks through the already pinned SDK/bridge; verify actual installed version and callback options. Use a small fast ingress, with ELIOT owning long jobs. Never run a full audit after every edit, put heavy work in an inline pre-tool hook or implement Goal by an unbounded Stop hook. Command examples from documentation are examples, not hardened script sandboxes.
+**DOC:** [Temporal schedules](https://docs.temporal.io/schedule). Borrow the distinction between schedule and execution, pausing future starts and cancelling active work, overlap and catch-up. Keep ELIOT's latest-only default and explicit bounded alternatives. Do not import a Temporal cluster for local cron or call a durable timer exactly-once publication.
 
-### 3.2 OpenAI Codex
+**CODE, prior source pass:** [Goose scheduler/common.rs](https://github.com/aaif-goose/goose/blob/591edd47cf2cfea4957d720c607cf2a4def8673d/crates/goose/src/scheduler/common.rs). `ValidatedScheduleRecipe`, bounded regular-file handling and retained `recipe_base_dir` are useful for captured external-script bundles. Do not import the separate `schedule.json` or agent scheduler. Entry-point bytes alone do not capture mutable imported support files.
 
-**DOC:** [configuration reference](https://developers.openai.com/codex/config-reference/) and [app-server protocol](https://developers.openai.com/codex/app-server/).
+The source commit is evidence of the reviewed unit, not an instruction to vendor or install that commit.
 
-The current configuration reference documents local lifecycle hooks and separately notes cloud-orchestration restrictions. Command/MCP handlers and async semantics must be checked on the installed client; a local hook declaration is not evidence it runs in cloud Work orchestration.
+## 7. Native interfaces usable from Rust
 
-The app-server documents `item/agentMessage/delta`, readable `item/reasoning/summaryTextDelta` and, only when supported by the model, `item/reasoning/textDelta`. Use the documented native item/turn IDs, not transcript-string heuristics. Not every model supplies every reasoning class.
+**DOC:**
 
-**DESIGN:** keep the existing official SDK/protocol bridge. Add observability without taking ownership of a shared app-server or exposing opaque reasoning state. Protect exact parent/child attribution and gap recovery. Hook success is not a replacement for final durable execution evidence.
+- [Codex app-server](https://developers.openai.com/codex/app-server/).
+- [Claude CLI reference](https://code.claude.com/docs/en/cli-reference) and [hooks](https://code.claude.com/docs/en/hooks).
+- [Gemini CLI hooks](https://geminicli.com/docs/hooks/reference/).
+- [OpenCode plugin documentation](https://opencode.ai/docs/plugins/).
 
-### 3.3 Gemini CLI
+Codex's documented protocol is a Rust-client integration surface; its native IDs and supported discovery/events are preferable to terminal scraping. Claude documents structured input/output, partial/subagent forwarding and native hook-related facilities; a Rust process/codec adapter can use those documented boundaries without owning a Node SDK bridge. Individual installed capabilities still need readback and qualification; absence of a flag from help output alone is not conclusive capability discovery.
 
-**DOC:** [hooks reference](https://geminicli.com/docs/hooks/reference/) and [hook overview](https://geminicli.com/docs/hooks/).
+Async hooks do not veto a completed effect. Completion and Stop-style callbacks may have continuation semantics and must not become a hidden re-prompt loop. Gemini CLI support does not imply Gemini Spark/Antigravity support. Public OpenCode documentation must be matched to the actual installed V2 surface before mapping fields.
 
-Hook stdin/stdout have a structured JSON contract; event-specific exit/output behavior matters. A post-tool decision cannot undo an already performed side effect. After-agent feedback may cause another turn and therefore needs continuation-loop control.
+When a function exists only in a vendor-specific non-Rust plugin API with no suitable external interface, report the Rust integration gap. Do not ship an undisclosed JS internal subsystem, invent parity or claim a commercial SDK can simply be translated/copied. Native third-party binaries themselves are outside the ELIOT-owned language boundary.
 
-**DESIGN:** implement a Gemini CLI adapter only for an installed CLI route that is actually in scope. Do not attribute these APIs to Gemini Spark or Antigravity by name similarity. Keep logs off protocol stdout and preserve native failure semantics.
+## 8. GitHub API details that change the design
 
-### 3.4 OpenCode and Command
+### 8.1 Work identity, webhook delivery and request pacing
 
-**DOC:** [OpenCode plugins](https://opencode.ai/docs/plugins/) exposes event callbacks and before/after tool extension points.
+**DOC:** [Webhook best practices](https://docs.github.com/en/webhooks/using-webhooks/best-practices-for-using-webhooks), [signature validation](https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries), [REST best practices](https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api).
 
-**CODE:** ELIOT's [Command mod](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/35e499ae73b622d873c44873f6993ee3fcbea87b/modules/command/mod/eliot-command.ts) explicitly uses observational ModApi callbacks.
+Verify raw-body HMAC and repository/installation context, durably adopt the delivery, then process it. Delivery redirection/replay is not new work. Use conditional/paged reconciliation and actual rate-limit/reset evidence. The webhook is not a trusted source of arbitrary executable instructions, and event header strings alone do not grant authority.
 
-**DESIGN:** use official plugin APIs, not terminal scraping. Reconcile the public OpenCode plugin docs with the installed V2 service/source bundle before selecting types. These are separate product/version contracts. Command's `queueMessage` returning void is only local admission; it must not become `model_consumed=true`.
+**DESIGN:** one stable Task origin per external item; source changes create revisions. One shared Rust GitHub port and pending-effect projection prevent per-agent polling and comment spam.
 
-### 3.5 Every other installed module
+### 8.2 Audited state and Checks
 
-Muse, Zed, Antigravity and future modules must publish a hook/stream capability matrix. Supported callbacks are wired through their actual SDK/plugin surface; batch-only adapters report process-level coverage. Do not promise all tool hooks on every runtime, and do not make optional hook absence stop unrelated work.
+**DOC:** [Check runs](https://docs.github.com/en/rest/checks/runs), [protected branches](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches).
 
-## 4. Automation product donors
+Checks address commits; annotation updates append. Required GitHub checks can accept neutral/skipped conclusions, so ELIOT must not represent an inconclusive audit that way. `external_id` is useful correlation, not a guaranteed deduplication key. GitHub alone can set its stale conclusion.
 
-### 4.1 Temporal: borrow scheduling semantics
+**DESIGN:** retain exact-candidate review evidence internally; labels are display only. Read back uncertain check creation/annotation batches. Report coverage and permissions by token/installation, not by assuming every token has identical capabilities. Several internal auditors sharing an App are not several independent GitHub user approvals.
 
-**DOC:** [Schedule concepts and policies](https://docs.temporal.io/schedule).
+### 8.3 Merge and integrated verification
 
-The useful distinctions are schedule identity versus execution identity; pause of future starts versus pause/cancel of running work; overlap policy; catch-up window; explicit backfill; action limits. These prevent a timer from becoming an unbounded retry storm.
+**DOC:** [Pull request REST endpoints](https://docs.github.com/en/rest/pulls/pulls), [merge queue](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue).
 
-**DESIGN:** retain ELIOT's latest-only default, add bounded explicit alternatives and separate manual runs. Do not add a Temporal cluster/worker runtime to this local host merely to obtain cron. Temporal's `AllowAll`/termination options are not ELIOT defaults. Durable scheduling does not confer exactly-once arbitrary effects.
+The merge API's `sha` guards the PR head, not arbitrary base movement. The documented async path returns a request UUID; enqueued is not merged. Async results expire after their documented retention period, so a missing old result needs PR/ref readback, not another merge. Stacked merges may include other PRs.
 
-### 4.2 Windmill: borrow script/trigger/permission UX, not the whole control plane
+GitHub merge queues are restricted by repository ownership/plan and require merge-group checks. They are not a prerequisite for ELIOT's queue or publication path. Current ELIOT is user-owned; qualify actual repository capabilities rather than assume a native queue exists.
 
-**DOC:** [Schedules](https://www.windmill.dev/docs/core_concepts/scheduling), [roles and permissions](https://www.windmill.dev/docs/core_concepts/roles_and_permissions), [script settings](https://www.windmill.dev/docs/script_editor/settings), [draft/deploy](https://www.windmill.dev/docs/core_concepts/draft_and_deploy), [MCP](https://www.windmill.dev/docs/core_concepts/mcp), [concurrency](https://www.windmill.dev/docs/core_concepts/concurrency_limits).
+**DESIGN:** use one Rust publication queue; verify the actual integration candidate through the selected qualified path. A local mutex cannot exclude external GitHub writers. Never bypass repository rules or turn a manager confirmation into a nonexistent base-CAS guarantee.
 
-Useful pieces: one runnable used by manual/scheduled/event triggers; input schema and run history; draft separated from deployed definition; scoped resources and execution identity; exact jobs available through MCP. Documentation warns that UI visibility is not a permission boundary and secret-read access is real access.
+### 8.4 Workflow triggering
 
-**DESIGN:** scripts are named/versioned actions with the same ELIOT invocation path. Pin the script version in each schedule/run rather than silently following an edited deployment. Preserve author/activator/runner identities and validate effective authority at execution. Some concurrency controls are paid-edition features, so do not describe all Windmill functionality as freely vendorable. Full adoption would bring another product/queue/permission model and is not proposed.
+**DOC:** [Triggering workflows](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow).
 
-### 4.3 Goose: concrete Rust recipe-capture unit
+A push using `GITHUB_TOKEN` and a push using an App token do not have the same downstream workflow behavior. The current documentation also has event-specific exceptions; do not generalize to 'every token-created event is ignored'.
 
-**CODE:** inspected commit `591edd47cf2cfea4957d720c607cf2a4def8673d`:
+**DESIGN:** determine required CI triggers at setup and make missing expected checks visible. Do not execute untrusted PR code with privileged workflow credentials merely to work around a missing status.
 
-- [scheduler/common.rs](https://github.com/aaif-goose/goose/blob/591edd47cf2cfea4957d720c607cf2a4def8673d/crates/goose/src/scheduler/common.rs)
-- [scheduler_trait.rs](https://github.com/aaif-goose/goose/blob/591edd47cf2cfea4957d720c607cf2a4def8673d/crates/goose/src/scheduler_trait.rs)
+## 9. Owner evidence: failure cases, not copied policy
 
-`ValidatedScheduleRecipe`, bounded regular-file reads and retained `recipe_base_dir` are good implementation references. Relative dependency resolution must not unexpectedly move when content is copied to scheduler storage.
+The supplied MANAGER-BRIEF is operational history with multiple revisions; current user instructions and repository policy govern this program. The supplied `Manager -> Orchestrator -> Executors` audit is labelled owner evidence, not a fresh measurement of each upstream donor.
 
-**DESIGN:** capture one immutable script bundle plus manifest/environment identity. Do not import Goose's session scheduler or its separate `schedule.json`. A copied entrypoint alone does not pin mutable imported files; ELIOT must capture declared dependencies too. The inspected write helper is not a substitute for ELIOT's durable artifact publication contract.
-
-### 4.4 Paseo, AoE, CCCC and Claw
-
-**OWNER_AUDIT:** supplied `Manager → Orchestrator → Executors`, Revision 4, 2026-10-02. Its ratings and release inventory are historical, not independently renewed by this PR.
-
-Use its specific patterns as research inputs:
-
-- Paseo: daemon/client separation and configured workspace scripts/services.
-- Agent of Empires: manifest/grant fingerprints and reapproval when privileges expand.
-- CCCC: exact addressed delivery and separation of stored/read/replied facts.
-- Claw: independent acceptance contract and evidence, not self-reported completion.
-
-Do not copy these whole controllers, inherit their authorization defaults or claim their workflow replay makes push/merge idempotent. ELIOT already has the corresponding durable ownership layers. Any later direct code reuse requires current source/license/version review of the exact unit.
-
-## 5. GitHub and Git are event sources, not command text
-
-**DOC:** [webhook best practices](https://docs.github.com/en/webhooks/using-webhooks/best-practices-for-using-webhooks), [signature validation](https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries), [Git hooks](https://git-scm.com/docs/githooks).
-
-GitHub requires timely responses and recommends asynchronous processing. `X-GitHub-Delivery` survives requested redelivery. Validate HMAC-SHA256 against raw bytes before adopting a delivery; authenticate event/action and repository as well. Use durable intake and bounded reconciliation rather than assuming every event arrives once and in order.
-
-**DESIGN:** local commit hooks nominate an OID; ELIOT verifies the exact repository/worktree/ref and deduplicates the resulting audit action. Branch names, human comments and commit author strings do not confer Task ownership. Git hooks are optional observations and must not replace Git readback or override the protected forge runner's existing hook suppression.
-
-## 6. Owner operating evidence translated into safeguards
-
-The supplied MANAGER-BRIEF is operating history, not a new policy source. The current repository's Owner Decisions govern implementation cadence and authority.
-
-| Recorded incident | Required design response |
+| Recorded failure | Contract response |
 |---|---|
-| Harness cron never fired during a long manager session | Timers and due receipts belong to the long-lived ELIOT host |
-| Native CLI health checks restarted a busy shared service | Persistent native client/read-only reconciliation; never launch that CLI for monitoring |
-| Shared Codex events counted the same children under every manager | Exact native ancestry and binding attribution |
-| Raw command deltas duplicated final output and rapidly grew logs | Separate live presentation from retained terminal/evidence records |
-| Parent idle/finished while children or native Goal continued | Keep family/continuation ownership separate from wrapper exit |
-| Reminder text replaced the manager's actual work | Notice is not a Task; context injection is typed and bounded |
-| Busy hook spool blocked compaction | Optional observation is not an inline liveness gate |
-| Cleanup deleted live Windows transcripts based on mtime | Retain by actual active ownership/reference, not mtime alone |
-| Large process fleets included orphan shell/MCP/fsmonitor children | Reuse owned process trees and shared sensors; no poller/process per observer |
-| Old submission feedback modified a newer branch iteration | Every audit/action names exact Task revision, Attempt, candidate and source OID |
+| Several lines repeatedly selected the same Issue from an old queue | Stable origin, fresh readiness and atomic ownership reservation |
+| A submitted result was missed because it used another marker filename | Applied typed submission, not arbitrary marker-file conventions |
+| Late HOLD or review of A overwrote new submission B | Exact submission/candidate guards and historical late result |
+| Corrected code remained blocked by an unchanged checklist | Bind findings/revalidation to relevant source and evidence, not checklist bytes alone |
+| Comments/mentions triggered coordination-only model ping-pong | Typed workflow disposition; peer text cannot dispatch work |
+| Parent ended while native children or Goal continued | One continuation/lifecycle owner; terminal wrapper is insufficient |
+| Raw deltas duplicated final output and grew logs rapidly | Bounded live stream separate from terminal evidence |
+| A malformed model-authored line stopped every queue | Validate and isolate one source/configuration error; retain last valid state |
+| An implicit CLI health probe restarted a shared service | Direct qualified read-only native protocol, not health-check subprocesses |
+| Labels said complete while audit evidence disagreed | Labels are projections; exact review/acceptance facts decide |
+| Mixed Issues on one moving branch invalidated review | One manager worktree and one in-flight product candidate |
 
-These are negative scenarios to qualify, not measured defects in the proposed new code.
+Do not import historical fixed version, compulsory time-limit or additional worktree recommendations from donor audits. They are overridden where the current product contract differs.
 
-## 7. Reuse decision summary
+## 10. Reuse boundaries
 
-| Component | Decision |
-|---|---|
-| Existing ELIOT RuntimePort/SDKs/Store/CheckRunner/forge/atlas-redact | Reuse and extend |
-| Croner | Whole parser/evaluator dependency; reviewed version and one timezone backend |
-| sysinfo | Whole compatible metrics library; start with MSRV-compatible candidate, not unreviewed latest |
-| notify | Whole sensor library; reconciliation remains ELIOT-owned |
-| Tokio/rusqlite/RMCP | Existing stack; no parallel framework |
-| Temporal/Windmill/Goose scheduling engines | Patterns/source references only, no replacement authority |
-| Native provider hooks | Official callback adapters with installed capability evidence |
-| Arbitrary hook shell snippets/global monkey patches | Do not adopt |
-| Ready distributed brokers/full workflow engines | Not needed for the local first implementation |
+Whole libraries: compatible maintained Rust GitHub client, cron evaluator, metrics and file watcher. Existing ELIOT Store/Operations/process/artifact foundations remain owners. Rust donor implementation units can be reused after full unit/license review; non-Rust products contribute patterns only. No copied code or dependency change occurs in this documentation PR.
 
-No dependency or license decision is finalized by this docs-only PR. Implementation records the exact resolved artifact, license, transitive dependencies, supported MSRV and platform checks before adoption.
+Validation still needed: real native capabilities, Windows process ownership, runtime updates, model discovery and billing attribution, webhook/Checks/merge behavior with the selected installation, full review-repair-publication flow and load. No current donor source proves the entire ELIOT combination already works.

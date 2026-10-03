@@ -39,6 +39,8 @@ from controller import Checkpoint, ControllerEngine, MODULE_ARTIFACT_ID  # noqa:
 
 FIXTURE = HERE / "fixtures" / "recorded_session.json"
 CONTROLLER_FIXTURE = HERE / "fixtures" / "controller_session.json"
+FIXTURE_WORKSPACE = str(Path(tempfile.gettempdir()) / "eliot-codex-fixture-workspace")
+OTHER_FIXTURE_WORKSPACE = str(Path(tempfile.gettempdir()) / "eliot-codex-fixture-other-workspace")
 FORBIDDEN = {
     "thread/resume",
     "thread/start",
@@ -53,6 +55,22 @@ FORBIDDEN = {
 
 def _script() -> dict:
     return json.loads(FIXTURE.read_text(encoding="utf-8"))
+
+
+def _controller_script() -> dict:
+    """Use a host-native absolute temp path in the cross-platform fixture."""
+    script = json.loads(CONTROLLER_FIXTURE.read_text(encoding="utf-8"))
+
+    def replace_workspace(value):
+        if isinstance(value, dict):
+            return {key: replace_workspace(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [replace_workspace(item) for item in value]
+        if value == r"C:\Fixture\workspace":
+            return FIXTURE_WORKSPACE
+        return value
+
+    return replace_workspace(script)
 
 
 def _client():
@@ -304,7 +322,7 @@ class BridgeFixtureTests(unittest.TestCase):
 
     def test_cli_end_to_end_against_fixture(self):
         proc = subprocess.run(
-            [sys.executable, str(HERE / "bridge.py"), "--fixture", str(FIXTURE), "describe"],
+            [sys.executable, "-B", str(HERE / "bridge.py"), "--fixture", str(FIXTURE), "describe"],
             capture_output=True,
             text=True,
             timeout=60,
@@ -315,7 +333,7 @@ class BridgeFixtureTests(unittest.TestCase):
         self.assertEqual(out["executor"]["server_version"], "0.153.4")
 
     def test_controller_exact_model_and_dual_native_identity_readback(self):
-        script = json.loads(CONTROLLER_FIXTURE.read_text(encoding="utf-8"))
+        script = _controller_script()
         script["notifications"] = {
             "turn/start": [
                 {
@@ -346,7 +364,7 @@ class BridgeFixtureTests(unittest.TestCase):
                     "runtime": "codex",
                     "module_artifact_id": MODULE_ARTIFACT_ID,
                     "native_options": {
-                        "workspaceRoot": "C:\\Fixture\\workspace",
+                        "workspaceRoot": FIXTURE_WORKSPACE,
                         "modelProvider": "fixture-provider",
                         "model": "fixture-model",
                     },
@@ -363,21 +381,21 @@ class BridgeFixtureTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     opened["details"]["requested_workspace_root"],
-                    "C:\\Fixture\\workspace",
+                    FIXTURE_WORKSPACE,
                 )
                 self.assertEqual(
                     opened["details"]["observed_workspace_root"],
-                    "C:\\Fixture\\workspace",
+                    FIXTURE_WORKSPACE,
                 )
                 self.assertEqual(opened["details"]["workspace_status"], "workspace_exact")
                 observed_thread = engine.observation()["native"]["thread"]
                 self.assertEqual(
-                    observed_thread["requested_workspace_root"], "C:\\Fixture\\workspace"
+                    observed_thread["requested_workspace_root"], FIXTURE_WORKSPACE
                 )
                 self.assertEqual(
-                    observed_thread["observed_workspace_root"], "C:\\Fixture\\workspace"
+                    observed_thread["observed_workspace_root"], FIXTURE_WORKSPACE
                 )
-                self.assertEqual(observed_thread["cwd"], "C:\\Fixture\\workspace")
+                self.assertEqual(observed_thread["cwd"], FIXTURE_WORKSPACE)
                 self.assertNotIn("workspace_root", observed_thread)
                 duplicate_open = engine.handle(
                     {"operation_id": "operation-fixture-open-again", "method": "agent.open", "route": route}
@@ -420,6 +438,7 @@ class BridgeFixtureTests(unittest.TestCase):
                 thread_start = next(m for m in transport.sent if m.get("method") == "thread/start")
                 self.assertEqual(thread_start["params"]["modelProvider"], "fixture-provider")
                 self.assertEqual(thread_start["params"]["model"], "fixture-model")
+                self.assertEqual(thread_start["params"]["cwd"], FIXTURE_WORKSPACE)
                 turn_start = next(m for m in transport.sent if m.get("method") == "turn/start")
                 self.assertEqual(turn_start["params"]["model"], "fixture-model")
                 self.assertEqual(
@@ -479,20 +498,20 @@ class BridgeFixtureTests(unittest.TestCase):
             "runtime": "codex",
             "module_artifact_id": MODULE_ARTIFACT_ID,
             "native_options": {
-                "workspaceRoot": "C:\\Fixture\\workspace",
+                "workspaceRoot": FIXTURE_WORKSPACE,
                 "modelProvider": "fixture-provider",
                 "model": "fixture-model",
             },
         }
 
         cases = (
-            ("workspace-mismatch", "C:\\Fixture\\other", True, "workspace_mismatch"),
+            ("workspace-mismatch", OTHER_FIXTURE_WORKSPACE, True, "workspace_mismatch"),
             ("workspace-missing", None, True, "workspace_unknown"),
-            ("identity-missing", "C:\\Fixture\\workspace", False, "workspace_exact"),
+            ("identity-missing", FIXTURE_WORKSPACE, False, "workspace_exact"),
         )
         for case_name, cwd, include_id, workspace_status in cases:
             with self.subTest(case=case_name):
-                script = json.loads(CONTROLLER_FIXTURE.read_text(encoding="utf-8"))
+                script = _controller_script()
                 returned_thread = script["responses"]["thread/start"]["result"]["thread"]
                 if cwd is None:
                     returned_thread.pop("cwd", None)
@@ -530,7 +549,7 @@ class BridgeFixtureTests(unittest.TestCase):
                         self.assertEqual(opened["outcome"], "unknown")
                         self.assertEqual(
                             opened["details"]["requested_workspace_root"],
-                            "C:\\Fixture\\workspace",
+                            FIXTURE_WORKSPACE,
                         )
                         self.assertEqual(
                             opened["details"]["workspace_status"], workspace_status
@@ -543,7 +562,7 @@ class BridgeFixtureTests(unittest.TestCase):
                             observed_thread = engine.observation()["native"]["thread"]
                             self.assertEqual(
                                 observed_thread["requested_workspace_root"],
-                                "C:\\Fixture\\workspace",
+                                FIXTURE_WORKSPACE,
                             )
                             self.assertEqual(
                                 observed_thread["observed_workspace_root"], cwd
@@ -556,7 +575,7 @@ class BridgeFixtureTests(unittest.TestCase):
                             self.assertNotIn("native_root_id", opened)
                             self.assertEqual(
                                 opened["details"]["observed_workspace_root"],
-                                "C:\\Fixture\\workspace",
+                                FIXTURE_WORKSPACE,
                             )
                             # A repeated open operation has an ambiguous
                             # native effect; it must retain Unknown without
@@ -585,14 +604,14 @@ class BridgeFixtureTests(unittest.TestCase):
             "runtime": "codex",
             "module_artifact_id": MODULE_ARTIFACT_ID,
             "native_options": {
-                "workspaceRoot": "C:\\Fixture\\workspace",
+                "workspaceRoot": FIXTURE_WORKSPACE,
                 "modelProvider": "fixture-provider",
                 "model": "fixture-model",
             },
         }
 
         def make_engine(operation_id, ack_turn, history_turn, *, lose_ack=False):
-            script = json.loads(CONTROLLER_FIXTURE.read_text(encoding="utf-8"))
+            script = _controller_script()
             thread = script["responses"]["thread/read"]["result"]["thread"]
             thread["id"] = "thread-steer-root"
             thread["status"] = {"type": "active", "activeFlags": []}
@@ -642,7 +661,7 @@ class BridgeFixtureTests(unittest.TestCase):
                 effective_model_provider="fixture-provider",
                 effective_model="fixture-model",
                 effective_model_status="thread_configuration_exact",
-                workspace_root="C:\\Fixture\\workspace",
+                workspace_root=FIXTURE_WORKSPACE,
             )
             checkpoint.save()
             executor = bridge._executor_block(client, init)
@@ -747,7 +766,7 @@ class BridgeFixtureTests(unittest.TestCase):
             temp_dir.cleanup()
 
     def test_legacy_unknown_scope_allows_reconcile_but_blocks_new_dispatch(self):
-        script = json.loads(CONTROLLER_FIXTURE.read_text(encoding="utf-8"))
+        script = _controller_script()
         transport = ScriptedPeerTransport(script)
         client = SharedCodexClient(
             transport, allowed_methods=bridge.CONTROLLER_METHODS
@@ -772,9 +791,9 @@ class BridgeFixtureTests(unittest.TestCase):
                 effective_model_provider="fixture-provider",
                 effective_model="fixture-model",
                 effective_model_status="thread_configuration_exact",
-                workspace_root="C:\\Fixture\\workspace",
-                requested_workspace_root="C:\\Fixture\\workspace",
-                observed_workspace_root="C:\\Fixture\\workspace",
+                workspace_root=FIXTURE_WORKSPACE,
+                requested_workspace_root=FIXTURE_WORKSPACE,
+                observed_workspace_root=FIXTURE_WORKSPACE,
                 workspace_status="workspace_exact",
             )
             checkpoint.data["operations"][operation_id] = {
@@ -826,7 +845,7 @@ class BridgeFixtureTests(unittest.TestCase):
                     "runtime": "codex",
                     "module_artifact_id": MODULE_ARTIFACT_ID,
                     "native_options": {
-                        "workspaceRoot": "C:\\Fixture\\workspace",
+                        "workspaceRoot": FIXTURE_WORKSPACE,
                         "modelProvider": "fixture-provider",
                         "model": "fixture-model",
                     },

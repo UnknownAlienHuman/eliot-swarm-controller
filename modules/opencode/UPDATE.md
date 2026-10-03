@@ -15,6 +15,7 @@ new bindings, and how to roll back.
 | Reviewed upstream | `anomalyco/opencode@4c0d0ff478ca9150c163fb8b04a76395e4dccafe`; the exact reviewed files are enumerated in the module README |
 | Server | External and operator-owned. The route's `expected_version` must equal the installed server's `/api/info` version exactly. Server version, adapter artifact and controller version are three separate facts |
 | Optional service owner | `@opencode/server@2.0.7` plus the lockfile-pinned Effect/platform composition under Bun `1.4.0`; `modules/opencode/serve.mjs` is separately operated and is not launched or managed by the adapter |
+| Security overrides | The owner lockfile overrides `@ai-sdk/provider-utils` to `4.0.57` and `@opentelemetry/core` to `2.8.0`. Native core/server/util remain `2.0.7`; Effect/platform remain `4.0.0-rc.112`. An isolated model-free compatibility preview verified authenticated startup, persisted event readback after restart and clean process exits. Native model qualification for this dependency revision remains separate |
 | Model catalog mode | Owner default `refresh` loads the bundled snapshot and enables public metadata refresh; explicit `offline` disables both for no-model persistence smoke. Neither mode proves a provider/model/variant route |
 | Atlas donor | Used to scrub retained native copies; governed by [its own UPDATE.md](../atlas-redact/UPDATE.md) and never changed as a side effect of an adapter update |
 
@@ -56,7 +57,7 @@ separate, coordinated event, not part of adapter activation.
 cargo fmt -p eliot-swarm-controller -- --check
 cargo clippy --locked --lib --bins --no-deps -- -D warnings
 cargo build --locked --release --bin swarm
-cargo test --locked --lib opencode   # local evidence; CI defers tests by repository policy
+cargo test --locked --lib opencode   # focused local evidence; CI also runs the owned Rust tests
 ```
 
 Fixture servers are not OpenCode: passing fixtures prove the mapping

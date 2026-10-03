@@ -1,87 +1,91 @@
-# Agent Operations — Monitoring, Hooks and Server Automation
+# Agent Operations — Rust Control Plane and Configurable Delivery
 
-Revision 1 · researched 2026-10-03 · source baseline `35e499ae73b622d873c44873f6993ee3fcbea87b`.
+Revision 2 · researched 2026-10-03 · inspected main `35e499ae73b622d873c44873f6993ee3fcbea87b`.
 
-**Status: proposed product extension, not implemented or live-qualified by this PR.** This is a separate program from [PR #22](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/22); no changes to that PR, native services, local configuration or credentials are included.
+**Status: design and implementation contract; not a claim of implemented or live-qualified functionality.** This revision replaces the first revision's fixed dependency recommendations and internal JS/Python bridge development plan. It updates PR #23 without modifying PR #22 or the owner's machine.
 
-## Decision
+## Product decision
 
-ELIOT owns continuous observation and authorized automation even when a manager model, desktop UI or MCP client is disconnected. A manager assigns a work pool and policy once; ordinary observation, reminders, approved scripts and eligible scheduled actions do not need repeated manager prompts.
+The manager provides an ordered pool of work and execution preferences. ELIOT distributes eligible work, observes execution without questioning models, sends complete candidates to auditors, routes actionable corrections back, and publishes successful work automatically or after an explicit manager gate.
 
 ```text
-GitHub / Git / native runtime streams / supported hooks / OS observations
-                                 |
-                   validate, correlate, record
-                                 |
-           existing ELIOT Store + compact live-stream cache
-                     /                         \
-   dashboard, streams, attention       event/time/goal evaluation
-           |                                     |
-    MCP / CLI / optional UI           one authorized action admission
-                                                 |
-                                  existing durable Operations
-                                     /           |          \
-                              native Rust    script runner   RuntimePort
+manager: work pool + roles + runtime preferences + delivery policy
+                              |
+                    Rust admission/distributor
+                              |
+           manager-owned Attempt and one mutable worktree
+                              |
+                completed immutable submission
+                              |
+                   assigned auditor(s)
+                 /            |             \
+       changes requested    audited       inconclusive
+              |               |                |
+       original owner    auto or GM gate   diagnosis/review
+              |               |                |
+       new submission    acceptance + publication
+                              |
+                    remote readback + bookkeeping
 ```
 
-No second Task store, external broker, provider loop or general workflow language is required. New durable automation indexes belong to the existing SQLite database. High-volume text deltas do not become one database row per token.
+Peer consultation remains information, not assignment. Server dispatch is a distinct manager-authorized action. Ordinary handoffs do not need a fresh Root approval.
 
-## Four documents; one contract
+## Read only what the work needs
 
-- [Architecture and contracts](architecture.md): monitoring, streams, GitHub, hooks, actions, cron, server Goal, scripts, roles and MCP.
-- [Donor map](donor-map.md): exact inspected sources, reuse units, version/MSRV constraints and limits of the evidence.
-- [Implementation plan](implementation.md): complete vertical slices, source ownership, integration dependencies, migration and qualification.
+- [Architecture](architecture.md): Rust boundaries, monitoring/streams, hooks, actions, cron, Goal, scripts and durable recovery.
+- [Delivery](delivery.md): queue distribution, reviewer contracts, repair, audited state, GitHub effects and publication.
+- [Configuration](configuration.md): small agent-facing MCP configuration path, runtime/model preferences, updates and examples.
+- [Donor map](donor-map.md): inspected source units, official API contracts, what to reuse and what not to inherit.
+- [Implementation](implementation.md): source ownership, integration order and acceptance scenarios.
 
-These documents complement the canonical architecture and [Owner Decisions](../owner-decisions.md). They do not create another precedence ladder of retrospective amendments. Changes to existing policy are enumerated below; other policy remains unchanged.
+These are one program, not a chain of superseding amendments. Architecture owns service boundaries; Delivery owns delivery transitions; Configuration owns settings and public configuration methods. Evidence documents do not grant authority. PR #22 supplies the shared Participant, coordination, watch, launcher and deferred-catalog concepts; do not implement them twice.
 
-## Requirement coverage
+## Non-negotiable boundaries
 
-| Requested capability | Product decision |
-|---|---|
-| Dashboard without questioning agents | One host-owned observation pipeline; native events first, bounded shared read-only reconciliation where needed; no model status prompts. |
-| Read outputs/reasoning | On-demand scoped live/history stream. Only text, reasoning content or summaries deliberately exposed by the native API; unavailable fields remain unavailable. |
-| Hooks wherever supported | Adapter capability/install matrix; native veto hooks, observational hooks and wrapper events have different guarantees. |
-| Server cron/scheduler/Goal/reminders | Extend the existing persistent scheduler. Independent server Goal references existing Tasks and completion evidence. Reminders reuse one watch/notification service. |
-| PowerShell/Python and Rust actions | Versioned named script registry plus owned process runner; core notify/check/publish/merge actions remain typed Rust operations. |
-| Commit -> auditor | Exact Git commit observation -> one durable audit notice; optional review dispatch uses a standing manager grant and concurrency limit. |
-| Roles and custom roles | Versioned capability bundles with object scope and bounded delegation. Multiple auditors are supported; current GM designation is not a role-name string. |
-| Deferred MCP | Keep the small core and grouped catalog from #22. New domains are discoverable on demand, never globally eager. |
+**Rust owns every internal subsystem.** Host, Store, scheduler, Goal evaluator, dispatch, monitoring, GitHub client, webhook ingress, hooks registry/helper, MCP gateway, configuration, review routing and script runner are Rust. Python and PowerShell are optional user extensions executed by the Rust runner. They are not mandatory startup, queue, review, push or recovery components. ELIOT-owned JavaScript/TypeScript daemons are not an alternative implementation of this requirement.
 
-## Baseline: preserve versus extend
+External native harnesses, Git and tunnel executables remain external products. ELIOT controls them through documented protocols and Rust adapters; it does not rewrite their model loops. Existing non-Rust bridges are migration inputs, not evidence that the Rust target is complete.
 
-The following are source observations, not claims that the new system is already present.
+**No software-version pins in this program.** Do not require one old crate release, fixed CLI build, model revision, commit-based dependency or hash-named binary location. Use maintained Rust libraries, normal compatible dependency requirements, installed executable discovery and actual protocol/capability checks. Resolve preferred model/CLI choices from configuration. Source review dates and observed versions are evidence, not install restrictions.
 
-| Existing source | What is already usable | Gap this program closes |
+A candidate SHA, configuration revision or the bytes used by an already-started script identify work that happened. They do not force future work to use an obsolete software version. Scripts normally follow their active definition at the next admission, and runtime preferences apply to new launches; active work is not silently rewritten.
+
+**One manager, one mutable worktree and one in-flight product submission.** Writers can work in non-overlapping assignments within it. They do not independently run Cargo, change delivery policy or publish. Reviewers consume immutable source evidence. The manager prepares the next Issue without modifying a candidate under review.
+
+## Current source facts that implementation must not overlook
+
+| Source | Existing behavior | Required extension |
 |---|---|---|
-| [`src/scheduler.rs`](../../src/scheduler.rs), [`docs/schedules.md`](../schedules.md) | Persistent one-shot/interval CheckRun scheduling, latest-only catch-up, Store admission and retained receipts | Cron/timezones, dynamic definitions, script/native action kinds and larger indexed registry |
-| [`src/mcp/subscriptions.rs`](../../src/mcp/subscriptions.rs) | Bounded committed-fact subscriptions, lag notification and authoritative resync | Currently per-subscription polling; no native live-token stream or shared fleet projector |
-| [`modules/command/mod/eliot-command.ts`](../../modules/command/mod/eliot-command.ts) | Existing native ModApi event listener and exact control journal | No universal hooks registry; streaming partials intentionally excluded; synchronous journaling/whole-inbox reads need bounded integration |
-| [`modules/muse/observe.mjs`](../../modules/muse/observe.mjs) | Durability/death facts and explicit unfilled gap observation | Do not claim the SDK GapFiller is already active on this compact bridge path |
-| [`modules/claude/README.md`](../../modules/claude/README.md) | SDK-owned input and compact stream/family mapping | Full live stream, hook installation and several native controls are not wired by that mapping |
-| [`docs/forge-publication.md`](../forge-publication.md) | Accepted-candidate, non-force publication; owned process tree; uncertain-effect readback | PR creation/merge and GitHub work-pool synchronization are separate work |
-| [`src/mcp/profiles.rs`](../../src/mcp/profiles.rs), [`Cargo.toml`](../../Cargo.toml) | Closed MCP allowlists; Tokio/RMCP/SQLite and native adapters | Custom role definitions and the deferred catalog must remain distinct from permission |
+| `src/store/submissions.rs::reserve/finish` | `task.submit` has durable admission and a later applied `task.submission` result | Trigger review from the applied result, not from a queued request or the agent saying done |
+| `src/store/submissions.rs::request_changes` | Requires current GM/operator and returns a durable mailbox message, not native input | Scoped delegated review disposition and a separately authorized repair handoff; merely exposing a reviewer MCP tool is insufficient |
+| `src/policy.rs` | Recognizes one compiled owner-policy edition and document digest | Keep old Attempt evidence readable; add an authorized configurable workflow-policy binding rather than editing a digest to grant rights |
+| `src/scheduler.rs`, `src/store/schedules.rs` | One-shot/interval CheckRuns, latest-only catch-up, retained receipts | Cron, dynamic actions and indexed definitions in the same scheduler |
+| `src/mcp/subscriptions.rs` | Bounded committed-fact polling with lag/resync | Shared Rust projector plus separate native text stream; not polling each model |
+| `docs/forge-publication.md` | Accepted exact candidate, non-force push and uncertain-effect readback | Delegated publication, optional review-branch upload and PR operations with distinct authority |
+| Existing `modules/*` | Some controller adapters/mods use Python or JS/TS | Replace owned control/translation logic with Rust routes before claiming the new end-to-end path complete |
 
-The older module-contract status paragraphs are not sufficient inventories: some describe earlier slices. Implementation status must be checked against these exact source units and their active callers.
+## Explicit policy changes required when behavior lands
 
-## Explicit policy extension, not silent reinterpretation
+Update [Owner Decisions](../owner-decisions.md) and the relevant implementation together, not by silently reinterpreting old text:
 
-1. Owner Decisions §3 intentionally forbids an automatic OpenCode re-prompt loop in 0.1. This proposal adds a separately named **server Goal** with explicit standing execution grants. It does not change the meaning of `agent.goal`, replay unknown input, or infer authority from peer mail.
-2. Owner Decisions §4 and `schedules.md` intentionally limit the first scheduler to configured CheckRuns. The new version adds cron and other typed actions while preserving old schedule IDs, receipts and catch-up semantics.
-3. Module installation remains operator-controlled. Hook setup edits require an explicit installation plan, preserve existing hooks and may not silently restart a shared service. An already delegated project-local hook/script configuration may be managed within that delegation.
-4. Script authors may create, revise, activate and run scripts within an existing grant without routing every edit to Root. Wider OS trust, credentials, network access, global hooks or protected effects require the corresponding authority.
-5. Peer communication still does not start work. A server rule or Goal may start authorized work under a **standing manager grant**; that is a different, auditable cause, not an exception hidden inside messaging.
-6. One worktree per manager and exact-candidate acceptance remain. The new runner does not create a worktree per tiny script or share one mutable candidate across competing managers.
+1. Sections 1 and 5: authorized workflow service may apply a scoped review disposition and, when separately delegated, accept/publish an eligible exact candidate. It does not become GM. Human/GM-only operations remain protected.
+2. Section 3: server Goal may advance the assigned pool under a standing grant; native `agent.goal` retains its own meaning and cannot compete with server continuation.
+3. Section 4 and [Schedules](../schedules.md): extend configured CheckRuns to agent-configurable cron and registered actions; preserve old schedule receipts.
+4. Section 6 and [Forge publication](../forge-publication.md): distinguish an optional review-branch upload from accepted publication and from merge. Preserve existing non-force and readback guarantees.
+5. Module contract/update instructions: new owned integration logic is Rust and compatibility-based, not a prescribed frozen SDK package. Preserve existing live bindings until safe handover; no automatic service restart.
 
-The implementation must update the named policy sections in the same delivery as the new behavior. Until then, existing behavior remains authoritative.
+The new direction does not authorize repository-protection changes, arbitrary credential access, heuristic killing, implicit model spending outside a grant or broad test workflows during code construction.
 
-## What gets reused
+## Practical defaults
 
-Keep the existing SDKs, RuntimePort, Store receipts, artifact/redaction layer, process ownership and CheckRunner. Use a complete cron-expression library rather than writing a parser. Use a complete file-event library and a process-metrics library as sensors, not ownership authorities. Learn schedule overlap from Temporal, script versions/grants from Windmill and bounded recipe capture from Goose without importing their independent runtimes/databases. Exact selection and limitations are in the donor map.
+Use the `reviewed_delivery` preset. Agent setup selects a work pool, writer/auditor profiles, concurrency and either `auto_after_audit` or `manager_gate`. Built-in Rust stages handle the ordinary path; scripts and custom event rules are optional.
 
-## Deployment and evidence boundary
+`audited` is an exact-candidate review fact. A GitHub label is only its display projection. `audited`, `accepted`, `uploaded`, `merged` and `published` must never be interchangeable statuses.
 
-ELIOT must run as a locally installed long-lived host for server automation to survive client exit. This PR neither installs a service nor changes startup settings. Recovery after an actual machine reboot is tested later on the owner's machine.
+Invalid configuration retains the last valid configuration. Unavailable routes delay only relevant work; invalid source data cannot stop the entire fleet. A changed preferred model does not kill an existing session. No free-text comment, mention or reminder starts a handoff by itself.
 
-No live models, scripts, schedulers, hooks, GitHub webhooks or forge effects were run for this design. Library compatibility is a researched candidate, not a build result. Keep states separate: `documented`, `source_reviewed`, `implemented`, `fixture_checked`, `live_qualified`.
+## Validation and privacy
 
-Real deployment domains, tunnel/account identifiers, local private paths and secrets are local setup inputs. Repository examples use `YOUR_DOMAIN`, `mcp.example.com`, logical project handles and secret references only.
+This PR changes documentation only. It runs no models, scripts, native hooks, schedulers, installers or forge effects against a project. Source/API research does not establish performance or live compatibility.
+
+Real deployment endpoints, tunnel/account identifiers, credentials and private filesystem paths remain local setup inputs. Examples use logical handles and placeholders. The existing local gateway audit is operating evidence, not permission to publish its deployment details or reproduce its JS/PM2 stack as ELIOT's internal architecture.
