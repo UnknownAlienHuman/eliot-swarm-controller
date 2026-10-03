@@ -197,6 +197,12 @@ const COORDINATION_READ_AUDIENCES: &[ToolAudience] = &[
     ToolAudience::GmOperator,
     ToolAudience::FullCompatibility,
 ];
+const WATCH_AUDIENCES: &[ToolAudience] = &[
+    ToolAudience::Participant,
+    ToolAudience::Manager,
+    ToolAudience::GmOperator,
+    ToolAudience::FullCompatibility,
+];
 const PARTICIPANT_ONLY_AUDIENCES: &[ToolAudience] =
     &[ToolAudience::Participant, ToolAudience::FullCompatibility];
 const ASSIGNED_REVIEWER_AUDIENCES: &[ToolAudience] = &[
@@ -942,6 +948,36 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
         "Bounded manager-actionable page with explicit projection coverage."
     ),
     entry!(
+        "swarm.launch.preview",
+        ManagerCore,
+        MANAGER_AUDIENCES,
+        Core,
+        "Validate one exact launch request under current Manager or local Operator authority.",
+        "Use before admitting a launch to review the exact Task revision, route, profiles, budget, stop conditions, and requested configuration.",
+        &[
+            "launch",
+            "preview",
+            "route",
+            "agent profile",
+            "MCP profile",
+            "workspace policy",
+            "budget"
+        ],
+        &[
+            "task_id",
+            "expected_task_revision",
+            "route",
+            "agent_profile",
+            "mcp_profile",
+            "mcp_surface",
+            "workspace_policy",
+            "budget",
+            "stop_conditions",
+            "purpose"
+        ],
+        "Read-only validation and retained preview row; it does not start an agent, native session, or model turn."
+    ),
+    entry!(
         "coordination.participant.get",
         AssignmentRead,
         MANAGER_AUDIENCES,
@@ -994,6 +1030,34 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
         ],
         &["one exact relationship selector; manager also supplies exact scope tuple"],
         "Bounded selector-index page with stale and coverage gaps."
+    ),
+    entry!(
+        "coordination.consult",
+        ParticipantCoordination,
+        PARTICIPANT_ONLY_AUDIENCES,
+        Core,
+        "Resolve one exact current card owner and request one missing fact when the owner is unique and live.",
+        "Use when an exact contract, path, symbol, or interface selector identifies a needed card field that is absent; ambiguous, unowned, and uncovered matches do not send a message.",
+        &[
+            "consult",
+            "ask owner",
+            "card field",
+            "contract",
+            "path",
+            "symbol",
+            "interface",
+            "one fact"
+        ],
+        &[
+            "one exact target selector",
+            "field",
+            "question_kind",
+            "question",
+            "why_needed",
+            "evidence_refs",
+            "authenticated current Participant scope"
+        ],
+        "Card answer or explicit resolution status; at most one exact-owner mailbox delivery, never a broadcast."
     ),
     entry!(
         "coordination.work_card.get",
@@ -1070,6 +1134,27 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
         &["inbox", "messages", "peer", "delivery", "coordination"],
         &["authenticated participant; optional after_operation_id/limit"],
         "Bounded addressed-delivery page; reading is non-destructive."
+    ),
+    entry!(
+        "coordination.watch.list",
+        ParticipantCoordination,
+        WATCH_AUDIENCES,
+        Searchable,
+        "Page one-shot terminal-operation watches in the caller's authenticated scope.",
+        "Use when a known Task/Attempt scope needs a bounded view of watches; Participant callers omit the scope tuple and derive it from their live registration.",
+        &[
+            "watch",
+            "operation",
+            "terminal",
+            "notification",
+            "list",
+            "scope"
+        ],
+        &[
+            "authenticated Participant scope or exact Manager/Operator task_id/task_revision/attempt_id",
+            "optional limit/after_watch_id"
+        ],
+        "Scope-filtered bounded watch page; authorization is rechecked before paging."
     ),
     entry!(
         "review.get",
@@ -1276,6 +1361,42 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
         "One durable addressed delivery; no method passthrough or native effect."
     ),
     entry!(
+        "coordination.watch.create",
+        ParticipantCoordination,
+        WATCH_AUDIENCES,
+        Core,
+        "Create one exact-scope one-shot watch for an operation terminal transition.",
+        "Use when an explicit caller-owned request needs a bounded mailbox-header notification for one known operation; Participant scope is derived and managers supply the exact Task/Attempt tuple.",
+        &[
+            "watch",
+            "create",
+            "operation",
+            "terminal",
+            "one-shot",
+            "mailbox notification"
+        ],
+        &[
+            "watch_kind=operation_terminal",
+            "address.operation_id",
+            "expires_at_ms",
+            "delivery=mailbox_header",
+            "one_shot=true",
+            "authenticated Participant scope or exact Manager/Operator scope"
+        ],
+        "One durable exact-scope watch; trigger-time authorization is rechecked."
+    ),
+    entry!(
+        "coordination.watch.cancel",
+        ParticipantCoordination,
+        WATCH_AUDIENCES,
+        ManualOnly,
+        "Cancel one exact stored operation watch after reauthorizing its stored scope.",
+        "Use only when the caller explicitly requests cancellation of a known watch ID.",
+        &["watch", "cancel", "operation", "watch_id"],
+        &["watch_id", "stored watch scope remains authorized"],
+        "One guarded watch cancellation; no unrelated watch or operation is changed."
+    ),
+    entry!(
         "review.assign",
         Review,
         MANAGER_AUDIENCES,
@@ -1411,26 +1532,24 @@ const MANAGER_CORE: &[&str] = &[
     "swarm.queue.get",
     "swarm.agent.inspect",
     "swarm.exceptions.get",
+    "swarm.launch.preview",
     "operation.get",
 ];
 const PARTICIPANT_CORE: &[&str] = &[
     "swarm.context.get",
     "swarm.tools.search",
+    "coordination.consult",
     "coordination.send",
     "coordination.inbox",
+    "coordination.watch.create",
     "operation.get",
 ];
 const NO_FULL_COMPATIBILITY_CORE: &[&str] = &[];
-const PARTICIPANT_GAPS: &[&str] = &[
-    "coordination.consult",
-    "coordination.sync_integration",
-    "coordination.watch.create",
-    "swarm.overlap.check",
-];
+const PARTICIPANT_GAPS: &[&str] = &["coordination.sync_integration", "swarm.overlap.check"];
 const OBSERVER_GAPS: &[&str] = &[];
 const REVIEWER_GAPS: &[&str] = &[];
 const ASSIGNED_REVIEWER_GAPS: &[&str] = &[];
-const MANAGER_GAPS: &[&str] = &["swarm.launch.preview", "swarm.launch", "swarm.agent.steer"];
+const MANAGER_GAPS: &[&str] = &["swarm.launch", "swarm.agent.steer"];
 const FULL_GAPS: &[&str] = &[];
 
 pub const fn role_core(role: CoreRole) -> RoleCore {

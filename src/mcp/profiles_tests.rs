@@ -73,6 +73,14 @@ fn profile_tables_are_closed_and_keep_gm_authority_separate() {
         McpToolProfile::Manager,
         "agent.background"
     ));
+    assert!(profiles::allows_method(
+        McpToolProfile::Manager,
+        "swarm.launch.preview"
+    ));
+    assert!(profiles::allows_method(
+        McpToolProfile::Manager,
+        "coordination.watch.create"
+    ));
     assert!(!profiles::allows_method(
         McpToolProfile::Manager,
         "client.register"
@@ -89,6 +97,18 @@ fn profile_tables_are_closed_and_keep_gm_authority_separate() {
     assert!(profiles::allows_method(
         McpToolProfile::Participant,
         "coordination.work_card.publish"
+    ));
+    assert!(profiles::allows_method(
+        McpToolProfile::Participant,
+        "coordination.consult"
+    ));
+    assert!(profiles::allows_method(
+        McpToolProfile::Participant,
+        "coordination.watch.create"
+    ));
+    assert!(profiles::allows_method(
+        McpToolProfile::Participant,
+        "coordination.watch.list"
     ));
     assert!(!profiles::allows_method(
         McpToolProfile::Participant,
@@ -109,6 +129,14 @@ fn profile_tables_are_closed_and_keep_gm_authority_separate() {
     assert!(!profiles::allows_method(
         McpToolProfile::AssignedReviewer,
         "task.request_changes"
+    ));
+    assert!(!profiles::allows_method(
+        McpToolProfile::AssignedReviewer,
+        "coordination.consult"
+    ));
+    assert!(!profiles::allows_method(
+        McpToolProfile::AssignedReviewer,
+        "coordination.watch.create"
     ));
     assert!(profiles::allows_method(
         McpToolProfile::Gm,

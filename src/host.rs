@@ -91,8 +91,9 @@ pub async fn run(config: Config) -> Result<()> {
     exit
 }
 
-/// One host-owned reconciler for all enabled entries. Committed changes are
-/// hints; bounded startup/periodic scans recover after missed hints or restart.
+/// One host-owned reconciler for enabled automation entries and passive scoped
+/// watches. Bounded startup/periodic scans recover after missed hints or
+/// restart without creating per-watch tasks.
 async fn supervise_automation(store: Store, mut stopping: watch::Receiver<bool>) -> Result<()> {
     let mut changed = store.subscribe_schedule_changes();
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
@@ -109,10 +110,12 @@ async fn supervise_automation(store: Store, mut stopping: watch::Receiver<bool>)
                 if result.is_err() { return Err(Error::new("STORE_CLOSED", "automation change stream ended")); }
                 if *stopping.borrow() { return Ok(()); }
                 store.reconcile_automations_once().await?;
+                store.reconcile_watches_once().await?;
             }
             _ = tick.tick() => {
                 if *stopping.borrow() { return Ok(()); }
                 store.reconcile_automations_once().await?;
+                store.reconcile_watches_once().await?;
             }
         }
     }

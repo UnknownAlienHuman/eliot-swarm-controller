@@ -9,6 +9,152 @@ use crate::{
 };
 use serde_json::{Value, json};
 
+/// Exact, caller-proposed launch facts. Parsing is pure: this request never
+/// creates an Attempt, Operation, workspace, credential, or native process.
+#[derive(Debug, Clone)]
+pub(crate) struct LaunchPreviewRequest {
+    pub task_id: String,
+    pub expected_task_revision: i64,
+    pub route: String,
+    pub agent_profile: String,
+    pub mcp_profile: String,
+    pub mcp_surface: String,
+    pub workspace_policy: String,
+    pub requested_model: Option<String>,
+    pub requested_effort: Option<String>,
+    pub budget: Value,
+    pub stop_conditions: Vec<String>,
+    pub purpose: String,
+}
+
+impl LaunchPreviewRequest {
+    pub(crate) fn parse(params: &Value) -> Result<Self> {
+        model::fields(
+            params,
+            &[
+                "task_id",
+                "expected_task_revision",
+                "route",
+                "agent_profile",
+                "mcp_profile",
+                "mcp_surface",
+                "workspace_policy",
+                "requested_model",
+                "requested_effort",
+                "budget",
+                "stop_conditions",
+                "purpose",
+            ],
+        )?;
+        let task_id = required_launch_text(params, "task_id", 512)?;
+        let expected_task_revision = params["expected_task_revision"]
+            .as_i64()
+            .filter(|revision| *revision > 0)
+            .ok_or_else(|| Error::invalid("expected_task_revision must be a positive integer"))?;
+        let route = required_launch_text(params, "route", 256)?;
+        let agent_profile = required_launch_text(params, "agent_profile", 256)?;
+        let mcp_profile = required_launch_text(params, "mcp_profile", 256)?;
+        let mcp_surface = required_launch_text(params, "mcp_surface", 256)?;
+        let workspace_policy = required_launch_text(params, "workspace_policy", 256)?;
+        let requested_model = nullable_launch_text(params, "requested_model", 256)?;
+        let requested_effort = nullable_launch_text(params, "requested_effort", 256)?;
+        let budget = parse_launch_budget(
+            params
+                .get("budget")
+                .ok_or_else(|| Error::invalid("budget is required"))?,
+        )?;
+        let stop_conditions = parse_stop_conditions(
+            params
+                .get("stop_conditions")
+                .ok_or_else(|| Error::invalid("stop_conditions is required"))?,
+        )?;
+        let purpose = required_launch_text(params, "purpose", 128)?;
+
+        Ok(Self {
+            task_id,
+            expected_task_revision,
+            route,
+            agent_profile,
+            mcp_profile,
+            mcp_surface,
+            workspace_policy,
+            requested_model,
+            requested_effort,
+            budget,
+            stop_conditions,
+            purpose,
+        })
+    }
+}
+
+fn required_launch_text(params: &Value, field: &str, max_bytes: usize) -> Result<String> {
+    let value = params
+        .get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::invalid(format!("{field} must be a string")))?;
+    bounded_launch_text(value, field, max_bytes)
+}
+
+fn nullable_launch_text(params: &Value, field: &str, max_bytes: usize) -> Result<Option<String>> {
+    let value = params
+        .get(field)
+        .ok_or_else(|| Error::invalid(format!("{field} is required; use null when unset")))?;
+    match value {
+        Value::Null => Ok(None),
+        Value::String(value) => bounded_launch_text(value, field, max_bytes).map(Some),
+        _ => Err(Error::invalid(format!("{field} must be a string or null"))),
+    }
+}
+
+fn bounded_launch_text(value: &str, field: &str, max_bytes: usize) -> Result<String> {
+    if value.trim().is_empty()
+        || value.len() > max_bytes
+        || value.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return Err(Error::invalid(format!(
+            "{field} must be 1..={max_bytes} bytes without control characters"
+        )));
+    }
+    Ok(value.to_owned())
+}
+
+fn parse_launch_budget(value: &Value) -> Result<Value> {
+    model::fields(value, &["max_turns", "max_duration_ms", "max_cost_units"])?;
+    let mut budget = serde_json::Map::new();
+    for field in ["max_turns", "max_duration_ms", "max_cost_units"] {
+        let amount = value.get(field).ok_or_else(|| {
+            Error::invalid(format!("budget.{field} is required; use null when unset"))
+        })?;
+        if !amount.is_null() && amount.as_i64().is_none_or(|amount| amount < 0) {
+            return Err(Error::invalid(format!(
+                "budget.{field} must be a nonnegative integer or null"
+            )));
+        }
+        budget.insert(field.to_owned(), amount.clone());
+    }
+    Ok(Value::Object(budget))
+}
+
+fn parse_stop_conditions(value: &Value) -> Result<Vec<String>> {
+    let conditions = value
+        .as_array()
+        .ok_or_else(|| Error::invalid("stop_conditions must be an array"))?;
+    if conditions.len() > 16 {
+        return Err(Error::invalid(
+            "stop_conditions must contain at most 16 items",
+        ));
+    }
+    conditions
+        .iter()
+        .map(|condition| {
+            let condition = condition
+                .as_str()
+                .ok_or_else(|| Error::invalid("each stop condition must be a string"))?;
+            bounded_launch_text(condition, "stop condition", 512)
+        })
+        .collect()
+}
+
 /// Default rows for an interactive manager page.
 pub const DEFAULT_PAGE_SIZE: i64 = 20;
 /// Keep launcher pages smaller than the generic Store report ceiling.

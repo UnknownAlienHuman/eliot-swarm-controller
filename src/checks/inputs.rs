@@ -110,7 +110,29 @@ impl ResolvedCheckPlan {
 /// during planning and again by the worker before command spawn.
 pub(crate) fn effective_environment(profile: &CheckProfile) -> BTreeMap<String, String> {
     let mut values = BTreeMap::new();
-    for name in [
+    for name in builtin_environment_names()
+        .iter()
+        .copied()
+        .chain(profile.inherit_env.iter().map(String::as_str))
+    {
+        if let Some((key, value)) = std::env::vars().find(|(key, _)| env_key_eq(key, name)) {
+            values.insert(key, value);
+        }
+    }
+    for (key, value) in &profile.environment {
+        if cfg!(windows) {
+            values.retain(|existing, _| !existing.eq_ignore_ascii_case(key));
+        }
+        values.insert(key.clone(), value.clone());
+    }
+    values
+}
+
+// Keep defaults target-specific: an absent platform-only variable is still a
+// configured name and would otherwise be treated as opaque on this host.
+#[cfg(windows)]
+fn builtin_environment_names() -> &'static [&'static str] {
+    &[
         "PATH",
         "SystemRoot",
         "WINDIR",
@@ -124,21 +146,19 @@ pub(crate) fn effective_environment(profile: &CheckProfile) -> BTreeMap<String, 
         "RUSTUP_HOME",
         "CARGO_HOME",
     ]
-    .iter()
-    .copied()
-    .chain(profile.inherit_env.iter().map(String::as_str))
-    {
-        if let Some((key, value)) = std::env::vars().find(|(key, _)| env_key_eq(key, name)) {
-            values.insert(key, value);
-        }
-    }
-    for (key, value) in &profile.environment {
-        if cfg!(windows) {
-            values.retain(|existing, _| !existing.eq_ignore_ascii_case(key));
-        }
-        values.insert(key.clone(), value.clone());
-    }
-    values
+}
+
+#[cfg(not(windows))]
+fn builtin_environment_names() -> &'static [&'static str] {
+    &[
+        "PATH",
+        "HOME",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "RUSTUP_HOME",
+        "CARGO_HOME",
+    ]
 }
 
 fn env_key_eq(left: &str, right: &str) -> bool {
@@ -342,23 +362,10 @@ fn environment_values_identity(
     profile: &CheckProfile,
     values: &BTreeMap<String, String>,
 ) -> (BTreeMap<String, Value>, Vec<String>, Vec<String>) {
-    let mut configured: BTreeSet<String> = [
-        "PATH",
-        "SystemRoot",
-        "WINDIR",
-        "USERPROFILE",
-        "HOME",
-        "LOCALAPPDATA",
-        "APPDATA",
-        "TEMP",
-        "TMP",
-        "TMPDIR",
-        "RUSTUP_HOME",
-        "CARGO_HOME",
-    ]
-    .iter()
-    .map(|name| normalized_env_name(name))
-    .collect();
+    let mut configured: BTreeSet<String> = builtin_environment_names()
+        .iter()
+        .map(|name| normalized_env_name(name))
+        .collect();
     configured.extend(
         profile
             .inherit_env

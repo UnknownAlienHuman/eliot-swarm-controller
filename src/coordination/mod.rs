@@ -10,10 +10,216 @@ use crate::{
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
+pub mod watch;
+
 pub const MAX_CARD_BYTES: usize = 32 * 1024;
 pub const MAX_MESSAGE_BYTES: usize = 8 * 1024;
 pub const MAX_PAGE_SIZE: i64 = 50;
 pub const MAX_INBOX_SCAN: i64 = 1000;
+
+const CONSULT_QUESTION_KINDS: &[&str] = &[
+    "contract_shape",
+    "integration_point",
+    "identity",
+    "failure_semantics",
+    "status_fact",
+    "assumption_check",
+    "scope_overlap",
+    "compatibility",
+    "predecessor_fact",
+];
+
+const CONSULT_CARD_FIELDS: &[&str] = &[
+    "provides",
+    "requires",
+    "planned_scopes",
+    "assumptions",
+    "known_contract_gaps",
+    "integration_points",
+    "contract_keys",
+    "paths",
+    "symbols",
+    "interfaces",
+    "role",
+    "version",
+    "producer",
+    "consumer",
+    "carrier",
+    "contract",
+    "inputs",
+    "outputs",
+    "serialization",
+    "ownership",
+    "availability",
+    "limits",
+    "result_disposition",
+    "retry_semantics",
+    "canonical_sources",
+];
+
+#[derive(Debug, Clone)]
+pub(crate) struct ConsultRequest {
+    pub client_request_id: String,
+    pub target_kind: TermKind,
+    pub target_value: String,
+    pub field: String,
+    pub question_kind: String,
+    pub question: String,
+    pub why_needed: String,
+    pub expected_answer: String,
+    pub blocking: bool,
+    pub reply_deadline_ms: Value,
+    pub evidence_refs: Vec<String>,
+}
+
+/// Parse the one canonical consult input shape. This is also used when the
+/// retained operation is projected back into the addressed participant inbox.
+pub(crate) fn parse_consult_request(value: &Value) -> Result<ConsultRequest> {
+    model::fields(
+        value,
+        &[
+            "client_request_id",
+            "target",
+            "field",
+            "question_kind",
+            "question",
+            "why_needed",
+            "expected_answer",
+            "blocking",
+            "reply_deadline_ms",
+            "evidence_refs",
+        ],
+    )?;
+    let client_request_id = model::text(value, "client_request_id")?.to_owned();
+    let target = value
+        .get("target")
+        .ok_or_else(|| Error::invalid("target is required"))?;
+    model::fields(target, &["contract_key", "path", "symbol", "interface"])?;
+    let mut selected = None;
+    for (field, kind) in [
+        ("contract_key", TermKind::Contract),
+        ("path", TermKind::Path),
+        ("symbol", TermKind::Symbol),
+        ("interface", TermKind::Interface),
+    ] {
+        let Some(raw) = target.get(field) else {
+            continue;
+        };
+        if raw.is_null() {
+            continue;
+        }
+        let term = raw
+            .as_str()
+            .filter(|term| !term.trim().is_empty() && term.len() <= 1024)
+            .ok_or_else(|| {
+                Error::invalid(format!(
+                    "target.{field} must be nonempty text up to 1024 bytes"
+                ))
+            })?;
+        if term.bytes().any(|byte| byte.is_ascii_control()) {
+            return Err(Error::invalid(format!(
+                "target.{field} contains a control character"
+            )));
+        }
+        if kind == TermKind::Contract && identifier_invalid(term, 256) {
+            return Err(Error::invalid(
+                "target.contract_key must be 1..=256 bytes without whitespace",
+            ));
+        }
+        if selected.replace((kind, term.to_owned())).is_some() {
+            return Err(Error::invalid(
+                "target must select exactly one contract_key, path, symbol, or interface",
+            ));
+        }
+    }
+    let (target_kind, target_value) = selected.ok_or_else(|| {
+        Error::invalid("target must select exactly one contract_key, path, symbol, or interface")
+    })?;
+
+    let field = model::text(value, "field")?;
+    if !CONSULT_CARD_FIELDS.contains(&field) {
+        return Err(Error::invalid("field must name a structured card field"));
+    }
+    let question_kind = model::text(value, "question_kind")?;
+    if !CONSULT_QUESTION_KINDS.contains(&question_kind) {
+        return Err(Error::invalid("unsupported question_kind"));
+    }
+    let question = bounded_text(value, "question", 2048)?;
+    let why_needed = bounded_text(value, "why_needed", 1024)?;
+    let expected_answer = model::text(value, "expected_answer")?;
+    if expected_answer != "one_fact" {
+        return Err(Error::invalid("expected_answer must be one_fact"));
+    }
+    let blocking = value
+        .get("blocking")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| Error::invalid("blocking must be a boolean"))?;
+    let reply_deadline_ms = model::deadline(value, "reply_deadline_ms")?;
+    let refs = value
+        .get("evidence_refs")
+        .and_then(Value::as_array)
+        .ok_or_else(|| Error::invalid("evidence_refs must be an array"))?;
+    if refs.len() > 32 {
+        return Err(Error::invalid("evidence_refs may contain at most 32 items"));
+    }
+    let mut evidence_refs = Vec::with_capacity(refs.len());
+    let mut seen = BTreeSet::new();
+    let mut evidence_bytes = 0usize;
+    for item in refs {
+        let reference = item
+            .as_str()
+            .filter(|reference| !reference.trim().is_empty() && reference.len() <= 512)
+            .ok_or_else(|| {
+                Error::invalid("evidence_refs entries must be nonempty strings up to 512 bytes")
+            })?;
+        if reference.bytes().any(|byte| byte.is_ascii_control()) {
+            return Err(Error::invalid(
+                "evidence_refs entries cannot contain control characters",
+            ));
+        }
+        if !seen.insert(reference) {
+            return Err(Error::invalid("evidence_refs entries must be unique"));
+        }
+        evidence_bytes = evidence_bytes.saturating_add(reference.len());
+        evidence_refs.push(reference.to_owned());
+    }
+    if evidence_bytes > 3072 {
+        return Err(Error::invalid(
+            "evidence_refs may contain at most 3072 total bytes",
+        ));
+    }
+    Ok(ConsultRequest {
+        client_request_id,
+        target_kind,
+        target_value,
+        field: field.to_owned(),
+        question_kind: question_kind.to_owned(),
+        question,
+        why_needed,
+        expected_answer: expected_answer.to_owned(),
+        blocking,
+        reply_deadline_ms,
+        evidence_refs,
+    })
+}
+
+fn bounded_text(value: &Value, field: &str, max_bytes: usize) -> Result<String> {
+    let text = model::text(value, field)?;
+    if text.len() > max_bytes || text.bytes().any(|byte| byte.is_ascii_control()) {
+        return Err(Error::invalid(format!(
+            "{field} must be 1..={max_bytes} bytes without control characters"
+        )));
+    }
+    Ok(text.to_owned())
+}
+
+fn identifier_invalid(value: &str, max_bytes: usize) -> bool {
+    value.is_empty()
+        || value.len() > max_bytes
+        || value
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+}
 
 /// Closed, side-effect-free validation for the supported coordination
 /// mutations. Store authorization and current Task/Attempt checks remain the
@@ -43,6 +249,18 @@ pub fn validate_mutation(method: &str, value: &Value) -> Result<()> {
         "coordination.contract_card.publish" => &["client_request_id", "contract_key", "fields"],
         "coordination.contract_card.withdraw" => &["client_request_id", "contract_key"],
         "coordination.send" => &["client_request_id", "recipient", "body"],
+        "coordination.consult" => &[
+            "client_request_id",
+            "target",
+            "field",
+            "question_kind",
+            "question",
+            "why_needed",
+            "expected_answer",
+            "blocking",
+            "reply_deadline_ms",
+            "evidence_refs",
+        ],
         _ => return Err(Error::new("METHOD_NOT_FOUND", method)),
     };
     model::fields(value, allowed)?;
@@ -235,6 +453,7 @@ pub fn validate_mutation(method: &str, value: &Value) -> Result<()> {
             }
             Ok(())
         }
+        "coordination.consult" => parse_consult_request(value).map(|_| ()),
         _ => unreachable!("method was checked above"),
     }
 }
@@ -297,6 +516,14 @@ pub(crate) fn mailbox_key(
         "{}{created_at_ms:020}:{}",
         mailbox_prefix(scope, recipient),
         key_component(operation_id)
+    )
+}
+
+/// Exact unresolved consultation fingerprint within one Task/Attempt edition.
+pub(crate) fn consult_key(scope: &str, fingerprint: &str) -> String {
+    format!(
+        "coordination:consult:{scope}:{}",
+        key_component(fingerprint)
     )
 }
 

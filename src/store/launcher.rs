@@ -4,6 +4,7 @@
 
 use super::{acceptance, capacity, meta, projection, tasks::task_sources};
 use crate::{
+    config::{Config, McpToolProfile},
     error::{Error, Result},
     launcher::{self, PageRequest},
     model::{self, Dependency, Principal, Role, TaskSpec},
@@ -23,6 +24,8 @@ const MAX_SCOPE_PATH_BYTES: usize = 512;
 const ATTENTION_SCAN_LIMIT: i64 = 200;
 const MAX_INSPECT_SNAPSHOT_FIELD_BYTES: usize = 12_288;
 const MAX_INSPECT_SNAPSHOT_FIELD_ITEMS: usize = 64;
+const MAX_LAUNCH_OPERATION_ROWS: i64 = 8;
+const MAX_LAUNCH_BRIEF_BYTES: usize = 8_192;
 
 #[derive(Debug)]
 struct TaskRow {
@@ -363,6 +366,41 @@ fn query_tasks(
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok((total, rows))
+}
+
+fn query_task(db: &Connection, task_id: &str) -> Result<TaskRow> {
+    let sql = "SELECT t.task_id,t.project_id,t.revision,t.state,t.accepted_attempt_id,
+                      t.accepted_operation_id,t.accepted_revision,t.accepted_phase,
+                      t.accepted_candidate_ref,t.spec_json,t.created_at_ms,t.updated_at_ms,
+                      (SELECT a.attempt_id FROM attempts a WHERE a.task_id=t.task_id
+                       AND a.released_at_ms IS NULL ORDER BY a.created_at_ms DESC,a.attempt_id DESC LIMIT 1)
+               FROM tasks t WHERE t.task_id=?1";
+    db.query_row(sql, [task_id], |row| {
+        let spec: String = row.get(9)?;
+        Ok(TaskRow {
+            task_id: row.get(0)?,
+            project_id: row.get(1)?,
+            revision: row.get(2)?,
+            state: row.get(3)?,
+            accepted_attempt_id: row.get(4)?,
+            accepted_operation_id: row.get(5)?,
+            accepted_revision: row.get(6)?,
+            accepted_phase: row.get(7)?,
+            accepted_candidate_ref: row.get(8)?,
+            spec: serde_json::from_str(&spec).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    9,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?,
+            created_at_ms: row.get(10)?,
+            updated_at_ms: row.get(11)?,
+            current_attempt_id: row.get(12)?,
+        })
+    })
+    .optional()?
+    .ok_or_else(|| Error::new("NOT_FOUND", format!("Task {task_id}")))
 }
 
 fn get_attempt_row(db: &Connection, attempt_id: &str) -> Result<Option<AttemptRow>> {
@@ -876,6 +914,614 @@ fn exact_attempt_capacity(db: &Connection, attempt: &AttemptRow) -> Result<Value
     }))
 }
 
+fn authorize_launch_project(
+    db: &Connection,
+    p: &Principal,
+    attempt: Option<&AttemptRow>,
+) -> Result<()> {
+    require_manager(db, p)?;
+    if p.role == Role::Manager
+        && !attempt.is_some_and(|attempt| {
+            attempt.owner_id == p.client_id && attempt.released_at_ms.is_none()
+        })
+    {
+        // An unassigned Task has no project-specific manager ACL in the
+        // retained schema. Only the current GM can preview that scope.
+        super::gm::require_authority(db, p)?;
+    }
+    Ok(())
+}
+
+fn launch_operation_projection(db: &Connection, task_id: &str) -> Result<Value> {
+    let total: i64 = db.query_row(
+        "SELECT count(*) FROM operations WHERE task_id=?1 AND method='swarm.launch'",
+        [task_id],
+        |row| row.get(0),
+    )?;
+    let unresolved: i64 = db.query_row(
+        "SELECT count(*) FROM operations WHERE task_id=?1 AND method='swarm.launch'
+         AND state IN ('queued','sending','native_accepted','outcome_unknown')",
+        [task_id],
+        |row| row.get(0),
+    )?;
+    let unknown: i64 = db.query_row(
+        "SELECT count(*) FROM operations WHERE task_id=?1 AND method='swarm.launch'
+         AND state='outcome_unknown'",
+        [task_id],
+        |row| row.get(0),
+    )?;
+    let mut statement = db.prepare(
+        "SELECT operation_id,state,attempt_id,created_at_ms,updated_at_ms FROM operations
+         WHERE task_id=?1 AND method='swarm.launch'
+         ORDER BY created_at_ms DESC,operation_id DESC LIMIT ?2",
+    )?;
+    let items = statement
+        .query_map(params![task_id, MAX_LAUNCH_OPERATION_ROWS], |row| {
+            let operation_id: String = row.get(0)?;
+            let state: String = row.get(1)?;
+            let attempt_id: Option<String> = row.get(2)?;
+            let created_at_ms: i64 = row.get(3)?;
+            let updated_at_ms: i64 = row.get(4)?;
+            Ok(json!({
+                "operation_id":operation_id,
+                "state":state,
+                "attempt_id":attempt_id,
+                "created_at_ms":created_at_ms,
+                "updated_at_ms":updated_at_ms,
+            }))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(json!({
+        "items":items,
+        "total_items":total,
+        "unresolved_count":unresolved,
+        "outcome_unknown_count":unknown,
+        "coverage":if total > MAX_LAUNCH_OPERATION_ROWS {"partial"} else {"complete"},
+        "next_after":if total > MAX_LAUNCH_OPERATION_ROWS {
+            json!(MAX_LAUNCH_OPERATION_ROWS)
+        } else {
+            Value::Null
+        },
+    }))
+}
+
+struct ConfiguredRouteModel<'a> {
+    provider_id: Option<&'a str>,
+    model_id: Option<&'a str>,
+    variant: Option<&'a str>,
+}
+
+fn configured_route_model(route: &crate::config::Route) -> ConfiguredRouteModel<'_> {
+    let model = &route.native_options["model"];
+    let model_id = model
+        .get("id")
+        .or_else(|| model.get("modelID"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty() && value.len() <= 256);
+    let provider_id = model
+        .get("providerID")
+        .or_else(|| model.get("provider_id"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty() && value.len() <= 256);
+    let variant = model
+        .get("variant")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty() && value.len() <= 256);
+    ConfiguredRouteModel {
+        provider_id,
+        model_id,
+        variant,
+    }
+}
+
+fn safe_route_runtime(runtime: &str) -> &'static str {
+    if runtime == crate::runtime::codex::RUNTIME {
+        "codex"
+    } else if runtime == crate::runtime::opencode_v2::RUNTIME {
+        "opencode_v2"
+    } else {
+        "unknown"
+    }
+}
+
+fn launch_route_projection(
+    config: &Config,
+    request: &launcher::LaunchPreviewRequest,
+    hard_blocks: &mut Vec<&'static str>,
+    gaps: &mut Vec<&'static str>,
+) -> Value {
+    let route = config
+        .routes
+        .iter()
+        .find(|route| route.alias == request.route);
+    let Some(route) = route else {
+        hard_blocks.push("route_not_configured");
+        gaps.push("route_live_qualification_and_provider_capacity_not_observed");
+        return json!({
+            "alias":request.route,
+            "configured":false,
+            "enabled":false,
+            "live_qualified":false,
+            "requested_model":request.requested_model,
+            "requested_effort":request.requested_effort,
+            "agent_profile":{"requested":request.agent_profile,"validation":"unknown"},
+            "capability_gaps":["route_not_configured","provider_model_and_agent_catalog_not_retained"],
+        });
+    };
+    if !route.enabled {
+        hard_blocks.push("route_disabled");
+    }
+    let configured_model = configured_route_model(route);
+    let model_status = match request.requested_model.as_deref() {
+        None => "not_requested",
+        Some(requested) if configured_model.model_id == Some(requested) => {
+            "matches_configured_route_model_id"
+        }
+        Some(_) => "unknown_without_retained_provider_model_catalog",
+    };
+    let effort_status = match request.requested_effort.as_deref() {
+        None => "not_requested",
+        Some(requested) if configured_model.variant == Some(requested) => {
+            "matches_configured_route_variant"
+        }
+        Some(_) => "unknown_without_retained_provider_model_catalog",
+    };
+    if model_status == "unknown_without_retained_provider_model_catalog"
+        || effort_status == "unknown_without_retained_provider_model_catalog"
+    {
+        gaps.push("requested_provider_model_or_variant_not_validated_against_a_retained_catalog");
+    }
+    gaps.push("route_configuration_does_not_prove_live_runtime_qualification_or_capacity");
+    gaps.push("native_agent_profile_catalog_not_retained_for_preview");
+    json!({
+        "alias":route.alias,
+        "configured":true,
+        "enabled":route.enabled,
+        "runtime_kind":safe_route_runtime(&route.runtime),
+        "live_qualified":false,
+        "configured_model":{
+            "status":if configured_model.provider_id.is_some()
+                && configured_model.model_id.is_some()
+                && configured_model.variant.is_some() {
+                "recorded_in_route_configuration"
+            } else {
+                "not_recorded_in_route_configuration"
+            },
+            "provider_id_recorded":configured_model.provider_id.is_some(),
+            "model_id_recorded":configured_model.model_id.is_some(),
+            "variant_recorded":configured_model.variant.is_some(),
+        },
+        "requested_model":{
+            "value":request.requested_model,
+            "validation":model_status,
+        },
+        "requested_effort":{
+            "value":request.requested_effort,
+            "validation":effort_status,
+        },
+        "agent_profile":{
+            "requested":request.agent_profile,
+            "validation":"unknown_without_retained_native_agent_catalog",
+        },
+        "capability_gaps":[
+            "live_route_qualification_not_observed",
+            "provider_model_catalog_not_retained",
+            "native_agent_profile_catalog_not_retained",
+            "provider_runtime_capacity_not_selected_for_a_new_binding",
+        ],
+    })
+}
+
+fn launch_mcp_profile_projection(
+    db: &Connection,
+    config: &Config,
+    request: &launcher::LaunchPreviewRequest,
+    hard_blocks: &mut Vec<&'static str>,
+) -> Result<Value> {
+    let Some(profile) = config.mcp.profiles.get(&request.mcp_profile) else {
+        hard_blocks.push("mcp_profile_not_configured");
+        return Ok(json!({
+            "profile_name":request.mcp_profile,
+            "status":"not_configured",
+            "surface":request.mcp_surface,
+        }));
+    };
+    let role = profile.tool_profile;
+    let narrow_role = matches!(
+        role,
+        McpToolProfile::Participant | McpToolProfile::AssignedReviewer
+    );
+    if !narrow_role {
+        hard_blocks.push("mcp_profile_is_not_a_narrow_assignment_role");
+    }
+    if role == McpToolProfile::AssignedReviewer && request.purpose != "review" {
+        hard_blocks.push("assigned_reviewer_profile_requires_review_purpose");
+    }
+    if role == McpToolProfile::Participant && request.purpose == "review" {
+        hard_blocks.push("review_purpose_requires_assigned_reviewer_profile");
+    }
+
+    let identity = meta(db, &format!("client:{}", profile.expected_client_id))?;
+    let identity_state = match identity.as_ref() {
+        None => "not_registered",
+        Some(client) if client["disabled"] == true => "disabled",
+        Some(client) if client["role"] != "participant" => "role_mismatch",
+        Some(_) => "registered_enabled_participant",
+    };
+    if identity_state != "registered_enabled_participant" {
+        hard_blocks.push("configured_mcp_identity_is_not_an_enabled_participant");
+    }
+
+    if profile
+        .surface
+        .as_deref()
+        .is_some_and(|configured| configured != request.mcp_surface)
+    {
+        hard_blocks.push("requested_mcp_surface_differs_from_configured_profile_surface");
+    }
+    let surface = match crate::mcp::launch_profile_surface(
+        role,
+        &request.mcp_surface,
+        &profile.deferred_groups,
+        &profile.manual_tools,
+    ) {
+        Ok(surface) => surface,
+        Err(error) if error.code == "INVALID_PARAMS" => {
+            hard_blocks.push("mcp_surface_not_authorized_by_static_catalog");
+            json!({
+                "status":"invalid_for_profile",
+                "profile_name":request.mcp_profile,
+                "hard_profile":role,
+                "surface":request.mcp_surface,
+            })
+        }
+        Err(error) => return Err(error),
+    };
+    Ok(json!({
+        "status":if surface["surface_id"].is_string() {"validated_against_static_catalog"} else {"invalid_for_profile"},
+        "profile_name":request.mcp_profile,
+        "hard_profile":role,
+        "identity":{"status":identity_state,"role":"participant"},
+        "surface":request.mcp_surface,
+        "surface_facts":surface,
+        "runtime_loaded":"unknown",
+        "gaps":["mcp_profile_configuration_does_not_prove_native_runtime_tool_loading"],
+    }))
+}
+
+fn launch_workspace_projection(request: &launcher::LaunchPreviewRequest) -> Value {
+    let supported = request.workspace_policy == "manager_owned_worktree";
+    json!({
+        "policy":request.workspace_policy,
+        "status":if supported {"not_provisioned"} else {"unsupported_policy"},
+        "lease":"unknown",
+        "dirty":Value::Null,
+        "filesystem_inspected":false,
+        "repository_handle":Value::Null,
+        "worktree_handle":Value::Null,
+        "branch":Value::Null,
+        "baseline_commit":Value::Null,
+    })
+}
+
+/// Read-only bounded plan over one exact Task revision and the Store's
+/// current Attempt, dependency, policy, capacity, Operation, route, and MCP
+/// profile facts. No filesystem or native runtime is consulted here.
+pub(super) fn launch_preview(
+    db: &Connection,
+    p: &Principal,
+    params_value: &Value,
+    config: &Config,
+) -> Result<Value> {
+    let request = launcher::LaunchPreviewRequest::parse(params_value)?;
+    require_manager(db, p)?;
+
+    let row = query_task(db, &request.task_id)?;
+    let attempt = row
+        .current_attempt_id
+        .as_deref()
+        .map(|attempt_id| get_attempt_row(db, attempt_id))
+        .transpose()?
+        .flatten();
+    authorize_launch_project(db, p, attempt.as_ref())?;
+
+    let exact_current_attempt = attempt.as_ref().filter(|attempt| {
+        attempt.task_id == row.task_id
+            && attempt.released_at_ms.is_none()
+            && row.current_attempt_id.as_deref() == Some(attempt.attempt_id.as_str())
+    });
+    let task_revision_current = request.expected_task_revision == row.revision;
+    let (task_brief, task_brief_reference, spec) = source_brief(&row);
+    let task_brief =
+        launcher::brief_projection(&task_brief, task_brief_reference, MAX_LAUNCH_BRIEF_BYTES)?;
+    let spec_valid = spec.as_ref().is_some_and(|spec| spec.validate().is_ok());
+    let dependencies = dependency_projection(db, spec.as_ref())?;
+    let claim_readiness = readiness(
+        db,
+        &row,
+        exact_current_attempt,
+        spec.as_ref(),
+        spec_valid,
+        &dependencies,
+    )?;
+    let work_scope = scope_projection(spec.as_ref());
+
+    let mut hard_blocks = Vec::new();
+    let mut gaps = vec![
+        "workspace_lease_dirty_state_and_git_baseline_not_observed",
+        "launch_manifest_and_launch_mutation_are_not_implemented",
+        "provider_runtime_and_native_agent_capability_receipts_not_observed",
+    ];
+    if !task_revision_current {
+        hard_blocks.push("task_revision_changed");
+    }
+    if row.state != "open" {
+        hard_blocks.push("task_not_open");
+    }
+    if !spec_valid {
+        hard_blocks.push("task_spec_unavailable_or_invalid");
+    }
+    if claim_readiness["owner_policy"]["status"] != "accepted" {
+        hard_blocks.push("owner_policy_not_recognized");
+    }
+    if exact_current_attempt.is_none() {
+        if claim_readiness["new_work_admission"] == "disabled" {
+            hard_blocks.push("new_work_admission_disabled");
+        } else if claim_readiness["new_work_admission"] != "enabled" {
+            hard_blocks.push("new_work_admission_state_unknown");
+            gaps.push("new_work_admission_state_unknown");
+        }
+    }
+    match dependencies["status"].as_str() {
+        Some("waiting") => hard_blocks.push("required_dependency_not_accepted"),
+        Some("unknown") => hard_blocks.push("dependency_state_not_complete"),
+        Some("satisfied") => {}
+        _ => hard_blocks.push("dependency_state_unavailable"),
+    }
+    if task_brief["status"] != "included" {
+        gaps.push("exact_current_task_brief_not_inline");
+    }
+    if work_scope["status"] == "not_recorded" {
+        gaps.push("task_work_scope_not_recorded");
+    } else if work_scope["status"] != "recorded" {
+        gaps.push("some_scope_paths_are_redacted_or_omitted");
+    }
+    if request.workspace_policy != "manager_owned_worktree" {
+        hard_blocks.push("unsupported_workspace_policy");
+    } else {
+        gaps.push("manager_owned_worktree_not_provisioned_by_preview");
+    }
+
+    let route = launch_route_projection(config, &request, &mut hard_blocks, &mut gaps);
+    let mcp_profile = launch_mcp_profile_projection(db, config, &request, &mut hard_blocks)?;
+    let launch_operations = launch_operation_projection(db, &row.task_id)?;
+    if launch_operations["unresolved_count"].as_i64().unwrap_or(0) > 0 {
+        hard_blocks.push("prior_launch_operation_unresolved");
+    }
+    if launch_operations["coverage"] != "complete" {
+        gaps.push("prior_launch_operation_page_is_partial");
+    }
+
+    let own_initial_paths = spec
+        .as_ref()
+        .and_then(|spec| spec.scope.as_ref())
+        .map(|scope| scope.initial_paths.as_slice())
+        .unwrap_or_default();
+    let overlaps = current_scope_overlaps(
+        db,
+        exact_current_attempt.map(|attempt| attempt.attempt_id.as_str()),
+        &row.project_id,
+        own_initial_paths,
+        PageRequest {
+            after: 0,
+            limit: MAX_INSPECT_OVERLAPS,
+        },
+    )?;
+    if overlaps["coverage"] != "complete" {
+        gaps.push("literal_path_overlap_coverage_is_partial_or_unknown");
+    }
+
+    let (attempt_action, attempt_block) = match exact_current_attempt {
+        Some(attempt) => {
+            if attempt.task_revision != row.revision {
+                ("forbidden", Some("current_attempt_revision_is_stale"))
+            } else if p.role == Role::Manager && attempt.owner_id != p.client_id {
+                (
+                    "forbidden",
+                    Some("current_attempt_is_owned_by_another_manager"),
+                )
+            } else if !matches!(
+                attempt.state.as_str(),
+                "reserved" | "running" | "needs_correction"
+            ) {
+                ("forbidden", Some("current_attempt_state_is_not_reusable"))
+            } else {
+                ("use_existing", None)
+            }
+        }
+        None if row.current_attempt_id.is_some() => {
+            ("forbidden", Some("current_attempt_record_missing"))
+        }
+        None if hard_blocks.is_empty() => ("claim_new", None),
+        None => ("forbidden", None),
+    };
+    if let Some(block) = attempt_block {
+        hard_blocks.push(block);
+    }
+
+    let attempt_binding = if let Some(attempt) = exact_current_attempt {
+        match (&attempt.binding_id, attempt.binding_generation) {
+            (Some(binding_id), Some(generation)) => {
+                let detail = binding_summary(db, binding_id, generation)?;
+                let route_alias = detail["route"]["alias"].as_str();
+                if route_alias.is_some_and(|alias| alias != request.route) {
+                    hard_blocks.push("requested_route_differs_from_current_attempt_binding");
+                }
+                json!({
+                    "binding_id":binding_id,
+                    "generation":generation,
+                    "state":detail["state"],
+                    "route_alias":route_alias,
+                    "runtime_kind":detail["route"]["runtime"]
+                        .as_str()
+                        .map(safe_route_runtime)
+                        .unwrap_or("unknown"),
+                    "connection":detail["observation"]["connection"],
+                    "live_qualified":false,
+                })
+            }
+            _ => json!({"status":"no_exact_binding_recorded"}),
+        }
+    } else {
+        Value::Null
+    };
+    let capacity = match exact_current_attempt {
+        Some(attempt) => exact_attempt_capacity(db, attempt)?,
+        None => json!({
+            "status":"unknown",
+            "capacity_available":null,
+            "reason":"no_exact_attempt_binding_or_owner_route_selected",
+            "full_scope_capacity_claimed":false,
+        }),
+    };
+    if capacity["scope_capacity_available"].is_null() {
+        gaps.push("full_provider_runtime_capacity_not_proven");
+    }
+
+    let attempt_projection = match exact_current_attempt {
+        Some(attempt) => json!({
+            "status":"current",
+            "attempt_id":attempt.attempt_id,
+            "task_revision":attempt.task_revision,
+            "state":attempt.state,
+            "owner":owner_profile(db,&attempt.owner_id)?,
+            "start_owner":attempt.start_owner,
+            "start_operation_id":attempt.start_operation_id,
+            "created_at_ms":attempt.created_at_ms,
+            "updated_at_ms":attempt.updated_at_ms,
+            "binding":attempt_binding,
+            "submission_ref":attempt.submission_ref,
+        }),
+        None => json!({
+            "status":if row.current_attempt_id.is_some() {"record_missing"} else {"none"},
+            "attempt_id":row.current_attempt_id,
+        }),
+    };
+    let candidate_scope = json!({
+        "current_attempt_candidate_ref":exact_current_attempt.and_then(|attempt| attempt.candidate_ref.as_deref()),
+        "task_accepted_candidate_ref":row.accepted_candidate_ref,
+        "candidate_artifact_bytes_read":false,
+        "candidate_validation":"reference_only",
+    });
+    if !candidate_scope["current_attempt_candidate_ref"].is_string()
+        && !candidate_scope["task_accepted_candidate_ref"].is_string()
+    {
+        gaps.push("no_retained_candidate_reference_for_current_scope");
+    }
+
+    let action = if hard_blocks.is_empty() {
+        attempt_action
+    } else {
+        "forbidden"
+    };
+    let readiness = if !hard_blocks.is_empty() {
+        "blocked"
+    } else {
+        // The Store has no launch manifest, route capability receipt,
+        // workspace lease, or full-scope capacity proof.
+        "unknown"
+    };
+    let mut plan = json!({
+        "preview_only":true,
+        "effects":"none",
+        "launch_implemented":false,
+        "preview_readiness":readiness,
+        "task":{
+            "task_id":row.task_id,
+            "project_id":row.project_id,
+            "revision":row.revision,
+            "expected_revision":request.expected_task_revision,
+            "state":row.state,
+            "accepted_attempt_id":row.accepted_attempt_id,
+            "accepted_operation_id":row.accepted_operation_id,
+            "accepted_candidate_ref":row.accepted_candidate_ref,
+            "task_brief":task_brief,
+            "work_scope":work_scope,
+            "updated_at_ms":row.updated_at_ms,
+        },
+        "attempt_action":action,
+        "current_attempt":attempt_projection,
+        "candidate_scope":candidate_scope,
+        "queue_context":{
+            "rank":{"status":"not_recorded"},
+            "claim_readiness":claim_readiness,
+            "dependencies":dependencies,
+            "prior_launch_operations":launch_operations,
+        },
+        "workspace":launch_workspace_projection(&request),
+        "route":route,
+        "mcp":mcp_profile,
+        "capacity":capacity,
+        "overlap":overlaps,
+        "requested_plan_facts":{
+            "budget":request.budget,
+            "stop_conditions":request.stop_conditions,
+            "purpose":request.purpose,
+            "enforceability":"not_recorded_until_a_durable_launch_manifest_exists",
+        },
+        "hard_blocks":hard_blocks,
+        "coverage":if gaps.is_empty() {"complete"} else {"partial"},
+        "gaps":gaps,
+    });
+    let mut detached_references = vec![json!({
+        "method":"task.get",
+        "params":{"task_id":row.task_id},
+    })];
+    if let Some(attempt_id) = attempt_projection["attempt_id"].as_str() {
+        detached_references.push(json!({
+            "method":"swarm.agent.inspect",
+            "params":{"attempt_id":attempt_id},
+        }));
+    }
+    detached_references.push(json!({
+        "method":"swarm.queue.get",
+        "params":{"project_id":row.project_id,"limit":DASHBOARD_PAGE_LIMIT},
+    }));
+    let canonical = model::canonical(&plan)?;
+    let plan_digest = format!("sha256:{}", model::digest(canonical.as_bytes()));
+    plan["plan_digest"] = json!(plan_digest);
+    let canonical = model::canonical(&plan)?;
+    if canonical.len() <= projection::MAX_SERIALIZED_BYTES {
+        return Ok(plan);
+    }
+
+    Ok(json!({
+        "plan_digest":plan_digest,
+        "preview_only":true,
+        "effects":"none",
+        "launch_implemented":false,
+        "preview_readiness":readiness,
+        "task":{
+            "task_id":row.task_id,
+            "project_id":row.project_id,
+            "revision":row.revision,
+            "expected_revision":request.expected_task_revision,
+            "state":row.state,
+        },
+        "attempt_action":action,
+        "current_attempt":attempt_projection,
+        "context_detached":{
+            "status":"detached",
+            "serialized_bytes":canonical.len(),
+            "digest":model::digest(canonical.as_bytes()),
+            "references":detached_references,
+        },
+        "hard_blocks":hard_blocks,
+        "coverage":"partial",
+        "gaps":["combined_launch_preview_exceeded_serialized_budget; use the exact linked read projections"],
+    }))
+}
+
 fn queue_page(db: &Connection, params_value: &Value, brief_limit: usize) -> Result<Value> {
     model::fields(
         params_value,
@@ -1020,7 +1666,7 @@ fn check_page(db: &Connection, attempt_id: &str, page: PageRequest) -> Result<Va
 
 fn current_scope_overlaps(
     db: &Connection,
-    target: &AttemptRow,
+    target_attempt_id: Option<&str>,
     project_id: &str,
     own_paths: &[String],
     page: PageRequest,
@@ -1076,7 +1722,7 @@ fn current_scope_overlaps(
     let rows = statement
         .query_map(
             params![
-                target.attempt_id,
+                target_attempt_id.unwrap_or(""),
                 project_id,
                 paths_json,
                 i64::try_from(MAX_MATCHED_PATHS).unwrap_or(8),
@@ -1483,7 +2129,7 @@ pub(super) fn agent_inspect(db: &Connection, p: &Principal, params_value: &Value
     }
     let overlaps = current_scope_overlaps(
         db,
-        &attempt,
+        Some(&attempt.attempt_id),
         &task_project(db, &attempt.task_id)?,
         own_initial_paths,
         overlap_page,

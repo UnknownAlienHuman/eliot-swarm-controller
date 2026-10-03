@@ -307,6 +307,14 @@ enum CoordinationCommand {
         #[command(subcommand)]
         command: CardCommand,
     },
+    Consult {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    Watch {
+        #[command(subcommand)]
+        command: CoordinationWatchCommand,
+    },
     Send {
         #[arg(long)]
         file: PathBuf,
@@ -342,6 +350,21 @@ enum ParticipantCommand {
 #[derive(Subcommand)]
 enum PeerCommand {
     Find {
+        #[arg(long)]
+        file: PathBuf,
+    },
+}
+#[derive(Subcommand)]
+enum CoordinationWatchCommand {
+    Create {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    List {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    Cancel {
         #[arg(long)]
         file: PathBuf,
     },
@@ -417,6 +440,10 @@ enum AutomationConfigCommand {
 #[derive(Subcommand)]
 enum LauncherCommand {
     Dashboard {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    Preview {
         #[arg(long)]
         file: PathBuf,
     },
@@ -749,6 +776,20 @@ async fn run(cli: Cli) -> Result<()> {
                     ("coordination.contract_card.list".into(), read_json(&file)?)
                 }
             },
+            CoordinationCommand::Consult { file } => {
+                ("coordination.consult".into(), read_json(&file)?)
+            }
+            CoordinationCommand::Watch { command } => match command {
+                CoordinationWatchCommand::Create { file } => {
+                    ("coordination.watch.create".into(), read_json(&file)?)
+                }
+                CoordinationWatchCommand::List { file } => {
+                    ("coordination.watch.list".into(), read_json(&file)?)
+                }
+                CoordinationWatchCommand::Cancel { file } => {
+                    ("coordination.watch.cancel".into(), read_json(&file)?)
+                }
+            },
             CoordinationCommand::Send { file } => ("coordination.send".into(), read_json(&file)?),
             CoordinationCommand::Inbox { file } => ("coordination.inbox".into(), read_json(&file)?),
             CoordinationCommand::Context { file } => {
@@ -780,6 +821,7 @@ async fn run(cli: Cli) -> Result<()> {
         },
         Command::Launcher { command } => match command {
             LauncherCommand::Dashboard { file } => ("swarm.dashboard".into(), read_json(&file)?),
+            LauncherCommand::Preview { file } => ("swarm.launch.preview".into(), read_json(&file)?),
             LauncherCommand::Queue { command } => match command {
                 LauncherQueueCommand::Get { file } => ("swarm.queue.get".into(), read_json(&file)?),
             },
@@ -883,9 +925,11 @@ async fn run(cli: Cli) -> Result<()> {
             | "automation.config.preview"
             | "automation.config.explain"
             | "swarm.dashboard"
+            | "swarm.launch.preview"
             | "swarm.queue.get"
             | "swarm.agent.inspect"
             | "swarm.exceptions.get"
+            | "coordination.watch.list"
     );
     if !is_read {
         if !params.is_object() {

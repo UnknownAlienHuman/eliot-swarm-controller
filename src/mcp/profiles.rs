@@ -64,7 +64,11 @@ pub(super) fn allows_method(profile: McpToolProfile, method: &str) -> bool {
                 | "coordination.contract_card.publish"
                 | "coordination.contract_card.withdraw"
                 | "coordination.send"
+                | "coordination.consult"
                 | "coordination.inbox"
+                | "coordination.watch.create"
+                | "coordination.watch.list"
+                | "coordination.watch.cancel"
                 | "review.get"
                 | "review.list"
                 | "swarm.review.context"
@@ -130,6 +134,10 @@ pub(super) fn allows_method(profile: McpToolProfile, method: &str) -> bool {
                 | "swarm.queue.get"
                 | "swarm.agent.inspect"
                 | "swarm.exceptions.get"
+                | "swarm.launch.preview"
+                | "coordination.watch.create"
+                | "coordination.watch.list"
+                | "coordination.watch.cancel"
         ),
         McpToolProfile::Gm => {
             (allows_method(McpToolProfile::Manager, method)

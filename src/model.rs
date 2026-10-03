@@ -198,6 +198,7 @@ pub const PARTICIPANT_READ_METHODS: &[&str] = &[
     "coordination.contract_card.get",
     "coordination.contract_card.list",
     "coordination.inbox",
+    "coordination.watch.list",
     "operation.get",
 ];
 
@@ -207,6 +208,9 @@ pub const PARTICIPANT_MUTATION_METHODS: &[&str] = &[
     "coordination.contract_card.publish",
     "coordination.contract_card.withdraw",
     "coordination.send",
+    "coordination.consult",
+    "coordination.watch.create",
+    "coordination.watch.cancel",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -519,13 +523,18 @@ pub fn response(id: Value, result: Result<Value>) -> Value {
 /// particular, an accidental client.hello/token must never become a receipt.
 pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
     let allowed: &[&str] = match method {
+        "coordination.watch.create" | "coordination.watch.cancel" => {
+            crate::coordination::watch::validate_mutation(method, params)?;
+            return Ok(());
+        }
         "coordination.participant.register"
         | "coordination.participant.disable"
         | "coordination.work_card.publish"
         | "coordination.work_card.withdraw"
         | "coordination.contract_card.publish"
         | "coordination.contract_card.withdraw"
-        | "coordination.send" => {
+        | "coordination.send"
+        | "coordination.consult" => {
             crate::coordination::validate_mutation(method, params)?;
             return Ok(());
         }

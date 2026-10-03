@@ -8,7 +8,7 @@
 // live in observe.mjs so they can be exercised here without a host.
 // Run:  node selftest.mjs
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import net from 'node:net';
 import { randomUUID } from 'node:crypto';
@@ -154,10 +154,13 @@ const AT_MS = 1780000000123;
   const stateDir=path.join(dir,'state');
   const home=path.join(dir,'native-home');
   await mkdir(stateDir);await mkdir(home);
+  // A prior bridge launch persists realpath(museHome), which can be a Windows
+  // 8.3 path even though route_defaults retains the long path.
+  const canonicalHome=await realpath(home);
   const ownerFile=path.join(stateDir,'owner.json');
   const token='fixture-reboot-boot';
   await writeFile(ownerFile,JSON.stringify({version:1,process:{purpose:'module'},token}));
-  const nativeScope=`muse:${process.platform}:${process.platform==='win32'?home.toLowerCase():home}`;
+  const nativeScope=`muse:${process.platform}:${process.platform==='win32'?canonicalHome.toLowerCase():canonicalHome}`;
   const saved=structuredClone(checkpointFixture.state);
   saved.module_artifact_id='muse-sdk-1.3.0-bridge.7';
   saved.native_scope=nativeScope;

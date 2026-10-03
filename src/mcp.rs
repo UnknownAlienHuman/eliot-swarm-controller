@@ -220,6 +220,38 @@ static TOOLS: &[(bool, ToolSpec)] = &[
         &[],
     ),
     read(
+        "swarm.launch.preview",
+        "Preview one exact Task launch configuration under current manager authority. This validates configuration only; it never starts a model or native session.",
+        &[
+            f("task_id", S),
+            f("expected_task_revision", I),
+            f("route", S),
+            f("agent_profile", S),
+            f("mcp_profile", S),
+            f("mcp_surface", S),
+            f("workspace_policy", S),
+            f("requested_model", SN),
+            f("requested_effort", SN),
+            f("budget", O),
+            f("stop_conditions", A),
+            f("purpose", S),
+        ],
+        &[
+            "task_id",
+            "expected_task_revision",
+            "route",
+            "agent_profile",
+            "mcp_profile",
+            "mcp_surface",
+            "workspace_policy",
+            "requested_model",
+            "requested_effort",
+            "budget",
+            "stop_conditions",
+            "purpose",
+        ],
+    ),
+    read(
         "coordination.participant.get",
         "Read one participant registration only within an authenticated current Task/Attempt scope.",
         &[
@@ -323,6 +355,18 @@ static TOOLS: &[(bool, ToolSpec)] = &[
         "coordination.inbox",
         "Read bounded durable deliveries addressed to the authenticated Participant in its exact current scope.",
         &[f("limit", I), f("after_operation_id", S)],
+        &[],
+    ),
+    read(
+        "coordination.watch.list",
+        "Page one-shot terminal-operation watches in the authenticated Participant scope or an exact Manager/Operator Task/Attempt scope.",
+        &[
+            f("task_id", S),
+            f("task_revision", I),
+            f("attempt_id", S),
+            f("limit", I),
+            f("after_watch_id", S),
+        ],
         &[],
     ),
     read(
@@ -562,6 +606,58 @@ static TOOLS: &[(bool, ToolSpec)] = &[
         "Deliver a bounded non-null JSON body to one active Participant in the same current Task/Attempt scope; this is typed coordination, not raw mailbox access.",
         &[f("recipient", S), f("body", "non_null_json")],
         &["recipient", "body"],
+    ),
+    mutation(
+        "coordination.consult",
+        "Resolve one exact card owner and ask one bounded question only when that unique live owner's card lacks the requested field.",
+        &[
+            f("target", O),
+            f("field", S),
+            f("question_kind", S),
+            f("question", S),
+            f("why_needed", S),
+            f("expected_answer", S),
+            f("blocking", B),
+            f("reply_deadline_ms", IN),
+            f("evidence_refs", A),
+        ],
+        &[
+            "target",
+            "field",
+            "question_kind",
+            "question",
+            "why_needed",
+            "expected_answer",
+            "blocking",
+            "evidence_refs",
+        ],
+    ),
+    mutation(
+        "coordination.watch.create",
+        "Create one bounded, one-shot operation-terminal watch in the authenticated Participant scope or exact Manager/Operator Task/Attempt scope.",
+        &[
+            f("watch_kind", S),
+            f("address", O),
+            f("expires_at_ms", I),
+            f("delivery", S),
+            f("one_shot", B),
+            f("task_id", S),
+            f("task_revision", I),
+            f("attempt_id", S),
+        ],
+        &[
+            "watch_kind",
+            "address",
+            "expires_at_ms",
+            "delivery",
+            "one_shot",
+        ],
+    ),
+    mutation(
+        "coordination.watch.cancel",
+        "Cancel one watch by its exact ID; the stored watch scope is reauthorized before the change.",
+        &[f("watch_id", S)],
+        &["watch_id"],
     ),
     mutation(
         "review.assign",
@@ -1002,10 +1098,100 @@ fn input_schema(spec: &ToolSpec, read_only: bool, require_request_id: bool) -> A
     if !required.is_empty() {
         schema["required"] = json!(required);
     }
+    refine_input_schema(spec.method, &mut schema);
     match schema {
         Value::Object(map) => Arc::new(map),
         _ => unreachable!("schema literal is an object"),
     }
+}
+
+fn refine_input_schema(method: &str, schema: &mut Value) {
+    let properties = &mut schema["properties"];
+    match method {
+        "coordination.consult" => {
+            properties["target"] = json!({
+                "oneOf": [
+                    {"type":"object","properties":{"contract_key":{"type":"string","minLength":1,"maxLength":256}},"required":["contract_key"],"additionalProperties":false},
+                    {"type":"object","properties":{"path":{"type":"string","minLength":1,"maxLength":1024}},"required":["path"],"additionalProperties":false},
+                    {"type":"object","properties":{"symbol":{"type":"string","minLength":1,"maxLength":1024}},"required":["symbol"],"additionalProperties":false},
+                    {"type":"object","properties":{"interface":{"type":"string","minLength":1,"maxLength":1024}},"required":["interface"],"additionalProperties":false}
+                ]
+            });
+            properties["field"] = json!({"type":"string","minLength":1,"maxLength":128});
+            properties["question_kind"] = json!({
+                "type":"string",
+                "enum":["contract_shape","integration_point","identity","failure_semantics","status_fact","assumption_check","scope_overlap","compatibility","predecessor_fact"]
+            });
+            properties["question"] = json!({"type":"string","minLength":1,"maxLength":2048});
+            properties["why_needed"] = json!({"type":"string","minLength":1,"maxLength":1024});
+            properties["expected_answer"] = json!({"const":"one_fact"});
+            properties["reply_deadline_ms"] = json!({"type":["integer","null"],"minimum":1});
+            properties["evidence_refs"] = json!({
+                "type":"array","maxItems":32,"uniqueItems":true,
+                "items":{"type":"string","minLength":1,"maxLength":512}
+            });
+        }
+        "coordination.watch.create" => {
+            properties["watch_kind"] = json!({"const":"operation_terminal"});
+            properties["address"] = json!({
+                "type":"object",
+                "properties":{"operation_id":{"type":"string","minLength":1,"maxLength":512}},
+                "required":["operation_id"],
+                "additionalProperties":false
+            });
+            properties["expires_at_ms"] = json!({"type":"integer","minimum":1});
+            properties["delivery"] = json!({"const":"mailbox_header"});
+            properties["one_shot"] = json!({"const":true});
+            properties["task_id"] = json!({"type":"string","minLength":1,"maxLength":512});
+            properties["task_revision"] = json!({"type":"integer","minimum":1});
+            properties["attempt_id"] = json!({"type":"string","minLength":1,"maxLength":512});
+            require_all_or_none_scope(schema);
+        }
+        "coordination.watch.list" => {
+            properties["task_id"] = json!({"type":"string","minLength":1,"maxLength":512});
+            properties["task_revision"] = json!({"type":"integer","minimum":1});
+            properties["attempt_id"] = json!({"type":"string","minLength":1,"maxLength":512});
+            properties["limit"] = json!({"type":"integer","minimum":1,"maximum":50});
+            properties["after_watch_id"] = json!({"type":"string","minLength":1,"maxLength":512});
+            require_all_or_none_scope(schema);
+        }
+        "swarm.launch.preview" => {
+            properties["task_id"] = json!({"type":"string","minLength":1,"maxLength":512});
+            properties["expected_task_revision"] = json!({"type":"integer","minimum":1});
+            for name in ["route", "agent_profile", "mcp_profile", "mcp_surface"] {
+                properties[name] = json!({"type":"string","minLength":1,"maxLength":256});
+            }
+            properties["workspace_policy"] = json!({"const":"manager_owned_worktree"});
+            for name in ["requested_model", "requested_effort"] {
+                properties[name] = json!({"type":["string","null"],"maxLength":256});
+            }
+            properties["budget"] = json!({
+                "type":"object",
+                "properties":{
+                    "max_turns":{"type":["integer","null"],"minimum":0,"maximum":9223372036854775807_i64},
+                    "max_duration_ms":{"type":["integer","null"],"minimum":0,"maximum":9223372036854775807_i64},
+                    "max_cost_units":{"type":["integer","null"],"minimum":0,"maximum":9223372036854775807_i64}
+                },
+                "required":["max_turns","max_duration_ms","max_cost_units"],
+                "additionalProperties":false
+            });
+            properties["stop_conditions"] = json!({
+                "type":"array","maxItems":16,
+                "items":{"type":"string","minLength":1,"maxLength":512}
+            });
+            properties["purpose"] = json!({"type":"string","minLength":1,"maxLength":128});
+        }
+        _ => {}
+    }
+}
+
+fn require_all_or_none_scope(schema: &mut Value) {
+    schema["allOf"] = json!([{
+        "oneOf": [
+            {"not":{"anyOf":[{"required":["task_id"]},{"required":["task_revision"]},{"required":["attempt_id"]}]}},
+            {"required":["task_id","task_revision","attempt_id"]}
+        ]
+    }]);
 }
 
 fn field_schema(kind: &str) -> Value {
@@ -1896,6 +2082,29 @@ pub(crate) fn profiled_facade(
     Ok(ProfiledFacade::with_surface(facade, profile, surface))
 }
 
+/// Validate a launch-preview target MCP presentation using the same rules as
+/// the configured facade. This describes server-side configuration only; it
+/// does not establish that a native harness loaded or acknowledged the tools.
+pub(crate) fn launch_profile_surface(
+    profile: McpToolProfile,
+    surface_name: &str,
+    groups: &[String],
+    manual_tools: &[String],
+) -> Result<Value> {
+    let surface = catalog::Surface::configured(profile, Some(surface_name), groups, manual_tools)
+        .map_err(|error| Error::invalid(error.to_string()))?;
+    let suggested = surface.suggested();
+    let core = catalog::role_core(surface.core);
+    Ok(json!({
+        "surface_id": suggested.id,
+        "core_role": suggested.core_role,
+        "core": suggested.core,
+        "core_methods": core.methods,
+        "deferred_groups": suggested.deferred_groups,
+        "manual_tools": suggested.exact_manual_methods,
+    }))
+}
+
 fn method_not_found(method: &str) -> McpError {
     McpError::new(
         rmcp::model::ErrorCode::METHOD_NOT_FOUND,
@@ -2251,6 +2460,7 @@ mod tests {
             "swarm.queue.get",
             "swarm.agent.inspect",
             "swarm.exceptions.get",
+            "swarm.launch.preview",
             "coordination.participant.get",
             "coordination.participant.list",
             "coordination.peer.find",
@@ -2259,6 +2469,7 @@ mod tests {
             "coordination.contract_card.get",
             "coordination.contract_card.list",
             "coordination.inbox",
+            "coordination.watch.list",
             "review.get",
             "review.list",
             "swarm.review.context",
@@ -2303,6 +2514,9 @@ mod tests {
             "coordination.contract_card.publish",
             "coordination.contract_card.withdraw",
             "coordination.send",
+            "coordination.consult",
+            "coordination.watch.create",
+            "coordination.watch.cancel",
             "review.assign",
             "review.submit",
             "automation.config.apply",
@@ -2310,11 +2524,11 @@ mod tests {
         .into_iter()
         .collect();
         assert_eq!(methods, expected);
-        assert_eq!(TOOLS.len(), 83);
-        assert_eq!(TOOLS.iter().filter(|(read_only, _)| *read_only).count(), 42);
+        assert_eq!(TOOLS.len(), 88);
+        assert_eq!(TOOLS.iter().filter(|(read_only, _)| *read_only).count(), 44);
         assert_eq!(
             TOOLS.iter().filter(|(read_only, _)| !*read_only).count(),
-            41
+            44
         );
     }
 

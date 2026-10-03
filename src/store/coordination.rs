@@ -13,7 +13,7 @@ use crate::{
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 const LIVE_ATTEMPT_STATES: &[&str] = &[
     "reserved",
@@ -38,6 +38,12 @@ struct IndexedCard {
     client_id: String,
     card_kind: String,
     identity: String,
+}
+
+struct ConsultCardMatch {
+    indexed: IndexedCard,
+    participant: ScopeData,
+    card: Value,
 }
 
 struct ParticipantOperationRecord {
@@ -72,6 +78,9 @@ pub(crate) fn authorize_participant_mutation(
             | "coordination.contract_card.publish"
             | "coordination.contract_card.withdraw"
             | "coordination.send"
+            | "coordination.consult"
+            | "coordination.watch.create"
+            | "coordination.watch.cancel"
     ) {
         return Err(Error::new(
             "FORBIDDEN",
@@ -95,6 +104,141 @@ pub(crate) fn list_scope_participants(
 ) -> Result<Value> {
     let scope = manager_scope(db, principal, task_id, task_revision, attempt_id)?;
     list_participant_page(db, &scope, limit, after_client_id)
+}
+
+/// Resolve the exact scope used by participant coordination and watch methods.
+/// Participants may never override their Task/Attempt identity; Managers and
+/// Operators must name one exact current assignment they are authorized to
+/// inspect.
+pub(crate) fn watch_scope(
+    db: &Connection,
+    principal: &Principal,
+    task_id: Option<&str>,
+    task_revision: Option<i64>,
+    attempt_id: Option<&str>,
+) -> Result<Value> {
+    let scope = match principal.role {
+        Role::Participant => {
+            if task_id.is_some() || task_revision.is_some() || attempt_id.is_some() {
+                return Err(Error::invalid(
+                    "participants use their authenticated Task/Attempt scope",
+                ));
+            }
+            load_current_scope(db, principal)?
+        }
+        Role::Manager | Role::Operator => {
+            let (Some(task_id), Some(task_revision), Some(attempt_id)) =
+                (task_id, task_revision, attempt_id)
+            else {
+                return Err(Error::invalid(
+                    "manager watch calls require task_id, task_revision, and attempt_id",
+                ));
+            };
+            manager_scope(db, principal, task_id, task_revision, attempt_id)?
+        }
+        _ => {
+            return Err(Error::new(
+                "FORBIDDEN",
+                "watch scope requires a Participant or authorized manager",
+            ));
+        }
+    };
+    Ok(scope_projection(&scope))
+}
+
+/// Revalidate the persisted watch creator without constructing an authenticated
+/// Principal. Expected revocation or stale-scope outcomes return `None` so the
+/// shared reconciler can settle quietly; storage and invariant errors propagate.
+pub(crate) fn watch_scope_for_creator(
+    db: &Connection,
+    creator_role: &str,
+    creator_id: &str,
+    task_id: &str,
+    task_revision: i64,
+    attempt_id: &str,
+) -> Result<Option<Value>> {
+    let Some(registration) = meta(db, &format!("client:{creator_id}"))? else {
+        return Ok(None);
+    };
+    if registration["disabled"] == true || registration["role"] != creator_role {
+        return Ok(None);
+    }
+    match creator_role {
+        "participant" => {
+            let scope = match load_current_scope_for_client(db, creator_id) {
+                Ok(scope) => scope,
+                Err(error) if is_stale_watch_authority(&error) => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            if scope.task["task_id"] != task_id
+                || scope.task["revision"] != task_revision
+                || scope.attempt["attempt_id"] != attempt_id
+            {
+                return Ok(None);
+            }
+            Ok(Some(scope_projection(&scope)))
+        }
+        "manager" | "operator" => {
+            let task = match tasks::get_task(db, task_id) {
+                Ok(task) => task,
+                Err(error) if error.code == "NOT_FOUND" => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            if task["state"] != "open"
+                || task["revision"] != task_revision
+                || task["current_attempt_id"] != attempt_id
+            {
+                return Ok(None);
+            }
+            let attempt = match tasks::get_attempt(db, attempt_id) {
+                Ok(attempt) => attempt,
+                Err(error) if error.code == "NOT_FOUND" => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            if let Err(error) =
+                validate_current_attempt(&task, &attempt, task_id, task_revision, attempt_id)
+            {
+                if error.code == "STALE_PARTICIPANT" {
+                    return Ok(None);
+                }
+                return Err(error);
+            }
+            let authorized = if creator_role == "operator" {
+                match super::require_local_operator(db, creator_id) {
+                    Ok(()) => true,
+                    Err(error) if error.code == "LOCAL_OPERATOR_MISMATCH" => false,
+                    Err(error) => return Err(error),
+                }
+            } else {
+                let is_attempt_owner = attempt["owner_id"] == creator_id;
+                let is_current_gm = gm::record(db)?
+                    .is_some_and(|designation| designation["client_id"] == creator_id);
+                is_attempt_owner || is_current_gm
+            };
+            if !authorized {
+                return Ok(None);
+            }
+            Ok(Some(scope_projection(&ScopeData {
+                registration: Value::Null,
+                task,
+                attempt,
+                scope_id: keys::scope_id(task_id, task_revision, attempt_id)?,
+            })))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn is_stale_watch_authority(error: &Error) -> bool {
+    matches!(
+        error.code.as_str(),
+        "NOT_FOUND"
+            | "FORBIDDEN"
+            | "UNAUTHORIZED"
+            | "STALE_PARTICIPANT"
+            | "STALE_REVISION"
+            | "PARTICIPANT_NOT_ASSIGNED"
+    )
 }
 
 /// Resolve configured auditor profiles through the exact pending-slot index.
@@ -392,6 +536,9 @@ pub(super) fn apply(
         }
         "coordination.send" => {
             send(tx, principal, value, config, operation_id, now).map(|value| (value, false))
+        }
+        "coordination.consult" => {
+            consult(tx, principal, value, config, operation_id, now).map(|value| (value, false))
         }
         _ => Err(Error::new(
             "METHOD_NOT_FOUND",
@@ -1201,7 +1348,7 @@ fn required_registration_text<'a>(registration: &'a Value, field: &str) -> Resul
         .ok_or_else(|| Error::new("STALE_PARTICIPANT", format!("registration lacks {field}")))
 }
 
-fn attach_operation_scope(
+pub(super) fn attach_operation_scope(
     tx: &Transaction<'_>,
     operation_id: &str,
     task_id: &str,
@@ -2503,6 +2650,7 @@ fn inbox(db: &Connection, principal: &Principal, value: &Value) -> Result<Value>
     let scope = load_current_scope(db, principal)?;
     let limit = keys::parse_page(value.get("limit"), 20)?;
     let after = keys::optional_cursor(value, "after_operation_id")?;
+    let watch_notifications = super::coordination_watch::notifications(db, principal, 20)?;
     if scope.registration["inbound_policy"] == "hold" {
         return Ok(json!({
             "items":[],
@@ -2512,6 +2660,7 @@ fn inbox(db: &Connection, principal: &Principal, value: &Value) -> Result<Value>
             "inbound_policy":"hold",
             "availability":"held_by_inbound_policy",
             "next_after":null,
+            "watch_notifications":watch_notifications,
             "coverage":"complete",
             "gaps":[],
         }));
@@ -2520,7 +2669,8 @@ fn inbox(db: &Connection, principal: &Principal, value: &Value) -> Result<Value>
         let row: Option<(i64, String)> = db
             .query_row(
                 "SELECT created_at_ms,result_json FROM operations \
-                 WHERE operation_id=?1 AND caller_id<>?2 AND method='coordination.send' \
+                 WHERE operation_id=?1 AND caller_id<>?2 \
+                   AND method IN ('coordination.send','coordination.consult') \
                    AND state='settled' AND json_extract(result_json,'$.recipient')=?2",
                 params![operation_id, principal.client_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
@@ -2579,16 +2729,25 @@ fn inbox(db: &Connection, principal: &Principal, value: &Value) -> Result<Value>
             stale = stale.saturating_add(1);
             continue;
         };
-        let operation: Option<(String, i64, String, String)> = db
+        let operation: Option<(String, String, i64, String, String)> = db
             .query_row(
-                "SELECT caller_id,created_at_ms,original_request_json,result_json \
-                 FROM operations WHERE operation_id=?1 AND method='coordination.send' \
+                "SELECT method,caller_id,created_at_ms,original_request_json,result_json \
+                 FROM operations WHERE operation_id=?1 \
+                   AND method IN ('coordination.send','coordination.consult') \
                    AND state='settled'",
                 [operation_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .optional()?;
-        let Some((sender, created_at, request_json, result_json)) = operation else {
+        let Some((method, sender, created_at, request_json, result_json)) = operation else {
             stale = stale.saturating_add(1);
             continue;
         };
@@ -2602,7 +2761,7 @@ fn inbox(db: &Connection, principal: &Principal, value: &Value) -> Result<Value>
             || index["task_revision"] != scope.task["revision"]
             || index["attempt_id"] != scope.attempt["attempt_id"]
             || index["created_at_ms"] != created_at
-            || request["recipient"] != principal.client_id
+            || (method == "coordination.send" && request["recipient"] != principal.client_id)
         {
             stale = stale.saturating_add(1);
             continue;
@@ -2612,7 +2771,20 @@ fn inbox(db: &Connection, principal: &Principal, value: &Value) -> Result<Value>
             break;
         }
         let envelope: Value = serde_json::from_str(model::text(&result, "text")?)?;
-        if envelope["body"] != request["body"] {
+        let body_matches = if method == "coordination.send" {
+            envelope["body"] == request["body"]
+        } else {
+            consult_delivery_matches(
+                &result,
+                &request,
+                &envelope["body"],
+                &scope,
+                &sender,
+                &principal.client_id,
+                operation_id,
+            )?
+        };
+        if !body_matches {
             stale = stale.saturating_add(1);
             continue;
         }
@@ -2623,6 +2795,7 @@ fn inbox(db: &Connection, principal: &Principal, value: &Value) -> Result<Value>
             "recipient":principal.client_id,
             "sent_at_ms":created_at,
             "payload_digest":result["payload_digest"],
+            "kind":if method == "coordination.consult" { "consult" } else { "message" },
             "body":envelope["body"],
         }));
         last_operation = Some(operation_id.to_owned());
@@ -2640,6 +2813,7 @@ fn inbox(db: &Connection, principal: &Principal, value: &Value) -> Result<Value>
         "attempt_id":scope.attempt["attempt_id"],
         "inbound_policy":scope.registration["inbound_policy"],
         "next_after":next_after,
+        "watch_notifications":watch_notifications,
         "coverage":if partial { "partial" } else { "complete" },
         "gaps":if stale > 0 { json!([{"kind":"stale_mailbox_records","count":stale}]) } else if scan_more { json!([{"kind":"inbox_scan_bound","count":null}]) } else { json!([]) },
     }))
@@ -2663,6 +2837,42 @@ fn delivery_matches_scope(result: &Value, scope: &ScopeData, recipient: &str) ->
         && result["task_id"] == scope.task["task_id"]
         && result["task_revision"] == scope.task["revision"]
         && result["attempt_id"] == scope.attempt["attempt_id"])
+}
+
+fn consult_delivery_matches(
+    result: &Value,
+    request: &Value,
+    body: &Value,
+    scope: &ScopeData,
+    sender: &str,
+    recipient: &str,
+    operation_id: &str,
+) -> Result<bool> {
+    let consult = match keys::parse_consult_request(request) {
+        Ok(consult) => consult,
+        Err(_) => return Ok(false),
+    };
+    let evidence_digest = evidence_set_digest(&consult.evidence_refs)?;
+    Ok(result["delivery_created"] == true
+        && result["delivery_operation_id"] == operation_id
+        && result["ask_id"] == body["ask_id"]
+        && result["ask"] == *body
+        && body["schema"] == "eliot.coordination.consult.v1"
+        && body["task_id"] == scope.task["task_id"]
+        && body["task_revision"] == scope.task["revision"]
+        && body["attempt_id"] == scope.attempt["attempt_id"]
+        && body["sender"] == sender
+        && body["recipient"] == recipient
+        && body["target"] == consult_target_json(&consult)
+        && body["field"] == consult.field
+        && body["question_kind"] == consult.question_kind
+        && body["question"] == consult.question
+        && body["why_needed"] == consult.why_needed
+        && body["expected_answer"] == consult.expected_answer
+        && body["blocking"] == consult.blocking
+        && body["reply_deadline_ms"] == consult.reply_deadline_ms
+        && body["evidence_refs"] == json!(consult.evidence_refs)
+        && body["evidence_set_digest"] == evidence_digest)
 }
 
 fn participant_operation_get(
@@ -2769,4 +2979,473 @@ fn send(
         "text":mailbox_result["text"],
         "delivery":"durable_mailbox_only",
     }))
+}
+
+fn consult(
+    tx: &Transaction<'_>,
+    principal: &Principal,
+    value: &Value,
+    config: &Config,
+    operation_id: &str,
+    now: i64,
+) -> Result<Value> {
+    principal.require_participant()?;
+    let request = keys::parse_consult_request(value)?;
+    let sender = load_current_scope(tx, principal)?;
+    let (cards, index_more, stale) = consult_matching_cards(tx, &sender, &request)?;
+    if index_more || stale > 0 {
+        return scoped_consult_result(
+            tx,
+            operation_id,
+            &sender,
+            json!({
+                "status":"unknown_coverage",
+                "owner_state":"unknown_coverage",
+                "target":consult_target_json(&request),
+                "field":request.field,
+                "delivery_created":false,
+                "coverage":"partial",
+                "gaps":[{
+                    "kind":if index_more { "consult_relevance_scan_bound" } else { "stale_consult_card_index_entries" },
+                    "count":if index_more { Value::Null } else { json!(stale) },
+                }],
+            }),
+        );
+    }
+
+    let field_matches: Vec<&ConsultCardMatch> = cards
+        .iter()
+        .filter(|candidate| {
+            candidate.card["fields"]
+                .get(&request.field)
+                .is_some_and(|answer| !answer.is_null())
+        })
+        .collect();
+    if field_matches.len() == 1 {
+        let candidate = field_matches[0];
+        let selected_fields = json!([request.field]);
+        let card = project_card(&candidate.card, Some(&selected_fields))?;
+        let mut answer = serde_json::Map::new();
+        answer.insert(
+            request.field.clone(),
+            card["fields"]
+                .get(request.field.as_str())
+                .cloned()
+                .unwrap_or(Value::Null),
+        );
+        return scoped_consult_result(
+            tx,
+            operation_id,
+            &sender,
+            json!({
+                "status":"answered_from_card",
+                "owner_state":"exact_owner",
+                "target":consult_target_json(&request),
+                "field":request.field,
+                "card_revision":card["card_revision"],
+                "card_digest":card["material_digest"],
+                "answer":Value::Object(answer),
+                "source":{
+                    "client_id":candidate.indexed.client_id,
+                    "card_kind":candidate.indexed.card_kind,
+                    "identity":candidate.indexed.identity,
+                },
+                "delivery_created":false,
+                "coverage":"complete",
+                "gaps":[],
+            }),
+        );
+    }
+    if field_matches.len() > 1 {
+        return scoped_consult_result(
+            tx,
+            operation_id,
+            &sender,
+            json!({
+                "status":"multiple_candidates",
+                "owner_state":"multiple_candidates",
+                "target":consult_target_json(&request),
+                "field":request.field,
+                "card_fact_count":field_matches.len(),
+                "candidates":consult_candidates(&field_matches),
+                "delivery_created":false,
+                "coverage":"complete",
+                "gaps":[],
+            }),
+        );
+    }
+
+    let mut owner_matches = Vec::new();
+    let mut seen_owners = BTreeSet::new();
+    for candidate in cards
+        .iter()
+        .filter(|candidate| candidate.indexed.client_id != principal.client_id)
+    {
+        if seen_owners.insert(candidate.indexed.client_id.clone()) {
+            owner_matches.push(candidate);
+        }
+    }
+    if owner_matches.is_empty() {
+        return scoped_consult_result(
+            tx,
+            operation_id,
+            &sender,
+            json!({
+                "status":"unowned",
+                "owner_state":"unowned",
+                "target":consult_target_json(&request),
+                "field":request.field,
+                "delivery_created":false,
+                "coverage":"complete",
+                "manager_attention":if request.blocking {
+                    json!({"created":false,"gap":"blocking_unowned_attention_not_implemented"})
+                } else {
+                    Value::Null
+                },
+                "gaps":if request.blocking {
+                    json!([{"kind":"manager_attention_not_recorded"}])
+                } else {
+                    json!([])
+                },
+            }),
+        );
+    }
+    if owner_matches.len() > 1 {
+        return scoped_consult_result(
+            tx,
+            operation_id,
+            &sender,
+            json!({
+                "status":"multiple_candidates",
+                "owner_state":"multiple_candidates",
+                "target":consult_target_json(&request),
+                "field":request.field,
+                "candidates":consult_candidates(&owner_matches),
+                "delivery_created":false,
+                "coverage":"complete",
+                "gaps":[],
+            }),
+        );
+    }
+
+    let recipient = &owner_matches[0].indexed.client_id;
+    let evidence_set_digest = evidence_set_digest(&request.evidence_refs)?;
+    let fingerprint = consult_fingerprint(
+        &sender,
+        &principal.client_id,
+        recipient,
+        &request,
+        &evidence_set_digest,
+    )?;
+    let ask_id = fingerprint.clone();
+    let consult_key = keys::consult_key(&sender.scope_id, &fingerprint);
+    if let Some(existing) = meta(tx, &consult_key)? {
+        let Some(existing_operation_id) = existing["operation_id"].as_str() else {
+            return scoped_consult_result(
+                tx,
+                operation_id,
+                &sender,
+                stale_consult_result(&request, "stale_consult_fingerprint_record"),
+            );
+        };
+        let existing_operation = match operations::get_operation(tx, existing_operation_id) {
+            Ok(operation) => operation,
+            Err(error) if error.code == "NOT_FOUND" => {
+                return scoped_consult_result(
+                    tx,
+                    operation_id,
+                    &sender,
+                    stale_consult_result(&request, "stale_consult_operation"),
+                );
+            }
+            Err(error) => return Err(error),
+        };
+        let existing_result = &existing_operation["result"];
+        if existing["fingerprint"] != fingerprint
+            || existing["ask_id"] != ask_id
+            || existing["recipient"] != recipient.as_str()
+            || existing_operation["caller_id"] != principal.client_id
+            || existing_operation["method"] != "coordination.consult"
+            || existing_operation["state"] != "settled"
+            || existing_operation["task_id"] != sender.task["task_id"]
+            || existing_operation["attempt_id"] != sender.attempt["attempt_id"]
+            || existing_result["ask_id"] != ask_id
+            || existing_result["recipient"] != recipient.as_str()
+        {
+            return scoped_consult_result(
+                tx,
+                operation_id,
+                &sender,
+                stale_consult_result(&request, "consult_coalescing_record_mismatch"),
+            );
+        }
+        return scoped_consult_result(
+            tx,
+            operation_id,
+            &sender,
+            json!({
+                "operation_id":operation_id,
+                "status":"coalesced",
+                "owner_state":"exact_owner",
+                "ask_id":ask_id,
+                "delivery_operation_id":existing_operation_id,
+                "delivery_id":existing_result["delivery_id"],
+                "sender":principal.client_id,
+                "recipient":recipient,
+                "task_id":sender.task["task_id"],
+                "task_revision":sender.task["revision"],
+                "attempt_id":sender.attempt["attempt_id"],
+                "ask":existing_result["ask"],
+                "delivery_created":false,
+                "delivery":"durable_mailbox_only",
+            }),
+        );
+    }
+
+    let ask = json!({
+        "schema":"eliot.coordination.consult.v1",
+        "ask_id":ask_id,
+        "task_id":sender.task["task_id"],
+        "task_revision":sender.task["revision"],
+        "attempt_id":sender.attempt["attempt_id"],
+        "sender":principal.client_id,
+        "recipient":recipient,
+        "target":consult_target_json(&request),
+        "field":request.field,
+        "question_kind":request.question_kind,
+        "question":request.question,
+        "why_needed":request.why_needed,
+        "expected_answer":request.expected_answer,
+        "blocking":request.blocking,
+        "reply_deadline_ms":request.reply_deadline_ms,
+        "evidence_refs":request.evidence_refs,
+        "evidence_set_digest":evidence_set_digest,
+        "created_at_ms":now,
+    });
+    let sent = send(
+        tx,
+        principal,
+        &json!({
+            "client_request_id":request.client_request_id,
+            "recipient":recipient,
+            "body":ask,
+        }),
+        config,
+        operation_id,
+        now,
+    )?;
+    set_meta(
+        tx,
+        &consult_key,
+        &json!({
+            "ask_id":ask_id,
+            "fingerprint":fingerprint,
+            "operation_id":operation_id,
+            "recipient":recipient,
+            "task_id":sender.task["task_id"],
+            "task_revision":sender.task["revision"],
+            "attempt_id":sender.attempt["attempt_id"],
+        }),
+    )?;
+    let mut result = sent;
+    result["status"] = json!("asked");
+    result["owner_state"] = json!("exact_owner");
+    result["ask_id"] = json!(ask_id);
+    result["delivery_operation_id"] = json!(operation_id);
+    result["ask"] = ask;
+    result["delivery_created"] = json!(true);
+    Ok(result)
+}
+
+fn consult_matching_cards(
+    db: &Connection,
+    sender: &ScopeData,
+    request: &keys::ConsultRequest,
+) -> Result<(Vec<ConsultCardMatch>, bool, usize)> {
+    let prefix =
+        keys::relevance_prefix(&sender.scope_id, request.target_kind, &request.target_value);
+    let upper = format!("{prefix}g");
+    let raw_limit = keys::MAX_INBOX_SCAN;
+    let mut statement = db.prepare(
+        "SELECT key,value_json FROM meta WHERE key>=?1 AND key<?2 ORDER BY key LIMIT ?3",
+    )?;
+    let raw: Vec<(String, String)> = statement
+        .query_map(params![prefix, upper, raw_limit + 1], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
+        .collect::<std::result::Result<_, _>>()?;
+    let index_more = raw.len() as i64 > raw_limit;
+    let mut cards = Vec::new();
+    let mut stale = 0usize;
+    for (index_key, raw_index) in raw.iter().take(raw_limit as usize) {
+        let index: Value = match serde_json::from_str(raw_index) {
+            Ok(index) => index,
+            Err(_) => {
+                stale = stale.saturating_add(1);
+                continue;
+            }
+        };
+        let Some(client_id) = index.get("client_id").and_then(Value::as_str) else {
+            stale = stale.saturating_add(1);
+            continue;
+        };
+        let Some(card_kind) = index.get("card_kind").and_then(Value::as_str) else {
+            stale = stale.saturating_add(1);
+            continue;
+        };
+        let Some(identity) = index.get("identity").and_then(Value::as_str) else {
+            stale = stale.saturating_add(1);
+            continue;
+        };
+        if !matches!(card_kind, "work" | "contract")
+            || keys::relevance_key(
+                &sender.scope_id,
+                request.target_kind,
+                &request.target_value,
+                client_id,
+                card_kind,
+                identity,
+            ) != index_key.as_str()
+        {
+            stale = stale.saturating_add(1);
+            continue;
+        }
+        let indexed = IndexedCard {
+            client_id: client_id.to_owned(),
+            card_kind: card_kind.to_owned(),
+            identity: identity.to_owned(),
+        };
+        let participant = match load_current_scope_for_client(db, client_id) {
+            Ok(participant) => participant,
+            Err(_) => {
+                stale = stale.saturating_add(1);
+                continue;
+            }
+        };
+        if participant.scope_id != sender.scope_id {
+            stale = stale.saturating_add(1);
+            continue;
+        }
+        let Some(card) = current_card(db, &sender.scope_id, card_kind, identity, client_id)? else {
+            stale = stale.saturating_add(1);
+            continue;
+        };
+        if card["client_id"] != client_id
+            || card["task_id"] != sender.task["task_id"]
+            || card["task_revision"] != sender.task["revision"]
+            || card["attempt_id"] != sender.attempt["attempt_id"]
+            || card["card_kind"] != card_kind
+            || card["identity"] != identity
+        {
+            stale = stale.saturating_add(1);
+            continue;
+        }
+        let indexed_fields = indexable_card_fields(&card["fields"], card_kind, identity);
+        let exact_term = keys::indexed_terms(&indexed_fields, card_kind)
+            .get(&request.target_kind)
+            .is_some_and(|terms| terms.contains(&request.target_value));
+        if !exact_term {
+            stale = stale.saturating_add(1);
+            continue;
+        }
+        cards.push(ConsultCardMatch {
+            indexed,
+            participant,
+            card,
+        });
+    }
+    Ok((cards, index_more, stale))
+}
+
+fn consult_candidates(matches: &[&ConsultCardMatch]) -> Value {
+    let mut candidates = BTreeMap::<String, Value>::new();
+    for candidate in matches {
+        candidates
+            .entry(candidate.indexed.client_id.clone())
+            .or_insert_with(|| {
+                json!({
+                    "client_id":candidate.indexed.client_id,
+                    "display_alias":candidate.participant.registration["display_alias"],
+                    "card_kind":candidate.indexed.card_kind,
+                    "identity":candidate.indexed.identity,
+                })
+            });
+    }
+    let mut items: Vec<Value> = candidates.into_values().collect();
+    let truncated = items.len() > 20;
+    items.truncate(20);
+    json!({"items":items,"truncated":truncated})
+}
+
+fn consult_target_json(request: &keys::ConsultRequest) -> Value {
+    let field = match request.target_kind {
+        keys::TermKind::Contract => "contract_key",
+        keys::TermKind::Path => "path",
+        keys::TermKind::Symbol => "symbol",
+        keys::TermKind::Interface => "interface",
+    };
+    let mut target = serde_json::Map::new();
+    target.insert(field.to_owned(), json!(request.target_value));
+    Value::Object(target)
+}
+
+fn consult_fingerprint(
+    sender: &ScopeData,
+    sender_id: &str,
+    recipient: &str,
+    request: &keys::ConsultRequest,
+    evidence_set_digest: &str,
+) -> Result<String> {
+    let fingerprint = json!({
+        "task_id":sender.task["task_id"],
+        "task_revision":sender.task["revision"],
+        "attempt_id":sender.attempt["attempt_id"],
+        "sender":sender_id,
+        "participation_basis":sender.registration["participation_basis"],
+        "recipient":recipient,
+        "target":{"kind":request.target_kind.as_str(),"value":request.target_value},
+        "field":request.field,
+        "question_kind":request.question_kind,
+        "question":request.question,
+        "why_needed":request.why_needed,
+        "expected_answer":request.expected_answer,
+        "blocking":request.blocking,
+        "reply_deadline_ms":request.reply_deadline_ms,
+        "evidence_set_digest":evidence_set_digest,
+    });
+    Ok(model::digest(model::canonical(&fingerprint)?.as_bytes()))
+}
+
+fn evidence_set_digest(evidence_refs: &[String]) -> Result<String> {
+    let mut sorted = evidence_refs.to_vec();
+    sorted.sort();
+    Ok(model::digest(model::canonical(&json!(sorted))?.as_bytes()))
+}
+
+fn stale_consult_result(request: &keys::ConsultRequest, gap: &str) -> Value {
+    json!({
+        "status":"unknown_coverage",
+        "owner_state":"unknown_coverage",
+        "target":consult_target_json(request),
+        "field":request.field,
+        "delivery_created":false,
+        "coverage":"partial",
+        "gaps":[{"kind":gap}],
+    })
+}
+
+fn scoped_consult_result(
+    tx: &Transaction<'_>,
+    operation_id: &str,
+    sender: &ScopeData,
+    result: Value,
+) -> Result<Value> {
+    attach_operation_scope(
+        tx,
+        operation_id,
+        sender.task["task_id"].as_str().unwrap_or_default(),
+        sender.attempt["attempt_id"].as_str().unwrap_or_default(),
+        &sender.attempt,
+    )?;
+    Ok(result)
 }

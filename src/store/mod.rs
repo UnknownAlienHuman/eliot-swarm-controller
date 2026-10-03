@@ -6,6 +6,7 @@ mod automation_dispatch;
 pub(crate) mod capacity;
 mod checks;
 mod coordination;
+mod coordination_watch;
 mod forge;
 mod gm;
 mod launcher;
@@ -187,6 +188,18 @@ impl Store {
             let result = automation_dispatch::reconcile(&tx, 16, 64, model::now_ms()?)?;
             // The cursor, pending reasons, semantic slot and Operation are
             // durable before the host can observe an admitted action.
+            tx.commit()?;
+            Ok(result)
+        })
+        .await
+    }
+
+    /// Scoped watches share the host reconciler. Notification headers are
+    /// passive facts and never enqueue native work.
+    pub(crate) async fn reconcile_watches_once(&self) -> Result<Value> {
+        self.run(move |db| {
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let result = coordination_watch::reconcile(&tx, 32, model::now_ms()?)?;
             tx.commit()?;
             Ok(result)
         })
@@ -405,6 +418,9 @@ impl Store {
                         return mutate(db, &principal, &method, &params, &config);
                     }
                     if model::PARTICIPANT_READ_METHODS.contains(&method.as_str()) {
+                        if method == "coordination.watch.list" {
+                            return coordination_watch::read(db, &principal, &params);
+                        }
                         if method == "operation.get" {
                             let id = model::text(&params, "operation_id")?;
                             if reviews::authorize_operation_read(db, &principal, id).is_ok() {
@@ -836,6 +852,7 @@ fn is_read(method: &str) -> bool {
             | "coordination.contract_card.get"
             | "coordination.contract_card.list"
             | "coordination.inbox"
+            | "coordination.watch.list"
             | "review.get"
             | "review.list"
             | "swarm.review.context"
@@ -846,6 +863,7 @@ fn is_read(method: &str) -> bool {
             | "swarm.queue.get"
             | "swarm.agent.inspect"
             | "swarm.exceptions.get"
+            | "swarm.launch.preview"
             | "check.profiles"
             | "artifact.get"
             | "artifact.parts"
@@ -883,6 +901,16 @@ fn participant_method_allowed(method: &str) -> bool {
                 | "check.get"
         )
 }
+// Watch ownership is checked against the live assignment in its handler;
+// these two methods are shared with Manager/Operator identities.
+fn participant_only_mutation(method: &str) -> bool {
+    model::PARTICIPANT_MUTATION_METHODS.contains(&method)
+        && !matches!(
+            method,
+            "coordination.watch.create" | "coordination.watch.cancel"
+        )
+}
+
 fn page(params: &Value) -> Result<(i64, i64)> {
     let integer = |name, default| -> Result<i64> {
         match params.get(name) {
@@ -948,7 +976,7 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
         )
     )
     OR (
-        op.method IN ('message.send', 'coordination.send')
+        op.method IN ('message.send', 'coordination.send', 'coordination.consult')
         AND op.state = 'settled'
         AND json_type(op.result_json, '$.sender') = 'text'
         AND json_extract(op.result_json, '$.sender') = op.caller_id
@@ -1130,15 +1158,17 @@ fn mcp_authorization(db: &Connection, p: &Principal, value: &Value) -> Result<Va
         }
         Role::Operator => {
             require_local_operator(db, &p.client_id)?;
-            allowed.extend(methods.into_iter().filter(|method| {
-                !model::PARTICIPANT_MUTATION_METHODS.contains(method) && *method != "review.submit"
-            }));
+            allowed.extend(
+                methods.into_iter().filter(|method| {
+                    !participant_only_mutation(method) && *method != "review.submit"
+                }),
+            );
         }
         Role::Manager => {
             let gm_authority = gm::require_authority(db, p).is_ok();
             revision_context["current_gm_authority"] = json!(gm_authority);
             allowed.extend(methods.into_iter().filter(|method| {
-                !model::PARTICIPANT_MUTATION_METHODS.contains(method)
+                !participant_only_mutation(method)
                     && *method != "review.submit"
                     && (gm_authority
                         || !matches!(
@@ -1162,6 +1192,7 @@ fn mcp_authorization(db: &Connection, p: &Principal, value: &Value) -> Result<Va
                         | "swarm.queue.get"
                         | "swarm.agent.inspect"
                         | "swarm.exceptions.get"
+                        | "swarm.launch.preview"
                         | "review.get"
                         | "review.list"
                         | "swarm.review.context"
@@ -1207,6 +1238,7 @@ fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config
         | "coordination.contract_card.get"
         | "coordination.contract_card.list"
         | "coordination.inbox" => coordination::read(db, p, method, v),
+        "coordination.watch.list" => coordination_watch::read(db, p, v),
         "review.get" | "review.list" | "swarm.review.context" => reviews::read(db, p, method, v),
         "automation.config.get" => automation::get(db, p, v),
         "automation.config.preview" => automation::preview(db, p, v),
@@ -1215,6 +1247,7 @@ fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config
         "swarm.queue.get" => launcher::queue_get(db, p, v),
         "swarm.agent.inspect" => launcher::agent_inspect(db, p, v),
         "swarm.exceptions.get" => launcher::exceptions_get(db, p, v),
+        "swarm.launch.preview" => launcher::launch_preview(db, p, v, config),
         "check.get" => checks::describe(db, v),
         "check.profiles" => {
             model::fields(v, &[])?;
@@ -1619,13 +1652,17 @@ fn apply(
         check_plan,
     } = context;
     match method {
+        "coordination.watch.create" | "coordination.watch.cancel" => {
+            coordination_watch::apply(tx, p, method, v, id, now)
+        }
         "coordination.participant.register"
         | "coordination.participant.disable"
         | "coordination.work_card.publish"
         | "coordination.work_card.withdraw"
         | "coordination.contract_card.publish"
         | "coordination.contract_card.withdraw"
-        | "coordination.send" => coordination::apply(tx, p, method, v, config, id, now),
+        | "coordination.send"
+        | "coordination.consult" => coordination::apply(tx, p, method, v, config, id, now),
         "review.assign" => {
             let request = crate::review::ReviewAssignRequest::parse(v)?;
             reviews::reserve_assign(tx, reviews::ReviewActor::Direct(p), &request, id, now)
