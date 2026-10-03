@@ -127,11 +127,9 @@ mod os {
             }
         }
         pub fn children_empty(&self) -> Result<bool> {
-            // ActiveProcesses can briefly lag a signaled child at leader exit.
-            // Enumerate this exact Job and pin each candidate process before
-            // deciding whether a live descendant remains. This also tolerates
-            // terminated PIDs retained in a just-updated Job inventory without
-            // treating a reused PID as owned.
+            // Job accounting can retain exited PIDs briefly, so inspect the
+            // exact Job's current PID inventory and pin each candidate before
+            // deciding whether a live descendant remains.
             for pid in members(self.job)? {
                 if pid == std::process::id() {
                     continue;
@@ -151,18 +149,25 @@ mod os {
                         }
                         return Err(error.into());
                     }
-                    let is_live_member = (|| -> Result<bool> {
-                        if wait_process_signaled(handle, 0)? {
-                            return Ok(false);
+                    let signaled = match wait_process_signaled(handle, 0) {
+                        Ok(signaled) => signaled,
+                        Err(error) => {
+                            CloseHandle(handle);
+                            return Err(error);
                         }
-                        let mut owned = 0;
-                        if IsProcessInJob(handle, self.job, &mut owned) == 0 {
-                            return Err(std::io::Error::last_os_error().into());
-                        }
-                        Ok(owned != 0)
-                    })();
+                    };
+                    if signaled {
+                        CloseHandle(handle);
+                        continue;
+                    }
+                    let mut owned = 0;
+                    if IsProcessInJob(handle, self.job, &mut owned) == 0 {
+                        let error = std::io::Error::last_os_error();
+                        CloseHandle(handle);
+                        return Err(error.into());
+                    }
                     CloseHandle(handle);
-                    if is_live_member? {
+                    if owned != 0 {
                         return Ok(false);
                     }
                 }

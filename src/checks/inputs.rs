@@ -1089,11 +1089,10 @@ fn execute_probe(request: ProbeRequest) -> ProbeResponse {
     // Check and clear the owned process group before joining the pipe readers.
     // A child can outlive the command while retaining an inherited pipe; joining
     // first would then wait for EOF and could miss that child after it exits.
-    let had_descendants = owner
-        .group
-        .children_empty()
-        .map(|empty| !empty)
-        .unwrap_or(true);
+    let (had_descendants, membership_diagnostic) = match owner.group.children_empty() {
+        Ok(empty) => (!empty, None),
+        Err(error) => (false, Some(cleanup_error_diagnostic(&error))),
+    };
     let cleanup = if had_descendants {
         let _ = owner.group.cancel_children();
         owner.release()
@@ -1119,10 +1118,12 @@ fn execute_probe(request: ProbeRequest) -> ProbeResponse {
     let stderr = stderr_result.unwrap_or_default();
     let child_status = child_status.or(exit_status);
     let exit_code = child_status.and_then(|status| status.code());
+    let membership_failed = membership_diagnostic.is_some();
     let success = group_empty
         && !timed_out
         && !output_limited
         && !had_descendants
+        && !membership_failed
         && readers_ok
         && child_status.is_some_and(|status| status.success());
     ProbeResponse {
@@ -1131,18 +1132,26 @@ fn execute_probe(request: ProbeRequest) -> ProbeResponse {
         output_limited,
         exit_code,
         group_empty,
-        message: match (cleanup_diagnostic, had_descendants) {
-            (Some(diagnostic), true) => {
+        message: match (membership_diagnostic, cleanup_diagnostic, had_descendants) {
+            (Some(membership), Some(cleanup), _) => {
+                format!(
+                    "input probe process group membership check failed; {membership}; {cleanup}"
+                )
+            }
+            (Some(membership), None, _) => {
+                format!("input probe process group membership check failed; {membership}")
+            }
+            (None, Some(diagnostic), true) => {
                 format!("input probe left descendants after its command exited; {diagnostic}")
             }
-            (Some(diagnostic), false) => {
+            (None, Some(diagnostic), false) => {
                 format!("input probe process group could not be released; {diagnostic}")
             }
-            (None, true) => "input probe left descendants after its command exited".into(),
-            (None, false) if !group_empty => {
+            (None, None, true) => "input probe left descendants after its command exited".into(),
+            (None, None, false) if !group_empty => {
                 "input probe process group could not be released".into()
             }
-            (None, false) if !readers_ok => "input probe output reader failed".into(),
+            (None, None, false) if !readers_ok => "input probe output reader failed".into(),
             _ => String::new(),
         },
         stdout,
