@@ -1,95 +1,76 @@
-# Agent Operations — Manual Control and Opt-in Rust Automation
+# Agent Operations — Manager-Owned Automation
 
-Revision 3 · reviewed 2026-10-03 · source baseline `504199d14135c030ad3951a3c5023a098a3d03f0`.
+Revision 4 · 2026-10-03 · reviewed against main `504199d14135c030ad3951a3c5023a098a3d03f0`.
 
-**Status: design and implementation contract; not implemented or live-qualified behavior.** This revision updates the six existing PR #23 documents together. PR #22 and the owner's installation are not changed.
+**Status: proposed Rust implementation and documentation contract, not shipped functionality.** This revision corrects the existing six PR #23 documents in place. PR #22 and the user's installation are unchanged.
 
-## Product decision
+## Product rule
 
-**Manual management is the default and a complete product path. Automation is an optional tool explicitly configured and activated by an authorized manager.** Registering agents, importing a work pool, selecting a preset, granting permissions or increasing fleet size must not activate it.
+**Management is manual by default. A manager may enable whichever automations help with their work. Those automations execute on that manager's behalf.**
 
-A manager can work with one or several agents by selecting every task, launch, audit, correction, continuation and publication. The same manager can later delegate selected transitions for a larger pool without changing the work's identity or moving to another controller.
+There is no application-wide choice between manual, assisted and delegated modes. Manual commands and enabled automations coexist. With no automations enabled, the manager chooses every step. Enabling an audit handoff does not enable distribution, repair or publication.
 
 ```text
-                        one durable Rust control plane
-                                      |
-             +------------------------+-----------------------+
-             |                                                |
-    manual control (default)                       delegated transitions (opt-in)
-    manager chooses each next step                 manager chooses scope and stages once
-             |                                                |
-             +---- same Task / Attempt / Operation handlers ---+
-                                      |
-                    exact candidate, audit and effect evidence
+manager issues a command -----------------------+
+                                               |
+manager enables an automation                  v
+  -> matching event/time -> act for manager -> same Rust action handler
+                                               |
+                                      retained Operation/result
 ```
 
-Observation is independent of unattended execution. Dashboard, native streams, bounded Git/GitHub reads, direct peer communication and authoritative result recording continue for configured sources in manual mode. They do not ask models for status or start work.
+The manager can configure, enable, edit or disable their automations through one small configuration interface. No additional Root approval or special automation grant is required for actions already permitted to that manager. Actions the manager cannot perform directly remain unavailable through automation.
 
-## Read only what the work needs
+Every automatic invocation records the owning manager, the automation and its triggering event, and the service that executed it. This is explicit attribution, not token sharing, a forged human GitHub author or a second manager identity.
 
-- [Configuration](configuration.md): manual default, manager activation, stage selection, pause/resume, runtime preferences and examples.
-- [Architecture](architecture.md): Rust boundaries, shared admission, control/effect ordering, monitoring, hooks, cron, Goal, scripts and recovery.
-- [Delivery](delivery.md): complete manual path, optional queue distribution, audit, repair and GitHub publication.
-- [Donor map](donor-map.md): inspected source, official contracts and the limits of adopted ideas.
-- [Implementation](implementation.md): O1–O11 ownership, integration order and acceptance scenarios.
+## Read only what the change needs
 
-These documents form one contract, not a chain of superseding appendices. Configuration owns control settings; Architecture owns execution guarantees; Delivery owns transitions. Source evidence never grants authority. PR #22 supplies Participant identities, communication, watches, launcher and deferred MCP concepts; implement each only once.
+- [Configuration](configuration.md): per-automation enablement, manager ownership, models/runtimes and the MCP editing path.
+- [Architecture](architecture.md): Rust services, on-behalf authorization, observation, hooks, scheduler, Goal, scripts and recovery.
+- [Delivery](delivery.md): manual commands and optional distribution, audit, repair and GitHub effects.
+- [Donor map](donor-map.md): source evidence, useful existing components and limits of reuse.
+- [Implementation](implementation.md): O1–O11 production paths and qualification cases.
 
-## Control contract at a glance
+These files form one contract. No superseding appendix is required. PR #22 supplies Participant identities, peer coordination, watches, launcher and deferred MCP concepts; implement each once.
 
-| State | Behavior |
-|---|---|
-| `manual` | No unattended execution. Managers issue exact one-shot commands; observations and peer collaboration remain available. |
-| `assisted` | Manual execution plus bounded deterministic suggestions. Suggestions are not queued commands or extra model turns. |
-| `delegated` | Only the manager-selected stages/definitions and scope execute automatically, within current grants and capacity. |
-| Paused delegation | Stop future unattended effect starts; retain settings, pending work and evidence. Already started actions drain or report unknown. |
+## What the manager sees
 
-The mode never changes because of agent count, queue length, model output, a hook, a new plugin or a remembered grant. New projects have no delegated stages, enabled rules/schedules/Goals or automatic GitHub writes.
+A list of their automations, each with `enabled`, scope, trigger/actions, preferred profiles, last/next invocation and any concrete problem. The dashboard may say "Manual control; two automations enabled". It does not require a global mode transition to use a reminder or cron job.
 
-Saving configuration is not activation. A manager can prepare a `reviewed_delivery` definition, inspect its dry run, then explicitly enable selected stages. `manager_gate` controls the final publication decision only; it is not a synonym for fully manual operation.
+Examples of independent choices:
 
-Returning to manual does not kill agents, erase candidates, release occupied worktrees or reverse a sent push. The result identifies queued actions held, running effects, unresolved external continuations and what is safe to control manually. A local stop must not claim it cancelled a native Goal or GitHub auto-merge already accepted elsewhere.
+- Notify an auditor when a verified commit is observed, without starting the auditor.
+- Assign an auditor when an immutable submission is ready, leaving repair and publication manual.
+- Distribute a selected queue using chosen runtimes, while the manager performs all reviews.
+- Run a complete configured review/repair/publication path within the manager's existing rights.
 
-## Non-negotiable boundaries
+Observation, streams, peer messages, requested reminders, ordinary work and manual commands remain usable whether zero or many automations are enabled. Agent count does not change these settings.
 
-**Rust owns every internal subsystem:** host, Store, authorization, configuration, native adapters, process supervision, monitoring, GitHub client, queue/review routing, hooks, scheduler, Goal, reminders, MCP/gateway and script runner. Python and PowerShell are optional user extensions, not mandatory queue/push/recovery components. Existing owned non-Rust bridges are migration inputs; external vendor executables remain external products.
+## Boundaries that still matter
 
-**No software-version pins.** Do not prescribe an obsolete crate, fixed CLI/model release, commit dependency or hash-named executable location. Use maintained Rust libraries, compatible requirements, installed-runtime discovery and actual protocol/capability checks. Observed versions, candidate SHAs and the bytes used by an admitted script are evidence, not restrictions on future software updates.
+**Rust internals:** host, Store, authorization, adapters, monitoring, GitHub client, hooks, distribution/review, scheduler, Goal, MCP/gateway, configuration and script runner are Rust. Python/PowerShell are optional external extensions. Existing owned non-Rust bridges are migration inputs, not the target architecture. Vendor executables remain external products.
 
-**One manager, one mutable worktree and one in-flight product submission.** Writers follow non-overlapping assignments in that worktree, do not run Cargo or change control policy, and cannot publish/accept their own work. Reviewers inspect immutable candidate evidence. The next task cannot mutate a candidate still in review.
+**No software-version pins:** no prescribed old crate, fixed CLI/model release or hash-named executable path. Use maintained libraries, compatible dependency requirements and installed protocol/capability checks. Candidate SHAs, configuration revisions and the bytes of a completed invocation identify evidence; they do not freeze future software.
 
-**Permission is not activation.** A standing grant defines a ceiling; the manager's control decision selects what may run unattended. A configuration editor, script author, auditor or executor does not obtain activation rights merely by being an agent. Managers may delegate configuration preparation; changing effective control requires explicit management authority over that scope.
+**One manager, one mutable worktree and one in-flight product submission.** Writers receive non-overlapping work within that assignment; they do not independently run Cargo, publish or accept their own work. Reviewers read the exact candidate.
 
-## Existing source facts to preserve
+**Same action, same safeguards:** manual and automatic requests share identity, permissions, candidate verification, resource ownership and effect deduplication. An enabled flag cannot bypass a missing publication right, supply reviewer evidence or make an uncertain push safe to repeat.
 
-| Source | Existing behavior | Required extension |
+**Durable settings, not session tricks:** enabled automations belong to a stable manager identity and persist across client disconnect/restart. Recovery checks ownership and unfinished effects before continuing. Disabling stops future starts, not already running agents or remote operations. No mandatory re-enable ceremony on every host restart.
+
+## Existing source anchors
+
+| Unit | Current behavior | Required integration |
 |---|---|---|
-| `src/store/submissions.rs::reserve/finish` | Queued `task.submit` followed by an applied `task.submission` result | Make applied submission available for manual review; dispatch automatically only if enabled. |
-| `src/store/submissions.rs::request_changes` | GM/operator guard; exact-candidate feedback and mail, no native input | Narrow delegated disposition and separate repair dispatch; preserve the manual path and stale-review guards. |
-| `src/policy.rs` | One compiled accepted policy edition and source digest | Preserve historical Attempt evidence when adding explicitly accepted policy editions. |
-| `src/scheduler.rs`, `src/store/schedules.rs` | Configured once/interval CheckRuns and retained receipts | Extend the same Rust scheduler; new schedules default disabled and old receipts remain readable. |
-| `src/mcp/subscriptions.rs` | Committed-fact polling with lag/resync | Shared source projector and separate native content streams, independent of automation mode. |
-| `docs/forge-publication.md` | Accepted exact candidate, non-force publication and uncertain-effect readback | Same safety for manual/delegated execution; review upload and PR merge remain distinct operations. |
-| `docs/owner-decisions.md` | Read-only reports do not change work; `new_work=disabled` drains admissions | Add a scoped automation control gate, not a replacement for host admission or current authority. |
+| `src/store/submissions.rs::reserve/finish` | Queued admission then applied `task.submission` | Review only a retained applied submission. |
+| `src/store/submissions.rs::request_changes` | GM/operator guard; exact feedback and mail, no native input | Implement scoped manager feedback rights explicitly; automation uses those same rights. Repair delivery is a separate action. |
+| `src/policy.rs` | Compiled policy edition and digest | Keep historical Attempts readable while adopting the accepted workflow changes. |
+| `src/scheduler.rs`, `src/store/schedules.rs` | Configured once/interval CheckRuns and retained receipts | Extend the existing scheduler, preserving prior occurrences. |
+| `src/mcp/subscriptions.rs` | Committed-fact polling with lag/resync | Shared Rust projector and separate native content streams. |
+| `docs/forge-publication.md` | Accepted candidate, non-force push, unknown-effect readback | Reuse for both callers; review upload and PR merge have distinct effects. |
 
-## Policy changes when the implementation lands
+When protected manager capabilities are added, update Owner Decisions and code together. An automation never acquires a capability merely because the Rust service can reach an internal function. Preserve current GM/epoch checks where they apply.
 
-Update the relevant Owner Decisions and code together: delegated review/acceptance rights where authorized; opt-in server Goal; dynamic schedules/actions; distinct review upload and publication; Rust integration and compatibility-based updates. Keep historic policy editions readable. Do not edit a documentation hash to manufacture authority.
+## Scope and privacy
 
-Manual and delegated commands must share the same candidate, permission, resource-ownership and verification checks. Manual means the manager selects the action, not that protections or required audits are bypassed.
-
-## Practical use
-
-For a small team, use the normal manager core: inspect, launch one assignment, read streams, choose an auditor, review findings, return or publish. No delivery preset, cron, Goal, GitHub App installation or standing automation grant is required merely to run local manually assigned work.
-
-For a larger team, prepare `reviewed_delivery`, choose writer/auditor profiles and explicitly activate selected transitions. Dispatch and review can be automatic while correction, acceptance and publication remain manual. Alternatively, eligible end-to-end delivery can be delegated inside a standing grant. Scripts are optional in either case.
-
-`audited`, `accepted`, `uploaded`, `merged` and `published` are different facts. A GitHub label is only a projection. Local audit status can update in manual mode; a remote label/comment/write still needs an explicit command or enabled projection policy.
-
-Invalid configuration retains the last valid definition and cannot reset a pause. Future runtime preferences do not restart active agents. Restart resumes unattended work only under the manager's explicit restart policy, not simply because a preset or enabled-looking file exists.
-
-## Validation and privacy
-
-This is a documentation-only PR. No model, script, native hook, scheduler, installer, service or forge action is run against the owner's projects. Source/API research and static example checks are not runtime qualification.
-
-Real deployment endpoints, infrastructure identifiers, credentials and private paths remain local setup inputs. Repository examples use logical handles and placeholders. Historical scripts and deployment audits are evidence, not instructions to reproduce their non-Rust services or auto-enable their workflows.
+This PR edits documentation only; it activates no automation and runs no model, script, hook, installer, scheduler or forge effect. Static review is not runtime qualification. Real deployment endpoints, credentials, infrastructure identifiers and private paths remain local; examples use placeholders.

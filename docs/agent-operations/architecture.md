@@ -1,216 +1,189 @@
-# Agent Operations: Rust Architecture and Service Contracts
+# Agent Operations — Rust Architecture and Execution Contracts
 
-Revision 3 · 2026-10-03 · source baseline `504199d14135c030ad3951a3c5023a098a3d03f0`.
+Revision 4 · 2026-10-03 · source baseline `504199d14135c030ad3951a3c5023a098a3d03f0`.
 
-[Configuration](configuration.md) defines manual/assisted/delegated control. [Delivery](delivery.md) defines work transitions. [Donor map](donor-map.md) distinguishes inspected evidence from design. Proposed methods are not claimed implemented.
+[Configuration](configuration.md) owns per-automation settings; [Delivery](delivery.md) owns work transitions; [Donor map](donor-map.md) separates external evidence from design. New contracts are proposed, not implemented by this document.
 
-## 1. Rust boundary and manual-first operation
+## 1. Rust boundary
 
-All ELIOT-owned internal logic is Rust:
+All ELIOT-owned host, Store, authorization, configuration, native transport/adapters, process supervision, monitoring, GitHub, hooks, distribution/review, cron, Goal, MCP/gateway and script-runner logic is Rust. Python/PowerShell are optional external extensions, not internal services or mandatory wrappers for basic operations.
 
-```text
-host / Store / authorization / configuration / control
-native adapters / transport readers / process supervision
-monitoring / dashboard projections / streams
-Git / GitHub API / webhook validation
-assignment distributor / review router / publication controller
-hooks / actions / cron / Goal / reminders
-MCP facade / gateway / CLI / external-script runner
-```
+Vendor executables remain external products. Rust adapters use actual documented protocols or suitable maintained Rust libraries. Existing owned Python/JS/TS bridges are migration inputs. A capability reachable only through an unacceptable non-Rust owned subsystem remains an explicit integration gap; do not invent parity or copy private vendor internals.
 
-Python/PowerShell are optional external extensions. Normal startup, manual or automated delivery and recovery must work without them. No internal Node gateway, shell merge loop or Python GitHub daemon is introduced.
+No fixed library/CLI/model release is prescribed. Qualify protocol/capability compatibility; preserve observed versions as evidence. New adapter settings affect future bindings, not an unannounced restart of existing work.
 
-Vendor executables remain external products. Rust adapters use documented HTTP/SSE, WebSocket, MCP/ACP or framed stdio interfaces and suitable Rust libraries. Existing owned Python/JS/TS bridges are migration inputs. A feature accessible only through a non-Rust custom plugin is a named integration gap, not permission to hide another owned scripting subsystem or copy commercial SDK internals.
+## 2. One action path, owned by the manager
 
-Accept newer compatible runtimes by protocol/capability evidence. No software-version pins or automatic downgrade to make an old document true. Adapter changes affect future bindings; existing work retains its lifecycle owner until a supported handover.
-
-Manual mode is the first-run state and a complete path through the same services. It means the manager chooses assignments and workflow transitions, not that the native model asks permission for every token/tool or that safety checks are bypassed. Native permission/Goal behavior is separately configured and reported honestly.
-
-## 2. One admission path, two execution authorities
-
-Separate observation, deterministic decisions and effects:
+Manual management is always available. Automations are individual manager-owned definitions, disabled unless that manager enables them. There is no global mode state machine or parallel control service.
 
 ```text
-native/source event or deadline -> validated fact/current projection
-                                  |
-                    manual mode: next action is visible, not executed
-                                  |
-                  explicit manager command OR enabled delegated stage
-                                  |
-             current scope/control/grant/identity/resource checks
-                                  |
-          existing Operation and semantic action slot committed
-                                  |
-                 Rust effect worker outside Store transaction
-                                  |
-                 retained result and actual resource disposition
+explicit manager command -------------------------------+
+                                                       |
+verified event/time -> enabled automation -> its manager |
+                                                       v
+                     common action/object/resource checks
+                                                       |
+                             retained Operation + action slot
+                                                       |
+                        Rust worker performs I/O outside Store
+                                                       |
+                               outcome/evidence/readback
 ```
 
-An invocation is an existing Operation, not a second job state machine. Metadata links cause, selected definition, control/grant revisions, targets and outcome references. Delivery phases are projections.
+A manual action needs no automation object. An automation uses the same rights the owning manager currently has for the configured action and target. Enabling it is sufficient standing instruction within those rights; do not require another per-stage grant or Root approval merely because execution is automatic.
 
-Permission alone is not a trigger. Automatic execution requires a manager-activated control scope, selected stage, selected trigger definition when applicable, a current standing grant and actual capacity. A saved configuration, pool import, completed review, larger queue or model request cannot enable it.
+The service does not acquire the manager's unrestricted credentials. It receives a trusted internal execution context limited to that enabled definition, resolved action and scope. This context is created from Store state, never from an event's `manager_id`, a role name or a public `run_as` parameter.
 
-Direct authorized manual operations remain callable with automation disabled. A manual launch includes its declared finite prerequisites such as workspace preparation and selected runtime start. It does not authorize an endless pool-consumption/review/repair/publication loop. Subsequent workflow stages are independent decisions.
+### 2.1 Authorization and attribution
 
-### 2.1 Provenance and dedupe
+Keep these facts distinct:
 
-Origin is derived from trusted admission, not accepted as a caller-supplied `manual=true` flag. Distinguish direct commands from an authorized management session, explicitly requested notifications/watches, and autonomous rule/schedule/Goal/preset actions.
+```text
+requester / technical executor
+on_behalf_of_manager_id
+automation_id and definition revision, when automatic
+semantic trigger/cause and action slot
+Task / Attempt / candidate / effect target
+actual reviewer or native producer, when recording evidence
+```
 
-Run-scoped credentials for automatically launched models and scripts retain that causal origin. A model with a manager-like job title cannot relabel its new downstream launch/publication as a direct control-manager command. It may finish its already assigned work and report evidence, but new workflow effects remain subject to current control. Management-control credentials are not silently inherited by worker sessions.
+Resolve the manager's current role, scope and existing grants using the shared authorization evaluator. Check again immediately before a consequential effect. Automatic execution cannot do something the manager cannot do directly. Existing GM/epoch, accepted-candidate and repository checks remain authoritative.
 
-Retain request identity and domain-level uniqueness. Examples: one launch slot for the current Task/Attempt, one review slot for `(submission_ref, policy_generation, slot)`, and one publication intent for its exact candidate/target. Manual and automatic callers use the same logical slot. Origin or incidental configuration revision must not produce duplicate work. A slot may reference serial explicitly superseded attempts; at most one may start an effect at a time.
+Use one trusted execution context in the common Rust handlers. Do not change an existing Operation's `caller_id`, forge a manager `Principal`, pass a GM token around, or give the internal scheduler unrestricted writer rights. Add the on-behalf linkage without losing the actual requester and existing receipt identity. Public request parsing rejects an attempt to supply internal execution identity.
 
-Automatic event consideration uses `(scope, semantic cause, action slot, deliberate replay generation)`. Editing a rule does not replay past events. Explicit rerun is a new authorized decision after prior outcome is known; it cannot conceal uncertain delivery.
+Current feedback/acceptance/forge role gates require explicit implementation changes where scoped manager rights are intended. Add those rights to the shared action check for both manual and automatic use; do not add a service-only bypass. Preserve historical policy editions and current candidate checks when updating Owner Decisions.
 
-A new invocation resolves active definitions once and records what it used. The same request ID after a settings change returns the prior receipt. Future independent work may use updated libraries, profiles and scripts; retained identity does not freeze future software.
+A manager launched by another manager is still a manager for its assigned scope. Its real authority, not its launch origin, decides which automations it can configure. Ordinary executors, auditors and script invocations are not promoted by changing a profile title.
 
-### 2.2 Control/effect ordering
+When an automation assigns an auditor, the assignment is on behalf of its manager, but `review.submit` remains attributable to the assigned auditor. A successful script or manager-owned automation cannot fabricate independent review evidence.
 
-Use the existing single Store owner and short transactions. Add the smallest indexed control/current-start linkage needed; do not introduce another coordinator or custom distributed lock service.
+### 2.2 Shared deduplication and execution identity
 
-Before an autonomous worker crosses the effect-start boundary, it revalidates effective control, selected stage/definition, grant, expected candidate and ownership. The transition to effect-started and a pause/manual change serialize through Store. Only then may it perform the corresponding I/O outside the transaction.
+Retain `(caller_id, client_request_id)` receipts. Internal automatic request IDs are deterministically derived from the definition identity, semantic cause and action slot; never use a constant request ID across all owners or an event timestamp alone.
 
-If pause commits first, an unstarted automatic action remains held and cannot use its old admission permission to start. If effect-start commits first, the pause result lists that action as in-flight: a network write may reach the remote after the local pause returned. Do not claim instantaneous rollback of already-started effects.
+Also retain domain-level uniqueness across callers: one current Task launch reservation, one `(submission_ref, review_policy_generation, review_slot)`, and one exact candidate/target publication slot. Manual versus automatic origin is not a separate slot. An incidental rule/config edit does not permit the same effect again.
 
-The started action may finish its originally authorized bounded work, record its outcome and reconcile uncertainty. Its completion cannot automatically admit the next disabled stage. Each independently effectful child of an automation script/preset/model rechecks control; it cannot inherit unlimited start permission from an old parent.
+Distinct automations may legitimately observe the same project or submission. They are not mutually exclusive owners of the entire Task. Only conflicting effect/role/workspace reservations contend. Identical requests coalesce or return an existing reference; incompatible choices report the exact conflict instead of running two auditors in one slot or pushing twice.
 
-A held condition is a projection over the existing queued Operation/control state, not a fabricated success or another authoritative execution state machine. Manual and automatic starts contend for the same slot. A second caller gets the retained in-progress/result reference or a precise conflict, never a second writer/auditor/push.
+Resolve active profiles/scripts for each new invocation and retain that invocation's effective inputs. An identical retry returns its old receipt, not newly resolved settings. A deliberate rerun needs a new explicit decision after the prior outcome is known.
 
-### 2.3 Returning control to the manager
+### 2.3 Disable versus effect start
 
-A restrictive local control change must work without GitHub, a model, script execution or a successful configuration-file reload. It returns control revision, held unstarted actions, started actions, uncertain effects and external continuations. Native readers, result ingestion, read-only reconciliation and dashboard remain active.
+The enabled/revision check and transition to effect-started serialize with disable/update in the existing Store. I/O occurs afterward, outside the transaction.
 
-Do not kill processes, clear native Goals, cancel GitHub requests, delete worktrees or release occupied leases as a side effect of setting manual/paused. Offer exact supported addressed operations separately. A trusted-local script may still perform OS effects while draining; API permission revocation alone is not a process sandbox.
+If disable commits first, an unstarted automatic invocation remains held and cannot start using old admission permission. If effect-start commits first, report it as in-flight; its previously authorized I/O may finish after disable returns. Do not claim instantaneous remote rollback.
 
-Expose `draining` while previously started actions remain, and `external_continuation_unresolved` when a native/remote owner can still continue. Report quiescent manual control only after relevant outcomes/owners are observed, without inferring death from silence. Local manual mode alone cannot disable independently configured GitHub workflows or recall accepted remote auto-merge.
+A started operation may finish its bounded action and record/reconcile its result. Each separate follow-up action consults the currently enabled definition and manager rights. Work already assigned to an executor may finish; turning off audit dispatch does not kill that auditor or revoke its ability to submit evidence.
 
-### 2.4 Manually execute held work without deadlock or double execution
+Never clear native Goals, interrupt models, cancel remote merges, delete worktrees or release live ownership implicitly on disable. Those are separately requested supported actions. A running trusted-local script may continue real OS effects; an API flag is not a sandbox.
 
-The manager's normal typed action may name `expected_pending_operation_id` from the pending-action view. This is not a generic run-any-method tool. It requests a one-shot takeover of the same logical action slot, using the method's ordinary input, candidate guards and manager authority.
+### 2.4 Manual action while automation is pending
 
-Inside one Store transaction, verify that the old automatic Operation still owns the slot and is provably never started. Cancel/supersede that unstarted attempt through the existing guarded cancellation path, append the new manual Operation and atomically link the slot to it. Retain the original request/receipt and an explicit successor reference; do not edit the original caller or claim it was manually authorized all along.
+Manual controls remain available. A manager's normal typed action may name an existing pending operation when choosing to handle it directly. If the automatic operation is provably never started, atomically supersede its queued attempt and link the new manual request to the same logical slot. Preserve both receipts; the old worker's start check must fail.
 
-A racing old worker's start check must fail against that updated slot/control revision. Retrying either request returns its own retained lineage. This is one serial replacement, not a new slot that bypasses duplicate protection. All normal manual effect checks still run.
+If work has started, is sending or has an unknown outcome, return the actual operation/readback reference instead of repeating it. Completed equivalent work returns its result. This shared handler prevents both duplicate execution and a permanently held automatic slot making manual control unusable.
 
-If the prior operation crossed effect-start, is sending or has unknown outcome, takeover is rejected with its exact operation/readback reference. If it already completed, return that fact rather than execute again. Queued replacement cannot bypass stale GM epoch or acceptance rules. No new request identity is ever used to repeat a possibly applied external effect.
+## 3. Continuous monitoring
 
-Implement this once in shared admission/cancellation internals and exercise it from review and publication; merely returning a held automatic receipt forever would leave manual mode unusable.
-
-## 3. Continuous observation in every mode
-
-| Source | Rust path | Limit |
+| Source | Rust path | Truthful coverage |
 |---|---|---|
-| Native stream | Shared adapter reader for a supported connection/scope | Exact binding/root/child/generation; shared-server traffic is not every manager's traffic. |
-| Native snapshot | Shared bounded read-only reconciliation | Partial absence is not termination. |
-| OS processes | Recorded identity plus selective sampler | PID alive is not model progress; query failure is not an empty process set. |
-| Git | Shared hints followed by object/status reads | File event and commit author are not current assignment ownership. |
-| GitHub | Authenticated intake and conditional paged reads | Assignees/labels/comments are external facts, not execution authority. |
-| Store | Committed Task/Attempt/Operation/submission facts | Admission is not completion. |
+| Native stream | Shared reader per supported connection/scope | Verified binding/root/child/generation; shared server traffic is not every manager's traffic. |
+| Native snapshot | Shared bounded read-only reconciliation | Missing/partial data is not proof of termination. |
+| OS process | Recorded start/boot/ownership plus selective metrics | PID alive is not model progress; enumeration failure is not an empty inventory. |
+| Git | Shared change hints plus exact object/status reads | File events and commit authors do not assign current work. |
+| GitHub | Authenticated intake plus conditional paged reads | Comments, labels and assignees are source facts, not runnable instructions. |
+| Store | Committed Task/Attempt/Operation/submission events | Queued admission is not successful completion. |
 
-Configured-source observation continues in manual mode. Source setup is still explicit; opening a local dashboard does not install a GitHub App, hook or remote service. Use events first, shared paced read-only polling when necessary. Never query a model for status or invoke a health CLI that may restart its service.
+Observation works with no automations enabled. Configuring observation does not enable model launch, scripts or remote writes. Use events first and centrally paced read-only polling where necessary. Never ask models for status or invoke a health-check CLI that may restart a shared service.
 
-Recorded process identity includes start/boot/ownership facts. Parent idle, wrapper exit, old mtime and transport loss do not prove that children or native Goals stopped. No heuristic death grants a second writer the same workspace.
+Parent idle, wrapper exit, mtime and tunnel loss do not prove that descendants or native Goal stopped. Preserve actual lifecycle ownership and uncertainty before admitting a replacement writer.
 
 ### 3.1 Dashboard
 
-Join project/repository/Issue/source revision; Task/Attempt/assignment/submission; manager/executor/auditor; binding/native root/child/run/turn; worktree/branch/candidate; and separate process, connection, execution and delivery states.
+Join source Issue/revision; Task/Attempt/assignment/submission; manager/executor/auditor; native binding/root/child/turn; workspace/branch/candidate; process, connection, execution and delivery states without conflating them.
 
-Include current control mode/owner, selected automatic stages, manual holds, paused/draining state, pending manual decisions and external continuations. `awaiting_manager` is not a code defect, timeout-based consent or trigger to prompt that manager repeatedly. A deliberately manual scope with idle agents is not broken automation.
+Show the manager's enabled automations, each configured scope, last/next run, pending manual choices and in-flight/unknown effects. There is no mode gate on the dashboard. Waiting for the manager is not a code defect or reason to send repetitive prompts.
 
-Expose last transport activity separately from material progress, active tools/questions/children, CPU/RSS, account-capacity basis and coverage/gaps. Preserve unknown native statuses instead of mapping them to success. Dashboard reads projections, not serial queries to all agents.
+Transport activity and material progress are separate. Include tool/question/child state, CPU/RSS, shared account capacity and source gaps. Unknown native statuses remain unknown. Reads use maintained projections, not a sequence of model interrogations.
 
-### 3.2 Snapshot, delta and fairness
+### 3.2 Cursors and fairness
 
-Return a consistent committed cut plus controller cursor. Preserve upstream cursors independently; do not promise a globally atomic GitHub/native/OS view. Existing per-subscription committed-fact polling is migrated to a shared Rust projector while preserving lag/resync.
+Return a consistent committed snapshot plus controller high-water cursor. Preserve upstream cursors independently; do not promise a globally atomic native/GitHub/OS view. Migrate per-viewer fact polling to shared intake/projectors while preserving lag/resync.
 
-Live content has a separate presentation sequence. Bound queues and serialized bytes. Slow viewers receive gaps and resync; they cannot block terminal recording, native permission replies or manager control commands. CPU parsing/OS enumeration use bounded blocking workers. No Store transaction waits for network, scripts or models.
+Bound queues and serialized bytes. Reserve control, native reply and completion capacity separately from optional streams, Git scans and scripts. Slow readers receive a gap and reread authoritative state. CPU parsing and OS work use bounded blocking workers; no transaction waits on network, process or model.
 
-## 4. Text and reasoning streams
+## 4. Text, tools and reasoning streams
 
-`stream.open/read/close` select an authorized binding/assignment and content classes. Opening a stream observes; it never starts a model. Support bounded cursor reads and negotiated notifications.
+`stream.open/read/close` observes an authorized assignment/binding; it starts no model. Support cursor pages and qualified notifications.
 
-Expose only content deliberately provided by the native interface: assistant text, reasoning summaries or native reasoning text when supplied, tools, lifecycle and usage. Do not decode hidden/encrypted state or manufacture a reasoning transcript. Mark unavailable/redacted/not-retained content explicitly.
+Expose only deliberately supplied assistant text, reasoning summary/native reasoning text, tool progress/results, lifecycle and usage. Hidden/encrypted reasoning is not decoded or reconstructed. Mark unavailable, redacted and not-retained classes explicitly.
 
-Keep native item/part identities and ordering. Final items supersede matching deltas without double counting. Cumulative usage replaces prior cumulative observations; an unknown billing basis stays unknown.
+Preserve native item/part IDs and order. Final content supersedes matching deltas without double-counting; cumulative usage replaces prior cumulative data. Unknown cost basis stays unknown.
 
-Use shared bounded rings and configured capped artifact chunks, not a full Observation per token or per viewer. Protect secrets spanning chunk boundaries; until streaming redaction is qualified, buffer bounded logical records or omit the sensitive class. Source/reasoning/tool text never becomes a rule or authority. Retention protects active/referenced evidence by ownership, not mtime.
+Use shared bounded rings and optional capped artifact chunks, not full Observations per token or transcript copies per viewer. Redact across chunk boundaries; use bounded logical records or omit sensitive classes until streaming redaction is qualified. Protect referenced evidence by ownership, not file mtime. Text never becomes execution authority.
 
-## 5. Hooks are observation unless an action is explicitly enabled
+## 5. Hooks and event actions
 
-Every installed adapter reports supported native event, phase, correlation fields, lifetime, ordering, veto/output behavior and installation readback. Distinguish `native_blocking`, `native_observational`, ELIOT-only `wrapper`, and `external_hint` requiring verification.
+Report each supported event's native name, phase, correlation, ordering, lifetime, output/veto and installation readback. Distinguish `native_blocking`, `native_observational`, ELIOT-only `wrapper` and `external_hint` needing confirmation.
 
-The Rust `swarm hook emit` helper or adapter ingress authenticates setup-issued scope and bounds input. Observational hooks enqueue facts and return; heavy review/script/publication is never inline. In manual mode a commit/tool hook updates visible state but does not dispatch an auditor or execute a user script.
+Rust `swarm hook emit` or direct adapter ingress authenticates its setup-issued source scope. The callback records bounded facts and returns; it does not run an auditor, Python, GitHub write or model inline. Only a matching enabled manager automation schedules those effects.
 
-Mandatory pre-effect safety checks still apply to manual actions. They are part of the action's authorization, not optional workflow automation. A supported blocking hook uses short local policy, not a model/remote script/Store-lock cycle. Async after-hooks cannot undo effects.
+Mandatory action authorization is not optional automation. A genuine blocking hook may evaluate bounded local policy before its protected effect. Async after-hooks cannot undo an effect. Optional telemetry backlog must not wedge compaction or productive work.
 
-Install through preview/apply preserving user and managed hooks. No implicit service restart, PATH change, interpreter installation or global hooks-path replacement. Enabling hook observation does not enable any associated rule. Optional telemetry loss is a gap and must not wedge compaction.
+Hook installation preserves existing user/managed entries through preview/apply and readback. No hidden service restart, global hooks-path change, PATH edit or interpreter installation. Installing the observer does not enable associated actions.
 
-Actual vendor capabilities remain separate: public OpenCode plugin docs do not prove the installed V2 contract; Gemini CLI is not Gemini Spark; Command's existing listener is observational. Missing optional coverage affects its source only; a missing mandatory protection blocks only the protected operation. Forge keeps controlled suppression of arbitrary Git hooks and exposes Rust action events instead.
+Qualify the actual installed interface: Gemini CLI support does not establish Spark support; public OpenCode plugins are not automatically this project's V2 contract. Forge suppresses uncontrolled Git hooks and exposes Rust before/after action events. Missing mandatory protection blocks its action, not the fleet.
 
-## 6. Rules and causal loops
+## 6. Rules and event loops
 
-Rules use typed predicates/mappings and registered action kinds, not executable strings, arbitrary method selection or prompt-derived authority. Create/save defaults inactive. Simulation is effect-free. Enabling requires manager control over the named definition and its action stages; rule edits cannot unpause or expand the envelope.
+Rules use small typed predicates and registered actions. No free-text method selection, executable templates or implicit dispatch from mentions. New rules are disabled unless the manager explicitly enables them in the save request. Simulation is read-only.
 
-Persist source/cause/parent/action-slot ancestry. Ignore self-descendants by default, reject visible cycles and bound dynamic causality/rates. No automatic explanation agent for failed notifications. New evidence may make work eligible; repeated unchanged failure affects only that item/rule and produces one incident.
+Rule/event and preset call sites use the same per-automation enabled check, not a second global stage gate. Record source cause, parent invocation and action slot. Ignore own descendants by default, reject configured cycles and contain dynamic loops with scoped dedupe/capacity. Meaningful changed evidence can permit progress; repeated identical failure produces one local diagnostic, not another agent asked to explain itself.
 
-While manual/paused, retain source facts and coalesced pending decisions, not one runnable command for every old event. Resume chooses `future_only` or a previewed `current_eligible` set and revalidates current state. Neither choice blindly drains an old event backlog.
+While disabled, retain useful source facts/current state, not one runnable command per old event. Re-enable defaults to future events; explicit current-eligible selection is available. Do not replay an entire old transcript after editing a rule.
 
-## 7. Server cron and reminders
+## 7. Cron and reminders
 
-Extend the existing Rust scheduler and preserve old receipt identities. Use indexed schedule/due records instead of enlarging the old 64-entry meta blob. New definitions default disabled; stored `enabled` is necessary but not sufficient for unattended starts without applicable manager control.
+Extend the existing Rust scheduler and Store, preserving legacy receipt identity. Indexed per-definition/due records replace expansion of the old shared schedule blob; no second scheduler database.
 
-Use a maintained complete Rust cron evaluator and one timezone integration. Intended calendar semantics, timezone, next occurrences, daylight-saving gaps/repetitions, overlap and misfire are explicit in preview. No software-release pin or handwritten parser. Library/tzdata changes recalculate future occurrences under declared semantics without duplicating already considered UTC slots.
+A schedule is a manager-owned automation with an enabled flag, calendar, action and scope. There is no extra project mode or stage flag. Use a maintained complete Rust cron evaluator plus one supported timezone implementation. Preview grammar, next occurrences, DST gaps/repetitions, overlap and catch-up honestly; no handwritten parser or frozen release.
 
-Occurrence identity is schedule ID, logical generation and due UTC instant; jitter/start time are separate. Active script/profile changes affect new runs, not old receipts. The default misfire rule is latest-only; bounded backfill is deliberate and requires a repeat-safe action. Intentional suspension is not a host outage: resume uses the manager's inclusion/misfire choice, not an automatic burst.
+Occurrence identity includes schedule identity/generation and due UTC instant, not actual jitter/start time. Updating active scripts/profiles does not rerun considered occurrences. Default missed-run handling is latest-only; bounded replay is deliberate and only for repeat-safe work. Future calendar/tzdata changes must not duplicate retained occurrences.
 
-A paused schedule can be run once via authorized `schedule.run_now`; that is a manual Operation, not an unpause. Ordinary host new-work/resource guards still apply. Pausing project automation holds unstarted automatic jobs across schedules/rules/Goals, not just the preset distributor.
+Authorized `schedule.run_now` is one manual run even when recurrence is disabled. Resume after intentional disable follows the manager's selected future/current policy; normal restart recovers saved enabled entries and their cursors without an obligatory approval round.
 
-Shared `coordination.watch.*` produces bounded freshness notices. Explicit direct mail, requested one-shot watches and delivery of already assigned results work in manual mode. Recurring nudges or a reminder that starts model work require separate selected automation authority. A notice does not replace the current Task prompt or restart an old session.
+Reuse #22's shared watches and timer indexes. Explicit one-shot notices work without enabling a recurring automation. A recurring nudge or reminder that invokes a model is a separately chosen typed automation action, not an implicit consequence of notification delivery.
 
 ## 8. Server Goal
 
-`goal.*` is ELIOT-owned and distinct from native `agent.goal`. It references existing Tasks and evidence, not another work graph. Create defaults draft/observational; an objective or enabled-looking file cannot delegate execution.
+ELIOT `goal.*` references existing assigned Tasks and completion evidence. Native `agent.goal` remains adapter-specific. Goal state/evaluation is not another Task graph.
 
-Only a manager-activated Goal definition and applicable stage/grant can advance dispatch/review/repair/continuation. Goal evaluation may update local evidence in manual mode without issuing commands. Success requires configured evidence at exact Task revisions, never commit volume or the model saying done.
+A tracked objective alone starts nothing. Its automatic progression is governed by its one manager-owned enabled execution definition. Goal-specific UI edits that flag through the same configuration path; do not store conflicting enabled values in two systems.
 
-Exactly one continuation owner exists per assignment: manual, server or native. Server control being manual does not prove a previously active native Goal stopped. Changing native ownership requires supported pause/clear and readback; unresolved old input/children blocks only competing work on that scope.
+Dispatch, review, repair and continuation are limited to the manager's configured actions and rights. Achievement uses exact required evidence, not commit volume or a model saying done. Unmachine-checkable completion uses the assigned evaluator.
 
-Pause/cancel affects future admissions. Active child cancellation is separate and addressed through the lifecycle owner. Preserve partial work, continue observation and do not infer permission to terminate from a timer or manager disconnect.
+Exactly one continuation owner per assignment is manual, server or native. This is a lifecycle fact, not a global operating mode. Changing native continuation requires supported clear/pause and actual readback. Unknown old input/children prevents competing continuation, not unrelated work. Disabling further progression preserves current work, results and monitoring.
 
-## 9. Optional external scripts
+## 9. Optional scripts
 
-`script.register/revise/validate/activate/run/get/list` manages named Python/PowerShell bundles with a Rust registry/runner. Activating content chooses the version for a future invocation; it does not start a script or attach an enabled trigger.
+`script.register/revise/validate/activate/run/get/list` manages named Python/PowerShell bundles through Rust. Activating content selects future runnable bytes; it does not start a script. A manager may run it manually or enable a cron/hook automation that selects it.
 
-Each new run resolves active bundle, support files, installed interpreter/environment, input/result schema and trust profile. Retain that execution snapshot. No mid-run imported-file mutation, software pin or package installation from a timer/hook. Environment preparation is a separate setup action.
+Resolve the active bundle, support files, installed interpreter/environment, schemas and trust for each new run. Retain the admitted snapshot. No mutable imported-file substitution halfway through a run, runtime install in a callback, or fixed interpreter/dependency release requirement.
 
-Pass JSON stdin and fixed separate argv; never interpolate event/Issue/branch text into code. PowerShell uses installed noninteractive/no-profile file execution without default policy bypass. Those options are hygiene, not isolation.
+Use JSON stdin, separate argv and installed noninteractive/no-profile PowerShell without default ExecutionPolicy Bypass. Drain bounded stdout/stderr and own descendants. These options and Job Objects/process groups provide hygiene/lifecycle containment, not filesystem/network isolation.
 
-Drain bounded stdout/stderr, validate typed result/evidence and own descendants. Short-lived invocation tokens retain the original manual/automatic lineage and permitted child effects. A manual script invocation can run its declared bounded work; it cannot activate a recurring workflow. An automatic script cannot bypass an off stage via a child MCP call.
+`trusted_local` executes with real selected OS-user rights. `isolated` requires actual supported enforcement; no silent downgrade. Run-scoped API credentials allow only that invocation's declared effects, on behalf of its owner, without exposing a manager token. They cannot edit automation ownership, expand rights or enable a new recurring workflow.
 
-`trusted_local` has the selected user's real filesystem/network rights. `isolated` requires actual OS/container/VM enforcement; no silent downgrade. Job Objects/process groups contain lifecycle, not permissions. A running trusted-local script may continue OS effects after local automation pause; show it as in-flight and offer exact authorized cancellation, not a fictitious rollback.
+A manager may authorize bounded child actions as part of an invocation. Disabling prevents new separate automatic stages; already-started native/OS activity remains in-flight until observed complete or explicitly cancelled. Unknown remote effects or surviving writers hold the affected scope; exit zero alone does not prove all intended work succeeded.
 
-Agent authoring/content activation is permitted inside a granted project envelope. Enabling unattended triggers remains a manager decision. Unknown effect or surviving writer descendants holds only the affected mutation scope. Exit zero alone does not prove completion.
+## 10. MCP, persistence and recovery
 
-## 10. Roles and MCP
+Use #22's role/surface/catalog separation and small eager cores. Deferred groups contain automation config, runtime profiles, streams, review, hooks, scripts, schedules, Goals and forge. No `automation.control.*` mode-management group and no arbitrary execute-method tool. Names and output identify the real owner and enabled entry.
 
-Separate principal, finite capability bundle, object scope, standing grant, effective control, MCP profile/surface, current GM designation and OS identity. Presets include manager, executor/Participant, auditor, observer and GM candidate/operator; several auditors are normal.
+Keep existing SQLite/Store, Operations, Observations and artifacts. Add indexed automation ownership/revision/enabled, review/due/action-slot metadata only as needed. Forward migrations preserve historical policy, old receipts and evidence; no second job engine or full-history scan per viewer.
 
-Only current management authority over a scope can activate/widen control. Configuration preparation can be delegated without that right. Custom role labels and a negative not-observer check are insufficient. Role/grant revocation invalidates cached authorization for new effects; it does not replay uncertain work under another identity.
+Crash recovery preserves explicitly saved enabled/disabled settings. Manager-client disconnect is not loss of management identity. Recheck owner permissions, targets and unresolved effects before continuing; never automatically pause all entries because the host restarted. Unattributable imported definitions remain disabled until a manager adopts them, which is different from recovering an existing owned entry.
 
-Current GM/operator feedback/acceptance/publication paths remain available. Planned narrow delegated branches use the same exact candidate checks. Manual requests do not need an active automation preset; reviewers do not receive GM credentials.
+Rights revocation blocks the affected new effects. Explicit handover validates the new manager and preserves old invocation attribution; a new owner cannot adopt an old epoch-fenced possibly sent publication by renaming it. Never pick Root as fallback owner.
 
-Use #22's small cores and deferred groups. Add `automation.control.get/preview/apply` alongside config, runtime profiles, streams, review, hooks, schedules, Goals and scripts. Disabling automation does not remove manual tools, dashboard or streams. Search/loading affects schema presentation, not permission or activation.
-
-Reads do not launch work or change settings. Static catalogue listing should not require every executor to be healthy. Cached/manual tool calls still pass application authorization. Output includes effective mode and exact reasons; deliberate manual waiting is not repeatedly escalated as failure.
-
-## 11. Persistence and recovery
-
-Reuse SQLite/Store, Operations, Observations and artifacts. Forward migrations add only needed indexed configuration/control, source, review, timer and effect-linkage data. No second broker, queue authority or state-machine copy. Do not rewrite historical policy/evidence.
-
-Manual is the default on new or unattributable restored state. Preserve explicitly configured legacy intent only when its source/authority is established; otherwise import definitions inactive and expose a manager adoption preview. Do not destroy old schedule receipts.
-
-Intentional delegation can survive manager-client exit. Host restart follows the manager's recorded `resume_after_restart` choice, default false. If true, recheck control/grants/targets and reconcile prior effects before new starts. If false, pause unattended execution while retaining readback and manual controls. Files/templates/plugins cannot clear that pause.
-
-Record late results in every mode. Readback of an already sent push/merge continues after disable, but a label-update failure does not restart publication and a finished action does not trigger an off next stage. Any external auto-merge/native continuation remains visibly owned by that external runtime until confirmed complete or explicitly cancelled.
-
-The product succeeds when small teams can operate entirely manually and larger teams can delegate only what they choose, without sacrificing observation, direct collaboration or exact work/effect identity.
+Independent native Goals, queued remote merge/workflow requests and trusted-local processes can outlive local disable. Keep them visible and reconcile read-only; supported cancellation is a separate manager choice. A failed label update does not repeat push, and a late result does not affect a newer candidate.
