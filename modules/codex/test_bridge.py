@@ -322,7 +322,7 @@ class BridgeFixtureTests(unittest.TestCase):
 
     def test_cli_end_to_end_against_fixture(self):
         proc = subprocess.run(
-            [sys.executable, str(HERE / "bridge.py"), "--fixture", str(FIXTURE), "describe"],
+            [sys.executable, "-B", str(HERE / "bridge.py"), "--fixture", str(FIXTURE), "describe"],
             capture_output=True,
             text=True,
             timeout=60,
