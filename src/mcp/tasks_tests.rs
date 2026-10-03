@@ -205,15 +205,14 @@ fn cancel_action_mirrors_operation_cancel() {
 
 #[test]
 fn server_advertises_the_tasks_extension() {
-    let facade = McpFacade {
-        root: PathBuf::from("/nonexistent"),
-        credential: Credential {
+    let facade = McpFacade::new(
+        PathBuf::from("/nonexistent"),
+        Credential {
             client_id: "test".into(),
             token: "test".into(),
         },
-        ipc_config: Arc::new(Config::default().ipc),
-        client: Mutex::new(None),
-    };
+        Arc::new(Config::default().ipc),
+    );
     assert!(facade.get_info().capabilities.supports_tasks());
 }
 
@@ -291,12 +290,11 @@ async fn start_stack() -> Stack {
 
 impl Stack {
     fn facade(&self) -> McpFacade {
-        McpFacade {
-            root: self.dir.clone(),
-            credential: self.credential.clone(),
-            ipc_config: Arc::new(self.config.ipc.clone()),
-            client: Mutex::new(None),
-        }
+        McpFacade::new(
+            self.dir.clone(),
+            self.credential.clone(),
+            Arc::new(self.config.ipc.clone()),
+        )
     }
 
     async fn store_call(&self, method: &str, params: Value) -> Result<Value> {

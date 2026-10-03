@@ -44,10 +44,29 @@
 //! `tasks/update` is deliberately not implemented: a pending native
 //! input is answered by the addressed `agent_reply` tool call, which is
 //! a durable Operation of its own, not by a free-form elicitation
-//! response. Subscriptions (§17.3) remain **not implemented** — that is
-//! slice S8, a future contract, not current behavior. Fact: the facade
-//! keeps no cache; authoritative reads are forwarded to the host with
-//! no stale-on-error caching.
+//! response.
+//!
+//! Subscriptions (R20, §17.3): the facade advertises the
+//! `eliot/subscriptions` extension and answers two protocol methods of
+//! its own, `eliot/subscribe` / `eliot/unsubscribe` (custom requests,
+//! not tools). A subscription is a bounded, read-only freshness hint
+//! over committed facts only — committed report transitions, mailbox
+//! deliveries and Operation state transitions, all filtered from the
+//! one committed observation stream `report.delta` reads, never from
+//! a volatile or native live stream. Each subscription's queue holds
+//! at most a fixed number of undelivered notifications; on overflow
+//! the subscriber receives exactly one explicit `lagged` marker for
+//! the skipped range and resyncs through the exact reads
+//! (`report.delta` / `message.read` / `operation.get`) from the last
+//! delivered cursor. Notifications carry the S2 projection frame of
+//! the page they were read from, so a subscriber can detect gaps
+//! itself. Subscriptions die with the session: a reconnect is not
+//! replay continuity, and state is re-established by cursor + resync.
+//! The pollers share one dedicated IPC connection, separate from the
+//! tool-call connection, under the same link discipline (see
+//! `subscriptions.rs` for the full contract and the RMCP seam).
+//! Fact: the facade keeps no cache; authoritative reads are forwarded
+//! to the host with no stale-on-error caching.
 
 use crate::{
     config::{Config, Ipc},
@@ -59,12 +78,13 @@ use rmcp::{
     ErrorData as McpError, ServerHandler, ServiceExt,
     model::{
         CallToolRequestParams, CallToolResponse, CallToolResult, CancelTaskParams, ContentBlock,
-        CreateTaskResult, DetailedTask, ElicitRequest, ElicitRequestParams, ElicitationSchema,
-        GetTaskParams, GetTaskResult, Implementation, InputRequest, InputRequests, ListToolsResult,
+        CreateTaskResult, CustomRequest, CustomResult, DetailedTask, ElicitRequest,
+        ElicitRequestParams, ElicitationSchema, ExtensionCapabilities, GetTaskParams,
+        GetTaskResult, Implementation, InputRequest, InputRequests, ListToolsResult,
         PaginatedRequestParams, ServerCapabilities, ServerConfig, Task as McpTask, TaskPayload,
         Tool, ToolAnnotations,
     },
-    service::{RequestContext, RoleServer},
+    service::{Peer, RequestContext, RoleServer},
     transport::stdio,
 };
 use serde_json::{Map, Value, json};
@@ -602,35 +622,78 @@ pub struct McpFacade {
     credential: Credential,
     ipc_config: Arc<Ipc>,
     client: Mutex<Option<ipc::Client>>,
+    /// The subscription pollers' own IPC connection (§17.3): lazily
+    /// connected, shared by every poller of this session, and never
+    /// used for tool calls — a dead pump link cannot wedge a tool
+    /// call, and a dropped tool link cannot stall a poller.
+    pump_client: Arc<Mutex<Option<ipc::Client>>>,
+    subscriptions: Arc<subscriptions::SubscriptionHub>,
 }
 
 impl McpFacade {
+    pub fn new(root: PathBuf, credential: Credential, ipc_config: Arc<Ipc>) -> Self {
+        Self {
+            root,
+            credential,
+            ipc_config,
+            client: Mutex::new(None),
+            pump_client: Arc::new(Mutex::new(None)),
+            subscriptions: Arc::new(subscriptions::SubscriptionHub::new(
+                subscriptions::MAX_QUEUE_DEPTH,
+                subscriptions::POLL_INTERVAL,
+            )),
+        }
+    }
+
     /// One forwarded request over the lazily connected IPC link. A failed
     /// link is never reused or silently retried under a possibly
     /// different outcome; the next request reconnects first.
     async fn request(&self, method: &str, params: Value) -> Result<Value> {
-        let mut client = self.client.lock().await;
-        if client.is_none() {
-            *client =
-                Some(ipc::Client::connect(&self.root, &self.credential, &self.ipc_config).await?);
-        }
-        let connected = client.as_mut().expect("client connected above");
-        match connected.request(method, params).await {
-            Ok(result) => Ok(result),
-            Err(e) => {
-                if matches!(
-                    e.code.as_str(),
-                    "DISCONNECTED"
-                        | "OUTCOME_UNKNOWN"
-                        | "PROTOCOL_ERROR"
-                        | "IO_ERROR"
-                        | "WRITE_TIMEOUT"
-                ) {
-                    *client = None;
-                }
-                Err(e)
-            }
-        }
+        request_on(
+            &self.client,
+            &self.root,
+            &self.credential,
+            &self.ipc_config,
+            method,
+            params,
+        )
+        .await
+    }
+
+    /// `eliot/subscribe` (§17.3): open a bounded subscription over
+    /// committed facts. The request's peer is captured for the
+    /// subscription's forwarder; the acknowledgement names the
+    /// starting cursor and the resync contract.
+    async fn subscribe(
+        &self,
+        params: Option<Value>,
+        peer: Peer<RoleServer>,
+    ) -> std::result::Result<CustomResult, McpError> {
+        let params = params.unwrap_or_else(|| json!({}));
+        let (categories, after) =
+            subscriptions::parse_subscribe(&params).map_err(protocol_error)?;
+        let source = Arc::new(subscriptions::PumpSource::new(
+            self.root.clone(),
+            self.credential.clone(),
+            self.ipc_config.clone(),
+            self.pump_client.clone(),
+        ));
+        let ack = self
+            .subscriptions
+            .subscribe(source, peer, categories, after)
+            .map_err(protocol_error)?;
+        Ok(CustomResult(ack))
+    }
+
+    /// `eliot/unsubscribe`: stop one subscription of this session.
+    fn unsubscribe(&self, params: Option<Value>) -> std::result::Result<CustomResult, McpError> {
+        let params = params.unwrap_or_else(|| json!({}));
+        let id = subscriptions::parse_unsubscribe(&params).map_err(protocol_error)?;
+        let ack = self
+            .subscriptions
+            .unsubscribe(&id)
+            .map_err(protocol_error)?;
+        Ok(CustomResult(ack))
     }
 
     async fn call(&self, method: &str, mut params: Value, read_only: bool) -> CallToolResult {
@@ -722,6 +785,43 @@ impl McpFacade {
                 CallToolResponse::Task(CreateTaskResult::new(detailed.task))
             }
             _ => result.into(),
+        }
+    }
+}
+
+/// One forwarded request over one lazily connected IPC link slot.
+/// The tool-call path and the subscription pump path each own a slot
+/// and share exactly this discipline: connect on first use; on a
+/// transport-class failure (the codes below) drop the link so the
+/// next request reconnects first; never silently retry a request
+/// whose outcome may differ on replay.
+async fn request_on(
+    slot: &Mutex<Option<ipc::Client>>,
+    root: &std::path::Path,
+    credential: &Credential,
+    ipc_config: &Ipc,
+    method: &str,
+    params: Value,
+) -> Result<Value> {
+    let mut client = slot.lock().await;
+    if client.is_none() {
+        *client = Some(ipc::Client::connect(root, credential, ipc_config).await?);
+    }
+    let connected = client.as_mut().expect("client connected above");
+    match connected.request(method, params).await {
+        Ok(result) => Ok(result),
+        Err(e) => {
+            if matches!(
+                e.code.as_str(),
+                "DISCONNECTED"
+                    | "OUTCOME_UNKNOWN"
+                    | "PROTOCOL_ERROR"
+                    | "IO_ERROR"
+                    | "WRITE_TIMEOUT"
+            ) {
+                *client = None;
+            }
+            Err(e)
         }
     }
 }
@@ -943,18 +1043,25 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 
 impl ServerHandler for McpFacade {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(
-            ServerCapabilities::builder()
-                .enable_tools()
-                .enable_tasks()
-                .build(),
-        )
-        .with_server_info(Implementation::new(
-            "eliot-swarm-controller",
-            env!("CARGO_PKG_VERSION"),
-        ))
-        .with_instructions(
-            "Tools map one-to-one onto the swarm controller's application API and are \
+        let mut extensions = ExtensionCapabilities::new();
+        extensions.insert(subscriptions::EXTENSION_ID.to_string(), JsonObject::new());
+        let mut capabilities = ServerCapabilities::builder()
+            .enable_tools()
+            .enable_tasks()
+            .build();
+        match &mut capabilities.extensions {
+            Some(map) => {
+                map.extend(extensions);
+            }
+            None => capabilities.extensions = Some(extensions),
+        }
+        ServerConfig::new(capabilities)
+            .with_server_info(Implementation::new(
+                "eliot-swarm-controller",
+                env!("CARGO_PKG_VERSION"),
+            ))
+            .with_instructions(
+                "Tools map one-to-one onto the swarm controller's application API and are \
              executed against the running host over local IPC with the configured \
              credential. Mutations accept a stable client_request_id: supply and \
              retain your own before dispatch if a mutation must be safely retryable \
@@ -966,8 +1073,17 @@ impl ServerHandler for McpFacade {
              still in flight instead returns an MCP task whose taskId is that \
              operation's ID: poll it with tasks/get, and cancel a still-queued \
              operation with tasks/cancel. Pending native inputs surfaced by \
-             tasks/get are answered with the agent_reply tool, not tasks/update.",
-        )
+             tasks/get are answered with the agent_reply tool, not tasks/update. \
+             The eliot/subscribe and eliot/unsubscribe protocol methods open and \
+             close a bounded subscription over committed facts (categories: \
+             reports, mailbox, operations): notifications/eliot/committed carries \
+             each committed transition with its projection frame, and an explicit \
+             notifications/eliot/lagged marks any range the bounded queue \
+             skipped. Notifications are a freshness hint, never complete history: \
+             resync through report_delta, message_read or operation_get from the \
+             last delivered cursor, and after a reconnect re-subscribe with that \
+             cursor — subscriptions do not survive the session.",
+            )
     }
 
     async fn list_tools(
@@ -1089,6 +1205,24 @@ impl ServerHandler for McpFacade {
             }
         }
     }
+    /// Facade-protocol methods (§17.3): `eliot/subscribe` and
+    /// `eliot/unsubscribe`. Everything else keeps the router's
+    /// default answer for a custom method: method not found.
+    async fn on_custom_request(
+        &self,
+        request: CustomRequest,
+        context: RequestContext<RoleServer>,
+    ) -> std::result::Result<CustomResult, McpError> {
+        match request.method.as_str() {
+            subscriptions::SUBSCRIBE_METHOD => self.subscribe(request.params, context.peer).await,
+            subscriptions::UNSUBSCRIBE_METHOD => self.unsubscribe(request.params),
+            _ => Err(McpError::new(
+                rmcp::model::ErrorCode::METHOD_NOT_FOUND,
+                request.method.clone(),
+                None,
+            )),
+        }
+    }
 }
 
 /// Whether the connected client declared the tasks extension during
@@ -1104,12 +1238,11 @@ fn client_tasks_negotiated(context: &RequestContext<RoleServer>) -> bool {
 /// established lazily on the first tool call, so discovery works before (and
 /// independently of) host availability.
 pub async fn run(config: Config, credential: Credential) -> Result<()> {
-    let facade = McpFacade {
-        root: config.storage.data_dir.clone(),
+    let facade = McpFacade::new(
+        config.storage.data_dir.clone(),
         credential,
-        ipc_config: Arc::new(config.ipc.clone()),
-        client: Mutex::new(None),
-    };
+        Arc::new(config.ipc.clone()),
+    );
     let service = facade
         .serve(stdio())
         .await
@@ -1159,5 +1292,9 @@ mod tests {
     }
 }
 
+mod subscriptions;
+
+#[cfg(test)]
+mod subscriptions_tests;
 #[cfg(test)]
 mod tasks_tests;
