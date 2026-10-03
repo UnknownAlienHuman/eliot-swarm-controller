@@ -1,0 +1,138 @@
+name: Local model CPU smoke
+
+# Explicit research branch only; no production automation is enabled.
+# After merging, repeat deliberately through workflow_dispatch.
+on:
+  push:
+    branches: [docs/local-model-backends]
+    paths: ['.github/workflows/local-model-cpu-smoke.yml']
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: local-model-cpu-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  vllm-cpu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      HF_HUB_DISABLE_TELEMETRY: '1'
+      VLLM_NO_USAGE_STATS: '1'
+      DO_NOT_TRACK: '1'
+      VLLM_CPU_KVCACHE_SPACE: '1'
+      VLLM_CPU_OMP_THREADS_BIND: 'auto'
+      VLLM_CPU_NUM_OF_RESERVED_CPU: '1'
+      MODEL_REPO: HuggingFaceTB/SmolLM2-135M-Instruct
+    steps:
+      - name: Isolated environment and current CPU release
+        shell: bash
+        run: |
+          set -euo pipefail
+          lab="$RUNNER_TEMP/eliot-local-models"
+          mkdir -p "$lab"
+          echo "LAB=$lab" >> "$GITHUB_ENV"
+          echo "HF_HOME=$lab/hf" >> "$GITHUB_ENV"
+          echo "UV_CACHE_DIR=$lab/uv-cache" >> "$GITHUB_ENV"
+          uname -a
+          lscpu | head -30
+          free -m
+          python3 -m venv "$lab/venv"
+          "$lab/venv/bin/pip" install --disable-pip-version-check uv
+          curl --fail --silent --show-error --max-time 60 \
+            https://api.github.com/repos/vllm-project/vllm/releases/latest > "$lab/release.json"
+          jq -r '.tag_name, .published_at' "$lab/release.json"
+          # Discover the current upstream CPU asset; do not pin an old release or ABI path.
+          jq -e '[.assets[] | select(.name | test("\\+cpu-.*manylinux.*x86_64\\.whl$"))] | length == 1' "$lab/release.json"
+          url=$(jq -r '.assets[] | select(.name | test("\\+cpu-.*manylinux.*x86_64\\.whl$")) | .browser_download_url' "$lab/release.json")
+          expected=$(jq -r '.assets[] | select(.name | test("\\+cpu-.*manylinux.*x86_64\\.whl$")) | .digest' "$lab/release.json")
+          case "$url" in https://github.com/vllm-project/vllm/releases/download/*) ;; *) exit 1 ;; esac
+          filename=$(basename "$url")
+          filename=${filename//%2B/+}
+          curl --fail --location --silent --show-error --max-time 300 "$url" -o "$lab/$filename"
+          case "$expected" in sha256:*) printf '%s  %s\n' "${expected#sha256:}" "$lab/$filename" | sha256sum -c - ;; *) echo 'Upstream release has no verifiable asset digest'; exit 1 ;; esac
+          "$lab/venv/bin/uv" pip install --python "$lab/venv/bin/python" "$lab/$filename" --torch-backend cpu
+          "$lab/venv/bin/uv" pip freeze --python "$lab/venv/bin/python" > "$lab/environment.txt"
+          grep -E '^(vllm|torch|transformers|uv)==' "$lab/environment.txt" || true
+          iomp=$(find "$lab/venv" -name libiomp5.so -print -quit)
+          if [ -n "$iomp" ]; then echo "LD_PRELOAD=$iomp" >> "$GITHUB_ENV"; fi
+
+      - name: Real CPU server and bounded HTTP protocol probes
+        shell: bash
+        run: |
+          set -euo pipefail
+          key=$(openssl rand -hex 24)
+          echo "::add-mask::$key"
+          port=18765
+          base="http://127.0.0.1:$port"
+          # Own one process group in this disposable runner, never a user service.
+          setsid "$LAB/venv/bin/vllm" serve "$MODEL_REPO" \
+            --host 127.0.0.1 --port "$port" --api-key "$key" \
+            --served-model-name eliot-cpu-smoke --dtype bfloat16 \
+            --max-model-len 512 --max-num-seqs 2 --max-num-batched-tokens 512 \
+            --enforce-eager --generation-config vllm \
+            > "$LAB/server.log" 2>&1 &
+          pid=$!
+          cleanup() {
+            kill -TERM -- "-$pid" 2>/dev/null || true
+            for _ in $(seq 1 10); do
+              kill -0 -- "-$pid" 2>/dev/null || break
+              sleep 1
+            done
+            kill -KILL -- "-$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            sed "s/$key/[redacted]/g" "$LAB/server.log" | tail -70
+          }
+          trap cleanup EXIT
+          ready=false
+          for _ in $(seq 1 180); do
+            if curl --fail --silent --max-time 2 "$base/health" >/dev/null; then ready=true; break; fi
+            if ! kill -0 "$pid" 2>/dev/null; then echo 'Server exited before readiness'; exit 1; fi
+            sleep 2
+          done
+          test "$ready" = true
+          auth=(-H "Authorization: Bearer $key")
+          json=(-H 'Content-Type: application/json')
+          curl --fail --silent --show-error --max-time 20 "${auth[@]}" "$base/v1/models" > "$LAB/models.json"
+          jq -e '.data | any(.id == "eliot-cpu-smoke")' "$LAB/models.json"
+          echo 'ELIOT_PROBE model_catalog PASS'
+          status=$(curl --silent --show-error --max-time 20 -o "$LAB/unauthorized.json" -w '%{http_code}' "$base/v1/models")
+          test "$status" = 401
+          echo 'ELIOT_PROBE unauthorized_models PASS'
+          request='{"model":"eliot-cpu-smoke","messages":[{"role":"user","content":"Reply with a short greeting."}],"temperature":0,"max_tokens":16}'
+          curl --fail --silent --show-error --max-time 120 "${auth[@]}" "${json[@]}" --data "$request" "$base/v1/chat/completions" > "$LAB/chat.json"
+          jq -e '.choices[0].message.role == "assistant" and (.choices[0].message.content | type == "string" and length > 0) and (.choices[0].finish_reason == "stop" or .choices[0].finish_reason == "length") and .usage.completion_tokens > 0' "$LAB/chat.json"
+          echo 'ELIOT_PROBE chat_completion PASS'
+          jq '{model, choices: [.choices[] | {finish_reason, message}], usage}' "$LAB/chat.json"
+          jq -cn --argjson r "$request" '$r + {stream:true,stream_options:{include_usage:true}}' > "$LAB/stream-request.json"
+          curl --fail --silent --show-error --no-buffer --max-time 120 "${auth[@]}" "${json[@]}" --data-binary "@$LAB/stream-request.json" "$base/v1/chat/completions" > "$LAB/stream.txt"
+          grep -q '^data: \[DONE\]' "$LAB/stream.txt"
+          sed -n 's/^data: //p' "$LAB/stream.txt" | grep -v '^\[DONE\]' | jq -s -e 'any(.[]; .choices[0].finish_reason == "stop" or .choices[0].finish_reason == "length") and any(.[]; (.usage.completion_tokens // 0) > 0)'
+          echo 'ELIOT_PROBE streaming_terminal_and_usage PASS'
+          invalid='{"model":"eliot-definitely-absent","messages":[{"role":"user","content":"hello"}],"max_tokens":4}'
+          status=$(curl --silent --show-error --max-time 20 "${auth[@]}" "${json[@]}" --data "$invalid" -o "$LAB/absent.json" -w '%{http_code}' "$base/v1/chat/completions")
+          test "$status" = 404
+          jq -e '.error != null' "$LAB/absent.json"
+          echo 'ELIOT_PROBE missing_model_rejected PASS'
+          pids=()
+          for i in 1 2; do
+            curl --fail --silent --show-error --max-time 120 "${auth[@]}" "${json[@]}" --data "$request" "$base/v1/chat/completions" > "$LAB/concurrent-$i.json" &
+            pids+=("$!")
+          done
+          for p in "${pids[@]}"; do wait "$p"; done
+          for i in 1 2; do jq -e '.choices[0].message.content | type == "string" and length > 0' "$LAB/concurrent-$i.json"; done
+          echo 'ELIOT_PROBE two_concurrent_requests PASS'
+          jq -cn '{model:"eliot-cpu-smoke",messages:[{role:"user",content:([range(0;1500)|" hello"]|join(""))}],max_tokens:8}' > "$LAB/oversized-request.json"
+          status=$(curl --silent --show-error --max-time 30 "${auth[@]}" "${json[@]}" --data-binary "@$LAB/oversized-request.json" -o "$LAB/oversized.json" -w '%{http_code}' "$base/v1/chat/completions")
+          test "$status" = 400
+          echo 'ELIOT_PROBE context_overflow_rejected PASS'
+          echo 'ELIOT_RESULT CPU_HTTP_SMOKE_PASS; tool execution, GPU performance and ELIOT integration NOT TESTED'
+
+      - name: Record failure context
+        if: failure()
+        shell: bash
+        run: |
+          echo 'ELIOT_RESULT CPU_HTTP_SMOKE_FAILED; do not qualify runtime from this run'
+          test ! -f "$LAB/environment.txt" || cat "$LAB/environment.txt"
