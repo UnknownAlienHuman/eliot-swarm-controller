@@ -6,17 +6,19 @@
 // Run: node test-glue.mjs   (or: npm test)
 
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   classifyLine,
+  commandReceiptFacts,
   describe,
   openRun,
   snapshotRun,
   DEFAULT_MOD_PATH,
   batchRunId,
+  buildTaskPrompt,
   controlRecordRef,
   outcomeFromRun,
   resultRecordRef,
@@ -33,6 +35,21 @@ const config = {
 };
 
 const scratch = mkdtempSync(join(tmpdir(), "eliot-command-test-"));
+const envProbeFile = join(scratch, "native-env.ndjson");
+const ownerDir = join(scratch, "module-owner");
+mkdirSync(ownerDir, { recursive: true });
+writeFileSync(join(ownerDir, "owner.json"), JSON.stringify({
+  version: 1,
+  token: "owner-token-fixture",
+  process: { purpose: "module" },
+}));
+process.env.ELIOT_SWARM_MODULE_STATE = ownerDir;
+process.env.ELIOT_SWARM_MODULE_OWNER = join(ownerDir, "owner.json");
+process.env.ELIOT_COMMAND_CONTROL_DIR = "parent-private-control-dir";
+process.env.SWARM_QUAL_CAPTURE_ROOT = "private-qualification-root";
+process.env.CAPTURE_SECRET_SENTINEL = "must-not-reach-native-child";
+process.env.ANTHROPIC_API_KEY = "vendor-auth-sentinel";
+process.env.FAKE_CMD_ENV_PROBE_FILE = envProbeFile;
 let passed = 0;
 async function test(name, fn) {
   await fn();
@@ -53,6 +70,20 @@ try {
     assert.equal(classifyLine('{"answer": 42}').kind, "gap");
   });
 
+  await test("core-canonical prompt order and Unicode byte digest are stable", () => {
+    const snapshot = { objective: "Review café 🐇", nested: { b: 2, a: "雪" } };
+    const canonical = '{"nested":{"a":"雪","b":2},"objective":"Review café 🐇"}';
+    const text = "Keep these words exactly: naïve 🐇";
+    const prompt = buildTaskPrompt(snapshot, text, canonical);
+    assert.equal(prompt, `${text}\n\nELIOT immutable task snapshot:\n${canonical}`);
+    const facts = commandReceiptFacts("operation-🐇", prompt);
+    assert.equal(facts.prompt_bytes, Buffer.byteLength(prompt, "utf8"));
+    assert.equal(facts.prompt_sha256, sha256Hex(prompt));
+    assert.throws(() => buildTaskPrompt(snapshot, text, '{"objective":"altered"}'), /CANONICAL_TASK_SNAPSHOT_MISMATCH/);
+    const changedPrompt = buildTaskPrompt(snapshot, "changed words 🐇", canonical);
+    assert.notEqual(commandReceiptFacts("operation-🐇", changedPrompt).prompt_sha256, facts.prompt_sha256);
+  });
+
   await test("describe reports the fixture CLI and the pinned mod honestly", async () => {
     const info = await describe(config);
     assert.match(info.cli_version, /1\.66\.0/);
@@ -62,6 +93,14 @@ try {
     assert.equal(info.capabilities.resume, "unavailable");
     assert.equal(info.capabilities.open, "executor_preflight_only_no_native_session");
     assert.equal(info.capabilities.task_dispatch, "one_shot_sessionless_batch");
+    const versionProbe = JSON.parse(readFileSync(envProbeFile, "utf8").trim());
+    assert.equal(versionProbe.owner_present, false);
+    assert.equal(versionProbe.state_present, false);
+    assert.equal(versionProbe.command_control_dir, null);
+    assert.equal(versionProbe.qual_capture_present, false);
+    assert.equal(versionProbe.capture_present, false);
+    assert.equal(versionProbe.path_present, true);
+    assert.equal(versionProbe.vendor_auth_present, true);
   });
 
   await test("open: success run, mod ready, queue admission is not application", async () => {
@@ -73,7 +112,7 @@ try {
     ]);
     process.env.FAKE_CMD_SCENARIO = "success";
     const record = await openFixtureRun("success-op", "read the readme", dir);
-    assert.equal(record.disposition, "completed");
+    assert.equal(record.disposition, "completed", record.evidence_validation.diagnostic_code);
     assert.equal(record.disposition_basis, "result_line");
     assert.equal(record.exit.code, 0);
     assert.equal(record.exit.meaning, "EXIT_SUCCESS");
@@ -91,6 +130,18 @@ try {
     assert.equal(record.mod.ready, true);
     assert.equal(record.mod.session_ended, true);
     assert.equal(record.events.by_type.tool_completed, 1);
+    assert.equal(existsSync(join(dir, "mod", "mod-journal.ndjson")), true);
+    assert.equal(existsSync(join(dir, "mod", "inbox.ndjson")), true);
+    assert.equal(existsSync(join(dir, "mod-journal.ndjson")), false);
+    assert.equal(existsSync(join(dir, "inbox.ndjson")), false);
+    const nativeEnv = readFileSync(envProbeFile, "utf8").trim().split(/\r?\n/).map(JSON.parse).at(-1);
+    assert.equal(nativeEnv.owner_present, false);
+    assert.equal(nativeEnv.state_present, false);
+    assert.equal(nativeEnv.qual_capture_present, false);
+    assert.equal(nativeEnv.capture_present, false);
+    assert.equal(nativeEnv.command_control_dir, join(dir, "mod"));
+    assert.equal(nativeEnv.path_present, true);
+    assert.equal(nativeEnv.vendor_auth_present, true);
     // queueMessage returned void: admission was journaled, application never.
     const admission = record.mod.queue_admissions.find((r) => r.id === "q1");
     assert.ok(admission, "queue admission journaled by the mod");
@@ -101,7 +152,7 @@ try {
     assert.deepEqual(readback.active_after, ["read", "search"]);
     // Model setter has no documented readback: stays requested/unknown.
     const snapshot = snapshotRun(dir);
-    assert.equal(snapshot.terminal, "completed");
+    assert.equal(snapshot.terminal, "completed", snapshot.evidence.diagnostic_code);
     assert.equal(snapshot.completeness, "partial");
     assert.equal(snapshot.scope, "single_headless_run");
     assert.equal(snapshot.admission.operation_id, "success-op");
@@ -129,6 +180,112 @@ try {
     assert.equal(mismatch.outcome, "unknown");
     assert.equal(mismatch.details.exit_code, 1);
     assert.equal("completion_condition" in mismatch.details, false);
+  });
+
+  await test("reconcile rejects run records that disagree with the retained result stream and does not replay", async () => {
+    const dir = join(scratch, "tampered-result-stream");
+    const invocationFile = join(scratch, "tampered-result-invocations.ndjson");
+    process.env.FAKE_CMD_SCENARIO = "success";
+    process.env.FAKE_CMD_INVOCATION_FILE = invocationFile;
+    const record = await openFixtureRun("tampered-result-op", "read the fixture", dir);
+    assert.equal(record.evidence_validation.valid, true);
+    const stream = readFileSync(join(dir, "events.ndjson"), "utf8").trim().split(/\r?\n/).map(JSON.parse);
+    const resultFrame = stream.find((frame) => frame.kind === "result");
+    resultFrame.result.finalText = "altered after the run";
+    writeFileSync(join(dir, "events.ndjson"), stream.map((frame) => JSON.stringify(frame)).join("\n") + "\n");
+    const snapshot = snapshotRun(dir);
+    assert.equal(snapshot.evidence.valid, false);
+    assert.equal(snapshot.evidence.diagnostic_code, "saved_result_projection_mismatch");
+    assert.equal(snapshot.terminal, "unknown");
+    const replay = await openFixtureRun("tampered-result-op", "read the fixture", dir);
+    assert.equal(replay.replayed_from_saved_evidence, true);
+    assert.equal(replay.evidence_validation.valid, false);
+    assert.equal(outcomeFromRun(replay).outcome, "unknown");
+    assert.equal(readFileSync(invocationFile, "utf8").trim().split(/\r?\n/).length, 1);
+    delete process.env.FAKE_CMD_INVOCATION_FILE;
+  });
+
+  await test("reconcile rejects terminal exit facts that disagree with the retained result and does not replay", async () => {
+    const dir = join(scratch, "tampered-exit-facts");
+    const invocationFile = join(scratch, "tampered-exit-invocations.ndjson");
+    process.env.FAKE_CMD_SCENARIO = "success";
+    process.env.FAKE_CMD_INVOCATION_FILE = invocationFile;
+    const record = await openFixtureRun("tampered-exit-op", "read the fixture", dir);
+    assert.equal(record.evidence_validation.valid, true);
+    const savedRun = JSON.parse(readFileSync(join(dir, "run.json"), "utf8"));
+    savedRun.exit.code = 4;
+    savedRun.exit.meaning = "EXIT_PERMISSION_DENIED";
+    writeFileSync(join(dir, "run.json"), JSON.stringify(savedRun, null, 2) + "\n");
+    const snapshot = snapshotRun(dir);
+    assert.equal(snapshot.evidence.valid, false);
+    assert.equal(snapshot.evidence.diagnostic_code, "saved_terminal_projection_mismatch");
+    const replay = await openFixtureRun("tampered-exit-op", "read the fixture", dir);
+    assert.equal(replay.replayed_from_saved_evidence, true);
+    assert.equal(outcomeFromRun(replay).outcome, "unknown");
+    assert.equal(readFileSync(invocationFile, "utf8").trim().split(/\r?\n/).length, 1);
+    delete process.env.FAKE_CMD_INVOCATION_FILE;
+  });
+
+  await test("a mismatched core binding is rejected before admission or native spawn", async () => {
+    const dir = join(scratch, "bad-core-binding");
+    const prompt = "unaltered prompt 🐇";
+    const invocationFile = join(scratch, "bad-core-binding-invocations.ndjson");
+    process.env.FAKE_CMD_INVOCATION_FILE = invocationFile;
+    await assert.rejects(() => openRun(config, {
+      operationId: "bad-core-binding-op",
+      requestedModel: "fixture-model",
+      prompt,
+      coreBinding: {
+        ...commandReceiptFacts("bad-core-binding-op", prompt),
+        prompt_sha256: sha256Hex("altered prompt 🐇"),
+      },
+      controlDir: dir,
+    }), /CORE_PROMPT_BINDING_MISMATCH/);
+    assert.equal(existsSync(join(dir, "admission.json")), false);
+    assert.equal(existsSync(invocationFile), false);
+    delete process.env.FAKE_CMD_INVOCATION_FILE;
+  });
+
+  await test("legacy .2 terminal files stay readable and unchanged but cannot authorize .3 replay", async () => {
+    const dir = join(scratch, "legacy-v2");
+    const operationId = "legacy-v2-op";
+    mkdirSync(dir, { recursive: true });
+    const oldAdmission = {
+      schema: 1,
+      operation_id: operationId,
+      execution_shape: "sessionless_batch",
+      batch_run_id: batchRunId(operationId),
+      requested_model: "fixture-model",
+      prompt_sha256: sha256Hex("legacy prompt"),
+      prompt_bytes: Buffer.byteLength("legacy prompt", "utf8"),
+      control_record_ref: controlRecordRef(operationId),
+      result_ref: resultRecordRef(operationId),
+      artifact_refs: [
+        { kind: "command_control_record", ref: controlRecordRef(operationId) },
+        { kind: "command_result_record", ref: resultRecordRef(operationId) },
+      ],
+      admitted_at: "historical-fixture",
+    };
+    const oldRun = {
+      schema: 1,
+      module_artifact_id: "command-mod-0.1.0-glue.2",
+      operation_id: operationId,
+      disposition: "completed",
+      events: { total: 0, by_type: {}, gaps: [] },
+    };
+    writeFileSync(join(dir, "admission.json"), JSON.stringify(oldAdmission, null, 2) + "\n");
+    writeFileSync(join(dir, "run.json"), JSON.stringify(oldRun, null, 2) + "\n");
+    writeFileSync(join(dir, "mod-journal.ndjson"), JSON.stringify({ kind: "mod_ready" }) + "\n");
+    const admissionBefore = readFileSync(join(dir, "admission.json"), "utf8");
+    const runBefore = readFileSync(join(dir, "run.json"), "utf8");
+    const historical = snapshotRun(dir);
+    assert.equal(historical.run.disposition, "completed");
+    assert.equal(historical.terminal, "unknown");
+    assert.equal(historical.evidence.diagnostic_code, "legacy_artifact_read_only");
+    assert.equal(historical.mod.ready, true);
+    await assert.rejects(() => openFixtureRun(operationId, "legacy prompt", dir), /OPERATION_ID_CONFLICT/);
+    assert.equal(readFileSync(join(dir, "admission.json"), "utf8"), admissionBefore);
+    assert.equal(readFileSync(join(dir, "run.json"), "utf8"), runBefore);
   });
 
   await test("open: auth error is a failed run with no session and no mod readiness", async () => {
@@ -210,13 +367,15 @@ try {
     const operationId = "admitted-only-op";
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, "admission.json"), JSON.stringify({
-      schema: 1,
+      schema: 2,
+      module_artifact_id: "command-mod-0.1.0-glue.3",
       operation_id: operationId,
       execution_shape: "sessionless_batch",
       batch_run_id: batchRunId(operationId),
       requested_model: "fixture-model",
       prompt_sha256: sha256Hex(prompt),
       prompt_bytes: Buffer.byteLength(prompt, "utf8"),
+      core_binding: commandReceiptFacts(operationId, prompt),
       control_record_ref: controlRecordRef(operationId),
       result_ref: resultRecordRef(operationId),
       artifact_refs: [
@@ -234,6 +393,14 @@ try {
   });
 } finally {
   delete process.env.FAKE_CMD_SCENARIO;
+  delete process.env.FAKE_CMD_ENV_PROBE_FILE;
+  delete process.env.FAKE_CMD_INVOCATION_FILE;
+  delete process.env.ELIOT_SWARM_MODULE_STATE;
+  delete process.env.ELIOT_SWARM_MODULE_OWNER;
+  delete process.env.ELIOT_COMMAND_CONTROL_DIR;
+  delete process.env.SWARM_QUAL_CAPTURE_ROOT;
+  delete process.env.CAPTURE_SECRET_SENTINEL;
+  delete process.env.ANTHROPIC_API_KEY;
   rmSync(scratch, { recursive: true, force: true });
 }
 
@@ -242,9 +409,9 @@ process.stdout.write(`\n${passed} command glue tests passed\n`);
 function writeInbox(dir, commands) {
   // Pre-seed the control directory before the native process starts so the
   // mod's inbox poll can consume the commands mid-run.
-  mkdirSync(dir, { recursive: true });
+  mkdirSync(join(dir, "mod"), { recursive: true });
   writeFileSync(
-    join(dir, "inbox.ndjson"),
+    join(dir, "mod", "inbox.ndjson"),
     commands.map((c) => JSON.stringify(c)).join("\n") + "\n",
     "utf8",
   );
@@ -255,6 +422,7 @@ function openFixtureRun(operationId, prompt, controlDir) {
     operationId,
     requestedModel: "fixture-model",
     prompt,
+    coreBinding: commandReceiptFacts(operationId, prompt),
     controlDir,
   });
 }

@@ -280,7 +280,7 @@ impl RootCreationScan {
             let data = &value["data"];
             if kind != "session.created"
                 || value["durable"]["version"] != 1
-                || data.get("parentID").is_none_or(|parent| !parent.is_null())
+                || data.get("parentID").is_some_and(|parent| !parent.is_null())
                 || data["metadata"]["eliot"]["binding"] != self.binding_id
                 || data["metadata"]["eliot"]["generation"] != self.generation
                 || data["model"] != self.model
@@ -418,7 +418,7 @@ impl ExecutionScan {
         if self.creation.is_none() {
             if kind != "session.created"
                 || version != 1
-                || !data["parentID"].is_null()
+                || data.get("parentID").is_some_and(|parent| !parent.is_null())
                 || data["metadata"]["eliot"]["binding"] != descriptor.binding_id
                 || data["metadata"]["eliot"]["generation"] != descriptor.generation
                 || data["model"] != descriptor.model

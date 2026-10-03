@@ -12,6 +12,7 @@ import {
   MODULE_ARTIFACT_ID,
   batchRunId,
   buildTaskPrompt,
+  commandReceiptFacts,
   controlRecordRef,
   describe,
   openRun,
@@ -212,27 +213,31 @@ async function preflight(command) {
   };
 }
 
-function unknownTaskOutcome(admission, diagnosticCode) {
+function unknownTaskOutcome(admission, diagnosticCode, fallback = {}) {
+  const operationId = fallback.operation_id ?? admission?.operation_id;
+  const facts = fallback.core_binding ?? admission?.core_binding ?? {};
   return {
     outcome: "unknown",
     details: {
       execution_shape: "sessionless_batch",
-      batch_run_id: admission?.operation_id ? batchRunId(admission.operation_id) : null,
-      requested_model: admission?.requested_model ?? null,
+      batch_run_id: facts.batch_run_id ?? (operationId ? batchRunId(operationId) : null),
+      requested_model: fallback.requested_model ?? admission?.requested_model ?? null,
       effective_model: null,
       effective_model_status: "unknown",
       result_subtype: null,
       exit_code: null,
       signal: null,
+      spawn_error_observed: false,
+      timed_out: false,
       anomalies: [diagnosticCode],
       native_session_id: null,
-      prompt_sha256: admission?.prompt_sha256 ?? null,
-      prompt_bytes: admission?.prompt_bytes ?? null,
-      control_record_ref: admission?.operation_id ? controlRecordRef(admission.operation_id) : null,
-      result_ref: admission?.operation_id ? resultRecordRef(admission.operation_id) : null,
-      artifact_refs: admission?.operation_id ? [
-        { kind: "command_control_record", ref: controlRecordRef(admission.operation_id) },
-        { kind: "command_result_record", ref: resultRecordRef(admission.operation_id) },
+      prompt_sha256: facts.prompt_sha256 ?? admission?.prompt_sha256 ?? null,
+      prompt_bytes: facts.prompt_bytes ?? admission?.prompt_bytes ?? null,
+      control_record_ref: operationId ? controlRecordRef(operationId) : null,
+      result_ref: operationId ? resultRecordRef(operationId) : null,
+      artifact_refs: operationId ? [
+        { kind: "command_control_record", ref: controlRecordRef(operationId) },
+        { kind: "command_result_record", ref: resultRecordRef(operationId) },
       ] : [],
       result_text_sha256: null,
       result_text_bytes: null,
@@ -241,27 +246,32 @@ function unknownTaskOutcome(admission, diagnosticCode) {
   };
 }
 
-function taskOutcome(run) {
-  return outcomeFromRun(run);
+function taskOutcome(run, evidence = run?.evidence_validation) {
+  return outcomeFromRun(run, evidence);
 }
 
-function runEvidenceMatches(run, admission, operationId) {
+function runEvidenceMatches(run, admission, operationId, evidence) {
   const artifacts = [
     { kind: "command_control_record", ref: controlRecordRef(operationId) },
     { kind: "command_result_record", ref: resultRecordRef(operationId) },
   ];
-  return admission?.schema === 1
+  return evidence?.valid === true
+    && admission?.schema === 2
+    && admission.module_artifact_id === MODULE_ARTIFACT_ID
     && admission.operation_id === operationId
     && admission.batch_run_id === batchRunId(operationId)
     && admission.control_record_ref === controlRecordRef(operationId)
     && admission.result_ref === resultRecordRef(operationId)
     && JSON.stringify(admission.artifact_refs) === JSON.stringify(artifacts)
+    && run?.schema === 2
+    && run.module_artifact_id === MODULE_ARTIFACT_ID
     && (!run || (
       run.operation_id === operationId
       && run.batch_run_id === batchRunId(operationId)
       && run.requested_model === admission.requested_model
       && run.prompt_sha256 === admission.prompt_sha256
       && run.prompt_bytes === admission.prompt_bytes
+      && JSON.stringify(run.core_binding) === JSON.stringify(admission.core_binding)
       && run.control_record_ref === controlRecordRef(operationId)
       && run.result_ref === resultRecordRef(operationId)
       && JSON.stringify(run.artifact_refs) === JSON.stringify(artifacts)
@@ -269,33 +279,137 @@ function runEvidenceMatches(run, admission, operationId) {
 }
 
 async function dispatchTask(command) {
+  const { operationId, modelId, cwd, input, prompt, coreBinding } = dispatchIdentity(command);
+  if (input.command_core_binding?.batch_run_id !== coreBinding.batch_run_id
+      || input.command_core_binding?.prompt_sha256 !== coreBinding.prompt_sha256
+      || input.command_core_binding?.prompt_bytes !== coreBinding.prompt_bytes) {
+    throw codedError("CORE_PROMPT_BINDING_MISMATCH");
+  }
+  const controlDir = runDirectory(operationId);
+  const record = await openRun(config, {
+    operationId,
+    requestedModel: modelId,
+    prompt,
+    coreBinding,
+    controlDir,
+    cwd,
+  });
+  if (record.evidence_validation?.valid !== true) {
+    return unknownTaskOutcome(null,
+      record.evidence_validation?.diagnostic_code ?? "saved_terminal_evidence_untrusted",
+      dispatchFallback({ operationId, modelId, coreBinding }));
+  }
+  return taskOutcome(record, record.evidence_validation);
+}
+
+function dispatchIdentity(command) {
   const operationId = required(command, "operation_id");
   const modelId = routeModel(command);
   const nativeOptions = command.route.native_options ?? {};
   const cwd = required(nativeOptions, "workspaceRoot");
   if (!path.isAbsolute(cwd)) throw codedError("WORKSPACE_ROOT_MUST_BE_ABSOLUTE");
   const input = command.input ?? {};
-  const prompt = buildTaskPrompt(input.task_snapshot, input.text);
-  const controlDir = runDirectory(operationId);
-  const record = await openRun(config, {
-    operationId,
-    requestedModel: modelId,
-    prompt,
-    controlDir,
-    cwd,
-  });
-  return taskOutcome(record);
+  const prompt = buildTaskPrompt(input.task_snapshot, input.text, input.task_snapshot_canonical);
+  const coreBinding = commandReceiptFacts(operationId, prompt);
+  return { operationId, modelId, cwd, input, prompt, coreBinding };
+}
+
+function dispatchFallback(identity) {
+  return {
+    operation_id: identity.operationId,
+    requested_model: identity.modelId,
+    core_binding: identity.coreBinding,
+  };
+}
+
+function unknownDispatchOutcome(command, diagnosticCode) {
+  try {
+    return unknownTaskOutcome(null, diagnosticCode, dispatchFallback(dispatchIdentity(command)));
+  } catch {
+    // Invalid or incomplete dispatch inputs cannot be made into a core-bound
+    // receipt. The Store will reject the missing identity rather than trust
+    // values from an unreadable saved record.
+    return unknownTaskOutcome(null, diagnosticCode, {
+      operation_id: command.operation_id,
+    });
+  }
+}
+
+function matchesCoreBinding(actual, expected) {
+  return actual !== null
+    && typeof actual === "object"
+    && !Array.isArray(actual)
+    && Object.keys(actual).sort().join(",") === "batch_run_id,prompt_bytes,prompt_sha256"
+    && actual.batch_run_id === expected.batch_run_id
+    && actual.prompt_sha256 === expected.prompt_sha256
+    && actual.prompt_bytes === expected.prompt_bytes;
+}
+
+function targetDispatchFallback(command, targetOperationId) {
+  const input = command.input ?? {};
+  const requestedModel = input.target_command_requested_model;
+  const coreBinding = input.target_command_core_binding;
+  if (typeof requestedModel !== "string"
+      || requestedModel !== routeModel(command)
+      || !coreBinding
+      || typeof coreBinding !== "object"
+      || Array.isArray(coreBinding)
+      || Object.keys(coreBinding).sort().join(",") !== "batch_run_id,prompt_bytes,prompt_sha256"
+      || coreBinding.batch_run_id !== batchRunId(targetOperationId)
+      || !/^[0-9a-f]{64}$/.test(coreBinding.prompt_sha256 ?? "")
+      || !Number.isSafeInteger(coreBinding.prompt_bytes)
+      || coreBinding.prompt_bytes < 1) {
+    throw codedError("TARGET_COMMAND_CORE_BINDING_INVALID");
+  }
+  return {
+    operation_id: targetOperationId,
+    requested_model: requestedModel,
+    core_binding: coreBinding,
+  };
+}
+
+function targetUnknown(targetOperationId, fallback, diagnosticCode) {
+  const result = unknownTaskOutcome(null, diagnosticCode, fallback);
+  saveOutcome(targetOperationId, result, "task.dispatch");
+  return { operation_id: targetOperationId, ...result };
+}
+
+function unknownOpenTargetOutcome() {
+  return {
+    outcome: "unknown",
+    details: {
+      execution_shape: "sessionless_batch",
+      native_session_state: "not_started",
+      diagnostic_code: "original_preflight_receipt_unavailable",
+    },
+  };
 }
 
 function reconcileTarget(command) {
   const targetOperationId = required(command.input ?? {}, "operation_id");
+  const targetMethod = required(command.input ?? {}, "target_command_method");
+  if (!new Set(["agent.open", "task.dispatch"]).has(targetMethod)) {
+    throw codedError("TARGET_COMMAND_METHOD_INVALID");
+  }
+  if (targetMethod === "agent.open") {
+    // The original open is a version/mod preflight only. The bridge keeps no
+    // durable operation receipt for it, so a lost acknowledgement cannot be
+    // reconstructed by probing the CLI again.
+    const targetResult = unknownOpenTargetOutcome();
+    saveOutcome(targetOperationId, targetResult, "agent.open");
+    return {
+      target_operation_id: targetOperationId,
+      target_record_state: "preflight_receipt_unavailable",
+      target_outcome: { operation_id: targetOperationId, ...targetResult },
+    };
+  }
+  const fallback = targetDispatchFallback(command, targetOperationId);
   const targetDir = runDirectory(targetOperationId);
   let saved;
   try {
     saved = snapshotRun(targetDir);
   } catch {
-    const targetResult = unknownTaskOutcome({ operation_id: targetOperationId }, "saved_record_unreadable");
-    saveOutcome(targetOperationId, targetResult, "task.dispatch");
+    const targetResult = targetUnknown(targetOperationId, fallback, "saved_record_unreadable");
     return {
       target_operation_id: targetOperationId,
       target_record_state: "unreadable",
@@ -303,18 +417,37 @@ function reconcileTarget(command) {
     };
   }
   if (saved.admission?.operation_id !== targetOperationId) {
+    const missing = saved.admission === null;
+    const targetResult = targetUnknown(
+      targetOperationId,
+      fallback,
+      missing ? "saved_admission_missing" : "saved_admission_identity_mismatch",
+    );
     return {
       target_operation_id: targetOperationId,
-      target_record_state: "not_found",
-      target_outcome: null,
+      target_record_state: missing ? "admission_missing" : "identity_mismatch",
+      target_outcome: targetResult,
     };
   }
-  const identityMatches = runEvidenceMatches(saved.run, saved.admission, targetOperationId);
-  const targetResult = !identityMatches
-    ? unknownTaskOutcome(saved.admission, "saved_record_identity_mismatch")
-    : saved.run
-      ? taskOutcome(saved.run)
-      : unknownTaskOutcome(saved.admission, "native_result_missing_after_admission");
+  const admissionMatchesCore = saved.admission.requested_model === fallback.requested_model
+    && matchesCoreBinding(saved.admission.core_binding, fallback.core_binding);
+  const identityMatches = admissionMatchesCore
+    && runEvidenceMatches(saved.run, saved.admission, targetOperationId, saved.evidence);
+  if (!identityMatches) {
+    const targetResult = targetUnknown(
+      targetOperationId,
+      fallback,
+      saved.evidence?.diagnostic_code ?? "saved_record_identity_mismatch",
+    );
+    return {
+      target_operation_id: targetOperationId,
+      target_record_state: saved.run ? "terminal_record_untrusted" : "admission_untrusted",
+      target_outcome: targetResult,
+    };
+  }
+  const targetResult = saved.run
+    ? taskOutcome(saved.run, saved.evidence)
+    : unknownTaskOutcome(null, "native_result_missing_after_admission", fallback);
   saveOutcome(targetOperationId, targetResult, "task.dispatch");
   return {
     target_operation_id: targetOperationId,
@@ -377,25 +510,36 @@ async function execute(command) {
       try {
         const dir = runDirectory(operationId);
         const saved = snapshotRun(dir);
+        const currentIdentity = dispatchIdentity(command);
+        const fallback = dispatchFallback(currentIdentity);
         if (saved.admission?.operation_id === operationId) {
-          result = !runEvidenceMatches(saved.run, saved.admission, operationId)
-            ? unknownTaskOutcome(saved.admission, "saved_record_identity_mismatch")
+          const savedBinding = saved.admission?.core_binding;
+          const sameRequestBinding = savedBinding?.batch_run_id === currentIdentity.coreBinding.batch_run_id
+            && savedBinding?.prompt_sha256 === currentIdentity.coreBinding.prompt_sha256
+            && savedBinding?.prompt_bytes === currentIdentity.coreBinding.prompt_bytes
+            && saved.admission?.requested_model === currentIdentity.modelId;
+          result = !sameRequestBinding
+            ? unknownTaskOutcome(null, "dispatch_identity_conflict", fallback)
+            : !runEvidenceMatches(saved.run, saved.admission, operationId, saved.evidence)
+              ? unknownTaskOutcome(null, saved.evidence?.diagnostic_code ?? "saved_record_identity_mismatch", fallback)
             : saved.run
-              ? taskOutcome(saved.run)
-              : unknownTaskOutcome(saved.admission, "native_result_missing_after_admission");
+              ? taskOutcome(saved.run, saved.evidence)
+              : unknownTaskOutcome(null, "native_result_missing_after_admission", fallback);
         } else if (existsSync(path.join(dir, "admission.json"))) {
-          result = unknownTaskOutcome({ operation_id: operationId }, "admission_record_unreadable");
+          result = unknownTaskOutcome(null, "admission_record_unreadable", fallback);
         }
       } catch { /* corrupt evidence remains an explicit unknown below */ }
     }
     if (!result) {
-      result = {
-        outcome: "rejected",
-        details: {
-          diagnostic_code: error.code ?? "COMMAND_BRIDGE_ERROR",
-          ...(error.capability ? { capability: error.capability } : {}),
-        },
-      };
+      result = command.method === "task.dispatch"
+        ? unknownDispatchOutcome(command, error.code ?? "COMMAND_BRIDGE_ERROR")
+        : {
+            outcome: "rejected",
+            details: {
+              diagnostic_code: error.code ?? "COMMAND_BRIDGE_ERROR",
+              ...(error.capability ? { capability: error.capability } : {}),
+            },
+          };
     }
     saveOutcome(operationId, result, command.method);
   } finally {

@@ -6,9 +6,9 @@
 // snapshot facts. bridge.mjs owns module IPC and calls these functions.
 //
 // Evidence rules, from the architecture and runtime notes:
-// - The terminal fact of a run is the final NDJSON result line, corroborated
-//   by the process exit code. Process exit alone never proves success, and a
-//   missing result line leaves the disposition `unknown`.
+// - The terminal fact is the final NDJSON result line, corroborated by the
+//   process exit code and by the saved run projection. Process exit alone
+//   never proves success, and missing/inconsistent saved evidence is unknown.
 // - `mod_error` events are observed facts about a mod, not process death:
 //   the run continues to its own result line.
 // - Mod readiness (mod-journal records written by the mod itself) is tracked
@@ -29,12 +29,14 @@ import {
 } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
+import { isDeepStrictEqual } from "node:util";
 import { fileURLToPath } from "node:url";
 
 export const RUNTIME = "command";
 export const ENTRYPOINT = "native_mod";
 export const TRANSPORT = "headless_ndjson";
-export const MODULE_ARTIFACT_ID = "command-mod-0.1.0-glue.2";
+export const MODULE_ARTIFACT_ID = "command-mod-0.1.0-glue.3";
+export const LEGACY_MODULE_ARTIFACT_ID = "command-mod-0.1.0-glue.2";
 
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
 export const DEFAULT_MOD_PATH = join(MODULE_DIR, "mod", "eliot-command.ts");
@@ -62,17 +64,30 @@ export function sha256Hex(text) {
   return createHash("sha256").update(text, "utf8").digest("hex");
 }
 
-export function buildTaskPrompt(taskSnapshot, text) {
+export function buildTaskPrompt(taskSnapshot, text, canonicalSnapshot) {
   if (taskSnapshot === null || typeof taskSnapshot !== "object" || Array.isArray(taskSnapshot)) {
     throw new Error("TASK_SNAPSHOT_REQUIRED");
   }
-  if (text !== undefined && typeof text !== "string") {
+  if (typeof text !== "string" || text.trim() === "") {
     throw new Error("DISPATCH_TEXT_INVALID");
   }
-  const body = typeof text === "string" && text.trim() ? text : null;
-  return [`Task specification: ${JSON.stringify(taskSnapshot)}`, body]
-    .filter(Boolean)
-    .join("\n\n");
+  if (typeof canonicalSnapshot !== "string") {
+    throw new Error("CANONICAL_TASK_SNAPSHOT_REQUIRED");
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(canonicalSnapshot);
+  } catch {
+    throw new Error("CANONICAL_TASK_SNAPSHOT_INVALID");
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)
+      || !isDeepStrictEqual(parsed, taskSnapshot)) {
+    throw new Error("CANONICAL_TASK_SNAPSHOT_MISMATCH");
+  }
+  // Rust batch::instruction is the canonical prompt contract. The canonical
+  // snapshot text is supplied by the controller; this module does not invent
+  // a second serializer that could disagree on Unicode or map ordering.
+  return `${text}\n\nELIOT immutable task snapshot:\n${canonicalSnapshot}`;
 }
 
 function operationDigest(operationId) {
@@ -84,6 +99,40 @@ function operationDigest(operationId) {
 
 export function batchRunId(operationId) {
   return `command-batch:${operationDigest(operationId)}`;
+}
+
+export function commandReceiptFacts(operationId, prompt) {
+  if (typeof prompt !== "string") throw new Error("PROMPT_REQUIRED");
+  return {
+    batch_run_id: batchRunId(operationId),
+    prompt_sha256: sha256Hex(prompt),
+    prompt_bytes: Buffer.byteLength(prompt, "utf8"),
+  };
+}
+
+function coreBindingMatches(actual, expected) {
+  return actual !== null
+    && typeof actual === "object"
+    && !Array.isArray(actual)
+    && Object.keys(actual).sort().join(",") === "batch_run_id,prompt_bytes,prompt_sha256"
+    && actual.batch_run_id === expected.batch_run_id
+    && actual.prompt_sha256 === expected.prompt_sha256
+    && actual.prompt_bytes === expected.prompt_bytes;
+}
+
+function nativeEnvironment(controlDir = null) {
+  const env = {};
+  for (const [name, value] of Object.entries(process.env)) {
+    const upper = name.toUpperCase();
+    if (upper.startsWith("ELIOT_")
+        || upper.startsWith("SWARM_")
+        || upper.includes("CAPTURE")) {
+      continue;
+    }
+    env[name] = value;
+  }
+  if (controlDir) env.ELIOT_COMMAND_CONTROL_DIR = controlDir;
+  return env;
 }
 
 export function controlRecordRef(operationId) {
@@ -107,14 +156,16 @@ function resultExitAgrees(result, exit) {
   if (result.subtype === "max_turns") return exit.code === 8;
   return result.subtype === "error"
     && exit.code !== 0
+    && exit.code !== 8
     && Object.hasOwn(EXIT_MEANINGS, exit.code);
 }
 
-export function outcomeFromRun(run) {
+export function outcomeFromRun(run, evidence = run?.evidence_validation) {
   const subtype = run?.result?.subtype ?? null;
   const exitCode = run?.exit?.code ?? null;
   const terminalExitAgrees = resultExitAgrees(run?.result, run?.exit);
-  const cleanEvidence = terminalExitAgrees
+  const cleanEvidence = evidence?.valid === true
+    && terminalExitAgrees
     && (run?.events?.gaps?.length ?? 0) === 0
     && (run?.anomalies?.length ?? 0) === 0
     && run?.timed_out !== true;
@@ -137,25 +188,38 @@ export function outcomeFromRun(run) {
       native_session_id: run?.session_id ?? null,
       prompt_sha256: run?.prompt_sha256 ?? null,
       prompt_bytes: run?.prompt_bytes ?? null,
+      spawn_error_observed: run?.spawn_error_observed === true,
+      timed_out: run?.timed_out === true,
       control_record_ref: run?.control_record_ref ?? null,
       result_ref: run?.result_ref ?? null,
       artifact_refs: Array.isArray(run?.artifact_refs) ? run.artifact_refs : [],
       result_text_sha256: typeof resultText === "string" ? sha256Hex(resultText) : null,
       result_text_bytes: typeof resultText === "string" ? Buffer.byteLength(resultText, "utf8") : null,
-      ...(!cleanEvidence ? { diagnostic_code: run?.anomalies?.[0] ?? "NATIVE_RESULT_NOT_VALIDATED" } : {}),
+      ...(!cleanEvidence ? {
+        diagnostic_code: evidence?.diagnostic_code
+          ?? run?.anomalies?.[0]
+          ?? "NATIVE_RESULT_NOT_VALIDATED",
+      } : {}),
     },
   };
 }
 
 function createAdmission(options) {
+  const coreBinding = options.coreBinding ?? commandReceiptFacts(options.operationId, options.prompt);
+  const expectedCoreBinding = commandReceiptFacts(options.operationId, options.prompt);
+  if (!coreBindingMatches(coreBinding, expectedCoreBinding)) {
+    throw new Error("CORE_PROMPT_BINDING_MISMATCH");
+  }
   return {
-    schema: 1,
+    schema: 2,
+    module_artifact_id: MODULE_ARTIFACT_ID,
     operation_id: options.operationId,
     execution_shape: "sessionless_batch",
-    batch_run_id: batchRunId(options.operationId),
+    batch_run_id: coreBinding.batch_run_id,
     requested_model: options.requestedModel,
-    prompt_sha256: sha256Hex(options.prompt),
-    prompt_bytes: Buffer.byteLength(options.prompt, "utf8"),
+    prompt_sha256: coreBinding.prompt_sha256,
+    prompt_bytes: coreBinding.prompt_bytes,
+    core_binding: coreBinding,
     control_record_ref: controlRecordRef(options.operationId),
     result_ref: resultRecordRef(options.operationId),
     artifact_refs: artifactRefs(options.operationId),
@@ -215,8 +279,11 @@ function readJsonLines(path) {
   return records;
 }
 
-export function readModJournal(controlDir) {
-  const records = readJsonLines(join(controlDir, "mod-journal.ndjson"));
+export function readModJournal(controlDir, { legacy = false } = {}) {
+  const journalPath = legacy
+    ? join(controlDir, "mod-journal.ndjson")
+    : join(controlDir, "mod", "mod-journal.ndjson");
+  const records = readJsonLines(journalPath);
   return {
     records,
     loaded: records.some((r) => r.kind === "mod_loaded"),
@@ -226,6 +293,161 @@ export function readModJournal(controlDir) {
     queueAdmissions: records.filter((r) => r.kind === "queue_admitted"),
     toolsReadbacks: records.filter((r) => r.kind === "tools_readback"),
   };
+}
+
+function projectNativeResult(result) {
+  if (!result || !RESULT_SUBTYPES.has(result.subtype)) return null;
+  const finalText = result.finalText ?? null;
+  return {
+    subtype: result.subtype,
+    stop_reason: result.stopReason ?? null,
+    duration_ms: result.durationMs ?? null,
+    usage: result.usage ?? null,
+    final_text: finalText,
+    final_text_sha256: typeof finalText === "string" ? sha256Hex(finalText) : null,
+    final_text_bytes: typeof finalText === "string" ? Buffer.byteLength(finalText, "utf8") : null,
+    error: result.error ?? null,
+  };
+}
+
+function eventSummary(records) {
+  const events = records.filter((record) => record?.kind === "event").map((record) => record.event);
+  const gaps = records.filter((record) => record?.kind === "gap");
+  const byType = {};
+  for (const event of events) byType[event.type] = (byType[event.type] ?? 0) + 1;
+  return { events, gaps, byType };
+}
+
+function expectedTerminalFacts(result, exit, timedOut, records) {
+  const resultIndex = records.findIndex((record) => record?.kind === "result");
+  const framesAfterResult = resultIndex < 0
+    ? 0
+    : records.slice(resultIndex + 1).filter((record) => record?.kind === "event").length;
+  const gaps = records.filter((record) => record?.kind === "gap");
+  const anomalies = [];
+  if (framesAfterResult > 0) anomalies.push("frames_after_result_line");
+  if (!result) anomalies.push("native_result_missing");
+  if (result?.subtype === "success" && exit?.code !== 0) anomalies.push("exit_result_mismatch");
+  if (timedOut) anomalies.push("glue_timeout_killed_owned_child");
+  if (exit?.spawn_error != null) anomalies.push("native_spawn_failed");
+  if (gaps.length > 0) anomalies.push("native_stream_protocol_gaps");
+
+  let disposition = "unknown";
+  let dispositionBasis = "missing_result_line";
+  if (result) {
+    dispositionBasis = "result_line";
+    const terminalValidated = resultExitAgrees(result, exit)
+      && !timedOut
+      && exit?.spawn_error == null
+      && framesAfterResult === 0
+      && gaps.length === 0;
+    if (terminalValidated) {
+      if (result.subtype === "success") disposition = "completed";
+      else if (result.subtype === "error") disposition = "failed";
+      else if (result.subtype === "max_turns") disposition = "max_turns";
+    } else {
+      dispositionBasis = "result_exit_or_stream_mismatch";
+    }
+  }
+  return { anomalies, disposition, dispositionBasis, framesAfterResult };
+}
+
+function validateSavedEvidence(controlDir, admission, run, records) {
+  const invalid = (diagnostic_code) => ({ valid: false, diagnostic_code });
+  if (!admission) return invalid("saved_admission_missing");
+  if (admission.schema === 1 && run?.module_artifact_id === LEGACY_MODULE_ARTIFACT_ID) {
+    return { valid: false, diagnostic_code: "legacy_artifact_read_only" };
+  }
+  if (!run) return invalid("saved_terminal_evidence_missing");
+  if (admission.schema !== 2 || admission.module_artifact_id !== MODULE_ARTIFACT_ID
+      || run.schema !== 2 || run.module_artifact_id !== MODULE_ARTIFACT_ID) {
+    return invalid("saved_artifact_identity_mismatch");
+  }
+  const operationId = admission.operation_id;
+  const expectedArtifacts = artifactRefs(operationId);
+  if (typeof operationId !== "string" || operationId.trim() === ""
+      || admission.execution_shape !== "sessionless_batch"
+      || admission.batch_run_id !== batchRunId(operationId)
+      || admission.control_record_ref !== controlRecordRef(operationId)
+      || admission.result_ref !== resultRecordRef(operationId)
+      || JSON.stringify(admission.artifact_refs) !== JSON.stringify(expectedArtifacts)
+      || admission.core_binding?.batch_run_id !== admission.batch_run_id
+      || admission.core_binding?.prompt_sha256 !== admission.prompt_sha256
+      || admission.core_binding?.prompt_bytes !== admission.prompt_bytes
+      || !/^[0-9a-f]{64}$/.test(admission.prompt_sha256 ?? "")
+      || !Number.isSafeInteger(admission.prompt_bytes)
+      || admission.prompt_bytes < 1) {
+    return invalid("saved_admission_identity_mismatch");
+  }
+  if (run.runtime !== RUNTIME || run.entrypoint !== ENTRYPOINT || run.transport !== TRANSPORT
+      || run.execution_shape !== "sessionless_batch"
+      || run.operation_id !== operationId
+      || run.batch_run_id !== admission.batch_run_id
+      || run.requested_model !== admission.requested_model
+      || run.prompt_sha256 !== admission.prompt_sha256
+      || run.prompt_bytes !== admission.prompt_bytes
+      || !isDeepStrictEqual(run.core_binding, admission.core_binding)
+      || run.control_record_ref !== admission.control_record_ref
+      || run.result_ref !== admission.result_ref
+      || JSON.stringify(run.artifact_refs) !== JSON.stringify(expectedArtifacts)
+      || resolve(run.control_dir ?? "") !== resolve(controlDir)) {
+    return invalid("saved_run_identity_mismatch");
+  }
+  if (!Array.isArray(records) || records.some((record, index) =>
+    !record || typeof record !== "object" || record.seq !== index + 1
+      || !["event", "result", "gap"].includes(record.kind))) {
+    return invalid("saved_event_sequence_invalid");
+  }
+  const summary = eventSummary(records);
+  const resultRecords = records.filter((record) => record.kind === "result");
+  if (resultRecords.length > 1
+      || (resultRecords.length === 1 && records.at(-1) !== resultRecords[0])) {
+    return invalid("saved_result_frame_order_invalid");
+  }
+  if (summary.events.some((event) => !event || typeof event !== "object"
+      || Array.isArray(event) || typeof event.type !== "string")) {
+    return invalid("saved_event_frame_invalid");
+  }
+  const rawResult = resultRecords[0]?.result ?? null;
+  if (rawResult && (!projectNativeResult(rawResult)
+      || !isDeepStrictEqual(run.result, projectNativeResult(rawResult)))) {
+    return invalid("saved_result_projection_mismatch");
+  }
+  if (!rawResult && run.result !== null) return invalid("saved_result_frame_missing");
+  if (!Number.isSafeInteger(run.events?.total) || run.events.total !== summary.events.length
+      || !isDeepStrictEqual(run.events?.by_type, summary.byType)
+      || !isDeepStrictEqual(run.events?.gaps, summary.gaps)) {
+    return invalid("saved_event_summary_mismatch");
+  }
+  const exit = run.exit;
+  if (!exit || !["number", "object"].includes(typeof exit.code)
+      || (exit.code !== null && (!Number.isInteger(exit.code) || exit.code < 0))
+      || !(exit.signal === null || typeof exit.signal === "string")
+      || !(exit.spawn_error === null || typeof exit.spawn_error === "string")
+      || (typeof run.timed_out !== "boolean")
+      || run.spawn_error_observed !== (exit.spawn_error !== null)
+      || exit.meaning !== (exit.code !== null ? (EXIT_MEANINGS[exit.code] ?? "UNLISTED_EXIT_CODE") : null)) {
+    return invalid("saved_process_exit_facts_invalid");
+  }
+  const terminal = expectedTerminalFacts(rawResult, exit, run.timed_out, records);
+  if (!isDeepStrictEqual(run.anomalies, terminal.anomalies)
+      || run.disposition !== terminal.disposition
+      || run.disposition_basis !== terminal.dispositionBasis) {
+    return invalid("saved_terminal_projection_mismatch");
+  }
+  const sessionFromEvent = summary.events.find(
+    (event) => event.type === "run_start" && typeof event.sessionId === "string",
+  )?.sessionId ?? null;
+  const expectedSessionId = typeof rawResult?.sessionId === "string"
+    ? rawResult.sessionId
+    : sessionFromEvent;
+  const expectedSessionSource = typeof rawResult?.sessionId === "string"
+    ? "result_line"
+    : sessionFromEvent ? "run_start_event" : "none";
+  if (run.session_id !== expectedSessionId || run.session_id_source !== expectedSessionSource) {
+    return invalid("saved_session_evidence_mismatch");
+  }
+  return { valid: true, diagnostic_code: null };
 }
 
 function modErrorEvents(events) {
@@ -301,6 +523,7 @@ function runProbe(executable, argsPrefix) {
     let child;
     try {
       child = spawn(executable, [...argsPrefix, "--version"], {
+        env: nativeEnvironment(),
         stdio: ["ignore", "pipe", "pipe"],
       });
     } catch (error) {
@@ -337,6 +560,7 @@ function runProbe(executable, argsPrefix) {
 export async function openRun(config, options) {
   const controlDir = resolve(options.controlDir);
   const runPath = join(controlDir, "run.json");
+  const eventsPath = join(controlDir, "events.ndjson");
   const operationId = options.operationId;
   const requestedModel = options.requestedModel;
   if (typeof operationId !== "string" || operationId.trim() === "") {
@@ -364,43 +588,38 @@ export async function openRun(config, options) {
   const priorAdmission = readAdmission(controlDir);
   if (priorAdmission) {
     if (
-      priorAdmission.schema !== 1
+      priorAdmission.schema !== 2
+      || priorAdmission.module_artifact_id !== MODULE_ARTIFACT_ID
       || priorAdmission.operation_id !== operationId
       || priorAdmission.batch_run_id !== expectedAdmission.batch_run_id
       || priorAdmission.requested_model !== requestedModel
       || priorAdmission.prompt_sha256 !== expectedAdmission.prompt_sha256
       || priorAdmission.prompt_bytes !== expectedAdmission.prompt_bytes
+      || !isDeepStrictEqual(priorAdmission.core_binding, expectedAdmission.core_binding)
       || priorAdmission.control_record_ref !== expectedAdmission.control_record_ref
       || priorAdmission.result_ref !== expectedAdmission.result_ref
       || JSON.stringify(priorAdmission.artifact_refs) !== JSON.stringify(expectedAdmission.artifact_refs)
     ) {
       throw new Error("OPERATION_ID_CONFLICT");
     }
-    const saved = existsSync(runPath) ? JSON.parse(readFileSync(runPath, "utf8")) : null;
-    if (saved) {
-      if (
-        saved.operation_id !== operationId
-        || saved.batch_run_id !== expectedAdmission.batch_run_id
-        || saved.requested_model !== requestedModel
-        || saved.prompt_sha256 !== expectedAdmission.prompt_sha256
-        || saved.prompt_bytes !== expectedAdmission.prompt_bytes
-        || saved.control_record_ref !== expectedAdmission.control_record_ref
-        || saved.result_ref !== expectedAdmission.result_ref
-        || JSON.stringify(saved.artifact_refs) !== JSON.stringify(expectedAdmission.artifact_refs)
-      ) {
-        throw new Error("CONTROL_RECORD_CONFLICT");
-      }
-      return { ...saved, replayed_from_saved_evidence: true };
+    const snapshot = snapshotRun(controlDir);
+    if (snapshot.run) {
+      return {
+        ...snapshot.run,
+        evidence_validation: snapshot.evidence,
+        replayed_from_saved_evidence: true,
+      };
     }
     return {
-      schema: 1,
+      schema: 2,
       runtime: RUNTIME,
       entrypoint: ENTRYPOINT,
       transport: TRANSPORT,
-      module_artifact_id: config.moduleArtifactId ?? MODULE_ARTIFACT_ID,
+      module_artifact_id: MODULE_ARTIFACT_ID,
       operation_id: operationId,
       batch_run_id: priorAdmission.batch_run_id,
       requested_model: requestedModel,
+      core_binding: priorAdmission.core_binding,
       effective_model: null,
       effective_model_status: "unknown",
       control_dir: controlDir,
@@ -411,14 +630,17 @@ export async function openRun(config, options) {
       prompt_bytes: priorAdmission.prompt_bytes,
       result: null,
       exit: { code: null, signal: null, spawn_error: null, meaning: null },
+      spawn_error_observed: false,
+      timed_out: false,
       disposition: "unknown",
       disposition_basis: "admission_without_terminal_record",
       anomalies: ["native_result_missing_after_admission"],
       events: { total: 0, by_type: {}, gaps: [] },
+      evidence_validation: { valid: false, diagnostic_code: "saved_terminal_evidence_missing" },
       replayed_from_saved_evidence: true,
     };
   }
-  if (existsSync(runPath)) {
+  if (existsSync(runPath) || existsSync(eventsPath)) {
     throw new Error("CONTROL_RECORD_WITHOUT_ADMISSION");
   }
   const cwd = options.cwd ?? config.cwd;
@@ -439,14 +661,17 @@ export async function openRun(config, options) {
     options.prompt,
   ];
   const startedAt = new Date().toISOString();
+  const modControlDir = join(controlDir, "mod");
+  mkdirSync(modControlDir, { recursive: true });
+  // Prepare every durable journal path before starting the owned child. A
+  // local file error must not leave an untracked native process running.
+  writeFileSync(eventsPath, "", "utf8");
   const child = spawn(config.command, args, {
     cwd,
-    env: { ...process.env, ELIOT_COMMAND_CONTROL_DIR: controlDir },
+    env: nativeEnvironment(modControlDir),
     stdio: ["ignore", "pipe", "pipe"],
   });
 
-  const eventsPath = join(controlDir, "events.ndjson");
-  writeFileSync(eventsPath, "", "utf8");
   const events = [];
   const gaps = [];
   let result = null;
@@ -555,14 +780,16 @@ export async function openRun(config, options) {
   )?.sessionId;
 
   const record = {
-    schema: 1,
+    schema: 2,
     runtime: RUNTIME,
     entrypoint: ENTRYPOINT,
     transport: TRANSPORT,
-    module_artifact_id: config.moduleArtifactId ?? MODULE_ARTIFACT_ID,
+    module_artifact_id: MODULE_ARTIFACT_ID,
+    execution_shape: "sessionless_batch",
     operation_id: operationId,
-      batch_run_id: expectedAdmission.batch_run_id,
+    batch_run_id: expectedAdmission.batch_run_id,
     requested_model: requestedModel,
+    core_binding: expectedAdmission.core_binding,
     // Command's headless result/event contract has not yielded a documented
     // effective-model identity field; never infer one from the request.
     effective_model: null,
@@ -609,6 +836,7 @@ export async function openRun(config, options) {
           ? (EXIT_MEANINGS[exit.code] ?? "UNLISTED_EXIT_CODE")
           : null,
     },
+    spawn_error_observed: exit.spawnError !== null,
     disposition,
     disposition_basis: dispositionBasis,
     timed_out: timedOut,
@@ -628,7 +856,11 @@ export async function openRun(config, options) {
   const tmpPath = `${runPath}.tmp`;
   writeFileSync(tmpPath, JSON.stringify(record, null, 2) + "\n", "utf8");
   renameSync(tmpPath, runPath);
-  return record;
+  const snapshot = snapshotRun(controlDir);
+  return {
+    ...record,
+    evidence_validation: snapshot.evidence,
+  };
 }
 
 // Snapshot of one control directory. Scope is a single headless run, so
@@ -640,15 +872,20 @@ export function snapshotRun(controlDir) {
     ? JSON.parse(readFileSync(runPath, "utf8"))
     : null;
   const admission = readAdmission(resolved);
-  const journal = readModJournal(resolved);
+  const legacy = admission?.schema === 1 && run?.module_artifact_id === LEGACY_MODULE_ARTIFACT_ID;
+  const journal = readModJournal(resolved, { legacy });
   const eventRecords = readJsonLines(join(resolved, "events.ndjson"));
+  const evidence = legacy
+    ? { valid: false, diagnostic_code: "legacy_artifact_read_only" }
+    : validateSavedEvidence(resolved, admission, run, eventRecords);
   return {
     scope: "single_headless_run",
     completeness: "partial",
     control_dir: resolved,
     admission,
-    terminal: run ? run.disposition : "not_observed",
+    terminal: run ? (evidence.valid ? run.disposition : "unknown") : "not_observed",
     run,
+    evidence,
     mod: {
       loaded: journal.loaded,
       ready: journal.ready,

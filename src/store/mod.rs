@@ -22,7 +22,9 @@ use crate::{
     model::{self, Credential, Principal, Role},
     platform::DataRoot,
 };
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OptionalExtension, Transaction, TransactionBehavior, named_params, params,
+};
 use serde_json::{Value, json};
 use std::{fs::File, path::Path, sync::Arc, thread::JoinHandle};
 use tokio::sync::{Semaphore, mpsc, oneshot, watch};
@@ -594,7 +596,21 @@ fn open_database(root: &Path, credential: &Credential) -> Result<Connection> {
         .checked_add(1)
         .ok_or_else(|| Error::new("EPOCH_OVERFLOW", "host epoch exhausted"))?;
     set_meta(&tx, "host_epoch", &json!(epoch))?;
-    tx.execute("UPDATE operations SET state='outcome_unknown', updated_at_ms=?1 WHERE state IN ('sending','native_accepted')", [model::now_ms()?])?;
+    tx.execute(
+        "UPDATE operations SET state='outcome_unknown',result_json=CASE \
+         WHEN method='forge.publish_ref' AND state='sending' THEN \
+           json_set(COALESCE(result_json,'{}'), \
+             '$.outcome','unknown', \
+             '$.publication','operator_intervention_required', \
+             '$.process_tree_unconfirmed',json('true'), \
+             '$.process_tree_status','unconfirmed_after_restart', \
+             '$.process_tree_cleanup','host_lifecycle_interrupted_before_confirmation', \
+             '$.resolution','manual_operator_intervention_required', \
+             '$.reason','process_tree_unconfirmed') \
+         ELSE result_json END,updated_at_ms=?1 \
+         WHERE state IN ('sending','native_accepted')",
+        [model::now_ms()?],
+    )?;
     tx.execute(
         "UPDATE bindings SET state='reconciling',state_json=json_set(state_json,'$.connection','disconnected') WHERE state='ready' AND released_at_ms IS NULL",
         [],
@@ -670,6 +686,98 @@ fn page(params: &Value) -> Result<(i64, i64)> {
     }
     Ok((limit, after))
 }
+
+// Public Operation/report reads share this visibility rule for directed
+// message receipts. The caller and the exact original recipient may read a
+// send; cancellation recipients are resolved against the immutable settled
+// send identified by both delivery ID and payload digest. Only the verified
+// local operator receives the global diagnostic view.
+const OPERATION_VISIBILITY_SQL: &str = r#"(
+    :operator = 1
+    OR op.method NOT IN ('message.send', 'message.cancel')
+    OR op.caller_id = :client
+    OR (
+        op.method = 'message.send'
+        AND op.state = 'settled'
+        AND json_type(op.result_json, '$.sender') = 'text'
+        AND json_extract(op.result_json, '$.sender') = op.caller_id
+        AND json_type(op.result_json, '$.recipient') = 'text'
+        AND length(json_extract(op.result_json, '$.recipient')) > 0
+        AND json_extract(op.result_json, '$.recipient') = :client
+    )
+    OR (
+        op.method = 'message.cancel'
+        AND op.state = 'settled'
+        AND EXISTS (
+            SELECT 1 FROM operations AS original
+            WHERE original.method = 'message.send'
+              AND original.state = 'settled'
+              AND json_extract(original.result_json, '$.delivery_id') =
+                  json_extract(op.result_json, '$.cancellation.delivery_id')
+              AND json_extract(original.result_json, '$.payload_digest') =
+                  json_extract(op.result_json, '$.cancellation.payload_digest')
+              AND original.caller_id = op.caller_id
+              AND json_type(original.result_json, '$.sender') = 'text'
+              AND json_extract(original.result_json, '$.sender') = op.caller_id
+              AND json_type(original.result_json, '$.recipient') = 'text'
+              AND length(json_extract(original.result_json, '$.recipient')) > 0
+              AND json_extract(original.result_json, '$.recipient') = :client
+              AND (
+                  SELECT count(*) FROM operations AS same_identity
+                  WHERE same_identity.method = 'message.send'
+                    AND same_identity.state = 'settled'
+                    AND json_extract(same_identity.result_json, '$.delivery_id') =
+                        json_extract(op.result_json, '$.cancellation.delivery_id')
+                    AND json_extract(same_identity.result_json, '$.payload_digest') =
+                        json_extract(op.result_json, '$.cancellation.payload_digest')
+              ) = 1
+        )
+    )
+)"#;
+
+fn timeline_visibility_sql() -> String {
+    format!(
+        r#"(
+            (
+                :mailbox_only = 1
+                AND o.kind IN ('message.send', 'task.feedback', 'check.completed')
+                AND json_extract(o.payload_json, '$.recipient') = :client
+            )
+            OR (
+                :mailbox_only = 0
+                AND (
+                    o.kind NOT IN ('message.send', 'message.cancel')
+                    OR (:operator = 1 AND o.kind IN ('message.send', 'message.cancel'))
+                    OR (
+                        o.kind IN ('message.send', 'message.cancel')
+                        AND EXISTS (
+                            SELECT 1 FROM operations AS op
+                            WHERE op.operation_id = o.operation_id
+                              AND op.method = o.kind
+                              AND {OPERATION_VISIBILITY_SQL}
+                        )
+                    )
+                )
+            )
+        )"#
+    )
+}
+
+fn operation_visible_to(db: &Connection, p: &Principal, id: &str) -> Result<bool> {
+    let sql = format!(
+        "SELECT EXISTS(SELECT 1 FROM operations AS op WHERE op.operation_id=:operation_id AND {OPERATION_VISIBILITY_SQL})"
+    );
+    Ok(db.query_row(
+        &sql,
+        named_params! {
+            ":operation_id": id,
+            ":operator": p.role == Role::Operator,
+            ":client": &p.client_id,
+        },
+        |row| row.get(0),
+    )?)
+}
+
 fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config) -> Result<Value> {
     match method {
         "check.get" => checks::describe(db, v),
@@ -729,7 +837,11 @@ fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config
         }
         "operation.get" => {
             model::fields(v, &["operation_id"])?;
-            operations::get_operation(db, model::text(v, "operation_id")?)
+            let id = model::text(v, "operation_id")?;
+            if !operation_visible_to(db, p, id)? {
+                return Err(Error::new("NOT_FOUND", format!("Operation {id}")));
+            }
+            operations::get_operation(db, id)
         }
         "agent.state" => {
             model::fields(v, &["binding_id", "generation"])?;
@@ -779,9 +891,21 @@ fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config
             model::fields(v, &["after", "limit", "state"])?;
             let (limit, after) = page(v)?;
             let state = v.get("state").and_then(Value::as_str);
-            let mut s=db.prepare("SELECT operation_id FROM operations WHERE (?1 IS NULL OR state=?1) ORDER BY created_at_ms,operation_id LIMIT ?2 OFFSET ?3")?;
+            let sql = format!(
+                "SELECT op.operation_id FROM operations AS op WHERE (:state IS NULL OR op.state=:state) AND {OPERATION_VISIBILITY_SQL} ORDER BY op.created_at_ms,op.operation_id LIMIT :limit OFFSET :after"
+            );
+            let mut s = db.prepare(&sql)?;
             let ids = s
-                .query_map(params![state, limit, after], |r| r.get::<_, String>(0))?
+                .query_map(
+                    named_params! {
+                        ":state": state,
+                        ":limit": limit,
+                        ":after": after,
+                        ":operator": p.role == Role::Operator,
+                        ":client": &p.client_id,
+                    },
+                    |r| r.get::<_, String>(0),
+                )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             let items = ids
                 .iter()
@@ -802,18 +926,32 @@ fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config
         "report.delta" | "message.read" => {
             model::fields(v, &["after", "limit"])?;
             let (limit, after) = page(v)?;
-            let only_mail = method == "message.read";
-            let mut s=db.prepare("SELECT observation_id,kind,payload_json,recorded_at_ms,operation_id FROM observations WHERE observation_id>?1 AND (?2=0 OR (kind IN ('message.send','task.feedback','check.completed') AND json_extract(payload_json,'$.recipient')=?3)) ORDER BY observation_id LIMIT ?4")?;
+            let mailbox_only = method == "message.read";
+            // Reports subscriptions read this same scoped cursor, so hidden
+            // mail cannot leak through either payloads or pagination flags.
+            let visibility = timeline_visibility_sql();
+            let mut s = db.prepare(&format!(
+                "SELECT o.observation_id,o.kind,o.payload_json,o.recorded_at_ms,o.operation_id FROM observations AS o WHERE o.observation_id>:after AND {visibility} ORDER BY o.observation_id LIMIT :limit"
+            ))?;
             let rows = s
-                .query_map(params![after, only_mail, p.client_id, limit], |r| {
-                    Ok((
-                        r.get::<_, i64>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, i64>(3)?,
-                        r.get::<_, Option<String>>(4)?,
-                    ))
-                })?
+                .query_map(
+                    named_params! {
+                        ":after": after,
+                        ":mailbox_only": mailbox_only,
+                        ":operator": p.role == Role::Operator,
+                        ":client": &p.client_id,
+                        ":limit": limit,
+                    },
+                    |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, i64>(3)?,
+                            r.get::<_, Option<String>>(4)?,
+                        ))
+                    },
+                )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             // Projection first, limits after projection (§8.1): an
             // oversized item becomes an explicit gap reference at its
@@ -835,17 +973,31 @@ fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config
             // source itself continues past the last returned cursor.
             let has_newer: bool = limited.stopped_early
                 || db.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM observations WHERE observation_id>?1 AND (?2=0 OR (kind IN ('message.send','task.feedback','check.completed') AND json_extract(payload_json,'$.recipient')=?3)))",
-                    params![next, only_mail, p.client_id],
+                    &format!(
+                        "SELECT EXISTS(SELECT 1 FROM observations AS o WHERE o.observation_id>:after AND {visibility})"
+                    ),
+                    named_params! {
+                        ":after": next,
+                        ":mailbox_only": mailbox_only,
+                        ":operator": p.role == Role::Operator,
+                        ":client": &p.client_id,
+                    },
                     |r| r.get::<_, bool>(0),
                 )?;
             let has_older: bool = db.query_row(
-                "SELECT EXISTS(SELECT 1 FROM observations WHERE observation_id<=?1 AND (?2=0 OR (kind IN ('message.send','task.feedback','check.completed') AND json_extract(payload_json,'$.recipient')=?3)))",
-                params![after, only_mail, p.client_id],
+                &format!(
+                    "SELECT EXISTS(SELECT 1 FROM observations AS o WHERE o.observation_id<=:after AND {visibility})"
+                ),
+                named_params! {
+                    ":after": after,
+                    ":mailbox_only": mailbox_only,
+                    ":operator": p.role == Role::Operator,
+                    ":client": &p.client_id,
+                },
                 |r| r.get(0),
             )?;
             let frame = projection::frame(
-                if only_mail {
+                if mailbox_only {
                     "mailbox"
                 } else {
                     "observation_timeline"

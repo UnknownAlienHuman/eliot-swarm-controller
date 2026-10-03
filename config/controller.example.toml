@@ -71,7 +71,7 @@ variant = 'REPLACE_WITH_EXACT_VARIANT'
 [[routes]]
 alias = 'command-manager'
 runtime = 'command'
-module_artifact_id = 'command-mod-0.1.0-glue.2'
+module_artifact_id = 'command-mod-0.1.0-glue.3'
 enabled = false
 [routes.native_options]
 workspaceRoot = 'C:\Projects\YourRepository'

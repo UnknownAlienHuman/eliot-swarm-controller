@@ -45,6 +45,39 @@ Port, PID and credentials above are placeholders, not defaults. Credentials are 
 
 No native connection occurs merely to list routes or read host status. After explicit `agent.open` admission, the host attaches its built-in worker. No `client.register` module token or `module-run` process is needed for this adapter; those are Muse bridge setup steps. Existing controller credentials and request IDs still apply. Read an operation's result before using its returned binding/generation.
 
+## Optional pinned service owner
+
+The adapter above still attaches to an already-running service. For an explicitly operator-managed local installation, `serve.mjs` composes the official `@opencode/server` **2.0.7** library with its pinned Effect/Node platform packages and runs it under **Bun 1.4.0**. It binds authenticated HTTP only to `127.0.0.1`, enables native `events.persist`, and puts the database, XDG roots, config, temporary files, owner record and connection record below one explicit private state directory. Give that directory and its password file restrictive OS permissions before launch; the launcher refuses reparse paths and does not copy global configuration, provider credentials, history or databases. It writes the generated connection record for the controller at `connection.json`; treat that file as a secret.
+
+Install only the locked module dependencies and run the exact bundled Bun executable selected by the operator:
+
+```powershell
+npm ci --ignore-scripts
+& '<absolute-path-to-bun-1.4.0.exe>' .\serve.mjs `
+  --state-root '<absolute-private-state-directory>' `
+  --password-file '<absolute-private-state-directory>\server.password' `
+  --port 12345 `
+  --model-catalog refresh
+```
+
+`refresh` is the live default: OpenCode loads its bundled model snapshot and enables its public Models.dev metadata refresh. That refresh is metadata traffic only; this option does not request inference or qualify provider credentials. The explicit `--model-catalog offline` mode disables both snapshot and fetch for deterministic, credential-free persistence checks. The smoke command below uses only that offline mode, creates a model-free session, verifies the exact durable `session.created` event before and after restarting the owned service, checks the SQLite row read-only, and requires clean observed process exits:
+
+```powershell
+node .\selftest.mjs --bun '<absolute-path-to-bun-1.4.0.exe>'
+```
+
+Provider connection APIs are location-scoped. Use the same explicit
+`location[directory]` query pointing at the private workspace for
+`GET /api/integration`, the exact integration GET, credential connection and
+catalog reads. The list GET waits for native plugin activation; verify the
+exact integration and its key method before connecting an authorized key with
+`POST /api/integration/<exact-id>/connect/key`. Omitting the location selects
+the native process working directory and can return 404 even when the
+integration exists in the intended workspace. Keep keys and connection headers
+out of saved/public diagnostics.
+
+A successful smoke verifies service startup and event persistence only. Before any model request, read back the exact provider, model ID and variant from the running native catalog; a bundled snapshot's contents do not qualify a route. Keep the OpenCode version check, catalog identity and actual inference qualification as separate evidence. Stop the owner with Ctrl+C or its explicitly supervised stdin EOF. Before restart, the launcher requires matching owner/receipt schema, nonce, exact PID and state paths; both records must report `runtime_disposed=true` and listener closure, the connection record must be absent, and a non-destructive liveness probe must find the recorded PID gone. The smoke supervisor observes the exact child exit and checks its code against the receipt. A recorded exit-code field alone is not proof that the owner process exited. An active or unconfirmed owner is never killed or overwritten. Preserve the database directory across normal service restarts.
+
 ## Durable session configuration
 
 `agent.configure` supports one bounded native configuration unit: OpenCode's complete durable instruction-entry backend. ELIOT keeps the selected [`existing-control-bundle` donor boundary](../../docs/agent_swarm.donors-20260929.toml) for direct HTTP and delegates storage, replacement, removal and next-step rendering to the native backend rather than copying that state machine into Rust. The complete Atlas donor remains unchanged and continues to scrub retained native question/diagnostic copies. Native semantics were reviewed at OpenCode `4c0d0ff4`: [instruction-entry backend](https://github.com/anomalyco/opencode/blob/4c0d0ff478ca9150c163fb8b04a76395e4dccafe/packages/core/src/session/instruction-entry.ts), [key/value boundary](https://github.com/anomalyco/opencode/blob/4c0d0ff478ca9150c163fb8b04a76395e4dccafe/packages/schema/src/instruction-entry.ts), and [HTTP routes](https://github.com/anomalyco/opencode/blob/4c0d0ff478ca9150c163fb8b04a76395e4dccafe/packages/protocol/src/groups/session.ts).

@@ -1611,8 +1611,14 @@ mod tests {
 
     #[test]
     fn sending_after_restart_stays_held_even_if_readback_matches() {
-        let mut db = Connection::open_in_memory().unwrap();
-        db.execute_batch(super::super::SCHEMA).unwrap();
+        let directory =
+            std::env::temp_dir().join(format!("swarm-forge-reopen-{}", model::new_id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let credential = crate::model::Credential {
+            client_id: "operator".into(),
+            token: "forge-restart-fixture-token".into(),
+        };
+        let db = super::super::open_database(&directory, &credential).unwrap();
         seed_reconciliation_operation(
             &db,
             "op-interrupted-send",
@@ -1623,6 +1629,24 @@ mod tests {
                 "publication_may_have_started":false
             }),
         );
+        drop(db);
+
+        // Reopening exercises the real host-startup transaction before any
+        // Forge reconciliation can observe this interrupted send.
+        let mut db = super::super::open_database(&directory, &credential).unwrap();
+        let restarted = operations::get_operation(&db, "op-interrupted-send").unwrap();
+        assert_eq!(restarted["state"], "outcome_unknown");
+        assert_eq!(restarted["result"]["outcome"], "unknown");
+        assert_eq!(restarted["result"]["process_tree_unconfirmed"], true);
+        assert_eq!(
+            restarted["result"]["process_tree_status"],
+            "unconfirmed_after_restart"
+        );
+        assert_eq!(
+            restarted["result"]["process_tree_cleanup"],
+            "host_lifecycle_interrupted_before_confirmation"
+        );
+
         let principal = Principal {
             link_id: "forge-test".into(),
             client_id: "operator".into(),
@@ -1651,6 +1675,8 @@ mod tests {
             unresolved_process_tree_hold(&db, "github.com/owner/repo").unwrap(),
             Some("op-interrupted-send".into())
         );
+        drop(db);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }
 

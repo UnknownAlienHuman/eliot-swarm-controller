@@ -318,6 +318,11 @@ pub(super) fn hello(
 pub(super) fn next(db: &mut Connection, p: &Principal) -> Result<Value> {
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let (id, generation, b) = scope(&tx, p, true)?;
+    if crate::runtime::batch::is_legacy_command_route(&b["route"]) {
+        // Artifact .2 is retained for historical operation reads only. Never
+        // hand queued work to an old bridge after the .3 receipt contract ships.
+        return Ok(json!({"command":null,"reason":"command_artifact_retired"}));
+    }
     if !matches!(
         b["state"].as_str(),
         Some("opening" | "ready" | "reconciling")
@@ -500,8 +505,59 @@ pub(super) fn next(db: &mut Connection, p: &Principal) -> Result<Value> {
         input["task_snapshot"] = a["task_snapshot"].clone();
         if crate::runtime::codex::is_controller_route(&b["route"])
             || crate::runtime::prepared::is_prepared_claude_route(&b["route"])
+            || crate::runtime::batch::is_command_route(&b["route"])
         {
             input["task_snapshot_canonical"] = json!(model::canonical(&a["task_snapshot"])?);
+        }
+        if crate::runtime::batch::is_command_route(&b["route"]) {
+            let instruction = crate::runtime::batch::instruction(&input)?;
+            input["command_core_binding"] =
+                crate::runtime::batch::command_receipt_facts(&op, &instruction).as_json();
+        }
+    }
+    if method == "agent.reconcile" && crate::runtime::batch::is_command_route(&b["route"]) {
+        let target_id = model::text(&input, "operation_id")?.to_owned();
+        let target = operations::get_operation(&tx, &target_id)?;
+        if target["binding_id"] != id || target["binding_generation"] != generation {
+            return Err(Error::new(
+                "FORBIDDEN",
+                "reconcile target belongs to another binding generation",
+            ));
+        }
+        if !matches!(
+            target["method"].as_str(),
+            Some("agent.open" | "task.dispatch")
+        ) {
+            return Err(Error::invalid(
+                "Command reconciliation target must be agent.open or task.dispatch",
+            ));
+        }
+        if target["method"] == "task.dispatch" {
+            let raw: String = tx.query_row(
+                "SELECT original_request_json FROM operations WHERE operation_id=?1",
+                [&target_id],
+                |row| row.get(0),
+            )?;
+            let target_request: Value = serde_json::from_str(&raw)?;
+            let target_fields = command_target_receipt_fields(
+                &tx,
+                &target_id,
+                &target,
+                &target_request,
+                &b["route"],
+                &id,
+                generation,
+            )?;
+            input["target_command_method"] = target_fields["target_command_method"].clone();
+            // These reserved inputs are recomputed from the original Operation
+            // and immutable Attempt. A module never derives a target receipt
+            // identity from potentially corrupt saved files.
+            input["target_command_requested_model"] =
+                target_fields["target_command_requested_model"].clone();
+            input["target_command_core_binding"] =
+                target_fields["target_command_core_binding"].clone();
+        } else {
+            input["target_command_method"] = target["method"].clone();
         }
     }
     let command = RuntimeCommand {
@@ -621,6 +677,89 @@ pub(super) fn outcome(db: &mut Connection, p: &Principal, v: &Value) -> Result<V
     outcome_with_artifacts(db, p, v, &[])
 }
 
+fn expected_command_dispatch_identity(
+    db: &Connection,
+    operation_id: &str,
+    operation: &Value,
+    request: &Value,
+    route: &Value,
+) -> Result<(Value, String, crate::runtime::batch::CommandReceiptFacts)> {
+    let attempt_id = model::text(request, "attempt_id")?;
+    if operation["attempt_id"] != attempt_id {
+        return Err(Error::new(
+            "NATIVE_IDENTITY_MISMATCH",
+            "Command receipt does not match the dispatch Operation attempt",
+        ));
+    }
+    let attempt = tasks::get_attempt(db, attempt_id)?;
+    let mut frozen_input = request.clone();
+    frozen_input["task_snapshot"] = attempt["task_snapshot"].clone();
+    let instruction = crate::runtime::batch::instruction(&frozen_input)?;
+    let expected = crate::runtime::batch::command_receipt_facts(operation_id, &instruction);
+    let requested_model = model::text(&route["native_options"], "modelId")?.to_owned();
+    Ok((attempt, requested_model, expected))
+}
+
+fn command_target_receipt_fields(
+    db: &Connection,
+    operation_id: &str,
+    operation: &Value,
+    request: &Value,
+    route: &Value,
+    binding_id: &str,
+    generation: i64,
+) -> Result<Value> {
+    if operation["method"] != "task.dispatch"
+        || operation["binding_id"] != binding_id
+        || operation["binding_generation"] != generation
+    {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "reconcile target belongs to another binding generation or method",
+        ));
+    }
+    let (attempt, requested_model, facts) =
+        expected_command_dispatch_identity(db, operation_id, operation, request, route)?;
+    if attempt["binding_id"] != binding_id || attempt["binding_generation"] != generation {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "reconcile target Attempt belongs to another binding generation",
+        ));
+    }
+    Ok(json!({
+        "target_command_method":"task.dispatch",
+        "target_command_requested_model":requested_model,
+        "target_command_core_binding":facts.as_json()
+    }))
+}
+
+fn validate_command_dispatch_receipt(
+    db: &Connection,
+    operation: &Value,
+    route: &Value,
+    receipt: &RuntimeOutcome,
+) -> Result<()> {
+    let raw: String = db.query_row(
+        "SELECT original_request_json FROM operations WHERE operation_id=?1",
+        [&receipt.operation_id],
+        |row| row.get(0),
+    )?;
+    let request: Value = serde_json::from_str(&raw)?;
+    let (_attempt, expected_model, expected) =
+        expected_command_dispatch_identity(db, &receipt.operation_id, operation, &request, route)?;
+    if receipt.details["batch_run_id"] != expected.batch_run_id
+        || receipt.details["prompt_sha256"] != expected.prompt_sha256
+        || receipt.details["prompt_bytes"].as_u64() != u64::try_from(expected.prompt_bytes).ok()
+        || receipt.details["requested_model"].as_str() != Some(expected_model.as_str())
+    {
+        return Err(Error::new(
+            "NATIVE_IDENTITY_MISMATCH",
+            "Command receipt differs from the core-frozen Operation and prompt identity",
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn outcome_with_artifacts(
     db: &mut Connection,
     p: &Principal,
@@ -653,6 +792,9 @@ pub(super) fn outcome_with_artifacts(
     }
     if sessionless_batch {
         crate::runtime::batch::validate_outcome(&b["route"], model::text(&o, "method")?, &r)?;
+        if crate::runtime::batch::is_command_route(&b["route"]) && o["method"] == "task.dispatch" {
+            validate_command_dispatch_receipt(&tx, &o, &b["route"], &r)?;
+        }
         if o["method"] == "agent.reconcile" {
             let raw: String = tx.query_row(
                 "SELECT original_request_json FROM operations WHERE operation_id=?1",
@@ -814,6 +956,12 @@ pub(super) fn outcome_with_artifacts(
         params![stream,r.operation_id,encoded],|x|x.get(0))?;
     if previous {
         return Ok(json!({"recorded":true,"replayed":true,"state":o["state"]}));
+    }
+    if crate::runtime::batch::is_legacy_command_route(&b["route"]) {
+        return Err(Error::new(
+            "ARTIFACT_RETIRED",
+            "Command artifact .2 receipts are historical and cannot settle or mutate current Operations",
+        ));
     }
     // A saved unknown is not immutable failure: a later native fact may resolve
     // it. Conversely, late admission/unknown cannot roll a terminal result back.
@@ -2341,4 +2489,203 @@ pub(super) fn user_command(
     Ok(
         json!({"operation_id":op,"state":"queued","native_admission":"not_observed","prerequisite_operation_id":prerequisite_id,"prerequisite_state":prerequisite.receipt_state()}),
     )
+}
+
+#[cfg(test)]
+mod command_receipt_binding_tests {
+    use super::*;
+    use crate::runtime::EffectOutcome;
+
+    const OPERATION_ID: &str = "command-op-🐇-frozen";
+
+    fn fixture() -> (Connection, Value, Value, RuntimeOutcome) {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE operations(operation_id TEXT PRIMARY KEY, original_request_json TEXT NOT NULL);
+             CREATE TABLE attempts(
+               attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, task_revision INTEGER NOT NULL,
+               task_snapshot_json TEXT NOT NULL, owner_id TEXT NOT NULL, start_owner TEXT NOT NULL,
+               start_operation_id TEXT, binding_id TEXT, binding_generation INTEGER, state TEXT NOT NULL,
+               released_at_ms INTEGER, producers_json TEXT NOT NULL DEFAULT '[]',
+               submission_ref TEXT, candidate_ref TEXT
+             );",
+        )
+        .unwrap();
+        let snapshot = json!({
+            "objective":"Inspect the snowman 🐇",
+            "labels":["alpha","β"],
+            "nested":{"z":1,"a":"last"}
+        });
+        let request = json!({
+            "attempt_id":"attempt-command",
+            "text":"Use exact frozen words: café 🐇"
+        });
+        db.execute(
+            "INSERT INTO operations(operation_id,original_request_json) VALUES(?1,?2)",
+            params![OPERATION_ID, model::canonical(&request).unwrap()],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO attempts(attempt_id,task_id,task_revision,task_snapshot_json,owner_id,start_owner,binding_id,binding_generation,state) VALUES(?1,'task-command',1,?2,'operator','controller','binding-command',4,'reserved')",
+            params!["attempt-command", model::canonical(&snapshot).unwrap()],
+        )
+        .unwrap();
+        let route = json!({
+            "runtime":crate::runtime::batch::COMMAND_RUNTIME,
+            "module_artifact_id":crate::runtime::batch::COMMAND_ARTIFACT_ID,
+            "native_options":{"modelId":"stealth/space-bunny-alpha"}
+        });
+        let mut frozen_input = request.clone();
+        frozen_input["task_snapshot"] = snapshot;
+        let instruction = crate::runtime::batch::instruction(&frozen_input).unwrap();
+        let facts = crate::runtime::batch::command_receipt_facts(OPERATION_ID, &instruction);
+        let operation = json!({
+            "method":"task.dispatch",
+            "attempt_id":"attempt-command",
+            "binding_id":"binding-command",
+            "binding_generation":4
+        });
+        let receipt = RuntimeOutcome {
+            operation_id: OPERATION_ID.to_owned(),
+            outcome: EffectOutcome::Unknown,
+            native_root_id: None,
+            native_scope_key: None,
+            turn_id: None,
+            native_input_id: None,
+            details: json!({
+                "batch_run_id":facts.batch_run_id,
+                "prompt_sha256":facts.prompt_sha256,
+                "prompt_bytes":facts.prompt_bytes,
+                "requested_model":"stealth/space-bunny-alpha"
+            }),
+        };
+        (db, operation, route, receipt)
+    }
+
+    #[test]
+    fn command_receipt_is_bound_to_operation_unicode_text_and_frozen_attempt_snapshot() {
+        let (db, operation, route, receipt) = fixture();
+        validate_command_dispatch_receipt(&db, &operation, &route, &receipt).unwrap();
+
+        for (field, value) in [
+            ("batch_run_id", json!("command-batch:forged")),
+            ("prompt_sha256", json!(model::digest(b"altered prompt"))),
+            (
+                "prompt_bytes",
+                json!(receipt.details["prompt_bytes"].as_u64().unwrap() - 1),
+            ),
+        ] {
+            let mut forged: RuntimeOutcome =
+                serde_json::from_value(serde_json::to_value(&receipt).unwrap()).unwrap();
+            forged.details[field] = value;
+            let error =
+                validate_command_dispatch_receipt(&db, &operation, &route, &forged).unwrap_err();
+            assert_eq!(error.code, "NATIVE_IDENTITY_MISMATCH", "field {field}");
+        }
+
+        db.execute(
+            "UPDATE operations SET original_request_json=?2 WHERE operation_id=?1",
+            params![
+                OPERATION_ID,
+                model::canonical(&json!({
+                    "attempt_id":"attempt-command",
+                    "text":"changed words 🐇"
+                }))
+                .unwrap()
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            validate_command_dispatch_receipt(&db, &operation, &route, &receipt)
+                .unwrap_err()
+                .code,
+            "NATIVE_IDENTITY_MISMATCH"
+        );
+        db.execute(
+            "UPDATE operations SET original_request_json=?2 WHERE operation_id=?1",
+            params![
+                OPERATION_ID,
+                model::canonical(&json!({
+                    "attempt_id":"attempt-command",
+                    "text":"Use exact frozen words: café 🐇"
+                }))
+                .unwrap()
+            ],
+        )
+        .unwrap();
+        db.execute(
+            "UPDATE attempts SET task_snapshot_json=?1 WHERE attempt_id='attempt-command'",
+            [model::canonical(&json!({"objective":"altered snapshot 🐇"})).unwrap()],
+        )
+        .unwrap();
+        assert_eq!(
+            validate_command_dispatch_receipt(&db, &operation, &route, &receipt)
+                .unwrap_err()
+                .code,
+            "NATIVE_IDENTITY_MISMATCH"
+        );
+    }
+
+    #[test]
+    fn command_reconcile_target_envelope_uses_original_request_attempt_and_exact_binding() {
+        let (db, operation, route, receipt) = fixture();
+        let raw: String = db
+            .query_row(
+                "SELECT original_request_json FROM operations WHERE operation_id=?1",
+                [OPERATION_ID],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let request: Value = serde_json::from_str(&raw).unwrap();
+        let fields = command_target_receipt_fields(
+            &db,
+            OPERATION_ID,
+            &operation,
+            &request,
+            &route,
+            "binding-command",
+            4,
+        )
+        .unwrap();
+        assert_eq!(fields["target_command_method"], "task.dispatch");
+        assert_eq!(
+            fields["target_command_requested_model"],
+            receipt.details["requested_model"]
+        );
+        assert_eq!(
+            fields["target_command_core_binding"]["batch_run_id"],
+            receipt.details["batch_run_id"]
+        );
+        assert_eq!(
+            fields["target_command_core_binding"]["prompt_sha256"],
+            receipt.details["prompt_sha256"]
+        );
+        assert_eq!(
+            fields["target_command_core_binding"]["prompt_bytes"],
+            receipt.details["prompt_bytes"]
+        );
+
+        let error = command_target_receipt_fields(
+            &db,
+            OPERATION_ID,
+            &operation,
+            &request,
+            &route,
+            "another-binding",
+            4,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "FORBIDDEN");
+        let error = command_target_receipt_fields(
+            &db,
+            OPERATION_ID,
+            &operation,
+            &request,
+            &route,
+            "binding-command",
+            5,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "FORBIDDEN");
+    }
 }

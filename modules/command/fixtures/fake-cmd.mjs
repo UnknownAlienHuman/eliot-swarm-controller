@@ -23,6 +23,7 @@
 //   no-session-id | success-exit-mismatch  (default: success)
 
 import { pathToFileURL } from "node:url";
+import { appendFileSync } from "node:fs";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -44,6 +45,20 @@ function parseArgs(argv) {
 
 function printLine(value) {
   process.stdout.write(JSON.stringify(value) + "\n");
+}
+
+function recordFilteredEnvironment() {
+  const output = process.env.FAKE_CMD_ENV_PROBE_FILE;
+  if (!output) return;
+  appendFileSync(output, JSON.stringify({
+    owner_present: Object.hasOwn(process.env, "ELIOT_SWARM_MODULE_OWNER"),
+    state_present: Object.hasOwn(process.env, "ELIOT_SWARM_MODULE_STATE"),
+    command_control_dir: process.env.ELIOT_COMMAND_CONTROL_DIR ?? null,
+    qual_capture_present: Object.keys(process.env).some((name) => name.startsWith("SWARM_QUAL_")),
+    capture_present: Object.keys(process.env).some((name) => name.toUpperCase().includes("CAPTURE")),
+    path_present: typeof process.env.PATH === "string",
+    vendor_auth_present: Object.hasOwn(process.env, "ANTHROPIC_API_KEY"),
+  }) + "\n");
 }
 
 function createModHost() {
@@ -114,9 +129,13 @@ async function loadMods(paths, host) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
+  recordFilteredEnvironment();
   if (args.version) {
     process.stdout.write("cmd version 1.66.0 (fixture)\n");
     return;
+  }
+  if (process.env.FAKE_CMD_INVOCATION_FILE) {
+    appendFileSync(process.env.FAKE_CMD_INVOCATION_FILE, "native-run\n");
   }
   if (!args.print || args.outputFormat !== "json" || !args.model) {
     process.stderr.write("fixture supports only: -p --output-format json --model <id>\n");

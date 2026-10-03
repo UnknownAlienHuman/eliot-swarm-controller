@@ -13,18 +13,30 @@ use serde_json::{Value, json};
 
 pub const EXECUTION_SHAPE: &str = "sessionless_batch";
 pub const COMMAND_RUNTIME: &str = "command";
-pub const COMMAND_ARTIFACT_ID: &str = "command-mod-0.1.0-glue.2";
+pub const COMMAND_ARTIFACT_ID: &str = "command-mod-0.1.0-glue.3";
+pub const COMMAND_LEGACY_ARTIFACT_ID: &str = "command-mod-0.1.0-glue.2";
 pub const BATCH_OUTPUTS: [&str; 3] = ["result.json", "thread.md", "thread.json"];
+
+pub fn is_command_route(route: &Value) -> bool {
+    route["runtime"] == COMMAND_RUNTIME && route["module_artifact_id"] == COMMAND_ARTIFACT_ID
+}
+
+pub fn is_legacy_command_route(route: &Value) -> bool {
+    route["runtime"] == COMMAND_RUNTIME && route["module_artifact_id"] == COMMAND_LEGACY_ARTIFACT_ID
+}
 
 pub fn is_sessionless_route(route: &Value) -> bool {
     (route["runtime"] == crate::runtime::zed::RUNTIME
         && route["module_artifact_id"] == crate::runtime::zed::ARTIFACT_ID)
-        || (route["runtime"] == COMMAND_RUNTIME
-            && route["module_artifact_id"] == COMMAND_ARTIFACT_ID)
+        || is_command_route(route)
+        || is_legacy_command_route(route)
 }
 
 pub fn supports(route: &Value, method: &str) -> bool {
     if !is_sessionless_route(route) {
+        return false;
+    }
+    if is_legacy_command_route(route) {
         return false;
     }
     match method {
@@ -94,6 +106,34 @@ pub fn prompt_facts(instruction: &str, task_snapshot: &Value) -> Result<Value> {
     }))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandReceiptFacts {
+    pub batch_run_id: String,
+    pub prompt_sha256: String,
+    pub prompt_bytes: usize,
+}
+
+/// Core-owned identity for a Command batch. The Operation ID is stable across
+/// module reconnects; prompt facts use the shared canonical instruction.
+pub fn command_receipt_facts(operation_id: &str, instruction: &str) -> CommandReceiptFacts {
+    let operation_digest = model::digest(operation_id.as_bytes());
+    CommandReceiptFacts {
+        batch_run_id: format!("command-batch:{}", &operation_digest[..32]),
+        prompt_sha256: model::digest(instruction.as_bytes()),
+        prompt_bytes: instruction.len(),
+    }
+}
+
+impl CommandReceiptFacts {
+    pub fn as_json(&self) -> Value {
+        json!({
+            "batch_run_id":self.batch_run_id,
+            "prompt_sha256":self.prompt_sha256,
+            "prompt_bytes":self.prompt_bytes
+        })
+    }
+}
+
 fn native_identity_is_null(outcome: &RuntimeOutcome) -> bool {
     outcome.native_root_id.is_none()
         && outcome.native_scope_key.is_none()
@@ -106,6 +146,13 @@ fn successful_terminal(details: &Value) -> bool {
         && details["completion_condition"] == "native_result_observed"
         && details["exit_code"] == 0
         && terminal_status(details) == Some("success")
+}
+
+fn command_successful_terminal(details: &Value) -> bool {
+    successful_terminal(details)
+        && details["signal"].is_null()
+        && details["spawn_error_observed"] == false
+        && details["timed_out"] == false
 }
 
 fn terminal_status(details: &Value) -> Option<&str> {
@@ -141,6 +188,21 @@ fn failed_terminal(details: &Value) -> bool {
         _ => None,
     };
     expected_exit.is_some() && exit_code == expected_exit
+}
+
+fn command_failed_terminal(details: &Value) -> bool {
+    if details["execution_shape"] != EXECUTION_SHAPE
+        || details["completion_condition"] != "native_result_observed"
+        || !details["signal"].is_null()
+        || details["spawn_error_observed"] != false
+        || details["timed_out"] != false
+    {
+        return false;
+    }
+    matches!(
+        (terminal_status(details), details["exit_code"].as_i64()),
+        (Some("error"), Some(1 | 3 | 4 | 5 | 6 | 7 | 9 | 10 | 130)) | (Some("max_turns"), Some(8))
+    )
 }
 
 /// Validate the shared core envelope before it can settle a sessionless
@@ -186,16 +248,25 @@ pub fn validate_outcome(route: &Value, method: &str, outcome: &RuntimeOutcome) -
                 ));
             }
             match outcome.outcome {
-                EffectOutcome::Applied if !successful_terminal(&outcome.details) => {
+                EffectOutcome::Applied
+                    if !(if route["runtime"] == COMMAND_RUNTIME {
+                        command_successful_terminal(&outcome.details)
+                    } else {
+                        successful_terminal(&outcome.details)
+                    }) =>
+                {
                     return Err(Error::invalid(
                         "applied batch dispatch requires a successful result and exit code 0",
                     ));
                 }
                 EffectOutcome::Rejected
-                    if !failed_terminal(&outcome.details)
-                        && !(outcome.details["completion_condition"]
-                            == "executor_launch_rejected"
-                            && outcome.details["native_session_state"] == "not_started") =>
+                    if !(if route["runtime"] == COMMAND_RUNTIME {
+                        command_failed_terminal(&outcome.details)
+                    } else {
+                        failed_terminal(&outcome.details)
+                    }) && !(outcome.details["completion_condition"]
+                        == "executor_launch_rejected"
+                        && outcome.details["native_session_state"] == "not_started") =>
                 {
                     return Err(Error::invalid(
                         "rejected batch dispatch requires an observed native failure result",
@@ -316,6 +387,33 @@ mod tests {
             &json!({"runtime":"command","module_artifact_id":COMMAND_ARTIFACT_ID}),
             "agent.result"
         ));
+        let legacy_command = json!({
+            "runtime":COMMAND_RUNTIME,
+            "module_artifact_id":COMMAND_LEGACY_ARTIFACT_ID
+        });
+        assert!(is_sessionless_route(&legacy_command));
+        assert!(!supports(&legacy_command, "task.dispatch"));
+        assert!(
+            validate_command(&legacy_command, "task.dispatch", &json!({"text":"old"})).is_err()
+        );
+    }
+
+    #[test]
+    fn command_receipt_identity_uses_stable_operation_and_canonical_unicode_prompt() {
+        let snapshot = json!({"zeta":"🐇","alpha":{"text":"naïve"}});
+        let input = json!({"text":"réponds 🐇","task_snapshot":snapshot});
+        let instruction = instruction(&input).unwrap();
+        assert_eq!(
+            instruction,
+            "réponds 🐇\n\nELIOT immutable task snapshot:\n{\"alpha\":{\"text\":\"naïve\"},\"zeta\":\"🐇\"}"
+        );
+        let first = command_receipt_facts("operation-雪", &instruction);
+        let second = command_receipt_facts("operation-雪", &instruction);
+        assert_eq!(first, second);
+        assert_eq!(first.prompt_sha256, model::digest(instruction.as_bytes()));
+        assert_eq!(first.prompt_bytes, instruction.as_bytes().len());
+        assert!(first.batch_run_id.starts_with("command-batch:"));
+        assert_eq!(first.batch_run_id.len(), "command-batch:".len() + 32);
     }
 
     #[test]
@@ -423,7 +521,10 @@ mod tests {
                 "completion_condition":"native_result_observed",
                 "batch_run_id":"op-run",
                 "exit_code":8,
-                "result_subtype":"max_turns"
+                "result_subtype":"max_turns",
+                "signal":null,
+                "spawn_error_observed":false,
+                "timed_out":false
             }),
         );
         assert!(validate_outcome(&command_route, "task.dispatch", &max_turns).is_ok());
@@ -450,6 +551,82 @@ mod tests {
             }),
         );
         assert!(validate_outcome(&command_route, "task.dispatch", &conflicting_status).is_err());
+    }
+
+    #[test]
+    fn command_terminal_failures_require_documented_matching_exit_and_clean_process_facts() {
+        let route = json!({
+            "runtime":COMMAND_RUNTIME,
+            "module_artifact_id":COMMAND_ARTIFACT_ID
+        });
+        for exit_code in [1, 3, 4, 5, 6, 7, 9, 10, 130] {
+            let rejected = outcome(
+                EffectOutcome::Rejected,
+                json!({
+                    "execution_shape":EXECUTION_SHAPE,
+                    "completion_condition":"native_result_observed",
+                    "batch_run_id":"stable-run",
+                    "result_subtype":"error",
+                    "exit_code":exit_code,
+                    "signal":null,
+                    "spawn_error_observed":false,
+                    "timed_out":false
+                }),
+            );
+            assert!(validate_outcome(&route, "task.dispatch", &rejected).is_ok());
+        }
+
+        for invalid in [
+            json!({
+                "execution_shape":EXECUTION_SHAPE,
+                "completion_condition":"native_result_observed",
+                "batch_run_id":"stable-run",
+                "result_subtype":"error",
+                "exit_code":8,
+                "signal":null,
+                "spawn_error_observed":false,
+                "timed_out":false
+            }),
+            json!({
+                "execution_shape":EXECUTION_SHAPE,
+                "completion_condition":"native_result_observed",
+                "batch_run_id":"stable-run",
+                "result_subtype":"error",
+                "exit_code":3,
+                "signal":"SIGTERM",
+                "spawn_error_observed":false,
+                "timed_out":false
+            }),
+            json!({
+                "execution_shape":EXECUTION_SHAPE,
+                "completion_condition":"native_result_observed",
+                "batch_run_id":"stable-run",
+                "result_subtype":"error",
+                "exit_code":3,
+                "signal":null,
+                "spawn_error_observed":true,
+                "timed_out":false
+            }),
+            json!({
+                "execution_shape":EXECUTION_SHAPE,
+                "completion_condition":"native_result_observed",
+                "batch_run_id":"stable-run",
+                "result_subtype":"error",
+                "exit_code":3,
+                "signal":null,
+                "spawn_error_observed":false,
+                "timed_out":true
+            }),
+        ] {
+            assert!(
+                validate_outcome(
+                    &route,
+                    "task.dispatch",
+                    &outcome(EffectOutcome::Rejected, invalid)
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]

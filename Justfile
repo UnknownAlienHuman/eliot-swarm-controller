@@ -32,8 +32,12 @@ codex-fixtures:
     python modules/codex/verify_vendor.py
     python modules/codex/test_bridge.py
 
+# Requires module-local npm ci and the absolute Bun 1.4.0 path in ELIOT_OPENCODE_BUN_EXE.
+opencode-fixtures:
+    node modules/opencode/selftest.mjs
+
 build:
     cargo build --locked --release --bin swarm
 
 # Install the documented locked module SDKs before invoking this gate.
-verify: fmt clippy test bridge-fixtures codex-fixtures build
+verify: fmt clippy test bridge-fixtures codex-fixtures opencode-fixtures build

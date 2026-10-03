@@ -1024,6 +1024,12 @@ fn root_log_created(root: &str) -> Value {
     )
 }
 
+fn root_log_created_without_parent(root: &str) -> Value {
+    let mut event = root_log_created(root);
+    event["data"].as_object_mut().unwrap().remove("parentID");
+    event
+}
+
 /// Persist the exact origin facts from the native create request. Store-level
 /// tests use generated binding IDs, so the default unit-test binding above is
 /// not a valid origin for them.
@@ -1438,6 +1444,63 @@ async fn lost_activation_with_message_and_log_proves_admission_and_start_separat
     // Reconciliation read back only: no prompt or entry write was replayed.
     assert_eq!(f.posts(&goal_prompt_path(&root)), 1);
     assert_eq!(f.puts(&goal_entry_path(&root)), 1);
+}
+
+#[test]
+fn root_creation_and_input_scans_accept_native_omitted_parent_id_only() {
+    let root = root_id("fixture-binding", 1);
+    let model =
+        json!({"id":"fixture-model","providerID":"fixture-provider","variant":"explicit-variant"});
+    let created = root_log_created_without_parent(&root);
+
+    // OpenCode 2.0.7's native session.created schema makes parentID optional.
+    let mut origin = RootCreationScan::new(&root, "fixture-binding", 1, model.clone()).unwrap();
+    origin.consume(&created).unwrap();
+    assert!(origin.created());
+
+    let operation = "op_parentless_root";
+    let text = "verify parentless native root";
+    let marker = json!({"binding":"fixture-binding","generation":1,"operation":operation});
+    let command = RuntimeCommand {
+        operation_id: operation.into(),
+        method: "agent.goal".into(),
+        created_at_ms: 1,
+        binding_id: "fixture-binding".into(),
+        generation: 1,
+        native_root_id: Some(root.clone()),
+        route: json!({"runtime":RUNTIME,"module_artifact_id":ARTIFACT_ID,
+        "native_options":{"model":model.clone()}}),
+        input: json!({"text":text}),
+    };
+    let descriptor =
+        NativeInputDescriptor::for_goal_activation(&command, text, marker.clone()).unwrap();
+    let mut scan = ExecutionScan::for_goal(&descriptor).unwrap();
+    scan.consume(&created, &descriptor).unwrap();
+    let input = input_id(operation);
+    scan.consume(
+        &root_log_enqueued(&root, 2, &input, text, &marker),
+        &descriptor,
+    )
+    .unwrap();
+    assert!(scan.input_admitted());
+
+    // Absence is allowed for roots; any present parent remains a mismatch.
+    for parent in [json!("ses_foreign"), json!({"unexpected":"ses_foreign"})] {
+        let mut foreign = created.clone();
+        foreign["data"]["parentID"] = parent;
+
+        let mut origin = RootCreationScan::new(&root, "fixture-binding", 1, model.clone()).unwrap();
+        assert_eq!(
+            origin.consume(&foreign).unwrap_err().code,
+            "NATIVE_LOG_ORIGIN"
+        );
+
+        let mut scan = ExecutionScan::for_goal(&descriptor).unwrap();
+        assert_eq!(
+            scan.consume(&foreign, &descriptor).unwrap_err().code,
+            "NATIVE_LOG_ORIGIN"
+        );
+    }
 }
 
 #[test]
