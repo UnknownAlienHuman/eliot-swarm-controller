@@ -183,9 +183,26 @@ let resolveOutcomes;
 let rejectOutcomes;
 const outcomesDone = new Promise((resolve, reject) => { resolveOutcomes = resolve; rejectOutcomes = reject; });
 const sockets = new Set();
+let teardownStarted = false;
+const unexpectedSocketErrors = [];
+function recordSocketError(error) {
+  // Teardown also runs while unwinding a fixture failure; that original
+  // failure remains in flight. Ignore only ECONNRESET once cleanup starts.
+  if (teardownStarted && error?.code === "ECONNRESET") return;
+  const diagnostic = {
+    code: error?.code ?? null,
+    message: String(error?.message ?? error),
+    during_teardown: teardownStarted,
+  };
+  unexpectedSocketErrors.push(diagnostic);
+  rejectOutcomes(
+    new Error(`unexpected host fixture socket error: ${diagnostic.code ?? "unknown"}: ${diagnostic.message}`),
+  );
+}
 const server = net.createServer(socket => {
   sockets.add(socket);
   socket.on("close", () => sockets.delete(socket));
+  socket.on("error", recordSocketError);
   socket.setEncoding("utf8");
   let buffer = "";
   socket.on("data", chunk => {
@@ -417,6 +434,8 @@ try {
     new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error(`bridge timed out: ${stderr}`)), 15000); }),
   ]);
   clearTimeout(timeout);
+  assert.deepEqual(unexpectedSocketErrors, [], `unexpected fixture socket errors: ${JSON.stringify(unexpectedSocketErrors)}`);
+  teardownStarted = true;
   child.kill("SIGTERM");
   await childClosed;
   assert.equal(invalidParams.length, 0);
@@ -508,6 +527,7 @@ try {
   process.stdout.write("Command bridge fixture: preflight, one-shot dispatch, refresh and saved-run reconcile passed\n");
 } finally {
   clearTimeout(timeout);
+  teardownStarted = true;
   if (child && child.exitCode === null) {
     child.kill("SIGTERM");
     await childClosed;
@@ -515,4 +535,9 @@ try {
   for (const socket of sockets) socket.destroy();
   await new Promise(resolve => server.close(resolve));
   rmSync(scratch, { recursive: true, force: true });
+  assert.deepEqual(
+    unexpectedSocketErrors,
+    [],
+    `unexpected fixture socket errors: ${JSON.stringify(unexpectedSocketErrors)}`,
+  );
 }
