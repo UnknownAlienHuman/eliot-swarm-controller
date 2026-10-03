@@ -2,7 +2,7 @@
 
 **Revision:** 2 — 2026-10-03  
 **Integration review:** main `504199d14135c030ad3951a3c5023a098a3d03f0` and [Agent Operations PR #23](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/23).  
-**Status:** proposed public names and presentation contracts, not implemented capability claims.
+**Status:** authoritative public-name and presentation contract. Core registry/role authorization is wired in the active increment from `36cfb652`; backend gates passed on the current working tree, while actual native-MCP harness loading remains unknown. Names listed here are not proof every handler or client capability is complete.
 
 This is the canonical convenience-tool list for the [Communication Program](agent-communication-program.md). [Catalog and Loading](mcp-tool-catalog-and-loading.md) owns registry metadata; [Launcher](swarm-launcher-assignment-context.md) owns work context. Older aliases and reviewer examples are corrected here rather than exposed as competing APIs.
 
@@ -63,9 +63,9 @@ review.submit
 operation.get
 ```
 
-`review.submit` records the assigned auditor's exact-slot verdict/evidence. It does not apply Task feedback, start repair or publish. `task.request_changes` is the guarded manager disposition and is not part of the normal assigned-reviewer core. O7 of the operations program must wire the review assignment scope, result handler and profile together; a plain Participant cannot submit arbitrary audits.
+`review.submit` records the assigned auditor's exact-slot verdict/evidence. `review.get` and linked `operation.get` read only that authenticated reviewer's exact retained assignment/result; they may complete after Task revision or Attempt release while the credential remains valid and unrevoked. For this historical exception, no context/list, artifact or evidence reads are implied; the current assignment's ordinary review context is separately scope-checked. A pending `review_scope.review_assignment_id: null` becomes usable only after the server atomically binds the exact assignment. The assigned reviewer cannot apply Task feedback, start repair or publish. `task.request_changes` is the guarded manager disposition and is not part of the normal assigned-reviewer core. A legacy profile explicitly named `Reviewer` may retain old compatibility behavior, clearly separated from this canonical surface.
 
-Any previously implemented reviewer profile behavior is a separately identified legacy surface until deliberately migrated. A tool's existence or read/write annotation never overrides application authorization. Missing new review support is an explicit capability gap, not a silent substitution of a manager tool.
+Any previously implemented reviewer profile behavior is a separately identified legacy surface until deliberately migrated. The canonical coordination surface is `coordination.consult`; availability uses `coordination.watch.create/list/cancel`, not eager `ask_owner` or `notify_when_available` aliases. A tool's existence or read/write annotation never overrides application authorization. Missing new review support is an explicit capability gap, not a silent substitution of a manager tool.
 
 ### Observer
 

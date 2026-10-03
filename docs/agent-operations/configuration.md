@@ -167,7 +167,7 @@ effort = "EFFORT_FROM_WRITER_CATALOG"
 
 Placeholders must resolve to actual supported values. Runtime profiles are preferences, not security roles.
 
-Store owns active entries; TOML/JSON is import/export. A manager may explicitly authorize a local file-managed source under their identity. Its edits use the same revisioned apply path, including enabled changes. A file merely found in a writer checkout is not such authorization.
+Store owns active entries; TOML/JSON is import/export. File-managed imports are not implemented in the first slice. Before enabling them, a future authenticated source registration must bind the canonical path, effective ACL and reparse-point proof to the manager; imported edits must use revision/owner-epoch compare-and-swap through the same apply path. A file merely found in a writer checkout is not authorization, and failure never falls back to Root.
 
 MCP and file editing share one revision authority. A stale file cannot reverse a newer MCP disable. Invalid/partial saves keep the last valid values and show field errors. Watch parent-directory replacements and reconcile missed events in Rust. Imports create disabled entries unless the manager explicitly enables the named entries; a restore/import is not ordinary crash recovery of the same Store.
 
@@ -177,7 +177,7 @@ Saved enabled/disabled choices survive ordinary host restart and manager-client 
 
 Disable stops new starts and separate follow-ups, not running agents, native Goals or remote writes. Manual tools keep working and share the same reservations. Results/readback from already started work remain recordable; revocation never justifies forging new output or losing observed effect evidence.
 
-Revoked/deleted ownership blocks only new affected actions. Restored rights can make a still-enabled entry eligible; explicitly disabled entries stay disabled. Ownership transfer is an explicit authorized management action, not a side effect of editing, last-editor identity, session silence or queue balancing. Preserve old invocation attribution and reconcile old uncertain effects before replacing anything. GM handover does not automatically transfer every manager's automations or old epoch-fenced publication.
+Revoked/deleted ownership blocks only new affected actions. Restored rights can make a still-enabled entry eligible; explicitly disabled entries stay disabled. Owner transfer is a future explicit authorized management action, not implemented in this slice. Before enabling it, compare-and-swap the owner epoch; it is never a side effect of editing, last-editor identity, session silence or queue balancing. Preserve old invocation attribution and reconcile old uncertain effects before replacing anything. GM handover does not automatically transfer every manager's automations or old epoch-fenced publication.
 
 ## 9. Dynamic runtime preferences
 
@@ -197,4 +197,4 @@ Goal tracking starts no work. Its selected progression uses one enabled manager 
 
 Keep #22's small eager cores. Config get/preview/apply/explain and detailed runtime, hook, script, schedule, Goal, review and forge methods are deferred groups. Schedule/rule/Goal editors update the same entry and enabled flag, not parallel records. Before exposing them, wire their real application handler and result reader.
 
-For review, the normal assigned-auditor result tool is `review.submit`; `task.request_changes` remains the guarded manager disposition. Existing legacy MCP schemas do not silently acquire new rights. `automation.explain` and manual review/context reads must find on-behalf Operations through their owner linkage even though the service is their technical requester.
+For review, the normal assigned-auditor result tool is `review.submit`; `task.request_changes` remains the guarded manager disposition. Scoped Manager feedback is available only when a TaskSpec explicitly selects [owner-policy-v2](../owner-policy-v2.md) for a new Attempt. Existing v1 Attempts and their feedback rights/evidence remain frozen and unchanged. Existing legacy MCP schemas do not silently acquire new rights. `automation.explain` and manual review/context reads must find on-behalf Operations through their owner linkage even though the service is their technical requester.

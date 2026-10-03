@@ -266,6 +266,9 @@ The workflow pins Rust 1.98.1/Cargo.lock and checks owned-crate formatting, warn
 | [Module contract](docs/agent_swarm.module-contract-v2.md) | Capabilities, delivery and lifecycle |
 | [CheckRunner](docs/check-runner.md) | Implemented execution/cancellation/recovery details |
 | [Reference specification](docs/agent_swarm.spec-v18/README.md) | Design examples, not implementation evidence |
+| [Agent communication, launcher and MCP program](docs/agent-communication-program.md) | PR #22 canonical entrypoint and links to participant, launcher, surface and catalog requirements |
+| [Canonical MCP surfaces](docs/mcp-canonical-surfaces-and-topologies.md) / [tool catalog](docs/mcp-tool-catalog-and-loading.md) | Public names, permission profiles, topology and deferred loading |
+| [Agent Operations](docs/agent-operations/README.md) | PR #23 manager-owned configuration, dispatch, review and delivery requirements |
 | [Donors](docs/agent_swarm.donors-20260929.toml) | Inventory; selected Atlas snapshot is tracked separately, not all installed runtimes |
 | [Lessons](docs/lessons-learned.md) / [runtime notes](docs/runtime-notes.md) / [candidates](docs/candidate-notes.md) | On-demand evidence, not extra worker instructions |
 

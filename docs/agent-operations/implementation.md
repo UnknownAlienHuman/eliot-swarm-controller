@@ -1,8 +1,8 @@
 # Implementation Plan — Rust Operations on Behalf of the Manager
 
-Revision 5 · 2026-10-03 · inspected baseline `504199d14135c030ad3951a3c5023a098a3d03f0`.
+Revision 5 · 2026-10-03 · design baseline `36cfb652` plus the active implementation increment.
 
-Read [README](README.md), then the relevant [Configuration](configuration.md), [Architecture](architecture.md), [Delivery](delivery.md) and [Donor map](donor-map.md). These are planned production paths and qualification cases, not completed implementation.
+Read [README](README.md), then the relevant [Configuration](configuration.md), [Architecture](architecture.md), [Delivery](delivery.md) and [Donor map](donor-map.md). The program remains partial: implementation commit `2607c8858e573ae40459c27d76d8ae9e1ca9f8fc` wires 29 methods and 83 `ToolSpec` entries with live authorization/role cores. Backend dev build, Clippy, 221 Rust tests, Windows probe and final Muse fixture (7.4s) passed for that implementation; native MCP harness loading remains unknown. Launch, watch/consult, integration/scope-Git, Concilium, cron, Goal and native-Rust conversion remain planned gaps.
 
 ## 1. Delivery discipline
 
@@ -84,7 +84,7 @@ src/store/monitoring.rs
 - Share readers and projectors. Snapshot plus after-cursor reads must cover changes racing with subscription. No full history scan or model status query per viewer.
 - Separate terminal/control evidence from live presentation. Slow streams cannot starve completion, permission replies or manual actions.
 - Bound parser/OS/Git blocking work, queue bytes and serialized output. Keep owner/route fairness and shared-account capacity separate from configured concurrency.
-- Trusted file-managed configuration uses the same revisioned apply path; invalid/atomic-save races keep last valid values and stale files cannot reverse newer toggles.
+- Future file-managed configuration is not implemented in this slice. Before imports can be enabled, authenticated source registration must bind canonical path, ACL and reparse proof; apply uses revision/owner-epoch CAS, and import failure never falls back to Root.
 
 Done: monitoring works with no enabled automation, dropped notifications recover without lost/duplicate work, and one malformed source or waiting queue cannot block unrelated owners.
 
@@ -211,7 +211,7 @@ Reconcile these interfaces with #22 in the same implementation increment:
 
 | Interface | Combined contract |
 |---|---|
-| Assigned reviewer | Eager `review.submit` once implemented; `task.request_changes` stays manager disposition. Legacy profile behavior is not silently elevated. |
+| Assigned reviewer | Canonical `review.submit`, exact-assignment `review.get` and linked `operation.get` may finish/read after release while authenticated and unrevoked. `task.request_changes` stays manager disposition; explicit legacy `Reviewer` compatibility remains separate. |
 | Participant registration | Sponsored review scope may submit its exact slot; ordinary workers do not acquire review/Task rights. |
 | Operations/status | Manager sees authorized on-behalf actions despite service requester identity; result ingestion and new-effect permission differ. |
 | Launcher | One candidate/worktree owner, separate native continuation identity, real reporting capability evidence. |

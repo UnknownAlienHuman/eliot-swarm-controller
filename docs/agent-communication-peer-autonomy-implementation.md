@@ -44,24 +44,16 @@ It is an **assignment-bound coordination capability**, not a general writer role
 ### 1.1 Participant can call only
 
 ```text
-coordination.context.get
-coordination.peer.find
-coordination.work_card.publish/get/list/withdraw
-coordination.contract_card.publish/get/list/withdraw
-coordination.ask/answer/ask.get/ask.list
-coordination.integration.offer/requirement/check/ack/get
-coordination.agreement.get/list
-coordination.notify_when_available
-coordination.thread.open/get/list
-coordination.message.send
-coordination.thread.resolve/withdraw
-coordination.contract.propose/respond/get/list
-code.scope.propose/inspect/conflicts
-selected bounded Git reads permitted by the participant's exact Task context
-concilium.propose/get
-message.read
-message.cancel only for its own sent delivery
-operation.get only for its own coordination Operations
+swarm.context.get
+swarm.tools.search
+coordination.send
+coordination.inbox
+coordination.consult
+coordination.sync_integration
+coordination.watch.create/list/cancel
+swarm.overlap.check
+review.get / review.submit only for an atomically bound exact review assignment
+operation.get only for its own coordination Operations or that assignment's linked review Operation
 ```
 
 The exact final allowlist is fixed in code and profile documentation. Unknown methods fail before generic writer routing.
@@ -218,9 +210,11 @@ Every participant call also revalidates:
 - participation basis still valid;
 - optional binding generation/current native identity still matches.
 
-After Attempt release/supersession, mutation returns `STALE_PARTICIPANT`. Historical reads remain subject to manager/operator/review policy; the old participant cannot continue writing because its native process happens to remain alive.
+After Attempt release/supersession, generic participant writes return `STALE_PARTICIPANT`; revocation also denies writes. The narrow assigned-review exception is exact and does not revive the Participant identity generally: an authenticated reviewer Participant may read `review.get`, read the linked `operation.get`, and submit `review.submit` only for its retained assignment, submission and candidate after Task revision or Attempt release. It gets no historical context/list, artifact or evidence reads. These exact historical reads/submission remain subject to credential validity and explicit revocation; generic stale writes remain denied.
 
-Attempt release may mark participant registrations inactive in the same transaction or make them fail by revalidation. It must not silently map an old credential to a new Attempt.
+Attempt release may mark ordinary participant registrations inactive in the same transaction or make them fail by revalidation. A registered assigned reviewer can retain only the exact review scope needed to finish/read its existing assignment. It must not silently map an old credential to a new Attempt.
+
+If registration is prepared before a review assignment exists, `review_scope.review_assignment_id: null` is pending, not authority. The server must atomically bind the scope to the exact assignment before `review.get`, linked `operation.get`, or `review.submit` can succeed. Recheck the authenticated Participant, exact assignment/submission/candidate and revocation state on every call.
 
 ## 3. Native-agent access without manager relay
 
@@ -279,7 +273,7 @@ A participant can request exact card fields:
 coordination.contract_card.get(contract_key, fields=[...])
 ```
 
-Before sending a quick ask, `coordination.ask_owner` checks whether the requested structured field is present in the current card. If yes, result is:
+Before sending a quick ask, `coordination.consult` checks whether the requested structured field is present in the current card. If yes, result is:
 
 ```json
 {
@@ -327,7 +321,7 @@ Only `exact_owner` permits the convenience method to send. Ambiguity never becom
 ## 6.1 Convenience operation
 
 ```text
-coordination.ask_owner
+coordination.consult
 ```
 
 Transactionally:
@@ -639,7 +633,7 @@ Deliver:
 
 - card-field fast answer;
 - exact owner resolution;
-- `ask_owner`, `ask`, `answer`;
+- `coordination.consult` for card-backed answers or one exact-owner ask;
 - ask coalescing;
 - one-recipient mailbox delivery;
 - inbound policy facts;
@@ -695,7 +689,7 @@ A Participant profile exposes primarily:
 
 ```text
 coordination_context
-coordination_ask_owner
+coordination_consult
 coordination_answer
 coordination_publish_work_card
 coordination_publish_contract

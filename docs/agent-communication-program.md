@@ -3,7 +3,7 @@
 
 **Revision:** 7 — 2026-10-03  
 **Latest integration review:** main `504199d14135c030ad3951a3c5023a098a3d03f0` and the manager-owned operations program in [PR #23](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/23).  
-**Status:** documentation and implementation handoff, not a claim of implemented or live-qualified features.
+**Status (2026-10-03):** the documentation program is a design/implementation handoff, not a claim that PR #22/#23 is complete or live-qualified. From baseline `36cfb652`, implementation commit `2607c8858e573ae40459c27d76d8ae9e1ca9f8fc` wires 29 additional methods and 83 `ToolSpec` entries through the library/Store/host/model/CLI with live authorization and role-core checks. Backend dev build, Clippy, 221 Rust tests, Windows probe and final Muse fixture passed for that implementation; actual native-MCP harness loading remains unknown. Participant scoped coordination/cards/mailbox, assigned-review slots/history, explicitly selected owner-policy-v2 feedback, automation config, durable review dispatch, deferred MCP search and bounded launcher read projections are partial slices. Launch, watches, consultation, integration/scope-Git, cron, Goal and native-Rust conversion remain planned gaps.
 
 ## 1. Product rule
 
@@ -34,7 +34,7 @@ Read the canonical product/module contract and [Owner Decisions](owner-decisions
 | Existing mailbox/Store/Git source constraints | [Implementation Checklist](agent-communication-implementation-checklist.md) |
 | Manager-owned automations, review results, cron, hooks, Goal and scripts | [Agent Operations PR #23](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/23), `docs/agent-operations/` |
 
-The fleet and canonical-surface documents replace old count-based sponsorship, eager aliases and full-directory examples. The operations program supplies `review.assign/submit` and manager-owned execution; implement those shared capabilities once. The exact reviewer tool is `review.submit` when implemented, not an implicit right to perform the manager's `task.request_changes` transition.
+The fleet and canonical-surface documents replace old count-based sponsorship, eager aliases and full-directory examples. The canonical assigned-reviewer result is `review.submit`; `review.get` and `operation.get` may read only that reviewer's exact retained assignment/result, including after release, while authorization remains valid. They do not expose lists, historical context, artifacts or evidence. A pending `review_scope` with `review_assignment_id: null` is unusable until the server atomically binds it to the exact assignment. The reviewer cannot perform the manager's `task.request_changes` disposition. A legacy profile named `Reviewer` may retain old compatibility behavior only as an explicitly identified profile, never as the canonical assigned-reviewer contract.
 
 Expanded [Concilium](agent-communication-concilium.md), [Tool Contracts](agent-communication-tool-contracts.md) and [Issue Plan](agent-communication-implementation-issues.md) remain useful detail/history, subject to these current owners. Their older example names, role restrictions and numbered implementation sequences are not parallel APIs or another work plan. Resolve an actual cross-document discrepancy in its owning documents; do not invent a new precedence appendix, authority or compatibility alias.
 

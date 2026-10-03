@@ -4,10 +4,12 @@
 **Revision:** 1 — 2026-10-03  
 **Source baseline:** `main` at `35e499ae73b622d873c44873f6993ee3fcbea87b`  
 **Applies to:** [Communication Program](agent-communication-program.md), [Fleet-Scale Freedom](agent-communication-fleet-scale-freedom.md), [MCP Profiles](mcp-profiles.md)  
-**Status:** normative implementation amendment. It does not claim the grouped/deferred catalog is already implemented.  
+**Status:** normative catalog contract. From baseline `36cfb652`, implementation commit `2607c8858e573ae40459c27d76d8ae9e1ca9f8fc` wires 83 `ToolSpec` entries, live authorization, role cores and deferred tool search. Backend gates passed for that implementation; actual native-MCP harness loading remains unknown.
 **Precedence:** this file governs MCP grouping, eager/deferred loading, catalog metadata and launcher-facing tool UX. Existing application authorization and Task/Attempt authority remain unchanged.
 
 ## 0. Decision
+
+The [Canonical MCP Surfaces](mcp-canonical-surfaces-and-topologies.md) document is authoritative for exact public names. The canonical assigned-reviewer core uses `review.submit`, with `review.get` and linked `operation.get` limited to that reviewer's exact retained assignment/result, even after release if the credential remains valid and unrevoked. No historical context/list, artifact or evidence reads are implied. A null `review_scope.review_assignment_id` is pending until an atomic server bind. The legacy profile named `Reviewer` may remain only as an explicitly identified compatibility profile; its behavior does not redefine the assigned-reviewer core.
 
 ELIOT may eventually expose many application methods, but an ordinary model must not receive the complete schema catalog at session start.
 
@@ -53,26 +55,9 @@ manual memorization of low-level application method names
 
 ## 1. Current source facts and the exact gap
 
-Current `main` already has a sound first authorization layer:
+At baseline `36cfb652`, the MCP facade had 53 typed tools, fixed profiles and profile filtering before local IPC. Implementation commit `2607c8858e573ae40459c27d76d8ae9e1ca9f8fc` adds 29 methods and an 83-entry `ToolSpec` registry, live authorization/role cores and deferred tool search. Backend dev build, Clippy, 221 Rust tests, Windows probe and final Muse fixture passed for that implementation. Actual native-MCP harness loading remains unknown, so a registry entry or `tools/list` result is not evidence the model loaded or used that schema.
 
-- 53 exact MCP tools: 22 reads and 31 mutations;
-- one typed tool per public application method;
-- no universal method passthrough or shell tool;
-- fixed named profiles `observer`, `reviewer`, `manager`, `gm`, and `full`;
-- profile filtering in both `tools/list` and `tools/call` before local IPC;
-- restricted-profile mutations require caller-owned `client_request_id`;
-- Tasks and bounded subscriptions reuse existing Operations/Observations instead of creating another task store.
-
-The missing layer is catalog ergonomics and load control:
-
-- `ToolSpec` has method, description and fields, but no group, audience, loading tier or `when_to_use` metadata;
-- every allowed tool for a profile is returned in one `tools/list` response;
-- the current `list_tools` implementation ignores the pagination request;
-- manager and agent surfaces are authorization subsets, not small task-oriented starting palettes;
-- there is no verified role-specific core, no assignment-derived surface and no searchable group index;
-- a runtime may be instructed to use a tool that its actual backend did not expose.
-
-Do not replace the current profile layer. Extend it.
+The [Canonical MCP Surfaces](mcp-canonical-surfaces-and-topologies.md) document owns exact public names. This document owns group metadata and deferred-loading design. Remaining end-to-end gaps include native harness consumption/qualification and the larger launch, watch/consult, integration/scope-Git, cron, Goal and native-Rust program paths. Do not replace the application authorization layer with catalog metadata.
 
 ## 2. Evidence-based design constraints
 
@@ -228,12 +213,9 @@ Ordinary agent collaboration:
 ```text
 coordination.send
 coordination.inbox
-coordination.ask_owner
-coordination.answer
-coordination.publish_contract
+coordination.consult
 coordination.sync_integration
-coordination.peer_agree
-coordination.notify_when_available
+coordination.watch.create/list/cancel
 swarm.overlap.check
 ```
 
@@ -358,7 +340,9 @@ check.profiles
 artifact.get
 artifact.read
 artifact.parts
-task.request_changes
+review.submit
+review.get
+operation.get
 ```
 
 ## 4.11 `acceptance-effects`
@@ -431,9 +415,9 @@ swarm.context.get
 swarm.tools.search
 coordination.send
 coordination.inbox
-coordination.ask_owner
+coordination.consult
 coordination.sync_integration
-coordination.notify_when_available
+coordination.watch.create/list/cancel
 swarm.overlap.check
 operation.get
 ```
@@ -480,21 +464,22 @@ schedules
 mailbox-raw
 ```
 
-## 5.3 Reviewer
+## 5.3 Assigned reviewer
 
 Recommended eager tools:
 
 ```text
 swarm.review.context
+swarm.tools.search
 task.submission
 artifact.read
 check.get
-task.request_changes
+review.submit
+review.get
 operation.get
-swarm.tools.search
 ```
 
-Reviewer has no runtime-control or acceptance authority merely because those tools exist in the catalog.
+The canonical assigned reviewer can submit only its exact assigned result; after Task revision or Attempt release, only exact-assignment `review.get`, linked `operation.get` and `review.submit` remain available while authenticated and unrevoked. Historical context/list, artifact and evidence reads are not implied. `task.request_changes` is manager disposition. A legacy profile explicitly named `Reviewer` may retain old compatibility behavior separately.
 
 ## 5.4 GM/operator
 
@@ -666,7 +651,7 @@ swarm.overlap.check
 agent.send
   good: "Manager-only exact native input/steer. Do not use for peer coordination mail."
 
-coordination.ask_owner
+coordination.consult
   good: "Read the current contract card first; if the fact is absent, send one bounded question to the exact current owner."
 ```
 
@@ -712,7 +697,7 @@ At participant/manager launch, record what the runtime actually exposes:
   "catalog_revision": "sha256:...",
   "core": {
     "swarm.context.get": "available",
-    "coordination.ask_owner": "available",
+    "coordination.consult": "available",
     "coordination.send": "available",
     "operation.get": "available"
   },

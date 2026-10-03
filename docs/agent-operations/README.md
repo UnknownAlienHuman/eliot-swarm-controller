@@ -1,8 +1,8 @@
 # Agent Operations — Manager-Owned Automation
 
-Revision 5 · 2026-10-03 · source review at main `504199d14135c030ad3951a3c5023a098a3d03f0`.
+Revision 5 · 2026-10-03 · design baseline `36cfb652` plus the active implementation increment.
 
-**Status: implementation/design contract, not shipped functionality.** The six documents describe one Rust system. Research, configuration examples and acceptance scenarios are not evidence of a working runtime.
+**Status: partial implementation, not a completed or live-qualified program.** From baseline `36cfb652`, implementation commit `2607c8858e573ae40459c27d76d8ae9e1ca9f8fc` wires 29 additional methods and 83 `ToolSpec` entries through the library/Store/host/model/CLI with live authorization and role-core checks. Backend dev build, Clippy, 221 Rust tests, Windows probe and final Muse fixture passed for that implementation; actual native-MCP harness loading remains unknown. Participant scoped coordination/cards/mailbox, assigned-review slots/history, explicitly selected owner-policy-v2 feedback, automation config, durable `review_dispatch`, deferred MCP search and bounded launcher read projections are partial slices. Launch, watch/consult, integration/scope-Git, Concilium, cron, Goal and native-Rust conversion remain planned gaps. The six documents describe the intended larger Rust system; they are not proof those paths work.
 
 ## Product rule
 
@@ -32,7 +32,7 @@ Enabling audit assignment does not enable distribution, repair or push. Importin
 | [Donor map](donor-map.md) | Source observations and precisely limited reuse. |
 | [Implementation](implementation.md) | Shared ownership, O1–O11 production work and qualification scenarios. |
 
-PR #22 supplies peer coordination, Participant identity, watches, launcher and deferred MCP. Implement those once. Its reviewer surface must use the assigned `review.submit` result path when this program lands; a reviewer tool name does not grant the manager's Task-transition rights. The cross-PR contract is specified in Architecture and Implementation, not left to the implementer to guess.
+PR #22 supplies peer coordination, Participant identity, watches, launcher and deferred MCP. Implement those once. The canonical assigned-reviewer surface uses `review.submit`, with exact-assignment `review.get` and linked `operation.get` reads after release while authenticated and unrevoked; no historical context/list, artifact or evidence reads. A null preregistered `review_assignment_id` is unusable until atomic server binding. A legacy `Reviewer` profile may remain explicitly named for compatibility. Review submission never grants manager disposition rights.
 
 ## Everyday use
 

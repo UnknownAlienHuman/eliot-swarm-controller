@@ -85,11 +85,11 @@ An applied return opens a correction phase for the current owner. Capture the ol
 
 ### 6.1 Assignment and retries
 
-Direct manager and automation reserve the same `(submission_ref, review_policy_generation, review_slot)`. The policy generation identifies coverage/acceptance semantics, not the preferred model string. A profile rename, extra automation or random request ID cannot start a second auditor for that slot.
+Direct manager and automation reserve the same semantic slot: `(manager_id, task_revision, attempt_id, submission_ref, candidate_ref, action, review_slot)`. Record `review_policy_generation` and use it to reject stale admissions, but it does not define slot occupancy; cosmetic policy/configuration edits, automation IDs, random causes or request IDs cannot free or reoccupy an occupied slot.
 
 Assignment contains exact Task revision, Attempt, submission/candidate, commit/tree, phase, canonical sources, required coverage and output schema. Record manager sponsor and actual assigned auditor separately. Several auditors occupy declared separate slots, not cloned identities used to simulate independent evidence.
 
-A failed/inconclusive attempt is not a permanently occupied slot, but timeout alone is not proof the worker stopped. A manager or configured recovery action may replace it only after actual prior native/process/continuation disposition is known. The replacement is a new recorded review attempt in the same logical slot, preserving earlier output and rejecting late output as the replacement's result.
+A failed/inconclusive attempt is not a permanently occupied slot, but timeout alone is not proof the worker stopped. A manager or configured recovery action may replace it only after the prior attempt's actual process/continuation disposition is known. A historical review of candidate A may finish while corrected candidate B is current; retain A's exact late result as historical and never apply it to B. Do not issue a replacement/new dispatch for that slot until the prior attempt has actual disposition. The replacement is a new recorded review attempt in the same logical slot, preserving earlier output and rejecting late output as the replacement's result.
 
 ### 6.2 Result
 
@@ -120,7 +120,7 @@ Example proposed payload; identifiers must match the authenticated review assign
 
 A change request names a demonstrated violation of real requirements, with actionable evidence, not invented style demands or mechanisms. Inconclusive preserves uncertainty rather than sending correct code back for pointless rewriting. A supported critique inside a nominally positive narrative must not be discarded merely because its summary says pass.
 
-A completed assigned review may report after automation disable. Retain late findings against their original candidate and mark historical applicability. Explicit credential revocation still applies; trusted adapter recovery must not impersonate the auditor. Retraction/supersession is explicit history, never deletion of the original finding.
+A completed assigned review may report after automation disable, Task revision or Attempt release. Authenticated `review.get`, linked `operation.get` and `review.submit` remain limited to the exact retained assignment/submission/candidate; no historical context/list, artifact or evidence reads are implied. Generic stale writes remain denied, and explicit credential revocation denies even this exception. Retain late findings against their original candidate with explicit current-vs-historical applicability. Trusted adapter recovery must not impersonate the auditor. Retraction/supersession is explicit history, never deletion of the original finding.
 
 ### 6.3 Audited
 
@@ -132,7 +132,7 @@ Local audit aggregation works without enabled automation. Labels, acceptance and
 
 ## 7. Return and repair
 
-Current `task.request_changes` uses GM/operator authority and stores mail, not native input. Add intended scoped manager feedback rights in that existing guarded path for both manual and automatic callers. Do not give auditors GM credentials or treat an MCP tool annotation as permission.
+Current `task.request_changes` uses GM/operator authority and stores mail, not native input. Add scoped Manager feedback in that existing guarded path only for new Attempts whose TaskSpec explicitly selects [owner-policy-v2](../owner-policy-v2.md); v1 Attempts, existing rights and retained evidence stay frozen. Do not give auditors GM credentials or treat an MCP tool annotation as permission.
 
 The auditor calls `review.submit`. The manager or selected `review_disposition` applies relevant findings. Only explicit owner input or selected `repair_dispatch` starts correction. Feedback admission alone is not proof the correction reached the model; retain exact delivery/readback and retry semantics.
 
