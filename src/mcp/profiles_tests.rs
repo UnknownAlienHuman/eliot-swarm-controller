@@ -79,7 +79,19 @@ fn profile_tables_are_closed_and_keep_gm_authority_separate() {
     ));
     assert!(profiles::allows_method(
         McpToolProfile::Manager,
+        "swarm.launch"
+    ));
+    assert!(profiles::allows_method(
+        McpToolProfile::Manager,
         "coordination.watch.create"
+    ));
+    assert!(profiles::allows_method(
+        McpToolProfile::Manager,
+        "swarm.overlap.check"
+    ));
+    assert!(!profiles::allows_method(
+        McpToolProfile::Manager,
+        "coordination.sync_integration"
     ));
     assert!(!profiles::allows_method(
         McpToolProfile::Manager,
@@ -104,6 +116,14 @@ fn profile_tables_are_closed_and_keep_gm_authority_separate() {
     ));
     assert!(profiles::allows_method(
         McpToolProfile::Participant,
+        "coordination.sync_integration"
+    ));
+    assert!(profiles::allows_method(
+        McpToolProfile::Participant,
+        "swarm.overlap.check"
+    ));
+    assert!(profiles::allows_method(
+        McpToolProfile::Participant,
         "coordination.watch.create"
     ));
     assert!(profiles::allows_method(
@@ -113,6 +133,10 @@ fn profile_tables_are_closed_and_keep_gm_authority_separate() {
     assert!(!profiles::allows_method(
         McpToolProfile::Participant,
         "task.get"
+    ));
+    assert!(!profiles::allows_method(
+        McpToolProfile::Participant,
+        "swarm.launch"
     ));
     assert!(!profiles::allows_method(
         McpToolProfile::Participant,
@@ -137,6 +161,18 @@ fn profile_tables_are_closed_and_keep_gm_authority_separate() {
     assert!(!profiles::allows_method(
         McpToolProfile::AssignedReviewer,
         "coordination.watch.create"
+    ));
+    assert!(!profiles::allows_method(
+        McpToolProfile::AssignedReviewer,
+        "swarm.launch"
+    ));
+    assert!(!profiles::allows_method(
+        McpToolProfile::AssignedReviewer,
+        "coordination.sync_integration"
+    ));
+    assert!(!profiles::allows_method(
+        McpToolProfile::AssignedReviewer,
+        "swarm.overlap.check"
     ));
     assert!(profiles::allows_method(
         McpToolProfile::Gm,

@@ -152,19 +152,30 @@ pub(super) fn apply(
                 disabled_or_narrowed.push(change.after.automation_id.as_str());
             }
             entries.push(entry_projection(&change.after)?);
-            if change.include_existing && change.after.enabled {
+        } else {
+            entries.push(entry_projection(&change.after)?);
+        }
+    }
+    // Activate every changed entry before one shared intake pass. Disable-only
+    // edits do not depend on source reconciliation or an available producer.
+    if planned
+        .iter()
+        .any(|change| change.changed && change.include_existing && change.after.enabled)
+    {
+        let intake = automation_dispatch::reconcile_source_intake(tx, 64, now_ms)?;
+        for change in &planned {
+            if change.changed && change.include_existing && change.after.enabled {
                 let budget = 16usize.saturating_sub(dispatch.len());
                 if budget > 0 {
                     dispatch.push(automation_dispatch::reconcile_entry(
                         tx,
                         &change.after,
                         budget,
+                        intake,
                         now_ms,
                     )?);
                 }
             }
-        } else {
-            entries.push(entry_projection(&change.after)?);
         }
     }
     let impacted = disabled_or_narrowed

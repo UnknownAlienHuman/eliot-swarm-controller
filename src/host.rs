@@ -17,6 +17,10 @@ pub async fn run(config: Config) -> Result<()> {
     let root_path = root.path.clone();
     let config = Arc::new(config);
     let owner = StoreOwner::start(root, config.clone(), credential).await?;
+    if let Err(error) = owner.store.initialize_workspace_authority().await {
+        owner.close().await?;
+        return Err(error);
+    }
     let ipc_config = Arc::new(config.ipc.clone());
     let mut listener = ipc::Listener::bind(&root_path)?;
     let (shutdown, stopping) = watch::channel(false);
@@ -45,6 +49,9 @@ pub async fn run(config: Config) -> Result<()> {
     let store = owner.store.clone();
     let stop = stopping.clone();
     supervisors.spawn(async move { ("automation", supervise_automation(store, stop).await) });
+    let store = owner.store.clone();
+    let stop = stopping.clone();
+    supervisors.spawn(async move { ("launcher", supervise_launcher(store, stop).await) });
     let store = owner.store.clone();
     let stop = stopping.clone();
     supervisors.spawn(async move { ("forge", supervise_forge(store, stop).await) });
@@ -116,6 +123,25 @@ async fn supervise_automation(store: Store, mut stopping: watch::Receiver<bool>)
                 if *stopping.borrow() { return Ok(()); }
                 store.reconcile_automations_once().await?;
                 store.reconcile_watches_once().await?;
+            }
+        }
+    }
+}
+
+async fn supervise_launcher(store: Store, mut stopping: watch::Receiver<bool>) -> Result<()> {
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        if *stopping.borrow() {
+            return Ok(());
+        }
+        tokio::select! {
+            result = stopping.changed() => {
+                if result.is_err() || *stopping.borrow() { return Ok(()); }
+            }
+            _ = tick.tick() => {
+                if *stopping.borrow() { return Ok(()); }
+                store.reconcile_launches_once().await?;
             }
         }
     }

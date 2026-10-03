@@ -19,7 +19,7 @@ pub(crate) struct CreateRequest {
     pub task_revision: Option<i64>,
     pub attempt_id: Option<String>,
     pub watch_kind: String,
-    pub operation_id: String,
+    pub address: Value,
     pub expires_at_ms: i64,
 }
 
@@ -99,17 +99,10 @@ fn parse_create(value: &Value) -> Result<CreateRequest> {
     let _client_request_id = model::text(value, "client_request_id")?;
     let (task_id, task_revision, attempt_id) = parse_scope_fields(value)?;
     let watch_kind = model::text(value, "watch_kind")?.to_owned();
-    if watch_kind != "operation_terminal" {
-        return Err(Error::new(
-            "WATCH_KIND_UNSUPPORTED",
-            format!("watch kind {watch_kind:?} has no authoritative Store fact source"),
-        ));
-    }
     let address = value
         .get("address")
         .ok_or_else(|| Error::invalid("address is required"))?;
-    model::fields(address, &["operation_id"])?;
-    let operation_id = identifier(model::text(address, "operation_id")?, "operation_id")?;
+    validate_address(&watch_kind, address)?;
     let expires_at_ms = model::positive(value, "expires_at_ms")?;
     if model::text(value, "delivery")? != "mailbox_header" {
         return Err(Error::new(
@@ -125,9 +118,87 @@ fn parse_create(value: &Value) -> Result<CreateRequest> {
         task_revision,
         attempt_id,
         watch_kind,
-        operation_id,
+        address: address.clone(),
         expires_at_ms,
     })
+}
+
+/// Validate the exact address union used both at admission and when retained
+/// records are read back. A known canonical kind without a durable source is
+/// intentionally reported as a capability gap.
+pub(crate) fn validate_address(watch_kind: &str, address: &Value) -> Result<()> {
+    match watch_kind {
+        "operation_terminal" => {
+            model::fields(address, &["operation_id"])?;
+            let _ = identifier(model::text(address, "operation_id")?, "operation_id")?;
+            Ok(())
+        }
+        "contract_revision_changed" => {
+            model::fields(
+                address,
+                &[
+                    "task_id",
+                    "attempt_id",
+                    "contract_key",
+                    "client_id",
+                    "expected_revision",
+                ],
+            )?;
+            let _ = identifier(model::text(address, "task_id")?, "task_id")?;
+            let _ = identifier(model::text(address, "attempt_id")?, "attempt_id")?;
+            let _ = bounded_identifier(model::text(address, "contract_key")?, "contract_key", 256)?;
+            let _ = identifier(model::text(address, "client_id")?, "client_id")?;
+            let _ = nonnegative(address, "expected_revision")?;
+            Ok(())
+        }
+        "task_revision_changed" => {
+            model::fields(address, &["task_id", "expected_revision"])?;
+            let _ = identifier(model::text(address, "task_id")?, "task_id")?;
+            let _ = model::positive(address, "expected_revision")?;
+            Ok(())
+        }
+        "attempt_disposition_changed" => {
+            model::fields(address, &["attempt_id", "expected_state"])?;
+            let _ = identifier(model::text(address, "attempt_id")?, "attempt_id")?;
+            let expected_state = model::text(address, "expected_state")?;
+            if !matches!(
+                expected_state,
+                "reserved" | "running" | "submitted" | "needs_correction" | "recovery_pending"
+            ) {
+                return Err(Error::invalid(
+                    "expected_state must name a live Attempt state",
+                ));
+            }
+            Ok(())
+        }
+        "exact_deadline_reached" => {
+            model::fields(
+                address,
+                &["operation_id", "deadline_field", "expected_deadline_ms"],
+            )?;
+            let _ = identifier(model::text(address, "operation_id")?, "operation_id")?;
+            if model::text(address, "deadline_field")? != "reply_deadline_ms" {
+                return Err(Error::new(
+                    "WATCH_DEADLINE_UNSUPPORTED",
+                    "only a retained coordination.consult reply_deadline_ms is currently observable",
+                ));
+            }
+            let _ = model::positive(address, "expected_deadline_ms")?;
+            Ok(())
+        }
+        "ask_answered"
+        | "integration_cell_changed"
+        | "scope_released_or_changed"
+        | "submission_reviewed"
+        | "owner_available" => Err(Error::new(
+            "WATCH_KIND_UNSUPPORTED",
+            format!("watch kind {watch_kind:?} has no authoritative Store fact source"),
+        )),
+        _ => Err(Error::new(
+            "WATCH_KIND_UNSUPPORTED",
+            format!("watch kind {watch_kind:?} has no authoritative Store fact source"),
+        )),
+    }
 }
 
 fn parse_cancel(value: &Value) -> Result<CancelRequest> {
@@ -178,4 +249,26 @@ fn identifier(value: &str, name: &str) -> Result<String> {
         )));
     }
     Ok(value.to_owned())
+}
+
+fn bounded_identifier(value: &str, name: &str, max: usize) -> Result<String> {
+    if value.is_empty()
+        || value.len() > max
+        || value
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        return Err(Error::invalid(format!(
+            "{name} must be 1..={max} bytes without whitespace"
+        )));
+    }
+    Ok(value.to_owned())
+}
+
+fn nonnegative(value: &Value, field: &str) -> Result<i64> {
+    value
+        .get(field)
+        .and_then(Value::as_i64)
+        .filter(|n| *n >= 0)
+        .ok_or_else(|| Error::invalid(format!("{field} must be a nonnegative integer")))
 }

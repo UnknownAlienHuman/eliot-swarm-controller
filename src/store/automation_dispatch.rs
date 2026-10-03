@@ -1,12 +1,13 @@
 //! Bounded durable routing from committed submission facts into the existing
 //! review-assignment Operation and semantic slot.
 
-use super::{capacity, reviews::ReviewActor, submissions, tasks};
+use super::{automation_intake, capacity, reviews::ReviewActor, submissions, tasks};
 use crate::{
     automation::{
         actions::{AutomationCause, AutomationStep},
         authorization::{self, ManagerExecutionContext},
         config::{self, AutomationEntry},
+        intake::{IntakeItem, IntakeStatus, LocalProducer},
     },
     error::{Error, Result},
     model,
@@ -23,6 +24,7 @@ const MAX_RECENT_DISPOSITIONS: usize = 20;
 const MAX_RECONCILE_FACTS: usize = 16;
 const MAX_PENDING_RECHECKS: usize = 8;
 const MAX_SUBMISSION_PAGE: usize = 32;
+const MAX_INTAKE_SOURCE_PAGE: usize = 64;
 const GLOBAL_CURSOR_KEY: &str = "automation:v1:dispatch_global_cursor";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,6 +62,16 @@ struct PendingSubject {
     held: bool,
 }
 
+/// One shared intake source snapshot, produced once per Store transaction and
+/// reused by every enabled entry in that reconciliation pass.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub(crate) struct IntakeSnapshot {
+    pub(crate) cursor: i64,
+    pub(crate) high_water: i64,
+    pub(crate) processed: usize,
+    pub(crate) status: IntakeStatus,
+}
+
 #[derive(Debug)]
 enum SubjectResult {
     Assigned {
@@ -73,6 +85,56 @@ enum SubjectResult {
     Skipped {
         reason: String,
     },
+}
+
+/// Advance the shared, durable submission intake exactly once for a caller's
+/// transaction. Per-entry readers consume the retained pending journal below;
+/// they never rescan the observations source directly.
+pub(crate) fn reconcile_source_intake(
+    tx: &Transaction<'_>,
+    limit: usize,
+    now_ms: i64,
+) -> Result<IntakeSnapshot> {
+    let (registration, cursor) =
+        automation_intake::register_local_source(tx, LocalProducer::TaskSubmission, true, now_ms)?;
+    if !registration.include_existing && registration.initial_cursor > 0 {
+        return Err(Error::new(
+            "AUTOMATION_INTAKE_HISTORY_UNAVAILABLE",
+            "the registered submission source skipped history needed by per-entry activation cuts",
+        ));
+    }
+    let page = automation_intake::reconcile_source_page(
+        tx,
+        &registration.source_id,
+        cursor.observation_id,
+        limit.min(MAX_INTAKE_SOURCE_PAGE),
+        now_ms,
+    )?;
+    if matches!(
+        page.status,
+        IntakeStatus::UnknownSource | IntakeStatus::StaleCursor
+    ) {
+        return Err(Error::new(
+            "AUTOMATION_INTAKE_RECONCILIATION_FAILED",
+            format!("shared submission intake returned {:?}", page.status),
+        ));
+    }
+    Ok(IntakeSnapshot {
+        cursor: page.cursor.ok_or_else(|| {
+            Error::new(
+                "AUTOMATION_INTAKE_CURSOR_MISSING",
+                "registered submission intake returned no cursor",
+            )
+        })?,
+        high_water: page.high_water.ok_or_else(|| {
+            Error::new(
+                "AUTOMATION_INTAKE_HIGH_WATER_MISSING",
+                "registered submission intake returned no high-water cut",
+            )
+        })?,
+        processed: page.processed,
+        status: page.status,
+    })
 }
 
 pub(super) fn configure_activation(
@@ -142,6 +204,7 @@ pub(super) fn reconcile_entry(
     tx: &Transaction<'_>,
     entry: &AutomationEntry,
     budget: usize,
+    intake: IntakeSnapshot,
     now_ms: i64,
 ) -> Result<Value> {
     if !entry.enabled || !entry.steps.contains(&AutomationStep::ReviewDispatch) {
@@ -154,7 +217,6 @@ pub(super) fn reconcile_entry(
         &entry.project_id,
         &entry.automation_id,
     )?;
-    let high_water = observation_cut(tx)?;
     let mut state = load_state(tx, entry)?.ok_or_else(|| {
         Error::new(
             "AUTOMATION_CURSOR_MISSING",
@@ -172,13 +234,15 @@ pub(super) fn reconcile_entry(
     let remaining_budget = budget.saturating_sub(processed);
     if remaining_budget > 0 && state.pending.len() < MAX_PENDING_SUBJECTS {
         processed +=
-            consume_submission_page(tx, entry, &mut state, remaining_budget, high_water, now_ms)?;
+            consume_submission_page(tx, entry, &mut state, remaining_budget, intake, now_ms)?;
     }
     state.updated_at_ms = now_ms;
     save_state(tx, &key, &state)?;
     let mut projection = state_projection(&state);
     projection["processed"] = json!(processed);
-    projection["high_water"] = json!(high_water);
+    projection["high_water"] = json!(intake.high_water);
+    projection["intake_cursor"] = json!(intake.cursor);
+    projection["intake_status"] = serde_json::to_value(intake.status)?;
     Ok(projection)
 }
 
@@ -204,10 +268,11 @@ pub(crate) fn reconcile(
 ) -> Result<Value> {
     let entry_budget = entry_budget.clamp(1, 32);
     let fact_budget = fact_budget.clamp(1, MAX_RECONCILE_FACTS);
+    let intake = reconcile_source_intake(tx, MAX_INTAKE_SOURCE_PAGE, now_ms)?;
     let (entries, last_entry_key) = enabled_entry_page(tx, entry_budget)?;
     let mut results = Vec::with_capacity(entries.len());
     for entry in entries {
-        results.push(reconcile_entry(tx, &entry, fact_budget, now_ms)?);
+        results.push(reconcile_entry(tx, &entry, fact_budget, intake, now_ms)?);
     }
     if let Some(last_entry_key) = last_entry_key {
         config::write_record(
@@ -216,7 +281,12 @@ pub(crate) fn reconcile(
             &json!({"schema_version":1,"last_entry_key":last_entry_key}),
         )?;
     }
-    Ok(json!({"entries":results,"entry_budget":entry_budget,"fact_budget_per_entry":fact_budget}))
+    Ok(json!({
+        "intake":intake,
+        "entries":results,
+        "entry_budget":entry_budget,
+        "fact_budget_per_entry":fact_budget
+    }))
 }
 
 fn enabled_entry_page(
@@ -333,125 +403,228 @@ fn consume_submission_page(
     entry: &AutomationEntry,
     state: &mut DispatchState,
     budget: usize,
-    high_water: i64,
+    intake: IntakeSnapshot,
     now_ms: i64,
 ) -> Result<usize> {
+    let page_limit = budget.min(MAX_SUBMISSION_PAGE);
+    let page = automation_intake::pending_page(
+        tx,
+        LocalProducer::TaskSubmission.source_id(),
+        state.cursor,
+        page_limit,
+    )?;
+    if page.status == IntakeStatus::UnknownSource {
+        return Err(Error::new(
+            "AUTOMATION_INTAKE_SOURCE_MISSING",
+            "shared submission intake has not been registered",
+        ));
+    }
+    if page.status == IntakeStatus::StaleCursor {
+        // A future-only entry may intentionally start at a global observation
+        // cut ahead of the source-specific intake cursor. Wait until intake
+        // reaches that cut; never rewind the per-entry cursor.
+        return Ok(0);
+    }
+    let intake_cursor = page.cursor.ok_or_else(|| {
+        Error::new(
+            "AUTOMATION_INTAKE_CURSOR_MISSING",
+            "registered submission source has no durable cursor",
+        )
+    })?;
+    if intake_cursor != intake.cursor {
+        return Err(Error::new(
+            "AUTOMATION_INTAKE_CURSOR_CHANGED",
+            "per-entry journal read differs from the shared intake snapshot",
+        ));
+    }
     let target = state
         .catch_up_until
-        .map_or(high_water, |cut| high_water.min(cut));
+        .map_or(intake_cursor, |cut| intake_cursor.min(cut));
     if state.cursor >= target {
-        if state.catch_up_until.is_some_and(|cut| state.cursor >= cut) {
-            state.catch_up_until = None;
-        }
+        finish_activation_catch_up(state, intake);
         return Ok(0);
     }
-    let page_limit = budget.min(MAX_SUBMISSION_PAGE);
-    let mut statement = tx.prepare(
-        "SELECT observation_id,operation_id,payload_json FROM observations \
-         WHERE source_stream_id='controller' AND kind='task.submission' \
-         AND observation_id>?1 AND observation_id<=?2 \
-         ORDER BY observation_id LIMIT ?3",
-    )?;
-    let rows = statement
-        .query_map(params![state.cursor, target, page_limit as i64], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    drop(statement);
-    if rows.is_empty() {
-        state.cursor = target;
-        if state.catch_up_until.is_some_and(|cut| state.cursor >= cut) {
-            state.catch_up_until = None;
-        }
-        return Ok(0);
-    }
+
     let mut processed = 0usize;
-    let mut last_seen = state.cursor;
-    for (observation_id, fact_operation_id, payload_json) in &rows {
-        if state.pending.len() >= MAX_PENDING_SUBJECTS {
-            break;
-        }
-        let payload: Value = serde_json::from_str(payload_json).map_err(|_| {
-            Error::new(
-                "AUTOMATION_FACT_CORRUPT",
-                "submission fact payload is invalid",
-            )
-        })?;
-        last_seen = *observation_id;
-        processed += 1;
-        let fact_operation_id = fact_operation_id.as_deref().ok_or_else(|| {
-            Error::new(
-                "AUTOMATION_FACT_CORRUPT",
-                "submission observation has no Operation identity",
-            )
-        })?;
-        if payload.get("operation_id").and_then(Value::as_str) != Some(fact_operation_id) {
+    let mut stopped_at_cut = false;
+    let mut stopped_for_capacity = false;
+    for item in &page.items {
+        let observation_id = intake_item_observation_id(item);
+        if observation_id <= state.cursor {
             return Err(Error::new(
-                "AUTOMATION_FACT_CORRUPT",
-                "submission observation Operation does not match its payload",
+                "AUTOMATION_INTAKE_JOURNAL_ORDER_INVALID",
+                "pending journal returned an observation at or before the consumer cursor",
             ));
         }
-        match cause_from_fact(*observation_id, &payload)? {
-            None => {
+        if observation_id > target {
+            // The first returned observation after the activation cut proves
+            // that all source rows through the cut are already journaled.
+            state.cursor = target;
+            stopped_at_cut = true;
+            break;
+        }
+        if state.pending.len() >= MAX_PENDING_SUBJECTS {
+            stopped_for_capacity = true;
+            break;
+        }
+        processed += 1;
+        match item {
+            IntakeItem::Gap(gap) => {
+                if gap.source_id != LocalProducer::TaskSubmission.source_id()
+                    || gap.observation_id != observation_id
+                {
+                    return Err(Error::new(
+                        "AUTOMATION_INTAKE_JOURNAL_IDENTITY_INVALID",
+                        "pending gap does not match the registered submission source",
+                    ));
+                }
                 remember_recent(
                     state,
                     json!({
                         "observation_id":observation_id,
-                        "disposition":"skipped",
-                        "reason":"submission_not_applied"
+                        "source_id":gap.source_id,
+                        "source_event_key":gap.source_event_key,
+                        "disposition":"gap",
+                        "reason":gap.reason
                     }),
                 );
             }
-            Some(cause) => match attempt_review_assignment(tx, entry, &cause, now_ms)? {
-                SubjectResult::Assigned {
-                    operation_id,
-                    value,
-                } => remember_recent(
-                    state,
-                    json!({
-                        "observation_id":observation_id,
-                        "submission_ref":cause.id(),
-                        "disposition":"assigned",
-                        "operation_id":operation_id,
-                        "review_assignment_id":value["review_assignment_id"]
-                    }),
-                ),
-                SubjectResult::Pending { reason, wake_when } => {
-                    state.pending.push(PendingSubject {
-                        cause: cause.as_json(),
-                        reason,
-                        wake_when,
-                        first_seen_at_ms: now_ms,
-                        last_checked_at_ms: now_ms,
-                        held: false,
-                    });
+            IntakeItem::Receipt(receipt) => {
+                if receipt.source_id != LocalProducer::TaskSubmission.source_id()
+                    || receipt.event_kind != LocalProducer::TaskSubmission.event_kind()
+                {
+                    return Err(Error::new(
+                        "AUTOMATION_INTAKE_JOURNAL_IDENTITY_INVALID",
+                        "pending receipt is outside the registered submission source",
+                    ));
                 }
-                SubjectResult::Skipped { reason } => remember_recent(
-                    state,
-                    json!({
-                        "observation_id":observation_id,
-                        "submission_ref":cause.id(),
-                        "disposition":"skipped",
-                        "reason":reason
-                    }),
-                ),
-            },
+                let fact_operation_id = receipt.operation_id.as_deref();
+                if fact_operation_id.is_none()
+                    || receipt.payload.get("operation_id").and_then(Value::as_str)
+                        != fact_operation_id
+                {
+                    remember_recent(
+                        state,
+                        json!({
+                            "observation_id":observation_id,
+                            "source_event_key":receipt.source_event_key,
+                            "disposition":"gap",
+                            "reason":"submission_operation_identity_mismatch"
+                        }),
+                    );
+                    state.cursor = observation_id;
+                    continue;
+                }
+                match cause_from_fact(observation_id, &receipt.payload) {
+                    Err(error) => remember_recent(
+                        state,
+                        json!({
+                            "observation_id":observation_id,
+                            "source_event_key":receipt.source_event_key,
+                            "disposition":"gap",
+                            "reason":error.code.to_ascii_lowercase()
+                        }),
+                    ),
+                    Ok(None) => remember_recent(
+                        state,
+                        json!({
+                            "observation_id":observation_id,
+                            "source_event_key":receipt.source_event_key,
+                            "disposition":"skipped",
+                            "reason":"submission_not_applied"
+                        }),
+                    ),
+                    Ok(Some(cause))
+                        if state
+                            .pending
+                            .iter()
+                            .any(|pending| pending_cause_id(pending) == cause.id()) =>
+                    {
+                        // Duplicate producer observations for the same
+                        // immutable submission share one retained pending
+                        // subject and therefore one later review attempt.
+                        remember_recent(
+                            state,
+                            json!({
+                                "observation_id":observation_id,
+                                "submission_ref":cause.id(),
+                                "source_event_key":receipt.source_event_key,
+                                "disposition":"coalesced"
+                            }),
+                        );
+                    }
+                    Ok(Some(cause)) => {
+                        match attempt_review_assignment(tx, entry, &cause, now_ms)? {
+                            SubjectResult::Assigned {
+                                operation_id,
+                                value,
+                            } => remember_recent(
+                                state,
+                                json!({
+                                    "observation_id":observation_id,
+                                    "submission_ref":cause.id(),
+                                    "source_event_key":receipt.source_event_key,
+                                    "disposition":"assigned",
+                                    "operation_id":operation_id,
+                                    "review_assignment_id":value["review_assignment_id"]
+                                }),
+                            ),
+                            SubjectResult::Pending { reason, wake_when } => {
+                                state.pending.push(PendingSubject {
+                                    cause: cause.as_json(),
+                                    reason,
+                                    wake_when,
+                                    first_seen_at_ms: now_ms,
+                                    last_checked_at_ms: now_ms,
+                                    held: false,
+                                });
+                            }
+                            SubjectResult::Skipped { reason } => remember_recent(
+                                state,
+                                json!({
+                                    "observation_id":observation_id,
+                                    "submission_ref":cause.id(),
+                                    "source_event_key":receipt.source_event_key,
+                                    "disposition":"skipped",
+                                    "reason":reason
+                                }),
+                            ),
+                        }
+                    }
+                }
+            }
         }
-        state.cursor = *observation_id;
+        state.cursor = observation_id;
     }
-    if processed == rows.len() && rows.len() < page_limit {
+    if !stopped_at_cut
+        && !stopped_for_capacity
+        && processed == page.items.len()
+        && page.items.len() < page_limit
+    {
         state.cursor = target;
-    } else if processed == rows.len() {
-        state.cursor = last_seen;
     }
-    if state.catch_up_until.is_some_and(|cut| state.cursor >= cut) {
+    finish_activation_catch_up(state, intake);
+    Ok(processed)
+}
+
+fn intake_item_observation_id(item: &IntakeItem) -> i64 {
+    match item {
+        IntakeItem::Receipt(receipt) => receipt.observation_id,
+        IntakeItem::Gap(gap) => gap.observation_id,
+    }
+}
+
+fn finish_activation_catch_up(state: &mut DispatchState, intake: IntakeSnapshot) {
+    let Some(cut) = state.catch_up_until else {
+        return;
+    };
+    let reached_cut = state.cursor >= cut;
+    let source_caught_up_before_cut = intake.cursor >= intake.high_water
+        && intake.high_water < cut
+        && state.cursor >= intake.high_water;
+    if reached_cut || source_caught_up_before_cut {
         state.catch_up_until = None;
     }
-    Ok(processed)
 }
 
 fn recheck_pending(
@@ -964,14 +1137,6 @@ fn empty_state(entry: &AutomationEntry, cut: i64, now_ms: i64) -> DispatchState 
         recent: Vec::new(),
         updated_at_ms: now_ms,
     }
-}
-
-fn observation_cut(db: &rusqlite::Connection) -> Result<i64> {
-    Ok(db.query_row(
-        "SELECT COALESCE(MAX(observation_id),0) FROM observations",
-        [],
-        |row| row.get(0),
-    )?)
 }
 
 fn state_projection(state: &DispatchState) -> Value {

@@ -311,6 +311,16 @@ enum CoordinationCommand {
         #[arg(long)]
         file: PathBuf,
     },
+    /// Record one exact integration offer or requirement under a contract key.
+    SyncIntegration {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// Compare exact paths, symbols, contracts, or a candidate with current scoped facts.
+    OverlapCheck {
+        #[arg(long)]
+        file: PathBuf,
+    },
     Watch {
         #[command(subcommand)]
         command: CoordinationWatchCommand,
@@ -444,6 +454,11 @@ enum LauncherCommand {
         file: PathBuf,
     },
     Preview {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// Submit a caller-ID and preview-digest-bound launch intent.
+    Launch {
         #[arg(long)]
         file: PathBuf,
     },
@@ -779,6 +794,12 @@ async fn run(cli: Cli) -> Result<()> {
             CoordinationCommand::Consult { file } => {
                 ("coordination.consult".into(), read_json(&file)?)
             }
+            CoordinationCommand::SyncIntegration { file } => {
+                ("coordination.sync_integration".into(), read_json(&file)?)
+            }
+            CoordinationCommand::OverlapCheck { file } => {
+                ("swarm.overlap.check".into(), read_json(&file)?)
+            }
             CoordinationCommand::Watch { command } => match command {
                 CoordinationWatchCommand::Create { file } => {
                     ("coordination.watch.create".into(), read_json(&file)?)
@@ -822,6 +843,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Launcher { command } => match command {
             LauncherCommand::Dashboard { file } => ("swarm.dashboard".into(), read_json(&file)?),
             LauncherCommand::Preview { file } => ("swarm.launch.preview".into(), read_json(&file)?),
+            LauncherCommand::Launch { file } => ("swarm.launch".into(), read_json(&file)?),
             LauncherCommand::Queue { command } => match command {
                 LauncherQueueCommand::Get { file } => ("swarm.queue.get".into(), read_json(&file)?),
             },
@@ -918,6 +940,7 @@ async fn run(cli: Cli) -> Result<()> {
             | "coordination.contract_card.get"
             | "coordination.contract_card.list"
             | "coordination.inbox"
+            | "swarm.overlap.check"
             | "review.get"
             | "review.list"
             | "swarm.review.context"
@@ -935,7 +958,21 @@ async fn run(cli: Cli) -> Result<()> {
         if !params.is_object() {
             return Err(Error::invalid("params file must contain an object"));
         }
-        if let Some(id) = cli.request_id {
+        if method == "swarm.launch" {
+            // Launch requests are digest-bound and carry a caller-owned request
+            // ID; never manufacture one or replace the value inside the file.
+            let request_id = model::text(&params, "client_request_id")?;
+            model::text(&params, "plan_digest")?;
+            if cli
+                .request_id
+                .as_deref()
+                .is_some_and(|requested| requested != request_id)
+            {
+                return Err(Error::invalid(
+                    "--request-id must match the client_request_id in the swarm.launch params file",
+                ));
+            }
+        } else if let Some(id) = cli.request_id {
             params["client_request_id"] = json!(id);
         } else if params.get("client_request_id").is_none() {
             params["client_request_id"] = json!(model::new_id());

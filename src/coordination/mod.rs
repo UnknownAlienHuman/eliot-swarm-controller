@@ -10,6 +10,7 @@ use crate::{
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
+pub mod integration;
 pub mod watch;
 
 pub const MAX_CARD_BYTES: usize = 32 * 1024;

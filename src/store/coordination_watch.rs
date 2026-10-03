@@ -19,6 +19,7 @@ const ACTIVE_PREFIX: &str = "coordination:watch:v1:active:";
 const LIST_PREFIX: &str = "coordination:watch:v1:list:";
 const SUBJECT_PREFIX: &str = "coordination:watch:v1:subject:";
 const NOTICE_PREFIX: &str = "coordination:watch:v1:notice:";
+const OWNER_NOTICE_PREFIX: &str = "coordination:watch:v1:owner-notice:";
 const RECONCILE_CURSOR_KEY: &str = "coordination:watch:v1:reconcile_cursor";
 const MAX_RECONCILE_LIMIT: i64 = 256;
 const DEFAULT_NOTICE_LIMIT: i64 = 20;
@@ -76,13 +77,23 @@ pub(super) fn apply(
 pub(super) fn read(db: &Connection, principal: &Principal, value: &Value) -> Result<Value> {
     let principal = super::current_principal(db, principal.clone())?;
     let request = watch::parse_list(value)?;
-    let scope = request_scope(
+    let scope = match request_scope(
         db,
         &principal,
         request.task_id.as_deref(),
         request.task_revision,
         request.attempt_id.as_deref(),
-    )?;
+    ) {
+        Ok(scope) => scope,
+        Err(current_error) => retained_transition_scope(
+            db,
+            &principal,
+            request.task_id.as_deref(),
+            request.task_revision,
+            request.attempt_id.as_deref(),
+        )?
+        .ok_or(current_error)?,
+    };
     let prefix = list_prefix(&scope.id, &principal.client_id);
     let upper = format!("{prefix}g");
     let after_key = if let Some(after_watch_id) = request.after_watch_id.as_deref() {
@@ -173,43 +184,68 @@ pub(super) fn reconcile(tx: &Transaction<'_>, limit: i64, now: i64) -> Result<Va
             expired += 1;
             continue;
         }
-        if !stored_creator_scope_is_current(tx, &record)? {
+        let creator_is_current = if record["watch_kind"] == "operation_terminal" {
+            stored_creator_scope_is_current(tx, &record)?
+        } else {
+            event_creator_is_current(tx, &record)?
+        };
+        if !creator_is_current {
             settle_record(tx, &mut record, "stale_scope", now)?;
             stale += 1;
             continue;
         }
-        let Some(cursor) = terminal_operation_cursor(tx, &record)? else {
-            // The exact Operation disappeared or no longer names this retained
-            // Task/Attempt. Preserve the watch as a visible stale receipt.
-            settle_record(tx, &mut record, "stale_subject", now)?;
-            stale += 1;
-            continue;
+        let cursor = match event_cursor(tx, &record, now)? {
+            EventCursor::Pending => continue,
+            EventCursor::StaleSubject => {
+                // Exact historical subjects are readable only as bounded
+                // transition facts. Missing or mismatched identities settle
+                // visibly without projecting their retained context.
+                settle_record(tx, &mut record, "stale_subject", now)?;
+                stale += 1;
+                continue;
+            }
+            EventCursor::Matched(cursor) => cursor,
         };
-        if cursor["settled_at_ms"].is_null()
-            || !matches!(
-                cursor["state"].as_str(),
-                Some("settled" | "rejected" | "cancelled")
-            )
-        {
-            continue;
-        }
         let scope = scope_from_record(&record)?;
         let creator_id = model::text(&record["creator"], "client_id")?;
-        let operation_id = model::text(&record["address"], "operation_id")?;
-        let notification = json!({
-            "schema":NOTICE_SCHEMA,
-            "notification_id":watch_id,
-            "watch_id":watch_id,
-            "watch_kind":"operation_terminal",
-            "operation_id":operation_id,
-            "state":cursor["state"],
-            "matched_at_ms":now,
-        });
+        let watch_kind = model::text(&record, "watch_kind")?;
+        let notification = if watch_kind == "operation_terminal" {
+            // Preserve the original O1 notification envelope for existing
+            // inbox consumers while the event-kind envelopes stay fact-only.
+            json!({
+                "schema":NOTICE_SCHEMA,
+                "notification_id":watch_id,
+                "watch_id":watch_id,
+                "watch_kind":watch_kind,
+                "operation_id":record["address"]["operation_id"],
+                "state":cursor["state"],
+                "matched_at_ms":now,
+            })
+        } else {
+            json!({
+                "schema":NOTICE_SCHEMA,
+                "notification_id":watch_id,
+                "watch_id":watch_id,
+                "watch_kind":watch_kind,
+                "address":record["address"],
+                "facts":notification_facts(watch_kind, &record["address"], &cursor),
+                "matched_at_ms":now,
+            })
+        };
         let notice_key = notice_key(&scope.id, creator_id, now, watch_id);
         set_meta(
             tx,
             &notice_key,
             &json!({"watch_id":watch_id,"notification_id":watch_id}),
+        )?;
+        set_meta(
+            tx,
+            &owner_notice_key(creator_id, now, watch_id),
+            &json!({
+                "watch_id":watch_id,
+                "scope_id":scope.id,
+                "notice_index_key":notice_key,
+            }),
         )?;
         record["cursor"] = cursor;
         record["notification"] = notification;
@@ -243,13 +279,49 @@ pub(super) fn reconcile(tx: &Transaction<'_>, limit: i64, now: i64) -> Result<Va
 pub(super) fn notifications(db: &Connection, principal: &Principal, limit: i64) -> Result<Value> {
     let principal = super::current_principal(db, principal.clone())?;
     principal.require_participant()?;
-    let scope = request_scope(db, &principal, None, None, None)?;
     let limit = if limit <= 0 {
         DEFAULT_NOTICE_LIMIT
     } else {
         limit.clamp(1, watch::MAX_PAGE_SIZE)
     };
-    let prefix = notice_prefix(&scope.id, &principal.client_id);
+    let current_scope = match request_scope(db, &principal, None, None, None) {
+        Ok(scope) => Some(scope),
+        Err(error)
+            if matches!(
+                error.code.as_str(),
+                "FORBIDDEN"
+                    | "NOT_FOUND"
+                    | "STALE_REVISION"
+                    | "STALE_PARTICIPANT"
+                    | "PARTICIPANT_NOT_ASSIGNED"
+                    | "STALE_REVIEW_ASSIGNMENT"
+            ) =>
+        {
+            None
+        }
+        Err(error) => return Err(error),
+    };
+    let mut candidates = std::collections::BTreeMap::<String, (String, String)>::new();
+    let mut has_more = false;
+    if let Some(scope) = current_scope.as_ref() {
+        let prefix = notice_prefix(&scope.id, &principal.client_id);
+        let upper = format!("{prefix}g");
+        let mut statement = db.prepare(
+            "SELECT key,value_json FROM meta WHERE key>=?1 AND key<?2 ORDER BY key DESC LIMIT ?3",
+        )?;
+        let rows: Vec<(String, String)> = statement
+            .query_map(params![prefix, upper, limit.saturating_add(1)], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        has_more |= rows.len() as i64 > limit;
+        for (index_key, raw_index) in rows.into_iter().take(limit as usize) {
+            let index: Value = serde_json::from_str(&raw_index)?;
+            let watch_id = model::text(&index, "watch_id")?.to_owned();
+            candidates.insert(watch_id, (scope.id.clone(), index_key));
+        }
+    }
+    let prefix = owner_notice_prefix(&principal.client_id);
     let upper = format!("{prefix}g");
     let mut statement = db.prepare(
         "SELECT key,value_json FROM meta WHERE key>=?1 AND key<?2 ORDER BY key DESC LIMIT ?3",
@@ -259,30 +331,67 @@ pub(super) fn notifications(db: &Connection, principal: &Principal, limit: i64) 
             Ok((row.get(0)?, row.get(1)?))
         })?
         .collect::<std::result::Result<_, _>>()?;
-    let has_more = rows.len() as i64 > limit;
-    let mut items = Vec::new();
-    for (index_key, raw_index) in rows.iter().take(limit as usize).rev() {
-        let index: Value = serde_json::from_str(raw_index)?;
-        let watch_id = model::text(&index, "watch_id")?;
+    has_more |= rows.len() as i64 > limit;
+    for (owner_key, raw_index) in rows.into_iter().take(limit as usize) {
+        let index: Value = serde_json::from_str(&raw_index)?;
+        let watch_id = model::text(&index, "watch_id")?.to_owned();
+        let notice_key = model::text(&index, "notice_index_key")?.to_owned();
+        if !owner_key.ends_with(&keys::key_component(&watch_id)) {
+            return Err(damaged("watch owner notice key differs from its index"));
+        }
+        candidates.insert(
+            watch_id,
+            (model::text(&index, "scope_id")?.to_owned(), notice_key),
+        );
+    }
+    let mut notices = Vec::<(i64, String, Value)>::new();
+    let mut stale_authority = 0usize;
+    for (watch_id, (scope_id, notice_index_key)) in &candidates {
         let record = owned_watch(db, watch_id, &principal.client_id)?;
-        require_record_scope(&record, &scope)?;
+        let scope = scope_from_record(&record)?;
         if record["state"] != "matched"
-            || record["notice_index_key"] != index_key.as_str()
-            || record["notification"]["notification_id"] != watch_id
+            || scope.id != *scope_id
+            || record["notice_index_key"] != *notice_index_key
+            || record["notification"]["notification_id"].as_str() != Some(watch_id.as_str())
         {
             return Err(damaged(
                 "mailbox notice index differs from its watch receipt",
             ));
         }
-        items.push(record["notification"].clone());
+        let authority_current = if record["watch_kind"] == "operation_terminal" {
+            stored_creator_scope_is_current(db, &record)?
+        } else {
+            event_creator_is_current(db, &record)?
+        };
+        if !authority_current {
+            stale_authority += 1;
+            continue;
+        }
+        let matched_at_ms = record["notification"]["matched_at_ms"]
+            .as_i64()
+            .ok_or_else(|| damaged("watch notification has no numeric matched_at_ms"))?;
+        notices.push((
+            matched_at_ms,
+            watch_id.clone(),
+            record["notification"].clone(),
+        ));
     }
+    notices.sort_by(|left, right| (&left.0, &left.1).cmp(&(&right.0, &right.1)));
+    if notices.len() > limit as usize {
+        notices.drain(..notices.len() - limit as usize);
+        has_more = true;
+    }
+    let items: Vec<Value> = notices
+        .into_iter()
+        .map(|(_, _, notification)| notification)
+        .collect();
     Ok(json!({
         "items":items,
-        "task_id":scope.task_id,
-        "task_revision":scope.task_revision,
-        "attempt_id":scope.attempt_id,
+        "task_id":current_scope.as_ref().map(|scope|json!(scope.task_id)).unwrap_or(Value::Null),
+        "task_revision":current_scope.as_ref().map(|scope|json!(scope.task_revision)).unwrap_or(Value::Null),
+        "attempt_id":current_scope.as_ref().map(|scope|json!(scope.attempt_id)).unwrap_or(Value::Null),
         "coverage":if has_more { "partial" } else { "complete" },
-        "gaps":if has_more { json!([{"kind":"watch_notice_window_truncated","retained_inventory":"coordination.watch.list"}]) } else { json!([]) },
+        "gaps":if stale_authority > 0 { json!([{"kind":"watch_notice_current_authority_filtered","count":stale_authority}]) } else if has_more { json!([{"kind":"watch_notice_window_truncated","retained_inventory":"coordination.watch.list"}]) } else if current_scope.is_none() { json!([{"kind":"current_scope_unavailable","projection":"watch_headers_only"}]) } else { json!([]) },
     }))
 }
 
@@ -309,12 +418,11 @@ fn create(
             watch::MAX_WATCH_TTL_MS / (24 * 60 * 60 * 1000)
         )));
     }
-    let target = visible_operation(tx, principal, &scope, &request.operation_id)?;
     let subject_key = subject_key(
         &scope,
         &principal.client_id,
         &request.watch_kind,
-        &request.operation_id,
+        &request.address,
     )?;
     if let Some(subject) = meta(tx, &subject_key)? {
         let existing_id = model::text(&subject, "watch_id")?;
@@ -338,6 +446,7 @@ fn create(
             settle_record(tx, &mut existing, "expired", now)?;
         }
     }
+    let target = validate_target(tx, principal, &scope, &request.watch_kind, &request.address)?;
     let watch_id = model::new_id();
     let creator = json!({
         "client_id":principal.client_id,
@@ -350,7 +459,7 @@ fn create(
         "creator":creator,
         "scope":scope_json(&scope),
         "watch_kind":request.watch_kind,
-        "address":{"operation_id":request.operation_id},
+        "address":request.address,
         "delivery":"mailbox_header",
         "one_shot":true,
         "state":"active",
@@ -364,7 +473,7 @@ fn create(
         "subject_key":subject_key,
         "list_index_key":list_index_key,
         "notice_index_key":null,
-        "target_state_at_create":target["state"],
+        "target_state_at_create":target,
     });
     set_meta(tx, &record_key(&watch_id), &record)?;
     set_meta(tx, &list_index_key, &json!({"watch_id":watch_id}))?;
@@ -382,7 +491,7 @@ fn cancel(
 ) -> Result<Value> {
     let mut record = owned_watch(tx, &request.watch_id, &principal.client_id)?;
     let stored_scope = scope_from_record(&record)?;
-    let live_scope = request_scope(
+    let live_scope = match request_scope(
         tx,
         principal,
         if principal.role == Role::Participant {
@@ -400,7 +509,17 @@ fn cancel(
         } else {
             Some(stored_scope.attempt_id.as_str())
         },
-    )?;
+    ) {
+        Ok(scope) => scope,
+        Err(current_error) if record["watch_kind"] != "operation_terminal" => {
+            if event_creator_is_current(tx, &record)? {
+                stored_scope
+            } else {
+                return Err(current_error);
+            }
+        }
+        Err(current_error) => return Err(current_error),
+    };
     require_record_scope(&record, &live_scope)?;
     if record["state"] == "active" {
         record["state"] = json!("cancelled");
@@ -422,25 +541,25 @@ fn cancel(
 }
 
 fn visible_operation(
-    tx: &Transaction<'_>,
+    db: &Connection,
     principal: &Principal,
     scope: &ExactScope,
     operation_id: &str,
 ) -> Result<Value> {
-    if !super::operation_visible_to(tx, principal, operation_id)? {
+    if !super::operation_visible_to(db, principal, operation_id)? {
         return Err(Error::new(
             "NOT_FOUND",
             "Operation was not found or is not visible in this identity",
         ));
     }
-    let operation = operations::get_operation(tx, operation_id)?;
+    let operation = operations::get_operation(db, operation_id)?;
     if operation["task_id"] != scope.task_id || operation["attempt_id"] != scope.attempt_id {
         return Err(Error::new(
             "WATCH_SCOPE_MISMATCH",
             "operation is outside the exact current Task/Attempt scope",
         ));
     }
-    let attempt = tasks::get_attempt(tx, &scope.attempt_id)?;
+    let attempt = tasks::get_attempt(db, &scope.attempt_id)?;
     if attempt["task_id"] != scope.task_id || attempt["task_revision"] != scope.task_revision {
         return Err(Error::new(
             "WATCH_SCOPE_MISMATCH",
@@ -448,6 +567,344 @@ fn visible_operation(
         ));
     }
     Ok(json!({"state":operation["state"]}))
+}
+
+fn validate_target(
+    db: &Connection,
+    principal: &Principal,
+    scope: &ExactScope,
+    watch_kind: &str,
+    address: &Value,
+) -> Result<Value> {
+    validate_address_scope(watch_kind, address, scope)?;
+    match watch_kind {
+        "operation_terminal" => {
+            let operation_id = model::text(address, "operation_id")?;
+            let target = visible_operation(db, principal, scope, operation_id)?;
+            Ok(target["state"].clone())
+        }
+        "contract_revision_changed" => {
+            let client_id = model::text(address, "client_id")?;
+            if principal.role == Role::Participant && client_id != principal.client_id {
+                return Err(Error::new(
+                    "FORBIDDEN",
+                    "participants may watch only their own exact contract card",
+                ));
+            }
+            if coordination::watch_scope_for_creator(
+                db,
+                "participant",
+                client_id,
+                &scope.task_id,
+                scope.task_revision,
+                &scope.attempt_id,
+            )?
+            .is_none()
+            {
+                return Err(Error::new(
+                    "NOT_FOUND",
+                    "contract card owner is not an active Participant in this exact scope",
+                ));
+            }
+            let contract_key = model::text(address, "contract_key")?;
+            let expected_revision = address["expected_revision"]
+                .as_i64()
+                .ok_or_else(|| damaged("contract watch has no expected revision"))?;
+            let card = meta(
+                db,
+                &keys::card_key(&scope.id, "contract", contract_key, client_id),
+            )?;
+            let revision = card
+                .as_ref()
+                .and_then(|value| value["card_revision"].as_i64())
+                .unwrap_or(0);
+            if revision != expected_revision {
+                return Err(Error::new(
+                    "STALE_REVISION",
+                    "contract card revision differs from expected_revision",
+                ));
+            }
+            Ok(json!({
+                "client_id":client_id,
+                "contract_key":contract_key,
+                "card_revision":revision,
+                "state":card.as_ref().and_then(|value| value.get("state")).cloned().unwrap_or(json!("absent")),
+            }))
+        }
+        "task_revision_changed" => {
+            let task = tasks::get_task(db, &scope.task_id)?;
+            if task["revision"] != scope.task_revision {
+                return Err(Error::new(
+                    "STALE_REVISION",
+                    "Task revision differs from watch scope",
+                ));
+            }
+            Ok(json!({"task_id":scope.task_id,"revision":task["revision"]}))
+        }
+        "attempt_disposition_changed" => {
+            let attempt = tasks::get_attempt(db, &scope.attempt_id)?;
+            if !attempt["released_at_ms"].is_null()
+                || attempt["task_id"] != scope.task_id
+                || attempt["task_revision"] != scope.task_revision
+                || attempt["state"] != address["expected_state"]
+            {
+                return Err(Error::new(
+                    "STALE_REVISION",
+                    "Attempt is not live at expected_state in the exact watch scope",
+                ));
+            }
+            Ok(json!({
+                "attempt_id":scope.attempt_id,
+                "state":attempt["state"],
+                "released_at_ms":null,
+            }))
+        }
+        "exact_deadline_reached" => {
+            let operation_id = model::text(address, "operation_id")?;
+            let _ = visible_operation(db, principal, scope, operation_id)?;
+            let operation = operations::get_operation(db, operation_id)?;
+            let expected_deadline_ms = address["expected_deadline_ms"].as_i64();
+            if operation["method"] != "coordination.consult"
+                || operation["state"] != "settled"
+                || operation["result"]["ask"]["reply_deadline_ms"].as_i64() != expected_deadline_ms
+            {
+                return Err(Error::new(
+                    "WATCH_SUBJECT_MISMATCH",
+                    "deadline watch must name the exact retained coordination.consult reply deadline",
+                ));
+            }
+            Ok(json!({
+                "operation_id":operation_id,
+                "deadline_field":"reply_deadline_ms",
+                "deadline_at_ms":expected_deadline_ms,
+            }))
+        }
+        _ => Err(Error::new(
+            "WATCH_KIND_UNSUPPORTED",
+            format!("watch kind {watch_kind:?} has no authoritative Store fact source"),
+        )),
+    }
+}
+
+fn validate_address_scope(watch_kind: &str, address: &Value, scope: &ExactScope) -> Result<()> {
+    let matches = match watch_kind {
+        "contract_revision_changed" => {
+            address["task_id"] == scope.task_id && address["attempt_id"] == scope.attempt_id
+        }
+        "task_revision_changed" => {
+            address["task_id"] == scope.task_id
+                && address["expected_revision"] == scope.task_revision
+        }
+        "attempt_disposition_changed" => address["attempt_id"] == scope.attempt_id,
+        "operation_terminal" | "exact_deadline_reached" => true,
+        _ => false,
+    };
+    if !matches {
+        return Err(Error::new(
+            "WATCH_SCOPE_MISMATCH",
+            "watch address differs from the authenticated exact Task/Attempt scope",
+        ));
+    }
+    Ok(())
+}
+
+enum EventCursor {
+    Pending,
+    StaleSubject,
+    Matched(Value),
+}
+
+fn event_cursor(tx: &Transaction<'_>, record: &Value, now: i64) -> Result<EventCursor> {
+    let watch_kind = model::text(record, "watch_kind")?;
+    let address = &record["address"];
+    let scope = scope_from_record(record)?;
+    match watch_kind {
+        "operation_terminal" => {
+            let Some(cursor) = terminal_operation_cursor(tx, record)? else {
+                return Ok(EventCursor::StaleSubject);
+            };
+            if cursor["settled_at_ms"].is_null()
+                || !matches!(
+                    cursor["state"].as_str(),
+                    Some("settled" | "rejected" | "cancelled")
+                )
+            {
+                return Ok(EventCursor::Pending);
+            }
+            Ok(EventCursor::Matched(cursor))
+        }
+        "contract_revision_changed" => {
+            let expected = address["expected_revision"]
+                .as_i64()
+                .ok_or_else(|| damaged("contract watch expected_revision is invalid"))?;
+            match contract_revision_cursor(tx, &scope, address, expected)? {
+                Some(cursor) => Ok(EventCursor::Matched(cursor)),
+                None => Ok(EventCursor::Pending),
+            }
+        }
+        "task_revision_changed" => {
+            let task = match tasks::get_task(tx, &scope.task_id) {
+                Ok(task) => task,
+                Err(error) if error.code == "NOT_FOUND" => {
+                    return Ok(EventCursor::StaleSubject);
+                }
+                Err(error) => return Err(error),
+            };
+            let expected = address["expected_revision"].as_i64().unwrap_or_default();
+            let current = task["revision"].as_i64().unwrap_or_default();
+            if current < expected {
+                return Ok(EventCursor::StaleSubject);
+            }
+            if current == expected {
+                return Ok(EventCursor::Pending);
+            }
+            Ok(EventCursor::Matched(json!({
+                "task_id":scope.task_id,
+                "expected_revision":expected,
+                "current_revision":current,
+            })))
+        }
+        "attempt_disposition_changed" => {
+            let attempt = match tasks::get_attempt(tx, &scope.attempt_id) {
+                Ok(attempt) => attempt,
+                Err(error) if error.code == "NOT_FOUND" => {
+                    return Ok(EventCursor::StaleSubject);
+                }
+                Err(error) => return Err(error),
+            };
+            if attempt["task_id"] != scope.task_id
+                || attempt["task_revision"] != scope.task_revision
+            {
+                return Ok(EventCursor::StaleSubject);
+            }
+            let Some(released_at_ms) = attempt["released_at_ms"].as_i64() else {
+                return Ok(EventCursor::Pending);
+            };
+            let disposition = attempt["state"].as_str().unwrap_or_default();
+            if !matches!(
+                disposition,
+                "accepted" | "failed" | "cancelled" | "superseded"
+            ) {
+                return Ok(EventCursor::StaleSubject);
+            }
+            Ok(EventCursor::Matched(json!({
+                "attempt_id":scope.attempt_id,
+                "expected_state":address["expected_state"],
+                "disposition":disposition,
+                "released_at_ms":released_at_ms,
+            })))
+        }
+        "exact_deadline_reached" => {
+            let operation_id = model::text(address, "operation_id")?;
+            let operation = match operations::get_operation(tx, operation_id) {
+                Ok(operation) => operation,
+                Err(error) if error.code == "NOT_FOUND" => {
+                    return Ok(EventCursor::StaleSubject);
+                }
+                Err(error) => return Err(error),
+            };
+            if operation["method"] != "coordination.consult"
+                || operation["task_id"] != scope.task_id
+                || operation["attempt_id"] != scope.attempt_id
+                || operation["state"] != "settled"
+                || operation["result"]["ask"]["reply_deadline_ms"]
+                    != address["expected_deadline_ms"]
+            {
+                return Ok(EventCursor::StaleSubject);
+            }
+            let deadline = address["expected_deadline_ms"].as_i64().unwrap_or_default();
+            if now < deadline {
+                return Ok(EventCursor::Pending);
+            }
+            Ok(EventCursor::Matched(json!({
+                "operation_id":operation_id,
+                "deadline_field":"reply_deadline_ms",
+                "deadline_at_ms":deadline,
+                "observed_at_ms":now,
+            })))
+        }
+        _ => Err(damaged("watch record names an unsupported kind")),
+    }
+}
+
+fn contract_revision_cursor(
+    tx: &Transaction<'_>,
+    scope: &ExactScope,
+    address: &Value,
+    expected_revision: i64,
+) -> Result<Option<Value>> {
+    let Some(next_revision) = expected_revision.checked_add(1) else {
+        return Ok(None);
+    };
+    let contract_key = model::text(address, "contract_key")?;
+    let client_id = model::text(address, "client_id")?;
+    let prefix = format!(
+        "coordination:card-revision:{}:contract:{}:{}:",
+        scope.id,
+        keys::key_component(contract_key),
+        keys::key_component(client_id),
+    );
+    let lower = format!("{prefix}{next_revision:020}");
+    let upper = format!("{prefix}g");
+    let row: Option<(String, String)> = tx
+        .query_row(
+            "SELECT key,value_json FROM meta WHERE key>=?1 AND key<?2 ORDER BY key LIMIT 1",
+            params![lower, upper],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((key, raw)) = row else {
+        return Ok(None);
+    };
+    let card: Value = serde_json::from_str(&raw)?;
+    let Some(revision) = card["card_revision"].as_i64() else {
+        return Err(damaged(
+            "retained contract card revision has no numeric revision",
+        ));
+    };
+    let key_revision = key
+        .rsplit(':')
+        .next()
+        .and_then(|value| value.parse::<i64>().ok());
+    if revision < next_revision
+        || key_revision != Some(revision)
+        || card["card_kind"] != "contract"
+        || card["identity"] != contract_key
+        || card["task_id"] != scope.task_id
+        || card["task_revision"] != scope.task_revision
+        || card["attempt_id"] != scope.attempt_id
+        || card["client_id"] != client_id
+        || !matches!(card["state"].as_str(), Some("current" | "withdrawn"))
+    {
+        return Err(damaged(
+            "retained contract revision differs from its exact watch address",
+        ));
+    }
+    Ok(Some(json!({
+        "task_id":scope.task_id,
+        "attempt_id":scope.attempt_id,
+        "contract_key":contract_key,
+        "client_id":client_id,
+        "expected_revision":expected_revision,
+        "card_revision":revision,
+        "state":card["state"],
+        "updated_at_ms":card["updated_at_ms"],
+    })))
+}
+
+fn notification_facts(watch_kind: &str, address: &Value, cursor: &Value) -> Value {
+    match watch_kind {
+        "operation_terminal" => json!({
+            "operation_id":address["operation_id"],
+            "state":cursor["state"],
+            "settled_at_ms":cursor["settled_at_ms"],
+        }),
+        "contract_revision_changed" => cursor.clone(),
+        "task_revision_changed" => cursor.clone(),
+        "attempt_disposition_changed" => cursor.clone(),
+        "exact_deadline_reached" => cursor.clone(),
+        _ => Value::Null,
+    }
 }
 
 fn terminal_operation_cursor(tx: &Transaction<'_>, record: &Value) -> Result<Option<Value>> {
@@ -484,13 +941,13 @@ fn terminal_operation_cursor(tx: &Transaction<'_>, record: &Value) -> Result<Opt
     })))
 }
 
-fn stored_creator_scope_is_current(tx: &Transaction<'_>, record: &Value) -> Result<bool> {
+fn stored_creator_scope_is_current(db: &Connection, record: &Value) -> Result<bool> {
     let scope = scope_from_record(record)?;
     let creator = &record["creator"];
     let role = model::text(creator, "role")?;
     let client_id = model::text(creator, "client_id")?;
     Ok(coordination::watch_scope_for_creator(
-        tx,
+        db,
         role,
         client_id,
         &scope.task_id,
@@ -498,6 +955,19 @@ fn stored_creator_scope_is_current(tx: &Transaction<'_>, record: &Value) -> Resu
         &scope.attempt_id,
     )?
     .is_some())
+}
+
+fn event_creator_is_current(db: &Connection, record: &Value) -> Result<bool> {
+    let scope = scope_from_record(record)?;
+    let creator = &record["creator"];
+    coordination::watch_creator_authorized_for_subject(
+        db,
+        model::text(creator, "role")?,
+        model::text(creator, "client_id")?,
+        &scope.task_id,
+        scope.task_revision,
+        &scope.attempt_id,
+    )
 }
 
 fn request_scope(
@@ -514,6 +984,43 @@ fn request_scope(
         task_revision: model::positive(&projection["task"], "revision")?,
         attempt_id: model::text(&projection["attempt"], "attempt_id")?.to_owned(),
     })
+}
+
+fn retained_transition_scope(
+    db: &Connection,
+    principal: &Principal,
+    task_id: Option<&str>,
+    task_revision: Option<i64>,
+    attempt_id: Option<&str>,
+) -> Result<Option<ExactScope>> {
+    let (Some(task_id), Some(task_revision), Some(attempt_id)) =
+        (task_id, task_revision, attempt_id)
+    else {
+        // Participants do not supply subject identity on list calls. Their
+        // post-transition receipt is exposed through the owner-only inbox
+        // header projection instead.
+        return Ok(None);
+    };
+    if !matches!(principal.role, Role::Manager | Role::Operator) {
+        return Ok(None);
+    }
+    let role = role_tag(&principal.role)?;
+    if !coordination::watch_creator_authorized_for_subject(
+        db,
+        role,
+        &principal.client_id,
+        task_id,
+        task_revision,
+        attempt_id,
+    )? {
+        return Ok(None);
+    }
+    Ok(Some(ExactScope {
+        id: keys::scope_id(task_id, task_revision, attempt_id)?,
+        task_id: task_id.to_owned(),
+        task_revision,
+        attempt_id: attempt_id.to_owned(),
+    }))
 }
 
 fn scope_from_record(record: &Value) -> Result<ExactScope> {
@@ -566,7 +1073,16 @@ fn owned_watch(db: &Connection, watch_id: &str, client_id: &str) -> Result<Value
 fn verify_record(record: &Value, expected_id: &str) -> Result<()> {
     if record["schema"] != WATCH_SCHEMA
         || record["watch_id"] != expected_id
-        || record["watch_kind"] != "operation_terminal"
+        || !matches!(
+            record["watch_kind"].as_str(),
+            Some(
+                "operation_terminal"
+                    | "contract_revision_changed"
+                    | "task_revision_changed"
+                    | "attempt_disposition_changed"
+                    | "exact_deadline_reached"
+            )
+        )
         || record["delivery"] != "mailbox_header"
         || record["one_shot"] != true
         || !matches!(
@@ -576,10 +1092,14 @@ fn verify_record(record: &Value, expected_id: &str) -> Result<()> {
     {
         return Err(damaged("watch record does not match its supported schema"));
     }
-    let _ = scope_from_record(record)?;
+    let scope = scope_from_record(record)?;
     let _ = model::text(&record["creator"], "client_id")?;
     let _ = model::text(&record["creator"], "role")?;
-    let _ = model::text(&record["address"], "operation_id")?;
+    let watch_kind = model::text(record, "watch_kind")?;
+    watch::validate_address(watch_kind, &record["address"])
+        .map_err(|_| damaged("watch address does not match its supported schema"))?;
+    validate_address_scope(watch_kind, &record["address"], &scope)
+        .map_err(|_| damaged("watch address does not match its retained exact scope"))?;
     Ok(())
 }
 
@@ -703,14 +1223,25 @@ fn subject_key(
     scope: &ExactScope,
     creator_id: &str,
     watch_kind: &str,
-    operation_id: &str,
+    address: &Value,
 ) -> Result<String> {
-    let subject = json!({
-        "scope_id":scope.id,
-        "watcher_id":creator_id,
-        "watch_kind":watch_kind,
-        "operation_id":operation_id,
-    });
+    let subject = if watch_kind == "operation_terminal" {
+        // Preserve the original O1 fingerprint so retries against existing
+        // retained operation watches continue to coalesce after this extension.
+        json!({
+            "scope_id":scope.id,
+            "watcher_id":creator_id,
+            "watch_kind":watch_kind,
+            "operation_id":address["operation_id"],
+        })
+    } else {
+        json!({
+            "scope_id":scope.id,
+            "watcher_id":creator_id,
+            "watch_kind":watch_kind,
+            "address":address,
+        })
+    };
     Ok(format!(
         "{SUBJECT_PREFIX}{}",
         model::digest(model::canonical(&subject)?.as_bytes())
@@ -728,6 +1259,18 @@ fn notice_key(scope_id: &str, creator_id: &str, matched_at_ms: i64, watch_id: &s
     format!(
         "{}{matched_at_ms:020}:{}",
         notice_prefix(scope_id, creator_id),
+        keys::key_component(watch_id)
+    )
+}
+
+fn owner_notice_prefix(creator_id: &str) -> String {
+    format!("{OWNER_NOTICE_PREFIX}{}:", keys::key_component(creator_id))
+}
+
+fn owner_notice_key(creator_id: &str, matched_at_ms: i64, watch_id: &str) -> String {
+    format!(
+        "{}{matched_at_ms:020}:{}",
+        owner_notice_prefix(creator_id),
         keys::key_component(watch_id)
     )
 }

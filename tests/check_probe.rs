@@ -207,7 +207,11 @@ fn owned_probe_bounds_output_deadline_and_descendant_lifetime() {
                 &[
                     "-NoProfile",
                     "-Command",
-                    "1..10000 | ForEach-Object { 'xxxxxxxx' }",
+                    // Write one bounded-size block directly instead of
+                    // formatting 10,000 pipeline objects. The former can
+                    // exceed the five-second probe deadline on a cold Windows
+                    // runner before stdout reaches the configured byte cap.
+                    "[Console]::Out.Write('x' * 65536)",
                 ],
                 5_000,
                 1024,

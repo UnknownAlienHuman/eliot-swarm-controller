@@ -251,6 +251,40 @@ static TOOLS: &[(bool, ToolSpec)] = &[
             "purpose",
         ],
     ),
+    mutation(
+        "swarm.launch",
+        "Submit one exact, digest-bound launch plan under Manager or local Operator authority. This records a durable intent; current execution remains blocked until trusted workspace admission is available.",
+        &[
+            f("task_id", S),
+            f("expected_task_revision", I),
+            f("route", S),
+            f("agent_profile", S),
+            f("mcp_profile", S),
+            f("mcp_surface", S),
+            f("workspace_policy", S),
+            f("requested_model", SN),
+            f("requested_effort", SN),
+            f("budget", O),
+            f("stop_conditions", A),
+            f("purpose", S),
+            f("plan_digest", S),
+        ],
+        &[
+            "task_id",
+            "expected_task_revision",
+            "route",
+            "agent_profile",
+            "mcp_profile",
+            "mcp_surface",
+            "workspace_policy",
+            "requested_model",
+            "requested_effort",
+            "budget",
+            "stop_conditions",
+            "purpose",
+            "plan_digest",
+        ],
+    ),
     read(
         "coordination.participant.get",
         "Read one participant registration only within an authenticated current Task/Attempt scope.",
@@ -288,6 +322,20 @@ static TOOLS: &[(bool, ToolSpec)] = &[
             f("fields", A),
             f("limit", I),
             f("after_client_id", S),
+        ],
+        &[],
+    ),
+    read(
+        "swarm.overlap.check",
+        "Compare bounded selector facts for possible overlap in the caller's current scope; missing Git or workspace evidence remains unknown.",
+        &[
+            f("task_id", SN),
+            f("task_revision", IN),
+            f("attempt_id", SN),
+            f("paths", A),
+            f("symbols", A),
+            f("contracts", A),
+            f("candidate_ref", SN),
         ],
         &[],
     ),
@@ -608,6 +656,12 @@ static TOOLS: &[(bool, ToolSpec)] = &[
         &["recipient", "body"],
     ),
     mutation(
+        "coordination.sync_integration",
+        "Publish one integration offer or requirement linked to the authenticated Participant's current contract card; results are advisory and do not accept work or wake a model.",
+        &[f("contract_key", S), f("offer", O), f("requirement", O)],
+        &["contract_key"],
+    ),
+    mutation(
         "coordination.consult",
         "Resolve one exact card owner and ask one bounded question only when that unique live owner's card lacks the requested field.",
         &[
@@ -634,7 +688,7 @@ static TOOLS: &[(bool, ToolSpec)] = &[
     ),
     mutation(
         "coordination.watch.create",
-        "Create one bounded, one-shot operation-terminal watch in the authenticated Participant scope or exact Manager/Operator Task/Attempt scope.",
+        "Create one bounded, one-shot watch over a supported retained fact in the authenticated Participant scope or exact Manager/Operator Task/Attempt scope.",
         &[
             f("watch_kind", S),
             f("address", O),
@@ -1078,13 +1132,17 @@ fn input_schema(spec: &ToolSpec, read_only: bool, require_request_id: bool) -> A
             "client_request_id".to_string(),
             json!({
                 "type": "string",
-                "description": if require_request_id {
+                "description": if require_request_id || spec.method == "swarm.launch" {
                     "Caller-owned stable logical request ID. Choose it before dispatch and reuse it to reconcile a lost reply; the server does not retry mutations."
                 } else {
                     "Caller-owned stable logical request ID. Reuse it to reconcile a lost reply; the local full compatibility profile generates one only when omitted and a result arrives."
                 }
             }),
         );
+        if spec.method == "swarm.launch" {
+            properties["client_request_id"]["minLength"] = json!(1);
+            properties["client_request_id"]["maxLength"] = json!(128);
+        }
     }
     let mut schema = json!({
         "type": "object",
@@ -1092,7 +1150,7 @@ fn input_schema(spec: &ToolSpec, read_only: bool, require_request_id: bool) -> A
         "additionalProperties": false,
     });
     let mut required = spec.required.to_vec();
-    if !read_only && require_request_id {
+    if !read_only && (require_request_id || spec.method == "swarm.launch") {
         required.push("client_request_id");
     }
     if !required.is_empty() {
@@ -1108,6 +1166,76 @@ fn input_schema(spec: &ToolSpec, read_only: bool, require_request_id: bool) -> A
 fn refine_input_schema(method: &str, schema: &mut Value) {
     let properties = &mut schema["properties"];
     match method {
+        "coordination.sync_integration" => {
+            properties["client_request_id"]["minLength"] = json!(1);
+            properties["client_request_id"]["maxLength"] = json!(128);
+            properties["client_request_id"]["pattern"] = json!("^\\S+$");
+            properties["contract_key"] =
+                json!({"type":"string","minLength":1,"maxLength":256,"pattern":"^\\S+$"});
+            properties["offer"] = json!({
+                "oneOf":[sync_offer_schema(),{"type":"null"}]
+            });
+            properties["requirement"] = json!({
+                "oneOf":[sync_requirement_schema(),{"type":"null"}]
+            });
+            append_all_of(
+                schema,
+                json!({
+                    "oneOf":[
+                        {
+                            "properties":{
+                                "offer":{"type":"object"},
+                                "requirement":{"not":{"type":"object"}}
+                            },
+                            "required":["offer"]
+                        },
+                        {
+                            "properties":{
+                                "requirement":{"type":"object"},
+                                "offer":{"not":{"type":"object"}}
+                            },
+                            "required":["requirement"]
+                        }
+                    ]
+                }),
+            );
+        }
+        "swarm.overlap.check" => {
+            properties["task_id"] =
+                json!({"type":"string","minLength":1,"maxLength":256,"pattern":"^\\S+$"});
+            properties["task_revision"] =
+                json!({"type":"integer","minimum":1,"maximum":9223372036854775807_i64});
+            properties["attempt_id"] =
+                json!({"type":"string","minLength":1,"maxLength":256,"pattern":"^\\S+$"});
+            properties["paths"] = json!({
+                "type":"array",
+                "maxItems":24,
+                "uniqueItems":true,
+                "description":"Literal relative paths. The total number of paths, symbols, and contracts together is at most 24.",
+                "items":{"type":"string","minLength":1,"maxLength":1024}
+            });
+            properties["symbols"] = json!({
+                "type":"array",
+                "maxItems":24,
+                "uniqueItems":true,
+                "items":{"type":"string","minLength":1,"maxLength":1024,"pattern":"^\\S+$"}
+            });
+            properties["contracts"] = json!({
+                "type":"array",
+                "maxItems":24,
+                "uniqueItems":true,
+                "items":{"type":"string","minLength":1,"maxLength":256,"pattern":"^\\S+$"}
+            });
+            properties["candidate_ref"] =
+                json!({"type":["string","null"],"minLength":1,"maxLength":128});
+            require_all_or_none_scope(schema);
+            schema["anyOf"] = json!([
+                {"required":["paths"],"properties":{"paths":{"minItems":1}}},
+                {"required":["symbols"],"properties":{"symbols":{"minItems":1}}},
+                {"required":["contracts"],"properties":{"contracts":{"minItems":1}}},
+                {"required":["candidate_ref"],"properties":{"candidate_ref":{"type":"string"}}}
+            ]);
+        }
         "coordination.consult" => {
             properties["target"] = json!({
                 "oneOf": [
@@ -1132,32 +1260,44 @@ fn refine_input_schema(method: &str, schema: &mut Value) {
             });
         }
         "coordination.watch.create" => {
-            properties["watch_kind"] = json!({"const":"operation_terminal"});
-            properties["address"] = json!({
-                "type":"object",
-                "properties":{"operation_id":{"type":"string","minLength":1,"maxLength":512}},
-                "required":["operation_id"],
-                "additionalProperties":false
+            properties["watch_kind"] = json!({
+                "type":"string",
+                "enum":[
+                    "operation_terminal",
+                    "contract_revision_changed",
+                    "task_revision_changed",
+                    "attempt_disposition_changed",
+                    "exact_deadline_reached"
+                ]
             });
-            properties["expires_at_ms"] = json!({"type":"integer","minimum":1});
+            properties["address"] = json!({"type":"object"});
+            properties["expires_at_ms"] =
+                json!({"type":"integer","minimum":1,"maximum":9223372036854775807_i64});
             properties["delivery"] = json!({"const":"mailbox_header"});
             properties["one_shot"] = json!({"const":true});
-            properties["task_id"] = json!({"type":"string","minLength":1,"maxLength":512});
-            properties["task_revision"] = json!({"type":"integer","minimum":1});
-            properties["attempt_id"] = json!({"type":"string","minLength":1,"maxLength":512});
+            properties["task_id"] = json!({"type":"string","minLength":1,"maxLength":128});
+            properties["task_revision"] =
+                json!({"type":"integer","minimum":1,"maximum":9223372036854775807_i64});
+            properties["attempt_id"] = json!({"type":"string","minLength":1,"maxLength":128});
+            append_all_of(schema, watch_address_union());
             require_all_or_none_scope(schema);
         }
         "coordination.watch.list" => {
-            properties["task_id"] = json!({"type":"string","minLength":1,"maxLength":512});
-            properties["task_revision"] = json!({"type":"integer","minimum":1});
-            properties["attempt_id"] = json!({"type":"string","minLength":1,"maxLength":512});
+            properties["task_id"] = json!({"type":"string","minLength":1,"maxLength":128});
+            properties["task_revision"] =
+                json!({"type":"integer","minimum":1,"maximum":9223372036854775807_i64});
+            properties["attempt_id"] = json!({"type":"string","minLength":1,"maxLength":128});
             properties["limit"] = json!({"type":"integer","minimum":1,"maximum":50});
-            properties["after_watch_id"] = json!({"type":"string","minLength":1,"maxLength":512});
+            properties["after_watch_id"] = json!({"type":"string","minLength":1,"maxLength":128});
             require_all_or_none_scope(schema);
         }
-        "swarm.launch.preview" => {
+        "coordination.watch.cancel" => {
+            properties["watch_id"] = json!({"type":"string","minLength":1,"maxLength":128});
+        }
+        "swarm.launch.preview" | "swarm.launch" => {
             properties["task_id"] = json!({"type":"string","minLength":1,"maxLength":512});
-            properties["expected_task_revision"] = json!({"type":"integer","minimum":1});
+            properties["expected_task_revision"] =
+                json!({"type":"integer","minimum":1,"maximum":9223372036854775807_i64});
             for name in ["route", "agent_profile", "mcp_profile", "mcp_surface"] {
                 properties[name] = json!({"type":"string","minLength":1,"maxLength":256});
             }
@@ -1180,18 +1320,173 @@ fn refine_input_schema(method: &str, schema: &mut Value) {
                 "items":{"type":"string","minLength":1,"maxLength":512}
             });
             properties["purpose"] = json!({"type":"string","minLength":1,"maxLength":128});
+            if method == "swarm.launch" {
+                properties["plan_digest"] = json!({
+                    "type":"string",
+                    "minLength":71,
+                    "maxLength":71,
+                    "pattern":"^sha256:[0-9a-f]{64}$"
+                });
+            }
         }
         _ => {}
     }
 }
 
 fn require_all_or_none_scope(schema: &mut Value) {
-    schema["allOf"] = json!([{
-        "oneOf": [
-            {"not":{"anyOf":[{"required":["task_id"]},{"required":["task_revision"]},{"required":["attempt_id"]}]}},
-            {"required":["task_id","task_revision","attempt_id"]}
+    append_all_of(
+        schema,
+        json!({
+            "oneOf": [
+                {"not":{"anyOf":[{"required":["task_id"]},{"required":["task_revision"]},{"required":["attempt_id"]}]}},
+                {"required":["task_id","task_revision","attempt_id"]}
+            ]
+        }),
+    );
+}
+
+fn sync_offer_schema() -> Value {
+    let availability = json!({
+        "type":"object",
+        "properties":{
+            "path":{"type":["string","null"],"minLength":1,"maxLength":1024,"description":"Literal relative path."},
+            "symbol":{"type":["string","null"],"minLength":1,"maxLength":1024,"pattern":"^\\S+$"}
+        },
+        "anyOf":[
+            {"required":["path"],"properties":{"path":{"type":"string"}}},
+            {"required":["symbol"],"properties":{"symbol":{"type":"string"}}}
+        ],
+        "additionalProperties":false
+    });
+    json!({
+        "type":"object",
+        "properties":{
+            "readiness":{"type":"string","enum":["draft","implementation_ready","observed"]},
+            "will_be_available_at":availability,
+            "candidate_ref":{"type":["string","null"],"minLength":1,"maxLength":128},
+            "assumptions":{
+                "type":"array",
+                "maxItems":20,
+                "uniqueItems":true,
+                "items":{"type":"string","minLength":1,"maxLength":512}
+            }
+        },
+        "required":["readiness","will_be_available_at"],
+        "additionalProperties":false
+    })
+}
+
+fn sync_requirement_schema() -> Value {
+    let dimensions = [
+        "version",
+        "producer",
+        "consumer",
+        "carrier",
+        "contract",
+        "inputs",
+        "outputs",
+        "serialization",
+        "ownership",
+        "availability",
+        "limits",
+        "result_disposition",
+        "retry_semantics",
+        "canonical_sources",
+    ];
+    json!({
+        "type":"object",
+        "properties":{
+            "consumer_path":{"type":["string","null"],"minLength":1,"maxLength":1024,"description":"Literal relative path."},
+            "consumer_symbol":{"type":["string","null"],"minLength":1,"maxLength":1024,"pattern":"^\\S+$"},
+            "required_dimensions":{
+                "type":"object",
+                "minProperties":1,
+                "maxProperties":16,
+                "propertyNames":{"enum":dimensions},
+                "additionalProperties":{"not":{"type":"null"}},
+                "description":"Required dimension values; canonical JSON must be at most 8192 bytes."
+            },
+            "must_be_ready_before":{"type":"string","minLength":1,"maxLength":256},
+            "assumptions":{
+                "type":"array",
+                "maxItems":20,
+                "uniqueItems":true,
+                "items":{"type":"string","minLength":1,"maxLength":512}
+            }
+        },
+        "required":["required_dimensions","must_be_ready_before"],
+        "anyOf":[
+            {"required":["consumer_path"],"properties":{"consumer_path":{"type":"string"}}},
+            {"required":["consumer_symbol"],"properties":{"consumer_symbol":{"type":"string"}}}
+        ],
+        "additionalProperties":false
+    })
+}
+
+fn watch_address_union() -> Value {
+    let operation_terminal = json!({
+        "type":"object",
+        "properties":{"operation_id":{"type":"string","minLength":1,"maxLength":128}},
+        "required":["operation_id"],
+        "additionalProperties":false
+    });
+    let contract_revision_changed = json!({
+        "type":"object",
+        "properties":{
+            "task_id":{"type":"string","minLength":1,"maxLength":128},
+            "attempt_id":{"type":"string","minLength":1,"maxLength":128},
+            "contract_key":{"type":"string","minLength":1,"maxLength":256},
+            "client_id":{"type":"string","minLength":1,"maxLength":128},
+            "expected_revision":{"type":"integer","minimum":0,"maximum":9223372036854775807_i64}
+        },
+        "required":["task_id","attempt_id","contract_key","client_id","expected_revision"],
+        "additionalProperties":false
+    });
+    let task_revision_changed = json!({
+        "type":"object",
+        "properties":{
+            "task_id":{"type":"string","minLength":1,"maxLength":128},
+            "expected_revision":{"type":"integer","minimum":1,"maximum":9223372036854775807_i64}
+        },
+        "required":["task_id","expected_revision"],
+        "additionalProperties":false
+    });
+    let attempt_disposition_changed = json!({
+        "type":"object",
+        "properties":{
+            "attempt_id":{"type":"string","minLength":1,"maxLength":128},
+            "expected_state":{"type":"string","enum":["reserved","running","submitted","needs_correction","recovery_pending"]}
+        },
+        "required":["attempt_id","expected_state"],
+        "additionalProperties":false
+    });
+    let exact_deadline_reached = json!({
+        "type":"object",
+        "properties":{
+            "operation_id":{"type":"string","minLength":1,"maxLength":128},
+            "deadline_field":{"const":"reply_deadline_ms"},
+            "expected_deadline_ms":{"type":"integer","minimum":1,"maximum":9223372036854775807_i64}
+        },
+        "required":["operation_id","deadline_field","expected_deadline_ms"],
+        "additionalProperties":false
+    });
+    json!({
+        "oneOf":[
+            {"properties":{"watch_kind":{"const":"operation_terminal"},"address":operation_terminal}},
+            {"properties":{"watch_kind":{"const":"contract_revision_changed"},"address":contract_revision_changed}},
+            {"properties":{"watch_kind":{"const":"task_revision_changed"},"address":task_revision_changed}},
+            {"properties":{"watch_kind":{"const":"attempt_disposition_changed"},"address":attempt_disposition_changed}},
+            {"properties":{"watch_kind":{"const":"exact_deadline_reached"},"address":exact_deadline_reached}}
         ]
-    }]);
+    })
+}
+
+fn append_all_of(schema: &mut Value, constraint: Value) {
+    if let Some(all_of) = schema.get_mut("allOf").and_then(Value::as_array_mut) {
+        all_of.push(constraint);
+    } else {
+        schema["allOf"] = json!([constraint]);
+    }
 }
 
 fn field_schema(kind: &str) -> Value {
@@ -2307,7 +2602,7 @@ impl ServerHandler for ProfiledFacade {
             };
             return Ok(CallToolResult::structured(Value::Object(result)).into());
         }
-        if self.profile != McpToolProfile::Full && !*read_only {
+        if (self.profile != McpToolProfile::Full || spec.method == "swarm.launch") && !*read_only {
             let arguments = request
                 .arguments
                 .as_ref()
@@ -2461,6 +2756,8 @@ mod tests {
             "swarm.agent.inspect",
             "swarm.exceptions.get",
             "swarm.launch.preview",
+            "swarm.launch",
+            "swarm.overlap.check",
             "coordination.participant.get",
             "coordination.participant.list",
             "coordination.peer.find",
@@ -2515,6 +2812,7 @@ mod tests {
             "coordination.contract_card.withdraw",
             "coordination.send",
             "coordination.consult",
+            "coordination.sync_integration",
             "coordination.watch.create",
             "coordination.watch.cancel",
             "review.assign",
@@ -2524,11 +2822,11 @@ mod tests {
         .into_iter()
         .collect();
         assert_eq!(methods, expected);
-        assert_eq!(TOOLS.len(), 88);
-        assert_eq!(TOOLS.iter().filter(|(read_only, _)| *read_only).count(), 44);
+        assert_eq!(TOOLS.len(), 91);
+        assert_eq!(TOOLS.iter().filter(|(read_only, _)| *read_only).count(), 45);
         assert_eq!(
             TOOLS.iter().filter(|(read_only, _)| !*read_only).count(),
-            44
+            46
         );
     }
 

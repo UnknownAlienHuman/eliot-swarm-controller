@@ -79,6 +79,7 @@ pub(crate) fn authorize_participant_mutation(
             | "coordination.contract_card.withdraw"
             | "coordination.send"
             | "coordination.consult"
+            | "coordination.sync_integration"
             | "coordination.watch.create"
             | "coordination.watch.cancel"
     ) {
@@ -104,6 +105,169 @@ pub(crate) fn list_scope_participants(
 ) -> Result<Value> {
     let scope = manager_scope(db, principal, task_id, task_revision, attempt_id)?;
     list_participant_page(db, &scope, limit, after_client_id)
+}
+
+/// Exact contract relevance, with every indexed grant and card revalidated.
+/// This is deliberately bounded; incomplete coverage is never an agreement.
+pub(super) fn list_current_contract_participants(
+    db: &Connection,
+    principal: &Principal,
+    contract_key: &str,
+    limit: i64,
+) -> Result<Value> {
+    validate_identifier(contract_key, "contract_key", 1024)?;
+    if !(1..=keys::MAX_PAGE_SIZE).contains(&limit) {
+        return Err(Error::invalid("contract participant limit must be 1..=50"));
+    }
+    let caller = load_current_scope(db, principal)?;
+    let scan_limit = (limit * RELEVANCE_SCAN_FACTOR + 32).min(keys::MAX_INBOX_SCAN);
+    let (indexed, more) = indexed_cards(
+        db,
+        &caller.scope_id,
+        keys::TermKind::Contract,
+        contract_key,
+        Some("contract"),
+        None,
+        scan_limit,
+    )?;
+    let mut items = Vec::new();
+    let mut stale = 0usize;
+    let mut overflow = false;
+    for index in indexed {
+        let member = match load_current_scope_for_client(db, &index.client_id) {
+            Ok(member) if member.scope_id == caller.scope_id => member,
+            Ok(_) => {
+                stale += 1;
+                continue;
+            }
+            Err(error) if is_stale_watch_authority(&error) => {
+                stale += 1;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let Some(card) = current_card(
+            db,
+            &caller.scope_id,
+            "contract",
+            &index.identity,
+            &index.client_id,
+        )?
+        else {
+            stale += 1;
+            continue;
+        };
+        if card["identity"] != contract_key
+            || index.identity != contract_key
+            || card["client_id"] != index.client_id
+            || card["task_id"] != caller.task["task_id"]
+            || card["task_revision"] != caller.task["revision"]
+            || card["attempt_id"] != caller.attempt["attempt_id"]
+            || card["card_kind"] != "contract"
+        {
+            stale += 1;
+            continue;
+        }
+        if items.len() == limit as usize {
+            overflow = true;
+            break;
+        }
+        items.push(json!({"client_id":index.client_id,"participation_basis":member.registration["participation_basis"],"card":card}));
+    }
+    let incomplete = more || overflow || stale > 0;
+    Ok(json!({
+        "scope_id":caller.scope_id,
+        "task_id":caller.task["task_id"],"task_revision":caller.task["revision"],"attempt_id":caller.attempt["attempt_id"],
+        "items":items,"coverage":if incomplete { "partial" } else { "complete" },
+        "gaps":if incomplete { json!([{"kind":"bounded_or_stale_contract_relevance","stale_entries":stale,"more":more || overflow}]) } else { json!([]) },
+    }))
+}
+
+/// Authorization only for a retained watch subject. Unlike context access,
+/// the subject may have transitioned; this returns no historical payload.
+pub(crate) fn watch_creator_authorized_for_subject(
+    db: &Connection,
+    creator_role: &str,
+    creator_id: &str,
+    task_id: &str,
+    task_revision: i64,
+    attempt_id: &str,
+) -> Result<bool> {
+    let Some(registration) = meta(db, &format!("client:{creator_id}"))? else {
+        return Ok(false);
+    };
+    if registration["disabled"] == true || registration["role"] != creator_role {
+        return Ok(false);
+    }
+    let attempt = match tasks::get_attempt(db, attempt_id) {
+        Ok(attempt) => attempt,
+        Err(error) if error.code == "NOT_FOUND" => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if attempt["task_id"] != task_id || attempt["task_revision"] != task_revision {
+        return Ok(false);
+    }
+    match creator_role {
+        "operator" => match super::require_local_operator(db, creator_id) {
+            Ok(()) => Ok(true),
+            Err(error) if error.code == "LOCAL_OPERATOR_MISMATCH" => Ok(false),
+            Err(error) => Err(error),
+        },
+        "manager" => Ok(attempt["owner_id"] == creator_id
+            || gm::record(db)?.is_some_and(|record| record["client_id"] == creator_id)),
+        "participant" => {
+            if registration["task_id"] != task_id
+                || registration["task_revision"] != task_revision
+                || registration["attempt_id"] != attempt_id
+                || registration.get("binding_id").unwrap_or(&Value::Null)
+                    != attempt.get("binding_id").unwrap_or(&Value::Null)
+                || registration
+                    .get("binding_generation")
+                    .unwrap_or(&Value::Null)
+                    != attempt.get("binding_generation").unwrap_or(&Value::Null)
+            {
+                return Ok(false);
+            }
+            let basis = &registration["participation_basis"];
+            match basis["kind"].as_str() {
+                Some("attempt_owner") => Ok(registration["created_by"] == attempt["owner_id"]),
+                Some("producer_ref") => {
+                    let Some(assignment) = basis["assignment_id"].as_str() else {
+                        return Ok(false);
+                    };
+                    let Some(producer) = matching_producer(&attempt, assignment) else {
+                        return Ok(false);
+                    };
+                    if matches!(
+                        producer["disposition"].as_str(),
+                        Some("completed" | "failed" | "cancelled")
+                    ) {
+                        return Ok(false);
+                    }
+                    Ok(registration["native_session_id"].is_null()
+                        || registration["native_session_id"] == producer["native_session_id"])
+                }
+                Some("sponsored_reviewer") => {
+                    let scope = &basis["review_scope"];
+                    if scope["task_id"] != task_id
+                        || scope["task_revision"] != task_revision
+                        || scope["attempt_id"] != attempt_id
+                        || scope["submission_ref"] != attempt["submission_ref"]
+                        || scope["candidate_ref"] != attempt["candidate_ref"]
+                    {
+                        return Ok(false);
+                    }
+                    match verify_review_assignment(db, creator_id, &registration, scope) {
+                        Ok(()) => Ok(true),
+                        Err(error) if is_stale_watch_authority(&error) => Ok(false),
+                        Err(error) => Err(error),
+                    }
+                }
+                _ => Ok(false),
+            }
+        }
+        _ => Ok(false),
+    }
 }
 
 /// Resolve the exact scope used by participant coordination and watch methods.
@@ -238,6 +402,7 @@ fn is_stale_watch_authority(error: &Error) -> bool {
             | "STALE_PARTICIPANT"
             | "STALE_REVISION"
             | "PARTICIPANT_NOT_ASSIGNED"
+            | "STALE_REVIEW_ASSIGNMENT"
     )
 }
 
@@ -1527,6 +1692,15 @@ fn verify_review_assignment(
             "review assignment observation does not match the participant and exact slot",
         ));
     }
+    let identity: crate::review::ReviewSlotIdentity =
+        serde_json::from_value(observation["identity"].clone())?;
+    let current_slot = meta(db, &format!("review:slot:{}", identity.digest()?))?;
+    if !current_slot.is_some_and(|slot| slot["review_assignment_id"] == assignment_id) {
+        return Err(Error::new(
+            "STALE_REVIEW_ASSIGNMENT",
+            "reviewer assignment has been replaced for this exact slot",
+        ));
+    }
     let row: Option<(String, String, String)> = db
         .query_row(
             "SELECT method,state,result_json FROM operations WHERE operation_id=?1",
@@ -2647,9 +2821,27 @@ fn peer_find(db: &Connection, principal: &Principal, value: &Value) -> Result<Va
 fn inbox(db: &Connection, principal: &Principal, value: &Value) -> Result<Value> {
     principal.require_participant()?;
     model::fields(value, &["limit", "after_operation_id"])?;
-    let scope = load_current_scope(db, principal)?;
     let limit = keys::parse_page(value.get("limit"), 20)?;
     let after = keys::optional_cursor(value, "after_operation_id")?;
+    let scope = match load_current_scope(db, principal) {
+        Ok(scope) => scope,
+        Err(error) if is_stale_watch_authority(&error) => {
+            // Only enabled authenticated creators can retrieve their own
+            // compact watch notices after a subject transition. No retained
+            // mail or context is read by this fallback.
+            let current = super::current_principal(db, principal.clone())?;
+            current.require_participant()?;
+            let watch_notifications =
+                super::coordination_watch::notifications(db, &current, limit)?;
+            return Ok(
+                json!({"items":[],"task_id":null,"task_revision":null,"attempt_id":null,
+                "inbound_policy":null,"availability":"current_scope_unavailable","next_after":null,
+                "watch_notifications":watch_notifications,"coverage":"partial",
+                "gaps":[{"kind":"current_scope_unavailable","code":error.code}]}),
+            );
+        }
+        Err(error) => return Err(error),
+    };
     let watch_notifications = super::coordination_watch::notifications(db, principal, 20)?;
     if scope.registration["inbound_policy"] == "hold" {
         return Ok(json!({

@@ -192,6 +192,7 @@ impl Principal {
 /// branch. They must never be admitted by `require_writer()`.
 pub const PARTICIPANT_READ_METHODS: &[&str] = &[
     "swarm.context.get",
+    "swarm.overlap.check",
     "coordination.peer.find",
     "coordination.work_card.get",
     "coordination.work_card.list",
@@ -209,6 +210,7 @@ pub const PARTICIPANT_MUTATION_METHODS: &[&str] = &[
     "coordination.contract_card.withdraw",
     "coordination.send",
     "coordination.consult",
+    "coordination.sync_integration",
     "coordination.watch.create",
     "coordination.watch.cancel",
 ];
@@ -523,6 +525,14 @@ pub fn response(id: Value, result: Result<Value>) -> Value {
 /// particular, an accidental client.hello/token must never become a receipt.
 pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
     let allowed: &[&str] = match method {
+        "swarm.launch" => {
+            crate::launcher::LaunchRequest::parse(params)?;
+            return Ok(());
+        }
+        "coordination.sync_integration" => {
+            crate::coordination::integration::SyncRequest::parse(params)?;
+            return Ok(());
+        }
         "coordination.watch.create" | "coordination.watch.cancel" => {
             crate::coordination::watch::validate_mutation(method, params)?;
             return Ok(());

@@ -23,3 +23,4 @@ pub mod runtime;
 pub mod scheduler;
 pub mod store;
 pub mod submission;
+pub mod workspace;

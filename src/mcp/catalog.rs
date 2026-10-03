@@ -978,6 +978,28 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
         "Read-only validation and retained preview row; it does not start an agent, native session, or model turn."
     ),
     entry!(
+        "swarm.launch",
+        ManagerCore,
+        MANAGER_AUDIENCES,
+        Core,
+        "Submit one revision-checked, digest-bound launch intent after reviewing its preview.",
+        "Use only after swarm.launch.preview for the same exact request and plan digest; the host verifies a registered workspace lease before claiming an Attempt and opening its native binding.",
+        &[
+            "launch",
+            "admit",
+            "plan digest",
+            "workspace",
+            "agent profile",
+            "operation"
+        ],
+        &[
+            "all required swarm.launch.preview fields",
+            "plan_digest",
+            "caller-owned client_request_id"
+        ],
+        "Durable phased launch Operation with exact workspace and binding progress; productive dispatch waits for scoped credentials and verified native MCP capability."
+    ),
+    entry!(
         "coordination.participant.get",
         AssignmentRead,
         MANAGER_AUDIENCES,
@@ -1030,6 +1052,30 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
         ],
         &["one exact relationship selector; manager also supplies exact scope tuple"],
         "Bounded selector-index page with stale and coverage gaps."
+    ),
+    entry!(
+        "swarm.overlap.check",
+        ParticipantCoordination,
+        COORDINATION_READ_AUDIENCES,
+        Core,
+        "Compare bounded current controller ownership and integration facts for possible overlap.",
+        "Use with exact path, symbol, contract, or candidate selectors to identify recorded scope conflicts; missing Git, worktree, baseline, or capability evidence remains unknown.",
+        &[
+            "overlap",
+            "ownership",
+            "scope",
+            "path",
+            "symbol",
+            "contract",
+            "candidate",
+            "conflict"
+        ],
+        &[
+            "at least one selector or candidate_ref",
+            "at most 24 combined paths/symbols/contracts",
+            "authenticated Participant scope or exact Manager/Operator Task/Attempt scope"
+        ],
+        "Bounded retained-fact comparison only; Git evidence and absent coverage are reported as unknown, and no subprocess is started."
     ),
     entry!(
         "coordination.consult",
@@ -1361,23 +1407,49 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
         "One durable addressed delivery; no method passthrough or native effect."
     ),
     entry!(
+        "coordination.sync_integration",
+        ParticipantCoordination,
+        PARTICIPANT_ONLY_AUDIENCES,
+        Core,
+        "Publish one structured integration offer or requirement linked to the caller's current contract card.",
+        "Use after publishing the exact current contract card to record producer readiness/availability or consumer dimensions needed for comparison.",
+        &[
+            "integration",
+            "sync",
+            "compatibility",
+            "offer",
+            "requirement",
+            "readiness",
+            "dimensions",
+            "contract"
+        ],
+        &[
+            "contract_key",
+            "exactly one non-null offer or requirement",
+            "authenticated current Participant scope"
+        ],
+        "One durable advisory integration cell; identity and scope are Store-derived and the result never accepts work or wakes a model."
+    ),
+    entry!(
         "coordination.watch.create",
         ParticipantCoordination,
         WATCH_AUDIENCES,
         Core,
-        "Create one exact-scope one-shot watch for an operation terminal transition.",
-        "Use when an explicit caller-owned request needs a bounded mailbox-header notification for one known operation; Participant scope is derived and managers supply the exact Task/Attempt tuple.",
+        "Create one exact-scope one-shot watch over a supported retained Operation, card, Task, Attempt, or consult-deadline fact.",
+        "Use when an explicit caller-owned request needs a bounded mailbox-header notification for one exact subject and expected revision/state/deadline; Participant scope is derived and managers supply the exact Task/Attempt tuple.",
         &[
             "watch",
             "create",
             "operation",
-            "terminal",
+            "contract revision",
+            "task revision",
+            "attempt disposition",
+            "consult deadline",
             "one-shot",
             "mailbox notification"
         ],
         &[
-            "watch_kind=operation_terminal",
-            "address.operation_id",
+            "one supported watch_kind and its exact address schema",
             "expires_at_ms",
             "delivery=mailbox_header",
             "one_shot=true",
@@ -1533,23 +1605,26 @@ const MANAGER_CORE: &[&str] = &[
     "swarm.agent.inspect",
     "swarm.exceptions.get",
     "swarm.launch.preview",
+    "swarm.launch",
     "operation.get",
 ];
 const PARTICIPANT_CORE: &[&str] = &[
     "swarm.context.get",
     "swarm.tools.search",
     "coordination.consult",
+    "coordination.sync_integration",
     "coordination.send",
     "coordination.inbox",
     "coordination.watch.create",
+    "swarm.overlap.check",
     "operation.get",
 ];
 const NO_FULL_COMPATIBILITY_CORE: &[&str] = &[];
-const PARTICIPANT_GAPS: &[&str] = &["coordination.sync_integration", "swarm.overlap.check"];
+const PARTICIPANT_GAPS: &[&str] = &[];
 const OBSERVER_GAPS: &[&str] = &[];
 const REVIEWER_GAPS: &[&str] = &[];
 const ASSIGNED_REVIEWER_GAPS: &[&str] = &[];
-const MANAGER_GAPS: &[&str] = &["swarm.launch", "swarm.agent.steer"];
+const MANAGER_GAPS: &[&str] = &["swarm.agent.steer"];
 const FULL_GAPS: &[&str] = &[];
 
 pub const fn role_core(role: CoreRole) -> RoleCore {

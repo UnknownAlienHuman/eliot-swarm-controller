@@ -19,6 +19,7 @@ pub struct Config {
     pub mcp: McpConfig,
     pub gateway: GatewayConfig,
     pub forge: crate::forge::ForgeConfig,
+    pub workspace: crate::workspace::WorkspaceConfig,
     pub schedules: Vec<crate::scheduler::ScheduleConfig>,
 }
 
@@ -130,6 +131,7 @@ impl Default for Config {
             mcp: McpConfig::default(),
             gateway: GatewayConfig::default(),
             forge: crate::forge::ForgeConfig::default(),
+            workspace: crate::workspace::WorkspaceConfig::default(),
             schedules: Vec::new(),
         }
     }
@@ -391,6 +393,8 @@ impl Config {
         cfg.gateway.validate(&cfg.mcp, &cfg.ipc)?;
         cfg.forge.resolve_paths(&config_dir)?;
         cfg.forge.validate()?;
+        cfg.workspace.resolve_paths(&config_dir)?;
+        cfg.workspace.validate(&cfg.forge)?;
         crate::scheduler::validate_schedules(&cfg.schedules)?;
         let mut aliases = std::collections::BTreeSet::new();
         for r in &cfg.routes {

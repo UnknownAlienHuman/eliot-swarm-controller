@@ -3,3 +3,4 @@
 pub(crate) mod actions;
 pub(crate) mod authorization;
 pub(crate) mod config;
+pub(crate) mod intake;

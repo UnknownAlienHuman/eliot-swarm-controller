@@ -1,6 +1,6 @@
-//! Bounded manager-side views over the existing Task, Attempt, Binding,
-//! Operation, capacity and attention authorities. This module is read-only:
-//! it does not create launch records, call a runtime, or inspect Git.
+//! Bounded manager-side views over Task, Attempt, Binding, Operation,
+//! capacity and attention authorities, plus digest-bound launch admission.
+//! Workspace and runtime effects remain outside Store transactions.
 
 use super::{acceptance, capacity, meta, projection, tasks::task_sources};
 use crate::{
@@ -9,7 +9,7 @@ use crate::{
     launcher::{self, PageRequest},
     model::{self, Dependency, Principal, Role, TaskSpec},
 };
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Map, Value, json};
 use std::path::Path;
 
@@ -726,6 +726,7 @@ fn task_queue_item(db: &Connection, row: &TaskRow, brief_limit: usize) -> Result
             "task_revision":attempt.task_revision,
             "state":attempt.state,
             "owner":owner_profile(db,&attempt.owner_id)?,
+            "created_at_ms":attempt.created_at_ms,
             "start_owner":attempt.start_owner,
             "start_operation_id":attempt.start_operation_id,
             "binding": match (&attempt.binding_id,attempt.binding_generation) {
@@ -932,44 +933,54 @@ fn authorize_launch_project(
     Ok(())
 }
 
-fn launch_operation_projection(db: &Connection, task_id: &str) -> Result<Value> {
+fn launch_operation_projection(
+    db: &Connection,
+    task_id: &str,
+    exclude_operation_id: Option<&str>,
+) -> Result<Value> {
     let total: i64 = db.query_row(
-        "SELECT count(*) FROM operations WHERE task_id=?1 AND method='swarm.launch'",
-        [task_id],
+        "SELECT count(*) FROM operations WHERE task_id=?1 AND method='swarm.launch'
+         AND (?2 IS NULL OR operation_id<>?2)",
+        params![task_id, exclude_operation_id],
         |row| row.get(0),
     )?;
     let unresolved: i64 = db.query_row(
         "SELECT count(*) FROM operations WHERE task_id=?1 AND method='swarm.launch'
-         AND state IN ('queued','sending','native_accepted','outcome_unknown')",
-        [task_id],
+         AND state IN ('queued','sending','native_accepted','outcome_unknown')
+         AND (?2 IS NULL OR operation_id<>?2)",
+        params![task_id, exclude_operation_id],
         |row| row.get(0),
     )?;
     let unknown: i64 = db.query_row(
         "SELECT count(*) FROM operations WHERE task_id=?1 AND method='swarm.launch'
-         AND state='outcome_unknown'",
-        [task_id],
+         AND state='outcome_unknown' AND (?2 IS NULL OR operation_id<>?2)",
+        params![task_id, exclude_operation_id],
         |row| row.get(0),
     )?;
     let mut statement = db.prepare(
         "SELECT operation_id,state,attempt_id,created_at_ms,updated_at_ms FROM operations
          WHERE task_id=?1 AND method='swarm.launch'
-         ORDER BY created_at_ms DESC,operation_id DESC LIMIT ?2",
+         AND (?2 IS NULL OR operation_id<>?2)
+         ORDER BY created_at_ms DESC,operation_id DESC LIMIT ?3",
     )?;
     let items = statement
-        .query_map(params![task_id, MAX_LAUNCH_OPERATION_ROWS], |row| {
-            let operation_id: String = row.get(0)?;
-            let state: String = row.get(1)?;
-            let attempt_id: Option<String> = row.get(2)?;
-            let created_at_ms: i64 = row.get(3)?;
-            let updated_at_ms: i64 = row.get(4)?;
-            Ok(json!({
-                "operation_id":operation_id,
-                "state":state,
-                "attempt_id":attempt_id,
-                "created_at_ms":created_at_ms,
-                "updated_at_ms":updated_at_ms,
-            }))
-        })?
+        .query_map(
+            params![task_id, exclude_operation_id, MAX_LAUNCH_OPERATION_ROWS],
+            |row| {
+                let operation_id: String = row.get(0)?;
+                let state: String = row.get(1)?;
+                let attempt_id: Option<String> = row.get(2)?;
+                let created_at_ms: i64 = row.get(3)?;
+                let updated_at_ms: i64 = row.get(4)?;
+                Ok(json!({
+                    "operation_id":operation_id,
+                    "state":state,
+                    "attempt_id":attempt_id,
+                    "created_at_ms":created_at_ms,
+                    "updated_at_ms":updated_at_ms,
+                }))
+            },
+        )?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(json!({
         "items":items,
@@ -1204,6 +1215,1407 @@ fn launch_workspace_projection(request: &launcher::LaunchPreviewRequest) -> Valu
     })
 }
 
+/// Resolve an optional Task baseline artifact to the exact Git commit it
+/// records. An artifact reference alone is not a Git object ID: only a
+/// complete source snapshot with verified same-project acceptance is a pin.
+fn workspace_baseline_projection(
+    db: &Connection,
+    row: &TaskRow,
+    spec: Option<&TaskSpec>,
+) -> Result<Value> {
+    let Some(candidate_ref) = spec.and_then(|spec| spec.baseline_candidate_ref.as_deref()) else {
+        return Ok(json!({
+            "status":"not_configured",
+            "candidate_ref":Value::Null,
+            "commit":Value::Null,
+        }));
+    };
+    let frozen =
+        super::acceptance::freeze_baseline_candidate(db, &row.project_id, Some(candidate_ref))?;
+    if frozen["status"] != "verified" {
+        return Ok(json!({
+            "status":"unverifiable",
+            "candidate_ref":candidate_ref,
+            "reason":frozen["reason"],
+            "commit":Value::Null,
+        }));
+    }
+    let artifact = match super::results::get(db, candidate_ref) {
+        Ok(artifact) => artifact,
+        Err(error) if error.code == "NOT_FOUND" => {
+            return Ok(json!({
+                "status":"unverifiable",
+                "candidate_ref":candidate_ref,
+                "reason":"baseline_source_snapshot_not_registered",
+                "commit":Value::Null,
+            }));
+        }
+        Err(error) => return Err(error),
+    };
+    let commit = artifact.metadata["commit"].as_str();
+    if artifact.kind != "source_snapshot"
+        || artifact.metadata["coverage"] != "complete"
+        || artifact.metadata["task_id"] != frozen["task_id"]
+        || artifact.metadata["attempt_id"] != frozen["attempt_id"]
+        || artifact.metadata["task_revision"] != frozen["task_revision"]
+        || commit.is_none_or(|commit| !crate::forge::valid_object_id(commit))
+    {
+        return Ok(json!({
+            "status":"unverifiable",
+            "candidate_ref":candidate_ref,
+            "reason":"baseline_source_snapshot_has_no_verified_full_git_commit",
+            "commit":Value::Null,
+        }));
+    }
+    Ok(json!({
+        "status":"verified_source_snapshot_commit",
+        "candidate_ref":candidate_ref,
+        "commit":commit,
+        "artifact_digest":artifact.content_digest,
+        "acceptance_task_id":frozen["task_id"],
+        "acceptance_attempt_id":frozen["attempt_id"],
+        "acceptance_task_revision":frozen["task_revision"],
+    }))
+}
+
+fn normalized_scope_path(path: &str) -> String {
+    path.replace('\\', "/").trim_end_matches('/').to_lowercase()
+}
+
+fn scope_paths_overlap(left: &str, right: &str) -> bool {
+    let left = normalized_scope_path(left);
+    let right = normalized_scope_path(right);
+    left == right
+        || left
+            .strip_prefix(&right)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+        || right
+            .strip_prefix(&left)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn validate_workspace_scope_path(path: &str) -> bool {
+    !path.trim().is_empty()
+        && path.len() <= MAX_SCOPE_PATH_BYTES
+        && !path_is_absolute(path)
+        && !path.contains(['\\', ':', '\0'])
+        && !path.chars().any(char::is_control)
+        && !path.split('/').any(|part| {
+            part.is_empty()
+                || part == "."
+                || part == ".."
+                || part.eq_ignore_ascii_case(".git")
+                || part.ends_with(['.', ' '])
+        })
+}
+
+/// Admit one digest-bound launch intent. This transaction re-runs the exact
+/// preview before recording a manifest. It does not claim an Attempt, open a
+/// binding, dispatch work, or assert that an external effect occurred. The
+/// Host prepares a verified workspace lease before advancing this intent.
+pub(super) fn launch(
+    tx: &Transaction<'_>,
+    p: &Principal,
+    params_value: &Value,
+    config: &Config,
+    operation_id: &str,
+    now: i64,
+) -> Result<(Value, bool)> {
+    let request = launcher::LaunchRequest::parse(params_value)?;
+    require_manager(tx, p)?;
+    let preview_params = request.preview_params();
+    let preview = launch_preview_for_operation(tx, p, &preview_params, config, operation_id)?;
+    if preview["plan_digest"] != request.plan_digest {
+        return Err(Error::new(
+            "STALE_LAUNCH_PLAN",
+            "launch preview changed; obtain a fresh digest-bound preview",
+        ));
+    }
+
+    let blockers = preview["hard_blocks"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let blocked = !blockers.is_empty() || preview["attempt_action"] == "forbidden";
+    let task_id = model::text(&preview["task"], "task_id")?;
+    let task_revision = model::positive(&preview["task"], "revision")?;
+    let attempt_id = preview["current_attempt"]["attempt_id"]
+        .as_str()
+        .map(str::to_owned);
+    let launch_state = if blocked {
+        "blocked"
+    } else {
+        "pending_workspace"
+    };
+    let manifest = json!({
+        "manifest_version":"eliot-launch-manifest-v1",
+        "state":launch_state,
+        "created_at_ms":now,
+        "actor":{
+            "client_id":p.client_id,
+            "role":p.role,
+            "link_id":p.link_id,
+        },
+        "client_request_id":request.client_request_id,
+        "plan_digest":request.plan_digest,
+        "request":preview_params,
+        "task":{
+            "task_id":task_id,
+            "project_id":preview["task"]["project_id"],
+            "expected_revision":request.preview.expected_task_revision,
+            "observed_revision":task_revision,
+            "attempt_action":preview["attempt_action"],
+            "attempt_id":attempt_id,
+            "candidate_scope":preview["candidate_scope"],
+        },
+        "workspace":{
+            "policy":request.preview.workspace_policy,
+            "lease_state":if blocked {"not_started"} else {"pending"},
+            "dirty_state":"unknown_until_verified_lease",
+            "filesystem_inspected":false,
+        },
+        "runtime":{
+            "route":preview["route"],
+            "agent_profile":request.preview.agent_profile,
+            "requested_model":request.preview.requested_model,
+            "requested_effort":request.preview.requested_effort,
+            "budget":request.preview.budget,
+            "stop_conditions":request.preview.stop_conditions,
+            "purpose":request.preview.purpose,
+            "state":"not_started",
+            "native_effect":"not_attempted",
+        },
+        "mcp":preview["mcp"],
+        "preflight":{
+            "digest_revalidated":true,
+            "hard_blocks":blockers,
+            "coverage":preview["coverage"],
+            "gaps":preview["gaps"],
+        },
+        "progress":{
+            "workspace_lease":if blocked {"not_started"} else {"pending"},
+            "attempt_claim":"not_started",
+            "binding_open":"not_started",
+            "task_dispatch":"not_started",
+            "capability_readback":"not_started",
+        },
+        "effects":"none_until_verified_workspace_lease",
+    });
+    let effective = json!({
+        "operation_contract":{
+            "effect_scope":"one_exact_launch_plan",
+            "completion_condition":"workspace_binding_dispatch_and_capability_readback",
+            "replay_policy":"same_request_id_returns_retained_launch_receipt; unknown_effects_require_readback",
+            "contract_revision":"swarm-launch-v1",
+        },
+        "launch_manifest":manifest,
+    });
+    let original_request = model::canonical(params_value)?;
+    let changed = tx.execute(
+        "UPDATE operations SET task_id=?2,attempt_id=?3,effective_request_json=?4
+         WHERE operation_id=?1 AND caller_id=?5 AND client_request_id=?6
+           AND method='swarm.launch' AND state='queued' AND original_request_json=?7",
+        params![
+            operation_id,
+            task_id,
+            attempt_id,
+            model::canonical(&effective)?,
+            p.client_id,
+            request.client_request_id,
+            original_request,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(Error::conflict(
+            "launch Operation changed before its manifest could be committed",
+        ));
+    }
+
+    if blocked {
+        return Ok((
+            json!({
+                "operation_id":operation_id,
+                "launch_state":"blocked",
+                "state":"blocked",
+                "plan_digest":request.plan_digest,
+                "task_id":task_id,
+                "task_revision":task_revision,
+                "attempt_id":attempt_id,
+                "native_effect":"not_attempted",
+                "hard_blocks":blockers,
+                "gaps":preview["gaps"],
+            }),
+            false,
+        ));
+    }
+
+    Ok((
+        json!({
+            "operation_id":operation_id,
+            "launch_state":"pending_workspace",
+            "state":"queued",
+            "plan_digest":request.plan_digest,
+            "task_id":task_id,
+            "task_revision":task_revision,
+            "attempt_action":preview["attempt_action"],
+            "attempt_id":attempt_id,
+            "workspace_lease":"pending",
+            "attempt_claim":"not_started",
+            "binding_open":"not_started",
+            "task_dispatch":"not_started",
+            "native_effect":"not_attempted",
+            "capability_state":"unknown",
+            "next_phase":"prepare_and_verify_registered_workspace_lease",
+            "gaps":preview["gaps"],
+        }),
+        true,
+    ))
+}
+
+fn retained_launch_manifest(db: &Connection, operation_id: &str) -> Result<Value> {
+    let raw: String = db.query_row(
+        "SELECT effective_request_json FROM operations WHERE operation_id=?1 AND method='swarm.launch'",
+        [operation_id],
+        |row| row.get(0),
+    )?;
+    let effective: Value = serde_json::from_str(&raw)?;
+    effective
+        .get("launch_manifest")
+        .cloned()
+        .ok_or_else(|| Error::new("INVALID_LAUNCH_MANIFEST", "launch manifest is missing"))
+}
+
+struct LaunchBindingIdentity<'a> {
+    id: &'a str,
+    generation: i64,
+}
+
+struct LaunchProgress<'a> {
+    manifest: Value,
+    result: &'a Value,
+    operation_state: &'a str,
+    attempt_id: Option<&'a str>,
+    binding: Option<LaunchBindingIdentity<'a>>,
+    now: i64,
+}
+
+fn persist_launch_progress(
+    tx: &Transaction<'_>,
+    operation_id: &str,
+    mut progress: LaunchProgress<'_>,
+) -> Result<()> {
+    let raw: String = tx.query_row(
+        "SELECT effective_request_json FROM operations WHERE operation_id=?1 AND method='swarm.launch'",
+        [operation_id],
+        |row| row.get(0),
+    )?;
+    let mut effective: Value = serde_json::from_str(&raw)?;
+    progress.manifest["state"] = json!(progress.result["launch_state"]);
+    effective["launch_manifest"] = progress.manifest;
+    effective["receipt"] = json!({"ok":true,"value":progress.result});
+    let task_id = effective["launch_manifest"]["task"]["task_id"]
+        .as_str()
+        .ok_or_else(|| Error::new("INVALID_LAUNCH_MANIFEST", "launch Task identity is missing"))?;
+    let settled_at = matches!(
+        progress.operation_state,
+        "settled" | "rejected" | "cancelled"
+    )
+    .then_some(progress.now);
+    let changed = tx.execute(
+        "UPDATE operations SET task_id=?2,attempt_id=COALESCE(?3,attempt_id),\
+         binding_id=COALESCE(?4,binding_id),binding_generation=COALESCE(?5,binding_generation),\
+         state=?6,result_json=?7,effective_request_json=?8,settled_at_ms=?9,updated_at_ms=?10\
+         WHERE operation_id=?1 AND method='swarm.launch' AND state IN ('queued','outcome_unknown')",
+        params![
+            operation_id,
+            task_id,
+            progress.attempt_id,
+            progress.binding.as_ref().map(|binding| binding.id),
+            progress.binding.as_ref().map(|binding| binding.generation),
+            progress.operation_state,
+            model::canonical(progress.result)?,
+            model::canonical(&effective)?,
+            settled_at,
+            progress.now,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(Error::conflict(
+            "launch Operation changed before progress could be retained",
+        ));
+    }
+    let digest = model::digest(model::canonical(progress.result)?.as_bytes());
+    tx.execute(
+        "INSERT OR IGNORE INTO observations(source_stream_id,source_event_key,operation_id,kind,payload_json,recorded_at_ms)\
+         VALUES('controller',?1,?2,'swarm.launch.progress',?3,?4)",
+        params![
+            format!("launch-progress:{operation_id}:{digest}"),
+            operation_id,
+            model::canonical(progress.result)?,
+            progress.now,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Reconstruct the exact admitted manager/operator identity only while its
+/// registered role remains enabled and the same authority still applies.
+pub(super) fn launch_actor(db: &Connection, operation_id: &str) -> Result<Principal> {
+    let operation = super::operations::get_operation(db, operation_id)?;
+    if operation["method"] != "swarm.launch" {
+        return Err(Error::new("FORBIDDEN", "Operation is not a launch"));
+    }
+    let manifest = retained_launch_manifest(db, operation_id)?;
+    let client_id = model::text(&manifest["actor"], "client_id")?.to_owned();
+    if operation["caller_id"] != client_id {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "launch actor does not match its admitted Operation caller",
+        ));
+    }
+    let admitted_role = model::text(&manifest["actor"], "role")?;
+    let link_id = model::text(&manifest["actor"], "link_id")?.to_owned();
+    let profile = meta(db, &format!("client:{client_id}"))?
+        .ok_or_else(|| Error::new("FORBIDDEN", "admitted launch actor is no longer registered"))?;
+    if profile["disabled"] == true || profile["role"] != admitted_role {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "admitted launch actor registration is disabled or changed role",
+        ));
+    }
+    let role = match admitted_role {
+        "operator" => Role::Operator,
+        "manager" => Role::Manager,
+        _ => {
+            return Err(Error::new(
+                "FORBIDDEN",
+                "launch actor role is not authorized",
+            ));
+        }
+    };
+    let principal = Principal {
+        link_id,
+        client_id,
+        role,
+    };
+    require_manager(db, &principal)?;
+    let task_id = model::text(&manifest["task"], "task_id")?;
+    let task = super::tasks::get_task(db, task_id)?;
+    let attempt = task["current_attempt_id"]
+        .as_str()
+        .map(|attempt_id| get_attempt_row(db, attempt_id))
+        .transpose()?
+        .flatten();
+    authorize_launch_project(db, &principal, attempt.as_ref())?;
+    Ok(principal)
+}
+
+/// Bounded host selector. Unknown launches are selected for readback only;
+/// callers must inspect the retained manifest phase before acting.
+pub(super) fn pending_launches(db: &Connection, limit: i64) -> Result<Vec<String>> {
+    if !(1..=16).contains(&limit) {
+        return Err(Error::invalid(
+            "pending launch limit must be from 1 through 16",
+        ));
+    }
+    let mut statement = db.prepare(
+        "SELECT operation_id FROM operations\
+         WHERE method='swarm.launch' AND state IN ('queued','outcome_unknown')\
+           AND json_extract(effective_request_json,'$.launch_manifest.state')\
+             IN ('pending_workspace','awaiting_binding','awaiting_capability',\
+                 'awaiting_participant_credential','outcome_unknown')\
+         ORDER BY updated_at_ms,operation_id LIMIT ?1",
+    )?;
+    statement
+        .query_map([limit], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Turn a Host-side workspace failure into a stable launch receipt. The
+/// caller supplies a small code from this allow-list, never raw process or
+/// filesystem diagnostics. Unknown effects remain unknown and are not retried.
+pub(super) fn fail_launch(
+    tx: &Transaction<'_>,
+    operation_id: &str,
+    safe_code: &str,
+    now: i64,
+) -> Result<Value> {
+    let (launch_state, operation_state, native_effect) = match safe_code {
+        "workspace_stale_before_effect" => ("stale", "settled", "not_attempted"),
+        "workspace_admission_rejected" => ("blocked", "settled", "not_attempted"),
+        "workspace_effect_unknown" | "binding_effect_unknown" => {
+            ("outcome_unknown", "outcome_unknown", "unknown")
+        }
+        _ => return Err(Error::invalid("unsupported safe launch failure code")),
+    };
+    let operation = super::operations::get_operation(tx, operation_id)?;
+    if operation["method"] != "swarm.launch" {
+        return Err(Error::new("FORBIDDEN", "Operation is not a launch"));
+    }
+    let mut manifest = retained_launch_manifest(tx, operation_id)?;
+    if operation["state"] == operation_state
+        && manifest["state"] == launch_state
+        && manifest["failure"]["code"] == safe_code
+        && operation["result"]["failure"]["code"] == safe_code
+    {
+        return Ok(operation["result"].clone());
+    }
+    if !matches!(
+        operation["state"].as_str(),
+        Some("queued" | "outcome_unknown")
+    ) {
+        return Ok(operation["result"].clone());
+    }
+    manifest["failure"] = json!({"code":safe_code});
+    manifest["state"] = json!(launch_state);
+    manifest["runtime"]["native_effect"] = json!(native_effect);
+    manifest["effects"] = json!(if native_effect == "unknown" {
+        "workspace_or_binding_effect_requires_exact_readback"
+    } else {
+        "no_runtime_effect_was_admitted"
+    });
+    manifest["progress"]["workspace_lease"] = json!(if launch_state == "outcome_unknown" {
+        "readback_required"
+    } else {
+        "stopped"
+    });
+    let task_id = manifest["task"]["task_id"].clone();
+    let attempt_id = manifest["task"]["attempt_id"].clone();
+    let result = json!({
+        "operation_id":operation_id,
+        "launch_state":launch_state,
+        "state":operation_state,
+        "plan_digest":manifest["plan_digest"],
+        "task_id":task_id,
+        "task_revision":manifest["task"]["observed_revision"],
+        "attempt_id":attempt_id,
+        "native_effect":native_effect,
+        "failure":{"code":safe_code},
+        "gaps":["launch_progress_requires_operator_readback_or_configuration_repair"],
+    });
+    persist_launch_progress(
+        tx,
+        operation_id,
+        LaunchProgress {
+            manifest,
+            result: &result,
+            operation_state,
+            attempt_id: result["attempt_id"].as_str(),
+            binding: None,
+            now,
+        },
+    )?;
+    Ok(result)
+}
+
+/// Revalidate the pending launch intent immediately before Host-side lease
+/// preparation and return only the exact Task scope bound by its digest.
+pub(super) fn launch_workspace_plan(
+    db: &Connection,
+    p: &Principal,
+    operation_id: &str,
+    config: &Config,
+) -> Result<crate::workspace::WorkspaceLeasePlan> {
+    launch_workspace_plan_inner(db, p, operation_id, config, false)
+}
+
+fn launch_workspace_plan_inner(
+    db: &Connection,
+    p: &Principal,
+    operation_id: &str,
+    config: &Config,
+    allow_exact_unknown_readback: bool,
+) -> Result<crate::workspace::WorkspaceLeasePlan> {
+    require_manager(db, p)?;
+    let operation = super::operations::get_operation(db, operation_id)?;
+    let pending = operation["state"] == "queued"
+        && operation["result"]["launch_state"] == "pending_workspace";
+    let unknown_readback = allow_exact_unknown_readback
+        && operation["state"] == "outcome_unknown"
+        && operation["result"]["launch_state"] == "outcome_unknown"
+        && retained_launch_manifest(db, operation_id)?["state"] == "outcome_unknown";
+    if operation["method"] != "swarm.launch"
+        || operation["caller_id"] != p.client_id
+        || !(pending || unknown_readback)
+    {
+        return Err(Error::new(
+            "STALE_LAUNCH",
+            "Operation is not a caller-owned launch awaiting workspace preparation or exact readback",
+        ));
+    }
+    let original_request: String = db.query_row(
+        "SELECT original_request_json FROM operations WHERE operation_id=?1",
+        [operation_id],
+        |row| row.get(0),
+    )?;
+    let original_request: Value = serde_json::from_str(&original_request)?;
+    let request = launcher::LaunchRequest::parse(&original_request)?;
+    let retained_request_id: String = db.query_row(
+        "SELECT client_request_id FROM operations WHERE operation_id=?1",
+        [operation_id],
+        |row| row.get(0),
+    )?;
+    if request.client_request_id != retained_request_id {
+        return Err(Error::new(
+            "STALE_LAUNCH",
+            "retained launch request identity changed",
+        ));
+    }
+    let preview =
+        launch_preview_for_operation(db, p, &request.preview_params(), config, operation_id)?;
+    if preview["plan_digest"] != request.plan_digest
+        || operation["task_id"] != preview["task"]["task_id"]
+        || operation["attempt_id"] != preview["current_attempt"]["attempt_id"]
+    {
+        return Err(Error::new(
+            "STALE_LAUNCH",
+            "Task, Attempt, or launch plan changed before workspace preparation",
+        ));
+    }
+
+    let task_id = model::text(&preview["task"], "task_id")?;
+    let row = query_task(db, task_id)?;
+    let spec: TaskSpec = serde_json::from_value(row.spec.clone())?;
+    spec.validate()?;
+    let allowed_paths = spec
+        .scope
+        .as_ref()
+        .map(|scope| scope.initial_paths.clone())
+        .unwrap_or_default();
+    let forbidden_paths = spec
+        .scope
+        .as_ref()
+        .map(|scope| scope.forbidden_paths.as_slice())
+        .unwrap_or_default();
+    if allowed_paths.is_empty()
+        || allowed_paths.len() > MAX_SCOPE_PATHS
+        || allowed_paths
+            .iter()
+            .any(|path| !validate_workspace_scope_path(path))
+    {
+        return Err(Error::new(
+            "WORKSPACE_SCOPE_REQUIRED",
+            "launch requires a bounded relative Task mutation scope",
+        ));
+    }
+    if forbidden_paths
+        .iter()
+        .any(|path| !validate_workspace_scope_path(path))
+    {
+        return Err(Error::new(
+            "WORKSPACE_SCOPE_INVALID",
+            "Task forbidden paths are not safe repository-relative paths",
+        ));
+    }
+    if allowed_paths.iter().any(|allowed| {
+        forbidden_paths
+            .iter()
+            .any(|forbidden| scope_paths_overlap(allowed, forbidden))
+    }) {
+        return Err(Error::new(
+            "WORKSPACE_SCOPE_CONFLICT",
+            "Task allowed mutation scope overlaps a forbidden path",
+        ));
+    }
+
+    let baseline = workspace_baseline_projection(db, &row, Some(&spec))?;
+    let expected_baseline_commit = match baseline["status"].as_str() {
+        Some("not_configured") => None,
+        Some("verified_source_snapshot_commit") => {
+            Some(model::text(&baseline, "commit")?.to_owned())
+        }
+        _ => {
+            return Err(Error::new(
+                "BASELINE_PROVENANCE_UNVERIFIED",
+                "Task baseline artifact is not a verified complete source snapshot with a full Git commit",
+            ));
+        }
+    };
+
+    let lease_owner = if let Some(attempt_id) = row.current_attempt_id.as_deref() {
+        get_attempt_row(db, attempt_id)?
+            .filter(|attempt| {
+                attempt.task_id == row.task_id
+                    && attempt.task_revision == row.revision
+                    && attempt.released_at_ms.is_none()
+            })
+            .map(|attempt| attempt.owner_id)
+            .ok_or_else(|| Error::new("STALE_LAUNCH", "current Attempt owner is unavailable"))?
+    } else {
+        p.client_id.clone()
+    };
+    let plan = crate::workspace::WorkspaceLeasePlan {
+        project_id: row.project_id,
+        task_id: row.task_id,
+        task_revision: row.revision,
+        operation_id: operation_id.to_owned(),
+        plan_digest: request.plan_digest,
+        owner_client_id: lease_owner,
+        attempt_id: preview["current_attempt"]["attempt_id"]
+            .as_str()
+            .map(str::to_owned),
+        allowed_paths,
+        allowed_symbols: Vec::new(),
+        expected_baseline_commit,
+    };
+    plan.validate()?;
+    Ok(plan)
+}
+
+fn launch_child_request_id(operation_id: &str, phase: &str) -> String {
+    format!("launch:{operation_id}:{phase}")
+}
+
+struct LaunchOpenOperationRow {
+    operation_id: String,
+    method: String,
+    original_request_json: String,
+    state: String,
+    result_json: Option<String>,
+    effective_request_json: String,
+    prerequisite_operation_id: Option<String>,
+}
+
+fn admit_launch_open(
+    tx: &Transaction<'_>,
+    p: &Principal,
+    parent_operation_id: &str,
+    params_value: &Value,
+    lease: &crate::workspace::LeaseAuthorityRef,
+    now: i64,
+) -> Result<(String, bool)> {
+    model::validate_mutation("agent.open", params_value)?;
+    let request_id = model::text(params_value, "client_request_id")?;
+    let original = model::canonical(params_value)?;
+    let existing: Option<LaunchOpenOperationRow> = tx
+        .query_row(
+            "SELECT operation_id,method,original_request_json,state,result_json,effective_request_json,\
+                    prerequisite_operation_id\
+             FROM operations WHERE caller_id=?1 AND client_request_id=?2",
+            params![p.client_id, request_id],
+            |row| {
+                Ok(LaunchOpenOperationRow {
+                    operation_id: row.get(0)?,
+                    method: row.get(1)?,
+                    original_request_json: row.get(2)?,
+                    state: row.get(3)?,
+                    result_json: row.get(4)?,
+                    effective_request_json: row.get(5)?,
+                    prerequisite_operation_id: row.get(6)?,
+                })
+            },
+        )
+        .optional()?;
+    if let Some(existing) = existing {
+        if existing.method != "agent.open"
+            || existing.original_request_json != original
+            || existing.prerequisite_operation_id.as_deref() != Some(parent_operation_id)
+        {
+            return Err(Error::new(
+                "REQUEST_ID_CONFLICT",
+                "launch child request ID is already bound to different input or parent",
+            ));
+        }
+        if existing.state == "outcome_unknown" {
+            return Err(Error::new(
+                "LAUNCH_OPEN_OUTCOME_UNKNOWN",
+                "existing launch binding open requires exact readback",
+            ));
+        }
+        let effective: Value = serde_json::from_str(&existing.effective_request_json)?;
+        if effective["operation_contract"]["parent_launch_operation_id"] != parent_operation_id
+            || effective["workspace_lease"]["lease_id"] != lease.lease_id
+            || effective["workspace_lease"]["generation"] != lease.generation
+            || effective["workspace_lease"]["binding_digest"] != lease.binding_digest
+        {
+            return Err(Error::new(
+                "LAUNCH_OPEN_LEASE_MISMATCH",
+                "existing launch child is not bound to the exact parent and held workspace lease",
+            ));
+        }
+        let Some(result_raw) = existing.result_json else {
+            return Err(Error::new(
+                "LAUNCH_OPEN_READBACK_REQUIRED",
+                "existing launch binding open has no retained receipt",
+            ));
+        };
+        let result: Value = serde_json::from_str(&result_raw)?;
+        model::text(&result, "binding_id")?;
+        model::positive(&result, "generation")?;
+        return Ok((existing.operation_id, false));
+    }
+    let child_id = model::new_id();
+    tx.execute(
+        "INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,\
+         effective_request_json,prerequisite_operation_id,state,due_at_ms,created_at_ms,updated_at_ms)\
+         VALUES(?1,?2,?3,'agent.open',?4,'{}',?5,'queued',?6,?6,?6)",
+        params![child_id, p.client_id, request_id, original, parent_operation_id, now],
+    )?;
+    Ok((child_id, true))
+}
+
+struct LaunchOpenReceipt<'a> {
+    parent_operation_id: &'a str,
+    task_id: &'a str,
+    attempt_id: &'a str,
+    lease: &'a crate::workspace::LeaseAuthorityRef,
+    result: &'a Value,
+    now: i64,
+}
+
+fn retain_launch_open(
+    tx: &Transaction<'_>,
+    operation_id: &str,
+    receipt: LaunchOpenReceipt<'_>,
+) -> Result<()> {
+    let raw: String = tx.query_row(
+        "SELECT effective_request_json FROM operations WHERE operation_id=?1 AND method='agent.open'",
+        [operation_id],
+        |row| row.get(0),
+    )?;
+    let mut effective: Value = serde_json::from_str(&raw)?;
+    effective["operation_contract"] = json!({
+        "effect_scope":"one_exact_launch_binding",
+        "completion_condition":"binding_ready_readback",
+        "replay_policy":"exact_binding_readback_only_after_unknown",
+        "parent_launch_operation_id":receipt.parent_operation_id,
+    });
+    effective["workspace_lease"] = json!({
+        "lease_id":receipt.lease.lease_id,
+        "generation":receipt.lease.generation,
+        "binding_digest":receipt.lease.binding_digest,
+    });
+    effective["receipt"] = json!({"ok":true,"value":receipt.result});
+    let changed = tx.execute(
+        "UPDATE operations SET task_id=?2,attempt_id=?3,result_json=?4,effective_request_json=?5,\
+         updated_at_ms=?6 WHERE operation_id=?1 AND prerequisite_operation_id=?7\
+         AND method='agent.open' AND state='queued'",
+        params![
+            operation_id,
+            receipt.task_id,
+            receipt.attempt_id,
+            model::canonical(receipt.result)?,
+            model::canonical(&effective)?,
+            receipt.now,
+            receipt.parent_operation_id,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(Error::conflict(
+            "launch agent.open child changed before receipt retention",
+        ));
+    }
+    super::capacity::sync_operation(tx, operation_id, receipt.now)?;
+    let digest = model::digest(model::canonical(receipt.result)?.as_bytes());
+    tx.execute(
+        "INSERT OR IGNORE INTO observations(source_stream_id,source_event_key,operation_id,kind,payload_json,recorded_at_ms)\
+         VALUES('controller',?1,?2,'agent.open',?3,?4)",
+        params![
+            format!("launch-open:{operation_id}:{digest}"),
+            operation_id,
+            model::canonical(receipt.result)?,
+            receipt.now,
+        ],
+    )?;
+    Ok(())
+}
+
+fn final_workspace_manifest_digest(
+    plan_digest: &str,
+    lease: &crate::workspace::LeaseAuthorityRef,
+    lease_view: &Value,
+) -> Result<String> {
+    let facts = json!({
+        "launch_plan_digest":plan_digest,
+        "lease_id":lease.lease_id,
+        "registration_id":lease.registration_id,
+        "registration_generation":lease.registration_generation,
+        "project_id":lease.project_id,
+        "task_id":lease.task_id,
+        "task_revision":lease.task_revision,
+        "operation_id":lease.operation_id,
+        "owner_client_id":lease.owner_client_id,
+        "attempt_id":lease.attempt_id,
+        "generation":lease.generation,
+        "baseline_commit":lease.baseline_commit,
+        "branch_ref":lease.branch_ref,
+        "worktree_handle":lease.worktree_handle,
+        "allowed_paths":lease_view["allowed_paths"],
+        "allowed_symbols":lease_view["allowed_symbols"],
+        "binding_digest":lease.binding_digest,
+        "clean_state":lease_view["clean_state"],
+    });
+    Ok(format!(
+        "sha256:{}",
+        model::digest(model::canonical(&facts)?.as_bytes())
+    ))
+}
+
+/// Claim/reuse the exact Attempt and reserve its first workspace-bound native
+/// binding after Host evidence has moved the precise lease to held.
+pub(super) fn launch_after_workspace_held(
+    tx: &Transaction<'_>,
+    p: &Principal,
+    config: &Config,
+    operation_id: &str,
+    lease: &crate::workspace::LeaseAuthorityRef,
+    now: i64,
+) -> Result<Value> {
+    require_manager(tx, p)?;
+    let operation = super::operations::get_operation(tx, operation_id)?;
+    if operation["method"] != "swarm.launch" || operation["caller_id"] != p.client_id {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "launch is not owned by this manager",
+        ));
+    }
+    let mut manifest = retained_launch_manifest(tx, operation_id)?;
+    let recovering_unknown_workspace =
+        operation["state"] == "outcome_unknown" && manifest["state"] == "outcome_unknown";
+    if manifest["state"] != "pending_workspace" && !recovering_unknown_workspace {
+        if matches!(
+            manifest["state"].as_str(),
+            Some("awaiting_binding" | "awaiting_capability" | "awaiting_participant_credential")
+        ) {
+            return Ok(operation["result"].clone());
+        }
+        return Err(Error::new(
+            "STALE_LAUNCH",
+            "launch is not awaiting its first verified workspace lease",
+        ));
+    }
+    if operation["state"] != "queued" && !recovering_unknown_workspace {
+        return Err(Error::new(
+            "STALE_LAUNCH",
+            "launch Operation is no longer queued",
+        ));
+    }
+    let plan =
+        launch_workspace_plan_inner(tx, p, operation_id, config, recovering_unknown_workspace)?;
+    if lease.state != "held"
+        || lease.operation_id != operation_id
+        || lease.plan_digest != plan.plan_digest
+        || lease.project_id != plan.project_id
+        || lease.task_id != plan.task_id
+        || lease.task_revision != plan.task_revision
+        || lease.owner_client_id != plan.owner_client_id
+    {
+        return Err(Error::new(
+            "WORKSPACE_LEASE_STALE",
+            "held lease does not match the exact digest-bound launch plan",
+        ));
+    }
+    super::workspace::assert_held_for_claim(tx, lease, &plan)?;
+    let verified_lease_view = super::workspace::get_lease_view(tx, lease)?;
+    if recovering_unknown_workspace {
+        manifest["state"] = json!("pending_workspace");
+        if let Some(object) = manifest.as_object_mut() {
+            object.remove("failure");
+        }
+        let resumed = json!({
+            "operation_id":operation_id,
+            "launch_state":"pending_workspace",
+            "state":"queued",
+            "plan_digest":plan.plan_digest,
+            "task_id":plan.task_id,
+            "task_revision":plan.task_revision,
+            "attempt_id":lease.attempt_id,
+            "workspace_lease":"held_verified_by_exact_readback",
+            "native_effect":"not_attempted",
+            "next_phase":"claim_or_reuse_exact_attempt_and_open_binding",
+            "gaps":["workspace_effect_reconciled_by_exact_lease_readback"],
+        });
+        persist_launch_progress(
+            tx,
+            operation_id,
+            LaunchProgress {
+                manifest: manifest.clone(),
+                result: &resumed,
+                operation_state: "queued",
+                attempt_id: lease.attempt_id.as_deref(),
+                binding: None,
+                now,
+            },
+        )?;
+    }
+    let request_raw: String = tx.query_row(
+        "SELECT original_request_json FROM operations WHERE operation_id=?1",
+        [operation_id],
+        |row| row.get(0),
+    )?;
+    let launch_request =
+        launcher::LaunchRequest::parse(&serde_json::from_str::<Value>(&request_raw)?)?;
+    let preview = launch_preview_for_operation(
+        tx,
+        p,
+        &launch_request.preview_params(),
+        config,
+        operation_id,
+    )?;
+    if preview["plan_digest"] != launch_request.plan_digest {
+        return Err(Error::new(
+            "STALE_LAUNCH",
+            "Task, Attempt, or launch facts changed after workspace preparation",
+        ));
+    }
+
+    let task_id = model::text(&preview["task"], "task_id")?.to_owned();
+    let task_revision = model::positive(&preview["task"], "revision")?;
+    let attempt_action = model::text(&manifest["task"], "attempt_action")?.to_owned();
+    let attempt_id = match attempt_action.as_str() {
+        "claim_new" => {
+            if plan.attempt_id.is_some() || lease.attempt_id.is_some() {
+                return Err(Error::new(
+                    "STALE_LAUNCH",
+                    "new-claim launch unexpectedly has an Attempt-bound workspace lease",
+                ));
+            }
+            let claim_request = json!({
+                "client_request_id":launch_child_request_id(operation_id, "claim"),
+                "task_id":task_id,
+                "expected_revision":task_revision,
+                "owner_id":p.client_id,
+                "start_owner":"controller",
+            });
+            let claimed =
+                super::mutate_in_transaction(tx, p, "task.claim", &claim_request, config, now)??;
+            model::text(&claimed, "attempt_id")?.to_owned()
+        }
+        "use_existing" => {
+            let existing = model::text(&manifest["task"], "attempt_id")?;
+            if plan.attempt_id.as_deref() != Some(existing)
+                || lease.attempt_id.as_deref() != Some(existing)
+            {
+                return Err(Error::new(
+                    "STALE_LAUNCH",
+                    "workspace lease does not bind the exact existing Attempt",
+                ));
+            }
+            existing.to_owned()
+        }
+        _ => {
+            return Err(Error::new(
+                "STALE_LAUNCH",
+                "preview no longer authorizes an exact Attempt action",
+            ));
+        }
+    };
+    let task = super::tasks::get_task(tx, &task_id)?;
+    let attempt = super::tasks::get_attempt(tx, &attempt_id)?;
+    if task["state"] != "open"
+        || task["revision"] != task_revision
+        || task["current_attempt_id"].as_str() != Some(attempt_id.as_str())
+        || attempt["task_id"].as_str() != Some(task_id.as_str())
+        || attempt["task_revision"] != task_revision
+        || attempt["owner_id"] != plan.owner_client_id
+        || !attempt["released_at_ms"].is_null()
+        || attempt["state"] != "reserved"
+        || !attempt["binding_id"].is_null()
+        || !attempt["start_operation_id"].is_null()
+    {
+        return Err(Error::new(
+            "STALE_LAUNCH",
+            "current Attempt no longer matches its unstarted launch reservation",
+        ));
+    }
+    let lease = if plan.attempt_id.is_some() {
+        if lease.attempt_id.as_deref() != Some(attempt_id.as_str()) {
+            return Err(Error::new(
+                "WORKSPACE_ATTEMPT_MISMATCH",
+                "lease Attempt changed",
+            ));
+        }
+        lease.clone()
+    } else {
+        super::workspace::pin_lease_attempt(tx, p, lease, &plan, &attempt_id, now)?
+    };
+    super::workspace::assert_held_for_claim(tx, &lease, &plan)?;
+    let lease_view = if recovering_unknown_workspace && plan.attempt_id.is_none() {
+        super::workspace::get_lease_view(tx, &lease)?
+    } else if recovering_unknown_workspace {
+        verified_lease_view
+    } else {
+        super::workspace::get_lease_view(tx, &lease)?
+    };
+    let attempt = super::tasks::get_attempt(tx, &attempt_id)?;
+    if attempt["start_owner"] != "controller" && attempt["start_owner"] != "native_manager" {
+        return Err(Error::new("STALE_LAUNCH", "Attempt start owner is unknown"));
+    }
+
+    let open_request = json!({
+        "client_request_id":launch_child_request_id(operation_id, "open"),
+        "lane_id":format!("launch-{}", lease.lease_id),
+        "route":launch_request.preview.route,
+    });
+    let (open_operation_id, is_new_open) =
+        admit_launch_open(tx, p, operation_id, &open_request, &lease, now)?;
+    let open_result = if is_new_open {
+        let result = super::operations::open_for_launch(
+            tx,
+            p,
+            &open_request,
+            config,
+            &open_operation_id,
+            now,
+            &lease.lease_id,
+            lease.generation,
+        )?;
+        retain_launch_open(
+            tx,
+            &open_operation_id,
+            LaunchOpenReceipt {
+                parent_operation_id: operation_id,
+                task_id: &task_id,
+                attempt_id: &attempt_id,
+                lease: &lease,
+                result: &result,
+                now,
+            },
+        )?;
+        result
+    } else {
+        super::operations::get_operation(tx, &open_operation_id)?["result"].clone()
+    };
+    let binding_id = model::text(&open_result, "binding_id")?.to_owned();
+    let binding_generation = model::positive(&open_result, "generation")?;
+    let linked = tx.execute(
+        "UPDATE attempts SET binding_id=?2,binding_generation=?3,updated_at_ms=?4\
+         WHERE attempt_id=?1 AND task_id=?5 AND task_revision=?6 AND owner_id=?7\
+           AND state='reserved' AND released_at_ms IS NULL\
+           AND binding_id IS NULL AND binding_generation IS NULL",
+        params![
+            attempt_id,
+            binding_id,
+            binding_generation,
+            now,
+            task_id,
+            task_revision,
+            plan.owner_client_id,
+        ],
+    )?;
+    if linked != 1 {
+        return Err(Error::conflict(
+            "Attempt binding association changed before launch CAS",
+        ));
+    }
+
+    let workspace_manifest_digest =
+        final_workspace_manifest_digest(&launch_request.plan_digest, &lease, &lease_view)?;
+    manifest["state"] = json!("awaiting_binding");
+    manifest["task"]["attempt_id"] = json!(attempt_id);
+    manifest["attempt"] = json!({
+        "action":attempt_action,
+        "start_owner":attempt["start_owner"],
+        "state":"reserved",
+        "claim_operation_id":if attempt_action == "claim_new" {
+            Some(launch_child_request_id(operation_id, "claim"))
+        } else {
+            None
+        },
+    });
+    manifest["workspace"]["lease_state"] = json!("held");
+    manifest["workspace"]["dirty_state"] = json!("clean_verified");
+    manifest["workspace"]["filesystem_inspected"] = json!(true);
+    manifest["workspace"]["lease"] = lease_view.clone();
+    manifest["workspace"]["lease_authority"] = serde_json::to_value(&lease)?;
+    manifest["workspace"]["manifest_digest"] = json!(workspace_manifest_digest);
+    manifest["binding"] = json!({
+        "binding_id":binding_id,
+        "generation":binding_generation,
+        "state":open_result["state"],
+        "operation_id":open_operation_id,
+        "native_admission":open_result["native_admission"],
+    });
+    manifest["progress"]["workspace_lease"] = json!("held_verified");
+    manifest["progress"]["attempt_claim"] = json!(if attempt_action == "claim_new" {
+        "claimed"
+    } else {
+        "reused_exact_reserved_attempt"
+    });
+    manifest["progress"]["binding_open"] = json!("queued");
+    manifest["progress"]["task_dispatch"] = json!("not_started");
+    manifest["progress"]["capability_readback"] = json!("not_observed");
+    manifest["runtime"]["state"] = json!("opening");
+    manifest["runtime"]["native_effect"] = json!("not_observed");
+    manifest["effects"] = json!("verified_workspace_lease_and_queued_binding_open");
+    let result = json!({
+        "operation_id":operation_id,
+        "launch_state":"awaiting_binding",
+        "state":"queued",
+        "plan_digest":launch_request.plan_digest,
+        "workspace_manifest_digest":workspace_manifest_digest,
+        "task_id":task_id,
+        "task_revision":task_revision,
+        "attempt_id":attempt_id,
+        "attempt_action":attempt_action,
+        "workspace_lease":{
+            "lease_id":lease.lease_id,
+            "generation":lease.generation,
+            "binding_digest":lease.binding_digest,
+            "baseline_commit":lease.baseline_commit,
+            "worktree_handle":lease.worktree_handle,
+            "branch_ref":lease.branch_ref,
+            "dirty":false,
+        },
+        "binding":{
+            "operation_id":open_operation_id,
+            "binding_id":binding_id,
+            "generation":binding_generation,
+            "state":open_result["state"],
+        },
+        "task_dispatch":"not_started",
+        "native_effect":"not_observed",
+        "capability_state":"unknown",
+        "gaps":[
+            "runtime_binding_readback_pending",
+            "scoped_participant_credential_issuance_is_not_available",
+            "native_mcp_capability_readback_is_not_recorded",
+        ],
+    });
+    persist_launch_progress(
+        tx,
+        operation_id,
+        LaunchProgress {
+            manifest,
+            result: &result,
+            operation_state: "queued",
+            attempt_id: Some(&attempt_id),
+            binding: Some(LaunchBindingIdentity {
+                id: &binding_id,
+                generation: binding_generation,
+            }),
+            now,
+        },
+    )?;
+    Ok(result)
+}
+
+/// Reconcile one retained launch only from exact Store readback. This path
+/// never retries workspace preparation or binding admission; capability and
+/// participant facts must come from their own evidence sources.
+pub(super) fn reconcile_launch(
+    tx: &Transaction<'_>,
+    config: &Config,
+    operation_id: &str,
+    now: i64,
+) -> Result<Value> {
+    let operation = super::operations::get_operation(tx, operation_id)?;
+    if operation["method"] != "swarm.launch" {
+        return Err(Error::new("FORBIDDEN", "Operation is not a launch"));
+    }
+    let actor = launch_actor(tx, operation_id)?;
+    let mut manifest = retained_launch_manifest(tx, operation_id)?;
+    let launch_state = model::text(&manifest, "state")?;
+    if launch_state == "pending_workspace" {
+        return Ok(operation["result"].clone());
+    }
+    let recovering_unknown_binding = launch_state == "outcome_unknown"
+        && manifest["failure"]["code"] == "binding_effect_unknown";
+    if launch_state == "outcome_unknown" && !recovering_unknown_binding {
+        // Host readback owns this case. Never ask for a second workspace or
+        // binding effect from an unresolved parent Operation.
+        return Ok(operation["result"].clone());
+    }
+    if !matches!(
+        launch_state,
+        "awaiting_binding" | "awaiting_participant_credential" | "awaiting_capability"
+    ) && !recovering_unknown_binding
+    {
+        return Ok(operation["result"].clone());
+    }
+    let lease: crate::workspace::LeaseAuthorityRef =
+        serde_json::from_value(manifest["workspace"]["lease_authority"].clone()).map_err(|_| {
+            Error::new(
+                "INVALID_LAUNCH_MANIFEST",
+                "workspace authority reference is invalid",
+            )
+        })?;
+    let lease_view = match super::workspace::get_lease_view(tx, &lease) {
+        Ok(view) => view,
+        Err(error) if error.code == "WORKSPACE_LEASE_STALE" => {
+            return fail_launch(tx, operation_id, "binding_effect_unknown", now);
+        }
+        Err(error) => return Err(error),
+    };
+    let task_id = model::text(&manifest["task"], "task_id")?.to_owned();
+    let task_revision = model::positive(&manifest["task"], "observed_revision")?;
+    let attempt_id = model::text(&manifest["task"], "attempt_id")?.to_owned();
+    let task = super::tasks::get_task(tx, &task_id)?;
+    let attempt = super::tasks::get_attempt(tx, &attempt_id)?;
+    if task["state"] != "open"
+        || task["revision"] != task_revision
+        || task["current_attempt_id"] != attempt_id
+        || attempt["task_id"] != task_id
+        || attempt["task_revision"] != task_revision
+        || attempt["owner_id"] != lease.owner_client_id
+        || attempt["released_at_ms"].is_number()
+        || attempt["binding_id"] != manifest["binding"]["binding_id"]
+        || attempt["binding_generation"] != manifest["binding"]["generation"]
+    {
+        manifest["state"] = json!("stale");
+        manifest["failure"] = json!({"code":"task_or_attempt_changed_before_binding_readback"});
+        let result = json!({
+            "operation_id":operation_id,
+            "launch_state":"stale",
+            "state":"settled",
+            "plan_digest":manifest["plan_digest"],
+            "task_id":task_id,
+            "task_revision":task_revision,
+            "attempt_id":attempt_id,
+            "native_effect":"not_dispatched",
+            "gaps":["task_or_attempt_changed_before_binding_readback"],
+        });
+        persist_launch_progress(
+            tx,
+            operation_id,
+            LaunchProgress {
+                manifest,
+                result: &result,
+                operation_state: "settled",
+                attempt_id: Some(&attempt_id),
+                binding: None,
+                now,
+            },
+        )?;
+        return Ok(result);
+    }
+    let open_operation_id = model::text(&manifest["binding"], "operation_id")?.to_owned();
+    let open_operation = super::operations::get_operation(tx, &open_operation_id)?;
+    if open_operation["method"] != "agent.open"
+        || open_operation["caller_id"] != actor.client_id
+        || open_operation["prerequisite_operation_id"] != operation_id
+        || open_operation["attempt_id"].as_str() != Some(attempt_id.as_str())
+        || open_operation["task_id"].as_str() != Some(task_id.as_str())
+    {
+        return Err(Error::new(
+            "LAUNCH_BINDING_READBACK_MISMATCH",
+            "binding open Operation is not linked to the exact launch Attempt",
+        ));
+    }
+    if open_operation["state"] == "outcome_unknown" {
+        return fail_launch(tx, operation_id, "binding_effect_unknown", now);
+    }
+    if matches!(
+        open_operation["state"].as_str(),
+        Some("rejected" | "cancelled")
+    ) {
+        return fail_launch(tx, operation_id, "workspace_admission_rejected", now);
+    }
+    let binding_id = model::text(&manifest["binding"], "binding_id")?.to_owned();
+    let binding_generation = model::positive(&manifest["binding"], "generation")?;
+    let binding = super::operations::get_binding(tx, &binding_id, binding_generation)?;
+    if binding["released_at_ms"].is_number() || lease_view["state"] != "held" {
+        return fail_launch(tx, operation_id, "workspace_stale_before_effect", now);
+    }
+    if open_operation["state"] != "settled" || binding["state"] != "ready" {
+        return Ok(operation["result"].clone());
+    }
+
+    if recovering_unknown_binding && let Some(object) = manifest.as_object_mut() {
+        object.remove("failure");
+    }
+
+    manifest["binding"]["state"] = json!(binding["state"]);
+    manifest["binding"]["native_root_id"] = binding["native_root_id"].clone();
+    manifest["binding"]["native_scope_key"] = binding["native_scope_key"].clone();
+    manifest["progress"]["binding_open"] = json!("ready_readback");
+    manifest["runtime"]["state"] = json!("binding_ready");
+    manifest["runtime"]["native_effect"] = json!("binding_ready_observed");
+    manifest["progress"]["task_dispatch"] = json!("not_started");
+    manifest["progress"]["capability_readback"] = json!("not_observed");
+    let participant_id = config
+        .mcp
+        .profiles
+        .get(model::text(&manifest["request"], "mcp_profile")?)
+        .map(|profile| profile.expected_client_id.as_str());
+    let participant = participant_id
+        .map(|client_id| meta(tx, &format!("client:{client_id}")))
+        .transpose()?
+        .flatten();
+    let participant_matches = participant.as_ref().is_some_and(|registration| {
+        registration["role"] == "participant"
+            && registration["disabled"] != true
+            && registration["task_id"].as_str() == Some(task_id.as_str())
+            && registration["task_revision"] == task_revision
+            && registration["attempt_id"].as_str() == Some(attempt_id.as_str())
+            && registration["binding_id"].as_str() == Some(binding_id.as_str())
+            && registration["binding_generation"] == binding_generation
+    });
+    if !participant_matches {
+        manifest["state"] = json!("awaiting_participant_credential");
+        let result = json!({
+            "operation_id":operation_id,
+            "launch_state":"awaiting_participant_credential",
+            "state":"queued",
+            "plan_digest":manifest["plan_digest"],
+            "workspace_manifest_digest":manifest["workspace"]["manifest_digest"],
+            "task_id":task_id,
+            "task_revision":task_revision,
+            "attempt_id":attempt_id,
+            "binding":{"binding_id":binding_id,"generation":binding_generation,"state":"ready"},
+            "task_dispatch":"not_started",
+            "native_effect":"binding_ready_observed",
+            "capability_state":"unknown",
+            "gaps":["exact_scoped_participant_credential_is_not_registered"],
+        });
+        persist_launch_progress(
+            tx,
+            operation_id,
+            LaunchProgress {
+                manifest,
+                result: &result,
+                operation_state: "queued",
+                attempt_id: Some(&attempt_id),
+                binding: Some(LaunchBindingIdentity {
+                    id: &binding_id,
+                    generation: binding_generation,
+                }),
+                now,
+            },
+        )?;
+        return Ok(result);
+    }
+
+    // No current Store path records harness-acknowledged native MCP schema
+    // loading. A static profile or server tools/list is not that evidence.
+    manifest["state"] = json!("awaiting_capability");
+    let result = json!({
+        "operation_id":operation_id,
+        "launch_state":"awaiting_capability",
+        "state":"queued",
+        "plan_digest":manifest["plan_digest"],
+        "workspace_manifest_digest":manifest["workspace"]["manifest_digest"],
+        "task_id":task_id,
+        "task_revision":task_revision,
+        "attempt_id":attempt_id,
+        "binding":{"binding_id":binding_id,"generation":binding_generation,"state":"ready"},
+        "task_dispatch":"not_started",
+        "native_effect":"binding_ready_observed",
+        "capability_state":"unknown",
+        "gaps":[
+            "native_mcp_capability_readback_is_not_recorded",
+            "task_dispatch_is_held_until_required_core_capabilities_are_verified",
+        ],
+    });
+    persist_launch_progress(
+        tx,
+        operation_id,
+        LaunchProgress {
+            manifest,
+            result: &result,
+            operation_state: "queued",
+            attempt_id: Some(&attempt_id),
+            binding: Some(LaunchBindingIdentity {
+                id: &binding_id,
+                generation: binding_generation,
+            }),
+            now,
+        },
+    )?;
+    Ok(result)
+}
+
 /// Read-only bounded plan over one exact Task revision and the Store's
 /// current Attempt, dependency, policy, capacity, Operation, route, and MCP
 /// profile facts. No filesystem or native runtime is consulted here.
@@ -1212,6 +2624,26 @@ pub(super) fn launch_preview(
     p: &Principal,
     params_value: &Value,
     config: &Config,
+) -> Result<Value> {
+    launch_preview_inner(db, p, params_value, config, None)
+}
+
+pub(super) fn launch_preview_for_operation(
+    db: &Connection,
+    p: &Principal,
+    params_value: &Value,
+    config: &Config,
+    operation_id: &str,
+) -> Result<Value> {
+    launch_preview_inner(db, p, params_value, config, Some(operation_id))
+}
+
+fn launch_preview_inner(
+    db: &Connection,
+    p: &Principal,
+    params_value: &Value,
+    config: &Config,
+    exclude_operation_id: Option<&str>,
 ) -> Result<Value> {
     let request = launcher::LaunchPreviewRequest::parse(params_value)?;
     require_manager(db, p)?;
@@ -1249,7 +2681,7 @@ pub(super) fn launch_preview(
     let mut hard_blocks = Vec::new();
     let mut gaps = vec![
         "workspace_lease_dirty_state_and_git_baseline_not_observed",
-        "launch_manifest_and_launch_mutation_are_not_implemented",
+        "execution_waits_for_a_verified_registered_workspace_lease",
         "provider_runtime_and_native_agent_capability_receipts_not_observed",
     ];
     if !task_revision_current {
@@ -1286,6 +2718,12 @@ pub(super) fn launch_preview(
     } else if work_scope["status"] != "recorded" {
         gaps.push("some_scope_paths_are_redacted_or_omitted");
     }
+    let initial_path_count = work_scope["initial_path_count"].as_u64().unwrap_or(0);
+    if initial_path_count == 0 {
+        hard_blocks.push("task_mutable_scope_not_recorded");
+    } else if work_scope["status"] != "recorded" || work_scope["coverage_complete"] != true {
+        hard_blocks.push("task_mutable_scope_not_exact");
+    }
     if request.workspace_policy != "manager_owned_worktree" {
         hard_blocks.push("unsupported_workspace_policy");
     } else {
@@ -1294,7 +2732,12 @@ pub(super) fn launch_preview(
 
     let route = launch_route_projection(config, &request, &mut hard_blocks, &mut gaps);
     let mcp_profile = launch_mcp_profile_projection(db, config, &request, &mut hard_blocks)?;
-    let launch_operations = launch_operation_projection(db, &row.task_id)?;
+    let baseline = workspace_baseline_projection(db, &row, spec.as_ref())?;
+    if baseline["status"] == "unverifiable" {
+        hard_blocks.push("pinned_baseline_commit_not_proven");
+        gaps.push("task_baseline_artifact_does_not_prove_a_full_git_commit");
+    }
+    let launch_operations = launch_operation_projection(db, &row.task_id, exclude_operation_id)?;
     if launch_operations["unresolved_count"].as_i64().unwrap_or(0) > 0 {
         hard_blocks.push("prior_launch_operation_unresolved");
     }
@@ -1335,6 +2778,16 @@ pub(super) fn launch_preview(
                 "reserved" | "running" | "needs_correction"
             ) {
                 ("forbidden", Some("current_attempt_state_is_not_reusable"))
+            } else if attempt.binding_id.is_some() {
+                (
+                    "forbidden",
+                    Some("current_attempt_binding_is_not_linked_to_a_fresh_workspace_lease"),
+                )
+            } else if attempt.state != "reserved" || attempt.start_operation_id.is_some() {
+                (
+                    "forbidden",
+                    Some("current_attempt_has_prior_start_or_nonreserved_state"),
+                )
             } else {
                 ("use_existing", None)
             }
@@ -1434,7 +2887,8 @@ pub(super) fn launch_preview(
     let mut plan = json!({
         "preview_only":true,
         "effects":"none",
-        "launch_implemented":false,
+        "launch_mutation":"durable_intent_pending_workspace",
+        "launch_execution":"awaits_verified_workspace_lease",
         "preview_readiness":readiness,
         "task":{
             "task_id":row.task_id,
@@ -1459,6 +2913,7 @@ pub(super) fn launch_preview(
             "prior_launch_operations":launch_operations,
         },
         "workspace":launch_workspace_projection(&request),
+        "baseline":baseline,
         "route":route,
         "mcp":mcp_profile,
         "capacity":capacity,
@@ -1499,7 +2954,8 @@ pub(super) fn launch_preview(
         "plan_digest":plan_digest,
         "preview_only":true,
         "effects":"none",
-        "launch_implemented":false,
+        "launch_mutation":"durable_intent_pending_workspace",
+        "launch_execution":"awaits_verified_workspace_lease",
         "preview_readiness":readiness,
         "task":{
             "task_id":row.task_id,

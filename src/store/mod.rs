@@ -3,12 +3,14 @@ mod acceptance;
 mod assembly;
 mod automation;
 mod automation_dispatch;
+mod automation_intake;
 pub(crate) mod capacity;
 mod checks;
 mod coordination;
 mod coordination_watch;
 mod forge;
 mod gm;
+mod integration;
 mod launcher;
 mod message_batch;
 mod opencode;
@@ -23,6 +25,7 @@ mod schedules;
 mod status_reader;
 mod submissions;
 mod tasks;
+mod workspace;
 use crate::{
     artifacts::{ArtifactFiles, MAX_PAGE_BYTES, ResultPage},
     config::Config,
@@ -38,6 +41,7 @@ use std::{fs::File, path::Path, sync::Arc, thread::JoinHandle};
 use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 
 const SCHEMA: &str = include_str!("../../migrations/001_core.sql");
+const WORKSPACE_SCHEMA: &str = include_str!("../../migrations/002_workspace.sql");
 const APPLICATION_ID: i64 = 0x45534331;
 const LOCAL_OPERATOR_CLIENT_ID_KEY: &str = "local_operator_client_id";
 type RunJob = Box<dyn FnOnce(&mut Connection) + Send>;
@@ -59,6 +63,14 @@ pub struct StoreOwner {
     thread: JoinHandle<()>,
     status_thread: JoinHandle<()>,
     pub store: Store,
+}
+
+struct LaunchWorkspaceWork {
+    actor: Principal,
+    plan: crate::workspace::WorkspaceLeasePlan,
+    registration: crate::workspace::WorkspaceRegistration,
+    reservation: crate::workspace::LeaseReservation,
+    readback_only: bool,
 }
 
 impl StoreOwner {
@@ -182,6 +194,206 @@ async fn join_store_thread(thread: JoinHandle<()>, name: &'static str) -> Result
         .map_err(|_| Error::new("STORE_PANIC", format!("{name} panicked")))
 }
 impl Store {
+    /// Configuration is local Operator authority; filesystem checks happen in
+    /// the later host-owned preparation phase, outside this transaction.
+    pub(crate) async fn initialize_workspace_authority(&self) -> Result<Value> {
+        let config = self.config.clone();
+        self.run(move |db| {
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let operator = meta(&tx, LOCAL_OPERATOR_CLIENT_ID_KEY)?
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .ok_or_else(|| Error::new("LOCAL_OPERATOR_MISMATCH", "workspace initialization needs the pinned local Operator"))?;
+            require_local_operator(&tx, &operator)?;
+            let now = model::now_ms()?;
+            workspace::sync_configured_registrations(&tx, &operator, &config, now)?;
+            workspace::mark_preparing_unknown(&tx, now)?;
+            let recovery_pending = workspace::pending_leases(&tx, &config, 32)?.len();
+            tx.commit()?;
+            Ok(json!({"configured_projects":config.workspace.projects.len(),"recovery":"preparing_leases_require_readback","recovery_pending_in_bounded_window":recovery_pending}))
+        }).await
+    }
+
+    /// One bounded host worker. The Store retains intent before Git work,
+    /// joins the preparation, then commits verified facts before native open.
+    pub(crate) async fn reconcile_launches_once(&self) -> Result<Value> {
+        let ids = self
+            .run(move |db| launcher::pending_launches(db, 8))
+            .await?;
+        let mut progressed = 0usize;
+        let mut unknown = 0usize;
+        for operation_id in ids {
+            let config = self.config.clone();
+            let intent = operation_id.clone();
+            let prepared = self.run(move |db| {
+                let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let actor = launcher::launch_actor(&tx, &intent)?;
+                let raw: String = tx.query_row("SELECT effective_request_json FROM operations WHERE operation_id=?1", [&intent], |row| row.get(0))?;
+                let effective: Value = serde_json::from_str(&raw)?;
+                let phase = effective["launch_manifest"]["state"].as_str().unwrap_or("");
+                let unknown_workspace = phase == "outcome_unknown"
+                    && effective["launch_manifest"]["failure"]["code"] == "workspace_effect_unknown";
+                if phase != "pending_workspace" && !unknown_workspace {
+                    launcher::reconcile_launch(&tx, &config, &intent, model::now_ms()?)?;
+                    tx.commit()?;
+                    return Ok(None);
+                }
+                if let Some(held) = workspace::held_lease_for_operation(&tx, &intent)? {
+                    launcher::launch_after_workspace_held(&tx, &actor, &config, &intent, &held, model::now_ms()?)?;
+                    tx.commit()?;
+                    return Ok(None);
+                }
+                let ticket = workspace::pending_lease_for_operation(&tx, &config, &intent)?;
+                let (plan, reservation, registration, readback_only) = if let Some(ticket) = ticket {
+                    if ticket.state == "preparing" {
+                        tx.execute("UPDATE workspace_leases SET state='outcome_unknown',updated_at_ms=?2 WHERE lease_id=?1 AND state='preparing'", params![ticket.reservation.lease_id,model::now_ms()?])?;
+                    }
+                    (ticket.plan,ticket.reservation,ticket.registration,true)
+                } else {
+                    if unknown_workspace {
+                        tx.commit()?;
+                        return Ok(None);
+                    }
+                    let plan = launcher::launch_workspace_plan(&tx, &actor, &intent, &config)?;
+                    let reservation = workspace::reserve_lease(&tx, &actor, &plan, model::now_ms()?)?;
+                    let registration = workspace::get_registration(&tx, &plan.project_id, &config)?;
+                    (plan,reservation,registration,false)
+                };
+                tx.commit()?;
+                Ok(Some(LaunchWorkspaceWork { actor, plan, registration, reservation, readback_only }))
+            }).await;
+            let work = match prepared {
+                Ok(Some(work)) => work,
+                Ok(None) => {
+                    progressed += 1;
+                    continue;
+                }
+                Err(error) => {
+                    self.record_launch_failure(operation_id, error.code).await?;
+                    unknown += 1;
+                    continue;
+                }
+            };
+            let config = self.config.clone();
+            let fs_work = work.reservation.clone();
+            let fs_registration = work.registration.clone();
+            let fs_plan = work.plan.clone();
+            let readback_only = work.readback_only;
+            let evidence = tokio::task::spawn_blocking(move || {
+                let project = config
+                    .forge
+                    .projects
+                    .get(&fs_plan.project_id)
+                    .ok_or_else(|| {
+                        Error::new(
+                            "WORKSPACE_UNREGISTERED",
+                            "launch project mapping is unavailable",
+                        )
+                    })?;
+                if readback_only {
+                    crate::workspace::reconcile_workspace(
+                        &config.forge,
+                        project,
+                        &fs_registration,
+                        &fs_work,
+                        &fs_plan,
+                    )
+                } else {
+                    crate::workspace::prepare_lease(
+                        &config.forge,
+                        project,
+                        &fs_registration,
+                        &fs_work,
+                        &fs_plan,
+                    )
+                    .map(|workspace| workspace.evidence().clone())
+                }
+            })
+            .await
+            .map_err(|_| Error::new("WORKSPACE_WORKER_FAILED", "workspace worker did not return"))
+            .and_then(|result| result);
+            let evidence = match evidence {
+                Ok(evidence) => evidence,
+                Err(error) => {
+                    self.record_launch_failure(operation_id, error.code).await?;
+                    unknown += 1;
+                    continue;
+                }
+            };
+            let config = self.config.clone();
+            let intent = operation_id.clone();
+            let result = self
+                .run(move |db| {
+                    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                    let actor = current_principal(&tx, work.actor)?;
+                    let lease = if work.readback_only {
+                        workspace::reconcile_lease(
+                            &tx,
+                            &actor,
+                            &work.registration,
+                            &work.reservation,
+                            &work.plan,
+                            &evidence,
+                            model::now_ms()?,
+                        )?
+                    } else {
+                        workspace::commit_lease(
+                            &tx,
+                            &actor,
+                            &work.registration,
+                            &work.reservation,
+                            &work.plan,
+                            &evidence,
+                            model::now_ms()?,
+                        )?
+                    };
+                    let result = launcher::launch_after_workspace_held(
+                        &tx,
+                        &actor,
+                        &config,
+                        &intent,
+                        &lease,
+                        model::now_ms()?,
+                    )?;
+                    tx.commit()?;
+                    Ok(result)
+                })
+                .await;
+            match result {
+                Ok(_) => progressed += 1,
+                Err(error) => {
+                    self.record_launch_failure(operation_id, error.code).await?;
+                    unknown += 1;
+                }
+            }
+        }
+        self.changed.send_modify(|n| *n = n.wrapping_add(1));
+        Ok(json!({"progressed":progressed,"outcome_unknown":unknown}))
+    }
+
+    async fn record_launch_failure(&self, operation_id: String, safe_code: String) -> Result<()> {
+        self.run(move |db| {
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let now = model::now_ms()?;
+            // Preserve an uncertain filesystem effect and never re-create it.
+            tx.execute("UPDATE workspace_leases SET state='outcome_unknown',updated_at_ms=?2 WHERE operation_id=?1 AND state='preparing'", params![operation_id,now])?;
+            let operation = operations::get_operation(&tx, &operation_id)?;
+            let has_lease: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM workspace_leases WHERE operation_id=?1)", [&operation_id], |row| row.get(0))?;
+            let failure = if !operation["binding_id"].is_null() {
+                "binding_effect_unknown"
+            } else if has_lease {
+                "workspace_effect_unknown"
+            } else if safe_code.starts_with("STALE") {
+                "workspace_stale_before_effect"
+            } else {
+                "workspace_admission_rejected"
+            };
+            set_meta(&tx, &format!("launcher:failure:{operation_id}"), &json!({"code":safe_code,"classification":failure,"observed_at_ms":now}))?;
+            launcher::fail_launch(&tx, &operation_id, failure, now)?;
+            tx.commit()?;
+            Ok(())
+        }).await
+    }
+
     pub(crate) async fn reconcile_automations_once(&self) -> Result<Value> {
         self.run(move |db| {
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -418,6 +630,9 @@ impl Store {
                         return mutate(db, &principal, &method, &params, &config);
                     }
                     if model::PARTICIPANT_READ_METHODS.contains(&method.as_str()) {
+                        if method == "swarm.overlap.check" {
+                            return integration::read(db, &principal, &method, &params);
+                        }
                         if method == "coordination.watch.list" {
                             return coordination_watch::read(db, &principal, &params);
                         }
@@ -767,6 +982,31 @@ fn open_database(root: &Path, credential: &Credential) -> Result<Connection> {
             )?;
         }
     }
+    let workspace_digest = json!(model::digest(WORKSPACE_SCHEMA.as_bytes()));
+    match meta(&tx, "schema_extension:workspace:v1")? {
+        Some(digest) if digest == workspace_digest => {}
+        Some(_) => {
+            return Err(Error::new(
+                "SCHEMA_MISMATCH",
+                "workspace extension content differs",
+            ));
+        }
+        None => {
+            // Do not adopt arbitrary pre-existing tables as our authority.
+            let occupied: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE name IN ('workspace_registrations','workspace_leases')",
+                [], |row| row.get(0),
+            )?;
+            if occupied != 0 {
+                return Err(Error::new(
+                    "SCHEMA_MISMATCH",
+                    "unregistered workspace extension tables already exist",
+                ));
+            }
+            tx.execute_batch(WORKSPACE_SCHEMA)?;
+            set_meta(&tx, "schema_extension:workspace:v1", &workspace_digest)?;
+        }
+    }
     let scheduler_key = format!("client:{}", model::INTERNAL_SCHEDULER_CLIENT_ID);
     match meta(&tx, &scheduler_key)? {
         None => set_meta(
@@ -825,7 +1065,7 @@ fn open_database(root: &Path, credential: &Credential) -> Result<Connection> {
     }
     Ok(db)
 }
-fn meta(db: &Connection, key: &str) -> Result<Option<Value>> {
+pub(super) fn meta(db: &Connection, key: &str) -> Result<Option<Value>> {
     let raw: Option<String> = db
         .query_row("SELECT value_json FROM meta WHERE key=?1", [key], |r| {
             r.get(0)
@@ -834,7 +1074,7 @@ fn meta(db: &Connection, key: &str) -> Result<Option<Value>> {
     raw.map(|s| serde_json::from_str(&s).map_err(Into::into))
         .transpose()
 }
-fn set_meta(db: &Connection, key: &str, value: &Value) -> Result<()> {
+pub(super) fn set_meta(db: &Connection, key: &str, value: &Value) -> Result<()> {
     db.execute("INSERT INTO meta(key,value_json) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json", params![key,model::canonical(value)?])?;
     Ok(())
 }
@@ -864,6 +1104,7 @@ fn is_read(method: &str) -> bool {
             | "swarm.agent.inspect"
             | "swarm.exceptions.get"
             | "swarm.launch.preview"
+            | "swarm.overlap.check"
             | "check.profiles"
             | "artifact.get"
             | "artifact.parts"
@@ -1248,6 +1489,7 @@ fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config
         "swarm.agent.inspect" => launcher::agent_inspect(db, p, v),
         "swarm.exceptions.get" => launcher::exceptions_get(db, p, v),
         "swarm.launch.preview" => launcher::launch_preview(db, p, v, config),
+        "swarm.overlap.check" => integration::read(db, p, method, v),
         "check.get" => checks::describe(db, v),
         "check.profiles" => {
             model::fields(v, &[])?;
@@ -1333,11 +1575,14 @@ fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config
         }
         "agent.state" => {
             model::fields(v, &["binding_id", "generation"])?;
-            operations::get_binding(
-                db,
-                model::text(v, "binding_id")?,
-                model::positive(v, "generation")?,
-            )
+            let binding_id = model::text(v, "binding_id")?;
+            let generation = model::positive(v, "generation")?;
+            if p.role == Role::Operator {
+                require_local_operator(db, &p.client_id)?;
+                operations::get_binding(db, binding_id, generation)
+            } else {
+                operations::get_binding_public(db, binding_id, generation)
+            }
         }
         "route.list" => {
             model::fields(v, &[])?;
@@ -1363,6 +1608,10 @@ fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config
         "agent.list" => {
             model::fields(v, &["limit", "after"])?;
             let (limit, after) = page(v)?;
+            let private = p.role == Role::Operator;
+            if private {
+                require_local_operator(db, &p.client_id)?;
+            }
             let mut s=db.prepare("SELECT binding_id,generation FROM bindings ORDER BY created_at_ms,binding_id,generation LIMIT ?1 OFFSET ?2")?;
             let ids = s
                 .query_map(params![limit, after], |r| {
@@ -1371,7 +1620,13 @@ fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             let items = ids
                 .iter()
-                .map(|(id, g)| operations::get_binding(db, id, *g))
+                .map(|(id, g)| {
+                    if private {
+                        operations::get_binding(db, id, *g)
+                    } else {
+                        operations::get_binding_public(db, id, *g)
+                    }
+                })
                 .collect::<Result<Vec<_>>>()?;
             Ok(json!({"items":items,"next_after":after+ids.len() as i64}))
         }
@@ -1652,6 +1907,8 @@ fn apply(
         check_plan,
     } = context;
     match method {
+        "coordination.sync_integration" => integration::apply(tx, p, method, v, config, id, now),
+        "swarm.launch" => launcher::launch(tx, p, v, config, id, now),
         "coordination.watch.create" | "coordination.watch.cancel" => {
             coordination_watch::apply(tx, p, method, v, id, now)
         }

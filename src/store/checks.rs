@@ -355,7 +355,12 @@ pub(super) fn valid_process_receipt(receipt: &Value, spec: &Value) -> bool {
             && process["pid"].as_u64().is_some_and(|value| value > 0)
             && process["pgid"].as_u64().is_some_and(|value| value > 0)
             && process["start_ticks"]
-                .as_u64()
+                .as_str()
+                // `/proc/<pid>/stat` is parsed and retained as a decimal
+                // string by the process-group identity code. Keep that exact
+                // wire type here; requiring a JSON number rejects every real
+                // Linux process receipt and silently disables cache reuse.
+                .and_then(|value| value.parse::<u64>().ok())
                 .is_some_and(|value| value > 0)
             && process["boot_id"]
                 .as_str()
