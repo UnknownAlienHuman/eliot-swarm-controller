@@ -10,9 +10,11 @@ complete handlers or native-client loading.
 C7 implementation is committed at
 `2f00c2b3d7862788ca8a6bead4645d3ce64dc0ea`. Canonical formatting passed, and
 warnings-denied Clippy passed (13.06 s;
-`.local/qualification/r7-build-gate/clippy-c7-probe-repaired.log`). The C6 CI
-run `37147184684` passed its Linux job and does not cover C7; full CI for this
-commit is pending. The corrected targeted Windows `cargo test --test
+`.local/qualification/r7-build-gate/clippy-c7-probe-repaired.log`). Full Rust
+CI run `37153513585` passed all Ubuntu and Windows job steps for exact CI
+commit `8570dae7f478b6dd2b604727b34c285a86ee9acc`, including Rust
+application/protocol tests, native-bridge fixtures/offline smoke, and the
+release build. The corrected targeted Windows `cargo test --test
 check_probe` passed one test (1.04 s; build 43.34 s;
 `.local/qualification/r7-build-gate/windows-check-probe-c7-repaired.log`).
 The earlier failure was a fixture mismatch: it omitted the outer
@@ -29,10 +31,12 @@ MCP readback for configured/connect state; and a durable bounded
 review-disposition consumer with exact manager-on-behalf authority and semantic
 duplicate/gap handling. The readback does not prove tool loading or
 model-visible capability. Lease/release state is database-only, not an OS or
-filesystem lock. `launcher_mcp_tools.rs`, `mcp_plugin.rs` and work-dispatch
-modules are present but unwired and uncompiled. No overall C7 green gate,
-productive dispatch, full manager-owned cycle, native-MCP harness loading or
-model execution is qualified. C4's 221 Rust tests apply only to
+filesystem lock. The C7 build/CI gates are green, but productive dispatch,
+full manager-owned cycle, native-MCP harness loading and model execution remain
+unqualified. C8 WorkDispatch, typed-actor and MCP-tool integration is active
+WIP and has not passed the root build gate; do not claim it is compiled. The
+C7 `launcher_mcp_tools.rs`, `mcp_plugin.rs` and work-dispatch integration
+remains unwired. C4's 221 Rust tests apply only to
 `2607c8858e573ae40459c27d76d8ae9e1ca9f8fc`.
 
 Credential/profile references are visible in Operation readback. The audit did
@@ -91,8 +95,9 @@ and qualification follow it.
    Productive work dispatch remains unwired; repair, acceptance, publication
    and GitHub projection still need consumers that preserve current manager
    rights, semantic slots, linkage and result readback. Plugin/installer
-   integration is authored but unwired; `launcher_mcp_tools.rs`,
-   `mcp_plugin.rs` and work-dispatch modules are present but uncompiled.
+   integration is authored but unwired. C8 WorkDispatch, typed-actor and
+   MCP-tool integration is active WIP with no root build-gate result; do not
+   claim it is compiled.
 
 3. **O2 durable intake and shared monitoring — Partial.** Commit
    `e035c0c3fe855490863be81902c5152b548c42cd` wires the dispatcher to consume
@@ -142,14 +147,19 @@ and qualification follow it.
     Clippy, and the bounded exact-commit privacy/actor/workspace/no-replay/
     overlap review passed for `e035c0c3fe855490863be81902c5152b548c42cd`.
     C7 at `2f00c2b3d7862788ca8a6bead4645d3ce64dc0ea` passes formatting and
-    warnings-denied Clippy. The corrected Windows `check_probe` passed one
-    targeted test; full CI remains pending. Reviews of unchanged C7 privacy,
+    warnings-denied Clippy. Full Rust CI run `37153513585` passed all Ubuntu
+    and Windows job steps for exact commit
+    `8570dae7f478b6dd2b604727b34c285a86ee9acc`, including Rust app/protocol
+    tests, native-bridge fixtures/offline smoke and release build. The corrected
+    Windows `check_probe` also passed one targeted test. Reviews of unchanged C7 privacy,
     authority, disposition and lifecycle paths at `588a5ca21fbcbd5434540c011846535af7647f35`
     passed; exact `feedback_audit` review of the final three-file Windows delta
     passed (`.local/qualification/r7-build-gate/windows-probe-lifecycle-audit.md`). The
     launcher MCP facade, plugin and work-dispatch modules are present but
-    unwired and uncompiled. No overall green gate, productive launch, full-cycle
-    recovery, native-client or model evidence is established.
+    unwired. C8 WorkDispatch, typed-actor and MCP-tool integration remains WIP
+    without root build-gate qualification. The C7 build/CI gates are green;
+    productive launch, full-cycle recovery, native-client or model evidence is
+    still unqualified.
 
 The status separates implemented slices from authored work and from runtime
 qualification. A registry entry, configuration, or successful unrelated gate
