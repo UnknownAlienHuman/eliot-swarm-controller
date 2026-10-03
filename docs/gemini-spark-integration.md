@@ -553,7 +553,7 @@ Local setup collects:
 - authentication mode;
 - local ELIOT principal/credential reference;
 - named tool profile;
-- OAuth issuer/audience/scopes;
+- authentication-mode-specific validation inputs: Access assertion issuer/application audience and subject mapping, or gateway-owned OAuth resource-server inputs and scopes where defined;
 - approval policy;
 - optional future GM-candidate flag;
 - qualification record.
@@ -588,7 +588,8 @@ Store it in a user-restricted local profile outside the repository. Agents recei
 
 - configure a dedicated MCP server application;
 - test Access Managed OAuth/DCR;
-- validate Access JWT at origin;
+- test the installed client's RFC 8707 resource indicator;
+- validate the signed Access assertion at origin and enforce the configured subject-to-principal/profile mapping;
 - record exact redirect and token behavior;
 - retain route killswitch;
 - fall back only to a reviewed gateway-owned OAuth design or pre-registered client.
