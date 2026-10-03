@@ -31,12 +31,29 @@ MCP readback for configured/connect state; and a durable bounded
 review-disposition consumer with exact manager-on-behalf authority and semantic
 duplicate/gap handling. The readback does not prove tool loading or
 model-visible capability. Lease/release state is database-only, not an OS or
-filesystem lock. The C7 build/CI gates are green, but productive dispatch,
+filesystem lock. The C7 build/CI gates are green. C8 source commit
+`a1577aee63094e6fcb3feea6fc6079d1a8454850` wires WorkDispatch auto-admission
+under typed manager authority, a manager-scoped immutable launch slot shared
+with manual launches, and MCP install/proof handlers and readback. Owned-crate
+formatting and warnings-denied Clippy passed (12.46 s;
+`.local/qualification/r7-build-gate/clippy-c8-qualified.log`). The StoreAPI
+WorkDispatch regression passed 1/1 (0.06 s; build 35.09 s;
+`.local/qualification/r7-build-gate/work-dispatch-c8-qualified.log`); it covers
+Task-fact admission, exact manual-slot reuse/conflict and idempotent receipt,
+one Operation, and Manager/outsider `operation.get`/`operation.list` scope
+filtering before pagination. C8 CI run `37157609062` failed in both OS jobs on
+three projection fixtures because fixture setup installed `001core` but omitted
+`002workspace`; this left `workspace_leases` absent in test databases. The
+production path was unaffected. Repair commit
+`7d518ef4edb84c5e8ce677fafa778de914abed30` installs `002workspace`; the
+targeted projection filter passed 6/6 (0.05 s; build 37.36 s;
+`.local/qualification/r7-build-gate/projection-c8-ci-repaired.log`). Full CI
+run `37158328828` for the repair is in progress. C9 dirtyguard remains active,
+unqualified WIP; its separate unused-warning is not the C8 CI failure. The
+installed R6 is unchanged. Fresh-owned `mcp_plugin` startup remains
+unwired and unqualified. Productive/native dispatch,
 full manager-owned cycle, native-MCP harness loading and model execution remain
-unqualified. C8 WorkDispatch, typed-actor and MCP-tool integration is active
-WIP and has not passed the root build gate; do not claim it is compiled. The
-C7 `launcher_mcp_tools.rs`, `mcp_plugin.rs` and work-dispatch integration
-remains unwired. C4's 221 Rust tests apply only to
+unqualified. C4's 221 Rust tests apply only to
 `2607c8858e573ae40459c27d76d8ae9e1ca9f8fc`.
 
 Credential/profile references are visible in Operation readback. The audit did
@@ -92,12 +109,17 @@ and qualification follow it.
    configuration get/preview/apply/explain and durable `review_dispatch`
    admission exist. C7 adds a bounded review-disposition consumer that preserves
    exact manager-on-behalf authority and semantic duplicate/gap handling.
-   Productive work dispatch remains unwired; repair, acceptance, publication
-   and GitHub projection still need consumers that preserve current manager
-   rights, semantic slots, linkage and result readback. Plugin/installer
-   integration is authored but unwired. C8 WorkDispatch, typed-actor and
-   MCP-tool integration is active WIP with no root build-gate result; do not
-   claim it is compiled.
+    C8 source commit `a1577aee63094e6fcb3feea6fc6079d1a8454850` wires
+    manager-authorized WorkDispatch auto-admission, shared manual and automatic
+    launch slots, and MCP install/proof handlers/readback. Formatting, Clippy
+    and the bounded StoreAPI regression passed. CI run `37157609062` failed on
+    the projection test fixture's omitted `002workspace`; fix commit
+    `7d518ef4edb84c5e8ce677fafa778de914abed30` adds it, the focused projection
+    filter passed 6/6, and CI `37158328828` is in progress.
+    Productive/native dispatch, repair, acceptance, publication and GitHub
+    projection still need qualified consumers preserving manager rights,
+    semantic slots, linkage and result readback. Fresh-owned `mcp_plugin`
+    startup remains unwired.
 
 3. **O2 durable intake and shared monitoring — Partial.** Commit
    `e035c0c3fe855490863be81902c5152b548c42cd` wires the dispatcher to consume
@@ -109,7 +131,9 @@ and qualification follow it.
 4. **Productive launcher, workspace ownership and complete local O7 cycle —
    Partial.** Queue/context/overlap projections, launch preview, async lease /
    exact Task claim / `agent.open`, and C7 atomic private context plus held
-   database lease admission are wired in source. Lease enforcement is database-only;
+    database lease admission are wired in source. C8 adds manager-scoped
+    WorkDispatch admission and the shared immutable manual/automatic launch
+    slot, with targeted regression evidence recorded above. Lease enforcement is database-only;
    filesystem/OS ownership is not established, and stale-fence retention while
    old/unknown effects survive a revision is not yet gate-qualified. Productive dispatch
    and native tool/model capability proof remain absent. The complete
@@ -155,11 +179,13 @@ and qualification follow it.
     authority, disposition and lifecycle paths at `588a5ca21fbcbd5434540c011846535af7647f35`
     passed; exact `feedback_audit` review of the final three-file Windows delta
     passed (`.local/qualification/r7-build-gate/windows-probe-lifecycle-audit.md`). The
-    launcher MCP facade, plugin and work-dispatch modules are present but
-    unwired. C8 WorkDispatch, typed-actor and MCP-tool integration remains WIP
-    without root build-gate qualification. The C7 build/CI gates are green;
-    productive launch, full-cycle recovery, native-client or model evidence is
-    still unqualified.
+    C8 WorkDispatch auto-admission, typed manager authority, the manual-shared
+    immutable launch slot and MCP install/proof handlers/readback are wired in
+    source at `a1577aee63094e6fcb3feea6fc6079d1a8454850`. Formatting, Clippy
+    and the bounded StoreAPI regression passed; C8 CI run `37157609062` failed in both OS jobs on three projection fixtures: the fixture database installed schema `001core` but omitted `002workspace`, so `workspace_leases` was absent. Fix commit `7d518ef4edb84c5e8ce677fafa778de914abed30` installs `002workspace`; the targeted projection filter passed 6/6 (0.05 s; build 37.36 s; `.local/qualification/r7-build-gate/projection-c8-ci-repaired.log`). Full CI run `37158328828` for the repair is in progress.
+    Fresh-owned `mcp_plugin` startup remains
+    unwired. C7 build/CI gates are green; productive launch, full-cycle
+    recovery, native-client or model evidence is still unqualified.
 
 The status separates implemented slices from authored work and from runtime
 qualification. A registry entry, configuration, or successful unrelated gate

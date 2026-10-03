@@ -1,6 +1,6 @@
 # Configuration — Automations Enabled by Their Manager
 
-Revision 5 · 2026-10-03 · proposed Rust application/MCP schema, not fields already accepted by main.
+Revision 8 · 2026-10-03 · WorkDispatch field schema follows `src/automation/config.rs` and `src/automation/work_dispatch.rs`; C8 source commit `a1577aee63094e6fcb3feea6fc6079d1a8454850`; fixture repair commit `7d518ef4edb84c5e8ce677fafa778de914abed30`. C8 source passed owned-crate formatting, warnings-denied Clippy (12.46 s), and the bounded StoreAPI regression (1/1; 0.06 s; build 35.09 s). C8 CI run `37157609062` failed in both OS jobs on three projection fixtures: the fixture database installed schema `001core` but omitted `002workspace`, so `workspace_leases` was absent. Fix commit `7d518ef4edb84c5e8ce677fafa778de914abed30` installs `002workspace`; the targeted projection filter passed 6/6 (0.05 s; build 37.36 s; `.local/qualification/r7-build-gate/projection-c8-ci-repaired.log`). Full CI run `37158328828` for the repair is in progress. C7 full Rust CI run `37153513585` remains historical evidence for exact CI commit `8570dae7f478b6dd2b604727b34c285a86ee9acc`.
 
 [Architecture](architecture.md) owns execution; [Delivery](delivery.md) owns the shared work handlers.
 
@@ -63,7 +63,7 @@ Record the manager, technical requester/executor, automation/revision and exact 
 
 ## 4. Example: automatic audit assignment only
 
-This manager already has review-assignment rights. One request enables that helper and includes currently waiting submissions:
+This manager already has review-assignment rights. One request enables that helper and includes currently waiting submissions in the project scope:
 
 ```json
 {
@@ -77,7 +77,7 @@ This manager already has review-assignment rights. One request enables that help
       "patch": {
         "enabled": true,
         "preset": "reviewed_delivery",
-        "scope": {"work_pool_id": "my-work-pool"},
+        "scope": {"work_pool_id": null},
         "steps": ["review_dispatch"],
         "review": {"profile": "auditor", "required_reviewers": 1}
       }
@@ -106,13 +106,129 @@ To prevent future automatic audits:
 
 The revision assumes no intervening edit; real calls use the current returned value. Running audits can finish and report. `review.assign` remains available manually.
 
+### 4.1 WorkDispatch: explicit manager-authorized launch settings
+
+The current typed `work_dispatch` object is a complete launch-settings bundle,
+not a route-only switch. Replace the illustrative route/profile/surface names
+below with values from the manager's current `runtime.catalog`. Use
+`automation.config.preview` to check the patch and revision effects; each exact
+Task still goes through the canonical launcher preview and can wait on route,
+workspace, MCP, capacity or other readiness. C8 source commit
+`a1577aee63094e6fcb3feea6fc6079d1a8454850` wires manager-authorized automatic
+WorkDispatch and passed a bounded StoreAPI regression; C8 hosted CI has not yet
+run. This does not qualify productive dispatch or a complete local cycle. All local model/inference
+execution remains deferred by owner.
+
+The authenticated current Manager enables one entry for one project. The server
+derives `owner_manager_id` from that Manager; do not submit an owner, role or
+`run_as`. Admission and pending-work rechecks require that owner to remain a
+registered, enabled Manager and recheck the current entry. The technical actor
+does not fall back to GM authority.
+
+```json
+{
+  "client_request_id": "enable-manager-work-dispatch",
+  "project_id": "project-a",
+  "changes": [
+    {
+      "automation_id": "manager-work-dispatch",
+      "expected_revision": 0,
+      "include_existing": false,
+      "patch": {
+        "enabled": true,
+        "scope": {"work_pool_id": null},
+        "steps": ["work_dispatch"],
+        "work_dispatch": {
+          "route": "route-from-runtime-catalog",
+          "agent_profile": "agent-profile-from-runtime-catalog",
+          "mcp_profile": "work-participant",
+          "mcp_surface": "participant-core",
+          "workspace_policy": "manager_owned_worktree",
+          "requested_model": null,
+          "requested_effort": null,
+          "budget": {
+            "max_turns": null,
+            "max_duration_ms": null,
+            "max_cost_units": null
+          },
+          "stop_conditions": [],
+          "purpose": "implementation"
+        }
+      }
+    }
+  ]
+}
+```
+
+`expected_revision: 0` creates a new entry; existing entries use the latest
+revision returned by `automation.config.get`. `include_existing: false` is the
+future-only choice. `scope` currently accepts only `work_pool_id`; a non-null
+pool has no committed membership reader and returns a visible scope gap rather
+than widening access. Keep it `null` for the current project-wide Task reader.
+The settings object denies unknown fields and requires `route`, `agent_profile`,
+`mcp_profile`, `mcp_surface`, `workspace_policy`, nullable
+`requested_model`/`requested_effort`, all three nullable budget fields,
+`stop_conditions` (at most 16 strings), and `purpose`. No route, profile,
+workspace policy, model, effort, budget, or stop-condition default is inferred.
+`workspace_policy` currently uses `manager_owned_worktree`. `null` budget values
+mean no requested numeric cap for that field; choose bounds required by the
+manager's policy instead of treating null as a safe default.
+
+The C8 source path reads only committed local controller Task
+facts (`task.create`, `task.revise`, `task.claim`) and checks the exact current
+Task revision/Attempt before normal launch preview and manager-authorized
+admission. It does not consume GitHub/webhook events. At activation, Store
+records the current observation high-water as `activation_cut`. With
+`include_existing: false`, the durable per-entry cursor starts at that cut and
+processes later facts only. With `true`, it performs bounded catch-up only
+through the captured cut, then follows new facts; it does not replay arbitrary
+remote deliveries. Cursor, pending readiness state, semantic launch-slot
+reservation and admitted Operation are committed through the Store path. The
+bounded C8 StoreAPI regression passed. CI run `37157609062` failed because the test fixture omitted `002workspace`; repair `7d518ef4edb84c5e8ce677fafa778de914abed30` adds it, the focused projection filter passed 6/6, and CI `37158328828` is in progress.
+
+The `automation.explain` `work_dispatch` projection contains:
+`cursor`, `activation_cut`, optional `catch_up_until`, retained `pending`
+subjects with readiness reason/wake conditions, and a bounded `recent` window.
+Pending readiness is distinct from a source-integrity `gap`; gaps are surfaced
+in recent dispositions and are not silently treated as empty success. The
+cursor and source observations remain durable, while the recent diagnostic
+window is bounded. Unavailable manager authority remains a pending reason; it
+does not switch to another owner. This readback is part of the committed C8
+source; the bounded regression is not a substitute for hosted CI or end-to-end
+qualification.
+
+The C8 source has manual and automatic launch admission share the
+manager-scoped immutable semantic slot for the exact Task revision/Attempt and
+launch parameters. The bounded StoreAPI regression verified exact slot reuse,
+conflict handling, idempotent receipt and one Operation for its covered case.
+The existing `swarm.launch` semantic-reuse acknowledgment is immutable and does
+not copy mutable progress or result data. Its receipt shape is:
+
+```json
+{
+  "operation_id": "<operation-id>",
+  "operation_state_at_receipt": "queued",
+  "receipt_recorded_at_ms": 0,
+  "current_state_read_method": "operation.get",
+  "semantic_reuse": true
+}
+```
+
+Treat `operation_state_at_receipt` as a historical acknowledgment field. Read
+current progress/result using `operation.get` with `operation_id`; the intended
+WorkDispatch recent entry carries the admitted Operation ID and semantic slot
+ID. In the example, timestamp `0` is a numeric placeholder; the server supplies
+the actual receipt time. Current progress and result come from live
+`operation.get`, not the immutable receipt snapshot. C8 hosted CI has not yet
+run; productive dispatch and the full cycle remain unqualified.
+
 ## 5. Preset steps and prerequisites
 
 `steps` selects actions, not an executable array order. Each action has a typed trigger and committed prerequisites:
 
 | Step | Required fact before eligibility |
 |---|---|
-| `work_dispatch` | Current selected Task is ready; owner/workspace/capacity admission is available. |
+| `work_dispatch` | A committed local Task fact identifies a current ready Task revision/Attempt; current Manager, workspace and capacity admission are available. |
 | `review_dispatch` | Applied retained submission exists and its required review slot is unfilled. |
 | `review_disposition` | Assigned actionable findings apply to that exact current submission. |
 | `repair_dispatch` | Guarded feedback was applied and its current owner/continuation can receive the correction. |
