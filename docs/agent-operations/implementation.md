@@ -2,7 +2,7 @@
 
 Revision 5 · 2026-10-03 · design baseline `36cfb652` plus the active implementation increment.
 
-Read [README](README.md), then the relevant [Configuration](configuration.md), [Architecture](architecture.md), [Delivery](delivery.md) and [Donor map](donor-map.md). The program remains partial: implementation commit `2607c8858e573ae40459c27d76d8ae9e1ca9f8fc` wires 29 methods and 83 `ToolSpec` entries with live authorization/role cores. Backend dev build, Clippy, 221 Rust tests, Windows probe and final Muse fixture (7.4s) passed for that implementation; native MCP harness loading remains unknown. Launch, watch/consult, integration/scope-Git, Concilium, cron, Goal and native-Rust conversion remain planned gaps.
+Read [README](README.md), then the relevant [Configuration](configuration.md), [Architecture](architecture.md), [Delivery](delivery.md) and [Donor map](donor-map.md). The program remains partial. C4 commit `2607c8858e573ae40459c27d76d8ae9e1ca9f8fc` added 29 methods and 83 `ToolSpec` entries; its 221 Rust tests apply only to that SHA. C4 CI run 37137719451 failed on Linux environment defaults and Muse fixture realpath; C5 repairs are committed and remote CI is pending. C5 commit `b36e84b506a60fb09ecfe7a8adbb6da8e5ed0748` extends CLI/MCP to 88 `ToolSpec` entries, adds canonical consultation, `operation_terminal` watch create/list/cancel with passive inbox/shared tick, and read-only `launch.preview`, and passes Clippy in 8.85s plus the changed canonical-path Muse selftest in 7.4s. No new Cargo tests were run. Other watch kinds, productive launch, integration/scope-Git, Concilium, cron, Goal, native-Rust conversion and native-MCP harness loading remain planned or unknown.
 
 ## 1. Delivery discipline
 

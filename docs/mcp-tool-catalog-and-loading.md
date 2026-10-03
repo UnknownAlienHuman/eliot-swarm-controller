@@ -4,7 +4,7 @@
 **Revision:** 1 — 2026-10-03  
 **Source baseline:** `main` at `35e499ae73b622d873c44873f6993ee3fcbea87b`  
 **Applies to:** [Communication Program](agent-communication-program.md), [Fleet-Scale Freedom](agent-communication-fleet-scale-freedom.md), [MCP Profiles](mcp-profiles.md)  
-**Status:** normative catalog contract. From baseline `36cfb652`, implementation commit `2607c8858e573ae40459c27d76d8ae9e1ca9f8fc` wires 83 `ToolSpec` entries, live authorization, role cores and deferred tool search. Backend gates passed for that implementation; actual native-MCP harness loading remains unknown.
+**Status:** normative catalog contract. C5 commit `b36e84b506a60fb09ecfe7a8adbb6da8e5ed0748` extends CLI/MCP to 88 `ToolSpec` entries and adds canonical consultation, `operation_terminal` watch create/list/cancel with passive inbox/shared tick, and read-only `launch.preview`. C5 Clippy passed in 8.85s and the changed canonical-path Muse selftest passed in 7.4s. C4's 221 Rust tests remain tied to `2607c8858e573ae40459c27d76d8ae9e1ca9f8fc`; C4 CI run 37137719451 failed on Linux environment defaults/Muse fixture realpath, C5 repairs are committed and remote CI is pending. Other watch kinds and actual native-MCP harness loading remain unsupported or unknown.
 **Precedence:** this file governs MCP grouping, eager/deferred loading, catalog metadata and launcher-facing tool UX. Existing application authorization and Task/Attempt authority remain unchanged.
 
 ## 0. Decision
@@ -55,9 +55,9 @@ manual memorization of low-level application method names
 
 ## 1. Current source facts and the exact gap
 
-At baseline `36cfb652`, the MCP facade had 53 typed tools, fixed profiles and profile filtering before local IPC. Implementation commit `2607c8858e573ae40459c27d76d8ae9e1ca9f8fc` adds 29 methods and an 83-entry `ToolSpec` registry, live authorization/role cores and deferred tool search. Backend dev build, Clippy, 221 Rust tests, Windows probe and final Muse fixture passed for that implementation. Actual native-MCP harness loading remains unknown, so a registry entry or `tools/list` result is not evidence the model loaded or used that schema.
+At baseline `36cfb652`, the MCP facade had 53 typed tools, fixed profiles and profile filtering before local IPC. C4 commit `2607c8858e573ae40459c27d76d8ae9e1ca9f8fc` added 29 methods and 83 `ToolSpec` entries; its 221 Rust tests apply only to that SHA. C5 commit `b36e84b506a60fb09ecfe7a8adbb6da8e5ed0748` extends CLI/MCP to 88 entries. Its backend additions are canonical consultation, `operation_terminal` watches with passive inbox/shared tick and read-only `launch.preview`; other watch kinds remain unsupported. C5 Clippy and the changed canonical-path Muse selftest passed; C4 CI run 37137719451 failed on Linux environment defaults and Muse fixture realpath, with repairs in C5 and remote CI pending. Actual native-MCP harness loading remains unknown, so a registry entry or `tools/list` result is not evidence the model loaded or used that schema.
 
-The [Canonical MCP Surfaces](mcp-canonical-surfaces-and-topologies.md) document owns exact public names. This document owns group metadata and deferred-loading design. Remaining end-to-end gaps include native harness consumption/qualification and the larger launch, watch/consult, integration/scope-Git, cron, Goal and native-Rust program paths. Do not replace the application authorization layer with catalog metadata.
+The [Canonical MCP Surfaces](mcp-canonical-surfaces-and-topologies.md) document owns exact public names. This document owns group metadata and deferred-loading design. Remaining end-to-end gaps include actual native harness consumption/qualification, productive launch beyond read-only preview, watch kinds beyond `operation_terminal`, integration/scope-Git, Concilium, cron, Goal and native-Rust program paths. Do not replace the application authorization layer with catalog metadata.
 
 ## 2. Evidence-based design constraints
 
