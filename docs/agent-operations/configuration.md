@@ -1,6 +1,6 @@
 # Configuration — Automations Enabled by Their Manager
 
-Revision 8 · 2026-10-03 · WorkDispatch field schema follows `src/automation/config.rs` and `src/automation/work_dispatch.rs`; C8 source commit `a1577aee63094e6fcb3feea6fc6079d1a8454850`; fixture repair commit `7d518ef4edb84c5e8ce677fafa778de914abed30`. C8 source passed owned-crate formatting, warnings-denied Clippy (12.46 s), and the bounded StoreAPI regression (1/1; 0.06 s; build 35.09 s). C8 CI run `37157609062` failed in both OS jobs on three projection fixtures: the fixture database installed schema `001core` but omitted `002workspace`, so `workspace_leases` was absent. Fix commit `7d518ef4edb84c5e8ce677fafa778de914abed30` installs `002workspace`; the targeted projection filter passed 6/6 (0.05 s; build 37.36 s; `.local/qualification/r7-build-gate/projection-c8-ci-repaired.log`). Full CI run `37158328828` for the repair is in progress. C7 full Rust CI run `37153513585` remains historical evidence for exact CI commit `8570dae7f478b6dd2b604727b34c285a86ee9acc`.
+Revision 8 · 2026-10-03 · WorkDispatch field schema follows `src/automation/config.rs` and `src/automation/work_dispatch.rs`; C8 source commit `a1577aee63094e6fcb3feea6fc6079d1a8454850`; fixture repair commit `7d518ef4edb84c5e8ce677fafa778de914abed30`. C8 source passed owned-crate formatting, warnings-denied Clippy (12.46 s), and the bounded StoreAPI regression (1/1; 0.06 s; build 35.09 s). C8 CI run `37157609062` failed in both OS jobs on three projection fixtures: the fixture database installed schema `001core` but omitted `002workspace`, so `workspace_leases` was absent. Fix commit `7d518ef4edb84c5e8ce677fafa778de914abed30` installs `002workspace`; the targeted projection filter passed 6/6 (0.05 s; build 37.36 s; `.local/qualification/r7-build-gate/projection-c8-ci-repaired.log`). Full Rust CI run `37158328828` passed all Ubuntu and Windows job steps for repair commit `7d518ef4edb84c5e8ce677fafa778de914abed30`, including formatting, Clippy, Rust application/protocol tests, native offline fixtures, and release build. C7 full Rust CI run `37153513585` remains historical evidence for exact CI commit `8570dae7f478b6dd2b604727b34c285a86ee9acc`.
 
 [Architecture](architecture.md) owns execution; [Delivery](delivery.md) owns the shared work handlers.
 
@@ -184,7 +184,7 @@ processes later facts only. With `true`, it performs bounded catch-up only
 through the captured cut, then follows new facts; it does not replay arbitrary
 remote deliveries. Cursor, pending readiness state, semantic launch-slot
 reservation and admitted Operation are committed through the Store path. The
-bounded C8 StoreAPI regression passed. CI run `37157609062` failed because the test fixture omitted `002workspace`; repair `7d518ef4edb84c5e8ce677fafa778de914abed30` adds it, the focused projection filter passed 6/6, and CI `37158328828` is in progress.
+bounded C8 StoreAPI regression passed. CI run `37157609062` failed because the test fixture omitted `002workspace`; repair `7d518ef4edb84c5e8ce677fafa778de914abed30` adds it, the focused projection filter passed 6/6, and CI run `37158328828` passed all Ubuntu and Windows steps for repair commit `7d518ef4edb84c5e8ce677fafa778de914abed30`.
 
 The `automation.explain` `work_dispatch` projection contains:
 `cursor`, `activation_cut`, optional `catch_up_until`, retained `pending`

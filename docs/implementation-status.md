@@ -48,7 +48,7 @@ production path was unaffected. Repair commit
 `7d518ef4edb84c5e8ce677fafa778de914abed30` installs `002workspace`; the
 targeted projection filter passed 6/6 (0.05 s; build 37.36 s;
 `.local/qualification/r7-build-gate/projection-c8-ci-repaired.log`). Full CI
-run `37158328828` for the repair is in progress. C9 dirtyguard remains active,
+run `37158328828` passed all Ubuntu and Windows job steps for repair commit `7d518ef4edb84c5e8ce677fafa778de914abed30`, including formatting, Clippy, Rust application/protocol tests, native offline fixtures, and release build. C9 dirtyguard remains active,
 unqualified WIP; its separate unused-warning is not the C8 CI failure. The
 installed R6 is unchanged. Fresh-owned `mcp_plugin` startup remains
 unwired and unqualified. Productive/native dispatch,
@@ -115,7 +115,7 @@ and qualification follow it.
     and the bounded StoreAPI regression passed. CI run `37157609062` failed on
     the projection test fixture's omitted `002workspace`; fix commit
     `7d518ef4edb84c5e8ce677fafa778de914abed30` adds it, the focused projection
-    filter passed 6/6, and CI `37158328828` is in progress.
+    filter passed 6/6, and CI run `37158328828` passed all Ubuntu and Windows steps for repair commit `7d518ef4edb84c5e8ce677fafa778de914abed30`.
     Productive/native dispatch, repair, acceptance, publication and GitHub
     projection still need qualified consumers preserving manager rights,
     semantic slots, linkage and result readback. Fresh-owned `mcp_plugin`
@@ -182,7 +182,7 @@ and qualification follow it.
     C8 WorkDispatch auto-admission, typed manager authority, the manual-shared
     immutable launch slot and MCP install/proof handlers/readback are wired in
     source at `a1577aee63094e6fcb3feea6fc6079d1a8454850`. Formatting, Clippy
-    and the bounded StoreAPI regression passed; C8 CI run `37157609062` failed in both OS jobs on three projection fixtures: the fixture database installed schema `001core` but omitted `002workspace`, so `workspace_leases` was absent. Fix commit `7d518ef4edb84c5e8ce677fafa778de914abed30` installs `002workspace`; the targeted projection filter passed 6/6 (0.05 s; build 37.36 s; `.local/qualification/r7-build-gate/projection-c8-ci-repaired.log`). Full CI run `37158328828` for the repair is in progress.
+    and the bounded StoreAPI regression passed; C8 CI run `37157609062` failed in both OS jobs on three projection fixtures: the fixture database installed schema `001core` but omitted `002workspace`, so `workspace_leases` was absent. Fix commit `7d518ef4edb84c5e8ce677fafa778de914abed30` installs `002workspace`; the targeted projection filter passed 6/6 (0.05 s; build 37.36 s; `.local/qualification/r7-build-gate/projection-c8-ci-repaired.log`). Full Rust CI run `37158328828` passed all Ubuntu and Windows job steps for repair commit `7d518ef4edb84c5e8ce677fafa778de914abed30`, including formatting, Clippy, Rust application/protocol tests, native offline fixtures, and release build.
     Fresh-owned `mcp_plugin` startup remains
     unwired. C7 build/CI gates are green; productive launch, full-cycle
     recovery, native-client or model evidence is still unqualified.
