@@ -129,3 +129,51 @@ code 0. The bridge now records detached observation snapshots: a later native
 result cannot mutate an earlier acknowledged snapshot or be cited against its
 stale observation ID. The earlier failed run and its captured native success
 remain separate evidence; they were not relabelled as settled controller work.
+
+## R6 OpenCode and Command Code
+
+At **2026-10-03 08:05 UTC**, the tested source is
+`34bd4a42ebd7f15cc5ad6099f406d1c9cf3b8c6b`; its R6 release executable has
+SHA-256 `96c46cc6fbab070dc81d4ec5d0b5132e6f2f0b77eb7b2ce720632608a6ffde28`.
+Warnings-denied Clippy, all **185** Rust library tests and the release build
+passed. Independent Luna reviews bound the Command receipts, mailbox
+visibility, Forge restart holds and OpenCode owner/parent contract to that
+exact source commit. Module fixtures passed on their recorded frozen files.
+
+The pinned native OpenCode **2.0.7** owner runs under **Bun 1.4.0**, with
+event persistence enabled, a private workspace/database and a loopback-only
+authenticated HTTP listener. Only the operator-authorized `opencode-go` key
+was copied into that private database; original provider settings were not
+modified. Integration activation, key connection and catalog reads used the
+same private workspace location. The catalog confirmed exact
+`opencode-go/space-bunny-free`, variant `low`, before inference.
+
+The first root-session receipt was Unknown because a real native root event
+omits its optional `parentID`. No model input had been sent. After the adapter
+fix, restarting only the empty fixture host recovered the original Operation
+by exact session GET and preserved the original native root. The native
+service stayed running; no second session was created.
+
+One Task input then completed. Durable event readback confirmed the exact
+input and terminal execution, completed its sole producer, and retained an
+assistant response with the exact marker and the requested native model
+fields. An immutable result artifact passed its byte digest check. Receipt
+idempotency and changed-request rejection were observed; the latter exposed
+a wrong expected error name in the qualification script. Subsequent
+verification read the already completed input, refreshed the binding and
+exported its result without resending model input. The Task remained open.
+The failed harness records are retained alongside the successful readback.
+This establishes ordinary execution and host-side root recovery; it does
+not qualify native service restart during queued or running inference.
+
+Installed Command Code **1.74.1** and `command-mod-0.1.0-glue.3` completed one
+`stealth/space-bunny-alpha` input through the same R6 launcher. The exact
+native `result.finalText` marker, settled dispatch/refresh and separate Task
+acceptance passed. Its module family exited with code 0. The requested model
+is known; an upstream served-model identity remains unreported.
+
+The completed fixture hosts were stopped. The owned OpenCode service and
+original Codex processes remained alive; no global Codex restart occurred.
+The original Codex configuration acquired an unrelated edit during the
+campaign, so the earlier R2 digest comparison is historical evidence only.
+The campaign did not write or revert that configuration.
