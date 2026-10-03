@@ -1,8 +1,8 @@
 # Implementation Plan — Rust Operations on Behalf of the Manager
 
-Revision 5 · 2026-10-03 · design baseline `36cfb652` plus the active implementation increment.
+Revision 6 · 2026-10-03 · published C5 baseline `a0a931e` plus C6/local TaskSubmission intake committed at `e035c0c3fe855490863be81902c5152b548c42cd`.
 
-Read [README](README.md), then the relevant [Configuration](configuration.md), [Architecture](architecture.md), [Delivery](delivery.md) and [Donor map](donor-map.md). The program remains partial. C4 commit `2607c8858e573ae40459c27d76d8ae9e1ca9f8fc` added 29 methods and 83 `ToolSpec` entries; its 221 Rust tests apply only to that SHA. C4 CI run 37137719451 failed on Linux environment defaults and Muse fixture realpath; C5 repairs are committed and remote CI is pending. C5 commit `b36e84b506a60fb09ecfe7a8adbb6da8e5ed0748` extends CLI/MCP to 88 `ToolSpec` entries, adds canonical consultation, `operation_terminal` watch create/list/cancel with passive inbox/shared tick, and read-only `launch.preview`, and passes Clippy in 8.85s plus the changed canonical-path Muse selftest in 7.4s. No new Cargo tests were run. Other watch kinds, productive launch, integration/scope-Git, Concilium, cron, Goal, native-Rust conversion and native-MCP harness loading remain planned or unknown.
+Read [README](README.md), then the relevant [Configuration](configuration.md), [Architecture](architecture.md), [Delivery](delivery.md) and [Donor map](donor-map.md). The program remains partial. C4's 221 Rust tests apply only to `2607c8858e573ae40459c27d76d8ae9e1ca9f8fc`. C6 plus the bounded local `controller/task.submission` intake consumer is committed at `e035c0c3fe855490863be81902c5152b548c42cd`. Owned-crate formatting and `cargo clippy --locked --lib --bins --no-deps -- -D warnings` passed for that commit (9.60 s; `.local/qualification/r7-build-gate/clippy-c6-publish-repaired.log`), and the bounded exact-commit review of C6 privacy, actor, workspace, no-replay and overlap behavior passed. C5's last published CI run failed on Linux `start_ticks` parsing and a Windows stdout fixture; source repairs are included, but new CI is pending after the main push. No Cargo tests, native process, or model execution ran for this increment. The current catalog has 91 `ToolSpec` entries and C6 includes five passive watch kinds, integration sync, recomputed overlap, manager-admitted asynchronous workspace lease, exact Task claim and `agent.open`. Separate C7 Participant credential issuance, broader readback, native capability proof, and disposition/lifecycle modules remain unwired source WIP. Productive launch and the full manager-owned cycle remain unqualified; actual native-MCP harness loading remains unknown.
 
 ## 1. Delivery discipline
 
@@ -77,6 +77,13 @@ src/monitoring/pump.rs
 src/store/monitoring.rs
 ```
 
+Current source status: commit `e035c0c3fe855490863be81902c5152b548c42cd`
+wires the dispatcher to consume shared bounded intake and journal readback for
+the local `controller/task.submission` producer once per Store reconciliation
+transaction. Separate C7 credential issuance, broader source readback,
+native-capability proof, and disposition/lifecycle modules remain unwired; this
+is not a multi-source intake service.
+
 - Normalize source/native identity, source cursor/epoch, controller cursor, work/binding scope and coverage. Source failure is unknown, not empty success.
 - Commit verified intake before durable ACK. Dispatcher cursor advancement and Operation/reservation or pending-subject state commit together.
 - Treat `watch`/MCP notifications as lossy/coalesced hints. After reconnect/startup, read every unprocessed committed fact through a bounded high-water cut. No lost work between committing a cursor and enqueuing an in-memory command.
@@ -91,6 +98,12 @@ Done: monitoring works with no enabled automation, dropped notifications recover
 ## 5. O3 — Rust adapters, streams and direct manager control
 
 Read existing `src/runtime/owner.rs`, `src/runtime/warm_stream.rs`, `src/runtime/opencode_v2/*`, `src/platform/process_group.rs`, Doctor and module mappings.
+
+Committed C6 work adds a manager-admitted asynchronous workspace lease,
+an exact Task claim, and the `agent.open` path. Productive native launch still
+stops at credential and native-MCP capability checks; productive dispatch is
+not implemented in this increment. Formatting and warnings-denied Clippy
+passed; runtime and productive-launch qualification remain pending.
 
 - Port owned transport/translation to Rust through documented protocols or maintained libraries; preserve vendor loops externally. Do not silently retain a mandatory internal JS/Python service.
 - Qualify installed protocol/capabilities, not exact release equality. Preserve unknown consequential values and safe additive data.

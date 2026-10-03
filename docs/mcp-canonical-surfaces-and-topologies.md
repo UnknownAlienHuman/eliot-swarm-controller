@@ -1,8 +1,8 @@
 # ELIOT MCP Canonical Surfaces and Client Topologies
 
-**Revision:** 2 — 2026-10-03  
-**Integration review:** main `504199d14135c030ad3951a3c5023a098a3d03f0` and [Agent Operations PR #23](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/23).  
-**Status:** authoritative public-name and presentation contract. Core registry/role authorization is wired in the active increment from `36cfb652`; backend gates passed on the current working tree, while actual native-MCP harness loading remains unknown. Names listed here are not proof every handler or client capability is complete.
+**Revision:** 3 — 2026-10-03
+**Integration review:** published C5 snapshot `a0a931e` and [Agent Operations PR #23](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/23).
+**Status:** authoritative public-name and presentation contract. The current catalog contains 91 `ToolSpec` entries. C6 plus the wired local TaskSubmission-intake consumer is committed at `e035c0c3fe855490863be81902c5152b548c42cd`; owned-crate formatting and warnings-denied Clippy passed for that commit (9.60 s, `.local/qualification/r7-build-gate/clippy-c6-publish-repaired.log`), as did the bounded exact-commit review of C6 privacy, actor, workspace, no-replay and overlap behavior. No Cargo tests, native process, or model execution ran for this increment; new CI is pending after the main push. C6 includes five passive watch kinds, integration sync, recomputed overlap, and manager-admitted async workspace lease / exact Task claim / `agent.open` work. The local `controller/task.submission` intake consumer is wired. Separate C7 Participant credential issuance, broader readback, native capability proof, and disposition/lifecycle modules remain unwired source WIP. Productive launch and the full manager-owned cycle remain unqualified; actual native-MCP harness loading remains unknown. Names listed here do not prove every handler or client capability is complete.
 
 This is the canonical convenience-tool list for the [Communication Program](agent-communication-program.md). [Catalog and Loading](mcp-tool-catalog-and-loading.md) owns registry metadata; [Launcher](swarm-launcher-assignment-context.md) owns work context. Older aliases and reviewer examples are corrected here rather than exposed as competing APIs.
 
@@ -49,6 +49,7 @@ swarm.agent.steer
 swarm.exceptions.get
 operation.get
 swarm.tools.search
+agent.open
 ```
 
 ### Assigned reviewer
@@ -84,12 +85,14 @@ All reads are scoped and bounded. GM/operator uses the manager core, with rare a
 |---|---|
 | `swarm.context.get` | Task/Attempt/cards; supersedes old `coordination.context.get` examples. |
 | `coordination.consult` | Card field lookup, exact owner discovery and addressed ask; `ask_owner` is not a competing eager alias. |
-| `coordination.watch.create/list/cancel` | One shared watch service; availability is a watch kind, not a separate `notify_when_available` API. |
+| `coordination.watch.create/list/cancel` | One passive shared watch service; current kinds are `operation_terminal`, `contract_revision_changed`, `task_revision_changed`, `attempt_disposition_changed` and `exact_deadline_reached`. Availability is not a separate `notify_when_available` API. |
+| `coordination.sync_integration` | Store-derived scoped integration sync; advisory coordination does not accept work or wake a model. |
 | `coordination.send` | Typed peer delivery over coordination/raw mailbox primitives. |
-| `swarm.overlap.check` | ELIOT ownership, scope and bounded Git evidence; history is not current ownership. |
+| `swarm.overlap.check` | Recomputed ELIOT ownership, scope and bounded Git evidence; history is not current ownership. |
 | `swarm.agent.steer` | Manager-owned exact `agent.send` semantics, not peer mail. |
 | `swarm.agent.inspect` | One current scoped work/runtime/capability projection. |
 | `swarm.launch` | Linked existing Task/workspace/binding/Participant/runtime admissions, not an MCP-only macro. |
+| `agent.open` | Manager-admitted asynchronous open tied to an exact Task claim and held workspace lease; credential/native-MCP capability and productive dispatch remain gaps. |
 | `swarm.tools.search` | Authorized catalog lookup and loading guidance, not a generic execute-method endpoint. |
 
 Put prompt vocabulary synonyms in search metadata, not additional eager public aliases. Slash notation denotes separate typed methods.

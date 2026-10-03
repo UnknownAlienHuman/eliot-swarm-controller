@@ -1,10 +1,10 @@
 # ELIOT MCP Tool Catalog and Deferred Loading
 ## Small role-specific core, searchable domain groups, hard authorization and verified runtime capability
 
-**Revision:** 1 — 2026-10-03  
-**Source baseline:** `main` at `35e499ae73b622d873c44873f6993ee3fcbea87b`  
-**Applies to:** [Communication Program](agent-communication-program.md), [Fleet-Scale Freedom](agent-communication-fleet-scale-freedom.md), [MCP Profiles](mcp-profiles.md)  
-**Status:** normative catalog contract. C5 commit `b36e84b506a60fb09ecfe7a8adbb6da8e5ed0748` extends CLI/MCP to 88 `ToolSpec` entries and adds canonical consultation, `operation_terminal` watch create/list/cancel with passive inbox/shared tick, and read-only `launch.preview`. C5 Clippy passed in 8.85s and the changed canonical-path Muse selftest passed in 7.4s. C4's 221 Rust tests remain tied to `2607c8858e573ae40459c27d76d8ae9e1ca9f8fc`; C4 CI run 37137719451 failed on Linux environment defaults/Muse fixture realpath, C5 repairs are committed and remote CI is pending. Other watch kinds and actual native-MCP harness loading remain unsupported or unknown.
+**Revision:** 2 — 2026-10-03
+**Source baseline:** published C5 snapshot `a0a931e`; C6 plus the wired local TaskSubmission-intake consumer is committed at `e035c0c3fe855490863be81902c5152b548c42cd`.
+**Applies to:** [Communication Program](agent-communication-program.md), [Fleet-Scale Freedom](agent-communication-fleet-scale-freedom.md), [MCP Profiles](mcp-profiles.md)
+**Status:** normative catalog contract; 91 `ToolSpec` entries are present in the current catalog. Owned-crate formatting and `cargo clippy --locked --lib --bins --no-deps -- -D warnings` passed for `e035c0c3fe855490863be81902c5152b548c42cd` (9.60 s; `.local/qualification/r7-build-gate/clippy-c6-publish-repaired.log`); bounded exact-commit review of C6 privacy, actor, workspace, no-replay and overlap behavior passed as well. No Cargo tests, native process, or model execution ran for this increment; new CI is pending after the main push. C5's published CI run failed on Linux `start_ticks` parsing and the Windows stdout fixture; the source repairs are included, with new CI still pending. C6 includes five passive watch kinds (`operation_terminal`, `contract_revision_changed`, `task_revision_changed`, `attempt_disposition_changed`, `exact_deadline_reached`), integration sync and recomputed overlap. The local TaskSubmission-intake consumer is wired. Separate C7 Participant credential issuance, broader readback, native capability proof, and disposition/lifecycle modules remain unwired source WIP. C4's 221 Rust tests remain tied to `2607c8858e573ae40459c27d76d8ae9e1ca9f8fc`; actual native-MCP harness loading remains unknown.
 **Precedence:** this file governs MCP grouping, eager/deferred loading, catalog metadata and launcher-facing tool UX. Existing application authorization and Task/Attempt authority remain unchanged.
 
 ## 0. Decision
@@ -55,9 +55,9 @@ manual memorization of low-level application method names
 
 ## 1. Current source facts and the exact gap
 
-At baseline `36cfb652`, the MCP facade had 53 typed tools, fixed profiles and profile filtering before local IPC. C4 commit `2607c8858e573ae40459c27d76d8ae9e1ca9f8fc` added 29 methods and 83 `ToolSpec` entries; its 221 Rust tests apply only to that SHA. C5 commit `b36e84b506a60fb09ecfe7a8adbb6da8e5ed0748` extends CLI/MCP to 88 entries. Its backend additions are canonical consultation, `operation_terminal` watches with passive inbox/shared tick and read-only `launch.preview`; other watch kinds remain unsupported. C5 Clippy and the changed canonical-path Muse selftest passed; C4 CI run 37137719451 failed on Linux environment defaults and Muse fixture realpath, with repairs in C5 and remote CI pending. Actual native-MCP harness loading remains unknown, so a registry entry or `tools/list` result is not evidence the model loaded or used that schema.
+At baseline `36cfb652`, the MCP facade had 53 typed tools, fixed profiles and profile filtering before local IPC. C4's 221 Rust tests apply only to `2607c8858e573ae40459c27d76d8ae9e1ca9f8fc`. The current catalog contains 91 `ToolSpec` entries. C6 adds the five passive watch kinds listed above, `coordination.sync_integration`, recomputed `swarm.overlap.check`, and manager-admitted async workspace lease / exact Task claim / `agent.open` work. The local bounded TaskSubmission-intake consumer is committed and wired at `e035c0c3fe855490863be81902c5152b548c42cd`. Owned-crate formatting and warnings-denied Clippy passed for that commit (9.60 s); the bounded exact-commit privacy/actor/workspace/no-replay/overlap review passed. Productive launch remains gated on credential issuance and native-MCP capability proof, and dispatch is not implemented. Separate C7 Participant credential issuance, broader readback, native capability proof, and disposition/lifecycle modules remain unwired source WIP. No Cargo tests, native process, or model execution ran for this increment; new CI is pending after the main push. Actual native-MCP harness loading remains unknown, so a registry entry or `tools/list` result is not evidence the model loaded or used that schema.
 
-The [Canonical MCP Surfaces](mcp-canonical-surfaces-and-topologies.md) document owns exact public names. This document owns group metadata and deferred-loading design. Remaining end-to-end gaps include actual native harness consumption/qualification, productive launch beyond read-only preview, watch kinds beyond `operation_terminal`, integration/scope-Git, Concilium, cron, Goal and native-Rust program paths. Do not replace the application authorization layer with catalog metadata.
+The [Canonical MCP Surfaces](mcp-canonical-surfaces-and-topologies.md) document owns exact public names. This document owns group metadata and deferred-loading design. Remaining end-to-end gaps include actual native harness consumption/qualification, productive dispatch beyond the authored lease/claim/`agent.open` path, watch predicates without authoritative sources, broader integration/scope-Git, Concilium, cron, Goal and native-Rust program paths. Do not replace the application authorization layer with catalog metadata.
 
 ## 2. Evidence-based design constraints
 
@@ -257,7 +257,7 @@ These are high-level application methods. They do not bypass the existing Task, 
 
 ## 4.5 `runtime-control`
 
-Lower-level exact runtime operations, deferred from the normal manager palette:
+Lower-level exact runtime operations. `agent.open` is also admitted in the manager core; the asynchronous Task/workspace admission does not claim productive native dispatch is complete.
 
 ```text
 agent.open
@@ -443,6 +443,7 @@ swarm.dashboard
 swarm.queue.get
 swarm.launch.preview
 swarm.launch
+agent.open
 swarm.agent.inspect
 swarm.agent.steer
 swarm.exceptions.get
