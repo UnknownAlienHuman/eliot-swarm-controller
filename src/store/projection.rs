@@ -213,6 +213,7 @@ pub(super) fn timeline_gap_reference(
         "cursor": item["cursor"],
         "kind": item["kind"],
         "recorded_at_ms": item["recorded_at_ms"],
+        "operation_id": item["operation_id"],
         "gap": gap,
     }))
 }

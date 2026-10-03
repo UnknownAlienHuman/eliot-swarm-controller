@@ -736,7 +736,7 @@ fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config
             model::fields(v, &["after", "limit"])?;
             let (limit, after) = page(v)?;
             let only_mail = method == "message.read";
-            let mut s=db.prepare("SELECT observation_id,kind,payload_json,recorded_at_ms FROM observations WHERE observation_id>?1 AND (?2=0 OR (kind IN ('message.send','task.feedback','check.completed') AND json_extract(payload_json,'$.recipient')=?3)) ORDER BY observation_id LIMIT ?4")?;
+            let mut s=db.prepare("SELECT observation_id,kind,payload_json,recorded_at_ms,operation_id FROM observations WHERE observation_id>?1 AND (?2=0 OR (kind IN ('message.send','task.feedback','check.completed') AND json_extract(payload_json,'$.recipient')=?3)) ORDER BY observation_id LIMIT ?4")?;
             let rows = s
                 .query_map(params![after, only_mail, p.client_id, limit], |r| {
                     Ok((
@@ -744,6 +744,7 @@ fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config
                         r.get::<_, String>(1)?,
                         r.get::<_, String>(2)?,
                         r.get::<_, i64>(3)?,
+                        r.get::<_, Option<String>>(4)?,
                     ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -753,8 +754,8 @@ fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config
             // actually returned, so a limited page never replays or
             // silently skips a source row.
             let mut projected = Vec::with_capacity(rows.len());
-            for (id, kind, raw, time) in rows {
-                projected.push(json!({"cursor":id,"kind":kind,"payload":serde_json::from_str::<Value>(&raw)?,"recorded_at_ms":time}));
+            for (id, kind, raw, time, operation_id) in rows {
+                projected.push(json!({"cursor":id,"kind":kind,"payload":serde_json::from_str::<Value>(&raw)?,"recorded_at_ms":time,"operation_id":operation_id}));
             }
             let limited = projection::limit_items(projected, projection::timeline_gap_reference)?;
             let next = limited
