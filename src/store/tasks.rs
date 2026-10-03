@@ -1,5 +1,5 @@
 #[path = "task_sources.rs"]
-mod task_sources;
+pub(super) mod task_sources;
 
 use super::{acceptance, meta, operations};
 use crate::{

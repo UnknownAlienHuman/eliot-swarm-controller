@@ -15,6 +15,8 @@ use tokio::{
 #[test]
 fn profile_tables_are_closed_and_keep_gm_authority_separate() {
     let expected_observer: std::collections::BTreeSet<&str> = [
+        "swarm.tools.search",
+        "swarm.dashboard",
         "host.status",
         "task.get",
         "task.list",
@@ -80,6 +82,34 @@ fn profile_tables_are_closed_and_keep_gm_authority_separate() {
         "host.mode"
     ));
     assert!(profiles::allows_method(McpToolProfile::Gm, "gm.handover"));
+    assert!(!profiles::allows_method(
+        McpToolProfile::Gm,
+        "automation.config.get"
+    ));
+    assert!(profiles::allows_method(
+        McpToolProfile::Participant,
+        "coordination.work_card.publish"
+    ));
+    assert!(!profiles::allows_method(
+        McpToolProfile::Participant,
+        "task.get"
+    ));
+    assert!(!profiles::allows_method(
+        McpToolProfile::Participant,
+        "coordination.participant.list"
+    ));
+    assert!(profiles::allows_method(
+        McpToolProfile::AssignedReviewer,
+        "review.submit"
+    ));
+    assert!(!profiles::allows_method(
+        McpToolProfile::AssignedReviewer,
+        "task.get"
+    ));
+    assert!(!profiles::allows_method(
+        McpToolProfile::AssignedReviewer,
+        "task.request_changes"
+    ));
     assert!(profiles::allows_method(
         McpToolProfile::Gm,
         "client.register"
@@ -142,6 +172,9 @@ fn local_profile_binding_is_explicit_and_restricted_principals_are_distinct() {
         McpProfileConfig {
             tool_profile: McpToolProfile::Observer,
             expected_client_id: "same-principal".into(),
+            surface: None,
+            deferred_groups: Vec::new(),
+            manual_tools: Vec::new(),
         },
     );
     duplicated.profiles.insert(
@@ -149,6 +182,9 @@ fn local_profile_binding_is_explicit_and_restricted_principals_are_distinct() {
         McpProfileConfig {
             tool_profile: McpToolProfile::Observer,
             expected_client_id: "same-principal".into(),
+            surface: None,
+            deferred_groups: Vec::new(),
+            manual_tools: Vec::new(),
         },
     );
     assert_eq!(duplicated.validate().unwrap_err().code, "CONFIG_ERROR");
@@ -278,11 +314,16 @@ fn test_facade(profile: McpToolProfile, root: PathBuf) -> ProfiledFacade {
 
 #[tokio::test]
 async fn observer_hides_mutation_and_rejects_manual_tool_and_task_cancel_before_ipc() {
-    let nonexistent = std::env::temp_dir().join(format!(
-        "eliot-mcp-profile-no-ipc-{}",
-        crate::model::new_id()
-    ));
-    let facade = test_facade(McpToolProfile::Observer, nonexistent);
+    let host = start_manager_host().await;
+    let operator_credential = bootstrap_credential(&host.dir).unwrap();
+    let facade = ProfiledFacade::new(
+        McpFacade::new(
+            host.dir.clone(),
+            operator_credential,
+            Arc::new(Config::default().ipc),
+        ),
+        McpToolProfile::Observer,
+    );
     let mut client = ProfileClient::connect(facade, true).await;
 
     let listing = client.request("tools/list", json!({})).await.unwrap();
@@ -290,13 +331,14 @@ async fn observer_hides_mutation_and_rejects_manual_tool_and_task_cancel_before_
     assert!(
         tools
             .iter()
-            .any(|tool| tool["name"] == json!("report_attention"))
+            .any(|tool| tool["name"] == json!("swarm_tools_search"))
     );
     assert!(
         tools
             .iter()
-            .any(|tool| tool["name"] == json!("report_capacity"))
+            .any(|tool| tool["name"] == json!("operation_get"))
     );
+    assert!(tools.len() <= catalog::MAX_PAGE_ITEMS);
     assert!(
         tools
             .iter()
@@ -326,16 +368,21 @@ async fn observer_hides_mutation_and_rejects_manual_tool_and_task_cancel_before_
         .expect_err("observer cannot cancel through the Tasks protocol");
     assert_eq!(task_cancel["code"], json!(-32601));
     client.close().await;
+    host.close().await;
 }
 
 #[tokio::test]
 async fn restricted_mutations_require_caller_ids_before_ipc() {
-    let nonexistent = std::env::temp_dir().join(format!(
-        "eliot-mcp-profile-require-id-{}",
-        crate::model::new_id()
-    ));
+    let host = start_manager_host().await;
     let mut manager = ProfileClient::connect(
-        test_facade(McpToolProfile::Manager, nonexistent.clone()),
+        ProfiledFacade::new(
+            McpFacade::new(
+                host.dir.clone(),
+                host.manager_credential.clone(),
+                Arc::new(Config::default().ipc),
+            ),
+            McpToolProfile::Manager,
+        ),
         true,
     )
     .await;
@@ -374,8 +421,18 @@ async fn restricted_mutations_require_caller_ids_before_ipc() {
     assert_eq!(missing_task_id["code"], json!(-32602));
     manager.close().await;
 
-    let mut full =
-        ProfileClient::connect(test_facade(McpToolProfile::Full, nonexistent), false).await;
+    let mut full = ProfileClient::connect(
+        ProfiledFacade::new(
+            McpFacade::new(
+                host.dir.clone(),
+                host.manager_credential.clone(),
+                Arc::new(Config::default().ipc),
+            ),
+            McpToolProfile::Full,
+        ),
+        false,
+    )
+    .await;
     let listing = full.request("tools/list", json!({})).await.unwrap();
     for tool in listing["tools"]
         .as_array()
@@ -392,6 +449,7 @@ async fn restricted_mutations_require_caller_ids_before_ipc() {
         );
     }
     full.close().await;
+    host.close().await;
 }
 
 struct ManagerHost {

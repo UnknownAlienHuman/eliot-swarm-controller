@@ -1,0 +1,2772 @@
+//! Participant-scoped coordination projections over the existing Store.
+//!
+//! The `meta` rows here are small, namespaced current records and exact
+//! relevance indexes. Operations and Observations remain the audit/mailbox
+//! authority; this module adds no schema or Task graph.
+
+use super::{gm, meta, operations, set_meta, tasks};
+use crate::{
+    config::Config,
+    coordination as keys,
+    error::{Error, Result},
+    model::{self, Principal, Role},
+};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use serde_json::{Value, json};
+use std::collections::BTreeSet;
+
+const LIVE_ATTEMPT_STATES: &[&str] = &[
+    "reserved",
+    "running",
+    "submitted",
+    "needs_correction",
+    "recovery_pending",
+];
+const INBOUND_POLICIES: &[&str] = &["pull_only", "safe_boundary", "hold", "refuse"];
+const RELEVANCE_SCAN_FACTOR: i64 = 4;
+
+#[derive(Clone)]
+struct ScopeData {
+    registration: Value,
+    task: Value,
+    attempt: Value,
+    scope_id: String,
+}
+
+#[derive(Clone)]
+struct IndexedCard {
+    client_id: String,
+    card_kind: String,
+    identity: String,
+}
+
+struct ParticipantOperationRecord {
+    caller_id: String,
+    method: String,
+    task_id: Option<String>,
+    attempt_id: Option<String>,
+    binding_id: Option<String>,
+    binding_generation: Option<i64>,
+}
+
+/// The returned value is safe for a participant-facing context projection.
+/// The credential hash and native runtime identity never leave the Store.
+pub(crate) fn current_scope(db: &Connection, principal: &Principal) -> Result<Value> {
+    principal.require_participant()?;
+    let scope = load_current_scope_for_client(db, &principal.client_id)?;
+    Ok(scope_projection(&scope))
+}
+
+/// Enforce current Participant scope before the Store reaches general writer
+/// fallthrough. Apply functions repeat this check in the write transaction.
+pub(crate) fn authorize_participant_mutation(
+    db: &Connection,
+    principal: &Principal,
+    method: &str,
+) -> Result<()> {
+    principal.require_participant()?;
+    if !matches!(
+        method,
+        "coordination.work_card.publish"
+            | "coordination.work_card.withdraw"
+            | "coordination.contract_card.publish"
+            | "coordination.contract_card.withdraw"
+            | "coordination.send"
+    ) {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "participant credentials cannot perform this mutation",
+        ));
+    }
+    load_current_scope(db, principal)?;
+    Ok(())
+}
+
+/// Manager launcher projection helper. It validates exact current assignment
+/// ownership before returning a bounded, redacted local participant page.
+pub(crate) fn list_scope_participants(
+    db: &Connection,
+    principal: &Principal,
+    task_id: &str,
+    task_revision: i64,
+    attempt_id: &str,
+    limit: i64,
+    after_client_id: Option<&str>,
+) -> Result<Value> {
+    let scope = manager_scope(db, principal, task_id, task_revision, attempt_id)?;
+    list_participant_page(db, &scope, limit, after_client_id)
+}
+
+/// Resolve configured auditor profiles through the exact pending-slot index.
+/// This keeps review assignment admission proportional to the matching slot,
+/// rather than walking every credential record in the installation.
+pub(crate) fn find_review_profile_participants(
+    tx: &Transaction<'_>,
+    sponsor_client_id: &str,
+    profile: &str,
+    pending_scope: &Value,
+) -> Result<Vec<String>> {
+    let pending_scope = normalized_review_scope(pending_scope, true)?;
+    if !pending_scope["review_assignment_id"].is_null() {
+        return Err(Error::invalid(
+            "profile lookup requires a pending review scope with null review_assignment_id",
+        ));
+    }
+    let prefix = keys::pending_review_profile_prefix(&pending_scope, sponsor_client_id, profile)?;
+    let upper = format!("{prefix}g");
+    let mut statement = tx
+        .prepare("SELECT key,value_json FROM meta WHERE key>=?1 AND key<?2 ORDER BY key LIMIT 3")?;
+    let rows: Vec<(String, String)> = statement
+        .query_map(params![prefix, upper], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<std::result::Result<_, _>>()?;
+    let mut clients = Vec::with_capacity(rows.len());
+    for (key, raw) in rows {
+        let index: Value = serde_json::from_str(&raw)?;
+        let client_id = model::text(&index, "client_id")?;
+        let registration = participant_registration(tx, client_id)?;
+        if key
+            != keys::pending_review_profile_key(
+                &pending_scope,
+                sponsor_client_id,
+                profile,
+                client_id,
+            )?
+            || index["sponsor_client_id"] != sponsor_client_id
+            || index["review_profile"] != profile
+            || index["review_scope"] != pending_scope
+            || registration["disabled"] == true
+            || registration["review_sponsor_client_id"] != sponsor_client_id
+            || registration["review_profile"] != profile
+            || registration["participation_basis"]["kind"] != "sponsored_reviewer"
+            || registration["participation_basis"]["review_scope"] != pending_scope
+        {
+            return Err(Error::new(
+                "REVIEW_PROFILE_INDEX_DAMAGED",
+                "pending reviewer profile index differs from its exact registration",
+            ));
+        }
+        clients.push(client_id.to_owned());
+    }
+    Ok(clients)
+}
+
+/// Bind a pre-registered sponsored reviewer to the server-generated slot ID.
+/// Review assignment creation and this update must share one SQLite
+/// transaction. The pending credential cannot perform any participant call.
+pub(crate) fn bind_review_assignment(
+    tx: &Transaction<'_>,
+    reviewer_client_id: &str,
+    review_assignment_id: &str,
+    sponsor_client_id: &str,
+    exact_scope: &Value,
+) -> Result<()> {
+    let mut scope = normalized_review_scope(exact_scope, true)?;
+    if review_assignment_id.trim().is_empty()
+        || review_assignment_id.len() > 128
+        || review_assignment_id
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        return Err(Error::invalid(
+            "review_assignment_id must be 1..=128 bytes without whitespace",
+        ));
+    }
+    if scope["review_assignment_id"] != Value::Null {
+        return Err(Error::conflict(
+            "review scope is already bound to a review assignment",
+        ));
+    }
+    let key = format!("client:{reviewer_client_id}");
+    let mut registration = meta(tx, &key)?
+        .ok_or_else(|| Error::new("NOT_FOUND", "sponsored reviewer is not registered"))?;
+    if registration["role"] != "participant"
+        || registration["disabled"] == true
+        || registration["participation_basis"]["kind"] != "sponsored_reviewer"
+        || registration["review_sponsor_client_id"] != sponsor_client_id
+        || registration["participation_basis"]["review_scope"] != scope
+    {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "participant registration does not match this review sponsor and slot",
+        ));
+    }
+    validate_pending_review_tuple(tx, &scope)?;
+    if let Some(profile) = registration["review_profile"].as_str() {
+        tx.execute(
+            "DELETE FROM meta WHERE key=?1",
+            [keys::pending_review_profile_key(
+                &scope,
+                sponsor_client_id,
+                profile,
+                reviewer_client_id,
+            )?],
+        )?;
+    }
+    scope["review_assignment_id"] = json!(review_assignment_id);
+    registration["participation_basis"]["review_scope"] = scope;
+    set_meta(tx, &key, &registration)
+}
+
+/// Live assigned-review authority, suitable for packet/context reads and
+/// ordinary review actions. It requires the Task revision and Attempt to
+/// remain current.
+pub(crate) fn require_review_scope(
+    db: &Connection,
+    principal: &Principal,
+    review_assignment_id: &str,
+    exact_scope: &Value,
+) -> Result<()> {
+    let scope = normalized_review_scope(exact_scope, false)?;
+    if scope["review_assignment_id"] != review_assignment_id {
+        return Err(Error::new("FORBIDDEN", "review assignment scope mismatch"));
+    }
+    let current = load_current_scope(db, principal)?;
+    require_sponsored_scope(&current, &scope)?;
+    verify_review_assignment(
+        db,
+        principal.client_id.as_str(),
+        &current.registration,
+        &scope,
+    )
+}
+
+/// Narrow late-result authority for an already assigned reviewer. This helper
+/// deliberately skips only current Task/Attempt lifecycle equality; the exact
+/// retained tuple, enabled credential, sponsor and assignment evidence remain
+/// mandatory. Call it only from the exact assigned-slot result path.
+pub(crate) fn require_historical_review_result_scope(
+    db: &Connection,
+    principal: &Principal,
+    review_assignment_id: &str,
+    exact_scope: &Value,
+) -> Result<()> {
+    principal.require_participant()?;
+    let scope = normalized_review_scope(exact_scope, false)?;
+    if scope["review_assignment_id"] != review_assignment_id {
+        return Err(Error::new("FORBIDDEN", "review assignment scope mismatch"));
+    }
+    let registration = participant_registration(db, &principal.client_id)?;
+    if registration["disabled"] == true {
+        return Err(Error::new(
+            "UNAUTHORIZED",
+            "participant credential disabled",
+        ));
+    }
+    if registration["participation_basis"]["kind"] != "sponsored_reviewer"
+        || registration["participation_basis"]["review_scope"] != scope
+    {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "participant is not assigned to this exact review slot",
+        ));
+    }
+    validate_retained_review_tuple(db, &scope)?;
+    verify_review_assignment(db, &principal.client_id, &registration, &scope)
+}
+
+/// Canonical typed message request -> existing raw mailbox request. The caller
+/// must invoke this inside the message batch's transaction, then pass the
+/// result to the existing `message.send` apply branch. That preserves the
+/// single Operation, receipt, digest and durable mailbox primitive.
+pub(crate) fn normalize_send(
+    db: &Connection,
+    principal: &Principal,
+    value: &Value,
+) -> Result<Value> {
+    principal.require_participant()?;
+    model::fields(value, &["client_request_id", "recipient", "body"])?;
+    model::text(value, "client_request_id")?;
+    let sender = load_current_scope(db, principal)?;
+    let recipient = model::text(value, "recipient")?;
+    if recipient == principal.client_id {
+        return Err(Error::invalid("coordination.send cannot target the sender"));
+    }
+    let recipient_registration = participant_registration(db, recipient)?;
+    if recipient_registration["disabled"] == true {
+        return Err(Error::new(
+            "STALE_PARTICIPANT",
+            "recipient is no longer active",
+        ));
+    }
+    if recipient_registration["inbound_policy"] == "refuse" {
+        return Err(Error::new(
+            "DELIVERY_REFUSED",
+            "recipient inbound policy refuses coordination delivery",
+        ));
+    }
+    let target = load_current_scope_for_client(db, recipient)?;
+    if target.scope_id != sender.scope_id {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "coordination delivery must target a participant in the exact Task/Attempt scope",
+        ));
+    }
+    let body = value
+        .get("body")
+        .filter(|body| !body.is_null())
+        .ok_or_else(|| Error::invalid("body must be a non-null JSON value"))?;
+    let envelope = json!({
+        "schema": "eliot.coordination.message.v1",
+        "task_id": sender.task["task_id"],
+        "task_revision": sender.task["revision"],
+        "attempt_id": sender.attempt["attempt_id"],
+        "sender": principal.client_id,
+        "recipient": recipient,
+        "body": body,
+    });
+    let text = model::canonical(&envelope)?;
+    if text.len() > keys::MAX_MESSAGE_BYTES {
+        return Err(Error::invalid(format!(
+            "coordination message exceeds the {}-byte limit",
+            keys::MAX_MESSAGE_BYTES
+        )));
+    }
+    Ok(json!({
+        "client_request_id": value["client_request_id"],
+        "recipient": recipient,
+        "text": text,
+    }))
+}
+
+/// Dedicated participant read dispatch. Store-level routing must call this
+/// only after the current authenticated principal has been reloaded.
+pub(super) fn read(
+    db: &Connection,
+    principal: &Principal,
+    method: &str,
+    value: &Value,
+) -> Result<Value> {
+    match method {
+        "swarm.context.get" => context_get(db, principal, value),
+        "coordination.participant.get" => participant_get(db, principal, value),
+        "coordination.participant.list" => participant_list(db, principal, value),
+        "coordination.peer.find" => peer_find(db, principal, value),
+        "coordination.work_card.get" => card_get(db, principal, "work", value),
+        "coordination.work_card.list" => card_list(db, principal, "work", value),
+        "coordination.contract_card.get" => card_get(db, principal, "contract", value),
+        "coordination.contract_card.list" => card_list(db, principal, "contract", value),
+        "coordination.inbox" => inbox(db, principal, value),
+        "operation.get" => participant_operation_get(db, principal, value),
+        _ => Err(Error::new(
+            "METHOD_NOT_FOUND",
+            format!("{method} is not an implemented coordination read"),
+        )),
+    }
+}
+
+/// Dedicated coordination mutations. Normal Store receipt handling owns the
+/// outer Operation/Observation; every helper below writes only inside that
+/// transaction and reports no native/queued effect.
+pub(super) fn apply(
+    tx: &Transaction<'_>,
+    principal: &Principal,
+    method: &str,
+    value: &Value,
+    config: &Config,
+    operation_id: &str,
+    now: i64,
+) -> Result<(Value, bool)> {
+    match method {
+        "coordination.participant.register" => {
+            register_participant(tx, principal, value, operation_id, now)
+                .map(|value| (value, false))
+        }
+        "coordination.participant.disable" => {
+            disable_participant(tx, principal, value, operation_id, now).map(|value| (value, false))
+        }
+        "coordination.work_card.publish" => {
+            publish_card(tx, principal, "work", value, operation_id, now)
+                .map(|value| (value, false))
+        }
+        "coordination.work_card.withdraw" => {
+            withdraw_card(tx, principal, "work", value, operation_id, now)
+                .map(|value| (value, false))
+        }
+        "coordination.contract_card.publish" => {
+            publish_card(tx, principal, "contract", value, operation_id, now)
+                .map(|value| (value, false))
+        }
+        "coordination.contract_card.withdraw" => {
+            withdraw_card(tx, principal, "contract", value, operation_id, now)
+                .map(|value| (value, false))
+        }
+        "coordination.send" => {
+            send(tx, principal, value, config, operation_id, now).map(|value| (value, false))
+        }
+        _ => Err(Error::new(
+            "METHOD_NOT_FOUND",
+            format!("{method} is not an implemented coordination mutation"),
+        )),
+    }
+}
+
+fn participant_registration(db: &Connection, client_id: &str) -> Result<Value> {
+    let registration = meta(db, &format!("client:{client_id}"))?
+        .ok_or_else(|| Error::new("NOT_FOUND", "participant is not registered"))?;
+    if registration["role"] != "participant" {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "target identity is not a coordination participant",
+        ));
+    }
+    Ok(registration)
+}
+
+fn load_current_scope(db: &Connection, principal: &Principal) -> Result<ScopeData> {
+    principal.require_participant()?;
+    load_current_scope_for_client(db, &principal.client_id)
+}
+
+fn load_current_scope_for_client(db: &Connection, client_id: &str) -> Result<ScopeData> {
+    let registration = participant_registration(db, client_id)?;
+    if registration["disabled"] == true {
+        return Err(Error::new(
+            "UNAUTHORIZED",
+            "participant credential disabled",
+        ));
+    }
+    let task_id = required_registration_text(&registration, "task_id")?;
+    let attempt_id = required_registration_text(&registration, "attempt_id")?;
+    let task_revision = registration["task_revision"]
+        .as_i64()
+        .filter(|revision| *revision > 0)
+        .ok_or_else(|| {
+            Error::new(
+                "STALE_PARTICIPANT",
+                "participant has no valid Task revision",
+            )
+        })?;
+    let task = tasks::get_task(db, task_id)
+        .map_err(|_| Error::new("STALE_PARTICIPANT", "participant Task no longer exists"))?;
+    if task["revision"] != task_revision
+        || task["current_attempt_id"] != attempt_id
+        || task["state"] != "open"
+    {
+        return Err(Error::new(
+            "STALE_PARTICIPANT",
+            "participant Task revision or current Attempt changed",
+        ));
+    }
+    let attempt = tasks::get_attempt(db, attempt_id)
+        .map_err(|_| Error::new("STALE_PARTICIPANT", "participant Attempt no longer exists"))?;
+    validate_current_attempt(&task, &attempt, task_id, task_revision, attempt_id)?;
+    validate_registration_binding(&registration, &attempt)?;
+    validate_participation_basis(db, client_id, &registration, &task, &attempt, false)?;
+    let scope_id = keys::scope_id(task_id, task_revision, attempt_id)?;
+    Ok(ScopeData {
+        registration,
+        task,
+        attempt,
+        scope_id,
+    })
+}
+
+fn validate_current_attempt(
+    task: &Value,
+    attempt: &Value,
+    task_id: &str,
+    task_revision: i64,
+    attempt_id: &str,
+) -> Result<()> {
+    if attempt["attempt_id"] != attempt_id
+        || attempt["task_id"] != task_id
+        || attempt["task_revision"] != task_revision
+        || !attempt["released_at_ms"].is_null()
+        || !LIVE_ATTEMPT_STATES.contains(&attempt["state"].as_str().unwrap_or(""))
+    {
+        return Err(Error::new(
+            "STALE_PARTICIPANT",
+            "participant Attempt is no longer current and writable",
+        ));
+    }
+    if task["current_attempt_id"] != attempt_id || task["revision"] != task_revision {
+        return Err(Error::new(
+            "STALE_PARTICIPANT",
+            "participant Attempt no longer matches the current Task revision",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_registration_binding(registration: &Value, attempt: &Value) -> Result<()> {
+    let binding_id = registration.get("binding_id").unwrap_or(&Value::Null);
+    let generation = registration
+        .get("binding_generation")
+        .unwrap_or(&Value::Null);
+    let attempt_binding_id = attempt.get("binding_id").unwrap_or(&Value::Null);
+    let attempt_generation = attempt.get("binding_generation").unwrap_or(&Value::Null);
+    if binding_id.is_null() != generation.is_null() {
+        return Err(Error::new(
+            "STALE_PARTICIPANT",
+            "participant binding identity is incomplete",
+        ));
+    }
+    if attempt_binding_id.is_null() != attempt_generation.is_null()
+        || binding_id != attempt_binding_id
+        || generation != attempt_generation
+    {
+        return Err(Error::new(
+            "STALE_PARTICIPANT",
+            "participant binding generation no longer matches the Attempt",
+        ));
+    }
+    if let Some(session_id) = registration
+        .get("native_session_id")
+        .and_then(Value::as_str)
+    {
+        let present = attempt["producers"].as_array().is_some_and(|producers| {
+            producers.iter().any(|producer| {
+                producer["native_session_id"] == session_id
+                    && !matches!(
+                        producer["disposition"].as_str(),
+                        Some("completed" | "failed" | "cancelled")
+                    )
+            })
+        });
+        if !present {
+            return Err(Error::new(
+                "STALE_PARTICIPANT",
+                "participant native session is no longer a current Attempt producer",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_participation_basis(
+    db: &Connection,
+    client_id: &str,
+    registration: &Value,
+    task: &Value,
+    attempt: &Value,
+    historical_review: bool,
+) -> Result<()> {
+    let basis = &registration["participation_basis"];
+    match basis["kind"].as_str() {
+        Some("attempt_owner") => {
+            if basis
+                .get("assignment_id")
+                .is_some_and(|value| !value.is_null())
+                || basis
+                    .get("review_scope")
+                    .is_some_and(|value| !value.is_null())
+                || registration["created_by"] != attempt["owner_id"]
+            {
+                return Err(Error::new(
+                    "STALE_PARTICIPANT",
+                    "attempt-owner participation basis no longer matches the Attempt owner",
+                ));
+            }
+        }
+        Some("producer_ref") => {
+            if basis
+                .get("review_scope")
+                .is_some_and(|value| !value.is_null())
+            {
+                return Err(Error::new(
+                    "STALE_PARTICIPANT",
+                    "producer participation basis contains review scope",
+                ));
+            }
+            let assignment_id = basis
+                .get("assignment_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| Error::new("STALE_PARTICIPANT", "producer assignment is missing"))?;
+            let producer = matching_producer(attempt, assignment_id).ok_or_else(|| {
+                Error::new(
+                    "STALE_PARTICIPANT",
+                    "producer assignment is no longer present on the Attempt",
+                )
+            })?;
+            if matches!(
+                producer["disposition"].as_str(),
+                Some("completed" | "failed" | "cancelled")
+            ) {
+                return Err(Error::new(
+                    "STALE_PARTICIPANT",
+                    "producer assignment is already terminal",
+                ));
+            }
+            if let Some(session_id) = registration["native_session_id"].as_str()
+                && producer["native_session_id"] != session_id
+            {
+                return Err(Error::new(
+                    "STALE_PARTICIPANT",
+                    "producer reference changed its native session identity",
+                ));
+            }
+        }
+        Some("sponsored_reviewer") => {
+            if basis
+                .get("assignment_id")
+                .is_some_and(|value| !value.is_null())
+            {
+                return Err(Error::new(
+                    "STALE_PARTICIPANT",
+                    "sponsored review uses review_scope, not a producer assignment",
+                ));
+            }
+            let scope = normalized_review_scope(
+                basis
+                    .get("review_scope")
+                    .ok_or_else(|| Error::new("STALE_PARTICIPANT", "review scope is missing"))?,
+                historical_review,
+            )?;
+            if scope["task_id"] != task["task_id"]
+                || scope["attempt_id"] != attempt["attempt_id"]
+                || scope["task_revision"] != task["revision"]
+                || scope["submission_ref"] != attempt["submission_ref"]
+                || scope["candidate_ref"] != attempt["candidate_ref"]
+            {
+                return Err(Error::new(
+                    "STALE_PARTICIPANT",
+                    "sponsored review tuple no longer matches the Attempt candidate",
+                ));
+            }
+            if scope["review_assignment_id"].is_null() {
+                return Err(Error::new(
+                    "PARTICIPANT_NOT_ASSIGNED",
+                    "sponsored reviewer is waiting for an exact review assignment",
+                ));
+            }
+            if historical_review {
+                validate_retained_review_tuple(db, &scope)?;
+            } else {
+                verify_review_assignment(db, client_id, registration, &scope)?;
+            }
+        }
+        _ => {
+            return Err(Error::new(
+                "STALE_PARTICIPANT",
+                "participant has an unsupported participation basis",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn matching_producer<'a>(attempt: &'a Value, assignment_id: &str) -> Option<&'a Value> {
+    let matches: Vec<&Value> = attempt["producers"]
+        .as_array()?
+        .iter()
+        .filter(|producer| producer["assignment_id"] == assignment_id)
+        .collect();
+    if matches.len() == 1 {
+        matches.first().copied()
+    } else {
+        None
+    }
+}
+
+fn scope_projection(scope: &ScopeData) -> Value {
+    let producers: Vec<Value> = scope.attempt["producers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|producer| {
+            json!({
+                "assignment_id": producer.get("assignment_id").cloned().unwrap_or(Value::Null),
+                "disposition": producer.get("disposition").cloned().unwrap_or(Value::Null),
+            })
+        })
+        .take(100)
+        .collect();
+    let mut task = json!({
+        "task_id": scope.task["task_id"],
+        "project_id": scope.task["project_id"],
+        "revision": scope.task["revision"],
+        "state": scope.task["state"],
+        "brief": scope.task["task_brief"],
+    });
+    if let Some(sources) = scope.task["task_brief"].get("source_index") {
+        task["canonical_sources"] = sources.clone();
+    }
+    let attempt = json!({
+        "attempt_id": scope.attempt["attempt_id"],
+        "task_revision": scope.attempt["task_revision"],
+        "owner_id": scope.attempt["owner_id"],
+        "state": scope.attempt["state"],
+        "binding_id": scope.attempt["binding_id"],
+        "binding_generation": scope.attempt["binding_generation"],
+        "submission_ref": scope.attempt["submission_ref"],
+        "candidate_ref": scope.attempt["candidate_ref"],
+        "producer_refs": producers,
+        "producer_refs_truncated": scope.attempt["producers"].as_array().is_some_and(|items| items.len() > 100),
+    });
+    json!({
+        "scope_id": scope.scope_id,
+        "participant": public_registration(&scope.registration),
+        "task": task,
+        "attempt": attempt,
+    })
+}
+
+fn public_registration(registration: &Value) -> Value {
+    let mut public = registration.clone();
+    if let Some(object) = public.as_object_mut() {
+        for name in [
+            "token_hash",
+            "native_session_id",
+            "created_by",
+            "review_sponsor_client_id",
+        ] {
+            object.remove(name);
+        }
+    }
+    public
+}
+
+fn authorize_attempt_manager(
+    db: &Connection,
+    principal: &Principal,
+    attempt: &Value,
+) -> Result<()> {
+    if principal.role == Role::Operator {
+        return super::require_local_operator(db, &principal.client_id);
+    }
+    if principal.role == Role::Manager && attempt["owner_id"] == principal.client_id {
+        return Ok(());
+    }
+    if principal.role == Role::Manager {
+        return gm::require_authority(db, principal);
+    }
+    Err(Error::new(
+        "FORBIDDEN",
+        "current Attempt owner, local operator, or current GM authority required",
+    ))
+}
+
+fn manager_scope(
+    db: &Connection,
+    principal: &Principal,
+    task_id: &str,
+    task_revision: i64,
+    attempt_id: &str,
+) -> Result<ScopeData> {
+    let task = tasks::get_task(db, task_id)?;
+    if task["revision"] != task_revision
+        || task["state"] != "open"
+        || task["current_attempt_id"] != attempt_id
+    {
+        return Err(Error::new(
+            "STALE_REVISION",
+            "requested Task/Attempt scope is not current",
+        ));
+    }
+    let attempt = tasks::get_attempt(db, attempt_id)?;
+    validate_current_attempt(&task, &attempt, task_id, task_revision, attempt_id)?;
+    authorize_attempt_manager(db, principal, &attempt)?;
+    Ok(ScopeData {
+        registration: Value::Null,
+        task,
+        attempt,
+        scope_id: keys::scope_id(task_id, task_revision, attempt_id)?,
+    })
+}
+
+fn register_participant(
+    tx: &Transaction<'_>,
+    principal: &Principal,
+    value: &Value,
+    operation_id: &str,
+    now: i64,
+) -> Result<Value> {
+    model::fields(
+        value,
+        &[
+            "client_request_id",
+            "client_id",
+            "token_hash",
+            "task_id",
+            "task_revision",
+            "attempt_id",
+            "participation_basis",
+            "binding_id",
+            "binding_generation",
+            "native_session_id",
+            "display_alias",
+            "inbound_policy",
+            "review_profile",
+        ],
+    )?;
+    let client_id = model::text(value, "client_id")?;
+    validate_identifier(client_id, "client_id", 128)?;
+    let token_hash = model::text(value, "token_hash")?;
+    if token_hash.len() != 64 || !token_hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(Error::invalid("token_hash must be SHA-256 hex"));
+    }
+    if meta(tx, &format!("client:{client_id}"))?.is_some() {
+        return Err(Error::conflict(
+            "client already registered; no implicit credential rotation",
+        ));
+    }
+    let task_id = model::text(value, "task_id")?;
+    let task_revision = model::positive(value, "task_revision")?;
+    let attempt_id = model::text(value, "attempt_id")?;
+    let task = tasks::get_task(tx, task_id)?;
+    if task["revision"] != task_revision
+        || task["state"] != "open"
+        || task["current_attempt_id"] != attempt_id
+    {
+        return Err(Error::new(
+            "STALE_REVISION",
+            "participant registration requires the exact current Task revision and Attempt",
+        ));
+    }
+    let attempt = tasks::get_attempt(tx, attempt_id)?;
+    validate_current_attempt(&task, &attempt, task_id, task_revision, attempt_id)?;
+    authorize_attempt_manager(tx, principal, &attempt)?;
+
+    let basis = normalize_basis(
+        tx,
+        value.get("participation_basis"),
+        principal,
+        &task,
+        &attempt,
+    )?;
+    let requested_binding_id = optional_nonempty_text(value.get("binding_id"), "binding_id")?;
+    let requested_binding_generation =
+        optional_positive_value(value.get("binding_generation"), "binding_generation")?;
+    if requested_binding_id.is_some() != requested_binding_generation.is_some() {
+        return Err(Error::invalid(
+            "binding_id and binding_generation must be supplied together",
+        ));
+    }
+    let binding_id = optional_nonempty_text(attempt.get("binding_id"), "Attempt binding_id")?;
+    let binding_generation = optional_positive_value(
+        attempt.get("binding_generation"),
+        "Attempt binding_generation",
+    )?;
+    if binding_id.is_some() != binding_generation.is_some() {
+        return Err(Error::new(
+            "STALE_PARTICIPANT",
+            "current Attempt binding identity is incomplete",
+        ));
+    }
+    if let (Some(requested_id), Some(requested_generation)) = (
+        requested_binding_id.as_deref(),
+        requested_binding_generation,
+    ) && (binding_id.as_deref() != Some(requested_id)
+        || binding_generation != Some(requested_generation))
+    {
+        return Err(Error::new(
+            "STALE_PARTICIPANT",
+            "participant binding must match the current Attempt binding generation",
+        ));
+    }
+    let native_session_id =
+        optional_nonempty_text(value.get("native_session_id"), "native_session_id")?;
+    if let Some(session_id) = native_session_id.as_deref() {
+        let producer_ok = match basis["kind"].as_str() {
+            Some("producer_ref") => matching_producer(
+                &attempt,
+                basis["assignment_id"].as_str().unwrap_or_default(),
+            )
+            .is_some_and(|producer| producer["native_session_id"] == session_id),
+            _ => attempt["producers"].as_array().is_some_and(|producers| {
+                producers.iter().any(|producer| {
+                    producer["native_session_id"] == session_id
+                        && !matches!(
+                            producer["disposition"].as_str(),
+                            Some("completed" | "failed" | "cancelled")
+                        )
+                })
+            }),
+        };
+        if !producer_ok {
+            return Err(Error::new(
+                "STALE_PARTICIPANT",
+                "native_session_id does not identify a current producer on this Attempt",
+            ));
+        }
+    }
+    let alias = value
+        .get("display_alias")
+        .and_then(Value::as_str)
+        .unwrap_or(client_id);
+    validate_identifier(alias, "display_alias", 128)?;
+    let policy = value
+        .get("inbound_policy")
+        .and_then(Value::as_str)
+        .unwrap_or("pull_only");
+    if !INBOUND_POLICIES.contains(&policy) {
+        return Err(Error::invalid(
+            "inbound_policy must be pull_only, safe_boundary, hold, or refuse",
+        ));
+    }
+    let review_profile = optional_nonempty_text(value.get("review_profile"), "review_profile")?;
+    if review_profile
+        .as_deref()
+        .is_some_and(|profile| profile.len() > 128)
+    {
+        return Err(Error::invalid(
+            "review_profile may contain at most 128 bytes",
+        ));
+    }
+    if review_profile.is_some() && basis["kind"] != "sponsored_reviewer" {
+        return Err(Error::invalid(
+            "review_profile is only valid for sponsored reviewers",
+        ));
+    }
+    let scope_id = keys::scope_id(task_id, task_revision, attempt_id)?;
+    let registration = json!({
+        "role": "participant",
+        "token_hash": token_hash.to_lowercase(),
+        "disabled": false,
+        "task_id": task_id,
+        "task_revision": task_revision,
+        "attempt_id": attempt_id,
+        "participation_basis": basis,
+        "binding_id": binding_id,
+        "binding_generation": binding_generation,
+        "native_session_id": native_session_id,
+        "display_alias": alias,
+        "inbound_policy": policy,
+        "grant_revision": 1,
+        "created_by": principal.client_id,
+        "created_operation_id": operation_id,
+        "created_at_ms": now,
+        "review_sponsor_client_id": if review_profile.is_some() || basis["kind"] == "sponsored_reviewer" { json!(principal.client_id) } else { Value::Null },
+        "review_profile": review_profile,
+    });
+    set_meta(tx, &format!("client:{client_id}"), &registration)?;
+    set_meta(
+        tx,
+        &keys::participant_key(&scope_id, client_id),
+        &json!({"client_id":client_id,"grant_revision":1}),
+    )?;
+    if basis["kind"] == "sponsored_reviewer"
+        && let Some(profile) = review_profile.as_deref()
+    {
+        let review_scope = &basis["review_scope"];
+        let sponsor_client_id = principal.client_id.as_str();
+        set_meta(
+            tx,
+            &keys::pending_review_profile_key(review_scope, sponsor_client_id, profile, client_id)?,
+            &json!({
+                "client_id":client_id,
+                "sponsor_client_id":sponsor_client_id,
+                "review_profile":profile,
+                "review_scope":review_scope,
+            }),
+        )?;
+    }
+    attach_operation_scope(tx, operation_id, task_id, attempt_id, &attempt)?;
+    Ok(json!({
+        "operation_id": operation_id,
+        "client_id": client_id,
+        "role": "participant",
+        "task_id": task_id,
+        "task_revision": task_revision,
+        "attempt_id": attempt_id,
+        "participation_basis": basis,
+        "grant_revision": 1,
+        "inbound_policy": policy,
+        "review_profile": review_profile,
+        "usable": basis["kind"] != "sponsored_reviewer",
+    }))
+}
+
+fn normalize_basis(
+    db: &Connection,
+    value: Option<&Value>,
+    principal: &Principal,
+    task: &Value,
+    attempt: &Value,
+) -> Result<Value> {
+    let basis = value.ok_or_else(|| Error::invalid("participation_basis is required"))?;
+    model::fields(basis, &["kind", "assignment_id", "review_scope"])?;
+    match model::text(basis, "kind")? {
+        "attempt_owner" => {
+            if basis
+                .get("assignment_id")
+                .is_some_and(|value| !value.is_null())
+                || basis
+                    .get("review_scope")
+                    .is_some_and(|value| !value.is_null())
+                || principal.client_id != attempt["owner_id"].as_str().unwrap_or_default()
+            {
+                return Err(Error::new(
+                    "FORBIDDEN",
+                    "attempt_owner participation must be sponsored by the exact Attempt owner",
+                ));
+            }
+            Ok(json!({"kind":"attempt_owner","assignment_id":null,"review_scope":null}))
+        }
+        "producer_ref" => {
+            if basis
+                .get("review_scope")
+                .is_some_and(|value| !value.is_null())
+            {
+                return Err(Error::invalid(
+                    "producer_ref participation cannot carry review_scope",
+                ));
+            }
+            let assignment_id = model::text(basis, "assignment_id")?;
+            let producer = matching_producer(attempt, assignment_id).ok_or_else(|| {
+                Error::new(
+                    "NOT_FOUND",
+                    "assignment_id is not one exact ProducerRef on the current Attempt",
+                )
+            })?;
+            if matches!(
+                producer["disposition"].as_str(),
+                Some("completed" | "failed" | "cancelled")
+            ) {
+                return Err(Error::new(
+                    "STALE_PARTICIPANT",
+                    "terminal ProducerRef cannot sponsor a current participant",
+                ));
+            }
+            Ok(json!({
+                "kind":"producer_ref",
+                "assignment_id":assignment_id,
+                "review_scope":null,
+            }))
+        }
+        "sponsored_reviewer" => {
+            if basis
+                .get("assignment_id")
+                .is_some_and(|value| !value.is_null())
+            {
+                return Err(Error::invalid(
+                    "sponsored_reviewer uses review_scope and cannot name a ProducerRef",
+                ));
+            }
+            let scope = normalized_review_scope(
+                basis
+                    .get("review_scope")
+                    .ok_or_else(|| Error::invalid("sponsored_reviewer requires review_scope"))?,
+                true,
+            )?;
+            if scope["task_id"] != task["task_id"]
+                || scope["attempt_id"] != attempt["attempt_id"]
+                || scope["task_revision"] != task["revision"]
+                || scope["submission_ref"] != attempt["submission_ref"]
+                || scope["candidate_ref"] != attempt["candidate_ref"]
+            {
+                return Err(Error::new(
+                    "STALE_REVISION",
+                    "review scope must identify the exact current submitted candidate",
+                ));
+            }
+            if attempt["state"] != "submitted"
+                || scope["submission_ref"].is_null()
+                || scope["candidate_ref"].is_null()
+            {
+                return Err(Error::new(
+                    "STALE_REVISION",
+                    "sponsored review requires a submitted Attempt with retained candidate refs",
+                ));
+            }
+            validate_pending_review_tuple(db, &scope)?;
+            Ok(json!({
+                "kind":"sponsored_reviewer",
+                "assignment_id":null,
+                "review_scope":scope,
+            }))
+        }
+        _ => Err(Error::invalid(
+            "participation_basis.kind must be attempt_owner, producer_ref, or sponsored_reviewer",
+        )),
+    }
+}
+
+fn disable_participant(
+    tx: &Transaction<'_>,
+    principal: &Principal,
+    value: &Value,
+    operation_id: &str,
+    now: i64,
+) -> Result<Value> {
+    model::fields(
+        value,
+        &["client_request_id", "client_id", "expected_grant_revision"],
+    )?;
+    let client_id = model::text(value, "client_id")?;
+    let mut registration = participant_registration(tx, client_id)?;
+    let task_id = required_registration_text(&registration, "task_id")?.to_owned();
+    let attempt_id = required_registration_text(&registration, "attempt_id")?.to_owned();
+    let task_revision = registration["task_revision"].as_i64().unwrap_or_default();
+    let attempt = tasks::get_attempt(tx, &attempt_id)?;
+    if attempt["task_id"] != task_id || attempt["task_revision"] != task_revision {
+        return Err(Error::new(
+            "STALE_PARTICIPANT",
+            "participant registration no longer points at its original Attempt",
+        ));
+    }
+    authorize_attempt_manager(tx, principal, &attempt)?;
+    if let Some(expected) = value.get("expected_grant_revision") {
+        let expected = expected
+            .as_i64()
+            .filter(|revision| *revision > 0)
+            .ok_or_else(|| Error::invalid("expected_grant_revision must be positive"))?;
+        if registration["grant_revision"] != expected {
+            return Err(Error::new(
+                "STALE_REVISION",
+                "participant grant revision changed",
+            ));
+        }
+    }
+    let changed = registration["disabled"] != true;
+    if changed {
+        registration["disabled"] = json!(true);
+        registration["grant_revision"] = json!(
+            registration["grant_revision"]
+                .as_i64()
+                .unwrap_or(1)
+                .saturating_add(1)
+        );
+        registration["revoked_by"] = json!(principal.client_id);
+        registration["revoked_at_ms"] = json!(now);
+        registration["revocation_operation_id"] = json!(operation_id);
+        set_meta(tx, &format!("client:{client_id}"), &registration)?;
+        let scope_id = keys::scope_id(&task_id, task_revision, &attempt_id)?;
+        tx.execute(
+            "DELETE FROM meta WHERE key=?1",
+            [keys::participant_key(&scope_id, client_id)],
+        )?;
+        if registration["participation_basis"]["kind"] == "sponsored_reviewer"
+            && registration["participation_basis"]["review_scope"]["review_assignment_id"].is_null()
+            && let Some(profile) = registration["review_profile"].as_str()
+        {
+            tx.execute(
+                "DELETE FROM meta WHERE key=?1",
+                [keys::pending_review_profile_key(
+                    &registration["participation_basis"]["review_scope"],
+                    registration["review_sponsor_client_id"]
+                        .as_str()
+                        .unwrap_or_default(),
+                    profile,
+                    client_id,
+                )?],
+            )?;
+        }
+    }
+    attach_operation_scope(tx, operation_id, &task_id, &attempt_id, &attempt)?;
+    Ok(json!({
+        "operation_id": operation_id,
+        "client_id": client_id,
+        "disabled": true,
+        "changed": changed,
+        "grant_revision": registration["grant_revision"],
+        "coordination_history_erased": false,
+    }))
+}
+
+fn validate_identifier(value: &str, name: &str, max: usize) -> Result<()> {
+    if value.is_empty()
+        || value.len() > max
+        || value
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        return Err(Error::invalid(format!(
+            "{name} must be 1..={max} bytes without whitespace"
+        )));
+    }
+    Ok(())
+}
+
+fn optional_nonempty_text(value: Option<&Value>, name: &str) -> Result<Option<String>> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if !value.trim().is_empty() => Ok(Some(value.clone())),
+        Some(_) => Err(Error::invalid(format!(
+            "{name} must be nonempty text or null"
+        ))),
+    }
+}
+
+fn optional_positive_value(value: Option<&Value>, name: &str) -> Result<Option<i64>> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(number)) => number
+            .as_i64()
+            .filter(|value| *value > 0)
+            .map(Some)
+            .ok_or_else(|| Error::invalid(format!("{name} must be a positive integer or null"))),
+        Some(_) => Err(Error::invalid(format!(
+            "{name} must be a positive integer or null"
+        ))),
+    }
+}
+
+fn required_registration_text<'a>(registration: &'a Value, field: &str) -> Result<&'a str> {
+    registration
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| Error::new("STALE_PARTICIPANT", format!("registration lacks {field}")))
+}
+
+fn attach_operation_scope(
+    tx: &Transaction<'_>,
+    operation_id: &str,
+    task_id: &str,
+    attempt_id: &str,
+    attempt: &Value,
+) -> Result<()> {
+    tx.execute(
+        "UPDATE operations SET task_id=?2,attempt_id=?3,binding_id=?4,binding_generation=?5 WHERE operation_id=?1",
+        params![
+            operation_id,
+            task_id,
+            attempt_id,
+            attempt.get("binding_id").and_then(Value::as_str),
+            attempt.get("binding_generation").and_then(Value::as_i64),
+        ],
+    )?;
+    Ok(())
+}
+
+fn normalized_review_scope(value: &Value, allow_pending: bool) -> Result<Value> {
+    model::fields(
+        value,
+        &[
+            "review_assignment_id",
+            "task_id",
+            "attempt_id",
+            "task_revision",
+            "submission_ref",
+            "candidate_ref",
+        ],
+    )?;
+    let assignment = value
+        .get("review_assignment_id")
+        .cloned()
+        .ok_or_else(|| Error::invalid("review_assignment_id must be present as text or null"))?;
+    if assignment.is_null() {
+        if !allow_pending {
+            return Err(Error::new(
+                "PARTICIPANT_NOT_ASSIGNED",
+                "review scope has not been bound to a review assignment",
+            ));
+        }
+    } else if !assignment
+        .as_str()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return Err(Error::invalid(
+            "review_assignment_id must be nonempty text or null",
+        ));
+    }
+    let task_id = model::text(value, "task_id")?;
+    let attempt_id = model::text(value, "attempt_id")?;
+    let task_revision = model::positive(value, "task_revision")?;
+    let submission_ref = model::text(value, "submission_ref")?;
+    let candidate_ref = model::text(value, "candidate_ref")?;
+    Ok(json!({
+        "review_assignment_id": assignment,
+        "task_id": task_id,
+        "attempt_id": attempt_id,
+        "task_revision": task_revision,
+        "submission_ref": submission_ref,
+        "candidate_ref": candidate_ref,
+    }))
+}
+
+fn require_sponsored_scope(scope: &ScopeData, exact_scope: &Value) -> Result<()> {
+    let registration = &scope.registration;
+    if registration["participation_basis"]["kind"] != "sponsored_reviewer"
+        || registration["participation_basis"]["review_scope"] != *exact_scope
+    {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "participant is not assigned to this exact review slot",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_pending_review_tuple(db: &Connection, scope: &Value) -> Result<()> {
+    if !scope["review_assignment_id"].is_null() {
+        return Err(Error::invalid(
+            "pre-registration review scope must have a null review_assignment_id",
+        ));
+    }
+    let task_id = model::text(scope, "task_id")?;
+    let attempt_id = model::text(scope, "attempt_id")?;
+    let task_revision = model::positive(scope, "task_revision")?;
+    let task = tasks::get_task(db, task_id)?;
+    if task["revision"] != task_revision
+        || task["state"] != "open"
+        || task["current_attempt_id"] != attempt_id
+    {
+        return Err(Error::new(
+            "STALE_REVISION",
+            "sponsored review registration must identify the current Task revision and Attempt",
+        ));
+    }
+    let attempt = tasks::get_attempt(db, attempt_id)?;
+    validate_current_attempt(&task, &attempt, task_id, task_revision, attempt_id)?;
+    if attempt["state"] != "submitted"
+        || attempt["submission_ref"] != scope["submission_ref"]
+        || attempt["candidate_ref"] != scope["candidate_ref"]
+    {
+        return Err(Error::new(
+            "STALE_REVISION",
+            "sponsored review registration must match the exact submitted candidate",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_retained_review_tuple(db: &Connection, scope: &Value) -> Result<()> {
+    let task_id = model::text(scope, "task_id")?;
+    let attempt_id = model::text(scope, "attempt_id")?;
+    let task_revision = model::positive(scope, "task_revision")?;
+    // Confirm that the Task still exists, while using the immutable Attempt
+    // snapshot/refs rather than its newer current revision.
+    tasks::get_task(db, task_id).map_err(|_| {
+        Error::new(
+            "STALE_REVIEW_ASSIGNMENT",
+            "assigned review Task is no longer retained",
+        )
+    })?;
+    let attempt = tasks::get_attempt(db, attempt_id).map_err(|_| {
+        Error::new(
+            "STALE_REVIEW_ASSIGNMENT",
+            "assigned review Attempt is no longer retained",
+        )
+    })?;
+    if attempt["task_id"] != task_id
+        || attempt["task_revision"] != task_revision
+        || attempt["submission_ref"] != scope["submission_ref"]
+        || attempt["candidate_ref"] != scope["candidate_ref"]
+    {
+        return Err(Error::new(
+            "STALE_REVIEW_ASSIGNMENT",
+            "retained Attempt no longer identifies the exact reviewed candidate",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_review_assignment(
+    db: &Connection,
+    reviewer_client_id: &str,
+    registration: &Value,
+    scope: &Value,
+) -> Result<()> {
+    let assignment_id = model::text(scope, "review_assignment_id")?;
+    let event_key = format!("assignment:{assignment_id}");
+    let row: Option<(Option<String>, String)> = db
+        .query_row(
+            "SELECT operation_id,payload_json FROM observations \
+             WHERE source_stream_id='controller:review' AND source_event_key=?1 \
+               AND kind='review.assignment'",
+            [event_key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let (operation_id, payload_json) = row.ok_or_else(|| {
+        Error::new(
+            "STALE_REVIEW_ASSIGNMENT",
+            "review assignment observation is not retained",
+        )
+    })?;
+    let operation_id = operation_id.ok_or_else(|| {
+        Error::new(
+            "STALE_REVIEW_ASSIGNMENT",
+            "review assignment observation has no Operation link",
+        )
+    })?;
+    let observation: Value = serde_json::from_str(&payload_json)?;
+    if !review_record_matches(&observation, reviewer_client_id, registration, scope) {
+        return Err(Error::new(
+            "STALE_REVIEW_ASSIGNMENT",
+            "review assignment observation does not match the participant and exact slot",
+        ));
+    }
+    let row: Option<(String, String, String)> = db
+        .query_row(
+            "SELECT method,state,result_json FROM operations WHERE operation_id=?1",
+            [&operation_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let (method, state, result_json) = row.ok_or_else(|| {
+        Error::new(
+            "STALE_REVIEW_ASSIGNMENT",
+            "review assignment Operation is not retained",
+        )
+    })?;
+    if method != "review.assign" || state != "settled" {
+        return Err(Error::new(
+            "STALE_REVIEW_ASSIGNMENT",
+            "review assignment Operation is not a settled review.assign",
+        ));
+    }
+    let result: Value = serde_json::from_str(&result_json)?;
+    let value = result
+        .get("value")
+        .filter(|_| result["ok"] == true)
+        .unwrap_or(&result);
+    if !review_record_matches(value, reviewer_client_id, registration, scope) {
+        return Err(Error::new(
+            "STALE_REVIEW_ASSIGNMENT",
+            "settled review.assign result does not match the participant and exact slot",
+        ));
+    }
+    Ok(())
+}
+
+fn review_record_matches(
+    record: &Value,
+    reviewer_client_id: &str,
+    registration: &Value,
+    scope: &Value,
+) -> bool {
+    // Retained assignment observations and review.assign results carry the
+    // Task/Attempt tuple under `identity`; the participant grant carries the
+    // six-field `review_scope`. Compare the same exact facts across those
+    // different public record envelopes.
+    let identity = record.get("identity").unwrap_or(record);
+    record["review_assignment_id"] == scope["review_assignment_id"]
+        && record["reviewer_client_id"] == reviewer_client_id
+        && record["sponsor_client_id"] == registration["review_sponsor_client_id"]
+        && [
+            "task_id",
+            "attempt_id",
+            "task_revision",
+            "submission_ref",
+            "candidate_ref",
+        ]
+        .into_iter()
+        .all(|field| identity[field] == scope[field])
+}
+
+fn participant_get(db: &Connection, principal: &Principal, value: &Value) -> Result<Value> {
+    model::fields(
+        value,
+        &["client_id", "task_id", "task_revision", "attempt_id"],
+    )?;
+    let target_id = model::text(value, "client_id")?;
+    let expected_scope = if principal.role == Role::Participant {
+        let caller = load_current_scope(db, principal)?;
+        if value.get("task_id").is_some()
+            || value.get("task_revision").is_some()
+            || value.get("attempt_id").is_some()
+        {
+            return Err(Error::invalid(
+                "participants query only within their authenticated scope",
+            ));
+        }
+        caller.scope_id
+    } else {
+        let task_id = model::text(value, "task_id")?;
+        let task_revision = model::positive(value, "task_revision")?;
+        let attempt_id = model::text(value, "attempt_id")?;
+        manager_scope(db, principal, task_id, task_revision, attempt_id)?.scope_id
+    };
+    let target = load_current_scope_for_client(db, target_id)?;
+    if target.scope_id != expected_scope {
+        return Err(Error::new(
+            "NOT_FOUND",
+            "participant is not in the requested current scope",
+        ));
+    }
+    Ok(json!({
+        "participant": public_registration(&target.registration),
+        "task_id": target.task["task_id"],
+        "task_revision": target.task["revision"],
+        "attempt_id": target.attempt["attempt_id"],
+    }))
+}
+
+fn participant_list(db: &Connection, principal: &Principal, value: &Value) -> Result<Value> {
+    model::fields(
+        value,
+        &[
+            "task_id",
+            "task_revision",
+            "attempt_id",
+            "limit",
+            "after_client_id",
+        ],
+    )?;
+    if principal.role == Role::Participant {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "participants use exact relation discovery instead of a roster",
+        ));
+    }
+    let task_id = model::text(value, "task_id")?;
+    let task_revision = model::positive(value, "task_revision")?;
+    let attempt_id = model::text(value, "attempt_id")?;
+    let limit = keys::parse_page(value.get("limit"), 20)?;
+    let after = keys::optional_cursor(value, "after_client_id")?;
+    let scope = manager_scope(db, principal, task_id, task_revision, attempt_id)?;
+    list_participant_page(db, &scope, limit, after.as_deref())
+}
+
+fn list_participant_page(
+    db: &Connection,
+    scope: &ScopeData,
+    limit: i64,
+    after_client_id: Option<&str>,
+) -> Result<Value> {
+    if !(1..=keys::MAX_PAGE_SIZE).contains(&limit) {
+        return Err(Error::invalid(format!(
+            "limit must be in 1..={}",
+            keys::MAX_PAGE_SIZE
+        )));
+    }
+    let prefix = keys::participant_prefix(&scope.scope_id);
+    let upper = format!("{prefix}g");
+    let (lower, exclusive) = match after_client_id {
+        Some(client_id) => (format!("{prefix}{}", keys::key_component(client_id)), true),
+        None => (prefix, false),
+    };
+    let comparison = if exclusive { ">" } else { ">=" };
+    let sql = format!(
+        "SELECT key,value_json FROM meta WHERE key {comparison} ?1 AND key < ?2 ORDER BY key LIMIT ?3"
+    );
+    let scan_limit = (limit * RELEVANCE_SCAN_FACTOR + 32).min(keys::MAX_INBOX_SCAN);
+    let mut statement = db.prepare(&sql)?;
+    let rows: Vec<(String, String)> = statement
+        .query_map(params![lower, upper, scan_limit + 1], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
+        .collect::<std::result::Result<_, _>>()?;
+    let has_unscanned = rows.len() as i64 > scan_limit;
+    let mut items = Vec::new();
+    let mut stale = 0usize;
+    let mut last_scanned: Option<String> = None;
+    let mut cursor_before_extra: Option<String> = None;
+    let mut more_active = false;
+    for (key, raw) in rows.iter().take(scan_limit as usize) {
+        let record: Value = serde_json::from_str(raw)?;
+        let Some(client_id) = record.get("client_id").and_then(Value::as_str) else {
+            stale = stale.saturating_add(1);
+            continue;
+        };
+        if let Some(before) = last_scanned.as_ref() {
+            cursor_before_extra = Some(before.clone());
+        }
+        last_scanned = Some(client_id.to_owned());
+        match load_current_scope_for_client(db, client_id) {
+            Ok(candidate) if candidate.scope_id == scope.scope_id => {
+                let item = json!({
+                    "client_id": client_id,
+                    "participant": public_registration(&candidate.registration),
+                });
+                if items.len() < limit as usize {
+                    items.push(item);
+                } else {
+                    more_active = true;
+                    // Resume before the first unreturned active participant.
+                    last_scanned = cursor_before_extra;
+                    break;
+                }
+            }
+            _ => stale = stale.saturating_add(1),
+        }
+        let _ = key;
+    }
+    let partial = more_active || has_unscanned || stale > 0;
+    Ok(json!({
+        "items": items,
+        "task_id": scope.task["task_id"],
+        "task_revision": scope.task["revision"],
+        "attempt_id": scope.attempt["attempt_id"],
+        "next_after": if partial { last_scanned } else { None },
+        "coverage": if partial { "partial" } else { "complete" },
+        "gaps": if stale > 0 { json!([{"kind":"stale_participant_index_entries","count":stale}]) } else if has_unscanned { json!([{"kind":"participant_page_scan_bound","count":null}]) } else { json!([]) },
+    }))
+}
+
+fn publish_card(
+    tx: &Transaction<'_>,
+    principal: &Principal,
+    card_kind: &str,
+    value: &Value,
+    operation_id: &str,
+    now: i64,
+) -> Result<Value> {
+    let allowed = if card_kind == "work" {
+        &["client_request_id", "fields"][..]
+    } else {
+        &["client_request_id", "contract_key", "fields"][..]
+    };
+    model::fields(value, allowed)?;
+    let scope = load_current_scope(tx, principal)?;
+    let identity = if card_kind == "work" {
+        "work"
+    } else {
+        let key = model::text(value, "contract_key")?;
+        validate_identifier(key, "contract_key", 256)?;
+        key
+    };
+    let fields = value
+        .get("fields")
+        .ok_or_else(|| Error::invalid("fields is required"))?;
+    keys::validate_card_fields(card_kind, fields)?;
+    let digest = model::digest(model::canonical(fields)?.as_bytes());
+    let current_key = keys::card_key(&scope.scope_id, card_kind, identity, &principal.client_id);
+    let prior = meta(tx, &current_key)?;
+    if let Some(prior) = prior.as_ref()
+        && prior["state"] == "current"
+        && prior["material_digest"] == digest
+    {
+        attach_operation_scope(
+            tx,
+            operation_id,
+            scope.task["task_id"].as_str().unwrap_or_default(),
+            scope.attempt["attempt_id"].as_str().unwrap_or_default(),
+            &scope.attempt,
+        )?;
+        return Ok(json!({
+            "operation_id": operation_id,
+            "card_kind": card_kind,
+            "identity": identity,
+            "card_revision": prior["card_revision"],
+            "material_digest": digest,
+            "changed": false,
+            "coalesced": true,
+        }));
+    }
+    if let Some(prior) = prior.as_ref()
+        && prior["state"] == "current"
+    {
+        remove_relevance_indexes(
+            tx,
+            &scope.scope_id,
+            &principal.client_id,
+            card_kind,
+            identity,
+            &prior["fields"],
+        )?;
+    }
+    let revision = prior
+        .as_ref()
+        .and_then(|prior| prior["card_revision"].as_i64())
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| Error::new("REVISION_OVERFLOW", "card revision exhausted"))?;
+    let card = json!({
+        "card_kind": card_kind,
+        "identity": identity,
+        "task_id": scope.task["task_id"],
+        "task_revision": scope.task["revision"],
+        "attempt_id": scope.attempt["attempt_id"],
+        "client_id": principal.client_id,
+        "card_revision": revision,
+        "state": "current",
+        "material_digest": digest,
+        "fields": fields,
+        "updated_at_ms": now,
+    });
+    set_meta(tx, &current_key, &card)?;
+    set_meta(
+        tx,
+        &card_revision_key(
+            &scope.scope_id,
+            card_kind,
+            identity,
+            &principal.client_id,
+            revision,
+        ),
+        &card,
+    )?;
+    set_meta(
+        tx,
+        &card_owner_key(&scope.scope_id, &principal.client_id, card_kind, identity),
+        &json!({"card_key":current_key,"card_revision":revision}),
+    )?;
+    write_relevance_indexes(
+        tx,
+        &scope.scope_id,
+        &principal.client_id,
+        card_kind,
+        identity,
+        revision,
+        fields,
+    )?;
+    attach_operation_scope(
+        tx,
+        operation_id,
+        scope.task["task_id"].as_str().unwrap_or_default(),
+        scope.attempt["attempt_id"].as_str().unwrap_or_default(),
+        &scope.attempt,
+    )?;
+    Ok(json!({
+        "operation_id": operation_id,
+        "card_kind": card_kind,
+        "identity": identity,
+        "card_revision": revision,
+        "material_digest": digest,
+        "changed": true,
+        "coalesced": false,
+    }))
+}
+
+fn withdraw_card(
+    tx: &Transaction<'_>,
+    principal: &Principal,
+    card_kind: &str,
+    value: &Value,
+    operation_id: &str,
+    now: i64,
+) -> Result<Value> {
+    let allowed = if card_kind == "work" {
+        &["client_request_id"][..]
+    } else {
+        &["client_request_id", "contract_key"][..]
+    };
+    model::fields(value, allowed)?;
+    let scope = load_current_scope(tx, principal)?;
+    let identity = if card_kind == "work" {
+        "work"
+    } else {
+        let key = model::text(value, "contract_key")?;
+        validate_identifier(key, "contract_key", 256)?;
+        key
+    };
+    let current_key = keys::card_key(&scope.scope_id, card_kind, identity, &principal.client_id);
+    let prior = meta(tx, &current_key)?;
+    let Some(prior) = prior.filter(|prior| prior["state"] == "current") else {
+        attach_operation_scope(
+            tx,
+            operation_id,
+            scope.task["task_id"].as_str().unwrap_or_default(),
+            scope.attempt["attempt_id"].as_str().unwrap_or_default(),
+            &scope.attempt,
+        )?;
+        return Ok(json!({
+            "operation_id": operation_id,
+            "card_kind": card_kind,
+            "identity": identity,
+            "changed": false,
+            "state": "unavailable",
+        }));
+    };
+    remove_relevance_indexes(
+        tx,
+        &scope.scope_id,
+        &principal.client_id,
+        card_kind,
+        identity,
+        &prior["fields"],
+    )?;
+    tx.execute(
+        "DELETE FROM meta WHERE key=?1",
+        [card_owner_key(
+            &scope.scope_id,
+            &principal.client_id,
+            card_kind,
+            identity,
+        )],
+    )?;
+    let revision = prior["card_revision"]
+        .as_i64()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| Error::new("REVISION_OVERFLOW", "card revision exhausted"))?;
+    let tombstone = json!({
+        "card_kind": card_kind,
+        "identity": identity,
+        "task_id": scope.task["task_id"],
+        "task_revision": scope.task["revision"],
+        "attempt_id": scope.attempt["attempt_id"],
+        "client_id": principal.client_id,
+        "card_revision": revision,
+        "state": "withdrawn",
+        "material_digest": prior["material_digest"],
+        "fields": {},
+        "updated_at_ms": now,
+    });
+    set_meta(tx, &current_key, &tombstone)?;
+    set_meta(
+        tx,
+        &card_revision_key(
+            &scope.scope_id,
+            card_kind,
+            identity,
+            &principal.client_id,
+            revision,
+        ),
+        &tombstone,
+    )?;
+    attach_operation_scope(
+        tx,
+        operation_id,
+        scope.task["task_id"].as_str().unwrap_or_default(),
+        scope.attempt["attempt_id"].as_str().unwrap_or_default(),
+        &scope.attempt,
+    )?;
+    Ok(json!({
+        "operation_id": operation_id,
+        "card_kind": card_kind,
+        "identity": identity,
+        "card_revision": revision,
+        "changed": true,
+        "state": "withdrawn",
+    }))
+}
+
+fn card_revision_key(
+    scope: &str,
+    card_kind: &str,
+    identity: &str,
+    client_id: &str,
+    revision: i64,
+) -> String {
+    format!(
+        "coordination:card-revision:{scope}:{card_kind}:{}:{}:{revision:020}",
+        keys::key_component(identity),
+        keys::key_component(client_id),
+    )
+}
+
+fn card_owner_key(scope: &str, client_id: &str, card_kind: &str, identity: &str) -> String {
+    format!(
+        "coordination:card-owner:{scope}:{}:{card_kind}:{}",
+        keys::key_component(client_id),
+        keys::key_component(identity),
+    )
+}
+
+fn indexable_card_fields(fields: &Value, card_kind: &str, identity: &str) -> Value {
+    if card_kind != "contract" {
+        return fields.clone();
+    }
+    let mut indexed = fields.clone();
+    if let Some(object) = indexed.as_object_mut() {
+        object.insert("contract_key".into(), json!(identity));
+    }
+    indexed
+}
+
+fn write_relevance_indexes(
+    tx: &Transaction<'_>,
+    scope: &str,
+    client_id: &str,
+    card_kind: &str,
+    identity: &str,
+    revision: i64,
+    fields: &Value,
+) -> Result<()> {
+    let indexed_fields = indexable_card_fields(fields, card_kind, identity);
+    for (term_kind, terms) in keys::indexed_terms(&indexed_fields, card_kind) {
+        for term in terms {
+            let key = keys::relevance_key(scope, term_kind, &term, client_id, card_kind, identity);
+            set_meta(
+                tx,
+                &key,
+                &json!({
+                    "client_id":client_id,
+                    "card_kind":card_kind,
+                    "identity":identity,
+                    "term_kind":term_kind.as_str(),
+                    "term":term,
+                    "card_revision":revision,
+                }),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_relevance_indexes(
+    tx: &Transaction<'_>,
+    scope: &str,
+    client_id: &str,
+    card_kind: &str,
+    identity: &str,
+    fields: &Value,
+) -> Result<()> {
+    let indexed_fields = indexable_card_fields(fields, card_kind, identity);
+    for (term_kind, terms) in keys::indexed_terms(&indexed_fields, card_kind) {
+        for term in terms {
+            tx.execute(
+                "DELETE FROM meta WHERE key=?1",
+                [keys::relevance_key(
+                    scope, term_kind, &term, client_id, card_kind, identity,
+                )],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn read_scope(db: &Connection, principal: &Principal, value: &Value) -> Result<ScopeData> {
+    if principal.role == Role::Participant {
+        if value.get("task_id").is_some()
+            || value.get("task_revision").is_some()
+            || value.get("attempt_id").is_some()
+        {
+            return Err(Error::invalid(
+                "participants query only within their authenticated Task/Attempt",
+            ));
+        }
+        return load_current_scope(db, principal);
+    }
+    let task_id = model::text(value, "task_id")?;
+    let task_revision = model::positive(value, "task_revision")?;
+    let attempt_id = model::text(value, "attempt_id")?;
+    manager_scope(db, principal, task_id, task_revision, attempt_id)
+}
+
+fn indexed_cards(
+    db: &Connection,
+    scope_id: &str,
+    term_kind: keys::TermKind,
+    term: &str,
+    card_kind: Option<&str>,
+    after_client_id: Option<&str>,
+    raw_limit: i64,
+) -> Result<(Vec<IndexedCard>, bool)> {
+    let prefix = keys::relevance_prefix(scope_id, term_kind, term);
+    let upper = format!("{prefix}g");
+    let lower = match after_client_id {
+        Some(client_id) => format!(
+            "{}{client}:~",
+            prefix,
+            client = keys::key_component(client_id)
+        ),
+        None => prefix,
+    };
+    let comparison = if after_client_id.is_some() { ">" } else { ">=" };
+    let raw: Vec<String> = if let Some(card_kind) = card_kind {
+        let sql = format!(
+            "SELECT value_json FROM meta WHERE key {comparison} ?1 AND key < ?2 \
+             AND json_extract(value_json,'$.card_kind')=?3 ORDER BY key LIMIT ?4"
+        );
+        let mut statement = db.prepare(&sql)?;
+        statement
+            .query_map(params![lower, upper, card_kind, raw_limit + 1], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<std::result::Result<_, _>>()?
+    } else {
+        let sql = format!(
+            "SELECT value_json FROM meta WHERE key {comparison} ?1 AND key < ?2 ORDER BY key LIMIT ?3"
+        );
+        let mut statement = db.prepare(&sql)?;
+        statement
+            .query_map(params![lower, upper, raw_limit + 1], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<std::result::Result<_, _>>()?
+    };
+    let has_more = raw.len() as i64 > raw_limit;
+    let cards = raw
+        .iter()
+        .take(raw_limit as usize)
+        .filter_map(|raw| serde_json::from_str::<Value>(raw).ok())
+        .filter_map(|value| {
+            Some(IndexedCard {
+                client_id: value.get("client_id")?.as_str()?.to_owned(),
+                card_kind: value.get("card_kind")?.as_str()?.to_owned(),
+                identity: value.get("identity")?.as_str()?.to_owned(),
+            })
+        })
+        .collect();
+    Ok((cards, has_more))
+}
+
+fn current_card(
+    db: &Connection,
+    scope_id: &str,
+    card_kind: &str,
+    identity: &str,
+    client_id: &str,
+) -> Result<Option<Value>> {
+    Ok(meta(
+        db,
+        &keys::card_key(scope_id, card_kind, identity, client_id),
+    )?
+    .filter(|card| card["state"] == "current"))
+}
+
+fn project_card(card: &Value, selected_fields: Option<&Value>) -> Result<Value> {
+    if card["state"] != "current" {
+        return Ok(json!({"available":false,"state":card["state"]}));
+    }
+    validate_projection_fields(selected_fields)?;
+    let mut fields = card["fields"].clone();
+    if let Some(selected) = selected_fields {
+        let selected = selected
+            .as_array()
+            .ok_or_else(|| Error::invalid("fields must be an array of field names"))?;
+        let mut projected = serde_json::Map::new();
+        for item in selected {
+            let name = item
+                .as_str()
+                .filter(|name| !name.trim().is_empty())
+                .ok_or_else(|| Error::invalid("fields entries must be nonempty strings"))?;
+            if let Some(value) = fields.get(name) {
+                projected.insert(name.to_owned(), value.clone());
+            }
+        }
+        fields = Value::Object(projected);
+    }
+    Ok(json!({
+        "available": true,
+        "card_kind": card["card_kind"],
+        "identity": card["identity"],
+        "task_id": card["task_id"],
+        "task_revision": card["task_revision"],
+        "attempt_id": card["attempt_id"],
+        "client_id": card["client_id"],
+        "card_revision": card["card_revision"],
+        "material_digest": card["material_digest"],
+        "updated_at_ms": card["updated_at_ms"],
+        "fields": fields,
+    }))
+}
+
+fn validate_projection_fields(selected_fields: Option<&Value>) -> Result<()> {
+    let Some(selected_fields) = selected_fields else {
+        return Ok(());
+    };
+    let selected = selected_fields
+        .as_array()
+        .ok_or_else(|| Error::invalid("fields must be an array of field names"))?;
+    if selected.len() > 64 {
+        return Err(Error::invalid("fields may select at most 64 names"));
+    }
+    let mut seen = BTreeSet::new();
+    for item in selected {
+        let name = item
+            .as_str()
+            .filter(|name| !name.trim().is_empty())
+            .ok_or_else(|| Error::invalid("fields entries must be nonempty strings"))?;
+        if !seen.insert(name) {
+            return Err(Error::invalid("fields entries must be unique"));
+        }
+    }
+    Ok(())
+}
+
+fn card_get(
+    db: &Connection,
+    principal: &Principal,
+    card_kind: &str,
+    value: &Value,
+) -> Result<Value> {
+    let allowed: &[&str] = if card_kind == "work" {
+        &[
+            "participant_id",
+            "fields",
+            "task_id",
+            "task_revision",
+            "attempt_id",
+            "limit",
+            "after_client_id",
+        ]
+    } else {
+        &[
+            "contract_key",
+            "participant_id",
+            "fields",
+            "task_id",
+            "task_revision",
+            "attempt_id",
+            "limit",
+            "after_client_id",
+        ]
+    };
+    model::fields(value, allowed)?;
+    validate_projection_fields(value.get("fields"))?;
+    let scope = read_scope(db, principal, value)?;
+    let fields = value.get("fields");
+    if card_kind == "work" {
+        let owner = match value.get("participant_id") {
+            Some(_) => model::text(value, "participant_id")?,
+            None if principal.role == Role::Participant => principal.client_id.as_str(),
+            None => {
+                return Err(Error::invalid(
+                    "participant_id is required for manager work-card lookup",
+                ));
+            }
+        };
+        if principal.role == Role::Participant && owner != principal.client_id {
+            return Err(Error::new(
+                "FORBIDDEN",
+                "participants discover another owner's card through exact peer.find matches",
+            ));
+        }
+        let participant = load_current_scope_for_client(db, owner)?;
+        if participant.scope_id != scope.scope_id {
+            return Err(Error::new("NOT_FOUND", "participant is outside this scope"));
+        }
+        return match current_card(db, &scope.scope_id, "work", "work", owner)? {
+            Some(card) => project_card(&card, fields),
+            None => Ok(json!({"available":false,"card_kind":"work","participant_id":owner})),
+        };
+    }
+    let contract_key = model::text(value, "contract_key")?;
+    validate_identifier(contract_key, "contract_key", 256)?;
+    if value.get("participant_id").is_some() {
+        let owner = model::text(value, "participant_id")?;
+        if principal.role == Role::Participant && owner != principal.client_id {
+            return Err(Error::new(
+                "FORBIDDEN",
+                "participants discover another owner's card through exact peer.find matches",
+            ));
+        }
+        let participant = load_current_scope_for_client(db, owner)?;
+        if participant.scope_id != scope.scope_id {
+            return Err(Error::new("NOT_FOUND", "participant is outside this scope"));
+        }
+        return match current_card(db, &scope.scope_id, "contract", contract_key, owner)? {
+            Some(card) => project_card(&card, fields),
+            None => Ok(json!({
+                "available":false,
+                "card_kind":"contract",
+                "contract_key":contract_key,
+                "participant_id":owner,
+            })),
+        };
+    }
+    let (items, next_after, coverage, gaps) = contract_cards_for_term(
+        db,
+        &scope,
+        contract_key,
+        value.get("limit"),
+        value.get("after_client_id"),
+        fields,
+    )?;
+    Ok(json!({
+        "contract_key":contract_key,
+        "items":items,
+        "next_after":next_after,
+        "coverage":coverage,
+        "gaps":gaps,
+    }))
+}
+
+fn card_list(
+    db: &Connection,
+    principal: &Principal,
+    card_kind: &str,
+    value: &Value,
+) -> Result<Value> {
+    let allowed: &[&str] = if card_kind == "work" {
+        &[
+            "contract_key",
+            "path",
+            "symbol",
+            "interface",
+            "fields",
+            "task_id",
+            "task_revision",
+            "attempt_id",
+            "limit",
+            "after_client_id",
+        ]
+    } else {
+        &[
+            "contract_key",
+            "fields",
+            "task_id",
+            "task_revision",
+            "attempt_id",
+            "limit",
+            "after_client_id",
+        ]
+    };
+    model::fields(value, allowed)?;
+    validate_projection_fields(value.get("fields"))?;
+    let scope = read_scope(db, principal, value)?;
+    let (term_kind, term) = if card_kind == "contract" {
+        let contract_key = model::text(value, "contract_key")?;
+        validate_identifier(contract_key, "contract_key", 256)?;
+        (keys::TermKind::Contract, contract_key.to_owned())
+    } else {
+        selector(value)?.ok_or_else(|| {
+            Error::invalid(
+                "work_card.list requires one exact contract/path/symbol/interface selector",
+            )
+        })?
+    };
+    let limit = keys::parse_page(value.get("limit"), 20)?;
+    let after = keys::optional_cursor(value, "after_client_id")?;
+    let (cards, index_more) = indexed_cards(
+        db,
+        &scope.scope_id,
+        term_kind,
+        &term,
+        Some(card_kind),
+        after.as_deref(),
+        limit,
+    )?;
+    let mut items = Vec::new();
+    let mut stale = 0usize;
+    let mut last = None;
+    for indexed in cards {
+        last = Some(indexed.client_id.clone());
+        let Ok(participant) = load_current_scope_for_client(db, &indexed.client_id) else {
+            stale = stale.saturating_add(1);
+            continue;
+        };
+        if participant.scope_id != scope.scope_id {
+            stale = stale.saturating_add(1);
+            continue;
+        }
+        if let Some(card) = current_card(
+            db,
+            &scope.scope_id,
+            &indexed.card_kind,
+            &indexed.identity,
+            &indexed.client_id,
+        )? {
+            items.push(project_card(&card, value.get("fields"))?);
+        } else {
+            stale = stale.saturating_add(1);
+        }
+    }
+    let partial = index_more || stale > 0;
+    Ok(json!({
+        "items":items,
+        "selector":{"kind":term_kind.as_str(),"value":term},
+        "next_after":if index_more { last } else { None },
+        "coverage":if partial { "partial" } else { "complete" },
+        "gaps":if stale > 0 { json!([{"kind":"stale_card_index_entries","count":stale}]) } else if index_more { json!([{"kind":"more_indexed_cards","count":null}]) } else { json!([]) },
+    }))
+}
+
+fn selector(value: &Value) -> Result<Option<(keys::TermKind, String)>> {
+    let mut found = None;
+    for (field, kind) in [
+        ("contract_key", keys::TermKind::Contract),
+        ("path", keys::TermKind::Path),
+        ("symbol", keys::TermKind::Symbol),
+        ("interface", keys::TermKind::Interface),
+    ] {
+        if let Some(raw) = value.get(field) {
+            let term = raw
+                .as_str()
+                .filter(|term| !term.trim().is_empty() && term.len() <= 1024)
+                .ok_or_else(|| {
+                    Error::invalid(format!("{field} must be nonempty text up to 1024 bytes"))
+                })?;
+            if term.bytes().any(|byte| byte.is_ascii_control()) {
+                return Err(Error::invalid(format!(
+                    "{field} contains a control character"
+                )));
+            }
+            if kind == keys::TermKind::Contract {
+                validate_identifier(term, field, 256)?;
+            }
+            if found.is_some() {
+                return Err(Error::invalid(
+                    "supply exactly one contract_key, path, symbol, or interface selector",
+                ));
+            }
+            found = Some((kind, term.to_owned()));
+        }
+    }
+    Ok(found)
+}
+
+fn contract_cards_for_term(
+    db: &Connection,
+    scope: &ScopeData,
+    contract_key: &str,
+    raw_limit: Option<&Value>,
+    raw_after: Option<&Value>,
+    fields: Option<&Value>,
+) -> Result<(Vec<Value>, Option<String>, &'static str, Value)> {
+    validate_identifier(contract_key, "contract_key", 256)?;
+    let limit = keys::parse_page(raw_limit, 20)?;
+    let after_value = json!({"after_client_id":raw_after.cloned().unwrap_or(Value::Null)});
+    let after = keys::optional_cursor(&after_value, "after_client_id")?;
+    let (cards, index_more) = indexed_cards(
+        db,
+        &scope.scope_id,
+        keys::TermKind::Contract,
+        contract_key,
+        Some("contract"),
+        after.as_deref(),
+        limit,
+    )?;
+    let mut items = Vec::new();
+    let mut stale = 0usize;
+    let mut last = None;
+    for indexed in cards {
+        last = Some(indexed.client_id.clone());
+        let Ok(participant) = load_current_scope_for_client(db, &indexed.client_id) else {
+            stale = stale.saturating_add(1);
+            continue;
+        };
+        if participant.scope_id != scope.scope_id {
+            stale = stale.saturating_add(1);
+            continue;
+        }
+        match current_card(
+            db,
+            &scope.scope_id,
+            "contract",
+            contract_key,
+            &indexed.client_id,
+        )? {
+            Some(card) => items.push(project_card(&card, fields)?),
+            None => stale = stale.saturating_add(1),
+        }
+    }
+    let partial = index_more || stale > 0;
+    Ok((
+        items,
+        if index_more { last } else { None },
+        if partial { "partial" } else { "complete" },
+        if stale > 0 {
+            json!([{"kind":"stale_card_index_entries","count":stale}])
+        } else if index_more {
+            json!([{"kind":"more_indexed_cards","count":null}])
+        } else {
+            json!([])
+        },
+    ))
+}
+
+fn context_get(db: &Connection, principal: &Principal, value: &Value) -> Result<Value> {
+    model::fields(
+        value,
+        &[
+            "task_id",
+            "task_revision",
+            "attempt_id",
+            "contract_key",
+            "path",
+            "symbol",
+            "interface",
+            "limit",
+            "after_client_id",
+        ],
+    )?;
+    let scope = read_scope(db, principal, value)?;
+    let participant_id =
+        (principal.role == Role::Participant).then_some(principal.client_id.as_str());
+    let work_card = match participant_id {
+        Some(client_id) => current_card(db, &scope.scope_id, "work", "work", client_id)?,
+        None => None,
+    };
+    let mut contract_cards = Vec::new();
+    let mut contract_gaps = Vec::new();
+    if let Some(client_id) = participant_id {
+        let prefix = format!(
+            "coordination:card-owner:{}:{}:contract:",
+            scope.scope_id,
+            keys::key_component(client_id)
+        );
+        let upper = format!("{prefix}g");
+        let mut statement = db.prepare(
+            "SELECT value_json FROM meta WHERE key>=?1 AND key<?2 ORDER BY key LIMIT 21",
+        )?;
+        let rows: Vec<String> = statement
+            .query_map(params![prefix, upper], |row| row.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        for raw in rows.iter().take(20) {
+            let owner_index: Value = serde_json::from_str(raw)?;
+            let Some(card_key) = owner_index.get("card_key").and_then(Value::as_str) else {
+                contract_gaps.push(json!({"kind":"malformed_card_owner_index"}));
+                continue;
+            };
+            if let Some(card) = meta(db, card_key)?.filter(|card| card["state"] == "current") {
+                contract_cards.push(project_card(&card, None)?);
+            }
+        }
+        if rows.len() > 20 {
+            contract_gaps.push(json!({"kind":"contract_card_context_bound","limit":20}));
+        }
+    }
+    let peer_discovery = match selector(value)? {
+        Some(_) => peer_find(db, principal, value)?,
+        None => json!({
+            "items":[],
+            "coverage":"partial",
+            "gaps":[{"kind":"exact_relationship_selector_not_supplied"}],
+        }),
+    };
+    let gaps = if contract_gaps.is_empty() {
+        json!([])
+    } else {
+        Value::Array(contract_gaps)
+    };
+    Ok(json!({
+        "scope":scope_projection(&scope),
+        "work_card":work_card.map(|card| project_card(&card, None)).transpose()?,
+        "contract_cards":contract_cards,
+        "contract_card_gaps":gaps,
+        "peer_discovery":peer_discovery,
+    }))
+}
+
+fn peer_find(db: &Connection, principal: &Principal, value: &Value) -> Result<Value> {
+    model::fields(
+        value,
+        &[
+            "task_id",
+            "task_revision",
+            "attempt_id",
+            "contract_key",
+            "path",
+            "symbol",
+            "interface",
+            "fields",
+            "limit",
+            "after_client_id",
+        ],
+    )?;
+    validate_projection_fields(value.get("fields"))?;
+    let scope = read_scope(db, principal, value)?;
+    let (term_kind, term) = selector(value)?
+        .ok_or_else(|| Error::invalid("peer.find requires one exact relationship selector"))?;
+    let limit = keys::parse_page(value.get("limit"), 20)?;
+    let after = keys::optional_cursor(value, "after_client_id")?;
+    // Scan a bounded selector index, then collapse multiple matching cards to
+    // one peer. This is a sparse directory query, never a roster walk.
+    let scan_limit = keys::MAX_INBOX_SCAN;
+    let (cards, index_more) = indexed_cards(
+        db,
+        &scope.scope_id,
+        term_kind,
+        &term,
+        None,
+        after.as_deref(),
+        scan_limit,
+    )?;
+    let mut items = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut stale = 0usize;
+    let mut last = None;
+    let mut has_more_peers = false;
+    for indexed in cards {
+        last = Some(indexed.client_id.clone());
+        if principal.role == Role::Participant && indexed.client_id == principal.client_id {
+            continue;
+        }
+        if !seen.insert(indexed.client_id.clone()) {
+            continue;
+        }
+        let Ok(candidate) = load_current_scope_for_client(db, &indexed.client_id) else {
+            stale = stale.saturating_add(1);
+            continue;
+        };
+        if candidate.scope_id != scope.scope_id {
+            stale = stale.saturating_add(1);
+            continue;
+        }
+        let Some(card) = current_card(
+            db,
+            &scope.scope_id,
+            &indexed.card_kind,
+            &indexed.identity,
+            &indexed.client_id,
+        )?
+        else {
+            stale = stale.saturating_add(1);
+            continue;
+        };
+        if items.len() >= limit as usize {
+            has_more_peers = true;
+            // Continue from the last returned peer; this candidate remains
+            // discoverable because its client ID sorts later in the index.
+            last = items
+                .last()
+                .and_then(|item: &Value| item["client_id"].as_str())
+                .map(str::to_owned);
+            break;
+        }
+        items.push(json!({
+            "client_id":indexed.client_id,
+            "participant":{
+                "display_alias":candidate.registration["display_alias"],
+                "inbound_policy":candidate.registration["inbound_policy"],
+                "participation_basis_kind":candidate.registration["participation_basis"]["kind"],
+            },
+            "match":{"kind":term_kind.as_str(),"value":term,"reason":"exact_card_index"},
+            "card":project_card(&card, value.get("fields"))?,
+        }));
+    }
+    let partial = index_more || stale > 0 || has_more_peers;
+    Ok(json!({
+        "items":items,
+        "selector":{"kind":term_kind.as_str(),"value":term},
+        "task_id":scope.task["task_id"],
+        "task_revision":scope.task["revision"],
+        "attempt_id":scope.attempt["attempt_id"],
+        "next_after":if partial { last } else { None },
+        "coverage":if partial { "partial" } else { "complete" },
+        "gaps":if stale > 0 { json!([{"kind":"stale_card_index_entries","count":stale}]) } else if index_more { json!([{"kind":"relevance_scan_bound","count":null}]) } else if has_more_peers { json!([{"kind":"more_relevant_peers","count":null}]) } else { json!([]) },
+    }))
+}
+
+fn inbox(db: &Connection, principal: &Principal, value: &Value) -> Result<Value> {
+    principal.require_participant()?;
+    model::fields(value, &["limit", "after_operation_id"])?;
+    let scope = load_current_scope(db, principal)?;
+    let limit = keys::parse_page(value.get("limit"), 20)?;
+    let after = keys::optional_cursor(value, "after_operation_id")?;
+    if scope.registration["inbound_policy"] == "hold" {
+        return Ok(json!({
+            "items":[],
+            "task_id":scope.task["task_id"],
+            "task_revision":scope.task["revision"],
+            "attempt_id":scope.attempt["attempt_id"],
+            "inbound_policy":"hold",
+            "availability":"held_by_inbound_policy",
+            "next_after":null,
+            "coverage":"complete",
+            "gaps":[],
+        }));
+    }
+    let after_key = if let Some(operation_id) = after.as_deref() {
+        let row: Option<(i64, String)> = db
+            .query_row(
+                "SELECT created_at_ms,result_json FROM operations \
+                 WHERE operation_id=?1 AND caller_id<>?2 AND method='coordination.send' \
+                   AND state='settled' AND json_extract(result_json,'$.recipient')=?2",
+                params![operation_id, principal.client_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let (created_at_ms, result_json) = row.ok_or_else(|| {
+            Error::invalid(
+                "after_operation_id must identify a retained delivery to this participant",
+            )
+        })?;
+        let result: Value = serde_json::from_str(&result_json)?;
+        if !delivery_matches_scope(&result, &scope, &principal.client_id)? {
+            return Err(Error::invalid(
+                "after_operation_id is not a delivery in the authenticated exact scope",
+            ));
+        }
+        let key = keys::mailbox_key(
+            &scope.scope_id,
+            &principal.client_id,
+            created_at_ms,
+            operation_id,
+        );
+        if meta(db, &key)?.is_none() {
+            return Err(Error::invalid(
+                "after_operation_id has no retained scoped inbox index",
+            ));
+        }
+        Some(key)
+    } else {
+        None
+    };
+    let scan_limit = (limit * RELEVANCE_SCAN_FACTOR + 32).min(keys::MAX_INBOX_SCAN);
+    let prefix = keys::mailbox_prefix(&scope.scope_id, &principal.client_id);
+    let upper = format!("{prefix}g");
+    let (lower, comparison) = match after_key {
+        Some(key) => (key, ">"),
+        None => (prefix, ">="),
+    };
+    let sql = format!(
+        "SELECT key,value_json FROM meta WHERE key {comparison} ?1 AND key < ?2 ORDER BY key LIMIT ?3"
+    );
+    let mut statement = db.prepare(&sql)?;
+    let rows: Vec<(String, String)> = statement
+        .query_map(params![lower, upper, scan_limit + 1], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
+        .collect::<std::result::Result<_, _>>()?;
+    let scan_more = rows.len() as i64 > scan_limit;
+    let mut messages = Vec::new();
+    let mut stale = 0usize;
+    let mut last_operation = None;
+    let mut more = false;
+    for (_, raw_index) in rows.iter().take(scan_limit as usize) {
+        let index: Value = serde_json::from_str(raw_index)?;
+        let Some(operation_id) = index.get("operation_id").and_then(Value::as_str) else {
+            stale = stale.saturating_add(1);
+            continue;
+        };
+        let operation: Option<(String, i64, String, String)> = db
+            .query_row(
+                "SELECT caller_id,created_at_ms,original_request_json,result_json \
+                 FROM operations WHERE operation_id=?1 AND method='coordination.send' \
+                   AND state='settled'",
+                [operation_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let Some((sender, created_at, request_json, result_json)) = operation else {
+            stale = stale.saturating_add(1);
+            continue;
+        };
+        let result: Value = serde_json::from_str(&result_json)?;
+        let request: Value = serde_json::from_str(&request_json)?;
+        if !delivery_matches_scope(&result, &scope, &principal.client_id)?
+            || result["sender"] != sender
+            || index["sender"] != sender
+            || index["recipient"] != principal.client_id
+            || index["task_id"] != scope.task["task_id"]
+            || index["task_revision"] != scope.task["revision"]
+            || index["attempt_id"] != scope.attempt["attempt_id"]
+            || index["created_at_ms"] != created_at
+            || request["recipient"] != principal.client_id
+        {
+            stale = stale.saturating_add(1);
+            continue;
+        }
+        if messages.len() == limit as usize {
+            more = true;
+            break;
+        }
+        let envelope: Value = serde_json::from_str(model::text(&result, "text")?)?;
+        if envelope["body"] != request["body"] {
+            stale = stale.saturating_add(1);
+            continue;
+        }
+        messages.push(json!({
+            "operation_id":operation_id,
+            "delivery_id":result["delivery_id"],
+                "sender":sender,
+            "recipient":principal.client_id,
+            "sent_at_ms":created_at,
+            "payload_digest":result["payload_digest"],
+            "body":envelope["body"],
+        }));
+        last_operation = Some(operation_id.to_owned());
+    }
+    let partial = scan_more || stale > 0 || more;
+    let next_after = if more || (scan_more && !messages.is_empty()) {
+        last_operation
+    } else {
+        None
+    };
+    Ok(json!({
+        "items":messages,
+        "task_id":scope.task["task_id"],
+        "task_revision":scope.task["revision"],
+        "attempt_id":scope.attempt["attempt_id"],
+        "inbound_policy":scope.registration["inbound_policy"],
+        "next_after":next_after,
+        "coverage":if partial { "partial" } else { "complete" },
+        "gaps":if stale > 0 { json!([{"kind":"stale_mailbox_records","count":stale}]) } else if scan_more { json!([{"kind":"inbox_scan_bound","count":null}]) } else { json!([]) },
+    }))
+}
+
+fn delivery_matches_scope(result: &Value, scope: &ScopeData, recipient: &str) -> Result<bool> {
+    let Some(text) = result.get("text").and_then(Value::as_str) else {
+        return Ok(false);
+    };
+    let envelope: Value = match serde_json::from_str(text) {
+        Ok(envelope) => envelope,
+        Err(_) => return Ok(false),
+    };
+    Ok(envelope["schema"] == "eliot.coordination.message.v1"
+        && envelope["sender"] == result["sender"]
+        && envelope["recipient"] == recipient
+        && envelope["task_id"] == scope.task["task_id"]
+        && envelope["task_revision"] == scope.task["revision"]
+        && envelope["attempt_id"] == scope.attempt["attempt_id"]
+        && result["recipient"] == recipient
+        && result["task_id"] == scope.task["task_id"]
+        && result["task_revision"] == scope.task["revision"]
+        && result["attempt_id"] == scope.attempt["attempt_id"])
+}
+
+fn participant_operation_get(
+    db: &Connection,
+    principal: &Principal,
+    value: &Value,
+) -> Result<Value> {
+    principal.require_participant()?;
+    model::fields(value, &["operation_id"])?;
+    let scope = load_current_scope(db, principal)?;
+    let operation_id = model::text(value, "operation_id")?;
+    let raw: Option<ParticipantOperationRecord> = db
+        .query_row(
+            "SELECT caller_id,method,task_id,attempt_id,binding_id,binding_generation \
+             FROM operations WHERE operation_id=?1",
+            [operation_id],
+            |row| {
+                Ok(ParticipantOperationRecord {
+                    caller_id: row.get(0)?,
+                    method: row.get(1)?,
+                    task_id: row.get(2)?,
+                    attempt_id: row.get(3)?,
+                    binding_id: row.get(4)?,
+                    binding_generation: row.get(5)?,
+                })
+            },
+        )
+        .optional()?;
+    let record = raw.ok_or_else(|| Error::new("NOT_FOUND", format!("Operation {operation_id}")))?;
+    if record.caller_id != principal.client_id
+        || !record.method.starts_with("coordination.")
+        || record.task_id.as_deref() != scope.task["task_id"].as_str()
+        || record.attempt_id.as_deref() != scope.attempt["attempt_id"].as_str()
+        || record.binding_id.as_deref() != scope.attempt["binding_id"].as_str()
+        || record.binding_generation != scope.attempt["binding_generation"].as_i64()
+    {
+        return Err(Error::new(
+            "NOT_FOUND",
+            "Operation is outside the authenticated participant scope",
+        ));
+    }
+    operations::get_operation(db, operation_id)
+}
+
+fn send(
+    tx: &Transaction<'_>,
+    principal: &Principal,
+    value: &Value,
+    config: &Config,
+    operation_id: &str,
+    now: i64,
+) -> Result<Value> {
+    let sender = load_current_scope(tx, principal)?;
+    let mailbox_params = normalize_send(tx, principal, value)?;
+    let (mailbox_result, queued) = super::apply(
+        tx,
+        principal,
+        "message.send",
+        &mailbox_params,
+        config,
+        super::ApplyContext {
+            operation_id,
+            now,
+            check_plan: None,
+        },
+    )?;
+    if queued {
+        return Err(Error::new(
+            "COORDINATION_SEND_QUEUED",
+            "coordination messages must remain durable mailbox records without native effects",
+        ));
+    }
+    let recipient = model::text(&mailbox_result, "recipient")?;
+    let index_key = keys::mailbox_key(&sender.scope_id, recipient, now, operation_id);
+    set_meta(
+        tx,
+        &index_key,
+        &json!({
+            "operation_id":operation_id,
+            "sender":principal.client_id,
+            "recipient":recipient,
+            "task_id":sender.task["task_id"],
+            "task_revision":sender.task["revision"],
+            "attempt_id":sender.attempt["attempt_id"],
+            "created_at_ms":now,
+        }),
+    )?;
+    attach_operation_scope(
+        tx,
+        operation_id,
+        sender.task["task_id"].as_str().unwrap_or_default(),
+        sender.attempt["attempt_id"].as_str().unwrap_or_default(),
+        &sender.attempt,
+    )?;
+    Ok(json!({
+        "operation_id":operation_id,
+        "delivery_id":mailbox_result["delivery_id"],
+        "sender":principal.client_id,
+        "recipient":mailbox_result["recipient"],
+        "task_id":sender.task["task_id"],
+        "task_revision":sender.task["revision"],
+        "attempt_id":sender.attempt["attempt_id"],
+        "payload_digest":mailbox_result["payload_digest"],
+        "text":mailbox_result["text"],
+        "delivery":"durable_mailbox_only",
+    }))
+}

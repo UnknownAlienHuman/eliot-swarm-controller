@@ -77,7 +77,24 @@ enum Command {
         #[command(subcommand)]
         command: TaskCommand,
     },
-    /// Create a scoped local client credential. Run as the local operator.
+    Coordination {
+        #[command(subcommand)]
+        command: CoordinationCommand,
+    },
+    Review {
+        #[command(subcommand)]
+        command: ReviewCommand,
+    },
+    Automation {
+        #[command(subcommand)]
+        command: AutomationCommand,
+    },
+    Launcher {
+        #[command(subcommand)]
+        command: LauncherCommand,
+    },
+    /// Create a manager, observer, or module credential. Participant credentials
+    /// require a scoped registration through `coordination participant register`.
     ClientCreate {
         client_id: String,
         #[arg(long,default_value="manager",value_parser=["manager","observer","module"])]
@@ -268,6 +285,171 @@ enum TaskCommand {
         task_id: String,
         #[arg(long)]
         revision: i64,
+        #[arg(long)]
+        file: PathBuf,
+    },
+}
+#[derive(Subcommand)]
+enum CoordinationCommand {
+    Participant {
+        #[command(subcommand)]
+        command: ParticipantCommand,
+    },
+    Peer {
+        #[command(subcommand)]
+        command: PeerCommand,
+    },
+    WorkCard {
+        #[command(subcommand)]
+        command: CardCommand,
+    },
+    ContractCard {
+        #[command(subcommand)]
+        command: CardCommand,
+    },
+    Send {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    Inbox {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    Context {
+        #[arg(long)]
+        file: PathBuf,
+    },
+}
+#[derive(Subcommand)]
+enum ParticipantCommand {
+    Register {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    Disable {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    Get {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    List {
+        #[arg(long)]
+        file: PathBuf,
+    },
+}
+#[derive(Subcommand)]
+enum PeerCommand {
+    Find {
+        #[arg(long)]
+        file: PathBuf,
+    },
+}
+#[derive(Subcommand)]
+enum CardCommand {
+    Publish {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    Withdraw {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    Get {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    List {
+        #[arg(long)]
+        file: PathBuf,
+    },
+}
+#[derive(Subcommand)]
+enum ReviewCommand {
+    Assign {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    Submit {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    Get {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    List {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    Context {
+        #[arg(long)]
+        file: PathBuf,
+    },
+}
+#[derive(Subcommand)]
+enum AutomationCommand {
+    Config {
+        #[command(subcommand)]
+        command: AutomationConfigCommand,
+    },
+}
+#[derive(Subcommand)]
+enum AutomationConfigCommand {
+    Get {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    Preview {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    Apply {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    Explain {
+        #[arg(long)]
+        file: PathBuf,
+    },
+}
+#[derive(Subcommand)]
+enum LauncherCommand {
+    Dashboard {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    Queue {
+        #[command(subcommand)]
+        command: LauncherQueueCommand,
+    },
+    Agent {
+        #[command(subcommand)]
+        command: LauncherAgentCommand,
+    },
+    Exceptions {
+        #[command(subcommand)]
+        command: LauncherExceptionsCommand,
+    },
+}
+#[derive(Subcommand)]
+enum LauncherQueueCommand {
+    Get {
+        #[arg(long)]
+        file: PathBuf,
+    },
+}
+#[derive(Subcommand)]
+enum LauncherAgentCommand {
+    Inspect {
+        #[arg(long)]
+        file: PathBuf,
+    },
+}
+#[derive(Subcommand)]
+enum LauncherExceptionsCommand {
+    Get {
         #[arg(long)]
         file: PathBuf,
     },
@@ -518,6 +700,100 @@ async fn run(cli: Cli) -> Result<()> {
                 json!({"task_id":task_id,"expected_revision":revision,"spec":read_json(&file)?}),
             ),
         },
+        Command::Coordination { command } => match command {
+            CoordinationCommand::Participant { command } => match command {
+                ParticipantCommand::Register { file } => (
+                    "coordination.participant.register".into(),
+                    read_json(&file)?,
+                ),
+                ParticipantCommand::Disable { file } => {
+                    ("coordination.participant.disable".into(), read_json(&file)?)
+                }
+                ParticipantCommand::Get { file } => {
+                    ("coordination.participant.get".into(), read_json(&file)?)
+                }
+                ParticipantCommand::List { file } => {
+                    ("coordination.participant.list".into(), read_json(&file)?)
+                }
+            },
+            CoordinationCommand::Peer { command } => match command {
+                PeerCommand::Find { file } => ("coordination.peer.find".into(), read_json(&file)?),
+            },
+            CoordinationCommand::WorkCard { command } => match command {
+                CardCommand::Publish { file } => {
+                    ("coordination.work_card.publish".into(), read_json(&file)?)
+                }
+                CardCommand::Withdraw { file } => {
+                    ("coordination.work_card.withdraw".into(), read_json(&file)?)
+                }
+                CardCommand::Get { file } => {
+                    ("coordination.work_card.get".into(), read_json(&file)?)
+                }
+                CardCommand::List { file } => {
+                    ("coordination.work_card.list".into(), read_json(&file)?)
+                }
+            },
+            CoordinationCommand::ContractCard { command } => match command {
+                CardCommand::Publish { file } => (
+                    "coordination.contract_card.publish".into(),
+                    read_json(&file)?,
+                ),
+                CardCommand::Withdraw { file } => (
+                    "coordination.contract_card.withdraw".into(),
+                    read_json(&file)?,
+                ),
+                CardCommand::Get { file } => {
+                    ("coordination.contract_card.get".into(), read_json(&file)?)
+                }
+                CardCommand::List { file } => {
+                    ("coordination.contract_card.list".into(), read_json(&file)?)
+                }
+            },
+            CoordinationCommand::Send { file } => ("coordination.send".into(), read_json(&file)?),
+            CoordinationCommand::Inbox { file } => ("coordination.inbox".into(), read_json(&file)?),
+            CoordinationCommand::Context { file } => {
+                ("swarm.context.get".into(), read_json(&file)?)
+            }
+        },
+        Command::Review { command } => match command {
+            ReviewCommand::Assign { file } => ("review.assign".into(), read_json(&file)?),
+            ReviewCommand::Submit { file } => ("review.submit".into(), read_json(&file)?),
+            ReviewCommand::Get { file } => ("review.get".into(), read_json(&file)?),
+            ReviewCommand::List { file } => ("review.list".into(), read_json(&file)?),
+            ReviewCommand::Context { file } => ("swarm.review.context".into(), read_json(&file)?),
+        },
+        Command::Automation { command } => match command {
+            AutomationCommand::Config { command } => match command {
+                AutomationConfigCommand::Get { file } => {
+                    ("automation.config.get".into(), read_json(&file)?)
+                }
+                AutomationConfigCommand::Preview { file } => {
+                    ("automation.config.preview".into(), read_json(&file)?)
+                }
+                AutomationConfigCommand::Apply { file } => {
+                    ("automation.config.apply".into(), read_json(&file)?)
+                }
+                AutomationConfigCommand::Explain { file } => {
+                    ("automation.config.explain".into(), read_json(&file)?)
+                }
+            },
+        },
+        Command::Launcher { command } => match command {
+            LauncherCommand::Dashboard { file } => ("swarm.dashboard".into(), read_json(&file)?),
+            LauncherCommand::Queue { command } => match command {
+                LauncherQueueCommand::Get { file } => ("swarm.queue.get".into(), read_json(&file)?),
+            },
+            LauncherCommand::Agent { command } => match command {
+                LauncherAgentCommand::Inspect { file } => {
+                    ("swarm.agent.inspect".into(), read_json(&file)?)
+                }
+            },
+            LauncherCommand::Exceptions { command } => match command {
+                LauncherExceptionsCommand::Get { file } => {
+                    ("swarm.exceptions.get".into(), read_json(&file)?)
+                }
+            },
+        },
         Command::ClientCreate {
             client_id,
             role,
@@ -591,6 +867,25 @@ async fn run(cli: Cli) -> Result<()> {
             | "report.delta"
             | "message.read"
             | "client.list"
+            | "swarm.context.get"
+            | "coordination.participant.get"
+            | "coordination.participant.list"
+            | "coordination.peer.find"
+            | "coordination.work_card.get"
+            | "coordination.work_card.list"
+            | "coordination.contract_card.get"
+            | "coordination.contract_card.list"
+            | "coordination.inbox"
+            | "review.get"
+            | "review.list"
+            | "swarm.review.context"
+            | "automation.config.get"
+            | "automation.config.preview"
+            | "automation.config.explain"
+            | "swarm.dashboard"
+            | "swarm.queue.get"
+            | "swarm.agent.inspect"
+            | "swarm.exceptions.get"
     );
     if !is_read {
         if !params.is_object() {

@@ -134,6 +134,12 @@ fn read_status(
                 "module credentials serve only their native binding",
             ));
         }
+        if principal.role == Role::Participant {
+            return Err(Error::new(
+                "FORBIDDEN",
+                "participant credentials have no host-wide status surface",
+            ));
+        }
         super::read(&tx, &principal, "host.status", &params, config)
     })();
 

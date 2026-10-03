@@ -1,10 +1,14 @@
 //! A single database owner. The async facade never holds a SQLite connection.
 mod acceptance;
 mod assembly;
+mod automation;
+mod automation_dispatch;
 pub(crate) mod capacity;
 mod checks;
+mod coordination;
 mod forge;
 mod gm;
+mod launcher;
 mod message_batch;
 mod opencode;
 mod operations;
@@ -12,6 +16,7 @@ mod prerequisites;
 mod producers;
 mod projection;
 mod results;
+mod reviews;
 mod runtime;
 mod schedules;
 mod status_reader;
@@ -176,6 +181,18 @@ async fn join_store_thread(thread: JoinHandle<()>, name: &'static str) -> Result
         .map_err(|_| Error::new("STORE_PANIC", format!("{name} panicked")))
 }
 impl Store {
+    pub(crate) async fn reconcile_automations_once(&self) -> Result<Value> {
+        self.run(move |db| {
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let result = automation_dispatch::reconcile(&tx, 16, 64, model::now_ms()?)?;
+            // The cursor, pending reasons, semantic slot and Operation are
+            // durable before the host can observe an admitted action.
+            tx.commit()?;
+            Ok(result)
+        })
+        .await
+    }
+
     async fn run<T: Send + 'static>(
         &self,
         f: impl FnOnce(&mut Connection) -> Result<T> + Send + 'static,
@@ -190,11 +207,17 @@ impl Store {
         rx.await
             .map_err(|_| Error::new("STORE_CLOSED", "database operation lost its response"))?
     }
-    async fn message_send(&self, principal: Principal, params: Value) -> Result<Value> {
+    async fn message_send(
+        &self,
+        principal: Principal,
+        method: String,
+        params: Value,
+    ) -> Result<Value> {
         let (response, receive) = oneshot::channel();
         self.tx
             .send(Job::MessageSend(message_batch::Request {
                 principal,
+                method,
                 params,
                 response,
             }))
@@ -231,11 +254,17 @@ impl Store {
         .await
     }
     pub async fn call(&self, principal: Principal, method: String, params: Value) -> Result<Value> {
+        if principal.role == Role::Participant && !participant_method_allowed(&method) {
+            return Err(Error::new(
+                "FORBIDDEN",
+                "method is outside this participant's scoped surface",
+            ));
+        }
         if method == "host.status" {
             return self.status_reader.host_status(principal, params).await;
         }
-        if method == "message.send" {
-            return self.message_send(principal, params).await;
+        if matches!(method.as_str(), "message.send" | "coordination.send") {
+            return self.message_send(principal, method, params).await;
         }
         if method == "forge.publish_ref" {
             return self.publish_ref(principal, params).await;
@@ -300,7 +329,7 @@ impl Store {
             let mut inspection = self
                 .run(move |db| {
                     let p = current_principal(db, principal)?;
-                    if p.role == Role::Module {
+                    if matches!(p.role, Role::Module | Role::Participant) {
                         return Err(Error::new(
                             "FORBIDDEN",
                             "module credentials serve only their native binding",
@@ -347,6 +376,10 @@ impl Store {
                 | "agent.recover"
                 | "host.mode"
                 | "module.outcome"
+                | "automation.config.apply"
+                | "review.assign"
+                | "review.submit"
+                | "task.request_changes"
         );
         let config = self.config.clone();
         let result = self
@@ -361,6 +394,44 @@ impl Store {
                             "module credentials serve only their native binding",
                         )),
                     };
+                }
+                if method == "mcp.authorization" {
+                    return mcp_authorization(db, &principal, &params);
+                }
+                if principal.role == Role::Participant {
+                    if method == "review.submit" {
+                        // This one terminal result has its own retained-slot
+                        // guard; Task liveness must not erase late evidence.
+                        return mutate(db, &principal, &method, &params, &config);
+                    }
+                    if model::PARTICIPANT_READ_METHODS.contains(&method.as_str()) {
+                        if method == "operation.get" {
+                            let id = model::text(&params, "operation_id")?;
+                            if reviews::authorize_operation_read(db, &principal, id).is_ok() {
+                                model::fields(&params, &["operation_id"])?;
+                                return operations::get_operation(db, id);
+                            }
+                        }
+                        return coordination::read(db, &principal, &method, &params);
+                    }
+                    if matches!(
+                        method.as_str(),
+                        "review.get" | "review.list" | "swarm.review.context"
+                    ) {
+                        return reviews::read(db, &principal, &method, &params);
+                    }
+                    if matches!(method.as_str(), "task.submission" | "check.get") {
+                        reviews::authorize_evidence_read(db, &principal, &method, &params)?;
+                        return read(db, &principal, &method, &params, &config);
+                    }
+                    if model::PARTICIPANT_MUTATION_METHODS.contains(&method.as_str()) {
+                        coordination::authorize_participant_mutation(db, &principal, &method)?;
+                        return mutate(db, &principal, &method, &params, &config);
+                    }
+                    return Err(Error::new(
+                        "FORBIDDEN",
+                        "method is outside this participant's scoped surface",
+                    ));
                 }
                 if is_read(&method) {
                     return read(db, &principal, &method, &params, &config);
@@ -554,6 +625,7 @@ impl Store {
                         "module cannot inspect other results",
                     ));
                 }
+                reviews::authorize_artifact_read(db, &p, &id)?;
                 results::get(db, &id)
             })
             .await?;
@@ -754,6 +826,26 @@ fn is_read(method: &str) -> bool {
     matches!(
         method,
         "check.get"
+            | "mcp.authorization"
+            | "swarm.context.get"
+            | "coordination.participant.get"
+            | "coordination.participant.list"
+            | "coordination.peer.find"
+            | "coordination.work_card.get"
+            | "coordination.work_card.list"
+            | "coordination.contract_card.get"
+            | "coordination.contract_card.list"
+            | "coordination.inbox"
+            | "review.get"
+            | "review.list"
+            | "swarm.review.context"
+            | "automation.config.get"
+            | "automation.config.preview"
+            | "automation.config.explain"
+            | "swarm.dashboard"
+            | "swarm.queue.get"
+            | "swarm.agent.inspect"
+            | "swarm.exceptions.get"
             | "check.profiles"
             | "artifact.get"
             | "artifact.parts"
@@ -774,6 +866,22 @@ fn is_read(method: &str) -> bool {
             | "message.read"
             | "client.list"
     )
+}
+
+fn participant_method_allowed(method: &str) -> bool {
+    model::PARTICIPANT_READ_METHODS.contains(&method)
+        || model::PARTICIPANT_MUTATION_METHODS.contains(&method)
+        || matches!(
+            method,
+            "mcp.authorization"
+                | "review.submit"
+                | "review.get"
+                | "review.list"
+                | "swarm.review.context"
+                | "artifact.read"
+                | "task.submission"
+                | "check.get"
+        )
 }
 fn page(params: &Value) -> Result<(i64, i64)> {
     let integer = |name, default| -> Result<i64> {
@@ -799,10 +907,48 @@ fn page(params: &Value) -> Result<(i64, i64)> {
 // local operator receives the global diagnostic view.
 const OPERATION_VISIBILITY_SQL: &str = r#"(
     :operator = 1
-    OR op.method NOT IN ('message.send', 'message.cancel')
+    OR (
+        op.method NOT IN ('message.send', 'message.cancel', 'coordination.send',
+            'task.request_changes', 'check.run', 'check.cancel')
+        AND op.method NOT LIKE 'coordination.%'
+        AND op.method NOT LIKE 'review.%'
+        AND op.method NOT LIKE 'automation.%'
+        AND op.caller_id != 'eliot-internal-automation-v1'
+    )
     OR op.caller_id = :client
     OR (
-        op.method = 'message.send'
+        op.method IN ('task.request_changes', 'check.run', 'check.cancel')
+        AND EXISTS (
+            SELECT 1 FROM attempts AS target
+            WHERE target.attempt_id = op.attempt_id AND target.owner_id = :client
+        )
+    )
+    OR (
+        op.caller_id = 'eliot-internal-automation-v1'
+        AND EXISTS (
+            SELECT 1 FROM meta AS link
+            WHERE link.key = 'automation:v1:operation:' || op.operation_id
+              AND json_extract(link.value_json, '$.record.operation_id') = op.operation_id
+              AND json_extract(link.value_json, '$.record.technical_requester_id') = op.caller_id
+              AND json_extract(link.value_json, '$.record.effective_manager_id') = :client
+              AND json_extract(op.effective_request_json, '$.automation_on_behalf.effective_manager_id') = :client
+        )
+    )
+    OR (
+        op.method = 'review.submit'
+        AND json_extract(op.result_json, '$.sponsor_client_id') = :client
+        AND EXISTS (
+            SELECT 1 FROM observations AS assignment
+            WHERE assignment.source_stream_id = 'controller:review'
+              AND assignment.kind = 'review.assignment'
+              AND json_extract(assignment.payload_json, '$.review_assignment_id') =
+                  json_extract(op.result_json, '$.review_assignment_id')
+              AND json_extract(assignment.payload_json, '$.sponsor_client_id') = :client
+              AND json_extract(assignment.payload_json, '$.reviewer_client_id') = op.caller_id
+        )
+    )
+    OR (
+        op.method IN ('message.send', 'coordination.send')
         AND op.state = 'settled'
         AND json_type(op.result_json, '$.sender') = 'text'
         AND json_extract(op.result_json, '$.sender') = op.caller_id
@@ -851,14 +997,27 @@ fn timeline_visibility_sql() -> String {
             OR (
                 :mailbox_only = 0
                 AND (
-                    o.kind NOT IN ('message.send', 'message.cancel')
-                    OR (:operator = 1 AND o.kind IN ('message.send', 'message.cancel'))
+                    (
+                        o.kind NOT IN ('message.send', 'message.cancel', 'coordination.send',
+                            'task.request_changes', 'task.feedback', 'task.review_stale',
+                            'check.run', 'check.cancel', 'check.completed')
+                        AND o.kind NOT LIKE 'coordination.%'
+                        AND o.kind NOT LIKE 'review.%'
+                        AND o.kind NOT LIKE 'automation.%'
+                    )
+                    OR (:operator = 1 AND o.kind IN ('message.send', 'message.cancel', 'coordination.send'))
                     OR (
-                        o.kind IN ('message.send', 'message.cancel')
+                        (
+                            o.kind IN ('message.send', 'message.cancel', 'coordination.send',
+                                'task.request_changes', 'task.feedback', 'task.review_stale',
+                                'check.run', 'check.cancel', 'check.completed')
+                            OR o.kind LIKE 'coordination.%'
+                            OR o.kind LIKE 'review.%'
+                            OR o.kind LIKE 'automation.%'
+                        )
                         AND EXISTS (
                             SELECT 1 FROM operations AS op
                             WHERE op.operation_id = o.operation_id
-                              AND op.method = o.kind
                               AND {OPERATION_VISIBILITY_SQL}
                         )
                     )
@@ -869,6 +1028,24 @@ fn timeline_visibility_sql() -> String {
 }
 
 fn operation_visible_to(db: &Connection, p: &Principal, id: &str) -> Result<bool> {
+    let caller: Option<String> = db
+        .query_row(
+            "SELECT caller_id FROM operations WHERE operation_id=?1",
+            [id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if caller.as_deref()
+        == Some(crate::automation::authorization::AUTOMATION_TECHNICAL_REQUESTER_ID)
+    {
+        // SQL performs visibility filtering before page/count decisions;
+        // verify the retained link's digest and requester before projection.
+        return if p.role == Role::Operator {
+            Ok(crate::automation::authorization::operation_link(db, id)?.is_some())
+        } else {
+            crate::automation::authorization::on_behalf_visible_to(db, p, id)
+        };
+    }
     let sql = format!(
         "SELECT EXISTS(SELECT 1 FROM operations AS op WHERE op.operation_id=:operation_id AND {OPERATION_VISIBILITY_SQL})"
     );
@@ -883,8 +1060,161 @@ fn operation_visible_to(db: &Connection, p: &Principal, id: &str) -> Result<bool
     )?)
 }
 
+/// Internal MCP discovery context. This is not an execution grant: the
+/// hard facade profile and the target handler still enforce their guards.
+fn mcp_authorization(db: &Connection, p: &Principal, value: &Value) -> Result<Value> {
+    model::fields(value, &["task_id"])?;
+    let requested_task = match value.get("task_id") {
+        None | Some(Value::Null) => None,
+        Some(_) => Some(model::text(value, "task_id")?),
+    };
+    let mut revision_context = json!({"client_id":p.client_id,"role":p.role,"gm":gm::record(db)?});
+    let mut allowed = vec!["swarm.tools.search"];
+    let methods = crate::mcp::registered_application_methods();
+    match p.role {
+        Role::Participant => {
+            let registration = meta(db, &format!("client:{}", p.client_id))?
+                .ok_or_else(|| Error::new("UNAUTHORIZED", "participant is not registered"))?;
+            if requested_task.is_some_and(|task| registration["task_id"] != task) {
+                return Err(Error::new(
+                    "FORBIDDEN",
+                    "discovery Task is outside the participant assignment",
+                ));
+            }
+            revision_context["grant_revision"] = registration["grant_revision"].clone();
+            revision_context["participation_basis"] = registration["participation_basis"].clone();
+            revision_context["scope_state"] = json!("unavailable");
+            match coordination::current_scope(db, p) {
+                Ok(scope) => {
+                    revision_context["scope_state"] = json!("current");
+                    revision_context["scope"] = scope;
+                    allowed.extend(methods.into_iter().filter(|method| {
+                        (model::PARTICIPANT_READ_METHODS.contains(method)
+                            && !matches!(
+                                *method,
+                                "coordination.participant.get" | "coordination.participant.list"
+                            ))
+                            || model::PARTICIPANT_MUTATION_METHODS.contains(method)
+                    }));
+                    if registration["participation_basis"]["kind"] == "sponsored_reviewer" {
+                        allowed.extend([
+                            "review.submit",
+                            "review.get",
+                            "review.list",
+                            "swarm.review.context",
+                            "artifact.read",
+                            "task.submission",
+                            "check.get",
+                        ]);
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.code.as_str(),
+                        "STALE_PARTICIPANT" | "FORBIDDEN" | "NOT_FOUND"
+                    ) =>
+                {
+                    let scope = &registration["participation_basis"]["review_scope"];
+                    if let Some(assignment) = scope["review_assignment_id"].as_str()
+                        && coordination::require_historical_review_result_scope(
+                            db, p, assignment, scope,
+                        )
+                        .is_ok()
+                    {
+                        allowed.extend(["review.submit", "review.get", "operation.get"]);
+                        revision_context["scope_state"] = json!("historical_result_only");
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Role::Operator => {
+            require_local_operator(db, &p.client_id)?;
+            allowed.extend(methods.into_iter().filter(|method| {
+                !model::PARTICIPANT_MUTATION_METHODS.contains(method) && *method != "review.submit"
+            }));
+        }
+        Role::Manager => {
+            let gm_authority = gm::require_authority(db, p).is_ok();
+            revision_context["current_gm_authority"] = json!(gm_authority);
+            allowed.extend(methods.into_iter().filter(|method| {
+                !model::PARTICIPANT_MUTATION_METHODS.contains(method)
+                    && *method != "review.submit"
+                    && (gm_authority
+                        || !matches!(
+                            *method,
+                            "client.register"
+                                | "client.list"
+                                | "host.mode"
+                                | "task.accept"
+                                | "task.invalidate_acceptance"
+                                | "forge.publish_ref"
+                                | "gm.handover"
+                        ))
+            }));
+        }
+        Role::Observer => allowed.extend(methods.into_iter().filter(|method| {
+            (is_read(method) || matches!(*method, "host.status" | "artifact.read"))
+                && !matches!(
+                    *method,
+                    "client.list"
+                        | "swarm.context.get"
+                        | "swarm.queue.get"
+                        | "swarm.agent.inspect"
+                        | "swarm.exceptions.get"
+                        | "review.get"
+                        | "review.list"
+                        | "swarm.review.context"
+                        | "automation.config.get"
+                        | "automation.config.preview"
+                        | "automation.config.explain"
+                )
+                && !method.starts_with("coordination.")
+        })),
+        Role::Module | Role::Scheduler => {
+            return Err(Error::new(
+                "FORBIDDEN",
+                "this role has no MCP discovery surface",
+            ));
+        }
+    }
+    if p.role != Role::Participant
+        && let Some(task_id) = requested_task
+    {
+        let task = tasks::get_task(db, task_id)?;
+        revision_context["task"] =
+            json!({"task_id":task_id,"revision":task["revision"],"state":task["state"]});
+    }
+    allowed.sort_unstable();
+    allowed.dedup();
+    revision_context["allowed_methods"] = json!(allowed);
+    let authorization_revision = model::digest(model::canonical(&revision_context)?.as_bytes());
+    Ok(
+        json!({"authorization_revision":authorization_revision,"basis":"authenticated_store_scope",
+        "allowed_methods":allowed,"role":p.role,"task_id":requested_task}),
+    )
+}
+
 fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config) -> Result<Value> {
     match method {
+        "mcp.authorization" => mcp_authorization(db, p, v),
+        "swarm.context.get"
+        | "coordination.participant.get"
+        | "coordination.participant.list"
+        | "coordination.peer.find"
+        | "coordination.work_card.get"
+        | "coordination.work_card.list"
+        | "coordination.contract_card.get"
+        | "coordination.contract_card.list"
+        | "coordination.inbox" => coordination::read(db, p, method, v),
+        "review.get" | "review.list" | "swarm.review.context" => reviews::read(db, p, method, v),
+        "automation.config.get" => automation::get(db, p, v),
+        "automation.config.preview" => automation::preview(db, p, v),
+        "automation.config.explain" => automation::explain(db, p, v),
+        "swarm.dashboard" => launcher::dashboard(db, p, v),
+        "swarm.queue.get" => launcher::queue_get(db, p, v),
+        "swarm.agent.inspect" => launcher::agent_inspect(db, p, v),
+        "swarm.exceptions.get" => launcher::exceptions_get(db, p, v),
         "check.get" => checks::describe(db, v),
         "check.profiles" => {
             model::fields(v, &[])?;
@@ -1034,7 +1364,12 @@ fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             let items = ids
                 .iter()
-                .map(|id| operations::get_operation(db, id))
+                .map(|id| {
+                    if !operation_visible_to(db, p, id)? {
+                        return Err(Error::new("NOT_FOUND", format!("Operation {id}")));
+                    }
+                    operations::get_operation(db, id)
+                })
                 .collect::<Result<Vec<_>>>()?;
             Ok(json!({"items":items,"next_after":after+ids.len() as i64}))
         }
@@ -1085,6 +1420,26 @@ fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config
             // silently skips a source row.
             let mut projected = Vec::with_capacity(rows.len());
             for (id, kind, raw, time, operation_id) in rows {
+                if (kind.starts_with("coordination.")
+                    || kind.starts_with("review.")
+                    || kind.starts_with("automation.")
+                    || matches!(
+                        kind.as_str(),
+                        "task.request_changes"
+                            | "task.feedback"
+                            | "task.review_stale"
+                            | "check.run"
+                            | "check.cancel"
+                            | "check.completed"
+                    ))
+                    && let Some(operation_id) = operation_id.as_deref()
+                    && !operation_visible_to(db, p, operation_id)?
+                {
+                    return Err(Error::new(
+                        "NOT_FOUND",
+                        "scoped observation is not visible to this client",
+                    ));
+                }
                 projected.push(json!({"cursor":id,"kind":kind,"payload":serde_json::from_str::<Value>(&raw)?,"recorded_at_ms":time,"operation_id":operation_id}));
             }
             let limited = projection::limit_items(projected, projection::timeline_gap_reference)?;
@@ -1264,6 +1619,25 @@ fn apply(
         check_plan,
     } = context;
     match method {
+        "coordination.participant.register"
+        | "coordination.participant.disable"
+        | "coordination.work_card.publish"
+        | "coordination.work_card.withdraw"
+        | "coordination.contract_card.publish"
+        | "coordination.contract_card.withdraw"
+        | "coordination.send" => coordination::apply(tx, p, method, v, config, id, now),
+        "review.assign" => {
+            let request = crate::review::ReviewAssignRequest::parse(v)?;
+            reviews::reserve_assign(tx, reviews::ReviewActor::Direct(p), &request, id, now)
+                .map(|value| (value, false))
+        }
+        "review.submit" => {
+            let request = crate::review::ReviewSubmitRequest::parse(v)?;
+            reviews::reserve_submit(tx, p, &request, id, now).map(|value| (value, false))
+        }
+        "automation.config.apply" => {
+            automation::apply(tx, p, v, id, now).map(|value| (value, false))
+        }
         "forge.publish_ref" => forge::reserve(tx, p, v, id, config).map(|v| (v, true)),
         "source.capture" => checks::reserve_source(tx, p, v, id, config).map(|v| (v, true)),
         "check.run" => checks::reserve(tx, p, v, id, config, check_plan),
@@ -1322,6 +1696,12 @@ fn apply(
             )?;
             let client = model::text(v, "client_id")?;
             let role: Role = serde_json::from_value(v["role"].clone())?;
+            if role == Role::Participant {
+                return Err(Error::new(
+                    "FORBIDDEN",
+                    "participants require assignment-bound coordination registration",
+                ));
+            }
             if role == Role::Operator {
                 return Err(Error::new(
                     "FORBIDDEN",
@@ -1494,6 +1874,8 @@ fn cancel_message(tx: &Transaction<'_>, p: &Principal, v: &Value, id: &str) -> R
 mod capacity_tests;
 #[cfg(test)]
 mod mailbox_tests;
+#[cfg(test)]
+mod program_tests;
 #[cfg(test)]
 mod receipt_tests;
 #[cfg(test)]

@@ -44,6 +44,9 @@ pub async fn run(config: Config) -> Result<()> {
     supervisors.spawn(async move { ("scheduler", crate::scheduler::run(store, stop).await) });
     let store = owner.store.clone();
     let stop = stopping.clone();
+    supervisors.spawn(async move { ("automation", supervise_automation(store, stop).await) });
+    let store = owner.store.clone();
+    let stop = stopping.clone();
     supervisors.spawn(async move { ("forge", supervise_forge(store, stop).await) });
     let semaphore = Arc::new(Semaphore::new(config.ipc.max_connections));
     let mut connections = JoinSet::new();
@@ -86,6 +89,33 @@ pub async fn run(config: Config) -> Result<()> {
     }
     owner.close().await?;
     exit
+}
+
+/// One host-owned reconciler for all enabled entries. Committed changes are
+/// hints; bounded startup/periodic scans recover after missed hints or restart.
+async fn supervise_automation(store: Store, mut stopping: watch::Receiver<bool>) -> Result<()> {
+    let mut changed = store.subscribe_schedule_changes();
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        if *stopping.borrow() {
+            return Ok(());
+        }
+        tokio::select! {
+            result = stopping.changed() => {
+                if result.is_err() || *stopping.borrow() { return Ok(()); }
+            }
+            result = changed.changed() => {
+                if result.is_err() { return Err(Error::new("STORE_CLOSED", "automation change stream ended")); }
+                if *stopping.borrow() { return Ok(()); }
+                store.reconcile_automations_once().await?;
+            }
+            _ = tick.tick() => {
+                if *stopping.borrow() { return Ok(()); }
+                store.reconcile_automations_once().await?;
+            }
+        }
+    }
 }
 
 async fn supervise_forge(store: Store, mut stopping: watch::Receiver<bool>) -> Result<()> {

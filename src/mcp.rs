@@ -84,7 +84,7 @@ use rmcp::{
     transport::stdio,
 };
 use serde_json::{Map, Value, json};
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
 use tokio::sync::Mutex;
 
 type JsonObject = Map<String, Value>;
@@ -101,6 +101,7 @@ const fn f(name: &'static str, kind: &'static str) -> Field {
 const S: &str = "string";
 const SN: &str = "string_or_null";
 const I: &str = "integer";
+const IN: &str = "integer_or_null";
 const B: &str = "boolean";
 const O: &str = "object";
 const A: &str = "array";
@@ -150,6 +151,222 @@ const fn mutation(
 /// request-ID treatment (`agent.result` and `host.mode` are mutations).
 static TOOLS: &[(bool, ToolSpec)] = &[
     // Read-only methods.
+    read(
+        "swarm.tools.search",
+        "Search the caller's authorized MCP catalog by goal, purpose, or exact tool name. Returns metadata and a safe surface/reconnect recommendation only; it never executes a selected method.",
+        &[
+            f("query", S),
+            f("purpose", S),
+            f("task_id", S),
+            f("exact_method", S),
+            f("loaded_catalog_revision", S),
+            f("max_results", I),
+        ],
+        &["query"],
+    ),
+    read(
+        "swarm.context.get",
+        "Read the authenticated Participant's current Task/Attempt context or a manager-selected exact assignment context, including relevant cards and selector-bounded peer discovery.",
+        &[
+            f("task_id", S),
+            f("task_revision", I),
+            f("attempt_id", S),
+            f("contract_key", S),
+            f("path", S),
+            f("symbol", S),
+            f("interface", S),
+            f("limit", I),
+            f("after_client_id", S),
+        ],
+        &[],
+    ),
+    read(
+        "swarm.dashboard",
+        "Read one bounded retained-facts dashboard. Observer results are aggregate-only and omit assignment details and manager exceptions.",
+        &[f("limit", I)],
+        &[],
+    ),
+    read(
+        "swarm.queue.get",
+        "Page the current Task queue with optional project and state filters; queue ordering is the stored creation order, not a priority score.",
+        &[
+            f("after", I),
+            f("limit", I),
+            f("project_id", S),
+            f("task_state", S),
+        ],
+        &[],
+    ),
+    read(
+        "swarm.agent.inspect",
+        "Inspect one exact Attempt and its bounded binding, operation, check, peer, and overlap neighborhood.",
+        &[
+            f("attempt_id", S),
+            f("operation_after", I),
+            f("operation_limit", I),
+            f("check_after", I),
+            f("check_limit", I),
+            f("peer_after_client_id", S),
+            f("peer_limit", I),
+            f("overlap_after", I),
+            f("overlap_limit", I),
+        ],
+        &["attempt_id"],
+    ),
+    read(
+        "swarm.exceptions.get",
+        "Page manager-actionable items from the bounded attention projection; results include explicit coverage gaps.",
+        &[f("after", I), f("limit", I)],
+        &[],
+    ),
+    read(
+        "coordination.participant.get",
+        "Read one participant registration only within an authenticated current Task/Attempt scope.",
+        &[
+            f("client_id", S),
+            f("task_id", S),
+            f("task_revision", I),
+            f("attempt_id", S),
+        ],
+        &["client_id"],
+    ),
+    read(
+        "coordination.participant.list",
+        "Page the redacted participant roster for one exact manager-owned Task/Attempt scope.",
+        &[
+            f("task_id", S),
+            f("task_revision", I),
+            f("attempt_id", S),
+            f("limit", I),
+            f("after_client_id", S),
+        ],
+        &["task_id", "task_revision", "attempt_id"],
+    ),
+    read(
+        "coordination.peer.find",
+        "Find current participants only by one exact contract, path, symbol, or interface selector in the authenticated scope; never walks the roster.",
+        &[
+            f("task_id", S),
+            f("task_revision", I),
+            f("attempt_id", S),
+            f("contract_key", S),
+            f("path", S),
+            f("symbol", S),
+            f("interface", S),
+            f("fields", A),
+            f("limit", I),
+            f("after_client_id", S),
+        ],
+        &[],
+    ),
+    read(
+        "coordination.work_card.get",
+        "Read the caller's current work card, or a selected participant's card in an exact manager-owned scope.",
+        &[
+            f("participant_id", S),
+            f("fields", A),
+            f("task_id", S),
+            f("task_revision", I),
+            f("attempt_id", S),
+            f("limit", I),
+            f("after_client_id", S),
+        ],
+        &[],
+    ),
+    read(
+        "coordination.work_card.list",
+        "Page current work cards matching exactly one relationship selector in the caller's scope.",
+        &[
+            f("contract_key", S),
+            f("path", S),
+            f("symbol", S),
+            f("interface", S),
+            f("fields", A),
+            f("task_id", S),
+            f("task_revision", I),
+            f("attempt_id", S),
+            f("limit", I),
+            f("after_client_id", S),
+        ],
+        &[],
+    ),
+    read(
+        "coordination.contract_card.get",
+        "Read one contract card by exact key, or the bounded matching cards in an exact manager-owned scope.",
+        &[
+            f("contract_key", S),
+            f("participant_id", S),
+            f("fields", A),
+            f("task_id", S),
+            f("task_revision", I),
+            f("attempt_id", S),
+            f("limit", I),
+            f("after_client_id", S),
+        ],
+        &["contract_key"],
+    ),
+    read(
+        "coordination.contract_card.list",
+        "Page current contract cards by one exact contract key in the caller's scope.",
+        &[
+            f("contract_key", S),
+            f("fields", A),
+            f("task_id", S),
+            f("task_revision", I),
+            f("attempt_id", S),
+            f("limit", I),
+            f("after_client_id", S),
+        ],
+        &["contract_key"],
+    ),
+    read(
+        "coordination.inbox",
+        "Read bounded durable deliveries addressed to the authenticated Participant in its exact current scope.",
+        &[f("limit", I), f("after_operation_id", S)],
+        &[],
+    ),
+    read(
+        "review.get",
+        "Read one immutable review assignment visible to its exact assigned reviewer or the authorized manager/operator.",
+        &[f("review_assignment_id", S)],
+        &["review_assignment_id"],
+    ),
+    read(
+        "review.list",
+        "Page review assignments after filtering to the caller's authorized assignment scope.",
+        &[
+            f("task_id", S),
+            f("attempt_id", S),
+            f("submission_ref", S),
+            f("after", I),
+            f("limit", I),
+        ],
+        &[],
+    ),
+    read(
+        "swarm.review.context",
+        "Read the exact assigned-review packet and immutable submission/candidate metadata; content bytes remain behind artifact.read.",
+        &[f("review_assignment_id", S)],
+        &["review_assignment_id"],
+    ),
+    read(
+        "automation.config.get",
+        "Page revisioned automation definitions owned by the authenticated Manager and scoped to one project.",
+        &[f("project_id", S), f("after", I), f("limit", I)],
+        &["project_id"],
+    ),
+    read(
+        "automation.config.preview",
+        "Validate an automation change plan and return its digest and conflicts without applying it.",
+        &[f("project_id", S), f("changes", A)],
+        &["project_id", "changes"],
+    ),
+    read(
+        "automation.config.explain",
+        "Explain one owned automation's dispatch state and linked operations by exact project and automation ID.",
+        &[f("project_id", S), f("automation_id", S)],
+        &["project_id", "automation_id"],
+    ),
     read("host.status", "Controller status snapshot.", &[], &[]),
     read(
         "route.list",
@@ -284,6 +501,117 @@ static TOOLS: &[(bool, ToolSpec)] = &[
     ),
     // Mutations. Restricted profiles require a stable client_request_id;
     // only the explicit local Full compatibility profile permits omission.
+    mutation(
+        "coordination.participant.register",
+        "Register a Participant for one exact current Task/Attempt. Send only the precomputed token hash; keep the raw credential local. A sponsored reviewer remains unusable until bound to its exact review slot.",
+        &[
+            f("client_id", S),
+            f("token_hash", S),
+            f("task_id", S),
+            f("task_revision", I),
+            f("attempt_id", S),
+            f("participation_basis", O),
+            f("binding_id", SN),
+            f("binding_generation", IN),
+            f("native_session_id", SN),
+            f("display_alias", SN),
+            f("inbound_policy", SN),
+            f("review_profile", SN),
+        ],
+        &[
+            "client_id",
+            "token_hash",
+            "task_id",
+            "task_revision",
+            "attempt_id",
+            "participation_basis",
+        ],
+    ),
+    mutation(
+        "coordination.participant.disable",
+        "Disable one registered Participant under the exact Attempt manager; the grant revision advances and coordination history is retained.",
+        &[f("client_id", S), f("expected_grant_revision", I)],
+        &["client_id"],
+    ),
+    mutation(
+        "coordination.work_card.publish",
+        "Publish the authenticated Participant's bounded work card for its current Task/Attempt scope.",
+        &[f("fields", O)],
+        &["fields"],
+    ),
+    mutation(
+        "coordination.work_card.withdraw",
+        "Withdraw the authenticated Participant's current work card while preserving its history.",
+        &[],
+        &[],
+    ),
+    mutation(
+        "coordination.contract_card.publish",
+        "Publish one bounded contract card under an exact key in the authenticated Participant's current scope.",
+        &[f("contract_key", S), f("fields", O)],
+        &["contract_key", "fields"],
+    ),
+    mutation(
+        "coordination.contract_card.withdraw",
+        "Withdraw one exact contract card in the authenticated Participant's current scope.",
+        &[f("contract_key", S)],
+        &["contract_key"],
+    ),
+    mutation(
+        "coordination.send",
+        "Deliver a bounded non-null JSON body to one active Participant in the same current Task/Attempt scope; this is typed coordination, not raw mailbox access.",
+        &[f("recipient", S), f("body", "non_null_json")],
+        &["recipient", "body"],
+    ),
+    mutation(
+        "review.assign",
+        "Assign a reviewer to the exact current submitted candidate, choosing one reviewer identity or registered review profile. Replacement requires the prior assignment, reason, and evidence refs together.",
+        &[
+            f("attempt_id", S),
+            f("expected_revision", I),
+            f("submission_ref", S),
+            f("candidate_ref", S),
+            f("reviewer_client_id", SN),
+            f("review_profile", SN),
+            f("replaces_review_assignment_id", SN),
+            f("replacement_reason", SN),
+            f("replacement_evidence_refs", A),
+        ],
+        &[
+            "attempt_id",
+            "expected_revision",
+            "submission_ref",
+            "candidate_ref",
+        ],
+    ),
+    mutation(
+        "review.submit",
+        "Record the authenticated AssignedReviewer's immutable verdict and evidence for its exact assigned review slot. It does not apply Task feedback, start repair, or publish.",
+        &[
+            f("review_assignment_id", S),
+            f("submission_ref", S),
+            f("candidate_ref", S),
+            f("verdict", S),
+            f("coverage", S),
+            f("findings", A),
+            f("evidence_refs", A),
+        ],
+        &[
+            "review_assignment_id",
+            "submission_ref",
+            "candidate_ref",
+            "verdict",
+            "coverage",
+            "findings",
+            "evidence_refs",
+        ],
+    ),
+    mutation(
+        "automation.config.apply",
+        "Apply a revision-checked Manager-owned automation plan. Preview first and pass its digest when available; activation does not start a model turn.",
+        &[f("project_id", S), f("changes", A), f("preview_digest", SN)],
+        &["project_id", "changes"],
+    ),
     mutation(
         "host.mode",
         "Enable or disable admission of new work on the host: new_work is the string \"enabled\" or \"disabled\".",
@@ -631,6 +959,15 @@ static TOOLS: &[(bool, ToolSpec)] = &[
     ),
 ];
 
+/// Canonical application methods advertised by MCP. The catalog search is a
+/// local facade method and is intentionally excluded from the Store registry.
+pub(crate) fn registered_application_methods() -> Vec<&'static str> {
+    TOOLS
+        .iter()
+        .filter_map(|(_, spec)| (spec.method != "swarm.tools.search").then_some(spec.method))
+        .collect()
+}
+
 fn tool_name(method: &str) -> String {
     method.replace('.', "_")
 }
@@ -676,9 +1013,11 @@ fn field_schema(kind: &str) -> Value {
         "string" => json!({"type": "string"}),
         "string_or_null" => json!({"type": ["string", "null"]}),
         "integer" => json!({"type": "integer"}),
+        "integer_or_null" => json!({"type": ["integer", "null"]}),
         "boolean" => json!({"type": "boolean"}),
         "object" => json!({"type": "object"}),
         "array" => json!({"type": "array"}),
+        "non_null_json" => json!({"not": {"type": "null"}}),
         _ => json!({}),
     }
 }
@@ -1412,17 +1751,115 @@ impl ServerHandler for McpFacade {
 }
 
 /// The production MCP boundary is a session-fixed view over the local facade.
-/// It filters both discovery and every manually addressed method before the
-/// inner facade can open or write local IPC.
+/// Discovery intersects its presentation with live Store authorization;
+/// manually addressed tools are still rejected by the hard profile before
+/// their application method is forwarded.
 pub(crate) struct ProfiledFacade {
     inner: McpFacade,
     profile: McpToolProfile,
+    surface: catalog::Surface,
 }
 
 impl ProfiledFacade {
+    #[cfg(test)]
     fn new(inner: McpFacade, profile: McpToolProfile) -> Self {
-        Self { inner, profile }
+        Self::with_surface(inner, profile, catalog::Surface::role_default(profile))
     }
+
+    fn with_surface(inner: McpFacade, profile: McpToolProfile, surface: catalog::Surface) -> Self {
+        Self {
+            inner,
+            profile,
+            surface,
+        }
+    }
+
+    /// Ask the authenticated Store for current method membership on every
+    /// catalog operation. Discovery is not cached across grant/scope changes.
+    async fn catalog_authorization(
+        &self,
+        task_id: Option<&str>,
+    ) -> std::result::Result<CatalogAuthorization, McpError> {
+        let mut params = json!({});
+        if let Some(task_id) = task_id {
+            params["task_id"] = json!(task_id);
+        }
+        let value = self
+            .inner
+            .request("mcp.authorization", params)
+            .await
+            .map_err(|_| catalog_authorization_error())?;
+        parse_catalog_authorization(&value, task_id).ok_or_else(catalog_authorization_error)
+    }
+}
+
+struct CatalogAuthorization {
+    revision: String,
+    task_id: Option<String>,
+    allowed_methods: BTreeSet<String>,
+}
+
+fn catalog_authorization_error() -> McpError {
+    McpError::internal_error(
+        "current application authorization could not be confirmed",
+        None,
+    )
+}
+
+fn parse_catalog_authorization(
+    value: &Value,
+    requested_task_id: Option<&str>,
+) -> Option<CatalogAuthorization> {
+    let object = value.as_object()?;
+    if object.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "authorization_revision" | "basis" | "allowed_methods" | "role" | "task_id"
+        )
+    }) {
+        return None;
+    }
+    let revision = object.get("authorization_revision")?.as_str()?.trim();
+    if revision.is_empty() || revision.len() > 128 {
+        return None;
+    }
+    if object.get("basis")?.as_str()? != "authenticated_store_scope" {
+        return None;
+    }
+    if !matches!(
+        object.get("role")?.as_str()?,
+        "participant" | "manager" | "operator" | "observer"
+    ) {
+        return None;
+    }
+    let task_id = match object.get("task_id") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(task_id)) if !task_id.trim().is_empty() => Some(task_id.clone()),
+        _ => return None,
+    };
+    if task_id.as_deref() != requested_task_id {
+        return None;
+    }
+    let application_methods: BTreeSet<&str> =
+        registered_application_methods().into_iter().collect();
+    let mut allowed_methods = BTreeSet::new();
+    for method in object.get("allowed_methods")?.as_array()? {
+        let method = method.as_str()?;
+        if method != "swarm.tools.search" && !application_methods.contains(method) {
+            return None;
+        }
+        if !allowed_methods.insert(method.to_owned()) {
+            return None;
+        }
+    }
+    if !allowed_methods.contains("swarm.tools.search") {
+        return None;
+    }
+    Some(CatalogAuthorization {
+        revision: revision.to_owned(),
+        task_id,
+        allowed_methods,
+    })
 }
 
 /// Build the same session-fixed, profile-enforced facade used by stdio MCP.
@@ -1434,15 +1871,29 @@ pub(crate) fn profiled_facade(
     profile_name: Option<&str>,
 ) -> Result<ProfiledFacade> {
     config.mcp.validate()?;
+    let selected_name = profile_name.unwrap_or(&config.mcp.default_profile);
+    let named_profile = config.mcp.profiles.get(selected_name).ok_or_else(|| {
+        Error::new(
+            "CONFIG_ERROR",
+            format!("unknown MCP profile {selected_name:?}"),
+        )
+    })?;
     let profile = config
         .mcp
-        .selected_tool_profile(profile_name, &credential.client_id)?;
+        .selected_tool_profile(Some(selected_name), &credential.client_id)?;
+    let surface = catalog::Surface::configured(
+        profile,
+        named_profile.surface.as_deref(),
+        &named_profile.deferred_groups,
+        &named_profile.manual_tools,
+    )
+    .map_err(|error| Error::new("CONFIG_ERROR", error.to_string()))?;
     let facade = McpFacade::new(
         config.storage.data_dir.clone(),
         credential,
         Arc::new(config.ipc.clone()),
     );
-    Ok(ProfiledFacade::new(facade, profile))
+    Ok(ProfiledFacade::with_surface(facade, profile, surface))
 }
 
 fn method_not_found(method: &str) -> McpError {
@@ -1467,6 +1918,108 @@ fn require_caller_request_id(params: &Value) -> std::result::Result<(), McpError
     Ok(())
 }
 
+fn parse_catalog_search<'a>(
+    params: &'a Value,
+) -> std::result::Result<catalog::SearchRequest<'a>, McpError> {
+    let object = params.as_object().ok_or_else(|| {
+        McpError::invalid_params("catalog search arguments must be an object", None)
+    })?;
+    const FIELDS: &[&str] = &[
+        "query",
+        "purpose",
+        "task_id",
+        "exact_method",
+        "loaded_catalog_revision",
+        "max_results",
+    ];
+    if object.keys().any(|key| !FIELDS.contains(&key.as_str())) {
+        return Err(McpError::invalid_params(
+            "catalog search contains an unsupported argument",
+            None,
+        ));
+    }
+    let query = object
+        .get("query")
+        .and_then(Value::as_str)
+        .filter(|query| query.len() <= 512)
+        .ok_or_else(|| {
+            McpError::invalid_params("query must be a string of at most 512 bytes", None)
+        })?;
+    let optional_text =
+        |name: &str, limit: usize| -> std::result::Result<Option<&'a str>, McpError> {
+            match object.get(name) {
+                None | Some(Value::Null) => Ok(None),
+                Some(Value::String(value)) if value.len() <= limit => Ok(Some(value)),
+                _ => Err(McpError::invalid_params(
+                    format!("{name} must be a string of at most {limit} bytes"),
+                    None,
+                )),
+            }
+        };
+    let purpose = optional_text("purpose", 128)?;
+    let task_id = optional_text("task_id", 128)?;
+    let exact_method = optional_text("exact_method", 128)?;
+    let loaded_catalog_revision = optional_text("loaded_catalog_revision", 64)?;
+    if query.trim().is_empty() && exact_method.is_none() {
+        return Err(McpError::invalid_params(
+            "query must be non-empty unless exact_method is supplied",
+            None,
+        ));
+    }
+    if loaded_catalog_revision.is_some_and(|revision| {
+        revision.len() != 64
+            || !revision
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }) {
+        return Err(McpError::invalid_params(
+            "loaded_catalog_revision must be a lowercase SHA-256 digest",
+            None,
+        ));
+    }
+    let max_results = match object.get("max_results") {
+        None => 5,
+        Some(value) => value
+            .as_u64()
+            .filter(|value| (1..=catalog::MAX_SEARCH_RESULTS as u64).contains(value))
+            .map(|value| value as usize)
+            .ok_or_else(|| {
+                McpError::invalid_params(
+                    format!(
+                        "max_results must be between 1 and {}",
+                        catalog::MAX_SEARCH_RESULTS
+                    ),
+                    None,
+                )
+            })?,
+    };
+    Ok(catalog::SearchRequest {
+        query,
+        purpose,
+        task_id,
+        exact_method,
+        loaded_catalog_revision,
+        max_results,
+    })
+}
+
+fn catalog_protocol_error(error: catalog::CatalogError) -> McpError {
+    match error {
+        catalog::CatalogError::InvalidCursor
+        | catalog::CatalogError::InvalidSurface
+        | catalog::CatalogError::StaleCursor
+        | catalog::CatalogError::CursorOutOfRange
+        | catalog::CatalogError::StaleCatalogRevision => {
+            McpError::invalid_params(error.to_string(), None)
+        }
+        catalog::CatalogError::IncompleteRegistry
+        | catalog::CatalogError::ToolSchemaTooLarge
+        | catalog::CatalogError::Serialization(_) => {
+            McpError::internal_error(error.to_string(), None)
+        }
+    }
+}
+
 impl ServerHandler for ProfiledFacade {
     fn get_info(&self) -> ServerConfig {
         self.inner.get_info()
@@ -1474,18 +2027,29 @@ impl ServerHandler for ProfiledFacade {
 
     async fn list_tools(
         &self,
-        _request: Option<PaginatedRequestParams>,
+        request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> std::result::Result<ListToolsResult, McpError> {
-        let tools = TOOLS
-            .iter()
-            .filter(|(_, spec)| profiles::allows_method(self.profile, spec.method))
-            .map(|(read_only, spec)| {
-                tool_from_spec(*read_only, spec, self.profile != McpToolProfile::Full)
-            })
-            .collect();
+        let cursor = request.as_ref().and_then(|params| params.cursor.as_deref());
+        let authorization = self.catalog_authorization(None).await?;
+        let page = catalog::list_tools_page(
+            self.profile,
+            &self.surface,
+            cursor,
+            catalog::AuthorizationRevision {
+                value: &authorization.revision,
+                basis: catalog::AuthorizationBasis::AuthenticatedStoreScope,
+            },
+            |method, task_id| {
+                authorization.allowed_methods.contains(method)
+                    && task_id
+                        .is_none_or(|task_id| authorization.task_id.as_deref() == Some(task_id))
+            },
+        )
+        .map_err(catalog_protocol_error)?;
         Ok(ListToolsResult {
-            tools,
+            tools: page.tools,
+            next_cursor: page.next_cursor,
             ..Default::default()
         })
     }
@@ -1504,6 +2068,35 @@ impl ServerHandler for ProfiledFacade {
             return Err(McpError::method_not_found::<
                 rmcp::model::CallToolRequestMethod,
             >());
+        }
+        if spec.method == "swarm.tools.search" {
+            let arguments = Value::Object(request.arguments.clone().unwrap_or_default());
+            let search = parse_catalog_search(&arguments)?;
+            let authorization = self.catalog_authorization(search.task_id).await?;
+            let result = catalog::search_catalog(
+                self.profile,
+                &self.surface,
+                search,
+                catalog::AuthorizationRevision {
+                    value: &authorization.revision,
+                    basis: catalog::AuthorizationBasis::AuthenticatedStoreScope,
+                },
+                |method, task_id| {
+                    authorization.allowed_methods.contains(method)
+                        && task_id
+                            .is_none_or(|task_id| authorization.task_id.as_deref() == Some(task_id))
+                },
+            )
+            .map_err(catalog_protocol_error)?;
+            let value = serde_json::to_value(result)
+                .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+            let Value::Object(result) = value else {
+                return Err(McpError::internal_error(
+                    "MCP catalog search produced a non-object result",
+                    None,
+                ));
+            };
+            return Ok(CallToolResult::structured(Value::Object(result)).into());
         }
         if self.profile != McpToolProfile::Full && !*read_only {
             let arguments = request
@@ -1584,8 +2177,8 @@ fn client_tasks_negotiated(context: &RequestContext<RoleServer>) -> bool {
 }
 
 /// Serve MCP over stdio until the client disconnects. The host connection is
-/// established lazily on the first tool call, so discovery works before (and
-/// independently of) host availability.
+/// established lazily on the first catalog discovery, search, or tool call.
+/// Discovery fails closed while the host cannot confirm current authorization.
 pub async fn run(config: Config, credential: Credential) -> Result<()> {
     run_profiled(config, credential, None).await
 }
@@ -1630,6 +2223,7 @@ mod tests {
             }
         }
         let expected: BTreeSet<&str> = [
+            "swarm.tools.search",
             "host.status",
             "route.list",
             "client.list",
@@ -1652,6 +2246,25 @@ mod tests {
             "report.attention",
             "report.capacity",
             "message.read",
+            "swarm.context.get",
+            "swarm.dashboard",
+            "swarm.queue.get",
+            "swarm.agent.inspect",
+            "swarm.exceptions.get",
+            "coordination.participant.get",
+            "coordination.participant.list",
+            "coordination.peer.find",
+            "coordination.work_card.get",
+            "coordination.work_card.list",
+            "coordination.contract_card.get",
+            "coordination.contract_card.list",
+            "coordination.inbox",
+            "review.get",
+            "review.list",
+            "swarm.review.context",
+            "automation.config.get",
+            "automation.config.preview",
+            "automation.config.explain",
             "host.mode",
             "client.register",
             "source.capture",
@@ -1683,15 +2296,25 @@ mod tests {
             "agent.background",
             "message.send",
             "message.cancel",
+            "coordination.participant.register",
+            "coordination.participant.disable",
+            "coordination.work_card.publish",
+            "coordination.work_card.withdraw",
+            "coordination.contract_card.publish",
+            "coordination.contract_card.withdraw",
+            "coordination.send",
+            "review.assign",
+            "review.submit",
+            "automation.config.apply",
         ]
         .into_iter()
         .collect();
         assert_eq!(methods, expected);
-        assert_eq!(TOOLS.len(), 53);
-        assert_eq!(TOOLS.iter().filter(|(read_only, _)| *read_only).count(), 22);
+        assert_eq!(TOOLS.len(), 83);
+        assert_eq!(TOOLS.iter().filter(|(read_only, _)| *read_only).count(), 42);
         assert_eq!(
             TOOLS.iter().filter(|(read_only, _)| !*read_only).count(),
-            31
+            41
         );
     }
 
@@ -1732,6 +2355,7 @@ mod tests {
     }
 }
 
+mod catalog;
 mod profiles;
 mod subscriptions;
 

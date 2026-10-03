@@ -22,6 +22,7 @@ const RELEASE_ITEM_SQL: &str = "RELEASE message_send_batch_item";
 
 pub(super) struct Request {
     pub(super) principal: Principal,
+    pub(super) method: String,
     pub(super) params: Value,
     pub(super) response: oneshot::Sender<Result<Value>>,
 }
@@ -101,11 +102,24 @@ fn process_one(tx: &Transaction<'_>, request: &Request, config: &Config) -> Resu
             "module credentials serve only their native binding",
         )));
     }
-    principal.require_writer()?;
+    if !matches!(
+        request.method.as_str(),
+        "message.send" | "coordination.send"
+    ) {
+        return Err(Error::new(
+            "METHOD_NOT_FOUND",
+            "unsupported batched mailbox mutation",
+        ));
+    }
+    if principal.role == Role::Participant && request.method == "coordination.send" {
+        super::coordination::authorize_participant_mutation(tx, &principal, &request.method)?;
+    } else {
+        principal.require_writer()?;
+    }
     mutate_in_transaction(
         tx,
         &principal,
-        "message.send",
+        &request.method,
         &request.params,
         config,
         model::now_ms()?,
@@ -129,6 +143,7 @@ mod tests {
         (
             Request {
                 principal: principal.clone(),
+                method: "message.send".into(),
                 params,
                 response,
             },

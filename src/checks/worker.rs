@@ -436,14 +436,15 @@ fn decode_cargo_file_url(source: &str) -> Option<PathBuf> {
             index += 1;
         }
     }
-    let mut path = String::from_utf8(decoded).ok()?;
+    let path = String::from_utf8(decoded).ok()?;
     #[cfg(windows)]
-    {
+    let path = {
+        let mut path = path;
         if path.as_bytes().get(2) == Some(&b':') && path.starts_with('/') {
             path.remove(0);
         }
-        path = path.replace('/', "\\");
-    }
+        path.replace('/', "\\")
+    };
     Some(PathBuf::from(path))
 }
 

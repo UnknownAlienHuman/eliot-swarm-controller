@@ -74,12 +74,27 @@ fn counts_by(db: &Connection, table: &str, column: &str) -> Result<Value> {
 }
 
 fn owner_policy_report(db: &Connection) -> Result<Value> {
-    let identity = crate::policy::accepted_edition(Some(crate::policy::OWNER_POLICY_V1_ID))?;
-    let accepted: i64 = db.query_row(
-        "SELECT count(*) FROM attempts WHERE json_extract(task_snapshot_json,'$.owner_policy.status')='accepted' AND json_extract(task_snapshot_json,'$.owner_policy.policy_id')=?1 AND json_extract(task_snapshot_json,'$.owner_policy.edition')=?2 AND json_extract(task_snapshot_json,'$.owner_policy.document_path')=?3 AND json_extract(task_snapshot_json,'$.owner_policy.document_section')=?4 AND json_extract(task_snapshot_json,'$.owner_policy.document_sha256')=?5 AND (SELECT count(*) FROM json_each(task_snapshot_json,'$.owner_policy'))=6",
-        params![identity.policy_id, i64::from(identity.edition), identity.document_path, identity.document_section, identity.document_sha256],
-        |r| r.get(0),
-    )?;
+    let identities = crate::policy::accepted_editions();
+    let mut accepted = 0_i64;
+    let mut accepted_editions = Vec::with_capacity(identities.len());
+    for identity in identities {
+        let count: i64 = db.query_row(
+            "SELECT count(*) FROM attempts WHERE json_extract(task_snapshot_json,'$.owner_policy.status')='accepted' AND json_extract(task_snapshot_json,'$.owner_policy.policy_id')=?1 AND json_extract(task_snapshot_json,'$.owner_policy.edition')=?2 AND json_extract(task_snapshot_json,'$.owner_policy.document_path')=?3 AND json_extract(task_snapshot_json,'$.owner_policy.document_section')=?4 AND json_extract(task_snapshot_json,'$.owner_policy.document_sha256')=?5 AND (SELECT count(*) FROM json_each(task_snapshot_json,'$.owner_policy'))=6",
+            params![identity.policy_id, i64::from(identity.edition), identity.document_path, identity.document_section, identity.document_sha256],
+            |r| r.get(0),
+        )?;
+        accepted += count;
+        if count > 0 || identity.policy_id == crate::policy::OWNER_POLICY_V1_ID {
+            accepted_editions.push(json!({
+                "policy_id": identity.policy_id,
+                "edition": identity.edition,
+                "document_path": identity.document_path,
+                "document_section": identity.document_section,
+                "document_sha256": identity.document_sha256,
+                "attempts": count,
+            }));
+        }
+    }
     let legacy_unknown: i64 = db.query_row(
         "SELECT count(*) FROM attempts WHERE json_type(task_snapshot_json,'$.owner_policy') IS NULL",
         [],
@@ -88,14 +103,6 @@ fn owner_policy_report(db: &Connection) -> Result<Value> {
     let total = count(db, "SELECT count(*) FROM attempts")?;
     let unrecognized = total - accepted - legacy_unknown;
 
-    let accepted_editions = vec![json!({
-        "policy_id": identity.policy_id,
-        "edition": identity.edition,
-        "document_path": identity.document_path,
-        "document_section": identity.document_section,
-        "document_sha256": identity.document_sha256,
-        "attempts": accepted,
-    })];
     Ok(json!({
         "by_status": {
             "accepted": accepted,

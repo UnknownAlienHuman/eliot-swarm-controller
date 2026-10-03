@@ -7,7 +7,7 @@ pub(super) fn brief(spec: &TaskSpec) -> Value {
     json!(spec.brief())
 }
 
-pub(super) fn project_brief(raw_spec: &Value) -> Value {
+pub(in crate::store) fn project_brief(raw_spec: &Value) -> Value {
     let Ok(spec) = serde_json::from_value::<TaskSpec>(raw_spec.clone()) else {
         return unavailable_brief();
     };

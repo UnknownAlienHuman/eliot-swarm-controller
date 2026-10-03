@@ -10,9 +10,11 @@ pub(super) fn allows_method(profile: McpToolProfile, method: &str) -> bool {
         return true;
     }
 
-    let observer = matches!(
+    let observer_read = matches!(
         method,
-        "host.status"
+        "swarm.tools.search"
+            | "host.status"
+            | "swarm.dashboard"
             | "task.get"
             | "task.list"
             | "task.submission"
@@ -33,13 +35,57 @@ pub(super) fn allows_method(profile: McpToolProfile, method: &str) -> bool {
             | "report.capacity"
             | "message.read"
     );
-    if observer {
+    if observer_read
+        && matches!(
+            profile,
+            McpToolProfile::Observer
+                | McpToolProfile::Reviewer
+                | McpToolProfile::Manager
+                | McpToolProfile::Gm
+        )
+    {
         return true;
     }
 
     match profile {
         McpToolProfile::Observer => false,
         McpToolProfile::Reviewer => method == "task.request_changes",
+        McpToolProfile::Participant => matches!(
+            method,
+            "swarm.tools.search"
+                | "swarm.context.get"
+                | "coordination.peer.find"
+                | "coordination.work_card.get"
+                | "coordination.work_card.list"
+                | "coordination.work_card.publish"
+                | "coordination.work_card.withdraw"
+                | "coordination.contract_card.get"
+                | "coordination.contract_card.list"
+                | "coordination.contract_card.publish"
+                | "coordination.contract_card.withdraw"
+                | "coordination.send"
+                | "coordination.inbox"
+                | "review.get"
+                | "review.list"
+                | "swarm.review.context"
+                | "review.submit"
+                | "task.submission"
+                | "check.get"
+                | "artifact.read"
+                | "operation.get"
+        ),
+        McpToolProfile::AssignedReviewer => matches!(
+            method,
+            "swarm.tools.search"
+                | "swarm.review.context"
+                | "review.get"
+                | "review.list"
+                | "review.submit"
+                | "task.submission"
+                | "check.get"
+                | "artifact.read"
+                | "operation.get"
+        ),
         McpToolProfile::Manager => matches!(
             method,
             "task.request_changes"
@@ -63,9 +109,37 @@ pub(super) fn allows_method(profile: McpToolProfile, method: &str) -> bool {
                 | "agent.result"
                 | "message.send"
                 | "message.cancel"
+                | "coordination.participant.register"
+                | "coordination.participant.disable"
+                | "coordination.participant.get"
+                | "coordination.participant.list"
+                | "swarm.context.get"
+                | "coordination.peer.find"
+                | "coordination.work_card.get"
+                | "coordination.work_card.list"
+                | "coordination.contract_card.get"
+                | "coordination.contract_card.list"
+                | "review.assign"
+                | "review.get"
+                | "review.list"
+                | "swarm.review.context"
+                | "automation.config.get"
+                | "automation.config.preview"
+                | "automation.config.apply"
+                | "automation.config.explain"
+                | "swarm.queue.get"
+                | "swarm.agent.inspect"
+                | "swarm.exceptions.get"
         ),
         McpToolProfile::Gm => {
-            allows_method(McpToolProfile::Manager, method)
+            (allows_method(McpToolProfile::Manager, method)
+                && !matches!(
+                    method,
+                    "automation.config.get"
+                        | "automation.config.preview"
+                        | "automation.config.apply"
+                        | "automation.config.explain"
+                ))
                 || matches!(
                     method,
                     "client.list"

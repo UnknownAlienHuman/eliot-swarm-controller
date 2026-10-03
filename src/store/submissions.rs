@@ -277,8 +277,23 @@ pub(super) fn request_changes(
     id: &str,
     now: i64,
 ) -> Result<Value> {
-    super::gm::require_authority(tx, p)?; // Decision owner (operator or current GM), not the worker or native module.
+    if p.role != Role::Manager {
+        super::gm::require_authority(tx, p)?;
+    }
     let input = ChangeRequest::parse(v)?;
+    let a = tasks::get_attempt(tx, &input.attempt_id)?;
+    let legacy_authority = p.role == Role::Operator
+        || (p.role == Role::Manager
+            && super::gm::record(tx)?.is_some_and(|record| record["client_id"] == p.client_id));
+    let scoped_manager = !legacy_authority
+        && p.role == Role::Manager
+        && a["owner_id"] == p.client_id
+        && crate::policy::allows_scoped_manager_feedback(&a["task_snapshot"]);
+    if !legacy_authority && !scoped_manager {
+        // Frozen v1, legacy, and unrecognized Attempts retain the historical
+        // local-Operator/current-GM guard. V2 adds one exact owner-scoped path.
+        super::gm::require_authority(tx, p)?;
+    }
     let doc = document(tx, &input.submission_ref)?;
     if doc["attempt_id"] != input.attempt_id
         || doc["task_revision"] != input.expected_revision
@@ -288,7 +303,6 @@ pub(super) fn request_changes(
             "review anchors do not match the named submission",
         ));
     }
-    let a = tasks::get_attempt(tx, &input.attempt_id)?;
     let spec: TaskSpec = serde_json::from_value(a["task_snapshot"]["spec"].clone())?;
     if input
         .requirement_ids
@@ -326,15 +340,121 @@ pub(super) fn request_changes(
     let t = tasks::get_task(tx, model::text(&a, "task_id")?)?;
     let applies = t["state"] == "open"
         && t["revision"] == input.expected_revision
+        && t["current_attempt_id"] == input.attempt_id
+        && a["task_revision"] == input.expected_revision
         && a["released_at_ms"].is_null()
         && a["submission_ref"] == input.submission_ref
         && a["candidate_ref"] == input.candidate_ref
         && matches!(a["state"].as_str(), Some("submitted" | "needs_correction"));
+    if scoped_manager && !applies {
+        return Err(Error::new(
+            "STALE_REVIEW_SUBJECT",
+            "owner-scoped feedback requires the exact current open Task submission",
+        ));
+    }
+    let review_provenance = if applies {
+        match super::reviews::actionable_finding(
+            tx,
+            model::text(&a, "task_id")?,
+            &input.attempt_id,
+            input.expected_revision,
+            &input.submission_ref,
+            &input.candidate_ref,
+            &input.finding_id,
+        ) {
+            Ok(provenance) => Some(provenance),
+            Err(error)
+                if !scoped_manager
+                    && matches!(
+                        error.code.as_str(),
+                        "REVIEW_FINDING_NOT_FOUND" | "REVIEW_FINDING_NOT_ACTIONABLE"
+                    ) =>
+            {
+                None
+            }
+            Err(error) => return Err(error),
+        }
+    } else {
+        None
+    };
+    if scoped_manager {
+        let provenance = review_provenance.as_ref().ok_or_else(|| {
+            Error::new(
+                "REVIEW_FINDING_NOT_FOUND",
+                "owner-scoped feedback requires a current assigned-auditor finding",
+            )
+        })?;
+        if provenance["finding"]["requirement_ids"] != json!(input.requirement_ids) {
+            return Err(Error::new(
+                "REVIEW_FINDING_MISMATCH",
+                "manager feedback must preserve the assigned finding's exact requirement scope",
+            ));
+        }
+        let review_evidence = provenance["finding"]["evidence_refs"]
+            .as_array()
+            .ok_or_else(|| Error::new("REVIEW_RESULT_DAMAGED", "finding evidence is missing"))?;
+        if review_evidence.iter().any(|reference| {
+            !input
+                .evidence
+                .iter()
+                .any(|provided| reference.as_str() == Some(provided.as_str()))
+        }) {
+            return Err(Error::new(
+                "REVIEW_EVIDENCE_MISMATCH",
+                "manager feedback must retain every evidence reference from the assigned finding",
+            ));
+        }
+    }
+    if applies && let Some(provenance) = &review_provenance {
+        let assignment_id = model::text(provenance, "review_assignment_id")?;
+        let disposition_key = format!("disposition:{assignment_id}");
+        let old_disposition: Option<String> = tx
+            .query_row(
+                "SELECT payload_json FROM observations WHERE source_stream_id='controller:review' AND source_event_key=?1 AND kind='review.disposition'",
+                [&disposition_key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(raw) = old_disposition {
+            let prior: Value = serde_json::from_str(&raw)?;
+            if prior["review_assignment_id"] != assignment_id
+                || prior["identity"] != provenance["identity"]
+                || prior["review_result_operation_id"] != provenance["review_operation_id"]
+                || prior["disposition"] != "return_for_correction"
+            {
+                return Err(Error::new(
+                    "REVIEW_DISPOSITION_CONFLICT",
+                    "the exact review slot already has a different manager disposition",
+                ));
+            }
+        } else {
+            let disposition = json!({
+                "schema_version":1,
+                "kind":"review.disposition",
+                "review_assignment_id":assignment_id,
+                "operation_id":id,
+                "disposition":"return_for_correction",
+                "review_result_operation_id":provenance["review_operation_id"],
+                "reason":input.reason,
+                "evidence_refs":input.evidence,
+                "finding_ids":[input.finding_id],
+                "decided_by":p.client_id,
+                "identity":provenance["identity"],
+                "task_feedback_operation_id":id,
+            });
+            tx.execute(
+                "INSERT INTO observations(source_stream_id,source_event_key,operation_id,kind,payload_json,recorded_at_ms) VALUES('controller:review',?1,?2,'review.disposition',?3,?4)",
+                params![disposition_key, id, model::canonical(&disposition)?, now],
+            )?;
+        }
+    }
     let value = json!({"operation_id":id,"message_id":if applies {Some(id)} else {None},
         "sender":p.client_id,"recipient":a["owner_id"],"task_id":a["task_id"],
         "finding":finding,"text":input.reason,"applied":applies,
         "status":if applies {"needs_correction"} else {"stale_review"},
-        "delivery":if applies {"durable_mailbox_only"} else {"historical_evidence_only"},"native_input_sent":false});
+        "delivery":if applies {"durable_mailbox_only"} else {"historical_evidence_only"},
+        "review_provenance":review_provenance,
+        "native_input_sent":false,"acceptance_changed":false,"repair_started":false,"publication_started":false});
     if applies {
         tx.execute(
             "UPDATE attempts SET state='needs_correction',updated_at_ms=?2 WHERE attempt_id=?1",

@@ -1,5 +1,6 @@
 use super::{meta, prerequisites, tasks};
 use crate::{
+    automation::authorization::operation_link,
     config::Config,
     error::{Error, Result},
     model::{self, Principal, Role},
@@ -163,7 +164,12 @@ pub(super) fn cancel(
     let target = model::text(v, "operation_id")?;
     let reason = model::text(v, "reason")?;
     let o = get_operation(tx, target)?;
-    p.owns(model::text(&o, "caller_id")?)?;
+    let linked = operation_link(tx, target)?;
+    let manager_owns_link =
+        o["method"] == "review.assign" && linked.as_ref().is_some_and(|link| link.belongs_to(p));
+    if !manager_owns_link {
+        p.owns(model::text(&o, "caller_id")?)?;
+    }
     let stale_publication = o["method"] == "forge.publish_ref"
         && o["state"] == "settled"
         && o["result"]["outcome"] == "stale_gm_epoch";

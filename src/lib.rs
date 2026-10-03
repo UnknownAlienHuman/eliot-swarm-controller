@@ -1,8 +1,10 @@
 //! Local task authority and IPC. Native execution is a separate integration boundary.
 pub mod acceptance;
 pub mod artifacts;
+pub mod automation;
 pub mod checks;
 pub mod config;
+pub mod coordination;
 pub mod doctor;
 pub mod error;
 pub mod export;
@@ -10,11 +12,13 @@ pub mod forge;
 pub mod gateway;
 pub mod host;
 pub mod ipc;
+pub mod launcher;
 pub mod mcp;
 pub mod model;
 pub mod platform;
 pub mod policy;
 mod redaction;
+pub mod review;
 pub mod runtime;
 pub mod scheduler;
 pub mod store;

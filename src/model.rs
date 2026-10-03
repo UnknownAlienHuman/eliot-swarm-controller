@@ -127,6 +127,8 @@ pub fn fields(value: &Value, allowed: &[&str]) -> Result<()> {
 pub enum Role {
     Operator,
     Manager,
+    /// Assignment-bound coordination only; never a generic writer identity.
+    Participant,
     Observer,
     Module,
     /// In-process schedule admission only; never an authenticatable client.
@@ -154,8 +156,20 @@ impl Principal {
         Ok(())
     }
     pub fn require_writer(&self) -> Result<()> {
-        if self.role == Role::Observer {
-            return Err(Error::new("FORBIDDEN", "observer is read-only"));
+        if matches!(self.role, Role::Observer | Role::Participant) {
+            return Err(Error::new(
+                "FORBIDDEN",
+                "this role has no generic writer authority",
+            ));
+        }
+        Ok(())
+    }
+    pub fn require_participant(&self) -> Result<()> {
+        if self.role != Role::Participant {
+            return Err(Error::new(
+                "FORBIDDEN",
+                "assignment-bound participant authority required",
+            ));
         }
         Ok(())
     }
@@ -173,6 +187,27 @@ impl Principal {
         }
     }
 }
+
+/// Participant methods are routed through a dedicated Store authorization
+/// branch. They must never be admitted by `require_writer()`.
+pub const PARTICIPANT_READ_METHODS: &[&str] = &[
+    "swarm.context.get",
+    "coordination.peer.find",
+    "coordination.work_card.get",
+    "coordination.work_card.list",
+    "coordination.contract_card.get",
+    "coordination.contract_card.list",
+    "coordination.inbox",
+    "operation.get",
+];
+
+pub const PARTICIPANT_MUTATION_METHODS: &[&str] = &[
+    "coordination.work_card.publish",
+    "coordination.work_card.withdraw",
+    "coordination.contract_card.publish",
+    "coordination.contract_card.withdraw",
+    "coordination.send",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -484,6 +519,29 @@ pub fn response(id: Value, result: Result<Value>) -> Value {
 /// particular, an accidental client.hello/token must never become a receipt.
 pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
     let allowed: &[&str] = match method {
+        "coordination.participant.register"
+        | "coordination.participant.disable"
+        | "coordination.work_card.publish"
+        | "coordination.work_card.withdraw"
+        | "coordination.contract_card.publish"
+        | "coordination.contract_card.withdraw"
+        | "coordination.send" => {
+            crate::coordination::validate_mutation(method, params)?;
+            return Ok(());
+        }
+        "review.assign" => {
+            crate::review::ReviewAssignRequest::parse(params)?;
+            return Ok(());
+        }
+        "review.submit" => {
+            crate::review::ReviewSubmitRequest::parse(params)?;
+            return Ok(());
+        }
+        "automation.config.apply" => {
+            crate::automation::config::parse_request(params, true)?;
+            text(params, "client_request_id")?;
+            return Ok(());
+        }
         "forge.publish_ref" => {
             crate::forge::PublishRefRequest::parse(params)?;
             return Ok(());

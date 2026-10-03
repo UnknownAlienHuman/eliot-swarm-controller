@@ -272,7 +272,13 @@ process.stdin.on('end',()=>process.exit(0));
   function maybeAdvance() {
     const state=observations.at(-1);
     const child=state?.observed_children?.find(c=>c.sessionId===childFixture.checkpoint_child.sessionId);
-    if(outcomes.has(commandIds.recover)&&child?.last_refresh_attempt?.status==='failed'&&!refreshQueued){
+    const recoveryOutcome=outcomes.get(commandIds.recover);
+    if(recoveryOutcome&&recoveryOutcome.outcome!=='applied'){
+      rejectFinished(new Error(`agent.recover did not apply: ${JSON.stringify(recoveryOutcome)}`));
+      return;
+    }
+    const recoveryReady=recoveryOutcome?.outcome==='applied'&&state?.recovery?.status==='resumed';
+    if(recoveryReady&&child?.last_refresh_attempt?.status==='failed'&&!refreshQueued){
       refreshQueued=true;commands.push({operation_id:commandIds.refresh,created_at_ms:AT_MS+1,method:'agent.refresh',native_root_id:saved.root_id,input:{session_id:childFixture.checkpoint_child.sessionId}});
     }
     if(outcomes.has(commandIds.refresh)&&child?.snapshot_freshness==='fresh'&&!staleQueued){
@@ -331,9 +337,12 @@ process.stdin.on('end',()=>process.exit(0));
       const result=await Promise.race([finished.then(()=>true),delay(25).then(()=>false)]);
       if(result)break;
     }
-    const debug={delivered:deliveredCommands,outcomes:[...outcomes.keys()],
+    let nativeDebug;
+    try{nativeDebug=JSON.parse(await readFile(auditPath,'utf8'));}catch{}
+    const debug={delivered:deliveredCommands,
+      outcomes:[...outcomes.values()].map(({operation_id,outcome,details})=>({operation_id,outcome,details})),
       observed:observations.slice(-4).map(state=>`${state.execution}:${(state.observed_children??[]).map(child=>`${child.sessionId}/${child.snapshot_freshness}/${child.last_refresh_attempt?.status}`).join(',')}`),
-      rpc:[...new Set(rpcMethods)]};
+      rpc:[...new Set(rpcMethods)],native:nativeDebug};
     assert.ok(outcomes.has(commandIds.stale),`bridge did not complete stale-turn fixture: ${stderr}; ${JSON.stringify(debug)}`);
     const auditDeadline=Date.now()+3000;
     let audit;

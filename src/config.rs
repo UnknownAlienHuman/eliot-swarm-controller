@@ -29,6 +29,8 @@ pub struct Config {
 pub enum McpToolProfile {
     Observer,
     Reviewer,
+    Participant,
+    AssignedReviewer,
     Manager,
     Gm,
     Full,
@@ -40,6 +42,15 @@ pub enum McpToolProfile {
 pub struct McpProfileConfig {
     pub tool_profile: McpToolProfile,
     pub expected_client_id: String,
+    /// Named presentation surface; absent means the profile's small role core.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface: Option<String>,
+    /// Authorized catalog groups selected for this session's initial view.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deferred_groups: Vec<String>,
+    /// Exact ManualOnly methods selected for this session's initial view.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub manual_tools: Vec<String>,
 }
 
 /// MCP profile selection is local configuration; the selected name and
@@ -146,6 +157,9 @@ impl Default for McpConfig {
                     McpProfileConfig {
                         tool_profile: McpToolProfile::Observer,
                         expected_client_id: "operator".into(),
+                        surface: None,
+                        deferred_groups: Vec::new(),
+                        manual_tools: Vec::new(),
                     },
                 ),
                 (
@@ -153,6 +167,9 @@ impl Default for McpConfig {
                     McpProfileConfig {
                         tool_profile: McpToolProfile::Full,
                         expected_client_id: "operator".into(),
+                        surface: None,
+                        deferred_groups: Vec::new(),
+                        manual_tools: Vec::new(),
                     },
                 ),
             ]),
@@ -181,6 +198,19 @@ impl McpConfig {
                 return Err(Error::new(
                     "CONFIG_ERROR",
                     "MCP profile names must be lowercase identifiers and expected_client_id must be non-empty",
+                ));
+            }
+            if profile.surface.as_deref().is_some_and(|surface| {
+                surface.is_empty()
+                    || !surface.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
+                    })
+            }) || !unique_mcp_labels(&profile.deferred_groups, false)
+                || !unique_mcp_labels(&profile.manual_tools, true)
+            {
+                return Err(Error::new(
+                    "CONFIG_ERROR",
+                    "MCP surface, deferred groups, and exact manual tools must be unique lowercase identifiers",
                 ));
             }
             // Full is the explicit local compatibility surface and may share
@@ -219,6 +249,20 @@ impl McpConfig {
         }
         Ok(profile.tool_profile)
     }
+}
+
+fn unique_mcp_labels(values: &[String], allow_method_separators: bool) -> bool {
+    let mut seen = BTreeMap::new();
+    values.iter().all(|value| {
+        !value.is_empty()
+            && value.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || byte == b'-'
+                    || (allow_method_separators && matches!(byte, b'.' | b'_'))
+            })
+            && seen.insert(value.as_str(), ()).is_none()
+    })
 }
 
 impl GatewayConfig {

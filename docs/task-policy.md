@@ -1,10 +1,11 @@
 # Task owner policy and source-indexed brief
 
 New Attempts must be claimed under an explicit accepted owner-policy edition. A
-TaskSpec selects it with `owner_policy_id`; the currently accepted value is
-`owner-policy-v1`. The selection is an identifier, not a date or a file-mtime
-lookup. Creating and revising Tasks without a policy remains readable for
-legacy compatibility, but such a Task cannot start a new Attempt.
+TaskSpec selects it with `owner_policy_id`; the accepted values are
+`owner-policy-v1` and `owner-policy-v2`. The selection is an identifier, not a
+date or a file-mtime lookup. Creating and revising Tasks without a policy
+remains readable for legacy compatibility, but such a Task cannot start a new
+Attempt.
 
 The accepted edition is Owner policy v1 in
 [`owner-decisions.md`](owner-decisions.md). Its frozen identity is
@@ -17,14 +18,29 @@ without the following section heading. Updating the accepted policy requires
 a new explicit edition identity and digest in code; editing the document does
 not silently change what an existing Attempt means.
 
+Owner policy v2 is frozen in
+[`owner-policy-v2.md`](owner-policy-v2.md). Its identity is
+`policy_id=owner-policy-v2`, `edition=2`, document path
+`docs/owner-policy-v2.md`, section
+`Owner policy v2 — scoped manager review disposition`, and SHA-256
+`a3490caa5ee7afa435dd0a4a317917a88b99c746f477a304de9458d45553b5db`. Its
+scoped manager right applies only to an Attempt whose complete frozen policy
+record matches this accepted edition. An authenticated Manager may apply an
+actionable finding from the exact current assigned review result only to the
+current open Task revision and the unreleased Attempt they own, with exact
+submission and candidate anchors. The existing Operator/current-GM path stays
+available under both editions. Owner policy v1 and Attempts with legacy or
+unrecognized snapshots do not gain manager feedback rights. No existing
+Attempt is migrated when v2 is added.
+
 Each new Attempt freezes the selected policy identity, the Task revision, the
 dependency acceptance receipts, and a deterministic brief in its existing
 `task_snapshot`. The brief is a projection of the revision's objective, phase,
 requirements, dependencies, scope, acceptance fields and ordered source index.
 It does not create workflow rules or replace the source specification. The
 attempt read projection exposes the frozen `owner_policy` and `task_brief`;
-Doctor reports counts for accepted, legacy-unknown and unrecognized policy
-records, plus the known accepted edition identity.
+policy projection recognizes both frozen editions and continues to report
+legacy-unknown and unrecognized records without assigning them a new edition.
 
 `task.get` and `task.list` expose the same normalized `task_brief` while keeping
 the raw stored `spec`. A historical spec that cannot be decoded remains
