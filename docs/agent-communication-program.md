@@ -1,7 +1,7 @@
 # ELIOT Agent Communication Program
 ## Start here
 
-**Revision:** 3 — 2026-10-03  
+**Revision:** 4 — 2026-10-03  
 **Repository baseline:** `3ecdf52707731e3f85e85827a88fbdb28d784f3e`  
 **Status:** documentation/implementation handoff. No communication feature is implemented merely because these documents exist.
 
@@ -76,8 +76,9 @@ Implementation agents read in this order:
 6. [Implementation Issue Plan](agent-communication-implementation-issues.md) — execution policy and unchanged mailbox/scope/Git/Concilium/verification slices; use the amended sequence below.
 7. [Agent Communication and Concilium](agent-communication-concilium.md) — broader architecture and Concilium. Older illustrative schemas are non-normative when corrected by items 2–5.
 8. [Tool Contracts](agent-communication-tool-contracts.md) — expanded schemas and recovery examples subject to the same precedence.
-9. [Peer Autonomy Source Map](agent-communication-peer-autonomy-sources.md) — official system behavior and earlier fleet lessons.
-10. [Field Evidence and Donor Map](agent-communication-field-evidence.md) — broader evidence, not product authority.
+9. [Fleet-Scale Source Map](agent-communication-fleet-scale-sources.md) — Agensh, Anthropic/OpenAI/Claude, topology research, donor and user field evidence. Evidence only; not product authority.
+10. [Peer Autonomy Source Map](agent-communication-peer-autonomy-sources.md) — official system behavior and earlier fleet lessons.
+11. [Field Evidence and Donor Map](agent-communication-field-evidence.md) — broader evidence, not product authority.
 
 When examples disagree, use the highest applicable item. Do not reconcile them by inventing a third mechanism.
 
