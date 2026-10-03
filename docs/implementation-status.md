@@ -2,40 +2,57 @@
 
 ## Current state
 
-The PR22/PR23 program is at a partial foundation stage. **Ten grouped delivery
-blocks remain**; they vary in size and are not ten equal tasks or a completion
-percentage. The current catalog has 91 `ToolSpec` entries, but catalog size
-does not establish complete handlers or native-client loading.
+The PR22/PR23 program remains partial. **Ten grouped delivery blocks remain**;
+they vary in size and are not ten equal tasks or a completion percentage. The
+C6 committed catalog had 91 `ToolSpec` entries; catalog size does not establish
+complete handlers or native-client loading.
 
-C6 plus the wired bounded local TaskSubmission-intake consumer is committed at
-`e035c0c3fe855490863be81902c5152b548c42cd`. Owned-crate formatting and
-`cargo clippy --locked --lib --bins --no-deps -- -D warnings` passed for this
-commit (9.60 s; `.local/qualification/r7-build-gate/clippy-c6-publish-repaired.log`).
-The bounded exact-commit review of C6 privacy, actor, workspace, no-replay and
-overlap behavior passed. No Cargo tests, native process, or model execution ran
-for this increment; new CI is pending after the main push. C5's last published
-CI run failed on Linux `start_ticks` parsing and a Windows stdout fixture;
-source repairs are included in this commit. C4's 221 Rust tests apply only to
-`2607c8858e573ae40459c27d76d8ae9e1ca9f8fc`. Separate C7 Participant credential
-issuance, broader readback, native capability proof, and disposition/lifecycle
-modules remain unwired source WIP. Productive launch and the full manager-owned
-cycle remain unqualified; actual native-MCP harness loading remains unknown.
+C7 implementation is committed at
+`2f00c2b3d7862788ca8a6bead4645d3ce64dc0ea`. Canonical formatting passed, and
+warnings-denied Clippy passed (13.06 s;
+`.local/qualification/r7-build-gate/clippy-c7-probe-repaired.log`). The C6 CI
+run `37147184684` passed its Linux job and does not cover C7; full CI for this
+commit is pending. The corrected targeted Windows `cargo test --test
+check_probe` passed one test (1.04 s; build 43.34 s;
+`.local/qualification/r7-build-gate/windows-check-probe-c7-repaired.log`).
+The earlier failure was a fixture mismatch: it omitted the outer
+`CREATE_NO_WINDOW` setting already used by production. A model-free `cmd-echo`
+diagnostic passed with that setting, but no live PID was observed, so the exact
+OS/root cause is unconfirmed. Review of unchanged C7 privacy, authority,
+disposition and lifecycle paths at `588a5ca21fbcbd5434540c011846535af7647f35`
+passed; `feedback_audit` also passed exact review of all three Windows-delta
+files in the final commit (`.local/qualification/r7-build-gate/windows-probe-lifecycle-audit.md`).
+The C7 slices wire
+Participant credential issuance into launch admission with atomic private
+assignment context and a held database workspace lease; partial authenticated
+MCP readback for configured/connect state; and a durable bounded
+review-disposition consumer with exact manager-on-behalf authority and semantic
+duplicate/gap handling. The readback does not prove tool loading or
+model-visible capability. Lease/release state is database-only, not an OS or
+filesystem lock. `launcher_mcp_tools.rs`, `mcp_plugin.rs` and work-dispatch
+modules are present but unwired and uncompiled. No overall C7 green gate,
+productive dispatch, full manager-owned cycle, native-MCP harness loading or
+model execution is qualified. C4's 221 Rust tests apply only to
+`2607c8858e573ae40459c27d76d8ae9e1ca9f8fc`.
 
-C6 committed slices include five passive watch kinds, integration sync,
-recomputed overlap, and manager-admitted asynchronous workspace lease / exact
-Task claim / `agent.open`. Productive launch still stops at credentials and
-native-MCP capability; productive dispatch is not implemented. Unsupported
-watch predicates, broader program stages, and end-to-end recovery remain open.
+Credential/profile references are visible in Operation readback. The audit did
+not establish token/path exposure or a public bearer-token resolve route; this
+does not qualify those references as confidential.
+
+C6 implemented five passive watch kinds, integration sync, recomputed overlap,
+and manager-admitted asynchronous workspace lease / exact Task claim /
+`agent.open`. C7 adds the launch-admission, authenticated readback and
+review-disposition slices above; unsupported watch predicates, broader program
+stages and end-to-end recovery remain open.
 
 ## Additional qualification evidence
 
-The Codex composition files `common.mjs`, `service.mjs` and `trial.mjs` passed
-syntax checks; the preflight state is `prepared_not_executed`, with no native
-parent/child execution or usage receipt established. The latest native CBM
-index snapshot is a working-tree result of 11,023 nodes and 46,261 edges from
-before the last repair; it includes unwired C7 work and does not qualify exact
-commit `e035c0c3fe855490863be81902c5152b548c42cd`. Native process restart and
-continuation remain unverified.
+Earlier `common.mjs`, `service.mjs` and `trial.mjs` syntax checks apply to a
+prior composition only. The runtime `0.160.0` native-harness schema and its
+three DTOs are repaired, and Node `--check` passed. No native-compose/trial or
+model execution is qualified. No native parent/child execution
+or usage receipt is established; process restart, continuation and native-MCP
+harness loading remain unverified.
 
 ## Deferred scope
 
@@ -69,28 +86,36 @@ and qualification follow it.
 
 2. **O1 manager-owned automation actions — Partial.** Owner-scoped
    configuration get/preview/apply/explain and durable `review_dispatch`
-   admission exist. Work dispatch, disposition, repair, acceptance,
-   publication and GitHub projection still need consumers that preserve current
-   manager rights, semantic slots, on-behalf linkage and result readback.
+   admission exist. C7 adds a bounded review-disposition consumer that preserves
+   exact manager-on-behalf authority and semantic duplicate/gap handling.
+   Productive work dispatch remains unwired; repair, acceptance, publication
+   and GitHub projection still need consumers that preserve current manager
+   rights, semantic slots, linkage and result readback. Plugin/installer
+   integration is authored but unwired; `launcher_mcp_tools.rs`,
+   `mcp_plugin.rs` and work-dispatch modules are present but uncompiled.
 
 3. **O2 durable intake and shared monitoring — Partial.** Commit
    `e035c0c3fe855490863be81902c5152b548c42cd` wires the dispatcher to consume
    bounded shared intake and journal readback for committed local
-   `controller/task.submission` observations. Separate C7 credential issuance,
-   broader readback, native capability proof, and disposition/lifecycle modules
-   remain unwired; other source adapters are not admitted.
+   `controller/task.submission` observations. C7 adds launch-bound Participant
+   credentials and partial authenticated configured/connect readback; it does
+   not prove tool or model loading. Other source adapters are not admitted.
 
 4. **Productive launcher, workspace ownership and complete local O7 cycle —
-   Partial.** Queue/context/overlap projections, launch preview, and authored
-   async lease / exact Task claim / `agent.open` slices exist. Credentials and
-   native-MCP capability still gate productive launch, and dispatch is not
-   implemented. The complete frozen-candidate, review, return, safe correction,
-   fresh-review and acceptance path remains.
+   Partial.** Queue/context/overlap projections, launch preview, async lease /
+   exact Task claim / `agent.open`, and C7 atomic private context plus held
+   database lease admission are wired in source. Lease enforcement is database-only;
+   filesystem/OS ownership is not established, and stale-fence retention while
+   old/unknown effects survive a revision is not yet gate-qualified. Productive dispatch
+   and native tool/model capability proof remain absent. The complete
+   frozen-candidate, review, return, safe correction, fresh-review and
+   acceptance path remains.
 
 5. **O3 Rust adapters and provider lifecycle — Partial.** Rust OpenCode V2 and
    Zed paths exist alongside JavaScript/Python module bridges. Rust-owned
    adapter/control/stream coverage and observed provider capabilities remain
-   incomplete.
+   incomplete. C7's authenticated configured/connect readback does not prove
+   native tool loading or model-visible capability.
 
 6. **O4 Git/GitHub intake, work pools and distribution — Partial.** Local
    non-force Git ref publication exists as a first slice, with live Git/remote
@@ -111,14 +136,20 @@ and qualification follow it.
    shared manager-enabled progression remain incomplete.
 
 10. **O10 cross-contract parity and O11 integrated qualification — Partial /
-    qualification pending.** The 91-entry catalog and role profiles do not
+    qualification pending.** The C6 91-entry catalog and role profiles do not
     prove all handlers have consumers, native harnesses load schemas, or the
     integrated workflow survives recovery. C6 formatting, warnings-denied
     Clippy, and the bounded exact-commit privacy/actor/workspace/no-replay/
     overlap review passed for `e035c0c3fe855490863be81902c5152b548c42cd`.
-    No Cargo tests or native/model execution ran in this increment; new CI,
-    productive launch, full-cycle recovery and native-client evidence remain
-    pending.
+    C7 at `2f00c2b3d7862788ca8a6bead4645d3ce64dc0ea` passes formatting and
+    warnings-denied Clippy. The corrected Windows `check_probe` passed one
+    targeted test; full CI remains pending. Reviews of unchanged C7 privacy,
+    authority, disposition and lifecycle paths at `588a5ca21fbcbd5434540c011846535af7647f35`
+    passed; exact `feedback_audit` review of the final three-file Windows delta
+    passed (`.local/qualification/r7-build-gate/windows-probe-lifecycle-audit.md`). The
+    launcher MCP facade, plugin and work-dispatch modules are present but
+    unwired and uncompiled. No overall green gate, productive launch, full-cycle
+    recovery, native-client or model evidence is established.
 
 The status separates implemented slices from authored work and from runtime
 qualification. A registry entry, configuration, or successful unrelated gate
