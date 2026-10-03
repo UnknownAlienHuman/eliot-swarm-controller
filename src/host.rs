@@ -12,6 +12,51 @@ use tokio::{
 };
 
 pub async fn run(config: Config) -> Result<()> {
+    run_until(config, async {
+        tokio::signal::ctrl_c().await.map_err(Into::into)
+    })
+    .await
+}
+
+/// Foreground embedding uses the owner's stdin EOF as a graceful shutdown
+/// request. A detached std thread avoids blocking Tokio runtime shutdown if a
+/// different supervisor fails while stdin is still open.
+pub async fn run_on_stdin_eof(config: Config) -> Result<()> {
+    let (sent, received) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("swarm-host-stdin".into())
+        .spawn(move || {
+            use std::io::Read;
+            let result = (|| -> Result<()> {
+                let mut input = std::io::stdin().lock();
+                let mut bytes = [0_u8; 1024];
+                loop {
+                    match input.read(&mut bytes) {
+                        Ok(0) => return Ok(()),
+                        Ok(_) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+            })();
+            let _ = sent.send(result);
+        })?;
+    run_until(config, async {
+        received.await.map_err(|_| {
+            Error::new(
+                "HOST_SHUTDOWN",
+                "foreground owner input ended without a result",
+            )
+        })?
+    })
+    .await
+}
+
+async fn run_until(
+    config: Config,
+    foreground_stop: impl std::future::Future<Output = Result<()>>,
+) -> Result<()> {
+    tokio::pin!(foreground_stop);
     let root = DataRoot::acquire(&config.storage.data_dir)?;
     let credential = bootstrap_credential(&root.path)?;
     let root_path = root.path.clone();
@@ -71,7 +116,7 @@ pub async fn run(config: Config) -> Result<()> {
     eprintln!("swarm host ready: {}", listener.endpoint());
     let exit = loop {
         tokio::select! {
-            signal=tokio::signal::ctrl_c()=>break signal.map_err(Into::into),
+            signal=&mut foreground_stop=>break signal,
             Some(result)=supervisors.join_next()=>{
                 break match result {
                     Ok((name, Ok(()))) => Err(Error::new("SUPERVISOR_STOPPED", format!("{name} stopped before host shutdown"))),

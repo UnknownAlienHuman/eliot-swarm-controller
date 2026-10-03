@@ -357,6 +357,7 @@ pub(super) fn release(
     let a = get_attempt(tx, attempt_id)?;
     p.owns(model::text(&a, "owner_id")?)?;
     if !a["released_at_ms"].is_null() {
+        operations::prepare_owned_service_attempt_release(tx, &a, id, now)?;
         return Ok(
             json!({"operation_id":id,"attempt_id":attempt_id,"released":true,"changed":false}),
         );
@@ -395,6 +396,7 @@ pub(super) fn release(
             "the exact assigned native runs have not ended; attestation cannot override a known producer",
         ));
     }
+    operations::prepare_owned_service_attempt_release(tx, &a, id, now)?;
     // Caller explicitly seals cooperative native work. This is not process evidence.
     // A queued check needs a retained cancellation result, not an orphaned row.
     tx.execute("UPDATE check_runs SET spec_json=json_set(spec_json,'$.cancel_requested','attempt released before execution') WHERE attempt_id=?1 AND state='queued'",[attempt_id])?;

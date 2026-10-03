@@ -1,5 +1,5 @@
-//! OpenCode V2 attaches to an explicitly configured, externally owned HTTP service.
-//! No CLI, process launch, service restart, implicit model choice or POST replay.
+//! OpenCode V2 connects to explicit external HTTP services or a separately
+//! admitted fresh owned foreground service. Native effects never replay.
 mod background;
 mod configuration;
 mod effects;
@@ -8,7 +8,9 @@ mod goal;
 mod http;
 mod mcp;
 pub(crate) mod mcp_install;
+pub(crate) mod mcp_plugin;
 pub(crate) mod mcp_tools;
+pub(crate) mod owned_service;
 mod prerequisites;
 mod results;
 mod snapshot;
@@ -33,6 +35,12 @@ use std::path::PathBuf;
 
 pub const ARTIFACT_ID: &str = "eliot-opencode-v2.http.1";
 pub const RUNTIME: &str = "opencode_v2";
+
+/// Internal foreground owner entry used by the controller's dedicated helper.
+/// It does not open the controller database or admit a launch request.
+pub fn run_owned_service_helper(plan_path: &std::path::Path) -> Result<()> {
+    owned_service::run_owned_service_helper(plan_path)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]

@@ -23,6 +23,7 @@ async fn start_store() -> (StoreOwner, PathBuf, Principal) {
     let mut config = Config::default();
     config.storage.data_dir = directory.clone();
     config.routes.push(Route {
+        owned_service: None,
         alias: "regression-route".to_owned(),
         runtime: "regression-runtime".to_owned(),
         module_artifact_id: "regression-artifact".to_owned(),

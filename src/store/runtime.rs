@@ -316,6 +316,22 @@ pub(super) fn hello(
 }
 
 pub(super) fn next(db: &mut Connection, p: &Principal) -> Result<Value> {
+    next_internal(db, p, None)
+}
+
+pub(super) fn next_with_config(
+    db: &mut Connection,
+    p: &Principal,
+    config: &crate::config::Config,
+) -> Result<Value> {
+    next_internal(db, p, Some(config))
+}
+
+fn next_internal(
+    db: &mut Connection,
+    p: &Principal,
+    config: Option<&crate::config::Config>,
+) -> Result<Value> {
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let (id, generation, b) = scope(&tx, p, true)?;
     if crate::runtime::batch::is_legacy_command_route(&b["route"]) {
@@ -331,7 +347,7 @@ pub(super) fn next(db: &mut Connection, p: &Principal) -> Result<Value> {
     }
     // Readback, replies and continuation-stop controls stay available while an
     // ordinary mutation awaits application. They do not spawn another executor.
-    let (op, method, raw, created) = {
+    let (op, method, raw, created, opening_actor) = {
         let row:Option<(String,String,String,i64)>=tx.query_row(
             "SELECT operation_id,method,original_request_json,created_at_ms FROM operations AS candidate
              WHERE binding_id=?1 AND binding_generation=?2 AND state='queued' AND due_at_ms<=?3
@@ -352,9 +368,19 @@ pub(super) fn next(db: &mut Connection, p: &Principal) -> Result<Value> {
         let Some((op, method, raw, created)) = row else {
             return Ok(json!({"command":null}));
         };
-        match prerequisites::for_operation(&tx, &b, &op)? {
+        let opening_actor = if method == "agent.open" {
+            super::launcher::opening_actor_for_open(&tx, &op, &id, generation)?
+        } else {
+            None
+        };
+        let prerequisite = if opening_actor.is_some() {
+            prerequisites::Gate::None
+        } else {
+            prerequisites::for_operation(&tx, &b, &op)?
+        };
+        match prerequisite {
             prerequisites::Gate::None | prerequisites::Gate::Ready { .. } => {
-                (op, method, raw, created)
+                (op, method, raw, created, opening_actor)
             }
             prerequisites::Gate::Pending {
                 operation_id,
@@ -395,16 +421,26 @@ pub(super) fn next(db: &mut Connection, p: &Principal) -> Result<Value> {
     let mut input: Value = serde_json::from_str(&raw)?;
     let guard = (|| -> Result<()> {
         let o = operations::get_operation(&tx, &op)?;
-        let caller = meta(&tx, &format!("client:{}", model::text(&o, "caller_id")?))?
-            .ok_or_else(|| Error::new("UNAUTHORIZED", "original caller no longer registered"))?;
-        if caller["disabled"] == true {
-            return Err(Error::new("UNAUTHORIZED", "original caller disabled"));
-        }
-        // Existing queued work must not retain an old remote Operator's
-        // privilege after the local bootstrap identity has been anchored.
-        if caller["role"] == "operator" {
-            super::require_local_operator(&tx, model::text(&o, "caller_id")?)?;
-        }
+        let caller = if opening_actor.is_some() {
+            // The exact opening guard above validated the retained actor in
+            // this transaction. A technical requester is not a registered
+            // client or a Principal; no synthetic profile is created here.
+            Value::Null
+        } else {
+            let caller = meta(&tx, &format!("client:{}", model::text(&o, "caller_id")?))?
+                .ok_or_else(|| {
+                    Error::new("UNAUTHORIZED", "original caller no longer registered")
+                })?;
+            if caller["disabled"] == true {
+                return Err(Error::new("UNAUTHORIZED", "original caller disabled"));
+            }
+            // Existing queued work must not retain an old remote Operator's
+            // privilege after the local bootstrap identity has been anchored.
+            if caller["role"] == "operator" {
+                super::require_local_operator(&tx, model::text(&o, "caller_id")?)?;
+            }
+            caller
+        };
         let reconcile_starts_work = if method == "agent.reconcile"
             && !crate::runtime::batch::is_sessionless_route(&b["route"])
             && b["route"]["runtime"] != crate::runtime::opencode_v2::RUNTIME
@@ -445,6 +481,20 @@ pub(super) fn next(db: &mut Connection, p: &Principal) -> Result<Value> {
         if method == "agent.open" {
             if b["state"] != "opening" || !b["native_root_id"].is_null() {
                 return Err(Error::conflict("root already opened or changed"));
+            }
+            if b["route"]
+                .get("owned_service")
+                .is_some_and(|v| !v.is_null())
+            {
+                let config = config.ok_or_else(|| {
+                    Error::new(
+                        "OWNED_SERVICE_SCOPE",
+                        "owned open requires the current controller configuration",
+                    )
+                })?;
+                super::launcher_owned_service::validate_owned_open_dispatch(
+                    &tx, config, &id, generation, &op,
+                )?;
             }
         } else if b["state"] != "ready" && !is_recovery_control(&method, &input, &b) {
             return Err(Error::new(
@@ -494,6 +544,22 @@ pub(super) fn next(db: &mut Connection, p: &Principal) -> Result<Value> {
         tx.execute("UPDATE operations SET state='rejected',result_json=?2,settled_at_ms=?3,updated_at_ms=?3 WHERE operation_id=?1 AND state='queued'",params![op,model::canonical(&json!(e))?,now])?;
         tx.commit()?;
         return Ok(json!({"command":null,"rejected_operation_id":op,"error":e}));
+    }
+    let mut command_route = b["route"].clone();
+    if command_route
+        .get("owned_service")
+        .is_some_and(|v| !v.is_null())
+    {
+        let config = config.ok_or_else(|| {
+            Error::new(
+                "OWNED_SERVICE_SCOPE",
+                "owned command requires the current controller configuration",
+            )
+        })?;
+        let options = super::launcher_owned_service::effective_options_for_binding(
+            &tx, config, &id, generation,
+        )?;
+        command_route["native_options"] = json!(options);
     }
     let now = model::now_ms()?;
     let won=tx.execute("UPDATE operations SET state='sending',sent_at_ms=?2,updated_at_ms=?2 WHERE operation_id=?1 AND state='queued'",params![op,now])?;
@@ -567,7 +633,7 @@ pub(super) fn next(db: &mut Connection, p: &Principal) -> Result<Value> {
         binding_id: id,
         generation,
         native_root_id: b["native_root_id"].as_str().map(str::to_owned),
-        route: b["route"].clone(),
+        route: command_route,
         input,
     };
     tx.commit()?; // Never return a command while SQLite can still roll back admission.
@@ -2299,6 +2365,7 @@ pub(super) fn user_command(
     method: &str,
     v: &Value,
     op: &str,
+    config: &crate::config::Config,
 ) -> Result<Value> {
     // Envelope shape is validated before persistence by model::validate_mutation.
     let id = model::text(v, "binding_id")?;
@@ -2428,11 +2495,23 @@ pub(super) fn user_command(
     let mut effective = json!({"route":b["route"],"native_root_id":b["native_root_id"]});
     if method == "agent.configure" && b["route"]["runtime"] == crate::runtime::opencode_v2::RUNTIME
     {
+        let native_options = if b["route"]
+            .get("owned_service")
+            .is_some_and(|v| !v.is_null())
+        {
+            json!(
+                super::launcher_owned_service::effective_options_for_binding(
+                    tx, config, id, generation
+                )?
+            )
+        } else {
+            b["route"]["native_options"].clone()
+        };
         effective["operation_contract"] = crate::runtime::opencode_v2::configuration_contract(
             &v["settings"],
             id,
             generation,
-            &b["route"]["native_options"],
+            &native_options,
         )?;
     } else if method == "agent.goal"
         && b["route"]["runtime"] == crate::runtime::opencode_v2::RUNTIME

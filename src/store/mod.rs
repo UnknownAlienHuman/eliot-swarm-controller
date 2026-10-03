@@ -18,6 +18,7 @@ pub(crate) mod launcher;
 mod launcher_issuance;
 mod launcher_mcp_tools;
 mod launcher_native_mcp;
+mod launcher_owned_service;
 mod launcher_participant;
 mod message_batch;
 mod native_mcp;
@@ -55,6 +56,7 @@ use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 
 const SCHEMA: &str = include_str!("../../migrations/001_core.sql");
 const WORKSPACE_SCHEMA: &str = include_str!("../../migrations/002_workspace.sql");
+const OWNED_SERVICE_SCHEMA: &str = include_str!("../../migrations/003_owned_services.sql");
 const APPLICATION_ID: i64 = 0x45534331;
 const LOCAL_OPERATOR_CLIENT_ID_KEY: &str = "local_operator_client_id";
 type RunJob = Box<dyn FnOnce(&mut Connection) + Send>;
@@ -208,11 +210,14 @@ async fn join_store_thread(thread: JoinHandle<()>, name: &'static str) -> Result
 }
 impl Store {
     pub(crate) async fn reconcile_workspace_lifecycle_once(&self) -> Result<Value> {
+        // Exact owned-process departure is observed outside the DB owner
+        // transaction. Unknown or live starts remain a separate lease fence.
+        let owned_departures = self.reconcile_owned_opencode_departures_once().await?;
         let result = self.run(move |db| {
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let sweep = workspace_lifecycle::reconcile(&tx, model::now_ms()?, 32)?;
             tx.commit()?;
-            Ok(json!({"examined":sweep.examined,"stale":sweep.stale,"released":sweep.released,"raced":sweep.raced}))
+            Ok(json!({"examined":sweep.examined,"stale":sweep.stale,"released":sweep.released,"raced":sweep.raced,"owned_departures":owned_departures}))
         }).await?;
         if result["stale"].as_u64().unwrap_or(0) != 0
             || result["released"].as_u64().unwrap_or(0) != 0
@@ -621,7 +626,10 @@ impl Store {
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
             loop {
                 let p = principal.clone();
-                let result = self.run(move |db| runtime::next(db, &p)).await?;
+                let config = self.config.clone();
+                let result = self
+                    .run(move |db| runtime::next_with_config(db, &p, &config))
+                    .await?;
                 if !result["command"].is_null() || result.get("rejected_operation_id").is_some() {
                     return Ok(result);
                 }
@@ -1053,6 +1061,31 @@ fn open_database(root: &Path, credential: &Credential) -> Result<Connection> {
             }
             tx.execute_batch(WORKSPACE_SCHEMA)?;
             set_meta(&tx, "schema_extension:workspace:v1", &workspace_digest)?;
+        }
+    }
+    let owned_digest = json!(model::digest(OWNED_SERVICE_SCHEMA.as_bytes()));
+    match meta(&tx, "schema_extension:owned_services:v1")? {
+        Some(digest) if digest == owned_digest => {}
+        Some(_) => {
+            return Err(Error::new(
+                "SCHEMA_MISMATCH",
+                "owned service extension content differs",
+            ));
+        }
+        None => {
+            let occupied: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='owned_service_starts')",
+                [],
+                |row| row.get(0),
+            )?;
+            if occupied {
+                return Err(Error::new(
+                    "SCHEMA_MISMATCH",
+                    "unregistered owned service table already exists",
+                ));
+            }
+            tx.execute_batch(OWNED_SERVICE_SCHEMA)?;
+            set_meta(&tx, "schema_extension:owned_services:v1", &owned_digest)?;
         }
     }
     let scheduler_key = format!("client:{}", model::INTERNAL_SCHEDULER_CLIENT_ID);
@@ -2856,7 +2889,7 @@ fn apply(
         "task.dispatch" => operations::dispatch(tx, p, v, id, now),
         "agent.send" | "agent.reply" | "agent.configure" | "agent.goal" | "agent.background"
         | "agent.refresh" | "agent.reconcile" | "agent.result" | "agent.recover" => {
-            runtime::user_command(tx, p, method, v, id).map(|v| (v, true))
+            runtime::user_command(tx, p, method, v, id, config).map(|v| (v, true))
         }
         "agent.open" => operations::open(tx, p, v, config, id, now).map(|v| (v, true)),
         "operation.cancel" => operations::cancel(tx, p, v, id, now).map(|v| (v, false)),

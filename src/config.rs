@@ -101,6 +101,46 @@ pub struct Route {
     pub enabled: bool,
     #[serde(default)]
     pub native_options: Value,
+    /// Explicit fresh foreground service declaration. External HTTP options
+    /// remain unchanged; this declaration grants no process-start authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owned_service: Option<OwnedOpenCodeServiceConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnedOpenCodeServiceConfig {
+    pub origin: String,
+    pub service_id: String,
+    pub model: crate::runtime::opencode_v2::ModelRef,
+    /// Explicit choice; offline qualification does not enable a live catalog.
+    pub model_catalog: String,
+    pub bun_executable: PathBuf,
+    pub bun_sha256: String,
+    pub server_program: PathBuf,
+    pub server_program_sha256: String,
+    pub state_root: PathBuf,
+    pub port: u16,
+}
+
+impl Route {
+    pub(crate) fn owned_opencode_service(
+        &self,
+    ) -> Result<Option<crate::runtime::opencode_v2::owned_service::OwnedServiceRoute>> {
+        let Some(definition) = &self.owned_service else {
+            return Ok(None);
+        };
+        if self.runtime != crate::runtime::opencode_v2::RUNTIME
+            || self.module_artifact_id != crate::runtime::opencode_v2::ARTIFACT_ID
+        {
+            return Err(Error::new(
+                "CONFIG_ERROR",
+                "owned service requires an OpenCode V2 route",
+            ));
+        }
+        crate::runtime::opencode_v2::owned_service::OwnedServiceRoute::from_config(definition)
+            .map(Some)
+    }
 }
 impl Default for Storage {
     fn default() -> Self {
@@ -398,6 +438,9 @@ impl Config {
         crate::scheduler::validate_schedules(&cfg.schedules)?;
         let mut aliases = std::collections::BTreeSet::new();
         for r in &cfg.routes {
+            if r.owned_service.is_some() {
+                r.owned_opencode_service()?;
+            }
             if r.alias.trim().is_empty()
                 || r.runtime.trim().is_empty()
                 || r.module_artifact_id.trim().is_empty()
@@ -430,6 +473,19 @@ impl Config {
                     "CONFIG_ERROR",
                     "unsupported builtin OpenCode module artifact",
                 ));
+            }
+            if let Some(owned) = route.owned_opencode_service()? {
+                let key = (owned.state_root().to_path_buf(), owned.version().to_owned());
+                if services
+                    .insert(owned.service_id().to_owned(), key.clone())
+                    .is_some_and(|old| old != key)
+                {
+                    return Err(Error::new(
+                        "CONFIG_ERROR",
+                        "owned service namespace must use one private state root",
+                    ));
+                }
+                continue;
             }
             let options = crate::runtime::opencode_v2::Options::parse(&route.native_options)?;
             if records

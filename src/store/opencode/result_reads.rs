@@ -1,5 +1,5 @@
 //! Result recovery repeats only scoped GET reads, never native input admission.
-use super::{Store, original, runtime};
+use super::{Store, original_with_config, runtime};
 use crate::{
     error::{Error, Result},
     model::Principal,
@@ -16,6 +16,7 @@ pub(super) fn next_read(
     db: &Connection,
     p: &Principal,
     after: &str,
+    config: &crate::config::Config,
 ) -> Result<Option<RuntimeCommand>> {
     let (id, generation, _) = runtime::scope(db, p, true)?;
     let query = |after: &str| -> Result<Option<String>> {
@@ -27,7 +28,8 @@ pub(super) fn next_read(
         None if !after.is_empty() => query("")?,
         None => None,
     };
-    next.map(|id| original(db, p, &id)).transpose()
+    next.map(|id| original_with_config(db, p, &id, config))
+        .transpose()
 }
 
 impl Store {
@@ -45,9 +47,10 @@ impl Store {
             let target =
                 crate::model::text(&command.input["selector"], "input_operation_id")?.to_owned();
             let p = p.clone();
+            let config = self.config.clone();
             Some(
                 self.run(move |db| {
-                    let command = original(db, &p, &target)?;
+                    let command = original_with_config(db, &p, &target, &config)?;
                     let op = super::operations::get_operation(db, &target)?;
                     if !matches!(
                         op["state"].as_str(),

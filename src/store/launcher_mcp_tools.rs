@@ -11,6 +11,7 @@
 
 use super::{Store, meta, set_meta};
 use crate::{
+    config::Config,
     error::{Error, Result},
     model::{self, Credential, Principal, Role},
     participant_credentials, platform,
@@ -19,7 +20,7 @@ use crate::{
 };
 use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 use serde_json::{Value, json};
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 const RECORD_KEY_PREFIX: &str = "launcher:native_mcp_tools:v1:";
 const SUPERVISOR_KEY_PREFIX: &str = "launcher:native_mcp_tools:supervisor:v1:";
@@ -71,6 +72,8 @@ struct LaunchFacts {
     credential_ref: String,
     profile_config_ref: String,
     options: Options,
+    owned_service: Option<launcher_native_mcp::OwnedServiceExpectation>,
+    config: Arc<Config>,
 }
 
 impl Store {
@@ -81,10 +84,11 @@ impl Store {
     /// reused as an installation delay.
     pub(crate) async fn reconcile_native_mcp_tools_once(&self) -> Result<Value> {
         let now = model::now_ms()?;
+        let config = self.config.clone();
         let outcome = self
             .run(move |db| {
                 let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                let outcome = claim_next_tools(&tx, now)?;
+                let outcome = claim_next_tools(&tx, now, &config)?;
                 tx.commit()?;
                 Ok(outcome)
             })
@@ -120,8 +124,9 @@ impl Store {
     /// entrypoint; all host callers must pass through the durable due claim.
     async fn advance_native_mcp_tools_once(&self, launch_operation_id: &str) -> Result<Value> {
         let operation_id = launch_operation_id.to_owned();
+        let config = self.config.clone();
         let facts = self
-            .run(move |db| load_launch_facts(db, &operation_id))
+            .run(move |db| load_launch_facts(db, &config, &operation_id))
             .await?;
 
         let (credential, first_principal, assignment, prepared) =
@@ -642,6 +647,7 @@ impl Store {
         now: i64,
     ) -> Result<Value> {
         let claim = claim.clone();
+        let config = self.config.clone();
         self.run(move |db| {
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let key = supervisor_key(&claim.operation_id);
@@ -662,7 +668,7 @@ impl Store {
                 }));
             }
 
-            let current = match load_launch_facts(&tx, &claim.operation_id) {
+            let current = match load_launch_facts(&tx, &config, &claim.operation_id) {
                 Ok(current) if current.identity_digest == claim.identity_digest => true,
                 Ok(_) => false,
                 Err(error) if is_stale_scope_code(&error.code) => false,
@@ -847,9 +853,12 @@ impl Store {
         let expected_options = facts.options.clone();
         let (assignment, options) = self
             .run(move |db| {
-                let snapshot =
-                    launcher_native_mcp::current_mcp_launch_snapshot(db, &facts.operation_id)?;
-                launcher_native_mcp::revalidate_mcp_launch_snapshot(db, &snapshot)?;
+                let snapshot = launcher_native_mcp::current_mcp_launch_snapshot(
+                    db,
+                    &facts.config,
+                    &facts.operation_id,
+                )?;
+                launcher_native_mcp::revalidate_mcp_launch_snapshot(db, &facts.config, &snapshot)?;
                 if snapshot.launch_operation_id() != facts.operation_id
                     || snapshot.identity_digest()? != facts.identity_digest
                     || snapshot.participant_id() != facts.participant_id
@@ -857,6 +866,19 @@ impl Store {
                     || snapshot.profile_config_ref() != facts.profile_config_ref
                     || model::canonical(&serde_json::to_value(snapshot.options())?)?
                         != model::canonical(&serde_json::to_value(&facts.options)?)?
+                    || snapshot.owned_service_expectation().as_ref().map(|value| {
+                        (
+                            value.process_id(),
+                            value.process_birth_token().to_owned(),
+                            value.executable_sha256().to_owned(),
+                        )
+                    }) != facts.owned_service.as_ref().map(|value| {
+                        (
+                            value.process_id(),
+                            value.process_birth_token().to_owned(),
+                            value.executable_sha256().to_owned(),
+                        )
+                    })
                 {
                     return Err(stale_scope());
                 }
@@ -889,7 +911,7 @@ impl Store {
         let (principal, current) = self
             .current_scope(facts, credential, Some(assignment))
             .await?;
-        let service = tokio::time::timeout(NATIVE_ACTION_TIMEOUT, Service::connect(&facts.options))
+        let service = tokio::time::timeout(NATIVE_ACTION_TIMEOUT, connect_native_service(facts))
             .await
             .map_err(|_| {
                 Error::new(
@@ -926,7 +948,7 @@ impl Store {
                 "native service identity changed around the admitted effect",
             ));
         }
-        let current = tokio::time::timeout(NATIVE_ACTION_TIMEOUT, Service::connect(&facts.options))
+        let current = tokio::time::timeout(NATIVE_ACTION_TIMEOUT, connect_native_service(facts))
             .await
             .map_err(|_| {
                 Error::new(
@@ -1552,12 +1574,27 @@ impl Store {
     }
 }
 
-fn load_launch_facts(db: &Connection, operation_id: &str) -> Result<LaunchFacts> {
+async fn connect_native_service(facts: &LaunchFacts) -> Result<Service> {
+    match facts.owned_service.as_ref() {
+        Some(expected) => {
+            Service::connect_owned(
+                &facts.options,
+                expected.process_id(),
+                expected.process_birth_token(),
+                expected.executable_sha256(),
+            )
+            .await
+        }
+        None => Service::connect(&facts.options).await,
+    }
+}
+
+fn load_launch_facts(db: &Connection, config: &Config, operation_id: &str) -> Result<LaunchFacts> {
     if operation_id.is_empty() || operation_id.len() > 256 {
         return Err(Error::invalid("launch Operation ID is invalid"));
     }
-    let snapshot = launcher_native_mcp::current_mcp_launch_snapshot(db, operation_id)?;
-    launcher_native_mcp::revalidate_mcp_launch_snapshot(db, &snapshot)?;
+    let snapshot = launcher_native_mcp::current_mcp_launch_snapshot(db, config, operation_id)?;
+    launcher_native_mcp::revalidate_mcp_launch_snapshot(db, config, &snapshot)?;
     Ok(LaunchFacts {
         operation_id: snapshot.launch_operation_id().to_owned(),
         identity_digest: snapshot.identity_digest()?,
@@ -1565,6 +1602,8 @@ fn load_launch_facts(db: &Connection, operation_id: &str) -> Result<LaunchFacts>
         credential_ref: snapshot.credential_ref().to_owned(),
         profile_config_ref: snapshot.profile_config_ref().to_owned(),
         options: snapshot.options().clone(),
+        owned_service: snapshot.owned_service_expectation(),
+        config: Arc::new(config.clone()),
     })
 }
 
@@ -1577,8 +1616,9 @@ fn validate_current_scope(
     if principal.role != Role::Participant || principal.client_id != facts.participant_id {
         return Err(scope_error("authenticated Participant changed"));
     }
-    let snapshot = launcher_native_mcp::current_mcp_launch_snapshot(db, &facts.operation_id)?;
-    launcher_native_mcp::revalidate_mcp_launch_snapshot(db, &snapshot)?;
+    let snapshot =
+        launcher_native_mcp::current_mcp_launch_snapshot(db, &facts.config, &facts.operation_id)?;
+    launcher_native_mcp::revalidate_mcp_launch_snapshot(db, &facts.config, &snapshot)?;
     if snapshot.launch_operation_id() != facts.operation_id
         || snapshot.identity_digest()? != facts.identity_digest
         || snapshot.participant_id() != facts.participant_id
@@ -1586,6 +1626,19 @@ fn validate_current_scope(
         || snapshot.profile_config_ref() != facts.profile_config_ref
         || model::canonical(&serde_json::to_value(snapshot.options())?)?
             != model::canonical(&serde_json::to_value(&facts.options)?)?
+        || snapshot.owned_service_expectation().as_ref().map(|value| {
+            (
+                value.process_id(),
+                value.process_birth_token().to_owned(),
+                value.executable_sha256().to_owned(),
+            )
+        }) != facts.owned_service.as_ref().map(|value| {
+            (
+                value.process_id(),
+                value.process_birth_token().to_owned(),
+                value.executable_sha256().to_owned(),
+            )
+        })
     {
         return Err(stale_scope());
     }
@@ -1658,7 +1711,7 @@ fn validate_install_readback(
 /// when the candidate set is larger than one page. C7's success refresh is
 /// intentionally not a C8 deadline: an `observed_partial` launch is eligible
 /// immediately unless its own C8 marker is waiting/running/terminal.
-fn claim_next_tools(tx: &Transaction<'_>, now: i64) -> Result<ToolsClaimOutcome> {
+fn claim_next_tools(tx: &Transaction<'_>, now: i64, config: &Config) -> Result<ToolsClaimOutcome> {
     let cursor = meta(tx, SUPERVISOR_CURSOR_KEY)?
         .and_then(|value| value.as_str().map(str::to_owned))
         .unwrap_or_default();
@@ -1693,7 +1746,7 @@ fn claim_next_tools(tx: &Transaction<'_>, now: i64) -> Result<ToolsClaimOutcome>
     let mut last_scanned: Option<String> = None;
     for operation_id in ids {
         last_scanned = Some(operation_id.clone());
-        let facts = match load_launch_facts(tx, &operation_id) {
+        let facts = match load_launch_facts(tx, config, &operation_id) {
             Ok(facts) => facts,
             Err(error) if is_stale_scope_code(&error.code) => {
                 let key = supervisor_key(&operation_id);

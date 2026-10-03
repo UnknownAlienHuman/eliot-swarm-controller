@@ -14,6 +14,7 @@ async fn start(f: &Fixture) -> (StoreOwner, Principal) {
     let mut cfg = Config::default();
     cfg.storage.data_dir = directory;
     cfg.routes.push(Route {
+        owned_service: None,
         alias: "fixture".into(),
         runtime: oc::RUNTIME.into(),
         module_artifact_id: oc::ARTIFACT_ID.into(),

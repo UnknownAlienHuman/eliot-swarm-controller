@@ -39,6 +39,13 @@ function assertAbsolutePath(value, flag) {
   return path.resolve(value);
 }
 
+function assertCanonicalUuid(value, flag) {
+  if (typeof value !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value)) {
+    throw new Error(`${flag} must be a canonical UUID`);
+  }
+  return value;
+}
+
 async function assertPlainPath(target, kind) {
   const info = await lstat(target);
   if (info.isSymbolicLink() || (kind === "directory" ? !info.isDirectory() : !info.isFile())) {
@@ -339,7 +346,12 @@ async function connectionDigestMatches(connectionPath, expectedDigest, root) {
   }
 }
 
-export async function startOwnedService({ stateRoot, passwordFile, port, readyTimeoutMs = READY_TIMEOUT_MS, modelCatalog = "refresh" }) {
+export async function startOwnedService({ stateRoot, passwordFile, port, readyTimeoutMs = READY_TIMEOUT_MS, modelCatalog = "refresh", ownerNonce, workspaceDirectory }) {
+  const nonce = ownerNonce === undefined ? randomUUID() : assertCanonicalUuid(ownerNonce, "--owner-nonce");
+  const launchWorkspace = workspaceDirectory === undefined
+    ? undefined
+    : assertAbsolutePath(workspaceDirectory, "--workspace-directory");
+  if (launchWorkspace !== undefined) await assertPlainPath(launchWorkspace, "directory");
   if (process.versions.bun !== BUN_VERSION) {
     throw new Error(`OpenCode service owner requires Bun ${BUN_VERSION}`);
   }
@@ -349,12 +361,11 @@ export async function startOwnedService({ stateRoot, passwordFile, port, readyTi
   }
   const state = await prepareState(stateRoot, passwordFile);
   applyPrivateEnvironment(state);
-  process.chdir(state.dirs.workspace);
+  process.chdir(launchWorkspace ?? state.dirs.workspace);
 
   const ownerPath = path.join(state.root, "owner.json");
   const connectionPath = path.join(state.root, "connection.json");
   const stopPath = path.join(state.root, "stop-receipt.json");
-  const nonce = randomUUID();
   if (await assertContainedPlainFile(state.root, ownerPath, { required: false })) {
     const previous = await readJsonFile(ownerPath);
     if (await assertContainedPlainFile(state.root, connectionPath, { required: false })) {
@@ -660,22 +671,26 @@ function parseArgs(argv) {
     index += 1;
   }
   if (args.has("--help")) return { help: true };
-  const expected = new Set(["--state-root", "--password-file", "--port", "--ready-timeout-ms", "--model-catalog"]);
+  const expected = new Set(["--state-root", "--password-file", "--port", "--ready-timeout-ms", "--model-catalog", "--owner-nonce", "--workspace-directory"]);
   for (const key of args.keys()) if (!expected.has(key)) throw new Error(`Unsupported argument: ${key}`);
   for (const key of ["--state-root", "--password-file", "--port"]) if (!args.has(key)) throw new Error("Required arguments: --state-root, --password-file, --port");
   const port = Number(args.get("--port"));
-  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("--port must be an integer from 1 to 65535");
+  if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error("--port must be an integer from 0 to 65535");
+  const ownerNonce = args.has("--owner-nonce") ? assertCanonicalUuid(args.get("--owner-nonce"), "--owner-nonce") : undefined;
+  const workspaceDirectory = args.has("--workspace-directory")
+    ? assertAbsolutePath(args.get("--workspace-directory"), "--workspace-directory")
+    : undefined;
   const readyTimeoutMs = args.has("--ready-timeout-ms") ? Number(args.get("--ready-timeout-ms")) : READY_TIMEOUT_MS;
   if (!Number.isInteger(readyTimeoutMs) || readyTimeoutMs < 1000 || readyTimeoutMs > 300_000) throw new Error("--ready-timeout-ms must be an integer from 1000 to 300000");
   const modelCatalog = args.get("--model-catalog") ?? "refresh";
   if (modelCatalog !== "refresh" && modelCatalog !== "offline") throw new Error("--model-catalog must be refresh or offline");
-  return { stateRoot: args.get("--state-root"), passwordFile: args.get("--password-file"), port, readyTimeoutMs, modelCatalog, stopOnStdinEof };
+  return { stateRoot: args.get("--state-root"), passwordFile: args.get("--password-file"), port, readyTimeoutMs, modelCatalog, ownerNonce, workspaceDirectory, stopOnStdinEof };
 }
 
 async function runCli(argv) {
   const options = parseArgs(argv);
   if (options.help) {
-    console.log("Usage: bun serve.mjs --state-root <absolute-private-dir> --password-file <absolute-private-file> --port <port> [--model-catalog <refresh|offline>] [--ready-timeout-ms <1000..300000>] [--stop-on-stdin-eof]");
+    console.log("Usage: bun serve.mjs --state-root <absolute-private-dir> --password-file <absolute-private-file> --port <0..65535> [--model-catalog <refresh|offline>] [--ready-timeout-ms <1000..300000>] [--owner-nonce <uuid>] [--workspace-directory <absolute-existing-directory>] [--stop-on-stdin-eof]");
     return;
   }
   const service = await startOwnedService(options);

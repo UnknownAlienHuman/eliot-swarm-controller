@@ -6,7 +6,7 @@
 
 use super::{Store, meta};
 use crate::{
-    config::{McpConfig, McpToolProfile},
+    config::{Config, McpConfig, McpToolProfile},
     error::{Error, Result},
     model::{self, Credential, Role},
     participant_credentials, platform,
@@ -45,6 +45,35 @@ struct LaunchSnapshot {
     lease_facts: Value,
     route_json: String,
     options: Options,
+    owned_service: Option<OwnedServiceExpectation>,
+}
+
+/// Exact process identity retained by the Store-owned startup row. The
+/// connection options remain private to this in-memory consumer path.
+#[derive(Clone)]
+pub(crate) struct OwnedServiceExpectation {
+    process_id: u32,
+    process_birth_token: String,
+    executable_sha256: String,
+    identity_digest: String,
+}
+
+impl OwnedServiceExpectation {
+    pub(crate) fn process_id(&self) -> u32 {
+        self.process_id
+    }
+
+    pub(crate) fn process_birth_token(&self) -> &str {
+        &self.process_birth_token
+    }
+
+    pub(crate) fn executable_sha256(&self) -> &str {
+        &self.executable_sha256
+    }
+
+    fn identity_digest(&self) -> &str {
+        &self.identity_digest
+    }
 }
 
 /// Opaque, immutable proof that a launch is still in the exact pre-dispatch
@@ -74,6 +103,10 @@ impl NativeMcpLaunchSnapshot {
 
     pub(crate) fn options(&self) -> &Options {
         &self.snapshot.options
+    }
+
+    pub(crate) fn owned_service_expectation(&self) -> Option<OwnedServiceExpectation> {
+        self.snapshot.owned_service.clone()
     }
 
     pub(crate) fn identity_digest(&self) -> Result<String> {
@@ -106,10 +139,11 @@ impl Store {
     /// durable backoff marker and never contact OpenCode on every tick.
     pub(crate) async fn reconcile_native_mcp_once(&self) -> Result<Value> {
         let now = model::now_ms()?;
+        let config = self.config.clone();
         let claim_outcome = self
             .run(move |db| {
                 let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                let outcome = claim_next_readback(&tx, now)?;
+                let outcome = claim_next_readback(&tx, now, &config)?;
                 tx.commit()?;
                 Ok(outcome)
             })
@@ -175,12 +209,13 @@ impl Store {
         let operation_id = claim.snapshot.operation_id.clone();
         let expected_snapshot = snapshot_identity(&claim.snapshot);
         let context_claim = clone_claim(&claim);
+        let config = self.config.clone();
         let binding_context = self
             .run(move |db| {
                 let _actor = launcher::launch_actor(db, &operation_id)?;
                 let (row, manifest) = load_launch_manifest(db, &operation_id)?;
                 verify_claim(&row, &manifest, &context_claim)?;
-                let current = validate_launch_snapshot(db, &row, &manifest)?;
+                let current = validate_launch_snapshot(db, &row, &manifest, &config)?;
                 if snapshot_identity(&current) != expected_snapshot {
                     return Err(stale_readback());
                 }
@@ -192,16 +227,27 @@ impl Store {
                 {
                     return Err(stale_readback());
                 }
-                Ok((assignment, current.options))
+                Ok((assignment, current.options, current.owned_service))
             })
             .await;
-        let (assignment, options) = match binding_context {
+        let (assignment, options, owned_service) = match binding_context {
             Ok(context) => context,
             Err(error) => return self.finish_readback_failure(&claim, &error).await,
         };
 
         let observation = tokio::time::timeout(NATIVE_READBACK_TIMEOUT, async {
-            let service = Service::connect(&options).await?;
+            let service = match owned_service.as_ref() {
+                Some(expected) => {
+                    Service::connect_owned(
+                        &options,
+                        expected.process_id(),
+                        expected.process_birth_token(),
+                        expected.executable_sha256(),
+                    )
+                    .await?
+                }
+                None => Service::connect(&options).await?,
+            };
             crate::runtime::opencode_v2::observe_mcp(&service, &options, assignment).await
         })
         .await;
@@ -221,13 +267,14 @@ impl Store {
         let operation_id = claim.snapshot.operation_id.clone();
         let observation_at = model::now_ms()?;
         let record_claim = clone_claim(&claim);
+        let config = self.config.clone();
         let result = self
             .run(move |db| {
                 let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 let _actor = launcher::launch_actor(&tx, &operation_id)?;
                 let (row, manifest) = load_launch_manifest(&tx, &operation_id)?;
                 verify_claim(&row, &manifest, &record_claim)?;
-                let current = validate_launch_snapshot(&tx, &row, &manifest)?;
+                let current = validate_launch_snapshot(&tx, &row, &manifest, &config)?;
                 if snapshot_identity(&current) != snapshot_identity(&record_claim.snapshot) {
                     return Err(stale_readback());
                 }
@@ -444,7 +491,7 @@ impl Store {
     }
 }
 
-fn claim_next_readback(tx: &Transaction<'_>, now: i64) -> Result<ClaimOutcome> {
+fn claim_next_readback(tx: &Transaction<'_>, now: i64, config: &Config) -> Result<ClaimOutcome> {
     let cutoff = now.saturating_sub(INFLIGHT_STALE_MS);
     let ids = {
         let mut statement = tx.prepare(
@@ -472,7 +519,7 @@ fn claim_next_readback(tx: &Transaction<'_>, now: i64) -> Result<ClaimOutcome> {
         let (row, manifest) = load_launch_manifest(tx, &operation_id)?;
         let previous = readback_marker(&manifest);
         let attempt = marker_attempts(previous).saturating_add(1);
-        match validate_launch_snapshot(tx, &row, &manifest) {
+        match validate_launch_snapshot(tx, &row, &manifest, config) {
             Ok(snapshot) => {
                 let claim = ReadbackClaim {
                     snapshot,
@@ -537,6 +584,7 @@ fn validate_launch_snapshot(
     db: &Connection,
     row: &LaunchRow,
     manifest: &Value,
+    config: &Config,
 ) -> Result<LaunchSnapshot> {
     if row.method != "swarm.launch"
         || row.state != "queued"
@@ -732,7 +780,66 @@ fn validate_launch_snapshot(
         },
     });
 
-    let options = Options::parse(&route["native_options"]).map_err(|_| stale_readback())?;
+    // An owned route must be authorized by the immutable startup row and its
+    // exact process receipt. Its per-binding options come only from that
+    // verified Store projection; never parse the route's external connection
+    // options or treat configured ownership as a live service.
+    let owned_binding =
+        super::opencode::owned_service_for_binding(db, config, binding_id, binding_generation)?;
+    if route
+        .get("owned_service")
+        .is_some_and(|value| !value.is_null() && !value.is_object())
+        || route["owned_service"].is_object() != owned_binding.is_some()
+    {
+        return Err(stale_readback());
+    }
+    let (options, owned_service) = match owned_binding {
+        Some(binding) => {
+            let options = binding.options();
+            let process_id = binding.process_id();
+            let process_birth_token = binding.process_birth_token().to_owned();
+            let executable_sha256 = binding.executable_sha256().to_owned();
+            if options.service_id != binding.service_id()
+                || options.expected_version != binding.service_version()
+                || binding.service_version() != "2.0.7"
+                || process_id == 0
+            {
+                return Err(stale_readback());
+            }
+            let options_digest =
+                model::digest(model::canonical(&serde_json::to_value(&options)?)?.as_bytes());
+            let identity_facts = json!({
+                "service_id":binding.service_id(),
+                "service_version":binding.service_version(),
+                "owner_nonce":binding.owner_nonce(),
+                "owned_binding_identity_digest":binding.identity_digest(),
+                "startup_proof_digest":binding.proof_digest(),
+                "process_id":process_id,
+                "process_birth_token":process_birth_token,
+                "executable_sha256":executable_sha256,
+                "endpoint_digest":binding.endpoint_digest(),
+                "connection_digest":binding.connection_digest(),
+                "config_digest":binding.config_digest(),
+                "plugin_module_sha256":binding.plugin_module_sha256(),
+                "options_digest":options_digest,
+            });
+            let identity_digest = format!(
+                "sha256:{}",
+                model::digest(model::canonical(&identity_facts)?.as_bytes())
+            );
+            let expected = OwnedServiceExpectation {
+                process_id,
+                process_birth_token,
+                executable_sha256,
+                identity_digest,
+            };
+            (options, Some(expected))
+        }
+        None => (
+            Options::parse(&route["native_options"]).map_err(|_| stale_readback())?,
+            None,
+        ),
+    };
     Ok(LaunchSnapshot {
         operation_id: row.operation_id.clone(),
         client_id,
@@ -752,6 +859,7 @@ fn validate_launch_snapshot(
         lease_facts: lease_view,
         route_json,
         options,
+        owned_service,
     })
 }
 
@@ -798,6 +906,7 @@ fn launch_actor_facts(db: &Connection, actor: &launcher::LaunchActor) -> Result<
 /// Task/Attempt/Binding, Participant grant and held workspace lease.
 pub(crate) fn current_mcp_launch_snapshot(
     db: &Connection,
+    config: &Config,
     operation_id: &str,
 ) -> Result<NativeMcpLaunchSnapshot> {
     if operation_id.is_empty()
@@ -807,7 +916,7 @@ pub(crate) fn current_mcp_launch_snapshot(
         return Err(Error::invalid("launch Operation ID is invalid"));
     }
     let (row, manifest) = load_launch_manifest(db, operation_id)?;
-    let snapshot = validate_launch_snapshot(db, &row, &manifest)?;
+    let snapshot = validate_launch_snapshot(db, &row, &manifest, config)?;
     let identity_digest = launch_identity_digest(&snapshot)?;
     Ok(NativeMcpLaunchSnapshot {
         snapshot,
@@ -819,9 +928,10 @@ pub(crate) fn current_mcp_launch_snapshot(
 /// post-dispatch or settled launch state is accepted by this interface.
 pub(crate) fn revalidate_mcp_launch_snapshot(
     db: &Connection,
+    config: &Config,
     snapshot: &NativeMcpLaunchSnapshot,
 ) -> Result<()> {
-    let current = current_mcp_launch_snapshot(db, &snapshot.snapshot.operation_id)?;
+    let current = current_mcp_launch_snapshot(db, config, &snapshot.snapshot.operation_id)?;
     if current.identity_digest != snapshot.identity_digest {
         return Err(stale_readback());
     }
@@ -1141,6 +1251,10 @@ fn snapshot_identity(snapshot: &LaunchSnapshot) -> Value {
         "current_authority_facts":snapshot.current_authority_facts,
         "lease_facts":snapshot.lease_facts,
         "route_json":snapshot.route_json,
+        "owned_service_identity":snapshot
+            .owned_service
+            .as_ref()
+            .map(OwnedServiceExpectation::identity_digest),
     })
 }
 
@@ -1171,6 +1285,7 @@ fn clone_snapshot(snapshot: &LaunchSnapshot) -> LaunchSnapshot {
         lease_facts: snapshot.lease_facts.clone(),
         route_json: snapshot.route_json.clone(),
         options: snapshot.options.clone(),
+        owned_service: snapshot.owned_service.clone(),
     }
 }
 

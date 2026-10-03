@@ -1,7 +1,8 @@
-//! Built-in HTTP modules use the existing operation/observation boundary. They
-//! own clients only; neither restart nor shutdown owns an OpenCode process.
+//! External HTTP bindings attach to an explicit service; the separate owned
+//! route keeps its helper lifecycle and exact process proof binding-scoped.
 mod execution_reads;
 mod result_reads;
+pub(crate) use super::launcher_owned_service::owned_service_for_binding;
 use super::{Store, meta, operations, runtime, set_meta, tasks};
 use crate::{
     error::{Error, Result},
@@ -29,11 +30,42 @@ fn bindings(db: &Connection, service: Option<&str>) -> Result<Vec<Value>> {
     let mut result = Vec::new();
     for (id, generation) in ids {
         let b = operations::get_binding(db, &id, generation)?;
-        if service.is_none_or(|s| b["route"]["native_options"]["service_id"] == s) {
+        if !b["route"]["owned_service"].is_object()
+            && service.is_none_or(|s| b["route"]["native_options"]["service_id"] == s)
+        {
             result.push(b);
         }
     }
     Ok(result)
+}
+
+fn owned_bindings(db: &Connection) -> Result<Vec<Value>> {
+    let mut stmt = db.prepare(
+        "SELECT binding_id,generation FROM bindings WHERE released_at_ms IS NULL AND json_extract(route_json,'$.runtime')=?1 AND module_artifact_id=?2 AND json_type(route_json,'$.owned_service')='object' ORDER BY created_at_ms,binding_id,generation",
+    )?;
+    let ids = stmt
+        .query_map(params![oc::RUNTIME, oc::ARTIFACT_ID], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    ids.into_iter()
+        .map(|(id, generation)| operations::get_binding(db, &id, generation))
+        .collect()
+}
+
+fn active_owned_binding(db: &Connection, id: &str, generation: i64) -> Result<Option<Value>> {
+    let active: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM bindings WHERE binding_id=?1 AND generation=?2
+          AND released_at_ms IS NULL AND json_extract(route_json,'$.runtime')=?3
+          AND module_artifact_id=?4 AND json_type(route_json,'$.owned_service')='object')",
+        params![id, generation, oc::RUNTIME, oc::ARTIFACT_ID],
+        |row| row.get(0),
+    )?;
+    if !active {
+        return Ok(None);
+    }
+    operations::get_binding(db, id, generation).map(Some)
 }
 /// Child sessions with a bound producer that no terminal evidence has
 /// discharged. The snapshot reader tracks exactly these (plus active and
@@ -66,7 +98,12 @@ fn bound_child_sessions(db: &Connection, p: &Principal) -> Result<BTreeSet<Strin
     }
     Ok(out)
 }
-fn attach(db: &mut Connection, binding: &Value, boot: &str) -> Result<Principal> {
+fn attach(
+    db: &mut Connection,
+    binding: &Value,
+    boot: &str,
+    native_owner: &str,
+) -> Result<Principal> {
     let id = model::text(binding, "binding_id")?;
     let generation = model::positive(binding, "generation")?;
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -114,7 +151,7 @@ fn attach(db: &mut Connection, binding: &Value, boot: &str) -> Result<Principal>
     };
     tx.execute("UPDATE operations SET state='outcome_unknown',updated_at_ms=?3 WHERE binding_id=?1 AND binding_generation=?2 AND state IN ('sending','native_accepted')",params![id,generation,model::now_ms()?])?;
     super::capacity::sync_binding(&tx, id, generation, model::now_ms()?)?;
-    tx.execute("UPDATE bindings SET state=CASE WHEN state='ready' THEN 'reconciling' ELSE state END,state_json=json_set(state_json,'$.bridge_boot_id',?3,'$.module_link_id',?4,'$.connection','connecting','$.native_owner','external_shared_service') WHERE binding_id=?1 AND generation=?2",params![id,generation,boot,p.link_id])?;
+    tx.execute("UPDATE bindings SET state=CASE WHEN state='ready' THEN 'reconciling' ELSE state END,state_json=json_set(state_json,'$.bridge_boot_id',?3,'$.module_link_id',?4,'$.connection','connecting','$.native_owner',?5) WHERE binding_id=?1 AND generation=?2",params![id,generation,boot,p.link_id,native_owner])?;
     tx.commit()?;
     Ok(p)
 }
@@ -149,9 +186,50 @@ fn original(db: &Connection, p: &Principal, id: &str) -> Result<RuntimeCommand> 
         input,
     })
 }
+
+fn original_with_config(
+    db: &Connection,
+    p: &Principal,
+    id: &str,
+    config: &crate::config::Config,
+) -> Result<RuntimeCommand> {
+    let mut command = original(db, p, id)?;
+    if command.route["owned_service"].is_object() {
+        let options = super::launcher_owned_service::effective_options_for_binding(
+            db,
+            config,
+            &command.binding_id,
+            command.generation,
+        )?
+        .ok_or_else(|| {
+            Error::new(
+                "NATIVE_OWNED_SERVICE_UNKNOWN",
+                "owned service has no exact retained runtime options",
+            )
+        })?;
+        command.route["native_options"] = serde_json::to_value(options)?;
+    }
+    Ok(command)
+}
 impl Store {
+    async fn close_owned_opencode_service(
+        &self,
+        handle: crate::runtime::opencode_v2::owned_service::OwnedServiceHandle,
+    ) {
+        match handle.close_gracefully().await {
+            Ok(_departure) => {
+                if let Err(error) = self.reconcile_owned_opencode_departures_once().await {
+                    eprintln!("OpenCode owned-service departure: {}", error.code);
+                }
+            }
+            Err(error) if error.code == "OWNED_SERVICE_OWNER_UNAVAILABLE" => {}
+            Err(error) => eprintln!("OpenCode owned-service owner: {}", error.code),
+        }
+    }
+
     pub async fn supervise_opencode(self, mut stopping: watch::Receiver<bool>) {
         let mut workers: BTreeMap<String, JoinHandle<()>> = BTreeMap::new();
+        let mut owned_workers: BTreeMap<(String, i64), JoinHandle<()>> = BTreeMap::new();
         let mut changed = self.changed.subscribe();
         while !*stopping.borrow() {
             let finished = workers
@@ -161,6 +239,16 @@ impl Store {
                 .collect::<Vec<_>>();
             for key in finished {
                 if let Some(task) = workers.remove(&key) {
+                    let _ = task.await;
+                }
+            }
+            let finished_owned = owned_workers
+                .iter()
+                .filter(|(_, task)| task.is_finished())
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>();
+            for key in finished_owned {
+                if let Some(task) = owned_workers.remove(&key) {
                     let _ = task.await;
                 }
             }
@@ -183,6 +271,29 @@ impl Store {
                 }
                 Err(e) => eprintln!("OpenCode supervisor: {}", e.code),
             }
+            match self.run(|db| owned_bindings(db)).await {
+                Ok(bindings) => {
+                    for binding in bindings {
+                        let key = (
+                            binding["binding_id"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .to_owned(),
+                            binding["generation"].as_i64().unwrap_or(0),
+                        );
+                        if let std::collections::btree_map::Entry::Vacant(entry) =
+                            owned_workers.entry(key.clone())
+                        {
+                            let store = self.clone();
+                            let stop = stopping.clone();
+                            entry.insert(tokio::spawn(async move {
+                                store.drive_owned_opencode(&key.0, key.1, stop).await;
+                            }));
+                        }
+                    }
+                }
+                Err(e) => eprintln!("OpenCode owned-service supervisor: {}", e.code),
+            }
             tokio::select! {
                 _ = stopping.changed() => {},
                 _ = changed.changed() => {},
@@ -190,6 +301,9 @@ impl Store {
             }
         }
         for task in workers.into_values() {
+            let _ = task.await;
+        }
+        for task in owned_workers.into_values() {
             let _ = task.await;
         }
     }
@@ -262,6 +376,370 @@ impl Store {
             Ok(())
         }).await
     }
+
+    // A single pass keeps explicit references to shared read/retry state and
+    // the optional owned route; none of these are independent authorities.
+    #[allow(clippy::too_many_arguments)]
+    async fn drive_opencode_bindings(
+        &self,
+        bindings: &[Value],
+        principals: &BTreeMap<(String, i64), Principal>,
+        service: &Service,
+        shared_options: &Options,
+        owned_options: Option<&Options>,
+        boot: &str,
+        event_state: &oc::EventState,
+        execution_reader: &mut execution_reads::Reader,
+        result_retries: &mut BTreeMap<(String, i64), (String, Instant)>,
+        stopping: &watch::Receiver<bool>,
+    ) {
+        execution_reader
+            .schedule(
+                self,
+                service,
+                shared_options,
+                bindings,
+                principals,
+                self.config.as_ref(),
+                stopping.clone(),
+            )
+            .await;
+        for binding in bindings {
+            if *stopping.borrow() {
+                break;
+            }
+            let key = (
+                binding["binding_id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+                binding["generation"].as_i64().unwrap_or(0),
+            );
+            let Some(p) = principals.get(&key) else {
+                continue;
+            };
+            let binding_options = if let Some(options) = owned_options {
+                options.clone()
+            } else {
+                match Options::parse(&binding["route"]["native_options"]) {
+                    Ok(options) => options,
+                    Err(_) => continue,
+                }
+            };
+            if binding_options.connection_file != shared_options.connection_file
+                || binding_options.expected_version != shared_options.expected_version
+            {
+                let _ = self
+                    .oc_connection(
+                        p,
+                        false,
+                        Some(&Error::new(
+                            "NATIVE_SERVICE_CONFLICT",
+                            "one service namespace cannot select multiple connection records/versions",
+                        )),
+                    )
+                    .await;
+                continue;
+            }
+            let _ = self.oc_connection(p, true, None).await;
+            let config = self.config.clone();
+            let principal = p.clone();
+            let pending = self
+                .run(move |db| {
+                    let (id, generation, _) = runtime::scope(db, &principal, true)?;
+                    let mut stmt=db.prepare("SELECT operation_id FROM operations WHERE binding_id=?1 AND binding_generation=?2 AND state IN ('sending','native_accepted','outcome_unknown') AND method IN ('agent.open','task.dispatch','agent.send','agent.configure','agent.goal','agent.background') ORDER BY created_at_ms LIMIT 16")?;
+                    let ids=stmt.query_map(params![id,generation],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+                    ids.into_iter().map(|id|original_with_config(db,&principal,&id,&config)).collect::<Result<Vec<_>>>()
+                })
+                .await;
+            if let Ok(pending) = pending {
+                for command in pending {
+                    if *stopping.borrow() {
+                        break;
+                    }
+                    let result = service.reconcile(&command, &binding_options).await;
+                    if matches!(result.outcome, EffectOutcome::Applied) {
+                        let _ = self.record_oc_outcome(p, result).await;
+                    }
+                }
+            }
+            let principal = p.clone();
+            let fresh = self
+                .run(move |db| runtime::scope(db, &principal, true).map(|(_, _, binding)| binding))
+                .await;
+            if let Ok(fresh) = &fresh
+                && fresh["native_root_id"].is_string()
+                && let Err(error) = self
+                    .oc_snapshot(p, service, &binding_options, fresh, boot, event_state)
+                    .await
+            {
+                let _ = self.oc_connection(p, false, Some(&error)).await;
+            }
+            let config = self.config.clone();
+            let principal = p.clone();
+            let next = self
+                .run(move |db| runtime::next_with_config(db, &principal, &config))
+                .await;
+            let command = next.ok().and_then(|value| {
+                serde_json::from_value::<RuntimeCommand>(value["command"].clone()).ok()
+            });
+            let command = if let Some(command) = command {
+                command
+            } else {
+                // Explicit queued work wins. Recover at most one read per binding
+                // per five seconds, rotating past unresolved reads.
+                if result_retries
+                    .get(&key)
+                    .is_some_and(|(_, at)| at.elapsed() < Duration::from_secs(5))
+                {
+                    continue;
+                }
+                let after = result_retries
+                    .get(&key)
+                    .map(|(id, _)| id.clone())
+                    .unwrap_or_default();
+                let config = self.config.clone();
+                let principal = p.clone();
+                let read = self
+                    .run(move |db| result_reads::next_read(db, &principal, &after, &config))
+                    .await;
+                let Ok(Some(command)) = read else {
+                    continue;
+                };
+                result_retries.insert(key.clone(), (command.operation_id.clone(), Instant::now()));
+                command
+            };
+            if command.method == "agent.result" {
+                self.oc_result_outcome(p, service, &binding_options, &command)
+                    .await;
+                continue;
+            }
+            let result = if command.method == "agent.refresh" {
+                let read = match fresh {
+                    Ok(fresh) => {
+                        self.oc_snapshot(p, service, &binding_options, &fresh, boot, event_state)
+                            .await
+                    }
+                    Err(error) => Err(error),
+                };
+                RuntimeOutcome {
+                    operation_id: command.operation_id.clone(),
+                    outcome: if read.is_ok() {
+                        EffectOutcome::Applied
+                    } else {
+                        EffectOutcome::Unknown
+                    },
+                    native_root_id: command.native_root_id.clone(),
+                    native_scope_key: Some(binding_options.scope()),
+                    turn_id: None,
+                    native_input_id: None,
+                    details: match read {
+                        Ok(()) => {
+                            json!({"completion_condition":"native_snapshot_recorded","family_complete":false})
+                        }
+                        Err(error) => oc::diagnostic(&error),
+                    },
+                }
+            } else if command.method == "agent.reconcile" {
+                let target_id = command.input["operation_id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                let config = self.config.clone();
+                let principal = p.clone();
+                let target = self
+                    .run(move |db| original_with_config(db, &principal, &target_id, &config))
+                    .await;
+                let resolved = if let Ok(target) = target {
+                    if target.method == "agent.result" {
+                        self.oc_result_outcome(p, service, &binding_options, &target)
+                            .await
+                    } else {
+                        let result = service.reconcile(&target, &binding_options).await;
+                        let resolved = matches!(result.outcome, EffectOutcome::Applied);
+                        self.record_oc_outcome(p, result).await.is_ok() && resolved
+                    }
+                } else {
+                    false
+                };
+                RuntimeOutcome {
+                    operation_id: command.operation_id.clone(),
+                    outcome: EffectOutcome::Applied,
+                    native_root_id: command.native_root_id.clone(),
+                    native_scope_key: Some(binding_options.scope()),
+                    turn_id: None,
+                    native_input_id: None,
+                    details: json!({"completion_condition":"readback_attempted","resolved":resolved,"replayed_native_input":false}),
+                }
+            } else {
+                service.execute(&command, &binding_options).await
+            };
+            if let Err(error) = self.record_oc_outcome(p, result).await {
+                eprintln!("OpenCode receipt: {}", error.code);
+            }
+        }
+    }
+
+    async fn drive_owned_opencode(
+        &self,
+        binding_id: &str,
+        generation: i64,
+        mut stopping: watch::Receiver<bool>,
+    ) {
+        let binding_id = binding_id.to_owned();
+        let boot = model::new_id();
+        let mut changed = self.changed.subscribe();
+        let mut execution_reader = execution_reads::Reader::default();
+        let mut result_retries: BTreeMap<(String, i64), (String, Instant)> = BTreeMap::new();
+
+        // The Store is the only process-start authority. Retrying this call can
+        // only read the exact retained intent after the durable unknown boundary;
+        // it cannot mint a replacement process for an unresolved effect.
+        let handle = loop {
+            if *stopping.borrow() {
+                return;
+            }
+            match self
+                .ensure_owned_opencode_service(&binding_id, generation, stopping.clone())
+                .await
+            {
+                Ok(handle) => break handle,
+                Err(error) => {
+                    eprintln!("OpenCode owned-service binding: {}", error.code);
+                    let id = binding_id.clone();
+                    let still_active = self
+                        .run(move |db| active_owned_binding(db, &id, generation))
+                        .await;
+                    if !matches!(still_active, Ok(Some(_))) {
+                        return;
+                    }
+                    tokio::select! {
+                        _ = stopping.changed() => {},
+                        _ = changed.changed() => {},
+                        _ = tokio::time::sleep(Duration::from_secs(5)) => {},
+                    }
+                }
+            }
+        };
+        let service = handle.service().clone();
+        let options = handle.options().clone();
+
+        let initial_id = binding_id.clone();
+        let initial = self
+            .run(move |db| active_owned_binding(db, &initial_id, generation))
+            .await;
+        let binding = match initial {
+            Ok(Some(binding)) => binding,
+            Ok(None) => {
+                execution_reader.close().await;
+                self.close_owned_opencode_service(handle).await;
+                return;
+            }
+            Err(error) => {
+                eprintln!("OpenCode owned-service binding: {}", error.code);
+                execution_reader.close().await;
+                self.close_owned_opencode_service(handle).await;
+                return;
+            }
+        };
+        let attach_binding = binding.clone();
+        let attach_boot = boot.clone();
+        let principal = self
+            .run(move |db| attach(db, &attach_binding, &attach_boot, "owned_fresh_service"))
+            .await;
+        let principal = match principal {
+            Ok(principal) => principal,
+            Err(error) => {
+                eprintln!("OpenCode owned-service attachment: {}", error.code);
+                execution_reader.close().await;
+                self.close_owned_opencode_service(handle).await;
+                return;
+            }
+        };
+        let key = (binding_id.clone(), generation);
+        let principals = BTreeMap::from([(key.clone(), principal.clone())]);
+        let event_state = oc::EventState {
+            connected: false,
+            revision: 0,
+            gaps: 0,
+            last_gap: None,
+        };
+
+        while !*stopping.borrow() {
+            let id = binding_id.clone();
+            let _binding = match self
+                .run(move |db| active_owned_binding(db, &id, generation))
+                .await
+            {
+                Ok(Some(binding)) => binding,
+                Ok(None) => break,
+                Err(error) => {
+                    eprintln!("OpenCode owned-service scope: {}", error.code);
+                    tokio::select! {
+                        _ = stopping.changed() => {},
+                        _ = changed.changed() => {},
+                        _ = tokio::time::sleep(Duration::from_secs(5)) => {},
+                    }
+                    continue;
+                }
+            };
+
+            let scope_principal = principal.clone();
+            let live_scope = self
+                .run(move |db| runtime::scope(db, &scope_principal, true).map(|(_, _, b)| b))
+                .await;
+            let binding = match live_scope {
+                Ok(binding) => binding,
+                Err(error) => {
+                    if matches!(
+                        error.code.as_str(),
+                        "BINDING_CLOSED" | "UNAUTHORIZED" | "STALE_LINK"
+                    ) {
+                        break;
+                    }
+                    eprintln!("OpenCode owned-service authority: {}", error.code);
+                    tokio::select! {
+                        _ = stopping.changed() => {},
+                        _ = changed.changed() => {},
+                        _ = tokio::time::sleep(Duration::from_secs(5)) => {},
+                    }
+                    continue;
+                }
+            };
+
+            match service.verify().await {
+                Ok(()) => {
+                    let bindings = [binding];
+                    self.drive_opencode_bindings(
+                        &bindings,
+                        &principals,
+                        &service,
+                        &options,
+                        Some(&options),
+                        &boot,
+                        &event_state,
+                        &mut execution_reader,
+                        &mut result_retries,
+                        &stopping,
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    let _ = self.oc_connection(&principal, false, Some(&error)).await;
+                }
+            }
+            tokio::select! {
+                _ = stopping.changed() => {},
+                _ = changed.changed() => {},
+                _ = tokio::time::sleep(Duration::from_secs(5)) => {},
+            }
+        }
+
+        execution_reader.close().await;
+        let _ = self.oc_connection(&principal, false, None).await;
+        self.close_owned_opencode_service(handle).await;
+    }
+
     async fn drive_opencode(&self, service_id: &str, mut stopping: watch::Receiver<bool>) {
         let boot = model::new_id();
         let mut principals = BTreeMap::new();
@@ -291,7 +769,10 @@ impl Store {
                 if let std::collections::btree_map::Entry::Vacant(entry) = principals.entry(key) {
                     let binding = b.clone();
                     let boot = boot.clone();
-                    match self.run(move |db| attach(db, &binding, &boot)).await {
+                    match self
+                        .run(move |db| attach(db, &binding, &boot, "external_shared_service"))
+                        .await
+                    {
                         Ok(p) => {
                             entry.insert(p);
                         }
@@ -323,194 +804,19 @@ impl Store {
                         connection = None;
                     }
                     Ok(()) => {
-                        execution_reader
-                            .schedule(
-                                self,
-                                service,
-                                &options,
-                                &list,
-                                &principals,
-                                stopping.clone(),
-                            )
-                            .await;
-                        for b in list {
-                            if *stopping.borrow() {
-                                break;
-                            }
-                            let Some(p) = principals.get(&(
-                                b["binding_id"].as_str().unwrap_or_default().to_owned(),
-                                b["generation"].as_i64().unwrap_or(0),
-                            )) else {
-                                continue;
-                            };
-                            let binding_options =
-                                match Options::parse(&b["route"]["native_options"]) {
-                                    Ok(o) => o,
-                                    Err(_) => continue,
-                                };
-                            if binding_options.connection_file != options.connection_file
-                                || binding_options.expected_version != options.expected_version
-                            {
-                                let _=self.oc_connection(p,false,Some(&Error::new("NATIVE_SERVICE_CONFLICT","one service namespace cannot select multiple connection records/versions"))).await;
-                                continue;
-                            }
-                            let _ = self.oc_connection(p, true, None).await;
-                            // Restart recovery reads retained operation identities. It
-                            // never recreates a session or resubmits an original input.
-                            let principal = p.clone();
-                            let pending=self.run(move|db|{
-                            let (id,generation,_)=runtime::scope(db,&principal,true)?;
-                            let mut stmt=db.prepare("SELECT operation_id FROM operations WHERE binding_id=?1 AND binding_generation=?2 AND state IN ('sending','native_accepted','outcome_unknown') AND method IN ('agent.open','task.dispatch','agent.send','agent.configure','agent.goal','agent.background') ORDER BY created_at_ms LIMIT 16")?;
-                            let ids=stmt.query_map(params![id,generation],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-                            ids.into_iter().map(|id|original(db,&principal,&id)).collect::<Result<Vec<_>>>()
-                        }).await;
-                            if let Ok(pending) = pending {
-                                for command in pending {
-                                    if *stopping.borrow() {
-                                        break;
-                                    }
-                                    let result =
-                                        service.reconcile(&command, &binding_options).await;
-                                    if matches!(result.outcome, EffectOutcome::Applied) {
-                                        let _ = self.record_oc_outcome(p, result).await;
-                                    }
-                                }
-                            }
-                            let principal = p.clone();
-                            let fresh = self
-                                .run(move |db| {
-                                    runtime::scope(db, &principal, true).map(|(_, _, b)| b)
-                                })
-                                .await;
-                            if let Ok(fresh) = &fresh
-                                && fresh["native_root_id"].is_string()
-                                && let Err(e) = self
-                                    .oc_snapshot(
-                                        p,
-                                        service,
-                                        &binding_options,
-                                        fresh,
-                                        &boot,
-                                        &event_state,
-                                    )
-                                    .await
-                            {
-                                let _ = self.oc_connection(p, false, Some(&e)).await;
-                            }
-                            let principal = p.clone();
-                            let next = self.run(move |db| runtime::next(db, &principal)).await;
-                            let command = next.ok().and_then(|v| {
-                                serde_json::from_value::<RuntimeCommand>(v["command"].clone()).ok()
-                            });
-                            let command = if let Some(command) = command {
-                                command
-                            } else {
-                                // Explicit queued work wins. Recover at most one read per
-                                // binding per five seconds, rotating past unresolved reads.
-                                let key = (
-                                    model::text(&b, "binding_id").unwrap_or_default().to_owned(),
-                                    b["generation"].as_i64().unwrap_or(0),
-                                );
-                                if result_retries
-                                    .get(&key)
-                                    .is_some_and(|(_, at)| at.elapsed() < Duration::from_secs(5))
-                                {
-                                    continue;
-                                }
-                                let after = result_retries
-                                    .get(&key)
-                                    .map(|(id, _)| id.clone())
-                                    .unwrap_or_default();
-                                let principal = p.clone();
-                                let read = self
-                                    .run(move |db| result_reads::next_read(db, &principal, &after))
-                                    .await;
-                                let Ok(Some(command)) = read else {
-                                    continue;
-                                };
-                                result_retries
-                                    .insert(key, (command.operation_id.clone(), Instant::now()));
-                                command
-                            };
-                            if command.method == "agent.result" {
-                                self.oc_result_outcome(p, service, &binding_options, &command)
-                                    .await;
-                                continue;
-                            }
-                            let result = if command.method == "agent.refresh" {
-                                let read = match fresh {
-                                    Ok(fresh) => {
-                                        self.oc_snapshot(
-                                            p,
-                                            service,
-                                            &binding_options,
-                                            &fresh,
-                                            &boot,
-                                            &event_state,
-                                        )
-                                        .await
-                                    }
-                                    Err(e) => Err(e),
-                                };
-                                RuntimeOutcome {
-                                    operation_id: command.operation_id.clone(),
-                                    outcome: if read.is_ok() {
-                                        EffectOutcome::Applied
-                                    } else {
-                                        EffectOutcome::Unknown
-                                    },
-                                    native_root_id: command.native_root_id.clone(),
-                                    native_scope_key: Some(binding_options.scope()),
-                                    turn_id: None,
-                                    native_input_id: None,
-                                    details: match read {
-                                        Ok(()) => {
-                                            json!({"completion_condition":"native_snapshot_recorded","family_complete":false})
-                                        }
-                                        Err(e) => oc::diagnostic(&e),
-                                    },
-                                }
-                            } else if command.method == "agent.reconcile" {
-                                let principal = p.clone();
-                                let target = command.input["operation_id"]
-                                    .as_str()
-                                    .unwrap_or_default()
-                                    .to_owned();
-                                let target =
-                                    self.run(move |db| original(db, &principal, &target)).await;
-                                let resolved = if let Ok(target) = target {
-                                    if target.method == "agent.result" {
-                                        self.oc_result_outcome(
-                                            p,
-                                            service,
-                                            &binding_options,
-                                            &target,
-                                        )
-                                        .await
-                                    } else {
-                                        let r = service.reconcile(&target, &binding_options).await;
-                                        let resolved = matches!(r.outcome, EffectOutcome::Applied);
-                                        self.record_oc_outcome(p, r).await.is_ok() && resolved
-                                    }
-                                } else {
-                                    false
-                                };
-                                RuntimeOutcome {
-                                    operation_id: command.operation_id.clone(),
-                                    outcome: EffectOutcome::Applied,
-                                    native_root_id: command.native_root_id.clone(),
-                                    native_scope_key: Some(binding_options.scope()),
-                                    turn_id: None,
-                                    native_input_id: None,
-                                    details: json!({"completion_condition":"readback_attempted","resolved":resolved,"replayed_native_input":false}),
-                                }
-                            } else {
-                                service.execute(&command, &binding_options).await
-                            };
-                            if let Err(e) = self.record_oc_outcome(p, result).await {
-                                eprintln!("OpenCode receipt: {}", e.code);
-                            }
-                        }
+                        self.drive_opencode_bindings(
+                            &list,
+                            &principals,
+                            service,
+                            &options,
+                            None,
+                            &boot,
+                            &event_state,
+                            &mut execution_reader,
+                            &mut result_retries,
+                            &stopping,
+                        )
+                        .await;
                     }
                 }
             }

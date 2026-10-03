@@ -601,6 +601,274 @@ pub(super) fn dispatch(
         true,
     ))
 }
+#[derive(Debug)]
+struct OwnedServiceStartLink {
+    launch_operation_id: String,
+    open_operation_id: String,
+    binding_id: String,
+    binding_generation: i64,
+    task_id: String,
+    task_revision: i64,
+    attempt_id: String,
+    technical_requester_id: String,
+    effective_manager_id: String,
+    state: String,
+}
+
+type OwnedBindingRow = (String, Option<i64>, Option<String>, Option<String>);
+
+type OwnedServiceOperationRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<String>,
+);
+
+fn owned_service_start_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<OwnedServiceStartLink> {
+    Ok(OwnedServiceStartLink {
+        launch_operation_id: row.get(0)?,
+        open_operation_id: row.get(1)?,
+        binding_id: row.get(2)?,
+        binding_generation: row.get(3)?,
+        task_id: row.get(4)?,
+        task_revision: row.get(5)?,
+        attempt_id: row.get(6)?,
+        technical_requester_id: row.get(7)?,
+        effective_manager_id: row.get(8)?,
+        state: row.get(9)?,
+    })
+}
+
+fn owned_service_start_for_operation(
+    db: &Connection,
+    operation_id: &str,
+) -> Result<Option<OwnedServiceStartLink>> {
+    let mut statement = db.prepare(
+        "SELECT launch_operation_id,open_operation_id,binding_id,binding_generation,
+                task_id,task_revision,attempt_id,technical_requester_id,
+                effective_manager_id,state
+         FROM owned_service_starts
+         WHERE launch_operation_id=?1 OR open_operation_id=?1 LIMIT 2",
+    )?;
+    let rows = statement.query_map([operation_id], owned_service_start_from_row)?;
+    let mut rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    if rows.len() > 1 {
+        return Err(owned_service_link_corrupt());
+    }
+    Ok(rows.pop())
+}
+
+fn owned_service_starts_for_attempt(
+    db: &Connection,
+    attempt_id: &str,
+) -> Result<Vec<OwnedServiceStartLink>> {
+    let mut statement = db.prepare(
+        "SELECT launch_operation_id,open_operation_id,binding_id,binding_generation,
+                task_id,task_revision,attempt_id,technical_requester_id,
+                effective_manager_id,state
+         FROM owned_service_starts WHERE attempt_id=?1 ORDER BY launch_operation_id",
+    )?;
+    let rows = statement.query_map([attempt_id], owned_service_start_from_row)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+fn fail_reserved_owned_service_start(
+    tx: &Transaction<'_>,
+    link: &OwnedServiceStartLink,
+    now: i64,
+) -> Result<()> {
+    match link.state.as_str() {
+        "reserved" => {
+            // The service-start coordinator must CAS this same row to
+            // outcome_unknown before it can mint the one-shot process permit.
+            // Winning this transaction therefore makes any prepared permit stale.
+            let binding: Option<OwnedBindingRow> = tx
+                .query_row(
+                    "SELECT state,released_at_ms,native_root_id,native_scope_key
+                     FROM bindings WHERE binding_id=?1 AND generation=?2",
+                    params![link.binding_id, link.binding_generation],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()?;
+            if !binding.is_some_and(|(state, released, native_root, native_scope)| {
+                state == "opening"
+                    && released.is_none()
+                    && native_root.is_none()
+                    && native_scope.is_none()
+            }) {
+                return Err(Error::new(
+                    "OWNED_SERVICE_ACTIVE",
+                    "reserved service start no longer proves an unreleased pre-native binding",
+                ));
+            }
+            let changed = tx.execute(
+                "UPDATE owned_service_starts SET state='failed_no_effect',updated_at_ms=?2
+                 WHERE launch_operation_id=?1 AND state='reserved'",
+                params![link.launch_operation_id, now],
+            )?;
+            if changed != 1 {
+                return Err(Error::conflict(
+                    "owned service start changed before its no-effect cancellation fence",
+                ));
+            }
+            Ok(())
+        }
+        "failed_no_effect" | "service_departed" => Ok(()),
+        "outcome_unknown" => Err(Error::new(
+            "OUTCOME_UNKNOWN",
+            "owned service start may have crossed its process boundary; reconcile it before cancellation or release",
+        )),
+        "service_observed" => Err(Error::new(
+            "OWNED_SERVICE_ACTIVE",
+            "owned service process is retained; observe its departure before cancellation or release",
+        )),
+        _ => Err(owned_service_link_corrupt()),
+    }
+}
+
+fn owned_service_link_corrupt() -> Error {
+    Error::new(
+        "OWNED_SERVICE_LINK_CORRUPT",
+        "owned service start linkage is invalid",
+    )
+}
+
+fn cancel_owned_service_linked_operation(
+    tx: &Transaction<'_>,
+    link: &OwnedServiceStartLink,
+    operation_id: &str,
+    method: &str,
+    released_by_operation_id: &str,
+    now: i64,
+) -> Result<()> {
+    let row: Option<OwnedServiceOperationRow> = tx
+        .query_row(
+            "SELECT caller_id,method,state,task_id,attempt_id,binding_id,
+                    binding_generation,prerequisite_operation_id
+             FROM operations WHERE operation_id=?1",
+            [operation_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((caller, actual_method, state, task, attempt, binding, generation, prerequisite)) =
+        row
+    else {
+        return Err(owned_service_link_corrupt());
+    };
+    let expected_prerequisite = if method == "agent.open" {
+        Some(link.launch_operation_id.as_str())
+    } else {
+        None
+    };
+    if caller != link.technical_requester_id
+        || actual_method != method
+        || task.as_deref() != Some(link.task_id.as_str())
+        || attempt.as_deref() != Some(link.attempt_id.as_str())
+        || binding.as_deref() != Some(link.binding_id.as_str())
+        || generation != Some(link.binding_generation)
+        || prerequisite.as_deref() != expected_prerequisite
+    {
+        return Err(owned_service_link_corrupt());
+    }
+    match state.as_str() {
+        "queued" => {
+            let cancellation = json!({
+                "reason":"attempt released before owned service completion",
+                "cancelled_by":released_by_operation_id
+            });
+            let changed = tx.execute(
+                "UPDATE operations SET state='cancelled',result_json=?2,settled_at_ms=?3,
+                 updated_at_ms=?3 WHERE operation_id=?1 AND method=?4 AND state='queued'",
+                params![operation_id, model::canonical(&cancellation)?, now, method,],
+            )?;
+            if changed != 1 {
+                return Err(Error::conflict(
+                    "owned service launch Operation changed before Attempt release",
+                ));
+            }
+            super::capacity::sync_operation(tx, operation_id, now)?;
+            Ok(())
+        }
+        "settled" | "rejected" | "cancelled" => Ok(()),
+        "sending" | "native_accepted" | "outcome_unknown" => Err(Error::new(
+            "OUTCOME_UNKNOWN",
+            "linked launch Operation is already sent or unresolved; resolve it before Attempt release",
+        )),
+        _ => Err(owned_service_link_corrupt()),
+    }?;
+    if method == "agent.open" {
+        tx.execute(
+            "UPDATE bindings SET state='closed',released_at_ms=?3
+             WHERE binding_id=?1 AND generation=?2 AND state='opening'
+               AND released_at_ms IS NULL AND native_root_id IS NULL
+               AND native_scope_key IS NULL",
+            params![link.binding_id, link.binding_generation, now],
+        )?;
+    }
+    Ok(())
+}
+
+pub(super) fn prepare_owned_service_attempt_release(
+    tx: &Transaction<'_>,
+    attempt: &Value,
+    released_by_operation_id: &str,
+    now: i64,
+) -> Result<()> {
+    let attempt_id = model::text(attempt, "attempt_id")?;
+    let task_id = model::text(attempt, "task_id")?;
+    let task_revision = model::positive(attempt, "task_revision")?;
+    let owner_id = model::text(attempt, "owner_id")?;
+    let binding_id = attempt["binding_id"].as_str();
+    let binding_generation = attempt["binding_generation"].as_i64();
+    for link in owned_service_starts_for_attempt(tx, attempt_id)? {
+        if link.attempt_id != attempt_id
+            || link.task_id != task_id
+            || link.task_revision != task_revision
+            || link.effective_manager_id != owner_id
+            || binding_id != Some(link.binding_id.as_str())
+            || binding_generation != Some(link.binding_generation)
+        {
+            return Err(owned_service_link_corrupt());
+        }
+        fail_reserved_owned_service_start(tx, &link, now)?;
+        cancel_owned_service_linked_operation(
+            tx,
+            &link,
+            &link.launch_operation_id,
+            "swarm.launch",
+            released_by_operation_id,
+            now,
+        )?;
+        cancel_owned_service_linked_operation(
+            tx,
+            &link,
+            &link.open_operation_id,
+            "agent.open",
+            released_by_operation_id,
+            now,
+        )?;
+    }
+    Ok(())
+}
+
 pub(super) fn cancel(
     tx: &Transaction<'_>,
     p: &Principal,
@@ -652,6 +920,29 @@ pub(super) fn cancel(
             "already-sent operations require native cancellation/reconciliation, not local deletion",
         ));
     }
+    if let Some(service_start) = owned_service_start_for_operation(tx, target)? {
+        let expected_method = if target == service_start.launch_operation_id {
+            "swarm.launch"
+        } else if target == service_start.open_operation_id {
+            "agent.open"
+        } else {
+            return Err(owned_service_link_corrupt());
+        };
+        if o["method"].as_str() != Some(expected_method)
+            || o["caller_id"].as_str() != Some(service_start.technical_requester_id.as_str())
+            || o["task_id"].as_str() != Some(service_start.task_id.as_str())
+            || o["attempt_id"].as_str() != Some(service_start.attempt_id.as_str())
+            || o["binding_id"].as_str() != Some(service_start.binding_id.as_str())
+            || o["binding_generation"].as_i64() != Some(service_start.binding_generation)
+            || (expected_method == "swarm.launch" && !o["prerequisite_operation_id"].is_null())
+            || (expected_method == "agent.open"
+                && o["prerequisite_operation_id"].as_str()
+                    != Some(service_start.launch_operation_id.as_str()))
+        {
+            return Err(owned_service_link_corrupt());
+        }
+        fail_reserved_owned_service_start(tx, &service_start, now)?;
+    }
     let cancellation = if stale_publication {
         json!({"reason":reason,"cancelled_by":id,"previous_result":o["result"]})
     } else {
@@ -676,7 +967,7 @@ pub(super) fn cancel(
         super::capacity::sync_attempt(tx, attempt_id, now)?;
     }
     if o["method"] == "agent.open" {
-        tx.execute("UPDATE bindings SET state='closed',released_at_ms=?3 WHERE binding_id=?1 AND generation=?2 AND state='opening' AND native_root_id IS NULL",params![o["binding_id"].as_str(),o["binding_generation"].as_i64(),now])?;
+        tx.execute("UPDATE bindings SET state='closed',released_at_ms=?3 WHERE binding_id=?1 AND generation=?2 AND state='opening' AND native_root_id IS NULL AND native_scope_key IS NULL",params![o["binding_id"].as_str(),o["binding_generation"].as_i64(),now])?;
     }
     Ok(json!({"operation_id":id,"cancelled_operation_id":target,"native_cancel_sent":false}))
 }

@@ -6,6 +6,7 @@ use reqwest::{Client, Method, Url, header};
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::Value;
 use std::{
+    future::Future,
     io::Read,
     net::{IpAddr, SocketAddr},
     path::{Component, Path},
@@ -33,6 +34,14 @@ pub(crate) struct Service {
     endpoint: Url,
     pub(crate) pid: u32,
     pub(crate) version: String,
+    owned_process: Option<OwnedProcessIdentity>,
+}
+#[derive(Clone)]
+struct OwnedProcessIdentity {
+    pid: u32,
+    birth_token: String,
+    image_sha256: String,
+    image_path: String,
 }
 #[derive(Deserialize)]
 struct ServerInfo {
@@ -137,54 +146,154 @@ pub(super) fn endpoint(text: &str) -> Result<Url> {
     }
     Ok(url)
 }
+
+async fn process_image_identity(pid: u32) -> Result<Value> {
+    tokio::task::spawn_blocking(move || crate::platform::process_group::process_image_identity(pid))
+        .await
+        .map_err(|_| Error::new("PROCESS_IDENTITY", "process identity reader stopped"))?
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn normalized_image_sha256(value: &str) -> Option<String> {
+    let digest = value.strip_prefix("sha256:").unwrap_or(value);
+    valid_sha256(digest).then(|| format!("sha256:{digest}"))
+}
+
+fn require_owned_process_image(
+    identity: &Value,
+    pid: u32,
+    expected_birth_token: &str,
+    expected_image_sha256: &str,
+) -> Result<()> {
+    if identity["pid"].as_u64() != Some(u64::from(pid))
+        || identity["image_sha256"].as_str() != Some(expected_image_sha256)
+        || identity["image_path"].as_str().is_none_or(str::is_empty)
+        || super::owned_service::process_birth_token(identity)? != expected_birth_token
+    {
+        return Err(Error::new(
+            "NATIVE_OWNED_PROCESS_MISMATCH",
+            "owned service process identity differs from its retained proof",
+        ));
+    }
+    Ok(())
+}
+
+fn authenticated_service(record: ConnectionRecord, expected_version: String) -> Result<Service> {
+    let endpoint = endpoint(&record.endpoint)?;
+    let mut auth = header::HeaderValue::from_str(&format!(
+        "Basic {}",
+        STANDARD.encode(format!("{}:{}", record.username, record.password))
+    ))
+    .map_err(|_| Error::new("NATIVE_CONNECTION_FILE", "invalid authentication value"))?;
+    auth.set_sensitive(true);
+    let mut headers = header::HeaderMap::new();
+    headers.insert(header::AUTHORIZATION, auth);
+    headers.insert(
+        header::ACCEPT,
+        header::HeaderValue::from_static("application/json"),
+    );
+    let mut builder = Client::builder()
+        .default_headers(headers)
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .connect_timeout(Duration::from_secs(3))
+        .http1_only();
+    // Resolve localhost explicitly; no DNS lookup can redirect a credential.
+    if endpoint.host_str() == Some("localhost") {
+        builder = builder.resolve(
+            "localhost",
+            SocketAddr::from((
+                [127, 0, 0, 1],
+                endpoint.port_or_known_default().unwrap_or(80),
+            )),
+        );
+    }
+    Ok(Service {
+        client: builder
+            .build()
+            .map_err(|_| Error::new("NATIVE_TRANSPORT", "HTTP client initialization failed"))?,
+        endpoint,
+        pid: record.pid,
+        version: expected_version,
+        owned_process: None,
+    })
+}
+
 impl Service {
     pub(crate) async fn connect(options: &Options) -> Result<Self> {
         let path = options.connection_file.clone();
         let record = tokio::task::spawn_blocking(move || record(&path))
             .await
             .map_err(|_| Error::new("NATIVE_CONNECTION_FILE", "connection reader stopped"))??;
-        let endpoint = endpoint(&record.endpoint)?;
-        let mut auth = header::HeaderValue::from_str(&format!(
-            "Basic {}",
-            STANDARD.encode(format!("{}:{}", record.username, record.password))
-        ))
-        .map_err(|_| Error::new("NATIVE_CONNECTION_FILE", "invalid authentication value"))?;
-        auth.set_sensitive(true);
-        let mut headers = header::HeaderMap::new();
-        headers.insert(header::AUTHORIZATION, auth);
-        headers.insert(
-            header::ACCEPT,
-            header::HeaderValue::from_static("application/json"),
-        );
-        let mut builder = Client::builder()
-            .default_headers(headers)
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .connect_timeout(Duration::from_secs(3))
-            .http1_only();
-        // Resolve localhost explicitly; no DNS lookup can redirect a credential.
-        if endpoint.host_str() == Some("localhost") {
-            builder = builder.resolve(
-                "localhost",
-                SocketAddr::from((
-                    [127, 0, 0, 1],
-                    endpoint.port_or_known_default().unwrap_or(80),
-                )),
-            );
+        let service = authenticated_service(record, options.expected_version.clone())?;
+        service.verify().await?;
+        Ok(service)
+    }
+
+    pub(crate) async fn connect_owned(
+        options: &Options,
+        expected_pid: u32,
+        expected_birth_token: &str,
+        expected_image_sha256: &str,
+    ) -> Result<Self> {
+        let expected_image_sha256 =
+            normalized_image_sha256(expected_image_sha256).ok_or_else(|| {
+                Error::new(
+                    "NATIVE_OWNED_PROCESS_MISMATCH",
+                    "owned service executable digest is malformed",
+                )
+            })?;
+        if expected_pid == 0 || !valid_sha256(expected_birth_token) {
+            return Err(Error::new(
+                "NATIVE_OWNED_PROCESS_MISMATCH",
+                "owned service process proof is malformed",
+            ));
         }
-        let service = Self {
-            client: builder
-                .build()
-                .map_err(|_| Error::new("NATIVE_TRANSPORT", "HTTP client initialization failed"))?,
-            endpoint,
-            pid: record.pid,
-            version: options.expected_version.clone(),
-        };
+        let before = process_image_identity(expected_pid).await?;
+        require_owned_process_image(
+            &before,
+            expected_pid,
+            expected_birth_token,
+            &expected_image_sha256,
+        )?;
+        let path = options.connection_file.clone();
+        let record = tokio::task::spawn_blocking(move || record(&path))
+            .await
+            .map_err(|_| Error::new("NATIVE_CONNECTION_FILE", "connection reader stopped"))??;
+        if record.pid != expected_pid {
+            return Err(Error::new(
+                "NATIVE_OWNED_PROCESS_MISMATCH",
+                "private connection record names another process",
+            ));
+        }
+        let mut service = authenticated_service(record, options.expected_version.clone())?;
+        service.owned_process = Some(OwnedProcessIdentity {
+            pid: expected_pid,
+            birth_token: expected_birth_token.to_owned(),
+            image_sha256: expected_image_sha256,
+            image_path: before["image_path"]
+                .as_str()
+                .ok_or_else(|| {
+                    Error::new(
+                        "NATIVE_OWNED_PROCESS_MISMATCH",
+                        "owned service executable path is unavailable",
+                    )
+                })?
+                .to_owned(),
+        });
         service.verify().await?;
         Ok(service)
     }
     pub(crate) async fn verify(&self) -> Result<()> {
+        // `request` brackets this exact /api/info round trip with the retained
+        // process birth, image digest, and executable-path proof for owned services.
         let info: ServerInfo = decode(self.get("/api/info", &[]).await?)?;
         if info.pid != self.pid
             || info.version != self.version
@@ -197,6 +306,46 @@ impl Service {
             ));
         }
         Ok(())
+    }
+    async fn verify_owned_process(&self) -> Result<Option<String>> {
+        let Some(expected) = &self.owned_process else {
+            return Ok(None);
+        };
+        let identity = process_image_identity(expected.pid).await?;
+        require_owned_process_image(
+            &identity,
+            expected.pid,
+            &expected.birth_token,
+            &expected.image_sha256,
+        )?;
+        let path = identity["image_path"].as_str().ok_or_else(|| {
+            Error::new(
+                "NATIVE_OWNED_PROCESS_MISMATCH",
+                "owned service executable path is unavailable",
+            )
+        })?;
+        if path != expected.image_path {
+            return Err(Error::new(
+                "NATIVE_OWNED_PROCESS_MISMATCH",
+                "owned service executable path changed",
+            ));
+        }
+        Ok(Some(path.to_owned()))
+    }
+    async fn with_owned_process_check<T>(
+        &self,
+        operation: impl Future<Output = Result<T>>,
+    ) -> Result<T> {
+        let before = self.verify_owned_process().await?;
+        let result = operation.await;
+        let after = self.verify_owned_process().await?;
+        if before != after {
+            return Err(Error::new(
+                "NATIVE_OWNED_PROCESS_MISMATCH",
+                "owned service process identity changed during its HTTP request",
+            ));
+        }
+        result
     }
     pub(super) async fn get(&self, path: &str, query: &[(&str, String)]) -> Result<Value> {
         self.request(Method::GET, path, query, None).await
@@ -219,6 +368,15 @@ impl Service {
     /// Callers must derive `relative` from a native result descriptor; this API
     /// deliberately does not accept an arbitrary URL or absolute path.
     pub(super) async fn get_location_file(
+        &self,
+        relative: &Path,
+        directory: &Path,
+        limit: usize,
+    ) -> Result<RawBody> {
+        self.with_owned_process_check(self.get_location_file_unchecked(relative, directory, limit))
+            .await
+    }
+    async fn get_location_file_unchecked(
         &self,
         relative: &Path,
         directory: &Path,
@@ -318,6 +476,16 @@ impl Service {
         Ok(RawBody { bytes, media_type })
     }
     async fn request(
+        &self,
+        method: Method,
+        path: &str,
+        query: &[(&str, String)],
+        body: Option<Value>,
+    ) -> Result<Value> {
+        self.with_owned_process_check(self.request_unchecked(method, path, query, body))
+            .await
+    }
+    async fn request_unchecked(
         &self,
         method: Method,
         path: &str,

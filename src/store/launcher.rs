@@ -27,6 +27,21 @@ const MAX_INSPECT_SNAPSHOT_FIELD_ITEMS: usize = 64;
 const MAX_LAUNCH_OPERATION_ROWS: i64 = 8;
 const MAX_LAUNCH_BRIEF_BYTES: usize = 8_192;
 
+type OpeningChildRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    String,
+    String,
+    String,
+    Option<String>,
+);
+
 /// Authority carried by the shared launcher from admission through native
 /// readback. WorkDispatch is deliberately an opaque context, never a forged
 /// manager Principal or a deserializable request field.
@@ -245,6 +260,405 @@ impl LaunchActor {
                     return Err(Error::new(
                         "STALE_LAUNCH",
                         "claimed launch Attempt is no longer the exact unstarted reservation",
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Verify the exact queued pre-ready launch opening before advancing its
+    /// `agent.open` child. The ready binding validator remains a separate
+    /// post-readback authority.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn require_opening_launch_attempt(
+        &self,
+        db: &Connection,
+        launch_operation_id: &str,
+        task_id: &str,
+        task_revision: i64,
+        attempt_id: &str,
+        binding_id: &str,
+        binding_generation: i64,
+    ) -> Result<()> {
+        match self {
+            Self::OnBehalf(context) => context.require_opening_launch_attempt(
+                db,
+                launch_operation_id,
+                task_id,
+                task_revision,
+                attempt_id,
+                binding_id,
+                binding_generation,
+            ),
+            Self::Direct(principal) => {
+                if launch_operation_id.is_empty()
+                    || task_id.is_empty()
+                    || task_revision <= 0
+                    || attempt_id.is_empty()
+                    || binding_id.is_empty()
+                    || binding_generation <= 0
+                {
+                    return Err(Error::new(
+                        "FORBIDDEN",
+                        "opening launch subject is incomplete",
+                    ));
+                }
+                self.require_action_object(
+                    db,
+                    "swarm.launch",
+                    task_id,
+                    task_revision,
+                    Some(attempt_id),
+                )?;
+
+                type OpeningLaunchParentRow = (
+                    String,
+                    String,
+                    String,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    Option<i64>,
+                    String,
+                    String,
+                );
+                let parent: Option<OpeningLaunchParentRow> = db
+                    .query_row(
+                        "SELECT caller_id,method,state,task_id,attempt_id,binding_id,binding_generation,\
+                         original_request_json,effective_request_json FROM operations WHERE operation_id=?1",
+                        [launch_operation_id],
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                                row.get(5)?,
+                                row.get(6)?,
+                                row.get(7)?,
+                                row.get(8)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                let Some((
+                    caller,
+                    method,
+                    state,
+                    operation_task,
+                    operation_attempt,
+                    operation_binding,
+                    operation_generation,
+                    original_request_json,
+                    effective_request_json,
+                )) = parent
+                else {
+                    return Err(Error::new("NOT_FOUND", "launch Operation was not found"));
+                };
+                if caller != principal.client_id
+                    || method != "swarm.launch"
+                    || state != "queued"
+                    || operation_task.as_deref() != Some(task_id)
+                    || operation_attempt.as_deref() != Some(attempt_id)
+                    || operation_binding.as_deref() != Some(binding_id)
+                    || operation_generation != Some(binding_generation)
+                {
+                    return Err(Error::new(
+                        "FORBIDDEN",
+                        "launch Operation is not bound to the exact queued opening subject",
+                    ));
+                }
+
+                let original_request: Value = serde_json::from_str(&original_request_json)
+                    .map_err(|_| {
+                        Error::new("LAUNCH_MANIFEST_CORRUPT", "launch request is invalid")
+                    })?;
+                let request = launcher::LaunchRequest::parse(&original_request)?;
+                if request.preview.task_id != task_id
+                    || request.preview.expected_task_revision != task_revision
+                {
+                    return Err(Error::new(
+                        "FORBIDDEN",
+                        "launch request does not retain the exact opening Task revision",
+                    ));
+                }
+
+                let effective: Value =
+                    serde_json::from_str(&effective_request_json).map_err(|_| {
+                        Error::new("LAUNCH_MANIFEST_CORRUPT", "launch manifest is invalid")
+                    })?;
+                let expected_contract = json!({
+                    "effect_scope":"one_exact_launch_plan",
+                    "completion_condition":"workspace_binding_dispatch_and_capability_readback",
+                    "replay_policy":"same_request_id_returns_retained_launch_receipt; unknown_effects_require_readback",
+                    "contract_revision":"swarm-launch-v1",
+                });
+                let manifest = effective.get("launch_manifest").ok_or_else(|| {
+                    Error::new("LAUNCH_MANIFEST_CORRUPT", "launch manifest is missing")
+                })?;
+                let task = query_task(db, task_id)?;
+                let attempt_action =
+                    manifest["task"]["attempt_action"].as_str().ok_or_else(|| {
+                        Error::new("LAUNCH_MANIFEST_CORRUPT", "Attempt action is missing")
+                    })?;
+                let expected_claim_operation = match attempt_action {
+                    "claim_new" => json!(launch_child_request_id(launch_operation_id, "claim")),
+                    "use_existing" => Value::Null,
+                    _ => {
+                        return Err(Error::new(
+                            "LAUNCH_MANIFEST_CORRUPT",
+                            "launch Attempt action is invalid",
+                        ));
+                    }
+                };
+                let attempt_start_owner =
+                    manifest["attempt"]["start_owner"].as_str().ok_or_else(|| {
+                        Error::new("LAUNCH_MANIFEST_CORRUPT", "Attempt start owner is missing")
+                    })?;
+                let expected_preview = request.preview_params();
+                let open_operation_id = manifest["binding"]["operation_id"]
+                    .as_str()
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        Error::new("LAUNCH_MANIFEST_CORRUPT", "open child is missing")
+                    })?;
+                if effective["operation_contract"] != expected_contract
+                    || manifest["manifest_version"] != "eliot-launch-manifest-v1"
+                    || manifest["state"] != "awaiting_binding"
+                    || manifest["actor"] != launch_actor_manifest(self)
+                    || manifest["client_request_id"] != request.client_request_id
+                    || manifest["plan_digest"] != request.plan_digest
+                    || manifest["request"] != expected_preview
+                    || manifest["task"]["task_id"] != task_id
+                    || manifest["task"]["project_id"] != task.project_id
+                    || manifest["task"]["expected_revision"] != task_revision
+                    || manifest["task"]["observed_revision"] != task_revision
+                    || manifest["task"]["attempt_id"] != attempt_id
+                    || manifest["attempt"]["state"] != "reserved"
+                    || manifest["attempt"]["action"] != attempt_action
+                    || manifest["attempt"]["claim_operation_id"] != expected_claim_operation
+                    || manifest["workspace"]["policy"] != expected_preview["workspace_policy"]
+                    || manifest["workspace"]["lease_state"] != "held"
+                    || manifest["workspace"]["dirty_state"] != "clean_verified"
+                    || manifest["workspace"]["filesystem_inspected"] != true
+                    || manifest["workspace"]["manifest_digest"].as_str().is_none()
+                    || manifest["runtime"]["route"] != expected_preview["route"]
+                    || manifest["runtime"]["agent_profile"] != expected_preview["agent_profile"]
+                    || manifest["runtime"]["requested_model"] != expected_preview["requested_model"]
+                    || manifest["runtime"]["requested_effort"]
+                        != expected_preview["requested_effort"]
+                    || manifest["runtime"]["budget"] != expected_preview["budget"]
+                    || manifest["runtime"]["stop_conditions"] != expected_preview["stop_conditions"]
+                    || manifest["runtime"]["purpose"] != expected_preview["purpose"]
+                    || manifest["runtime"]["state"] != "opening"
+                    || manifest["runtime"]["native_effect"] != "not_observed"
+                    || manifest["progress"]["binding_open"] != "queued"
+                    || manifest["progress"]["task_dispatch"] != "not_started"
+                    || manifest["binding"]["binding_id"] != binding_id
+                    || manifest["binding"]["generation"] != binding_generation
+                    || manifest["binding"]["state"] != "queued"
+                {
+                    return Err(Error::new(
+                        "LAUNCH_MANIFEST_CORRUPT",
+                        "launch manifest does not retain the exact queued opening phase",
+                    ));
+                }
+                let lease: crate::workspace::LeaseAuthorityRef =
+                    serde_json::from_value(manifest["workspace"]["lease_authority"].clone())
+                        .map_err(|_| {
+                            Error::new(
+                                "LAUNCH_MANIFEST_CORRUPT",
+                                "launch held-lease authority reference is invalid",
+                            )
+                        })?;
+                if lease.state != "held"
+                    || lease.lease_id.is_empty()
+                    || lease.generation <= 0
+                    || lease.registration_generation <= 0
+                    || lease.operation_id != launch_operation_id
+                    || lease.project_id != task.project_id
+                    || lease.task_id != task_id
+                    || lease.task_revision != task_revision
+                    || lease.plan_digest != request.plan_digest
+                    || lease.owner_client_id != principal.client_id
+                    || lease.attempt_id.as_deref() != Some(attempt_id)
+                    || !crate::forge::valid_object_id(&lease.baseline_commit)
+                    || lease.binding_digest.is_empty()
+                    || super::workspace::held_lease_for_operation(db, launch_operation_id)?.as_ref()
+                        != Some(&lease)
+                {
+                    return Err(Error::new(
+                        "WORKSPACE_LEASE_STALE",
+                        "launch manifest does not retain the exact current held lease",
+                    ));
+                }
+                let lease_view = super::workspace::get_lease_view(db, &lease)?;
+                let expected_workspace_manifest_digest =
+                    final_workspace_manifest_digest(&request.plan_digest, &lease, &lease_view)?;
+                if model::canonical(&lease_view)?
+                    != model::canonical(&manifest["workspace"]["lease"])?
+                    || manifest["workspace"]["manifest_digest"].as_str()
+                        != Some(expected_workspace_manifest_digest.as_str())
+                {
+                    return Err(Error::new(
+                        "WORKSPACE_LEASE_STALE",
+                        "launch manifest lease view differs from persisted lease authority",
+                    ));
+                }
+
+                let active_attempts: i64 = db.query_row(
+                    "SELECT count(*) FROM attempts WHERE task_id=?1 AND released_at_ms IS NULL",
+                    [task_id],
+                    |row| row.get(0),
+                )?;
+                let exact_attempt: bool = db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM attempts WHERE attempt_id=?1 AND task_id=?2 \
+                     AND task_revision=?3 AND owner_id=?4 AND state='reserved' \
+                     AND released_at_ms IS NULL AND start_operation_id IS NULL \
+                     AND binding_id=?5 AND binding_generation=?6 AND start_owner=?7)",
+                    params![
+                        attempt_id,
+                        task_id,
+                        task_revision,
+                        principal.client_id,
+                        binding_id,
+                        binding_generation,
+                        attempt_start_owner,
+                    ],
+                    |row| row.get(0),
+                )?;
+                if active_attempts != 1 || !exact_attempt {
+                    return Err(Error::new(
+                        "STALE_LAUNCH",
+                        "opening Attempt is not the sole current reserved unstarted assignment",
+                    ));
+                }
+
+                let child: Option<OpeningChildRow> = db
+                    .query_row(
+                        "SELECT caller_id,method,client_request_id,prerequisite_operation_id,task_id,\
+                         attempt_id,binding_id,binding_generation,state,original_request_json,\
+                         effective_request_json,result_json FROM operations WHERE operation_id=?1",
+                        [open_operation_id],
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                                row.get(5)?,
+                                row.get(6)?,
+                                row.get(7)?,
+                                row.get(8)?,
+                                row.get(9)?,
+                                row.get(10)?,
+                                row.get(11)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                let Some((
+                    child_caller,
+                    child_method,
+                    child_request_id,
+                    prerequisite,
+                    child_task,
+                    child_attempt,
+                    child_binding,
+                    child_generation,
+                    child_state,
+                    child_original_json,
+                    child_effective_json,
+                    child_result_json,
+                )) = child
+                else {
+                    return Err(Error::new(
+                        "LAUNCH_OPEN_MISSING",
+                        "launch open child is missing",
+                    ));
+                };
+                let expected_child_request = json!({
+                    "client_request_id":launch_child_request_id(launch_operation_id, "open"),
+                    "lane_id":format!("launch-{}", lease.lease_id),
+                    "route":request.preview.route,
+                });
+                let child_original: Value =
+                    serde_json::from_str(&child_original_json).map_err(|_| {
+                        Error::new("LAUNCH_OPEN_CORRUPT", "open child request is invalid")
+                    })?;
+                if child_caller != principal.client_id
+                    || child_method != "agent.open"
+                    || child_request_id != launch_child_request_id(launch_operation_id, "open")
+                    || prerequisite.as_deref() != Some(launch_operation_id)
+                    || child_task.as_deref() != Some(task_id)
+                    || child_attempt.as_deref() != Some(attempt_id)
+                    || child_binding.as_deref() != Some(binding_id)
+                    || child_generation != Some(binding_generation)
+                    || child_state != "queued"
+                    || model::canonical(&child_original)?
+                        != model::canonical(&expected_child_request)?
+                {
+                    return Err(Error::new(
+                        "FORBIDDEN",
+                        "agent.open child is not the exact queued child of this launch and lease",
+                    ));
+                }
+                let child_effective: Value =
+                    serde_json::from_str(&child_effective_json).map_err(|_| {
+                        Error::new("LAUNCH_OPEN_CORRUPT", "open child linkage is invalid")
+                    })?;
+                model::fields(
+                    &child_effective,
+                    &[
+                        "route",
+                        "module_instance_id",
+                        "operation_contract",
+                        "workspace_lease",
+                        "receipt",
+                    ],
+                )?;
+                let child_result: Value =
+                    serde_json::from_str(child_result_json.as_deref().ok_or_else(|| {
+                        Error::new("LAUNCH_OPEN_CORRUPT", "queued open child has no receipt")
+                    })?)
+                    .map_err(|_| {
+                        Error::new("LAUNCH_OPEN_CORRUPT", "open child receipt is invalid")
+                    })?;
+                if child_effective["operation_contract"]["parent_launch_operation_id"]
+                    != launch_operation_id
+                    || child_effective["workspace_lease"]["lease_id"] != lease.lease_id
+                    || child_effective["workspace_lease"]["generation"] != lease.generation
+                    || child_effective["workspace_lease"]["binding_digest"] != lease.binding_digest
+                    || child_effective["route"]["alias"] != expected_preview["route"]
+                    || child_effective["receipt"]["ok"] != true
+                    || child_effective["receipt"]["value"]["operation_id"] != open_operation_id
+                    || child_effective["receipt"]["value"]["binding_id"] != binding_id
+                    || child_effective["receipt"]["value"]["generation"] != binding_generation
+                    || child_effective["receipt"]["value"]["state"] != "queued"
+                    || model::canonical(&child_result)?
+                        != model::canonical(&child_effective["receipt"]["value"])?
+                {
+                    return Err(Error::new(
+                        "LAUNCH_OPEN_CORRUPT",
+                        "open child receipt does not bind this queued opening and held lease",
+                    ));
+                }
+
+                let binding = super::operations::get_binding(db, binding_id, binding_generation)?;
+                if binding["state"] != "opening"
+                    || !binding["released_at_ms"].is_null()
+                    || !binding["native_root_id"].is_null()
+                    || !binding["native_scope_key"].is_null()
+                    || binding["lane_id"] != format!("launch-{}", lease.lease_id)
+                    || binding["module_instance_id"] != child_effective["module_instance_id"]
+                    || binding["route"] != child_effective["route"]
+                {
+                    return Err(Error::new(
+                        "BINDING_NOT_READY",
+                        "binding is not the exact unreleased pre-native opening for this lease",
                     ));
                 }
                 Ok(())
@@ -1420,6 +1834,13 @@ struct ConfiguredRouteModel<'a> {
 }
 
 fn configured_route_model(route: &crate::config::Route) -> ConfiguredRouteModel<'_> {
+    if let Some(owned) = &route.owned_service {
+        return ConfiguredRouteModel {
+            provider_id: Some(&owned.model.provider_id),
+            model_id: Some(&owned.model.id),
+            variant: Some(&owned.model.variant),
+        };
+    }
     let model = &route.native_options["model"];
     let model_id = model
         .get("id")
@@ -2255,6 +2676,57 @@ pub(crate) fn launch_actor(db: &Connection, operation_id: &str) -> Result<Launch
     let attempt_id = manifest["task"]["attempt_id"].as_str();
     actor.require_action_object(db, "swarm.launch", task_id, task_revision, attempt_id)?;
     Ok(actor)
+}
+
+/// A launcher child's parent pointer is provenance, not an agent.configure
+/// barrier. Return authority only for the exact retained opening-stage tuple.
+pub(crate) fn opening_actor_for_open(
+    db: &Connection,
+    operation_id: &str,
+    binding_id: &str,
+    generation: i64,
+) -> Result<Option<LaunchActor>> {
+    let open = super::operations::get_operation(db, operation_id)?;
+    if open["method"] != "agent.open" {
+        return Ok(None);
+    }
+    let parent_id: Option<String> = db.query_row(
+        "SELECT prerequisite_operation_id FROM operations WHERE operation_id=?1",
+        [operation_id],
+        |row| row.get(0),
+    )?;
+    let Some(parent_id) = parent_id else {
+        return Ok(None);
+    };
+    let parent = super::operations::get_operation(db, &parent_id)?;
+    if parent["method"] != "swarm.launch" {
+        return Ok(None);
+    }
+    let manifest = retained_launch_manifest(db, &parent_id)?;
+    if open["state"] != "queued"
+        || open["binding_id"] != binding_id
+        || open["binding_generation"] != generation
+        || open["caller_id"] != parent["caller_id"]
+        || open["task_id"] != parent["task_id"]
+        || open["attempt_id"] != parent["attempt_id"]
+        || manifest["binding"]["operation_id"] != operation_id
+    {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "launch child differs from its exact parent tuple",
+        ));
+    }
+    let actor = launch_actor(db, &parent_id)?;
+    actor.require_opening_launch_attempt(
+        db,
+        &parent_id,
+        model::text(&parent, "task_id")?,
+        model::positive(&manifest["task"], "observed_revision")?,
+        model::text(&parent, "attempt_id")?,
+        binding_id,
+        generation,
+    )?;
+    Ok(Some(actor))
 }
 
 /// Bounded host selector. Unknown launches are selected for readback only;

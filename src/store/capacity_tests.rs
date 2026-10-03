@@ -822,6 +822,7 @@ async fn store_admission_records_and_cancel_releases_the_reservation() {
     let mut cfg = Config::default();
     cfg.storage.data_dir = directory;
     cfg.routes = vec![crate::config::Route {
+        owned_service: None,
         alias: "oc".into(),
         runtime: "opencode_v2".into(),
         module_artifact_id: "eliot-opencode-v2.http.1".into(),

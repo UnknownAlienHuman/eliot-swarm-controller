@@ -30,7 +30,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Start the user host in the foreground; never launches vendor agents implicitly.
-    Host,
+    Host {
+        /// Gracefully stop when the foreground owner's stdin closes.
+        #[arg(long)]
+        stop_on_stdin_eof: bool,
+    },
     /// Serve the application API as MCP tools over stdio for a General Manager
     /// client. A client of the running host over the same local IPC as the CLI;
     /// never opens the database or a network listener.
@@ -53,6 +57,12 @@ enum Command {
     /// Internal transient executor; never opens the controller database.
     #[command(hide = true)]
     CheckWorker {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// Internal foreground service owner; never opens the controller database.
+    #[command(hide = true)]
+    OwnedOpencodeService {
         #[arg(long)]
         file: PathBuf,
     },
@@ -517,9 +527,12 @@ fn execute(cli: Cli) -> Result<()> {
     if let Command::CheckWorker { file } = &cli.command {
         return eliot_swarm_controller::checks::worker::run(file);
     }
+    if let Command::OwnedOpencodeService { file } = &cli.command {
+        return eliot_swarm_controller::runtime::opencode_v2::run_owned_service_helper(file);
+    }
     // The host and gateway are long-lived. CLI calls perform one local exchange
     // and must not create a CPU-sized pool for every status request.
-    let mut builder = if matches!(&cli.command, Command::Host | Command::Gateway) {
+    let mut builder = if matches!(&cli.command, Command::Host { .. } | Command::Gateway) {
         tokio::runtime::Builder::new_multi_thread()
     } else {
         tokio::runtime::Builder::new_current_thread()
@@ -529,8 +542,12 @@ fn execute(cli: Cli) -> Result<()> {
 }
 async fn run(cli: Cli) -> Result<()> {
     let config = Config::load(cli.config.as_deref(), cli.data_dir.as_deref())?;
-    if matches!(&cli.command, Command::Host) {
-        return host::run(config).await;
+    if let Command::Host { stop_on_stdin_eof } = &cli.command {
+        return if *stop_on_stdin_eof {
+            host::run_on_stdin_eof(config).await
+        } else {
+            host::run(config).await
+        };
     }
     if matches!(&cli.command, Command::Gateway) {
         if cli.credential.is_some() {
@@ -587,10 +604,11 @@ async fn run(cli: Cli) -> Result<()> {
     }
     let mut pending_credential = None;
     let (method, mut params) = match cli.command {
-        Command::Host
+        Command::Host { .. }
         | Command::Mcp { .. }
         | Command::Gateway
         | Command::CheckWorker { .. }
+        | Command::OwnedOpencodeService { .. }
         | Command::ModuleRun { .. } => {
             unreachable!("executor returned above")
         }

@@ -5,6 +5,65 @@ use crate::{
     model,
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::{fs::File, io::Read, path::Path};
+
+const MAX_PROCESS_IMAGE_BYTES: u64 = 512 * 1024 * 1024;
+
+fn image_path_text(path: &Path) -> Result<String> {
+    let value = path.to_str().ok_or_else(|| {
+        Error::new(
+            "PROCESS_IDENTITY",
+            "process executable path is not valid Unicode",
+        )
+    })?;
+    if value.is_empty() || value.len() > 32 * 1024 || value.chars().any(char::is_control) {
+        return Err(Error::new(
+            "PROCESS_IDENTITY",
+            "process executable path is outside the supported boundary",
+        ));
+    }
+    Ok(value.to_owned())
+}
+
+fn hash_process_image(file: &mut File) -> Result<String> {
+    let before = file.metadata()?;
+    if !before.is_file() || before.len() == 0 || before.len() > MAX_PROCESS_IMAGE_BYTES {
+        return Err(Error::new(
+            "PROCESS_IDENTITY",
+            "process executable is outside the supported file boundary",
+        ));
+    }
+    let modified_before = before.modified()?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut total = 0_u64;
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        total = total
+            .checked_add(read as u64)
+            .ok_or_else(|| Error::new("PROCESS_IDENTITY", "process image size overflow"))?;
+        if total > MAX_PROCESS_IMAGE_BYTES {
+            return Err(Error::new(
+                "PROCESS_IDENTITY",
+                "process executable exceeds the supported hash boundary",
+            ));
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let after = file.metadata()?;
+    if total != before.len() || after.len() != before.len() || after.modified()? != modified_before
+    {
+        return Err(Error::new(
+            "PROCESS_IDENTITY",
+            "process executable changed during bounded hashing",
+        ));
+    }
+    Ok(format!("sha256:{:x}", hasher.finalize()))
+}
 
 #[cfg(windows)]
 mod os {
@@ -27,7 +86,8 @@ mod os {
             },
             Threading::{
                 GetCurrentProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-                PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
+                PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, QueryFullProcessImageNameW,
+                TerminateProcess, WaitForSingleObject,
             },
         },
     };
@@ -48,6 +108,139 @@ mod os {
                 "PROCESS_WAIT",
                 format!("unexpected process wait status {status:#x}"),
             )),
+        }
+    }
+
+    fn process_creation_filetime(handle: HANDLE) -> Result<u64> {
+        // SAFETY: the caller keeps a valid process handle open for this query.
+        unsafe {
+            let mut creation: FILETIME = std::mem::zeroed();
+            let mut exit: FILETIME = std::mem::zeroed();
+            let mut kernel: FILETIME = std::mem::zeroed();
+            let mut user: FILETIME = std::mem::zeroed();
+            if GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) == 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            Ok(((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64)
+        }
+    }
+
+    fn validate_process_birth(handle: HANDLE, expected: u64) -> Result<()> {
+        if wait_process_signaled(handle, 0)? || process_creation_filetime(handle)? != expected {
+            return Err(Error::new(
+                "PROCESS_GONE",
+                "process exited or its pinned birth identity changed",
+            ));
+        }
+        Ok(())
+    }
+
+    fn process_image_path(handle: HANDLE) -> Result<std::path::PathBuf> {
+        use std::{ffi::OsString, os::windows::ffi::OsStringExt};
+        let mut buffer = vec![0_u16; 32 * 1024];
+        let mut size = u32::try_from(buffer.len())
+            .map_err(|_| Error::new("PROCESS_IDENTITY", "image path buffer overflow"))?;
+        // SAFETY: `buffer` is writable for `size` UTF-16 code units and the
+        // process handle is held by the caller for the complete query.
+        if unsafe { QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut size) } == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let size = usize::try_from(size)
+            .map_err(|_| Error::new("PROCESS_IDENTITY", "invalid image path length"))?;
+        if size == 0 || size > buffer.len() {
+            return Err(Error::new(
+                "PROCESS_IDENTITY",
+                "process image path length is outside the supported boundary",
+            ));
+        }
+        Ok(std::path::PathBuf::from(OsString::from_wide(
+            &buffer[..size],
+        )))
+    }
+
+    pub fn process_image_identity(pid: u32) -> Result<Value> {
+        use std::fs;
+        // SAFETY: access is limited to querying process information and waiting;
+        // the handle pins the process object against PID reuse through hashing.
+        unsafe {
+            let process = OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                0,
+                pid,
+            );
+            if process.is_null() {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let result = (|| -> Result<Value> {
+                if wait_process_signaled(process, 0)? {
+                    return Err(Error::new("PROCESS_GONE", "process is no longer live"));
+                }
+                let birth = process_creation_filetime(process)?;
+                let reported_path = process_image_path(process)?;
+                let canonical_path = fs::canonicalize(&reported_path)?;
+                let mut image = File::open(&canonical_path)?;
+                let image_sha256 = hash_process_image(&mut image)?;
+                validate_process_birth(process, birth)?;
+                let path_after = fs::canonicalize(process_image_path(process)?)?;
+                if !canonical_path
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(&path_after.to_string_lossy())
+                {
+                    return Err(Error::new(
+                        "PROCESS_IDENTITY",
+                        "process executable path changed during bounded hashing",
+                    ));
+                }
+                let image_path = image_path_text(&canonical_path)?;
+                Ok(json!({
+                    "pid":pid,
+                    "creation_filetime":birth.to_string(),
+                    "image_path":image_path,
+                    "image_sha256":image_sha256
+                }))
+            })();
+            CloseHandle(process);
+            result
+        }
+    }
+
+    /// Return a pinned live process birth identity, or `None` only when the
+    /// process is proven exited/absent. Access and query failures stay errors.
+    pub fn process_birth_identity(pid: u32) -> Result<Option<Value>> {
+        if pid == 0 {
+            return Err(Error::invalid("invalid process PID"));
+        }
+        // SAFETY: the handle is opened only for query/synchronize rights and is
+        // kept alive through both the exit check and immutable creation-time read.
+        unsafe {
+            let process = OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                0,
+                pid,
+            );
+            if process.is_null() {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+                    return Ok(None);
+                }
+                return Err(error.into());
+            }
+            let result = (|| -> Result<Option<Value>> {
+                if wait_process_signaled(process, 0)? {
+                    return Ok(None);
+                }
+                let birth = process_creation_filetime(process)?;
+                if wait_process_signaled(process, 0)? {
+                    return Ok(None);
+                }
+                Ok(Some(json!({
+                    "platform":"windows",
+                    "pid":pid,
+                    "creation_filetime":birth.to_string()
+                })))
+            })();
+            CloseHandle(process);
+            result
         }
     }
 
@@ -512,6 +705,162 @@ mod os {
         }
         Ok(poll.revents & (libc::POLLIN | libc::POLLHUP) == 0)
     }
+
+    pub fn process_image_identity(pid: u32) -> Result<Value> {
+        use std::os::unix::fs::MetadataExt;
+        let proc_exe = std::path::PathBuf::from(format!("/proc/{pid}/exe"));
+        let boot_before = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+        let boot_before = boot_before.trim();
+        if boot_before.is_empty() {
+            return Err(Error::new(
+                "PROCESS_IDENTITY",
+                "kernel boot identity is unavailable",
+            ));
+        }
+        let (state_before, _, start_ticks) = stat(pid)?;
+        if !live(pid, state_before)? {
+            return Err(Error::new("PROCESS_GONE", "process is no longer live"));
+        }
+        // /proc/<pid>/exe is a kernel-provided reference to the executable
+        // backing this live process; do not resolve a configured or caller path.
+        let reported_path = fs::read_link(&proc_exe)?;
+        if !reported_path.is_absolute() {
+            return Err(Error::new(
+                "PROCESS_IDENTITY",
+                "kernel executable path is not absolute",
+            ));
+        }
+        let mut image = File::open(&proc_exe).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                Error::new("PROCESS_GONE", "process executable disappeared")
+            } else {
+                error.into()
+            }
+        })?;
+        let image_before = image.metadata()?;
+        let (state_open, _, start_open) = stat(pid)?;
+        let boot_open = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+        if start_open != start_ticks || boot_open.trim() != boot_before || !live(pid, state_open)? {
+            return Err(Error::new(
+                "PROCESS_GONE",
+                "process birth changed while opening its executable",
+            ));
+        }
+        let image_sha256 = hash_process_image(&mut image)?;
+        let image_after = image.metadata()?;
+        let current_image = File::open(&proc_exe).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                Error::new("PROCESS_GONE", "process executable disappeared")
+            } else {
+                error.into()
+            }
+        })?;
+        let current_image_metadata = current_image.metadata()?;
+        let current_path = fs::read_link(&proc_exe)?;
+        let (state_after, _, start_after) = stat(pid)?;
+        let boot_after = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+        if start_after != start_ticks
+            || boot_after.trim() != boot_before
+            || !live(pid, state_after)?
+            || current_path != reported_path
+            || image_before.dev() != image_after.dev()
+            || image_before.ino() != image_after.ino()
+            || image_before.dev() != current_image_metadata.dev()
+            || image_before.ino() != current_image_metadata.ino()
+        {
+            return Err(Error::new(
+                "PROCESS_IDENTITY",
+                "process birth or executable image changed during bounded hashing",
+            ));
+        }
+        Ok(json!({
+            "pid":pid,
+            "start_ticks":start_ticks,
+            "boot_id":boot_before,
+            "image_path":image_path_text(&reported_path)?,
+            "image_sha256":image_sha256
+        }))
+    }
+
+    /// Use a pidfd to pin this exact process incarnation while checking its
+    /// birth tuple. A changed/reused PID is returned as its new tuple so callers
+    /// can compare it with retained birth authority; uncertain reads fail closed.
+    pub fn process_birth_identity(pid: u32) -> Result<Option<Value>> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        if pid == 0 {
+            return Err(Error::invalid("invalid process PID"));
+        }
+        // SAFETY: pidfd_open returns a new owned descriptor on success.
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0u32) };
+        if raw < 0 {
+            let error = std::io::Error::last_os_error();
+            return if error.raw_os_error() == Some(libc::ESRCH) {
+                Ok(None)
+            } else {
+                Err(error.into())
+            };
+        }
+        // SAFETY: `raw` is the descriptor just returned by pidfd_open.
+        let pidfd = unsafe { OwnedFd::from_raw_fd(raw as i32) };
+        let exited = || -> Result<bool> {
+            let mut poll = libc::pollfd {
+                fd: pidfd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one initialized pollfd and a zero-duration poll.
+            if unsafe { libc::poll(&mut poll, 1, 0) } < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            if poll.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+                return Err(Error::new(
+                    "PROCESS_IDENTITY",
+                    "cannot observe pinned process birth",
+                ));
+            }
+            Ok(poll.revents & (libc::POLLIN | libc::POLLHUP) != 0)
+        };
+        if exited()? {
+            return Ok(None);
+        }
+        let boot_before = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+        let boot_before = boot_before.trim().to_owned();
+        if boot_before.is_empty() {
+            return Err(Error::new(
+                "PROCESS_IDENTITY",
+                "kernel boot identity is unavailable",
+            ));
+        }
+        let (_, _, start_before) = match stat(pid) {
+            Ok(value) => value,
+            Err(error) if error.code == "PROCESS_GONE" => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if exited()? {
+            return Ok(None);
+        }
+        let boot_after = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+        let (_, _, start_after) = match stat(pid) {
+            Ok(value) => value,
+            Err(error) if error.code == "PROCESS_GONE" => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if exited()? {
+            return Ok(None);
+        }
+        if boot_after.trim() != boot_before || start_after != start_before {
+            return Err(Error::new(
+                "PROCESS_IDENTITY",
+                "process birth changed during pinned identity read",
+            ));
+        }
+        Ok(Some(json!({
+            "platform":"linux",
+            "pid":pid,
+            "boot_id":boot_before,
+            "start_ticks":start_before
+        })))
+    }
     impl Group {
         pub fn enter(token: &str) -> Result<Self> {
             Self::enter_owned(token, false)
@@ -777,5 +1126,20 @@ mod os {
             "no spawned process disposition",
         ))
     }
+    pub fn process_image_identity(_pid: u32) -> Result<Value> {
+        Err(Error::new(
+            "PROCESS_PLATFORM_UNSUPPORTED",
+            "process image identity is implemented for Windows and Linux",
+        ))
+    }
+    pub fn process_birth_identity(_pid: u32) -> Result<Option<Value>> {
+        Err(Error::new(
+            "PROCESS_PLATFORM_UNSUPPORTED",
+            "process birth identity is implemented for Windows and Linux",
+        ))
+    }
 }
-pub use os::{Group, departed_empty, spawned_departed, spawned_identity};
+pub use os::{
+    Group, departed_empty, process_birth_identity, process_image_identity, spawned_departed,
+    spawned_identity,
+};

@@ -407,9 +407,35 @@ fn has_unresolved_native_work(
         ],
         |row| row.get(0),
     )?;
+    // A reserved service has not crossed the Store's one-shot start boundary;
+    // its queued launch/open Operations fence it until cancellation CASes the
+    // reservation to failed_no_effect. Unknown and observed starts are an
+    // independent process fence even if their Operations have become terminal.
+    let owned_service_live: bool = tx.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM owned_service_starts
+           WHERE state IN ('outcome_unknown','service_observed')
+             AND (
+               (lease_id=?1 AND lease_generation=?2)
+               OR (attempt_id=?3 AND binding_id IS ?4 AND binding_generation IS ?5)
+             )
+         )",
+        params![
+            lease.lease_id,
+            lease.generation,
+            attempt.attempt_id,
+            attempt.binding_id.as_deref(),
+            attempt.binding_generation,
+        ],
+        |row| row.get(0),
+    )?;
     let unresolved_producer =
         producers_are_unresolved(&attempt.producers_json, attempt.producers_oversized);
-    Ok(linked_operation || held_check_resource || active_binding || unresolved_producer)
+    Ok(linked_operation
+        || held_check_resource
+        || active_binding
+        || owned_service_live
+        || unresolved_producer)
 }
 
 fn producers_are_unresolved(raw: &str, oversized: bool) -> bool {

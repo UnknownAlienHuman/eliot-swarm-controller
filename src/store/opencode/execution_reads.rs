@@ -1,5 +1,5 @@
 //! Native input disposition is separate from the immutable admission receipt.
-use super::{Store, operations, original, runtime, tasks};
+use super::{Store, operations, original_with_config, runtime, tasks};
 use crate::{
     error::{Error, Result},
     model::{self, Principal},
@@ -27,6 +27,8 @@ pub(super) struct Reader {
     retries: BTreeMap<BindingKey, (String, Instant)>,
 }
 impl Reader {
+    // The reader borrows the current pass's service, scope and shutdown state.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn schedule(
         &mut self,
         store: &Store,
@@ -34,6 +36,7 @@ impl Reader {
         connection: &Options,
         bindings: &[Value],
         principals: &BTreeMap<BindingKey, Principal>,
+        config: &crate::config::Config,
         stopping: watch::Receiver<bool>,
     ) {
         if self.task.as_ref().is_some_and(|task| task.is_finished())
@@ -73,8 +76,29 @@ impl Reader {
             let Some(p) = principals.get(&key) else {
                 continue;
             };
-            let Ok(options) = Options::parse(&b["route"]["native_options"]) else {
-                continue;
+            let options = if b["route"]["owned_service"].is_object() {
+                let binding_id = key.0.clone();
+                let generation = key.1;
+                let config = (*config).clone();
+                match store
+                    .run(move |db| {
+                        super::super::launcher_owned_service::effective_options_for_binding(
+                            db,
+                            &config,
+                            &binding_id,
+                            generation,
+                        )
+                    })
+                    .await
+                {
+                    Ok(Some(options)) => options,
+                    _ => continue,
+                }
+            } else {
+                match Options::parse(&b["route"]["native_options"]) {
+                    Ok(options) => options,
+                    Err(_) => continue,
+                }
             };
             if options.connection_file != connection.connection_file
                 || options.expected_version != connection.expected_version
@@ -92,7 +116,10 @@ impl Reader {
                 .map(|(id, _)| id.clone())
                 .unwrap_or_default();
             let principal = p.clone();
-            let next = store.run(move |db| next_read(db, &principal, &after)).await;
+            let read_config = config.clone();
+            let next = store
+                .run(move |db| next_read(db, &principal, &after, &read_config))
+                .await;
             let Ok(Some((command, saved))) = next else {
                 continue;
             };
@@ -102,6 +129,7 @@ impl Reader {
             let store = store.clone();
             let service = service.clone();
             let p = p.clone();
+            let config = (*config).clone();
             let mut stopping = stopping.clone();
             self.task = Some(tokio::spawn(async move {
                 if *stopping.borrow() {
@@ -109,7 +137,7 @@ impl Reader {
                 }
                 tokio::select! {
                     _ = stopping.changed() => {},
-                    _ = store.oc_execution_read(p, service, options, command, saved) => {},
+                    _ = store.oc_execution_read(p, service, options, command, saved, config) => {},
                 }
             }));
             break;
@@ -142,6 +170,7 @@ fn next_read(
     db: &Connection,
     p: &Principal,
     after: &str,
+    config: &crate::config::Config,
 ) -> Result<Option<(RuntimeCommand, Option<Value>)>> {
     let (id, generation, _) = runtime::scope(db, p, true)?;
     let query = |after: &str| -> Result<Option<String>> {
@@ -156,7 +185,7 @@ fn next_read(
         None => None,
     };
     next.map(|id| {
-        let command = original(db, p, &id)?;
+        let command = original_with_config(db, p, &id, config)?;
         let op = operations::get_operation(db, &id)?;
         Ok((command, op["native_refs"].get("execution_scan").cloned()))
     })
@@ -164,8 +193,13 @@ fn next_read(
 }
 
 /// The single SQLite owner rechecks the exact command/link after network I/O.
-fn current(db: &Connection, p: &Principal, command: &RuntimeCommand) -> Result<Value> {
-    if json!(original(db, p, &command.operation_id)?) != json!(command) {
+fn current(
+    db: &Connection,
+    p: &Principal,
+    command: &RuntimeCommand,
+    config: &crate::config::Config,
+) -> Result<Value> {
+    if json!(original_with_config(db, p, &command.operation_id, config)?) != json!(command) {
         return Err(Error::new(
             "STALE_EXECUTION_READ",
             "native command scope changed during log read",
@@ -199,8 +233,9 @@ fn record(
     command: &RuntimeCommand,
     saved: Option<&Value>,
     read: ExecutionRead,
+    config: &crate::config::Config,
 ) -> Result<bool> {
-    let op = current(db, p, command)?;
+    let op = current(db, p, command, config)?;
     if op["native_refs"].get("execution_scan") != saved {
         return Err(Error::new(
             "STALE_EXECUTION_READ",
@@ -242,7 +277,7 @@ fn record(
     // A crash between these transactions leaves an admitted, unresolved producer
     // which the next read selects again. No duplicate native write is needed.
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let op = current(&tx, p, command)?;
+    let op = current(&tx, p, command, config)?;
     let mut refs = op["native_refs"].as_object().cloned().unwrap_or_default();
     refs.insert("execution_scan".into(), json!(read.scan));
     let status = json!({"synced":read.synced,"gap":read.gap.or(if proof.is_none() && read.synced {
@@ -344,6 +379,7 @@ impl Store {
         options: Options,
         command: RuntimeCommand,
         saved: Option<Value>,
+        config: crate::config::Config,
     ) {
         let read = tokio::time::timeout(
             Duration::from_secs(20),
@@ -360,7 +396,8 @@ impl Store {
             Ok(read) => {
                 let p = p.clone();
                 let command = command.clone();
-                self.run(move |db| record(db, &p, &command, saved.as_ref(), read))
+                let config = config.clone();
+                self.run(move |db| record(db, &p, &command, saved.as_ref(), read, &config))
                     .await
             }
             Err(e) => Err(e),
@@ -371,8 +408,9 @@ impl Store {
             Err(e) => {
                 // The diagnostic belongs to this input, not the whole service.
                 // Leave prior evidence and checked progress intact on failure.
+                let config = config.clone();
                 let _ = self.run(move |db| {
-                    let op = current(db,&p,&command)?;
+                    let op = current(db, &p, &command, &config)?;
                     let status = json!({"synced":false,"gap":e.code});
                     if op["native_refs"]["execution_read"] != status {
                         db.execute("UPDATE operations SET native_refs_json=json_set(COALESCE(native_refs_json,'{}'),'$.execution_read',json(?2)),updated_at_ms=?3 WHERE operation_id=?1",
