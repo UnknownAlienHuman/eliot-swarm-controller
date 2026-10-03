@@ -260,6 +260,7 @@ mod tests {
     fn fixture_db() -> Connection {
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch(super::super::SCHEMA).unwrap();
+        db.execute_batch(super::super::WORKSPACE_SCHEMA).unwrap();
         db
     }
 
