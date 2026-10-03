@@ -3,6 +3,7 @@ mod acceptance;
 mod assembly;
 pub(crate) mod capacity;
 mod checks;
+mod forge;
 mod gm;
 mod opencode;
 mod operations;
@@ -11,6 +12,7 @@ mod producers;
 mod projection;
 mod results;
 mod runtime;
+mod schedules;
 mod submissions;
 mod tasks;
 use crate::{
@@ -27,6 +29,7 @@ use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 
 const SCHEMA: &str = include_str!("../../migrations/001_core.sql");
 const APPLICATION_ID: i64 = 0x45534331;
+const LOCAL_OPERATOR_CLIENT_ID_KEY: &str = "local_operator_client_id";
 type Job = Box<dyn FnOnce(&mut Connection) + Send>;
 #[derive(Clone)]
 pub struct Store {
@@ -111,19 +114,32 @@ impl Store {
         self.run(move |db| {
             let value = meta(db, &format!("client:{}", credential.client_id))?
                 .ok_or_else(|| Error::new("UNAUTHORIZED", "unknown client or credential"))?;
+            if value["internal_only"] == true {
+                return Err(Error::new(
+                    "UNAUTHORIZED",
+                    "internal principals have no transport credentials",
+                ));
+            }
             let expected = value["token_hash"].as_str().unwrap_or("");
             if expected != model::digest(credential.token.as_bytes()) || value["disabled"] == true {
                 return Err(Error::new("UNAUTHORIZED", "unknown client or credential"));
             }
+            let role: Role = serde_json::from_value(value["role"].clone())?;
+            if role == Role::Operator {
+                require_local_operator(db, &credential.client_id)?;
+            }
             Ok(Principal {
                 link_id: model::new_id(),
                 client_id: credential.client_id,
-                role: serde_json::from_value(value["role"].clone())?,
+                role,
             })
         })
         .await
     }
     pub async fn call(&self, principal: Principal, method: String, params: Value) -> Result<Value> {
+        if method == "forge.publish_ref" {
+            return self.publish_ref(principal, params).await;
+        }
         if method == "module.hello" {
             let p = principal.clone();
             let v = params.clone();
@@ -453,11 +469,24 @@ fn current_principal(db: &Connection, principal: Principal) -> Result<Principal>
     if current["disabled"] == true {
         return Err(Error::new("UNAUTHORIZED", "client disabled"));
     }
-    Ok(Principal {
-        role: serde_json::from_value(current["role"].clone())?,
-        ..principal
-    })
+    let role: Role = serde_json::from_value(current["role"].clone())?;
+    if role == Role::Operator {
+        require_local_operator(db, &principal.client_id)?;
+    }
+    Ok(Principal { role, ..principal })
 }
+
+fn require_local_operator(db: &Connection, client_id: &str) -> Result<()> {
+    let local_operator = meta(db, LOCAL_OPERATOR_CLIENT_ID_KEY)?;
+    if local_operator.as_ref().and_then(Value::as_str) != Some(client_id) {
+        return Err(Error::new(
+            "LOCAL_OPERATOR_MISMATCH",
+            "operator identity does not match the bootstrap credential",
+        ));
+    }
+    Ok(())
+}
+
 fn open_database(root: &Path, credential: &Credential) -> Result<Connection> {
     if rusqlite::version_number() < 3_051_003 {
         return Err(Error::new(
@@ -495,6 +524,11 @@ fn open_database(root: &Path, credential: &Credential) -> Result<Connection> {
         set_meta(&tx, "execution_mode", &json!({"new_work":"enabled"}))?;
         set_meta(
             &tx,
+            LOCAL_OPERATOR_CLIENT_ID_KEY,
+            &json!(credential.client_id),
+        )?;
+        set_meta(
+            &tx,
             &format!("client:{}", credential.client_id),
             &json!({"role":"operator","token_hash":model::digest(credential.token.as_bytes()),"disabled":false}),
         )?;
@@ -503,6 +537,15 @@ fn open_database(root: &Path, credential: &Credential) -> Result<Connection> {
             return Err(Error::new(
                 "SCHEMA_MISMATCH",
                 "migration content differs; refusing to open a draft/reference database",
+            ));
+        }
+        let local_operator = meta(&tx, LOCAL_OPERATOR_CLIENT_ID_KEY)?;
+        if let Some(local_operator) = &local_operator
+            && local_operator.as_str() != Some(credential.client_id.as_str())
+        {
+            return Err(Error::new(
+                "LOCAL_OPERATOR_MISMATCH",
+                "bootstrap credential does not match the pinned local operator identity",
             ));
         }
         let record = meta(&tx, &format!("client:{}", credential.client_id))?.ok_or_else(|| {
@@ -518,6 +561,30 @@ fn open_database(root: &Path, credential: &Credential) -> Result<Connection> {
             return Err(Error::new(
                 "UNAUTHORIZED",
                 "operator credential does not match database",
+            ));
+        }
+        if local_operator.is_none() {
+            set_meta(
+                &tx,
+                LOCAL_OPERATOR_CLIENT_ID_KEY,
+                &json!(credential.client_id),
+            )?;
+        }
+    }
+    let scheduler_key = format!("client:{}", model::INTERNAL_SCHEDULER_CLIENT_ID);
+    match meta(&tx, &scheduler_key)? {
+        None => set_meta(
+            &tx,
+            &scheduler_key,
+            &json!({
+                "role": "scheduler", "internal_only": true, "disabled": false
+            }),
+        )?,
+        Some(record) if record["role"] == "scheduler" && record["internal_only"] == true => {}
+        Some(_) => {
+            return Err(Error::new(
+                "INTERNAL_CLIENT_CONFLICT",
+                "reserved scheduler identity already has a transport registration",
             ));
         }
     }
@@ -630,7 +697,7 @@ fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config
                 |r| r.get(0),
             )?;
             Ok(
-                json!({"version":env!("CARGO_PKG_VERSION"),"controller_id":meta(db,"controller_id")?,"host_epoch":meta(db,"host_epoch")?,"gm":gm::record(db)?,"gm_wake_mode":gm::WAKE_MODE,"sqlite":rusqlite::version(),"tasks":tasks,"unreleased_attempts":owners,"queued_operations":queued,"execution_mode":meta(db,"execution_mode")?,"native_modules_connected":db.query_row("SELECT count(*) FROM bindings WHERE released_at_ms IS NULL AND json_extract(state_json, '$.connection')='connected'",[],|r|r.get::<_,i64>(0))?,"native_execution":"scoped_runtime_protocol"}),
+                json!({"version":env!("CARGO_PKG_VERSION"),"controller_id":meta(db,"controller_id")?,"host_epoch":meta(db,"host_epoch")?,"gm":gm::record(db)?,"gm_wake_mode":gm::WAKE_MODE,"sqlite":rusqlite::version(),"tasks":tasks,"unreleased_attempts":owners,"queued_operations":queued,"execution_mode":meta(db,"execution_mode")?,"native_modules_connected":db.query_row("SELECT count(*) FROM bindings WHERE released_at_ms IS NULL AND json_extract(state_json, '$.connection')='connected'",[],|r|r.get::<_,i64>(0))?,"native_execution":"scoped_runtime_protocol","schedules":schedules::status(db,&config.schedules,model::now_ms()?)?}),
             )
         }
         "agent.family" => producers::family(db, v),
@@ -804,10 +871,32 @@ fn mutate(
     v: &Value,
     config: &Config,
 ) -> Result<Value> {
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let result = mutate_in_transaction(&tx, p, method, v, config, model::now_ms()?)?;
+    // Rejected requests retain the same durable receipt as successful requests.
+    tx.commit()?;
+    result
+}
+
+fn mutate_in_transaction(
+    tx: &Transaction<'_>,
+    p: &Principal,
+    method: &str,
+    v: &Value,
+    config: &Config,
+    now: i64,
+) -> Result<Result<Value>> {
+    if p.role == Role::Scheduler
+        && (p.client_id != model::INTERNAL_SCHEDULER_CLIENT_ID || method != "check.run")
+    {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "scheduler may admit only configured checks",
+        ));
+    }
     model::validate_mutation(method, v)?;
     let request_id = model::text(v, "client_request_id")?;
     let original = model::canonical(v)?;
-    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let old:Option<(String,String,String)> = tx.query_row("SELECT method,original_request_json,effective_request_json FROM operations WHERE caller_id=?1 AND client_request_id=?2", params![p.client_id,request_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
     if let Some((old_method, body, effective)) = old {
         if old_method != method || body != original {
@@ -817,13 +906,12 @@ fn mutate(
             ));
         }
         let receipt: Value = serde_json::from_str(&effective)?;
-        return receipt_result(&receipt["receipt"]);
+        return Ok(receipt_result(&receipt["receipt"]));
     }
     let id = model::new_id();
-    let now = model::now_ms()?;
     tx.execute("INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,effective_request_json,state,due_at_ms,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,?5,'{}','queued',?6,?6,?6)",params![id,p.client_id,request_id,method,original,now])?;
     tx.execute_batch("SAVEPOINT mutation_effect")?;
-    let result = apply(&tx, p, method, v, config, &id, now);
+    let result = apply(tx, p, method, v, config, &id, now);
     let receipt = match &result {
         Ok((value, queued)) => {
             tx.execute_batch("RELEASE mutation_effect")?;
@@ -831,7 +919,7 @@ fn mutate(
             tx.execute("UPDATE operations SET state=?2,result_json=?3,settled_at_ms=?4,updated_at_ms=?5 WHERE operation_id=?1",params![id,state,model::canonical(value)?,if *queued{None}else{Some(now)},now])?;
             // The admitted operation now holds (or releases) native
             // capacity; record that in the durable ledger (R23).
-            capacity::sync_operation(&tx, &id, now)?;
+            capacity::sync_operation(tx, &id, now)?;
             tx.execute("INSERT INTO observations(source_stream_id,source_event_key,operation_id,kind,payload_json,recorded_at_ms) VALUES('controller',?1,?1,?2,?3,?4)",params![id,method,model::canonical(value)?,now])?;
             json!({"ok":true,"value":value})
         }
@@ -842,8 +930,7 @@ fn mutate(
         }
     };
     tx.execute("UPDATE operations SET effective_request_json=json_set(effective_request_json,'$.receipt',json(?2)) WHERE operation_id=?1",params![id,model::canonical(&receipt)?])?;
-    tx.commit()?;
-    result.map(|(v, _)| v)
+    Ok(result.map(|(v, _)| v))
 }
 fn receipt_result(value: &Value) -> Result<Value> {
     if value["ok"] == true {
@@ -867,6 +954,7 @@ fn apply(
     now: i64,
 ) -> Result<(Value, bool)> {
     match method {
+        "forge.publish_ref" => forge::reserve(tx, p, v, id, config).map(|v| (v, true)),
         "source.capture" => checks::reserve_source(tx, p, v, id, config).map(|v| (v, true)),
         "check.run" => checks::reserve(tx, p, v, id, config),
         "check.cancel" => checks::cancel(tx, p, v, id).map(|v| (v, false)),
@@ -924,6 +1012,18 @@ fn apply(
             )?;
             let client = model::text(v, "client_id")?;
             let role: Role = serde_json::from_value(v["role"].clone())?;
+            if role == Role::Operator {
+                return Err(Error::new(
+                    "FORBIDDEN",
+                    "operator role is reserved for the bootstrap credential",
+                ));
+            }
+            if role == Role::Scheduler || client == model::INTERNAL_SCHEDULER_CLIENT_ID {
+                return Err(Error::new(
+                    "FORBIDDEN",
+                    "scheduler identity is reserved for in-process admission",
+                ));
+            }
             let hash = model::text(v, "token_hash")?;
             if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
                 return Err(Error::invalid("token_hash must be SHA-256 hex"));
@@ -1084,3 +1184,7 @@ fn cancel_message(tx: &Transaction<'_>, p: &Principal, v: &Value, id: &str) -> R
 mod capacity_tests;
 #[cfg(test)]
 mod mailbox_tests;
+#[cfg(test)]
+mod receipt_tests;
+#[cfg(test)]
+mod security_tests;

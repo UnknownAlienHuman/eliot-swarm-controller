@@ -14,12 +14,14 @@ use crate::{
     artifacts::{ArtifactFiles, ArtifactRecord, MAX_PAGE_BYTES},
     error::{Error, Result},
     model,
+    runtime::{RuntimeCommand, RuntimeOutcome, batch::prompt_facts},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::File,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
@@ -232,11 +234,12 @@ impl BatchDisposition {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BatchOutcome {
     pub run_id: String,
     pub disposition: BatchDisposition,
     pub exit_code: Option<i32>,
+    pub signal: Option<i32>,
     /// True only when this controller terminated the child at its own host
     /// deadline because the native timeout never fired.
     pub host_terminated: bool,
@@ -245,8 +248,50 @@ pub struct BatchOutcome {
     pub completion_condition: &'static str,
     /// Compact projection of the native `result.json`; never the transcript.
     pub native_result: Option<Value>,
+    /// Digest of the exact validated `result.json` bytes published as pages.
+    pub native_result_sha256: Option<String>,
     pub artifacts: Vec<ArtifactRecord>,
     pub output_dir: PathBuf,
+}
+
+/// Durable, non-secret identity written before the native process is spawned.
+/// The run directory itself is the no-replay marker after a crash.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BatchIntent {
+    pub version: u8,
+    pub operation_id: String,
+    pub run_id: String,
+    pub binding_id: String,
+    pub generation: i64,
+    pub route_sha256: String,
+    pub prompt_sha256: String,
+    pub prompt_bytes: usize,
+    pub task_snapshot_sha256: String,
+}
+
+/// Exact native terminal and immutable page identities retained for restart
+/// reconciliation. It contains no prompt, environment values or workspace path.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BatchReceipt {
+    pub version: u8,
+    pub intent: BatchIntent,
+    pub outcome: RuntimeOutcome,
+    pub artifacts: Vec<ArtifactRecord>,
+}
+
+/// Frozen runtime inputs required to identify one persisted receipt during
+/// reconciliation. Borrowed so the caller cannot mutate the authority while
+/// the receipt is being checked.
+#[derive(Debug, Clone, Copy)]
+pub struct BatchReadContext<'a> {
+    pub operation_id: &'a str,
+    pub binding_id: &'a str,
+    pub generation: i64,
+    pub route: &'a Value,
+    pub instruction: &'a str,
+    pub task_snapshot: &'a Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -273,6 +318,13 @@ struct EvalResult {
     #[serde(default)]
     tool_calls: Option<BTreeMap<String, u64>>,
 }
+
+struct NativeResult {
+    bytes: Vec<u8>,
+    sha256: String,
+    projection: Value,
+}
+
 impl EvalResult {
     fn validate(&self, options: &Options, exit_code: Option<i32>) -> Result<()> {
         let expected_status = match exit_code {
@@ -306,7 +358,7 @@ impl EvalResult {
     fn projection(&self) -> Value {
         json!({
             "status": self.status,
-            "error": self.error,
+            "error_reported": self.error.is_some(),
             "duration_secs": self.duration_secs,
             "timeout_secs": self.timeout_secs,
             "model": self.model,
@@ -340,6 +392,70 @@ pub fn run_batch(
     output_root: &Path,
     artifacts: &ArtifactFiles,
 ) -> Result<BatchOutcome> {
+    run_batch_inner(
+        options,
+        operation_id,
+        instruction,
+        output_root,
+        artifacts,
+        None,
+    )
+}
+
+pub fn run_batch_command(
+    options: &Options,
+    command: &RuntimeCommand,
+    instruction: &str,
+    output_root: &Path,
+    artifacts: &ArtifactFiles,
+) -> Result<(BatchOutcome, BatchIntent)> {
+    let intent = make_intent(command, instruction)?;
+    let outcome = run_batch_inner(
+        options,
+        &command.operation_id,
+        instruction,
+        output_root,
+        artifacts,
+        Some(intent.clone()),
+    )?;
+    Ok((outcome, intent))
+}
+
+pub fn make_intent(command: &RuntimeCommand, instruction: &str) -> Result<BatchIntent> {
+    if command.method != "task.dispatch" {
+        return Err(Error::invalid(
+            "Zed batch executor only accepts task.dispatch",
+        ));
+    }
+    let task_snapshot = command
+        .input
+        .get("task_snapshot")
+        .ok_or_else(|| Error::invalid("immutable task snapshot is required"))?;
+    let facts = prompt_facts(instruction, task_snapshot)?;
+    Ok(BatchIntent {
+        version: 1,
+        operation_id: command.operation_id.clone(),
+        run_id: run_id(&command.operation_id),
+        binding_id: command.binding_id.clone(),
+        generation: command.generation,
+        route_sha256: model::digest(model::canonical(&command.route)?.as_bytes()),
+        prompt_sha256: model::text(&facts, "prompt_sha256")?.to_owned(),
+        prompt_bytes: facts["prompt_bytes"]
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| Error::invalid("batch prompt length is out of range"))?,
+        task_snapshot_sha256: model::text(&facts, "task_snapshot_sha256")?.to_owned(),
+    })
+}
+
+fn run_batch_inner(
+    options: &Options,
+    operation_id: &str,
+    instruction: &str,
+    output_root: &Path,
+    artifacts: &ArtifactFiles,
+    intent: Option<BatchIntent>,
+) -> Result<BatchOutcome> {
     if instruction.trim().is_empty() || instruction.len() > MAX_INSTRUCTION_BYTES {
         return Err(Error::invalid(
             "batch instruction must be nonempty and within the frame bound",
@@ -354,14 +470,36 @@ pub fn run_batch(
     let resolved = resolve_program(&options.executable, std::env::var_os("PATH").as_deref())?;
     let run = run_id(operation_id);
     std::fs::create_dir_all(output_root)?;
+    validate_output_root(output_root)?;
     let output_dir = output_root.join(&run);
     if std::fs::create_dir(&output_dir).is_err() {
         return Err(Error::conflict(
             "batch run identity already has an output directory; refusing to overwrite native evidence",
         ));
     }
-    let stdout = File::create(output_dir.join("stdout.log"))?;
-    let stderr = File::create(output_dir.join("stderr.log"))?;
+    validate_run_directory(output_root, operation_id)?;
+    crate::platform::private_permissions(&output_dir, true)?;
+    let intent = intent.unwrap_or_else(|| BatchIntent {
+        version: 1,
+        operation_id: operation_id.to_owned(),
+        run_id: run.clone(),
+        binding_id: String::new(),
+        generation: 0,
+        route_sha256: String::new(),
+        prompt_sha256: model::digest(instruction.as_bytes()),
+        prompt_bytes: instruction.len(),
+        task_snapshot_sha256: String::new(),
+    });
+    if intent.operation_id != operation_id || intent.run_id != run {
+        return Err(Error::invalid("batch intent does not identify this run"));
+    }
+    write_json_new(&output_dir.join("intent.json"), &json!(intent))?;
+    let stdout_path = output_dir.join("stdout.log");
+    let stderr_path = output_dir.join("stderr.log");
+    let stdout = File::create(&stdout_path)?;
+    let stderr = File::create(&stderr_path)?;
+    crate::platform::private_permissions(&stdout_path, false)?;
+    crate::platform::private_permissions(&stderr_path, false)?;
     let mut command = Command::new(&resolved);
     command
         .arg("--workdir")
@@ -405,6 +543,13 @@ pub fn run_batch(
     let started = Instant::now();
     let (status, host_terminated) = wait_bounded(&mut child, deadline, started)?;
     let exit_code = status.code();
+    #[cfg(unix)]
+    let signal = {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal()
+    };
+    #[cfg(not(unix))]
+    let signal = None;
     let disposition = if host_terminated {
         BatchDisposition::Timeout
     } else {
@@ -426,33 +571,374 @@ pub fn run_batch(
         ));
     }
     let mut published = Vec::new();
+    let output_context = BatchOutputContext {
+        operation_id,
+        run_id: &run,
+        intent: &intent,
+        disposition,
+    };
     for name in NATIVE_OUTPUTS {
         let path = output_dir.join(name);
-        if path.is_file() {
-            publish_output(
-                artifacts,
-                operation_id,
-                &run,
-                name,
-                &path,
-                disposition,
-                &mut published,
-            )?;
+        if name == "result.json" {
+            if let Some(native) = &native {
+                publish_output_bytes(
+                    artifacts,
+                    &output_context,
+                    name,
+                    &native.bytes,
+                    &mut published,
+                )?;
+            } else {
+                match std::fs::symlink_metadata(&path) {
+                    Ok(_) => {
+                        return Err(Error::new(
+                            "NATIVE_RESULT_CHANGED",
+                            "result.json appeared after native result inspection",
+                        ));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        } else if path.is_file() {
+            publish_output(artifacts, &output_context, name, &path, &mut published)?;
         }
     }
     Ok(BatchOutcome {
         run_id: run,
         disposition,
         exit_code,
+        signal,
         host_terminated,
         completion_condition: if native.is_some() {
             "native_batch_result_recorded"
         } else {
             "native_batch_exit_classified"
         },
-        native_result: native.map(|r| r.projection()),
+        native_result: native.as_ref().map(|result| result.projection.clone()),
+        native_result_sha256: native.as_ref().map(|result| result.sha256.clone()),
         artifacts: published,
         output_dir,
+    })
+}
+
+pub fn run_directory(output_root: &Path, operation_id: &str) -> PathBuf {
+    output_root.join(run_id(operation_id))
+}
+
+fn validate_output_root(output_root: &Path) -> Result<PathBuf> {
+    let metadata = std::fs::symlink_metadata(output_root)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(Error::new(
+            "BATCH_PATH",
+            "batch evidence root must be a regular directory",
+        ));
+    }
+    Ok(std::fs::canonicalize(output_root)?)
+}
+
+fn validate_run_directory(output_root: &Path, operation_id: &str) -> Result<PathBuf> {
+    let root = validate_output_root(output_root)?;
+    let directory = run_directory(output_root, operation_id);
+    let metadata = std::fs::symlink_metadata(&directory)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(Error::new(
+            "BATCH_PATH",
+            "batch run directory must be a regular child directory",
+        ));
+    }
+    let canonical = std::fs::canonicalize(&directory)?;
+    if canonical.parent() != Some(root.as_path()) {
+        return Err(Error::new(
+            "BATCH_PATH",
+            "batch run directory escaped the evidence root",
+        ));
+    }
+    Ok(canonical)
+}
+
+pub fn persist_receipt(
+    output_root: &Path,
+    artifacts: &ArtifactFiles,
+    route: &Value,
+    receipt: &BatchReceipt,
+) -> Result<()> {
+    validate_receipt_content(receipt, artifacts, route)?;
+    let dir = validate_run_directory(output_root, &receipt.intent.operation_id)?;
+    let intent_value = read_json_bounded(&dir.join("intent.json"), 65_536)?;
+    let saved_intent: BatchIntent = serde_json::from_value(intent_value)
+        .map_err(|_| Error::new("BATCH_INTENT_INVALID", "batch intent schema is invalid"))?;
+    if saved_intent != receipt.intent
+        || receipt.version != 1
+        || receipt.outcome.operation_id != saved_intent.operation_id
+        || receipt.intent.run_id != run_id(&receipt.intent.operation_id)
+    {
+        return Err(Error::new(
+            "BATCH_RECEIPT_MISMATCH",
+            "terminal receipt differs from its durable batch intent",
+        ));
+    }
+    let path = dir.join("terminal.json");
+    let value = json!(receipt);
+    if path.try_exists()? {
+        let existing = read_json_bounded(&path, 4 * 1024 * 1024)?;
+        if model::canonical(&existing)? != model::canonical(&value)? {
+            return Err(Error::conflict(
+                "terminal batch receipt already exists with different evidence",
+            ));
+        }
+        return Ok(());
+    }
+    write_json_new(&path, &value)
+}
+
+pub fn read_receipt(
+    output_root: &Path,
+    context: BatchReadContext<'_>,
+    artifacts: &ArtifactFiles,
+) -> Result<Option<BatchReceipt>> {
+    validate_output_root(output_root)?;
+    let candidate = run_directory(output_root, context.operation_id);
+    let dir = match std::fs::symlink_metadata(&candidate) {
+        Ok(_) => validate_run_directory(output_root, context.operation_id)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let path = dir.join("terminal.json");
+    if !path.try_exists()? {
+        return Ok(None);
+    }
+    let raw = read_json_bounded(&path, 4 * 1024 * 1024)?;
+    let receipt: BatchReceipt = serde_json::from_value(raw)
+        .map_err(|_| Error::new("BATCH_RECEIPT_INVALID", "saved batch receipt is invalid"))?;
+    let facts = prompt_facts(context.instruction, context.task_snapshot)?;
+    if receipt.version != 1
+        || receipt.intent.operation_id != context.operation_id
+        || receipt.outcome.operation_id != context.operation_id
+        || receipt.intent.run_id != run_id(context.operation_id)
+        || receipt.intent.binding_id != context.binding_id
+        || receipt.intent.generation != context.generation
+        || receipt.intent.route_sha256 != model::digest(model::canonical(context.route)?.as_bytes())
+        || receipt.intent.prompt_sha256 != facts["prompt_sha256"]
+        || receipt.intent.prompt_bytes as u64 != facts["prompt_bytes"].as_u64().unwrap_or(u64::MAX)
+        || receipt.intent.task_snapshot_sha256 != facts["task_snapshot_sha256"]
+    {
+        return Err(Error::new(
+            "BATCH_RECEIPT_MISMATCH",
+            "saved terminal evidence does not match the frozen operation input",
+        ));
+    }
+    validate_receipt_content(&receipt, artifacts, context.route)?;
+    Ok(Some(receipt))
+}
+
+/// Verify each retained output and bind result.json's exact bytes to its
+/// recorded digest and parsed native projection before persistence/readback.
+fn validate_receipt_content(
+    receipt: &BatchReceipt,
+    artifacts: &ArtifactFiles,
+    route: &Value,
+) -> Result<()> {
+    validate_receipt_manifest(receipt)?;
+    let mismatch = || {
+        Error::new(
+            "BATCH_RECEIPT_MISMATCH",
+            "terminal result bytes do not match the validated native projection",
+        )
+    };
+    if receipt.intent.route_sha256 != model::digest(model::canonical(route)?.as_bytes()) {
+        return Err(mismatch());
+    }
+    for record in &receipt.artifacts {
+        if record.metadata["native_output"] != "result.json" {
+            artifacts.verify(record)?;
+        }
+    }
+
+    let result_records = receipt
+        .artifacts
+        .iter()
+        .filter(|record| record.metadata["native_output"] == "result.json")
+        .collect::<Vec<_>>();
+    if receipt.outcome.details["native_result"].is_null() {
+        if !result_records.is_empty() || !receipt.outcome.details["native_result_sha256"].is_null()
+        {
+            return Err(mismatch());
+        }
+        return Ok(());
+    }
+
+    let options = Options::parse(&route["native_options"]).map_err(|_| mismatch())?;
+    if receipt.outcome.details["requested_model"] != options.model
+        || receipt.outcome.details["effective_model"] != options.model
+        || receipt.outcome.details["effective_model_status"] != "observed"
+    {
+        return Err(mismatch());
+    }
+    let expected_digest = receipt.outcome.details["native_result_sha256"]
+        .as_str()
+        .ok_or_else(mismatch)?;
+    let total = result_records.iter().try_fold(0usize, |total, record| {
+        let page_len = usize::try_from(record.byte_length).map_err(|_| mismatch())?;
+        total.checked_add(page_len).ok_or_else(mismatch)
+    })?;
+    if u64::try_from(total).map_err(|_| mismatch())? > MAX_OUTPUT_BYTES || result_records.is_empty()
+    {
+        return Err(mismatch());
+    }
+    let mut bytes = Vec::with_capacity(total);
+    for record in result_records {
+        let page = artifacts.verified_bytes(record)?;
+        bytes.extend_from_slice(&page);
+    }
+    if bytes.len() != total || model::digest(&bytes) != expected_digest {
+        return Err(mismatch());
+    }
+    let result: EvalResult = serde_json::from_slice(&bytes).map_err(|_| mismatch())?;
+    let exit_code = receipt.outcome.details["exit_code"]
+        .as_i64()
+        .and_then(|value| i32::try_from(value).ok());
+    result
+        .validate(&options, exit_code)
+        .map_err(|_| mismatch())?;
+    if result.projection() != receipt.outcome.details["native_result"] {
+        return Err(mismatch());
+    }
+    Ok(())
+}
+
+/// Bind the receipt's terminal correlation and both artifact indexes to the
+/// exact retained page records. A receipt with internally inconsistent refs
+/// must stay unresolved during restart reconciliation.
+fn validate_receipt_manifest(receipt: &BatchReceipt) -> Result<()> {
+    let mismatch = || {
+        Error::new(
+            "BATCH_RECEIPT_MISMATCH",
+            "terminal receipt run identity or artifact manifest is inconsistent",
+        )
+    };
+    if receipt.version != 1
+        || receipt.intent.run_id != run_id(&receipt.intent.operation_id)
+        || receipt.outcome.operation_id != receipt.intent.operation_id
+        || receipt.outcome.details["batch_run_id"] != receipt.intent.run_id
+    {
+        return Err(mismatch());
+    }
+
+    let mut refs = Vec::with_capacity(receipt.artifacts.len());
+    let mut outputs = BTreeMap::<String, Vec<String>>::new();
+    let mut page_groups = BTreeMap::<String, Vec<(usize, usize)>>::new();
+    let mut seen = BTreeSet::new();
+    for record in &receipt.artifacts {
+        let output = record.metadata["native_output"]
+            .as_str()
+            .ok_or_else(mismatch)?;
+        let page = record.metadata["page"]
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(mismatch)?;
+        let page_count = record.metadata["pages"]
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(mismatch)?;
+        let identity = format!("{}:zed:{output}:{page}", receipt.intent.operation_id);
+        let expected_id = format!("result-{}", model::digest(identity.as_bytes()));
+        if record.kind != "native_result_page"
+            || !NATIVE_OUTPUTS.contains(&output)
+            || page_count == 0
+            || page >= page_count
+            || record.byte_length > MAX_PAGE_BYTES as u64
+            || record.artifact_id != expected_id
+            || record.relative_path != format!("artifacts/{expected_id}.bin")
+            || record.metadata["operation_id"] != receipt.intent.operation_id
+            || record.metadata["run_id"] != receipt.intent.run_id
+            || record.metadata["binding_id"] != receipt.intent.binding_id
+            || record.metadata["binding_generation"] != receipt.intent.generation
+            || !seen.insert(record.artifact_id.as_str())
+        {
+            return Err(mismatch());
+        }
+        refs.push(json!(record.artifact_id));
+        outputs
+            .entry(output.to_owned())
+            .or_default()
+            .push(record.artifact_id.clone());
+        page_groups
+            .entry(output.to_owned())
+            .or_default()
+            .push((page, page_count));
+    }
+    for group in page_groups.values_mut() {
+        group.sort_unstable();
+        let Some((_, expected_count)) = group.first().copied() else {
+            return Err(mismatch());
+        };
+        if group.len() != expected_count
+            || group.iter().any(|(_, count)| *count != expected_count)
+            || group
+                .iter()
+                .enumerate()
+                .any(|(expected_page, (page, _))| *page != expected_page)
+        {
+            return Err(mismatch());
+        }
+    }
+    if !receipt.outcome.details["native_result"].is_null()
+        && !page_groups.contains_key("result.json")
+    {
+        return Err(mismatch());
+    }
+    if receipt.outcome.details["artifact_refs"] != json!(refs)
+        || receipt.outcome.details["output_artifact_refs"] != json!(outputs)
+    {
+        return Err(mismatch());
+    }
+    Ok(())
+}
+
+fn write_json_new(path: &Path, value: &Value) -> Result<()> {
+    #[cfg(unix)]
+    let parent = path
+        .parent()
+        .ok_or_else(|| Error::invalid("batch control file has no parent"))?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(model::canonical(value)?.as_bytes())?;
+    file.sync_all()?;
+    #[cfg(unix)]
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+fn read_json_bounded(path: &Path, max_bytes: u64) -> Result<Value> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > max_bytes {
+        return Err(Error::new(
+            "BATCH_CONTROL_FILE_INVALID",
+            "batch control file is missing, linked or outside its size bound",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    File::open(path)?
+        .take(max_bytes + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(Error::new(
+            "BATCH_CONTROL_FILE_INVALID",
+            "batch control file exceeds its size bound",
+        ));
+    }
+    serde_json::from_slice(&bytes).map_err(|_| {
+        Error::new(
+            "BATCH_CONTROL_FILE_INVALID",
+            "batch control file is invalid JSON",
+        )
     })
 }
 
@@ -490,10 +976,12 @@ fn read_native_result(
     output_dir: &Path,
     options: &Options,
     exit_code: Option<i32>,
-) -> Result<Option<EvalResult>> {
+) -> Result<Option<NativeResult>> {
     let path = output_dir.join("result.json");
-    if !path.is_file() {
-        return Ok(None);
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
     }
     let bytes = read_bounded(&path)?;
     let result: EvalResult = serde_json::from_slice(&bytes).map_err(|_| {
@@ -503,29 +991,65 @@ fn read_native_result(
         )
     })?;
     result.validate(options, exit_code)?;
-    Ok(Some(result))
+    Ok(Some(NativeResult {
+        sha256: model::digest(&bytes),
+        projection: result.projection(),
+        bytes,
+    }))
 }
 
 fn read_bounded(path: &Path) -> Result<Vec<u8>> {
-    if std::fs::metadata(path)?.len() > MAX_OUTPUT_BYTES {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(Error::new(
+            "NATIVE_OUTPUT_INVALID",
+            "native output must be a regular file",
+        ));
+    }
+    if metadata.len() > MAX_OUTPUT_BYTES {
         return Err(Error::new(
             "NATIVE_OUTPUT_TOO_LARGE",
             "native output exceeds the publication bound; refusing to truncate evidence",
         ));
     }
-    Ok(std::fs::read(path)?)
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    File::open(path)?
+        .take(MAX_OUTPUT_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_OUTPUT_BYTES {
+        return Err(Error::new(
+            "NATIVE_OUTPUT_TOO_LARGE",
+            "native output exceeds the publication bound; refusing to truncate evidence",
+        ));
+    }
+    Ok(bytes)
+}
+
+struct BatchOutputContext<'a> {
+    operation_id: &'a str,
+    run_id: &'a str,
+    intent: &'a BatchIntent,
+    disposition: BatchDisposition,
 }
 
 fn publish_output(
     artifacts: &ArtifactFiles,
-    operation_id: &str,
-    run: &str,
+    context: &BatchOutputContext<'_>,
     name: &str,
     path: &Path,
-    disposition: BatchDisposition,
     published: &mut Vec<ArtifactRecord>,
 ) -> Result<()> {
     let bytes = read_bounded(path)?;
+    publish_output_bytes(artifacts, context, name, &bytes, published)
+}
+
+fn publish_output_bytes(
+    artifacts: &ArtifactFiles,
+    context: &BatchOutputContext<'_>,
+    name: &str,
+    bytes: &[u8],
+    published: &mut Vec<ArtifactRecord>,
+) -> Result<()> {
     let chunks: Vec<&[u8]> = if bytes.is_empty() {
         vec![&[]]
     } else {
@@ -534,16 +1058,19 @@ fn publish_output(
     let pages = chunks.len();
     for (page, chunk) in chunks.into_iter().enumerate() {
         let record = ArtifactFiles::record(
-            &format!("{operation_id}:zed:{name}:{page}"),
+            &format!("{}:zed:{name}:{page}", context.operation_id),
             chunk,
             json!({
+                "operation_id": context.intent.operation_id,
+                "binding_id": context.intent.binding_id,
+                "binding_generation": context.intent.generation,
                 "runtime": RUNTIME,
                 "contract_revision": CONTRACT_REVISION,
-                "run_id": run,
+                "run_id": context.run_id,
                 "native_output": name,
                 "page": page,
                 "pages": pages,
-                "disposition": disposition.as_str()
+                "disposition": context.disposition.as_str()
             }),
         );
         artifacts.publish(&record, chunk)?;

@@ -17,7 +17,7 @@
 //! incident details pass through the same redaction as native diagnostics.
 
 use crate::{config::Config, error::Result, model};
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 use std::path::{Component, Path};
 
@@ -71,6 +71,105 @@ fn counts_by(db: &Connection, table: &str, column: &str) -> Result<Value> {
         map.insert(key, json!(n));
     }
     Ok(Value::Object(map))
+}
+
+fn owner_policy_report(db: &Connection) -> Result<Value> {
+    let identity = crate::policy::accepted_edition(Some(crate::policy::OWNER_POLICY_V1_ID))?;
+    let accepted: i64 = db.query_row(
+        "SELECT count(*) FROM attempts WHERE json_extract(task_snapshot_json,'$.owner_policy.status')='accepted' AND json_extract(task_snapshot_json,'$.owner_policy.policy_id')=?1 AND json_extract(task_snapshot_json,'$.owner_policy.edition')=?2 AND json_extract(task_snapshot_json,'$.owner_policy.document_path')=?3 AND json_extract(task_snapshot_json,'$.owner_policy.document_section')=?4 AND json_extract(task_snapshot_json,'$.owner_policy.document_sha256')=?5 AND (SELECT count(*) FROM json_each(task_snapshot_json,'$.owner_policy'))=6",
+        params![identity.policy_id, i64::from(identity.edition), identity.document_path, identity.document_section, identity.document_sha256],
+        |r| r.get(0),
+    )?;
+    let legacy_unknown: i64 = db.query_row(
+        "SELECT count(*) FROM attempts WHERE json_type(task_snapshot_json,'$.owner_policy') IS NULL",
+        [],
+        |r| r.get(0),
+    )?;
+    let total = count(db, "SELECT count(*) FROM attempts")?;
+    let unrecognized = total - accepted - legacy_unknown;
+
+    let accepted_editions = vec![json!({
+        "policy_id": identity.policy_id,
+        "edition": identity.edition,
+        "document_path": identity.document_path,
+        "document_section": identity.document_section,
+        "document_sha256": identity.document_sha256,
+        "attempts": accepted,
+    })];
+    Ok(json!({
+        "by_status": {
+            "accepted": accepted,
+            "legacy_unknown": legacy_unknown,
+            "unrecognized": unrecognized,
+        },
+        "accepted_editions": accepted_editions,
+    }))
+}
+
+fn forge_report(db: &Connection, config: &Config) -> Result<Value> {
+    let mut statement = db.prepare(
+        "SELECT state,count(*) FROM operations WHERE method='forge.publish_ref' GROUP BY state ORDER BY state",
+    )?;
+    let state_rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut by_state = serde_json::Map::new();
+    for (state, count) in state_rows {
+        by_state.insert(state, json!(count));
+    }
+
+    // Project only the finite publication vocabulary; an unexpected or
+    // malformed stored value is counted as unrecognized, never echoed.
+    let mut by_publication = serde_json::Map::new();
+    let publication_values = [
+        "not_started",
+        "not_confirmed",
+        "confirmed_by_remote_readback",
+        "requires_readback",
+        "operator_intervention_required",
+    ];
+    let mut recognized = 0;
+    for publication in publication_values {
+        let count = db.query_row(
+            "SELECT count(*) FROM operations WHERE method='forge.publish_ref' AND json_extract(result_json,'$.publication')=?1",
+            [publication],
+            |row| row.get::<_, i64>(0),
+        )?;
+        recognized += count;
+        by_publication.insert(publication.to_owned(), json!(count));
+    }
+    let unrecorded = db.query_row(
+        "SELECT count(*) FROM operations WHERE method='forge.publish_ref' AND json_type(result_json,'$.publication') IS NULL",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let total = count(
+        db,
+        "SELECT count(*) FROM operations WHERE method='forge.publish_ref'",
+    )?;
+    by_publication.insert("unrecorded".into(), json!(unrecorded));
+    by_publication.insert(
+        "unrecognized".into(),
+        json!(total - recognized - unrecorded),
+    );
+
+    Ok(json!({
+        "implementation": "implemented",
+        "configuration": {
+            "enabled": config.forge.enabled,
+            "project_mappings": config.forge.projects.len(),
+        },
+        "operations": {
+            "by_state": by_state,
+            "by_publication": by_publication,
+        },
+        "native_qualification": {
+            "status": "unknown",
+            "qualification_recorded": false,
+        },
+    }))
 }
 
 fn finding(code: &str, severity: &str, summary: String, next_step: &str) -> Value {
@@ -386,6 +485,19 @@ pub fn inspect(db: &Connection, config: &Config) -> Result<Inspection> {
         [],
         |r| r.get(0),
     )?;
+    let owner_policy = owner_policy_report(db)?;
+    let forge = forge_report(db, config)?;
+    let legacy_policy_attempts = owner_policy["by_status"]["legacy_unknown"]
+        .as_i64()
+        .unwrap_or(0);
+    if legacy_policy_attempts > 0 {
+        findings.push(finding(
+            "ATTEMPTS_LEGACY_POLICY_UNKNOWN",
+            "gap",
+            format!("{legacy_policy_attempts} historical Attempt(s) have no recorded owner-policy edition"),
+            "Keep those snapshots as legacy unknown; do not infer an edition retroactively. New Attempts require an explicit known accepted owner_policy_id.",
+        ));
+    }
 
     // --- checks ---------------------------------------------------------------
     let checks_by_state = counts_by(db, "check_runs", "state")?;
@@ -550,6 +662,7 @@ pub fn inspect(db: &Connection, config: &Config) -> Result<Inspection> {
         "attempts": {
             "by_state": attempts_by_state,
             "unreleased": unreleased_attempts,
+            "owner_policy": owner_policy,
         },
         "checks": {
             "by_state": checks_by_state,
@@ -580,6 +693,7 @@ pub fn inspect(db: &Connection, config: &Config) -> Result<Inspection> {
                 "enabled": r.enabled,
             }))
             .collect::<Vec<_>>(),
+        "forge": forge,
         "live_qualification": false,
         "config": {
             "schema_version": config.schema_version,
@@ -605,8 +719,9 @@ pub fn inspect(db: &Connection, config: &Config) -> Result<Inspection> {
         "known_gaps": [
             {
                 "area": "forge_publication",
-                "status": "not_implemented",
-                "note": "Git/GitHub publication is not performed or recorded by this controller yet, so there are no publication facts to audit.",
+                "status": "unknown",
+                "implementation": "implemented",
+                "note": "The configured Forge publication operation and durable queued/readback receipts are implemented and their aggregate facts are reported above. No native qualification record is stored, so native publication qualification remains unknown; operation readback does not itself establish qualification.",
             },
             {
                 "area": "doctor_repair",
@@ -751,6 +866,60 @@ mod tests {
     }
 
     #[test]
+    fn owner_policy_report_lists_the_known_edition_when_no_attempts_exist() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(SCHEMA).unwrap();
+
+        let report = owner_policy_report(&db).unwrap();
+        let identity = crate::policy::current_edition();
+        assert_eq!(report["by_status"]["accepted"], 0);
+        assert_eq!(report["by_status"]["legacy_unknown"], 0);
+        assert_eq!(report["by_status"]["unrecognized"], 0);
+        assert_eq!(
+            report["accepted_editions"],
+            json!([{
+                "policy_id": identity.policy_id,
+                "edition": identity.edition,
+                "document_path": identity.document_path,
+                "document_section": identity.document_section,
+                "document_sha256": identity.document_sha256,
+                "attempts": 0,
+            }])
+        );
+    }
+
+    #[test]
+    fn owner_policy_report_counts_accepted_legacy_and_unrecognized_attempts() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(SCHEMA).unwrap();
+        let accepted = crate::policy::current_edition();
+        let snapshots = [
+            json!({"owner_policy":accepted}),
+            json!({"revision":1}),
+            json!({"owner_policy":{"status":"accepted","policy_id":"owner-policy-v999"}}),
+        ];
+        for (index, snapshot) in snapshots.iter().enumerate() {
+            let task_id = format!("t{index}");
+            db.execute(
+                "INSERT INTO tasks(task_id,project_id,revision,state,spec_json,created_at_ms,updated_at_ms) VALUES(?1,'p1',1,'open','{}',1000,1000)",
+                params![task_id],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO attempts(attempt_id,task_id,task_revision,task_snapshot_json,owner_id,start_owner,state,created_at_ms,updated_at_ms) VALUES(?1,?2,1,?3,'operator-1','native_manager','reserved',1000,1000)",
+                params![format!("a{index}"), task_id, model::canonical(snapshot).unwrap()],
+            )
+            .unwrap();
+        }
+
+        let report = owner_policy_report(&db).unwrap();
+        assert_eq!(report["by_status"]["accepted"], 1);
+        assert_eq!(report["by_status"]["legacy_unknown"], 1);
+        assert_eq!(report["by_status"]["unrecognized"], 1);
+        assert_eq!(report["accepted_editions"][0]["attempts"], 1);
+    }
+
+    #[test]
     fn inspect_reports_recorded_facts_and_findings_without_secrets() {
         let db = fixture_db();
         let inspection = inspect(&db, &Config::default()).unwrap();
@@ -785,6 +954,75 @@ mod tests {
             !rendered.contains("token_hash"),
             "hash field leaked: {rendered}"
         );
+    }
+
+    #[test]
+    fn forge_report_distinguishes_configuration_readback_facts_and_unknown_qualification() {
+        let db = fixture_db();
+        for (operation_id, request_id, state, publication) in [
+            ("forge-queued", "forge-req-queued", "queued", "not_started"),
+            (
+                "forge-unknown",
+                "forge-req-unknown",
+                "outcome_unknown",
+                "requires_readback",
+            ),
+        ] {
+            db.execute(
+                "INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,effective_request_json,state,result_json,due_at_ms,created_at_ms,updated_at_ms) VALUES(?1,'operator-1',?2,'forge.publish_ref','{}','{}',?3,?4,1000,1000,1000)",
+                params![
+                    operation_id,
+                    request_id,
+                    state,
+                    model::canonical(&json!({"publication":publication})).unwrap(),
+                ],
+            )
+            .unwrap();
+        }
+
+        let mut config = Config::default();
+        config.forge.enabled = true;
+        config.forge.projects.insert(
+            "p1".into(),
+            crate::forge::ForgeProject {
+                canonical_repository: "github.com/owner/repo".into(),
+                repository_path: Path::new("repo").to_path_buf(),
+                remote_name: "origin".into(),
+                policy_revision: "owner-policy-v1".into(),
+                target_refs: vec!["refs/heads/main".into()],
+            },
+        );
+
+        let report = inspect(&db, &config).unwrap().report;
+        assert_eq!(report["forge"]["implementation"], "implemented");
+        assert_eq!(report["forge"]["configuration"]["enabled"], true);
+        assert_eq!(report["forge"]["configuration"]["project_mappings"], 1);
+        assert_eq!(report["forge"]["operations"]["by_state"]["queued"], 1);
+        assert_eq!(
+            report["forge"]["operations"]["by_state"]["outcome_unknown"],
+            1
+        );
+        assert_eq!(
+            report["forge"]["operations"]["by_publication"]["not_started"],
+            1
+        );
+        assert_eq!(
+            report["forge"]["operations"]["by_publication"]["requires_readback"],
+            1
+        );
+        assert_eq!(report["forge"]["native_qualification"]["status"], "unknown");
+        assert_eq!(
+            report["forge"]["native_qualification"]["qualification_recorded"],
+            false
+        );
+        let forge_gap = report["known_gaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|gap| gap["area"] == "forge_publication")
+            .unwrap();
+        assert_eq!(forge_gap["implementation"], "implemented");
+        assert_eq!(forge_gap["status"], "unknown");
     }
 
     #[test]

@@ -1,59 +1,59 @@
-# Codex bridge — update and rollback
+# Codex bridge update and rollback
 
-## Pins
+## Pinned provenance
 
 | Fact | Value |
 |---|---|
 | Donor | `codex-python-sdk` (`docs/agent_swarm.donors-20260929.toml`) |
-| Upstream repo | `https://github.com/openai/codex` |
-| Source unit | `sdk/python` |
-| Upstream commit | `18194bfd3534ca567d886eac454028dafaa68b6c` (`vendor_bridge/UPSTREAM_COMMIT`) |
-| Package / version | `openai-codex`, `0.0.0-dev` (dev snapshot — never installed from a registry) |
-| Matching binary pin | `openai-codex-cli-bin==0.153.4` (the donor's own paired pin; names the server generation this SDK snapshot was generated against — it is server-side provenance, the bridge installs no binary) |
-| License | Apache-2.0 (`vendor_bridge/LICENSE`, upstream repo-root license) |
-| Bridge artifact | `codex-sdk-18194bf-bridge.1` |
-| Runtime deps (`requirements.txt`) | `pydantic==2.13.4`, `packaging==26.2` (exact versions from the donor's own `uv.lock` at the pin), `websockets==17.1` (transport library, local choice) |
+| Upstream repo / unit | `https://github.com/openai/codex` / `sdk/python` |
+| Upstream commit | `18194bfd3534ca567d886eac454028dafaa68b6c` |
+| Package / version | `openai-codex`, `0.0.0-dev` (vendored source, not installed from a registry) |
+| Matching binary pin | `openai-codex-cli-bin==0.153.4` (donor manifest provenance; this bridge attaches to an existing server) |
+| License | Apache-2.0 (`vendor_bridge/LICENSE`) |
+| Bridge artifact | `codex-sdk-18194bf-bridge.2` |
+| Runtime dependencies | exact pins in `requirements.txt` |
 
-## Local changes to the donor
+## ELIOT-owned changes in bridge.2
 
-None. `vendor_bridge/` is byte-identical to the upstream unit (plus the
-repo-root `LICENSE`, `UPSTREAM_COMMIT` and the generated `SHA256SUMS`);
-`python3 verify_vendor.py` proves it. The WebSocket transport adaptation
-is entirely in ELIOT-owned `bridge.py`: `SharedCodexClient` subclasses
-the pinned `CodexClient` and overrides only `start`, `close`,
-`_start_reader_thread`, `_write_message` and `_read_message`. The
-read-only method allowlist and the decline-all approval handler also live
-in `bridge.py`. If a future pin moves those touch-points, the adaptation
-is re-derived there, never by editing the donor.
+The observer CLI remains read-only by default. The registered controller uses
+a separate native method allowlist and durable operation checkpoint. It
+selects only the exact route `modelProvider` and `model`, uses the host's
+canonical task snapshot bytes for dispatch prompt construction, and records
+both the native turn ID and native user-item ID. A missing acknowledgment is
+resolved by unique `clientUserMessageId` history readback, never by replay.
+Reconnect attaches to the existing endpoint and validates the saved
+server/version scope; it does not start or stop the server or resume a thread.
 
-## Update procedure
+The `.159` installed app-server schema was checked for server-initiated
+requests. The bridge explicitly declines execution/file-change/patch
+approvals and elicitation, returns an empty permission profile, declines
+dynamic-tool execution, and sends no answers to user-input prompts. Unknown
+server request methods fail the local reader closed; they do not receive an
+empty object that could be mistaken for successful handling.
 
-1. Choose the new upstream commit deliberately; read its `sdk/python`
-   changelog surface (`pyproject.toml`, generated protocol diff) — a new
-   server generation pairs with a new matching-binary pin in the donor
-   manifest.
-2. Replace `vendor_bridge/` wholesale with the new `sdk/python` unit plus
-   the repo-root `LICENSE`; write the new commit into `UPSTREAM_COMMIT`;
-   regenerate `SHA256SUMS` (every file except `SHA256SUMS` itself).
-3. Update `requirements.txt` from the new unit's `uv.lock` (pydantic /
-   packaging) and re-check `bridge.py`'s transport touch-points and the
-   read-only allowlist against the new `client.py`.
-4. Update the pins table above, `bridge.py`'s pin constants,
-   `module.example.json`'s `moduleArtifactId`, the README and
-   `THIRD_PARTY_NOTICES.md` in the same change.
-5. Re-run: `python3 verify_vendor.py`, the fixture unittest suite, and
-   the fixture CLI smoke (`describe` / `open` / `snapshot`). Fixture
-   payloads must validate against the *new* generated models; where they
-   no longer do, the schema changed and the fixture is updated to the new
-   schema — never loosened to accept both.
-6. Live qualification against an installed server is a separate step and
-   does not follow from fixture success (matrix:
-   `installed_runtime_verified`).
+`vendor_bridge/` is not edited. Its donor source, generated models, and pins
+remain unchanged; `verify_vendor.py` continues to hash the donor bytes.
+
+## Updating the donor
+
+1. Select an upstream commit and matching generated server protocol on
+   purpose. Review `sdk/python` source, generated protocol models, license,
+   and donor pairing before changing any pins.
+2. Replace `vendor_bridge/` wholesale with that upstream unit plus its license;
+   update `UPSTREAM_COMMIT` and regenerate `SHA256SUMS` from donor bytes.
+3. Update runtime dependencies from the donor's lockfile. Re-derive the
+   transport adapter and server-request reply formats from the new client and
+   protocol schemas; do not change the donor to make the bridge pass.
+4. Update the pins above, bridge constants, module example, and README
+   together. Bump the artifact ID when the module contract changes.
+5. Run the vendor verifier and fixture tests. Fixture responses must validate
+   against the new generated models; update captured synthetic fixtures when
+   the schema changes rather than loosening validation.
+6. Treat fixture success and live app-server/provider qualification as
+   separate evidence.
 
 ## Rollback
 
-The module is self-contained: reverting the commit that changed
-`modules/codex/` (and the matching `THIRD_PARTY_NOTICES.md` entry)
-restores the previous pin and bridge together. No controller data,
-migration or server state is involved; the bridge writes nothing to the
-shared server in this slice, so rollback has no server-side effect.
+Reverting the ELIOT-owned `modules/codex/` change restores the prior module
+artifact. It does not alter the shared app-server, shared Codex home, or
+controller database. The bridge closes only its own client connection.

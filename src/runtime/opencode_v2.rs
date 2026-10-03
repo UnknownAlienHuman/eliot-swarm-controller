@@ -19,7 +19,8 @@ pub(crate) use configuration::{
     configuration_expectation,
 };
 pub(crate) use execution::{
-    ExecutionRead, ExecutionScan, NativeInputDescriptor, SessionRead, SessionScan,
+    ExecutionRead, ExecutionScan, NativeInputDescriptor, RootCreationRead, RootCreationScan,
+    SessionRead, SessionScan,
 };
 pub(crate) use goal::GOAL_CONTRACT_REVISION;
 pub(crate) use http::{EventReader, EventState, Service};

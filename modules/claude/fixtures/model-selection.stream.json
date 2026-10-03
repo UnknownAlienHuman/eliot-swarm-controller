@@ -1,0 +1,16 @@
+{
+  "messages": [
+    {
+      "type": "system",
+      "subtype": "init",
+      "session_id": "ses_model_selection_fixture",
+      "claude_code_version": "2.1.278-fixture",
+      "model": "claude-sonnet-5",
+      "permissionMode": "default",
+      "apiKeySource": "none",
+      "tools": [],
+      "uuid": "model-selection-init-1"
+    }
+  ],
+  "note": "Fixture authored from the pinned Claude Agent SDK 0.3.287 system/init message shape. It checks requested alias versus native-reported model identity; it is not a live capture."
+}

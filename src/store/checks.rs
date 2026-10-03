@@ -368,6 +368,55 @@ fn incident(db: &Connection, key: &str, error: Error) -> Result<()> {
     Ok(())
 }
 impl Store {
+    /// Startup readback of retained CheckRun evidence before schedule catch-up.
+    /// It never launches a worker or repeats a command. Live workers remain
+    /// under the normal supervisor, which owns their acknowledged go-ahead.
+    pub(crate) async fn reconcile_checks_once(&self) -> Result<()> {
+        let root = self.data_dir.clone();
+        let items = self.run(move |db| pending(db, root)).await?;
+        for work in items {
+            let scan = work.clone();
+            if let Some(completion) = self
+                .file_io(move |files| worker::completion(&scan, &files))
+                .await?
+            {
+                self.run(move |db| finish(db, &work, completion)).await?;
+                continue;
+            }
+            let scan = work.clone();
+            if let Some(completion) = self
+                .file_io(move |files| worker::recover_pre_identity(&scan, &files))
+                .await?
+            {
+                self.run(move |db| finish(db, &work, completion)).await?;
+                continue;
+            }
+            let scan = work.clone();
+            match self.file_io(move |_| worker::ready(&scan)).await {
+                Ok(Some(identity)) => {
+                    self.run(move |db| ready(db, &work, identity)).await?;
+                }
+                Ok(None) => {}
+                Err(error) if error.code == "CHECK_WORKER_LOST" => {
+                    let id = work.check_id.clone();
+                    self.run(move |db| {
+                        db.execute("UPDATE check_runs SET state='reconciling' WHERE check_id=?1 AND state='running'", [id])?;
+                        Ok(())
+                    }).await?;
+                    let scan = work.clone();
+                    if let Some(completion) = self
+                        .file_io(move |files| worker::recover(&scan, &files))
+                        .await?
+                    {
+                        self.run(move |db| finish(db, &work, completion)).await?;
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
     pub(super) async fn capture_source(
         &self,
         principal: Principal,

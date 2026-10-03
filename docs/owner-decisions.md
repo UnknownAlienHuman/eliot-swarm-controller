@@ -145,15 +145,13 @@ No timer invokes a model directly; it admits a normal typed Operation. Issue #7 
 
 ### 5.1. GM-only methods
 
-The current GM-only surface remains the implemented one: acceptance/invalidation, client administration, host admission mode and `gm.handover` alongside the local operator. Task create/revise remain normal authorized application methods, not GM-only merely because the caller is remote.
-
-Future forge publication and module activation are GM/operator-controlled only when their own contracts land.
+The current operator/current-GM control surface includes acceptance/invalidation, client administration, host admission mode, `gm.handover` and the implemented `forge.publish_ref` operation. Task create/revise remain normal authorized application methods, not GM-only merely because the caller is remote. Module activation remains future work and requires its own contract.
 
 ### 5.2. Epoch and queued work
 
-There are currently no queued GM-only application methods, so no generic adopt/cancel API is added speculatively.
+Forge publication is the current epoch-fenced queued operation. Its immutable intent records the GM epoch at admission, and the Store rechecks that epoch before queued work starts and again immediately before the push. A mismatch settles the never-sent Operation as `stale_gm_epoch`; a successor GM cannot adopt or resume that old publication.
 
-Any future queued GM-only Operation records the GM epoch at admission and rechecks it immediately before the external effect. On epoch change it becomes `stale_gm_epoch`; only the local operator may adopt or cancel it in v1. The successor GM cannot silently inherit a predecessor's high-impact queue.
+`operation.cancel` may cancel a still-queued publication from its caller or the local operator while the admitted epoch is current. After an epoch change, only the local operator may cancel the settled `stale_gm_epoch` record. Once work reaches `sending` or `outcome_unknown`, local cancellation is refused and recovery is readback-only. There is no adopt operation; a desired later publication must be a new request under current authority and accepted-candidate checks.
 
 ### 5.3. Handover
 
@@ -198,7 +196,9 @@ project policy revision
 
 The first slice includes the origin resolver because exact repository identity is required for deduplication and readback. Prefer forge/global node identity when available; canonical host/owner/repository is the fallback, never display name alone.
 
-Unknown push response is resolved by reading the exact remote ref and commit before any retry. Cleanup/bookkeeping are separate Operations. Issue #10 becomes implementable from this contract.
+After the Git runner proves its process tree empty, an unknown push response may be reconciled by reading the exact remote ref and commit. Reconciliation never repeats the push. If the runner cannot prove that its process tree ended, the Operation remains `outcome_unknown`, exact-ref readback cannot clear the hold, and later publications to that canonical repository are blocked pending manual operator intervention. Cleanup and bookkeeping, if added, are separate Operations.
+
+The first-slice implementation is present in the current candidate. Combined gates and live native Git/remote qualification remain pending; this section records the owner policy and does not claim those gates have passed.
 
 ## 7. Zed sessionless batch wiring — resolves issue #12 questions
 
@@ -237,13 +237,17 @@ The following are not owner-policy blocks and must not be “resolved” by pros
 - #4 — live family/child-discovery qualification after the already landed per-child reader;
 - #5 — live Muse Max/Windows/resume qualification;
 - #9 — Codex write route and installed-server qualification;
+- #10 — live native Git/remote publication qualification for the implemented first slice;
+- #12 — installed Zed binary/runtime qualification for the implemented sessionless batch route;
 - #11 — quiet-machine load run;
 - #19 — ACPX stays gated; the remote gateway is MCP/HTTP, not a real ACP consumer;
 - #20 — project the already implemented mailbox/background methods through MCP.
 
 Issue #1 is no longer a blank module task: observer/configuration bridge.3 against OpenCodex 2.75 is implemented. It should be rewritten to track only native Codex route composition and live mixed-provider qualification.
 
-## 10. Implementation order after these decisions
+## 10. Implementation order recorded at the 2026-10-02 baseline
+
+This was the planned sequence when the edition was accepted. Current implementation and gate status are tracked in the README and issue-specific evidence; do not treat this dated order as a current backlog.
 
 1. #20 MCP projection gaps required by remote profiles.
 2. #14 policy identity/projection code.

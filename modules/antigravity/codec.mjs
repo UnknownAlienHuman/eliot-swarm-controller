@@ -1,7 +1,9 @@
 // Pure mapping from the documented Antigravity CLI stream-json protocol to
-// the compact controller observation. This file imports nothing: bridge.mjs
-// feeds it the live `agy` stdout stream and selftest.mjs feeds it the
-// recorded fixtures, so the fixture path and the live path cannot drift.
+// the compact controller observation. bridge.mjs feeds it the live `agy`
+// stdout stream and selftest.mjs feeds it the recorded fixtures, so both
+// paths use the same mapping. Node's built-in SHA-256 fingerprints native
+// result text without copying that text into controller observations.
+import { createHash } from 'node:crypto';
 //
 // Protocol basis (official docs, accessed 2026-10-02):
 //   https://antigravity.google/docs/cli/headless/  (AG-HEADLESS)
@@ -34,7 +36,7 @@ const MAX_CHILDREN = 100;
 const MAX_TURNS = 32;
 const MAX_TOOL_ERRORS = 32;
 
-export function createStreamState() {
+export function createStreamState(initialResultOrdinal = 0) {
   return {
     phase: 'awaiting_init', // awaiting_init | ready | init_failed | stream_ended | stream_failed
     init: null,
@@ -43,6 +45,7 @@ export function createStreamState() {
     steps: new Map(), // step_index -> step record, insertion ordered
     children: new Map(), // child conversation_id -> child record
     turns: [],
+    result_ordinal: initialResultOrdinal,
     usage: null,
     tool_errors: [],
     native_events_seen: 0,
@@ -71,6 +74,21 @@ function usageNumbers(value) {
     if (typeof value[key] === 'number') out[key] = value[key];
   }
   return Object.keys(out).length ? out : null;
+}
+
+function responseSha256(value) {
+  if (typeof value !== 'string') return null;
+  return createHash('sha256').update(value, 'utf8').digest('hex');
+}
+
+export function terminalResultDisposition(status) {
+  switch (status) {
+    case 'SUCCESS': return 'completed';
+    case 'ERROR': return 'failed';
+    case 'CANCELED':
+    case 'INTERRUPTED': return 'cancelled';
+    default: return null; // WAITING, RUNNING, and unknown statuses are not terminal proof.
+  }
 }
 
 function applyInit(state, event) {
@@ -185,8 +203,15 @@ function applyStepUpdate(state, event) {
 function applyResult(state, event) {
   const payload = event.result && typeof event.result === 'object' ? event.result : null;
   if (!payload || typeof payload.status !== 'string') { state.gaps++; return; }
+  const resultOrdinal = state.result_ordinal + 1;
+  state.result_ordinal = resultOrdinal;
   const turn = {
     status: payload.status,
+    conversation_id: typeof payload.conversation_id === 'string'
+      ? payload.conversation_id
+      : (typeof event.conversation_id === 'string' ? event.conversation_id : null),
+    result_ordinal: resultOrdinal,
+    response_sha256: responseSha256(payload.response),
     error: typeof payload.error === 'string' ? payload.error : null,
     num_turns: typeof payload.num_turns === 'number' ? payload.num_turns : null,
     duration_seconds: typeof payload.duration_seconds === 'number' ? payload.duration_seconds : null,
@@ -294,6 +319,7 @@ export function snapshot(state) {
     steps: steps.slice(-50),
     steps_total: steps.length,
     turns: state.turns,
+    result_ordinal: state.result_ordinal,
     usage: state.usage,
     // Tool failures/soft-denials stay listed even when every turn result
     // is SUCCESS; a SUCCESS result alone is not tool success evidence.

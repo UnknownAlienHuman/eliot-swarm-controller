@@ -16,13 +16,19 @@ import {
   openRun,
   snapshotRun,
   DEFAULT_MOD_PATH,
+  batchRunId,
+  controlRecordRef,
+  outcomeFromRun,
+  resultRecordRef,
+  sha256Hex,
 } from "./glue.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FAKE = join(HERE, "fixtures", "fake-cmd.mjs");
 const config = {
   command: process.execPath,
-  argsPrefix: [FAKE],
+  commandArgs: [FAKE],
+  cwd: process.cwd(),
   modPath: DEFAULT_MOD_PATH,
 };
 
@@ -52,8 +58,10 @@ try {
     assert.match(info.cli_version, /1\.66\.0/);
     assert.match(info.mod.sha256, /^[0-9a-f]{64}$/);
     assert.equal(info.installed_runtime_verified, false);
-    assert.equal(info.capabilities.goal, "unavailable_headless_setter_not_established");
-    assert.equal(info.capabilities.resume, "unavailable_in_this_slice");
+    assert.equal(info.capabilities.goal, "unavailable");
+    assert.equal(info.capabilities.resume, "unavailable");
+    assert.equal(info.capabilities.open, "executor_preflight_only_no_native_session");
+    assert.equal(info.capabilities.task_dispatch, "one_shot_sessionless_batch");
   });
 
   await test("open: success run, mod ready, queue admission is not application", async () => {
@@ -64,7 +72,7 @@ try {
       { id: "m1", kind: "set_model", model: "fixture-model" },
     ]);
     process.env.FAKE_CMD_SCENARIO = "success";
-    const record = await openRun(config, { prompt: "read the readme", controlDir: dir });
+    const record = await openFixtureRun("success-op", "read the readme", dir);
     assert.equal(record.disposition, "completed");
     assert.equal(record.disposition_basis, "result_line");
     assert.equal(record.exit.code, 0);
@@ -72,6 +80,12 @@ try {
     assert.equal(record.session_id, "ses_fixture_1");
     assert.equal(record.session_id_source, "result_line");
     assert.equal(record.result.final_text, "done");
+    assert.equal(record.operation_id, "success-op");
+    assert.equal(record.requested_model, "fixture-model");
+    assert.equal(record.effective_model, null);
+    assert.equal(record.effective_model_status, "unknown");
+    assert.equal(record.prompt_bytes, Buffer.byteLength("read the readme", "utf8"));
+    assert.match(record.stderr.text, /fixture observed --model fixture-model/);
     assert.deepEqual(record.result.usage, { inputTokens: 120, outputTokens: 40 });
     assert.equal(record.mod.loaded, true);
     assert.equal(record.mod.ready, true);
@@ -90,12 +104,37 @@ try {
     assert.equal(snapshot.terminal, "completed");
     assert.equal(snapshot.completeness, "partial");
     assert.equal(snapshot.scope, "single_headless_run");
+    assert.equal(snapshot.admission.operation_id, "success-op");
+    const terminal = outcomeFromRun(record);
+    assert.equal(terminal.outcome, "applied");
+    assert.equal(terminal.details.completion_condition, "native_result_observed");
+    assert.equal(terminal.details.batch_run_id, batchRunId("success-op"));
+    assert.equal(terminal.details.native_session_id, "ses_fixture_1");
+    assert.equal(terminal.details.effective_model_status, "unknown");
+    assert.equal(terminal.details.control_record_ref, controlRecordRef("success-op"));
+    assert.equal(terminal.details.result_ref, resultRecordRef("success-op"));
+
+    const replay = await openFixtureRun("success-op", "read the readme", dir);
+    assert.equal(replay.replayed_from_saved_evidence, true);
+    assert.equal(replay.started_at, record.started_at);
+    await assert.rejects(
+      () => openFixtureRun("success-op", "changed prompt", dir),
+      /OPERATION_ID_CONFLICT/,
+    );
+    const mismatch = outcomeFromRun({
+      ...record,
+      exit: { ...record.exit, code: 1 },
+      anomalies: ["exit_result_mismatch"],
+    });
+    assert.equal(mismatch.outcome, "unknown");
+    assert.equal(mismatch.details.exit_code, 1);
+    assert.equal("completion_condition" in mismatch.details, false);
   });
 
   await test("open: auth error is a failed run with no session and no mod readiness", async () => {
     const dir = join(scratch, "auth");
     process.env.FAKE_CMD_SCENARIO = "auth-error";
-    const record = await openRun(config, { prompt: "hi", controlDir: dir });
+    const record = await openFixtureRun("auth-op", "hi", dir);
     assert.equal(record.disposition, "failed");
     assert.equal(record.exit.code, 3);
     assert.equal(record.exit.meaning, "EXIT_AUTH_ERROR");
@@ -108,7 +147,7 @@ try {
   await test("open: max_turns is its own disposition, not success or failure", async () => {
     const dir = join(scratch, "max-turns");
     process.env.FAKE_CMD_SCENARIO = "max-turns";
-    const record = await openRun(config, { prompt: "hi", controlDir: dir });
+    const record = await openFixtureRun("max-turns-op", "hi", dir);
     assert.equal(record.disposition, "max_turns");
     assert.equal(record.exit.code, 8);
     assert.equal(record.exit.meaning, "EXIT_MAX_TURNS_REACHED");
@@ -118,7 +157,7 @@ try {
   await test("open: a mod_error event is not process death", async () => {
     const dir = join(scratch, "mod-error");
     process.env.FAKE_CMD_SCENARIO = "mod-error";
-    const record = await openRun(config, { prompt: "hi", controlDir: dir });
+    const record = await openFixtureRun("mod-error-op", "hi", dir);
     assert.equal(record.disposition, "completed");
     assert.equal(record.exit.code, 0);
     assert.equal(record.mod.stream_mod_errors.length, 1);
@@ -128,17 +167,31 @@ try {
   await test("open: process death without a result line stays unknown", async () => {
     const dir = join(scratch, "crash");
     process.env.FAKE_CMD_SCENARIO = "crash-no-result";
-    const record = await openRun(config, { prompt: "hi", controlDir: dir });
+    const record = await openFixtureRun("crash-op", "hi", dir);
     assert.equal(record.disposition, "unknown");
     assert.equal(record.disposition_basis, "missing_result_line");
     assert.equal(record.exit.code, 1);
     assert.equal(record.result, null);
   });
 
+  await test("open: success result with a conflicting exit remains unknown", async () => {
+    const dir = join(scratch, "exit-mismatch");
+    process.env.FAKE_CMD_SCENARIO = "success-exit-mismatch";
+    const record = await openFixtureRun("exit-mismatch-op", "hi", dir);
+    assert.equal(record.result.subtype, "success");
+    assert.equal(record.exit.code, 1);
+    assert.equal(record.disposition, "unknown");
+    assert.equal(record.disposition_basis, "result_exit_or_stream_mismatch");
+    assert.deepEqual(record.anomalies, ["exit_result_mismatch"]);
+    const outcome = outcomeFromRun(record);
+    assert.equal(outcome.outcome, "unknown");
+    assert.equal("completion_condition" in outcome.details, false);
+  });
+
   await test("open: success may legitimately carry no session id", async () => {
     const dir = join(scratch, "no-session");
     process.env.FAKE_CMD_SCENARIO = "no-session-id";
-    const record = await openRun(config, { prompt: "hi", controlDir: dir });
+    const record = await openFixtureRun("no-session-op", "hi", dir);
     assert.equal(record.disposition, "completed");
     assert.equal(record.session_id, null);
     assert.equal(record.session_id_source, "none");
@@ -149,6 +202,35 @@ try {
     assert.equal(snapshot.terminal, "not_observed");
     assert.equal(snapshot.run, null);
     assert.equal(snapshot.mod.loaded, false);
+  });
+
+  await test("admission without terminal evidence is read back as unknown without replay", async () => {
+    const dir = join(scratch, "admitted-only");
+    const prompt = "do not replay";
+    const operationId = "admitted-only-op";
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "admission.json"), JSON.stringify({
+      schema: 1,
+      operation_id: operationId,
+      execution_shape: "sessionless_batch",
+      batch_run_id: batchRunId(operationId),
+      requested_model: "fixture-model",
+      prompt_sha256: sha256Hex(prompt),
+      prompt_bytes: Buffer.byteLength(prompt, "utf8"),
+      control_record_ref: controlRecordRef(operationId),
+      result_ref: resultRecordRef(operationId),
+      artifact_refs: [
+        { kind: "command_control_record", ref: controlRecordRef(operationId) },
+        { kind: "command_result_record", ref: resultRecordRef(operationId) },
+      ],
+      admitted_at: "fixture",
+    }));
+    const record = await openFixtureRun(operationId, prompt, dir);
+    assert.equal(record.disposition, "unknown");
+    assert.equal(record.disposition_basis, "admission_without_terminal_record");
+    assert.equal(record.replayed_from_saved_evidence, true);
+    assert.equal(record.anomalies[0], "native_result_missing_after_admission");
+    assert.equal(snapshotRun(dir).run, null);
   });
 } finally {
   delete process.env.FAKE_CMD_SCENARIO;
@@ -166,4 +248,13 @@ function writeInbox(dir, commands) {
     commands.map((c) => JSON.stringify(c)).join("\n") + "\n",
     "utf8",
   );
+}
+
+function openFixtureRun(operationId, prompt, controlDir) {
+  return openRun(config, {
+    operationId,
+    requestedModel: "fixture-model",
+    prompt,
+    controlDir,
+  });
 }

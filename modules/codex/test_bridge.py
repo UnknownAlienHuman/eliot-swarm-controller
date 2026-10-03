@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fixture tests for the ELIOT Codex bridge (slice 1, read-only attach).
+"""Fixture tests for the ELIOT Codex observer and controller bridge.
 
 Run in the module-local environment:
 
@@ -17,10 +17,13 @@ accepted as an attach.
 from __future__ import annotations
 
 import json
+import hashlib
 import subprocess
 import sys
+import tempfile
 import threading
 import unittest
+import warnings
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -32,8 +35,10 @@ from bridge import (  # noqa: E402
     ScriptedPeerTransport,
     SharedCodexClient,
 )
+from controller import Checkpoint, ControllerEngine, MODULE_ARTIFACT_ID  # noqa: E402
 
 FIXTURE = HERE / "fixtures" / "recorded_session.json"
+CONTROLLER_FIXTURE = HERE / "fixtures" / "controller_session.json"
 FORBIDDEN = {
     "thread/resume",
     "thread/start",
@@ -80,6 +85,87 @@ class BridgeFixtureTests(unittest.TestCase):
         )
         self.assertEqual(out["read_only_methods"], sorted(bridge.READ_ONLY_METHODS))
 
+    def test_codex_0159_user_agent_identity_and_thread_read_turn_projection(self):
+        script = _script()
+        initialize = script["responses"]["initialize"]["result"]
+        initialize.pop("serverInfo", None)
+        initialize["userAgent"] = (
+            "Codex Desktop/0.159.0 (Windows 10.0.26200; x86_64) dumb "
+            "(codex_python_sdk; 0.0.0-dev)"
+        )
+        thread = script["responses"]["thread/read"]["result"]["thread"]
+        thread["cliVersion"] = "0.159.0"
+        thread["turns"] = [
+            {
+                "id": "turn-0159",
+                "status": "completed",
+                "items": [
+                    {
+                        "id": "native-user-0159",
+                        "clientId": "operation-0159",
+                        "content": [{"type": "text", "text": "synthetic request"}],
+                        "type": "userMessage",
+                    },
+                    {
+                        "id": "native-agent-0159",
+                        "text": "synthetic response",
+                        "type": "agentMessage",
+                    },
+                ],
+            }
+        ]
+        transport = ScriptedPeerTransport(script)
+        client = SharedCodexClient(transport)
+        client.start()
+        try:
+            init = client.initialize()
+            executor = bridge._executor_block(client, init)
+            self.assertIsNone(init.serverInfo)
+            self.assertEqual(client._runtime_version, "0.159.0")
+            self.assertEqual(executor["server_name"], "Codex Desktop")
+            self.assertEqual(executor["server_name_source"], "initialize_user_agent")
+            self.assertEqual(executor["server_version"], "0.159.0")
+            self.assertEqual(
+                executor["server_version_source"],
+                "sdk_runtime_version_from_initialize_user_agent",
+            )
+
+            read = client.thread_read("thr_fixture_root", include_turns=True)
+            self.assertEqual(len(read.thread.turns), 1)
+            self.assertEqual(read.thread.turns[0].id, "turn-0159")
+            self.assertEqual(read.thread.turns[0].status.value, "completed")
+            self.assertEqual(
+                [item.root.type for item in read.thread.turns[0].items],
+                ["userMessage", "agentMessage"],
+            )
+            request = next(
+                message
+                for message in transport.sent
+                if message.get("method") == "thread/read"
+            )
+            self.assertEqual(
+                request["params"],
+                {"threadId": "thr_fixture_root", "includeTurns": True},
+            )
+
+            endpoint_identity = "endpoint-fixture-hash"
+            actual_scope = (
+                f"codex-appserver:{endpoint_identity}:Codex Desktop:0.159.0"
+            )
+            self.assertEqual(
+                bridge._native_scope_key(endpoint_identity, executor, None),
+                (actual_scope, False),
+            )
+            legacy_scope = (
+                f"codex-appserver:{endpoint_identity}:unknown-server:unknown-version"
+            )
+            self.assertEqual(
+                bridge._native_scope_key(endpoint_identity, executor, legacy_scope),
+                (legacy_scope, True),
+            )
+        finally:
+            client.close()
+
     def test_open_reads_without_resume_and_initialize_is_first(self):
         client, transport = _client()
         try:
@@ -120,7 +206,7 @@ class BridgeFixtureTests(unittest.TestCase):
         self.assertNotIn("thread/resume", sent_methods)
         self.assertNotIn("turn/start", sent_methods)
 
-    def test_server_approvals_are_declined(self):
+    def test_server_requests_get_schema_shaped_non_granting_replies(self):
         self.assertEqual(
             bridge._decline_all_approvals(
                 "item/commandExecution/requestApproval", None
@@ -131,6 +217,35 @@ class BridgeFixtureTests(unittest.TestCase):
             bridge._decline_all_approvals("item/fileChange/requestApproval", None),
             {"decision": "decline"},
         )
+        self.assertEqual(
+            bridge._decline_all_approvals("item/permissions/requestApproval", None),
+            {"permissions": {}, "scope": "turn"},
+        )
+        self.assertEqual(
+            bridge._decline_all_approvals("item/tool/call", None),
+            {"contentItems": [], "success": False},
+        )
+        self.assertEqual(
+            bridge._decline_all_approvals(
+                "item/tool/requestUserInput",
+                {"questions": [{"id": "q1"}, {"id": "q2"}]},
+            ),
+            {"answers": {"q1": {"answers": []}, "q2": {"answers": []}}},
+        )
+        self.assertEqual(
+            bridge._decline_all_approvals("mcpServer/elicitation/request", None),
+            {"action": "decline"},
+        )
+        self.assertEqual(
+            bridge._decline_all_approvals("applyPatchApproval", None),
+            {"decision": "denied"},
+        )
+        self.assertEqual(
+            bridge._decline_all_approvals("execCommandApproval", None),
+            {"decision": "denied"},
+        )
+        with self.assertRaises(bridge.UnsupportedServerRequest):
+            bridge._decline_all_approvals("unknown/request", None)
 
     def test_jsonl_line_is_not_a_fixture_or_attach(self):
         # The owned-process JSONL shape (bare lines, no per-frame request
@@ -167,19 +282,25 @@ class BridgeFixtureTests(unittest.TestCase):
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            transport = bridge.WebSocketTransport(f"ws://127.0.0.1:{port}", None)
-            client = SharedCodexClient(transport)
-            client.start()
-            try:
-                out = bridge.run_operation("describe", client, _Args())
-            finally:
-                client.close()
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", DeprecationWarning)
+                transport = bridge.WebSocketTransport(f"ws://127.0.0.1:{port}", None)
+                client = SharedCodexClient(transport)
+                client.start()
+                try:
+                    out = bridge.run_operation("describe", client, _Args())
+                finally:
+                    client.close()
         finally:
             server.shutdown()
         self.assertEqual(out["executor"]["server_version"], "0.153.4")
         frames = [json.loads(r) for r in received]
         self.assertTrue(all(isinstance(f, dict) for f in frames))
         self.assertEqual(frames[0]["method"], "initialize")
+        self.assertIsNone(transport._connection_context)
+        self.assertFalse(
+            [warning for warning in caught if issubclass(warning.category, DeprecationWarning)]
+        )
 
     def test_cli_end_to_end_against_fixture(self):
         proc = subprocess.run(
@@ -192,6 +313,554 @@ class BridgeFixtureTests(unittest.TestCase):
         out = json.loads(proc.stdout)
         self.assertEqual(out["operation"], "describe")
         self.assertEqual(out["executor"]["server_version"], "0.153.4")
+
+    def test_controller_exact_model_and_dual_native_identity_readback(self):
+        script = json.loads(CONTROLLER_FIXTURE.read_text(encoding="utf-8"))
+        script["notifications"] = {
+            "turn/start": [
+                {
+                    "method": "turn/started",
+                    "params": {
+                        "threadId": "thread-fixture-root",
+                        "turn": {
+                            "id": "turn-fixture-1",
+                            "status": "inProgress",
+                            "items": [],
+                        },
+                    },
+                }
+            ]
+        }
+        transport = ScriptedPeerTransport(script)
+        client = SharedCodexClient(transport, allowed_methods=bridge.CONTROLLER_METHODS)
+        client.start()
+        try:
+            init = client.initialize()
+            executor = bridge._executor_block(client, init)
+            scope_key = "codex-appserver:fixture:codex-app-server-fixture:0.153.4"
+            owner = {"version": 1, "process": {"purpose": "module"}, "token": "boot-fixture"}
+            with tempfile.TemporaryDirectory() as temp_dir:
+                checkpoint = Checkpoint(Path(temp_dir), owner)
+                engine = ControllerEngine(checkpoint, lambda: (client, executor, scope_key))
+                route = {
+                    "runtime": "codex",
+                    "module_artifact_id": MODULE_ARTIFACT_ID,
+                    "native_options": {
+                        "workspaceRoot": "C:\\Fixture\\workspace",
+                        "modelProvider": "fixture-provider",
+                        "model": "fixture-model",
+                    },
+                }
+                opened = engine.handle(
+                    {"operation_id": "operation-fixture-open", "method": "agent.open", "route": route}
+                )[0]
+                self.assertEqual(opened["outcome"], "applied")
+                self.assertEqual(opened["native_root_id"], "thread-fixture-root")
+                self.assertEqual(opened["details"]["requested_model_provider"], "fixture-provider")
+                self.assertEqual(opened["details"]["effective_model"], "fixture-model")
+                self.assertEqual(
+                    opened["details"]["effective_model_status"], "thread_configuration_exact"
+                )
+                self.assertEqual(
+                    opened["details"]["requested_workspace_root"],
+                    "C:\\Fixture\\workspace",
+                )
+                self.assertEqual(
+                    opened["details"]["observed_workspace_root"],
+                    "C:\\Fixture\\workspace",
+                )
+                self.assertEqual(opened["details"]["workspace_status"], "workspace_exact")
+                observed_thread = engine.observation()["native"]["thread"]
+                self.assertEqual(
+                    observed_thread["requested_workspace_root"], "C:\\Fixture\\workspace"
+                )
+                self.assertEqual(
+                    observed_thread["observed_workspace_root"], "C:\\Fixture\\workspace"
+                )
+                self.assertEqual(observed_thread["cwd"], "C:\\Fixture\\workspace")
+                self.assertNotIn("workspace_root", observed_thread)
+                duplicate_open = engine.handle(
+                    {"operation_id": "operation-fixture-open-again", "method": "agent.open", "route": route}
+                )[0]
+                self.assertEqual(duplicate_open["outcome"], "rejected")
+                self.assertEqual(
+                    duplicate_open["details"]["diagnostic_code"],
+                    "CONTROLLER_THREAD_ALREADY_RESERVED",
+                )
+                self.assertEqual(
+                    sum(m.get("method") == "thread/start" for m in transport.sent), 1
+                )
+
+                dispatch = {
+                    "operation_id": "operation-fixture-dispatch",
+                    "method": "task.dispatch",
+                    "native_root_id": "thread-fixture-root",
+                    "route": route,
+                    "input": {
+                        "task_snapshot": {},
+                        "task_snapshot_canonical": "{}",
+                        "text": "return marker",
+                    },
+                }
+                result = engine.handle(dispatch)[0]
+                self.assertEqual(result["outcome"], "applied", result)
+                self.assertEqual(result["turn_id"], "turn-fixture-1")
+                self.assertEqual(result["native_input_id"], "native-item-fixture-9")
+                self.assertNotEqual(result["native_input_id"], result["details"]["client_user_message_id"])
+                self.assertEqual(
+                    result["details"]["client_user_message_id"], "operation-fixture-dispatch"
+                )
+                prompt = "Task specification: {}\n\nreturn marker"
+                self.assertEqual(result["details"]["prompt_sha256"], hashlib.sha256(prompt.encode()).hexdigest())
+                self.assertEqual(result["details"]["prompt_bytes"], len(prompt.encode()))
+                self.assertEqual(result["details"]["completion_condition"], "native_input_admitted")
+                self.assertIsNone(result["details"]["served_model"])
+                self.assertEqual(result["details"]["billing_status"], "unknown")
+
+                thread_start = next(m for m in transport.sent if m.get("method") == "thread/start")
+                self.assertEqual(thread_start["params"]["modelProvider"], "fixture-provider")
+                self.assertEqual(thread_start["params"]["model"], "fixture-model")
+                turn_start = next(m for m in transport.sent if m.get("method") == "turn/start")
+                self.assertEqual(turn_start["params"]["model"], "fixture-model")
+                self.assertEqual(
+                    turn_start["params"]["clientUserMessageId"], "operation-fixture-dispatch"
+                )
+                self.assertEqual(
+                    turn_start["params"]["input"], [{"type": "text", "text": prompt}]
+                )
+                self.assertNotIn("turn-fixture-1", client._router._turn_notifications)
+                self.assertNotIn("turn-fixture-1", client._router._turn_states)
+
+                # Simulate a process loss after native acceptance but before
+                # the original outcome receipt. The next bridge reads exact
+                # native history and does not send a second turn/start.
+                record = checkpoint.data["operations"]["operation-fixture-dispatch"]
+                record["outcome"] = None
+                record["state"] = "native_effect_may_have_started"
+                checkpoint.save()
+                recovered_engine = ControllerEngine(
+                    checkpoint, lambda: (client, executor, scope_key)
+                )
+                recovered = recovered_engine.handle(dispatch)[0]
+                self.assertEqual(recovered["outcome"], "applied")
+                self.assertEqual(recovered["turn_id"], "turn-fixture-1")
+                self.assertEqual(recovered["native_input_id"], "native-item-fixture-9")
+                self.assertEqual(
+                    sum(m.get("method") == "turn/start" for m in transport.sent), 1
+                )
+                observed = recovered_engine.observation()
+                turn = observed["turns"][0]
+                self.assertEqual(turn["sessionId"], "thread-fixture-root")
+                self.assertEqual(turn["turnId"], "turn-fixture-1")
+                self.assertEqual(turn["nativeInputId"], "native-item-fixture-9")
+                self.assertEqual(turn["clientUserMessageId"], "operation-fixture-dispatch")
+                self.assertNotIn("terminal", turn)
+                self.assertEqual(ControllerEngine._turn_observation("s", "t", "interrupted")["terminal"], "cancelled")
+
+                changed_route = json.loads(json.dumps(route))
+                changed_route["native_options"]["model"] = "different-model"
+                changed = recovered_engine.handle(
+                    {
+                        **dispatch,
+                        "operation_id": "operation-fixture-wrong-route",
+                        "route": changed_route,
+                    }
+                )[0]
+                self.assertEqual(changed["outcome"], "rejected")
+                self.assertEqual(changed["details"]["diagnostic_code"], "ROUTE_CONFIGURATION_MISMATCH")
+                self.assertEqual(
+                    sum(m.get("method") == "turn/start" for m in transport.sent), 1
+                )
+        finally:
+            client.close()
+
+    def test_open_fails_closed_on_unconfirmed_thread_workspace_or_identity(self):
+        route = {
+            "runtime": "codex",
+            "module_artifact_id": MODULE_ARTIFACT_ID,
+            "native_options": {
+                "workspaceRoot": "C:\\Fixture\\workspace",
+                "modelProvider": "fixture-provider",
+                "model": "fixture-model",
+            },
+        }
+
+        cases = (
+            ("workspace-mismatch", "C:\\Fixture\\other", True, "workspace_mismatch"),
+            ("workspace-missing", None, True, "workspace_unknown"),
+            ("identity-missing", "C:\\Fixture\\workspace", False, "workspace_exact"),
+        )
+        for case_name, cwd, include_id, workspace_status in cases:
+            with self.subTest(case=case_name):
+                script = json.loads(CONTROLLER_FIXTURE.read_text(encoding="utf-8"))
+                returned_thread = script["responses"]["thread/start"]["result"]["thread"]
+                if cwd is None:
+                    returned_thread.pop("cwd", None)
+                else:
+                    returned_thread["cwd"] = cwd
+                if not include_id:
+                    returned_thread.pop("id", None)
+
+                transport = ScriptedPeerTransport(script)
+                client = SharedCodexClient(
+                    transport, allowed_methods=bridge.CONTROLLER_METHODS
+                )
+                client.start()
+                try:
+                    init = client.initialize()
+                    executor = bridge._executor_block(client, init)
+                    scope_key = "codex-appserver:fixture:codex-app-server-fixture:0.153.4"
+                    owner = {
+                        "version": 1,
+                        "process": {"purpose": "module"},
+                        "token": f"boot-{case_name}",
+                    }
+                    with tempfile.TemporaryDirectory() as temp_dir:
+                        checkpoint = Checkpoint(Path(temp_dir), owner)
+                        engine = ControllerEngine(
+                            checkpoint, lambda: (client, executor, scope_key)
+                        )
+                        opened = engine.handle(
+                            {
+                                "operation_id": f"operation-{case_name}",
+                                "method": "agent.open",
+                                "route": route,
+                            }
+                        )[0]
+                        self.assertEqual(opened["outcome"], "unknown")
+                        self.assertEqual(
+                            opened["details"]["requested_workspace_root"],
+                            "C:\\Fixture\\workspace",
+                        )
+                        self.assertEqual(
+                            opened["details"]["workspace_status"], workspace_status
+                        )
+                        if include_id:
+                            self.assertEqual(opened["native_root_id"], "thread-fixture-root")
+                            self.assertEqual(
+                                opened["details"]["observed_workspace_root"], cwd
+                            )
+                            observed_thread = engine.observation()["native"]["thread"]
+                            self.assertEqual(
+                                observed_thread["requested_workspace_root"],
+                                "C:\\Fixture\\workspace",
+                            )
+                            self.assertEqual(
+                                observed_thread["observed_workspace_root"], cwd
+                            )
+                            self.assertEqual(
+                                observed_thread["workspace_status"], workspace_status
+                            )
+                            self.assertNotIn("workspace_root", observed_thread)
+                        else:
+                            self.assertNotIn("native_root_id", opened)
+                            self.assertEqual(
+                                opened["details"]["observed_workspace_root"],
+                                "C:\\Fixture\\workspace",
+                            )
+                            # A repeated open operation has an ambiguous
+                            # native effect; it must retain Unknown without
+                            # issuing a second thread/start.
+                            repeated = engine.handle(
+                                {
+                                    "operation_id": f"operation-{case_name}",
+                                    "method": "agent.open",
+                                    "route": route,
+                                }
+                            )[0]
+                            self.assertEqual(repeated["outcome"], "unknown")
+                            self.assertEqual(
+                                repeated["details"]["diagnostic_code"],
+                                "THREAD_START_IDENTITY_MISSING",
+                            )
+                        self.assertEqual(
+                            sum(m.get("method") == "thread/start" for m in transport.sent),
+                            1,
+                        )
+                finally:
+                    client.close()
+
+    def test_steer_requires_persisted_ack_and_history_turn_match(self):
+        route = {
+            "runtime": "codex",
+            "module_artifact_id": MODULE_ARTIFACT_ID,
+            "native_options": {
+                "workspaceRoot": "C:\\Fixture\\workspace",
+                "modelProvider": "fixture-provider",
+                "model": "fixture-model",
+            },
+        }
+
+        def make_engine(operation_id, ack_turn, history_turn, *, lose_ack=False):
+            script = json.loads(CONTROLLER_FIXTURE.read_text(encoding="utf-8"))
+            thread = script["responses"]["thread/read"]["result"]["thread"]
+            thread["id"] = "thread-steer-root"
+            thread["status"] = {"type": "active", "activeFlags": []}
+            script["responses"]["thread/read"]["result"]["thread"] = thread
+            script["responses"]["thread/turns/list"] = {
+                "result": {
+                    "data": [{"id": "turn-expected", "status": "inProgress", "items": []}],
+                    "nextCursor": None,
+                }
+            }
+            if lose_ack:
+                script["responses"]["turn/steer"] = {
+                    "error": {"code": -32000, "message": "synthetic lost acknowledgment"}
+                }
+            else:
+                script["responses"]["turn/steer"] = {"result": {"turnId": ack_turn}}
+            script["responses"]["thread/items/list"] = {
+                "result": {
+                    "data": [
+                        {
+                            "turnId": history_turn,
+                            "item": {
+                                "id": f"native-item-{operation_id}",
+                                "clientId": operation_id,
+                                "content": [{"type": "text", "text": "continue this turn"}],
+                                "type": "userMessage",
+                            },
+                        }
+                    ],
+                    "nextCursor": None,
+                }
+            }
+            transport = ScriptedPeerTransport(script)
+            client = SharedCodexClient(
+                transport, allowed_methods=bridge.CONTROLLER_METHODS
+            )
+            client.start()
+            init = client.initialize()
+            owner = {"version": 1, "process": {"purpose": "module"}, "token": "boot-steer"}
+            temp_dir = tempfile.TemporaryDirectory()
+            checkpoint = Checkpoint(Path(temp_dir.name), owner)
+            checkpoint.data.update(
+                native_root_id="thread-steer-root",
+                native_scope_key="codex-appserver:fixture:server:0.153.4",
+                requested_model_provider="fixture-provider",
+                requested_model="fixture-model",
+                effective_model_provider="fixture-provider",
+                effective_model="fixture-model",
+                effective_model_status="thread_configuration_exact",
+                workspace_root="C:\\Fixture\\workspace",
+            )
+            checkpoint.save()
+            executor = bridge._executor_block(client, init)
+            engine = ControllerEngine(
+                checkpoint,
+                lambda: (
+                    client,
+                    executor,
+                    "codex-appserver:fixture:server:0.153.4",
+                ),
+            )
+            command = {
+                "operation_id": operation_id,
+                "method": "agent.send",
+                "native_root_id": "thread-steer-root",
+                "route": route,
+                "input": {
+                    "text": "continue this turn",
+                    "delivery": "steer",
+                    "expected_turn_id": "turn-expected",
+                },
+            }
+            return temp_dir, checkpoint, client, transport, engine, command
+
+        cases = (
+            ("steer-ack-mismatch", "turn-other", "turn-expected", "steer_ack_turn_mismatch"),
+            ("steer-history-mismatch", "turn-expected", "turn-other", "steer_history_turn_mismatch"),
+        )
+        for operation_id, ack_turn, history_turn, expected_diagnostic in cases:
+            with self.subTest(operation_id=operation_id):
+                temp_dir, checkpoint, client, transport, engine, command = make_engine(
+                    operation_id, ack_turn, history_turn
+                )
+                try:
+                    outcome = engine.handle(command)[0]
+                    self.assertEqual(checkpoint.data["operations"][operation_id]["expected_turn_id"], "turn-expected")
+                    self.assertEqual(outcome["outcome"], "unknown")
+                    self.assertEqual(outcome["details"]["diagnostic_code"], expected_diagnostic)
+                    self.assertEqual(
+                        sum(message.get("method") == "turn/steer" for message in transport.sent), 1
+                    )
+                finally:
+                    client.close()
+                    temp_dir.cleanup()
+
+        temp_dir, checkpoint, client, transport, engine, command = make_engine(
+            "steer-lost-ack", None, "turn-other", lose_ack=True
+        )
+        try:
+            first = engine.handle(command)[0]
+            self.assertEqual(first["outcome"], "unknown")
+            self.assertEqual(
+                checkpoint.data["operations"]["steer-lost-ack"]["expected_turn_id"],
+                "turn-expected",
+            )
+            reconciled = engine.handle(
+                {
+                    "operation_id": "reconcile-steer-lost-ack",
+                    "method": "agent.reconcile",
+                    "input": {"operation_id": "steer-lost-ack"},
+                }
+            )
+            self.assertEqual(reconciled[0]["outcome"], "unknown")
+            self.assertEqual(
+                reconciled[1]["details"]["disposition"],
+                "steer_history_turn_mismatch",
+            )
+            self.assertEqual(
+                sum(message.get("method") == "turn/steer" for message in transport.sent), 1
+            )
+        finally:
+            client.close()
+            temp_dir.cleanup()
+
+        temp_dir, checkpoint, client, transport, engine, command = make_engine(
+            "old-checkpoint-steer", None, "turn-expected"
+        )
+        try:
+            checkpoint.data["operations"]["old-checkpoint-steer"] = {
+                "method": "agent.send",
+                "kind": "send",
+                "state": "native_effect_may_have_started",
+                "native_root_id": "thread-steer-root",
+                "native_scope_key": "codex-appserver:fixture:server:0.153.4",
+                "client_user_message_id": "old-checkpoint-steer",
+                "prompt_sha256": hashlib.sha256(b"continue this turn").hexdigest(),
+                "prompt_bytes": len(b"continue this turn"),
+                "delivery": "steer",
+                "outcome": None,
+            }
+            checkpoint.save()
+            outcome = engine.handle(command)[0]
+            self.assertEqual(outcome["outcome"], "unknown")
+            self.assertEqual(
+                outcome["details"]["diagnostic_code"], "expected_steer_turn_missing"
+            )
+            sent_methods = [message.get("method") for message in transport.sent]
+            self.assertNotIn("turn/steer", sent_methods)
+            self.assertNotIn("thread/items/list", sent_methods)
+        finally:
+            client.close()
+            temp_dir.cleanup()
+
+    def test_legacy_unknown_scope_allows_reconcile_but_blocks_new_dispatch(self):
+        script = json.loads(CONTROLLER_FIXTURE.read_text(encoding="utf-8"))
+        transport = ScriptedPeerTransport(script)
+        client = SharedCodexClient(
+            transport, allowed_methods=bridge.CONTROLLER_METHODS
+        )
+        client.start()
+        init = client.initialize()
+        executor = bridge._executor_block(client, init)
+        root_id = "thread-fixture-root"
+        operation_id = "operation-fixture-dispatch"
+        prompt = "Task specification: {}\n\nreturn marker"
+        prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        legacy_scope = "codex-appserver:fixture:unknown-server:unknown-version"
+        owner = {"version": 1, "process": {"purpose": "module"}, "token": "boot-legacy"}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint = Checkpoint(Path(temp_dir), owner)
+            checkpoint.data.update(
+                native_root_id=root_id,
+                native_scope_key=legacy_scope,
+                legacy_scope_read_only=True,
+                requested_model_provider="fixture-provider",
+                requested_model="fixture-model",
+                effective_model_provider="fixture-provider",
+                effective_model="fixture-model",
+                effective_model_status="thread_configuration_exact",
+                workspace_root="C:\\Fixture\\workspace",
+                requested_workspace_root="C:\\Fixture\\workspace",
+                observed_workspace_root="C:\\Fixture\\workspace",
+                workspace_status="workspace_exact",
+            )
+            checkpoint.data["operations"][operation_id] = {
+                "method": "task.dispatch",
+                "kind": "send",
+                "state": "reported_pending",
+                "native_root_id": root_id,
+                "native_scope_key": legacy_scope,
+                "client_user_message_id": operation_id,
+                "requested_model_provider": "fixture-provider",
+                "requested_model": "fixture-model",
+                "effective_model_provider": "fixture-provider",
+                "effective_model": "fixture-model",
+                "prompt_sha256": prompt_hash,
+                "prompt_bytes": len(prompt.encode("utf-8")),
+                "delivery": "next_turn",
+                "returned_turn_id": "turn-fixture-1",
+                "turn_status": "inProgress",
+                "outcome": {
+                    "operation_id": operation_id,
+                    "outcome": "unknown",
+                    "native_root_id": root_id,
+                    "native_scope_key": legacy_scope,
+                    "details": {"diagnostic_code": "prior_readback_unavailable"},
+                },
+            }
+            checkpoint.save()
+            engine = ControllerEngine(
+                checkpoint,
+                lambda: (client, executor, legacy_scope),
+            )
+            try:
+                reconciled = engine.handle(
+                    {
+                        "operation_id": "operation-fixture-reconcile",
+                        "method": "agent.reconcile",
+                        "input": {"operation_id": operation_id},
+                    }
+                )
+                self.assertEqual(reconciled[0]["outcome"], "applied")
+                self.assertEqual(reconciled[0]["turn_id"], "turn-fixture-1")
+                self.assertEqual(
+                    reconciled[0]["native_input_id"], "native-item-fixture-9"
+                )
+                self.assertEqual(reconciled[0]["native_scope_key"], legacy_scope)
+                self.assertEqual(reconciled[1]["details"]["resolved"], True)
+
+                route = {
+                    "runtime": "codex",
+                    "module_artifact_id": MODULE_ARTIFACT_ID,
+                    "native_options": {
+                        "workspaceRoot": "C:\\Fixture\\workspace",
+                        "modelProvider": "fixture-provider",
+                        "model": "fixture-model",
+                    },
+                }
+                rejected = engine.handle(
+                    {
+                        "operation_id": "operation-fixture-new-dispatch",
+                        "method": "task.dispatch",
+                        "native_root_id": root_id,
+                        "route": route,
+                        "input": {
+                            "task_snapshot": {},
+                            "task_snapshot_canonical": "{}",
+                            "text": "return marker",
+                        },
+                    }
+                )[0]
+                self.assertEqual(rejected["outcome"], "rejected")
+                self.assertEqual(
+                    rejected["details"]["diagnostic_code"],
+                    "LEGACY_NATIVE_SCOPE_READ_ONLY",
+                )
+                self.assertEqual(checkpoint.data["native_scope_key"], legacy_scope)
+                sent_methods = [
+                    message.get("method")
+                    for message in transport.sent
+                    if message.get("method")
+                ]
+                self.assertEqual(sent_methods.count("thread/items/list"), 1)
+                self.assertNotIn("thread/start", sent_methods)
+                self.assertNotIn("turn/start", sent_methods)
+                self.assertNotIn("turn/steer", sent_methods)
+            finally:
+                client.close()
 
 
 if __name__ == "__main__":

@@ -1,7 +1,11 @@
 //! External modules share this command boundary, not vendor request schemas.
+pub mod batch;
+pub mod codex;
 pub mod opencode_v2;
 pub mod owner;
+pub mod prepared;
 pub(crate) mod prerequisites;
+pub mod warm_stream;
 pub mod zed;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

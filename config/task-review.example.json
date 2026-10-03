@@ -12,6 +12,7 @@
     }
   ],
   "dependencies": [],
+  "owner_policy_id": "owner-policy-v1",
   "scope": {
     "initial_paths": [
       "src/"

@@ -1,0 +1,42 @@
+{
+  "messages": [
+    {
+      "type": "system",
+      "subtype": "init",
+      "session_id": "ses_task_input_fixture",
+      "claude_code_version": "2.1.278-fixture",
+      "model": "claude-sonnet-5-20261001",
+      "permissionMode": "default",
+      "apiKeySource": "none",
+      "tools": [],
+      "uuid": "task-input-init-frame"
+    },
+    {
+      "type": "result",
+      "subtype": "success",
+      "session_id": "ses_task_input_fixture",
+      "uuid": "task-input-result-frame-1",
+      "result_index": 0,
+      "user_message_uuid": "d34d0011-1111-4111-8111-111111111111",
+      "user_message_uuids": ["d34d0011-1111-4111-8111-111111111111"],
+      "result": "first task output",
+      "is_error": false,
+      "stop_reason": "end_turn",
+      "num_turns": 1
+    },
+    {
+      "type": "result",
+      "subtype": "success",
+      "session_id": "ses_task_input_fixture",
+      "uuid": "task-input-result-frame-2",
+      "result_index": 1,
+      "user_message_uuid": "d34d0022-2222-4222-8222-222222222222",
+      "user_message_uuids": ["d34d0022-2222-4222-8222-222222222222"],
+      "result": "second task output",
+      "is_error": false,
+      "stop_reason": "end_turn",
+      "num_turns": 1
+    }
+  ],
+  "note": "Fixture follows the pinned Claude Agent SDK 0.3.287 SDKResultSuccess shape. It is not a live capture. Each distinct client user UUID is correlated with one terminal result frame, effective system/init model and output digest input."
+}

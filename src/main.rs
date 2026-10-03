@@ -34,7 +34,11 @@ enum Command {
     /// Serve the application API as MCP tools over stdio for a General Manager
     /// client. A client of the running host over the same local IPC as the CLI;
     /// never opens the database or a network listener.
-    Mcp,
+    Mcp {
+        /// Named profile from the local [mcp.profiles] configuration table.
+        #[arg(long, value_name = "NAME")]
+        profile: Option<String>,
+    },
     /// Independently run one bridge under a persistent, non-killing process owner.
     ModuleRun {
         #[arg(long)]
@@ -306,8 +310,9 @@ async fn run(cli: Cli) -> Result<()> {
         &cli.credential
             .unwrap_or_else(|| config.storage.data_dir.join("operator.json")),
     )?;
-    if matches!(&cli.command, Command::Mcp) {
-        return eliot_swarm_controller::mcp::run(config, credential).await;
+    if let Command::Mcp { profile } = &cli.command {
+        return eliot_swarm_controller::mcp::run_profiled(config, credential, profile.as_deref())
+            .await;
     }
     if let Command::Artifact {
         command: ArtifactCommand::Export { artifact_id, out },
@@ -326,7 +331,10 @@ async fn run(cli: Cli) -> Result<()> {
     }
     let mut pending_credential = None;
     let (method, mut params) = match cli.command {
-        Command::Host | Command::Mcp | Command::CheckWorker { .. } | Command::ModuleRun { .. } => {
+        Command::Host
+        | Command::Mcp { .. }
+        | Command::CheckWorker { .. }
+        | Command::ModuleRun { .. } => {
             unreachable!("executor returned above")
         }
         Command::Source {

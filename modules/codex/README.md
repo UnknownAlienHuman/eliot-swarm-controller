@@ -1,88 +1,89 @@
-# Codex bridge (C07, slice 1: shared-server attach, read-only)
+# Codex app-server bridge
 
-External bridge module for the **existing shared Codex app-server**. The
-whole pinned upstream Python SDK (`openai/codex`, `sdk/python`) is kept as
-one usable unit under `vendor_bridge/`; this directory's own code
-(`bridge.py`) adapts its transport to the shared server's WebSocket and
-exposes only an attach/read surface. The Rust host, the shared server's
-lifecycle and the shared `.codex` home are untouched by this slice, and no
-controller route is registered yet (see "Scope" below).
+This module has two explicit modes over an operator-owned Codex app-server:
+the `describe` / `open` / `snapshot` observer CLI and the registered Rust-host
+controller. The controller can create a thread with the route's exact
+`modelProvider` and `model`, submit one user input, steer one verified active
+turn, read native history, reconcile a saved operation, and explicitly resume
+a saved thread. It never starts or stops the shared app-server.
 
 ## Setup
 
-```sh
+Create a module-local Python environment and install only the pinned
+requirements:
+
+```powershell
 cd modules/codex
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt   # exact pins, module-local
-python3 verify_vendor.py                    # donor tree == SHA256SUMS
+py -3 -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+.venv\Scripts\python.exe verify_vendor.py
 ```
 
-Copy `module.example.json` outside the repository, keep it untracked, and
-adjust `endpoint`. The referenced server is started by the operator, for
-example `codex app-server --listen ws://127.0.0.1:4500`; this bridge never
-starts, stops or owns it. When the server requires WebSocket
-authentication, `tokenEnv` names the environment variable holding its
-bearer capability token (`--capability-token-file` / `--ws-auth` on the
-server side); the token is read from the environment at connect time and
-never appears in the config file, in output, or on a command line.
+Copy `module.example.json` outside the repository and set `endpoint`,
+`hostEndpoint`, and `credentialFile`. The referenced app-server is already
+running and remains operator-owned. `tokenEnv`, when set, names an environment
+variable containing its WebSocket bearer token; the token is never stored in
+the config file or logged. The host injects `ELIOT_SWARM_MODULE_STATE` and
+`ELIOT_SWARM_MODULE_OWNER` for the controller's private operation checkpoint.
 
-## Use
+## Observer CLI
 
-```sh
-.venv/bin/python bridge.py --config /path/to/codex-module.json describe
-.venv/bin/python bridge.py --config /path/to/codex-module.json open --thread <native-thread-id>
-.venv/bin/python bridge.py --config /path/to/codex-module.json snapshot [--limit N] [--cursor C] [--source-kinds cli vscode ...]
+```powershell
+.venv\Scripts\python.exe bridge.py --config C:\SwarmState\codex-module.json describe
+.venv\Scripts\python.exe bridge.py --config C:\SwarmState\codex-module.json open --thread <native-thread-id>
+.venv\Scripts\python.exe bridge.py --config C:\SwarmState\codex-module.json snapshot --limit 20
 ```
 
-Every outcome is one JSON object on stdout and always carries an
-`executor` block: the **server's** reported name/version (the actual
-executor that served the calls) kept separate from the **pinned SDK**
-identity (`openai-codex` `0.0.0-dev` at the vendored upstream commit and
-the donor's matching-binary pin). Errors are reported as an `error`
-object on stderr with exit 1; nothing is fabricated on failure.
+The observer attaches passively. Its client allowlist permits only
+`initialize`, `initialized`, `thread/read`, and `thread/list`.
 
-## Fixture checks
+## Registered controller
 
-No live server is needed to verify the slice:
+The operator launches the bridge through the managed module owner. Use the
+absolute paths of the pinned module-local Python interpreter and bridge:
 
-```sh
-.venv/bin/python -m unittest test_bridge -v
-.venv/bin/python bridge.py --fixture fixtures/recorded_session.json snapshot
+```powershell
+swarm module-run --state-dir C:\SwarmState\codex-owner --command ABSOLUTE_PYTHON_PATH -- ABSOLUTE_BRIDGE_PATH --config C:\SwarmState\codex-module.json module
 ```
 
-`fixtures/recorded_session.json` is a **synthetic script**, not a live
-capture: request ids are generated per call, so the fixture peer answers
-each request from a method→result script and echoes its id; every result
-is still validated by the pinned SDK's generated models. The tests assert
-the slice's acceptance properties: `initialize` precedes every read, a
-read issues no resume/start/turn/goal method, the method allowlist blocks
-mutating calls before the socket, server-initiated approvals are
-declined, one JSON-RPC object travels per WebSocket text frame (including
-a round-trip over a real local WebSocket), and the executor version is
-present in every outcome.
+The route must select `runtime = "codex"`, artifact
+`codex-sdk-18194bf-bridge.2`, and explicit `native_options.modelProvider`,
+`native_options.model`, and absolute `native_options.workspaceRoot`. Model
+configuration and effort changes are unavailable; the controller never
+silently chooses a model. `agent.open` records the requested route separately
+from the model/provider returned by native `thread/start`. Served model and
+billing remain `unknown` unless native evidence says otherwise.
 
-## Scope and boundaries
+`task.dispatch` and `agent.send` record the operation identity before issuing
+`turn/start` or `turn/steer`. They use the operation ID as
+`clientUserMessageId` and confirm the unique native user item, its content
+digest, its actual item ID, and associated turn ID from history. A lost
+turn-input acknowledgment is reconciled by reading history; the input is never replayed.
+Steering requires the exact active turn ID. Resume is explicit through
+`agent.recover`; reconnecting the WebSocket alone does not resume a thread.
 
-Delivered in this slice: WebSocket attach + `describe` / `open`
-(`thread/read`, passive — read is not resume) / `snapshot`
-(`thread/list`). **Not** in this slice, by plan: send/turn methods,
-native goal controls (they follow the comparable OpenCode goal slice in a
-later C07 slice), thread fork/archive/name, account/config reads, any
-Rust host or route registration, WebSocket-over-Unix-socket endpoints,
-and reconnect/single-flight handling for a failed attach. `sourceKinds`
-on `snapshot` is passed through verbatim only when the caller supplies
-it: which values the installed server's schema accepts — and the
-experimental lineage filters (`parentThreadId` / `ancestorThreadId`,
-absent from this pin's `ThreadListParams`) — are live-qualification
-points against the actually installed server, whose matrix entry is
-still `installed_runtime_verified: false`. An owned JSONL app-server is a
-separate, explicitly chosen deployment mode and is never a fallback when
-a shared-server attach fails.
+`thread/start` has no caller-selected correlation ID. A lost creation
+acknowledgment therefore leaves `agent.open` unknown and reserves that opening;
+the bridge cannot safely find a replacement thread or repeat creation. Native
+readiness is the last recorded observation until a subsequent successful read
+re-establishes it after a socket disconnect.
 
-Transport notes: the pinned SDK's own transport spawns `codex app-server`
-over stdio JSONL and cannot attach; `bridge.py` subclasses its
-`CodexClient` and replaces only the transport touch-points, reusing the
-SDK's router and generated protocol types unchanged (donor stays
-byte-identical, verified by `SHA256SUMS`). No RFC 6455 framing is
-hand-written; frames are the `websockets` library's, one JSON-RPC
-message per text frame, matching the app-server WebSocket transport.
+This bridge does not implement dynamic tools, file/command execution, goal
+controls, artifacts, or background work. App-server approval requests are
+answered with their schema's explicit deny/refuse form; a request the bridge
+does not recognize fails closed and does not receive an empty success object.
+Unsupported features are reported unavailable, not simulated.
+
+## Fixture verification
+
+The scripted peer fixtures validate the pinned SDK's actual JSON-RPC request
+and response models; they are synthetic and do not establish live provider
+availability or model service identity. A focused controller check is:
+
+```powershell
+.venv\Scripts\python.exe -m unittest test_bridge.BridgeFixtureTests.test_controller_exact_model_and_dual_native_identity_readback test_bridge.BridgeFixtureTests.test_server_requests_get_schema_shaped_non_granting_replies -v
+```
+
+The vendored `openai/codex/sdk/python` unit is kept byte-identical to upstream.
+All transport and controller adaptation is ELIOT-owned code outside
+`vendor_bridge/`.

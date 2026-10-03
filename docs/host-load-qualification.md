@@ -13,8 +13,9 @@ one run measured, under the conditions stated below, and no more.
 
 `tools/host-load.py` (Python 3 standard library only) starts one real
 `swarm host` process on a fresh temporary data directory and drives it over
-its local IPC — newline-delimited JSON-RPC 2.0 on the Unix socket
-(`control.sock`; the request `id` must be a nonempty string,
+its local IPC — newline-delimited JSON-RPC 2.0 on the Unix socket or the
+Windows named pipe (`control.sock` or the host's announced pipe; the
+request `id` must be a nonempty string,
 `model::Request::validate`). No `--config` is passed, so the `config.rs`
 defaults apply (`max_connections = 256`,
 `max_inflight_per_connection = 8`, `max_frame_bytes = 1 048 576`).
@@ -42,9 +43,10 @@ Phases, in order:
    admissions exactly; a mismatch fails the run (exit 1) and is reported,
    not hidden.
 6. **Post-load latency and state.** `host.status` samples again, final
-   counters, database size, and host RSS (VmRSS sampled every 250 ms;
-   Linux `/proc`, reported as null elsewhere). The host is stopped with
-   SIGINT and its exit code recorded. The temporary data directory is
+   counters, database size, and host memory (Linux VmRSS or Windows
+   working set sampled every 250 ms) plus OS process CPU counters. The
+   fixture host is stopped after verification and its disposition recorded.
+   The temporary data directory is
    removed unless `--keep-data-dir` is given.
 
 Reproduce:
@@ -53,6 +55,38 @@ Reproduce:
 cargo build --locked --release --bin swarm
 python3 tools/host-load.py --swarm target/release/swarm --out result.json
 ```
+
+## Windows owner-machine observation, 2026-10-03
+
+The updated harness ran once on Windows against the R2 release snapshot
+(binary SHA-256 `5893e3184f499b1b29841562b086f7519f43c40f35719802ba27e706708125bc`).
+This was an uncommitted integration build from the `3ecdf527` baseline;
+the checksum identifies the measured executable, not a later source commit.
+The same 200 clients, 32 senders, 168 consumers and 20-second load contour
+used real named-pipe IPC and SQLite durable writes. It invoked no native
+module or model.
+
+| Measurement | Result |
+|---|---|
+| Register / connect 200 clients | 0.374 s / 0.027 s |
+| Idle `host.status` p95 | 0.153 ms |
+| Sequential `task.create` p95 | 2.994 ms |
+| Durable `message.send` admissions | 5,661 successful, 0 errors |
+| Window including sender drain | 21.561 s; 262.6 events/s |
+| Verification drain | Exactly 5,661 matching events |
+| `host.status` p95 / p99 under load | 1,283.815 ms / 1,383.568 ms |
+| Host working set, idle / peak / final | 16,695,296 / 28,852,224 / 17,526,784 bytes |
+| Host / driver CPU | 14.969 s / 1.480 s |
+| Native modules connected | 0 |
+
+The integrity and 200-client checks passed. **This run did not meet the
+1,000-events/s or loaded-status p95 below 100 ms targets.** The measured
+status delay remains material queueing under concurrent durable writes;
+idle latency does not establish performance under load. The harness
+terminated only its owned, empty fixture host after draining and recorded
+Windows exit code 1 with that explicit termination disposition. Private
+raw results and the retained fixture database are local qualification
+evidence; the numbers above do not qualify native runtime capacity.
 
 ## Recorded run
 

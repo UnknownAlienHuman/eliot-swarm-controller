@@ -18,19 +18,35 @@
 //   result replaces the previous snapshot; results are never summed.
 // - An error result before init is an init failure, kept distinct from a
 //   failed turn and from an empty successful start.
+import { modelSelectionFacts } from './model-selection.mjs';
+import { createHash } from 'node:crypto';
 
 const MAX_MESSAGES = 200;
 const MAX_CHILDREN = 100;
 const MAX_TURNS = 32;
 const MAX_PERMISSION_REQUESTS = 32;
 const MAX_TASK_NOTIFICATIONS = 32;
+const MAX_INPUT_EXECUTIONS = 64;
+const SDK_RESULT_ERROR_SUBTYPES = new Set([
+  'error_during_execution',
+  'error_max_turns',
+  'error_max_budget_usd',
+  'error_max_structured_output_retries',
+]);
+
+function resultTerminalStatus(subtype, isError) {
+  if (typeof isError !== 'boolean') return null;
+  if (subtype === 'success') return isError ? 'failed' : 'completed';
+  return SDK_RESULT_ERROR_SUBTYPES.has(subtype) ? 'failed' : null;
+}
 
 export function createStreamState() {
   return {
     phase: 'awaiting_init', // awaiting_init | ready | init_failed | stream_ended | stream_failed
+    requested_model: null,
     init: null,
     init_failure: null,
-    execution: 'not_started', // not_started | running | turn_completed | turn_failed | init_failed | stream_ended | stream_failed
+    execution: 'not_started', // not_started | running | turn_completed | turn_failed | turn_unknown | init_failed | stream_ended | stream_failed
     messages: new Map(), // message.id -> record, insertion ordered
     frame_uuids: new Set(),
     children: new Map(), // Task/Agent tool_use id -> child record
@@ -40,6 +56,7 @@ export function createStreamState() {
     permission_denials_advisory: [],
     permission_requests: [],
     task_notifications: [],
+    input_executions: [], // native user UUID -> one exact SDK result frame, when unambiguous
     native_events_seen: 0,
     partial_events_seen: 0,
     other_events: 0,
@@ -189,7 +206,12 @@ function compactUsageNumbers(value) {
 }
 
 function applyResult(state, msg) {
-  const subtype = typeof msg.subtype === 'string' ? msg.subtype : 'unknown';
+  const rawSubtype = typeof msg.subtype === 'string' && msg.subtype.length > 0
+    ? msg.subtype
+    : null;
+  const subtype = rawSubtype ?? 'unknown';
+  const isError = typeof msg.is_error === 'boolean' ? msg.is_error : null;
+  const terminalStatus = resultTerminalStatus(rawSubtype, isError);
   if (state.phase === 'awaiting_init' && subtype === 'error_during_execution') {
     state.phase = 'init_failed';
     state.init_failure = {
@@ -208,8 +230,49 @@ function applyResult(state, msg) {
   };
   state.turns.push(turn);
   if (state.turns.length > MAX_TURNS) { state.turns.splice(0, state.turns.length - MAX_TURNS); state.gaps++; }
+  const sessionId = typeof msg.session_id === 'string' ? msg.session_id : null;
+  const primaryId = typeof msg.user_message_uuid === 'string' && msg.user_message_uuid
+    ? msg.user_message_uuid
+    : null;
+  const listedIds = Array.isArray(msg.user_message_uuids)
+    ? msg.user_message_uuids.filter(id => typeof id === 'string' && id.length > 0)
+    : null;
+  const inputIds = listedIds === null ? (primaryId ? [primaryId] : []) : [...new Set(listedIds)];
+  if (sessionId && sessionId === state.init?.session_id && typeof msg.uuid === 'string' && inputIds.length) {
+    const uniqueLink = listedIds === null
+      ? primaryId !== null
+      : listedIds.length === 1 && listedIds[0] === primaryId;
+    const output = typeof msg.result === 'string' ? msg.result : null;
+    const inputExecution = {
+      native_session_id: sessionId,
+      native_input_id: null,
+      user_message_uuid: primaryId,
+      user_message_uuids: inputIds.slice(0, 64),
+      correlation: uniqueLink ? 'unique' : 'ambiguous_multi_input',
+      result_frame_uuid: msg.uuid,
+      result_index: typeof msg.result_index === 'number' ? msg.result_index : null,
+      result_subtype: rawSubtype,
+      terminal_status: terminalStatus,
+      is_error: isError,
+      stop_reason: typeof msg.stop_reason === 'string' ? msg.stop_reason : null,
+      effective_model: typeof state.init?.model === 'string' ? state.init.model : null,
+      result_sha256: output === null ? null : createHash('sha256').update(output, 'utf8').digest('hex'),
+      result_bytes: output === null ? null : Buffer.byteLength(output, 'utf8'),
+    };
+    for (const inputId of inputExecution.user_message_uuids) {
+      state.input_executions.push({ ...inputExecution, native_input_id: inputId });
+    }
+    if (state.input_executions.length > MAX_INPUT_EXECUTIONS) {
+      state.input_executions.splice(0, state.input_executions.length - MAX_INPUT_EXECUTIONS);
+      state.gaps++;
+    }
+  }
   if (state.phase === 'init_failed' && state.execution === 'not_started') state.execution = 'init_failed';
-  else state.execution = subtype === 'success' ? 'turn_completed' : 'turn_failed';
+  else state.execution = terminalStatus === 'completed'
+    ? 'turn_completed'
+    : terminalStatus === 'failed'
+      ? 'turn_failed'
+      : 'turn_unknown';
   const modelUsage = {};
   if (msg.modelUsage && typeof msg.modelUsage === 'object') {
     for (const [model, entry] of Object.entries(msg.modelUsage)) {
@@ -356,14 +419,16 @@ function messageSnapshot(record) {
   };
 }
 
-export function snapshot(state) {
+export function snapshot(state, requestedModel = state.requested_model) {
   const messages = [...state.messages.values()];
+  const modelSelection = modelSelectionFacts(requestedModel, state.init?.model);
   return {
     adapter: {
       entrypoint: 'claude_agent_sdk_streaming_input',
       phase: state.phase,
       executor_version: state.init?.claude_code_version ?? null,
       model: state.init?.model ?? null,
+      ...modelSelection,
       permission_mode: state.init?.permission_mode ?? null,
       tools_count: state.init?.tools_count ?? null,
       effort_observed: state.init?.effort ?? null,
@@ -383,6 +448,7 @@ export function snapshot(state) {
     turns: state.turns,
     usage: state.usage,
     task_notifications: state.task_notifications,
+    input_executions: state.input_executions,
     init_failure: state.init_failure,
     stream_error: state.stream_error ?? null,
     stderr_tail: state.stderr_tail ? state.stderr_tail.slice(-512) : null,

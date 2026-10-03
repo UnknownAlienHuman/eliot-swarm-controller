@@ -1,7 +1,10 @@
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -11,6 +14,38 @@ pub struct Config {
     pub ipc: Ipc,
     pub routes: Vec<Route>,
     pub checks: crate::checks::model::CheckConfig,
+    pub mcp: McpConfig,
+    pub forge: crate::forge::ForgeConfig,
+    pub schedules: Vec<crate::scheduler::ScheduleConfig>,
+}
+
+/// Closed MCP method surfaces. A profile never changes the ELIOT role carried
+/// by the selected credential; the application checks that role separately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpToolProfile {
+    Observer,
+    Reviewer,
+    Manager,
+    Gm,
+    Full,
+}
+
+/// One local, named binding between an MCP tool profile and its ELIOT client.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpProfileConfig {
+    pub tool_profile: McpToolProfile,
+    pub expected_client_id: String,
+}
+
+/// MCP profile selection is local configuration; the selected name and
+/// client binding are fixed when `swarm mcp` starts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct McpConfig {
+    pub default_profile: String,
+    pub profiles: BTreeMap<String, McpProfileConfig>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -63,7 +98,94 @@ impl Default for Config {
             ipc: Ipc::default(),
             routes: Vec::new(),
             checks: crate::checks::model::CheckConfig::default(),
+            mcp: McpConfig::default(),
+            forge: crate::forge::ForgeConfig::default(),
+            schedules: Vec::new(),
         }
+    }
+}
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            default_profile: "local-observer".into(),
+            profiles: BTreeMap::from([
+                (
+                    "local-observer".into(),
+                    McpProfileConfig {
+                        tool_profile: McpToolProfile::Observer,
+                        expected_client_id: "operator".into(),
+                    },
+                ),
+                (
+                    "local-full".into(),
+                    McpProfileConfig {
+                        tool_profile: McpToolProfile::Full,
+                        expected_client_id: "operator".into(),
+                    },
+                ),
+            ]),
+        }
+    }
+}
+
+impl McpConfig {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.profiles.is_empty() || !self.profiles.contains_key(&self.default_profile) {
+            return Err(Error::new(
+                "CONFIG_ERROR",
+                "MCP default_profile must name a configured profile",
+            ));
+        }
+        let mut client_ids = BTreeMap::new();
+        for (name, profile) in &self.profiles {
+            if name.is_empty()
+                || name.starts_with('-')
+                || name.ends_with('-')
+                || !name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+                || profile.expected_client_id.trim().is_empty()
+            {
+                return Err(Error::new(
+                    "CONFIG_ERROR",
+                    "MCP profile names must be lowercase identifiers and expected_client_id must be non-empty",
+                ));
+            }
+            // Full is the explicit local compatibility surface and may share
+            // its local operator identity with the default observer profile.
+            // Restricted named principals must remain one-to-one so Dot and
+            // Muse cannot silently select a credential bound to the other.
+            if profile.tool_profile != McpToolProfile::Full
+                && client_ids
+                    .insert(profile.expected_client_id.as_str(), name.as_str())
+                    .is_some()
+            {
+                return Err(Error::new(
+                    "CONFIG_ERROR",
+                    "restricted MCP profiles must use distinct expected_client_id values",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn selected_tool_profile(
+        &self,
+        selected_name: Option<&str>,
+        client_id: &str,
+    ) -> Result<McpToolProfile> {
+        let name = selected_name.unwrap_or(&self.default_profile);
+        let profile = self
+            .profiles
+            .get(name)
+            .ok_or_else(|| Error::new("CONFIG_ERROR", format!("unknown MCP profile {name:?}")))?;
+        if profile.expected_client_id != client_id {
+            return Err(Error::new(
+                "PROFILE_MISMATCH",
+                "selected MCP profile is not bound to this ELIOT client",
+            ));
+        }
+        Ok(profile.tool_profile)
     }
 }
 fn default_data_dir() -> PathBuf {
@@ -114,6 +236,12 @@ impl Config {
                 "unsupported version or invalid IPC/queue capacity",
             ));
         }
+        cfg.mcp.validate()?;
+        let config_dir =
+            std::env::current_dir()?.join(path.and_then(Path::parent).unwrap_or(Path::new(".")));
+        cfg.forge.resolve_paths(&config_dir)?;
+        cfg.forge.validate()?;
+        crate::scheduler::validate_schedules(&cfg.schedules)?;
         let mut aliases = std::collections::BTreeSet::new();
         for r in &cfg.routes {
             if r.alias.trim().is_empty()
@@ -124,6 +252,15 @@ impl Config {
                 return Err(Error::new(
                     "CONFIG_ERROR",
                     "route aliases must be unique; runtime and artifact are required",
+                ));
+            }
+            if r.enabled
+                && r.runtime == crate::runtime::codex::RUNTIME
+                && r.module_artifact_id != crate::runtime::codex::ARTIFACT_ID
+            {
+                return Err(Error::new(
+                    "CONFIG_ERROR",
+                    "Codex controller routes require the exact .2 artifact; the .1 observer is standalone",
                 ));
             }
         }

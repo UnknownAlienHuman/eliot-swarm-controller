@@ -1,41 +1,16 @@
 # Updating modules/command
 
-The mod and glue are one pinned unit. A changed unit is a **new module
-artifact**; never edit the mod or glue in place for a binding that may still
-run, and never let a running process pick up a half-updated pair.
+A change to the bridge/glue contract is a new module artifact. The current pair is `command-mod-0.1.0-glue.2`; the native mod remains `0.1.0`. Do not change a unit under a running binding.
 
-## When the vendor surface moves
+## Change protocol
 
-1. Re-read the official pages against the source registry ids in
-   `vendor.lock` (CC-MODS, CC-HEADLESS, CC-AGENTS). The ModApi is documented
-   as experimental: diff the event catalog, `queueMessage`, the tool
-   controls, and the headless result-line/exit-code tables before touching
-   code.
-2. If a documented field the module relies on changes meaning, the affected
-   capability drops back to `unknown` in `glue.mjs` `describe` until it is
-   re-verified — a schema fingerprint is a reason to compare, not a global
-   outage, and unaffected paths stay as they are.
-3. Current tool argument names are checked against the live contract, never
-   carried over from an older brief (the `background:true` vs
-   `run_in_background` discrepancy in the notes is the standing example).
-
-## Making a change
-
-1. Edit `mod/eliot-command.ts` and/or `glue.mjs`; bump `MOD_VERSION` in the
-   mod and the artifact id (`command-mod-<mod>-glue.<n>`) in `glue.mjs`,
-   `module.example.json`, and any route that names it.
-2. Recompute the pins and update `vendor.lock`:
-   `sha256sum mod/eliot-command.ts glue.mjs`.
-3. Run `npm run check` and `npm test`. The fixture host implements only
-   documented loader behavior; a mod change that needs more surface than the
-   fixture offers is a sign to re-check the docs, not to enrich the fixture.
-4. Only after an installed binary is available: qualify live per README
-   ("Remaining work") before calling the new artifact verified.
+1. Re-check the official headless and Mods pages named in `vendor.lock`. Update only behavior supported by those surfaces; the ModApi is experimental.
+2. Keep `task.dispatch` one-shot and keyed by the caller’s Operation ID. Persist admission before spawn. Reconcile reads the saved run/admission evidence; it never repeats native input. A missing or conflicting terminal fact stays `Unknown`.
+3. Keep the model ID explicit in the route and pass it through as `--model`. Do not infer effective identity from a request, alias, process exit, or model-authored text. Unsupported settings remain unavailable.
+4. The module config's `command` is the absolute Node executable and `commandArgs` is the fixed absolute native CLI entrypoint prefix. Never replace that argv boundary with a shell shim or user-controlled command line.
+5. Bump the artifact ID in `glue.mjs`, `bridge.mjs` (via the imported constant), `module.example.json`, `vendor.lock`, and the route config. Recompute the exact bridge, glue and shared IPC transport digests in `vendor.lock`; do not change the mod digest unless the mod changed.
+6. Run the module checks once: `npm run check` and `npm test`. Fixture success is not live or controller qualification.
 
 ## Rollback
 
-Keep the previous artifact directory intact. Rollback = point the module
-config (and route, once wired) back at the previous artifact id and mod
-path. Rollback never replays inbox lines or run records into a new run; a
-run whose outcome is unknown stays unknown and is reconciled by reading its
-control directory, not by resending its prompt.
+Retain the previous artifact and its control records. A run with an admission marker but no terminal record remains `Unknown`; rollback or reconcile must not replay its prompt. Restore configuration to a compatible artifact only after confirming the module artifact ID and pinned mod path.

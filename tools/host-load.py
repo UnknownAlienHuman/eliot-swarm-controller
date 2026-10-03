@@ -18,8 +18,8 @@ and the recorded run):
   * connected clients   - the configured client population stays connected
                           for the whole run and drains its own mailboxes
                           with message.read while senders produce events;
-  * host RSS            - /proc/<pid>/status VmRSS of the host process
-                          (Linux; reported as null elsewhere).
+  * host RSS            - Linux VmRSS or Windows process working set
+                          (reported as null on unsupported platforms).
 
 Every admitted message.send is verified afterwards: the final report.delta
 drain must contain exactly as many `message.send` observations as the
@@ -70,7 +70,14 @@ class Client:
 
     @classmethod
     async def connect(cls, sock_path, credential):
-        reader, writer = await asyncio.open_unix_connection(sock_path)
+        if os.name == "nt":
+            loop = asyncio.get_running_loop()
+            reader = asyncio.StreamReader(limit=1048576)
+            protocol = asyncio.StreamReaderProtocol(reader)
+            transport, _ = await loop.create_pipe_connection(lambda: protocol, sock_path)
+            writer = asyncio.StreamWriter(transport, protocol, reader, loop)
+        else:
+            reader, writer = await asyncio.open_unix_connection(sock_path, limit=1048576)
         client = cls(reader, writer)
         client._reader_task = asyncio.ensure_future(client._read_loop())
         await client.call("client.hello", credential)
@@ -146,7 +153,53 @@ def latency_block(values_ms):
     }
 
 
+def windows_process_metrics(pid):
+    """Read the exact owned process using native Windows APIs; never signal it."""
+    import ctypes
+    from ctypes import wintypes
+
+    class MemoryCounters(ctypes.Structure):
+        _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD)] + [
+            (name, ctypes.c_size_t) for name in (
+                "PeakWorkingSetSize", "WorkingSetSize", "QuotaPeakPagedPoolUsage",
+                "QuotaPagedPoolUsage", "QuotaPeakNonPagedPoolUsage",
+                "QuotaNonPagedPoolUsage", "PagefileUsage", "PeakPagefileUsage",
+            )
+        ]
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.GetProcessTimes.argtypes = [wintypes.HANDLE] + [
+        ctypes.POINTER(wintypes.FILETIME)
+    ] * 4
+    psapi = ctypes.WinDLL("psapi", use_last_error=True)
+    psapi.GetProcessMemoryInfo.argtypes = [
+        wintypes.HANDLE, ctypes.POINTER(MemoryCounters), wintypes.DWORD,
+    ]
+    handle = kernel.OpenProcess(0x0410, False, pid)
+    if not handle:
+        return None, None
+    try:
+        counters = MemoryCounters()
+        counters.cb = ctypes.sizeof(counters)
+        memory = counters.WorkingSetSize if psapi.GetProcessMemoryInfo(
+            handle, ctypes.byref(counters), counters.cb
+        ) else None
+        times = [wintypes.FILETIME() for _ in range(4)]
+        cpu = None
+        if kernel.GetProcessTimes(handle, *(ctypes.byref(value) for value in times)):
+            cpu = sum((value.dwHighDateTime << 32) | value.dwLowDateTime
+                      for value in times[2:]) / 10_000_000
+        return memory, cpu
+    finally:
+        kernel.CloseHandle(handle)
+
+
 def read_rss_bytes(pid):
+    if os.name == "nt":
+        return windows_process_metrics(pid)[0]
     try:
         with open(f"/proc/{pid}/status", "r", encoding="ascii") as fh:
             for line in fh:
@@ -159,6 +212,8 @@ def read_rss_bytes(pid):
 
 def read_cpu_seconds(pid):
     """User+system CPU seconds of a process from /proc/<pid>/stat (Linux)."""
+    if os.name == "nt":
+        return windows_process_metrics(pid)[1]
     try:
         with open(f"/proc/{pid}/stat", "r", encoding="ascii") as fh:
             fields = fh.read().rsplit(")", 1)[1].split()
@@ -211,7 +266,7 @@ async def drain(client, after, want_kind=None):
 
 async def run(args):
     data_dir = args.data_dir or tempfile.mkdtemp(prefix="swarm-host-load-")
-    sock_path = os.path.join(data_dir, "control.sock")
+    sock_path = None if os.name == "nt" else os.path.join(data_dir, "control.sock")
     # The host refuses a data directory containing unrelated files, so its
     # stderr log lives next to the data directory, never inside it.
     host_log_path = data_dir.rstrip(os.sep) + ".host-stderr.log"
@@ -231,7 +286,15 @@ async def run(args):
             if host.poll() is not None:
                 raise RuntimeError(f"host exited early with {host.returncode}")
             cred_path = os.path.join(data_dir, "operator.json")
-            if os.path.exists(sock_path) and os.path.exists(cred_path):
+            if os.name == "nt":
+                # Use the host's actual endpoint, including its canonical-path
+                # namespace, rather than reimplementing its hashing rules.
+                with open(host_log_path, "r", encoding="utf-8") as log:
+                    for line in log:
+                        if line.startswith("swarm host ready: "):
+                            sock_path = line[len("swarm host ready: "):].strip()
+            endpoint_ready = bool(sock_path) if os.name == "nt" else os.path.exists(sock_path)
+            if endpoint_ready and os.path.exists(cred_path):
                 with open(cred_path, "r", encoding="utf-8") as fh:
                     operator_cred = json.load(fh)
                 break
@@ -459,7 +522,14 @@ async def run(args):
         return result
     finally:
         if host.poll() is None:
-            host.send_signal(signal.SIGINT)
+            if os.name == "nt":
+                # This fixture host owns no native agents or checks. Terminate
+                # only the Popen process created above; never a shared host.
+                host.terminate()
+                result["shutdown_disposition"] = "owned_fixture_host_terminated"
+            else:
+                host.send_signal(signal.SIGINT)
+                result["shutdown_disposition"] = "owned_fixture_host_sigint"
             try:
                 host.wait(timeout=15)
             except subprocess.TimeoutExpired:
@@ -498,6 +568,7 @@ def main():
     if args.senders >= args.clients:
         parser.error("--senders must be smaller than --clients")
 
+    loadavg_at_start = [round(v, 2) for v in os.getloadavg()] if hasattr(os, "getloadavg") else None
     result = asyncio.run(run(args))
     result["environment"] = {
         "platform": platform.platform(),
@@ -505,7 +576,7 @@ def main():
         "cpu_count": os.cpu_count(),
         "python": sys.version.split()[0],
         "hostname": socket.gethostname(),
-        "loadavg_at_start": [round(v, 2) for v in os.getloadavg()],
+        "loadavg_at_start": loadavg_at_start,
     }
     result["parameters"] = {
         "clients": args.clients,

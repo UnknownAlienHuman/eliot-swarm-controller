@@ -3,7 +3,8 @@ use super::{REQUEST_TIMEOUT, Service, header};
 use crate::{
     error::{Error, Result},
     runtime::opencode_v2::{
-        ExecutionRead, ExecutionScan, NativeInputDescriptor, SessionRead, SessionScan,
+        ExecutionRead, ExecutionScan, NativeInputDescriptor, RootCreationRead, RootCreationScan,
+        SessionRead, SessionScan,
     },
 };
 use eventsource_stream::Eventsource;
@@ -54,6 +55,26 @@ impl LogScan for SessionScan {
     }
     fn has_anchor(&self) -> bool {
         self.anchor().is_some()
+    }
+    fn verify_anchor(&self, value: &Value) -> Result<()> {
+        self.verify_anchor(value)
+    }
+    fn consume(&mut self, value: &Value) -> Result<()> {
+        self.consume(value)
+    }
+    fn synchronize(&mut self, value: &Value) -> Result<()> {
+        self.synchronize(value)
+    }
+}
+impl LogScan for RootCreationScan {
+    fn session_id(&self) -> &str {
+        self.session_id()
+    }
+    fn after(&self) -> Option<u64> {
+        None
+    }
+    fn has_anchor(&self) -> bool {
+        self.has_anchor()
     }
     fn verify_anchor(&self, value: &Value) -> Result<()> {
         self.verify_anchor(value)
@@ -213,5 +234,13 @@ impl Service {
     ) -> Result<SessionRead> {
         let (synced, gap) = self.stream_log(&mut scan).await?;
         Ok(SessionRead { scan, synced, gap })
+    }
+
+    pub(in crate::runtime::opencode_v2) async fn root_creation_log(
+        &self,
+        mut scan: RootCreationScan,
+    ) -> Result<RootCreationRead> {
+        let (synced, gap) = self.stream_log(&mut scan).await?;
+        Ok(RootCreationRead { scan, synced, gap })
     }
 }

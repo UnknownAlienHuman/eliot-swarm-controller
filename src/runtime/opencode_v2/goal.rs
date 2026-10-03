@@ -537,6 +537,20 @@ impl Service {
         let activate = matches!(decision, GoalDecision::Write(_, true));
         let mut activation_input_id = None;
         if activate {
+            if let Err(error) = self
+                .require_durable_root_creation(
+                    &root,
+                    &command.binding_id,
+                    command.generation,
+                    options,
+                )
+                .await
+            {
+                // The goal record is already durable, but this activation
+                // input has not crossed its POST boundary. Keep the Operation
+                // unresolved so readback cannot imply that provider work ran.
+                return failed(command, options, &error, true);
+            }
             let record = desired.as_ref().expect("activation requires a record");
             match self.admit_goal_activation(&root, command, record).await {
                 Ok(id) => activation_input_id = Some(id),

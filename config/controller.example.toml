@@ -25,14 +25,27 @@ reasoningEffort = 'max'
 approvalMode = 'allowAll'
 
 # Disabled by default. See modules/claude/README.md for the explicit bridge setup.
-# First slice: open/next-turn send/snapshot; resume/model/effort/goal stay unavailable.
+# Open prepares rootlessly; first exact Task input adopts the observed session.
 [[routes]]
 alias = 'claude-manager'
 runtime = 'claude'
-module_artifact_id = 'claude-agent-sdk-0.3.287-bridge.1'
+module_artifact_id = 'claude-agent-sdk-0.3.287-bridge.3'
 enabled = false
 [routes.native_options]
 workspaceRoot = 'C:\Projects\YourRepository'
+modelId = 'sonnet'
+
+# Disabled. One owned Antigravity warm CLI process per binding; terminal
+# results use explicit local receipts because the CLI exposes no turn ID.
+[[routes]]
+alias = 'antigravity-manager'
+runtime = 'antigravity'
+module_artifact_id = 'antigravity-cli-warm-bridge.2'
+enabled = false
+[routes.native_options]
+workspaceRoot = 'C:\Projects\YourRepository'
+modelId = 'gemini-3.8-flash-high'
+reasoningEffort = 'high'
 
 # Disabled, built-in Rust attach-only route. See modules/opencode/README.md.
 # Replace every placeholder, keeping credentials in the private connection file.
@@ -51,18 +64,19 @@ id = 'REPLACE_WITH_NATIVE_MODEL_ID'
 providerID = 'REPLACE_WITH_NATIVE_PROVIDER_ID'
 variant = 'REPLACE_WITH_EXACT_VARIANT'
 
-# Disabled. See modules/command/README.md. The Command Code module (pinned
-# mod + headless NDJSON glue) is fixture-verified but not yet wired behind
-# the host RuntimePort, and no installed Command Code binary is qualified;
-# enabling this route alone does not launch or control anything.
+# Disabled. See modules/command/README.md. The Command Code module exposes
+# sessionless batches through the scoped runtime protocol. Enabling this
+# route alone does not launch or control anything; native model qualification
+# is separate from bridge fixtures.
 [[routes]]
 alias = 'command-manager'
 runtime = 'command'
-module_artifact_id = 'command-mod-0.1.0-glue.1'
+module_artifact_id = 'command-mod-0.1.0-glue.2'
 enabled = false
 [routes.native_options]
 workspaceRoot = 'C:\Projects\YourRepository'
 controlRoot = 'C:\SwarmState\command-runs'
+modelId = 'REPLACE_WITH_EXACT_NATIVE_MODEL_ID'
 
 # Disabled. Routed models through an operator-run OpenCodex service
 # (modules/opencodex/README.md). Execution stays with the native Codex
@@ -76,14 +90,30 @@ controlRoot = 'C:\SwarmState\command-runs'
 # subscription via OpenCodex's stored login (tier not reported by
 # upstream) — this is NOT the native Claude route and NOT a "Max route";
 # the native Max route is modules/claude/ above.
-# NOTE: registering runtime = 'codex' routes is the remainder of the
-# Codex-module wiring work (issue #9); this example documents the shape
-# ahead of that wiring and enabling it changes nothing today.
+# Attach the .2 scoped bridge to an explicitly operator-owned Codex app-server.
+# Provider is its registered native provider ID; model is the Codex-visible ID.
+# A slash inside a model ID is not parsed as a provider selection.
 [[routes]]
 alias = 'codex-opencodex-manager'
 runtime = 'codex'
-module_artifact_id = 'codex-sdk-18194bf-bridge.1'
+module_artifact_id = 'codex-sdk-18194bf-bridge.2'
 enabled = false
 [routes.native_options]
-model = 'anthropic/REPLACE_WITH_ROUTED_MODEL_ID'
-opencodex_service = 'REPLACE_WITH_OPENCODEX_MODULE_BINDING'
+modelProvider = 'REPLACE_WITH_REGISTERED_CODEX_PROVIDER_ID'
+model = 'REPLACE_WITH_CODEX_VISIBLE_MODEL_ID'
+workspaceRoot = 'C:\Projects\YourRepository'
+
+# MCP surfaces are fixed when the stdio session starts. The default is a
+# read-only observer bound to the local operator identity. Select local-full
+# explicitly for the complete legacy local surface; application role and GM
+# epoch checks still apply.
+[mcp]
+default_profile = 'local-observer'
+
+[mcp.profiles.local-observer]
+tool_profile = 'observer'
+expected_client_id = 'operator'
+
+[mcp.profiles.local-full]
+tool_profile = 'full'
+expected_client_id = 'operator'

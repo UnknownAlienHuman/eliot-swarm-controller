@@ -1,5 +1,5 @@
 use super::{
-    Options, Service, diagnostic,
+    Options, RootCreationScan, Service, diagnostic,
     http::{Data, decode},
     input_id, root_id, valid_id,
 };
@@ -105,6 +105,46 @@ pub(super) async fn verify_directory(expected: &Path, observed: &Value) -> Resul
 }
 
 impl Service {
+    /// Require a clean read of the exact root's durable origin before any
+    /// native write that can resume or start provider work. A synced empty
+    /// aggregate is positive evidence that this service is not retaining the
+    /// event history the adapter's execution contract requires.
+    pub(super) async fn require_durable_root_creation(
+        &self,
+        root: &str,
+        binding: &str,
+        generation: i64,
+        options: &Options,
+    ) -> Result<()> {
+        if root != root_id(binding, generation) {
+            return Err(Error::new(
+                "NATIVE_IDENTITY_MISMATCH",
+                "native root does not belong to this binding generation",
+            ));
+        }
+        let scan = RootCreationScan::new(root, binding, generation, json!(options.model))?;
+        let read = self.root_creation_log(scan).await?;
+        if !read.synced {
+            return Err(Error::new(
+                read.gap.unwrap_or("NATIVE_LOG_NOT_SYNCED"),
+                "native root-origin log did not reach a clean sync watermark",
+            ));
+        }
+        if let Some(gap) = read.gap {
+            return Err(Error::new(
+                gap,
+                "native root-origin log contains an unresolved read gap",
+            ));
+        }
+        if !read.scan.created() {
+            return Err(Error::new(
+                "DURABLE_EVENT_PERSISTENCE_UNAVAILABLE",
+                "the exact native root has no retained session.created event",
+            ));
+        }
+        Ok(())
+    }
+
     async fn location(&self, options: &Options) -> Result<Value> {
         let value = self
             .get(
@@ -257,12 +297,23 @@ impl Service {
                     && response.data["model"] == json!(options.model)
                     && response.data["location"] == location;
                 if valid {
-                    outcome(
-                        command,
-                        EffectOutcome::Applied,
-                        options,
-                        json!({"completion_condition":"native_session_created","model":options.model,"location":location}),
-                    )
+                    match self
+                        .require_durable_root_creation(
+                            &root,
+                            &command.binding_id,
+                            command.generation,
+                            options,
+                        )
+                        .await
+                    {
+                        Ok(()) => outcome(
+                            command,
+                            EffectOutcome::Applied,
+                            options,
+                            json!({"completion_condition":"native_session_created","model":options.model,"location":location,"durable_origin":"exact_session_created_event"}),
+                        ),
+                        Err(error) => failed(command, options, &error, true),
+                    }
                 } else {
                     failed(
                         command,
@@ -289,6 +340,13 @@ impl Service {
                 return Err(Error::new("UNSUPPORTED_EXACT_TURN_STEER","V2 inbox steering has no atomic expected-turn guard; it must not emulate exact-turn steering"));
             }
             self.verify_binding(root,options,&command.binding_id,command.generation).await?;
+            self.require_durable_root_creation(
+                root,
+                &command.binding_id,
+                command.generation,
+                options,
+            )
+            .await?;
             Ok((root,prompt(command)?))
         }.await;
         let (root, text) = match prepare {
@@ -400,6 +458,13 @@ impl Service {
                     return Err(Error::invalid("native form answer required"));
                 }
             }
+            self.require_durable_root_creation(
+                root,
+                &command.binding_id,
+                command.generation,
+                options,
+            )
+            .await?;
             Ok(format!("/api/session/{session}/{kind}/{request}/reply"))
         }
         .await;
@@ -443,6 +508,7 @@ impl Service {
                 let id=root_id(&original.binding_id,original.generation);
                 let session=self.check_root(&id,options).await?;
                 if session["metadata"]["eliot"]!=marker(original) {return Err(Error::new("NATIVE_IDENTITY_MISMATCH","creation metadata does not match the original operation"));}
+                self.require_durable_root_creation(&id,&original.binding_id,original.generation,options).await?;
                 let mut r=outcome(original,EffectOutcome::Applied,options,json!({"completion_condition":"native_session_created","evidence":"exact_session_readback"}));r.native_root_id=Some(id);return Ok(r);
             }
             if !matches!(original.method.as_str(),"agent.send"|"task.dispatch") {return Err(Error::new("NATIVE_EVIDENCE_UNAVAILABLE","no exact readback contract for this operation"));}
@@ -461,7 +527,13 @@ impl Service {
         }.await;
         match readback {
             Ok(r) => r,
-            Err(e) => outcome(original, EffectOutcome::Unknown, options, diagnostic(&e)),
+            Err(e) => {
+                let mut r = outcome(original, EffectOutcome::Unknown, options, diagnostic(&e));
+                if original.method == "agent.open" {
+                    r.native_root_id = Some(root_id(&original.binding_id, original.generation));
+                }
+                r
+            }
         }
     }
 }

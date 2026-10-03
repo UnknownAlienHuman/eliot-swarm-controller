@@ -1,9 +1,11 @@
 # Exact references for modules/command. No secrets. This file pins the
 # module's own source units and the documented vendor surface they are
 # written against; it is not an installation lock for the vendor CLI.
+# Text-unit hashes use UTF-8 with LF newlines, matching tracked Git content
+# independently of Windows checkout line-ending conversion.
 schema_version = 1
 module = "runtime.command"
-module_artifact_id = "command-mod-0.1.0-glue.1"
+module_artifact_id = "command-mod-0.1.0-glue.2"
 status = "fixture_verified_live_unqualified"
 installed_runtime_verified = false
 
@@ -14,13 +16,25 @@ installed_runtime_verified = false
 id = "eliot-command-mod"
 path = "mod/eliot-command.ts"
 sha256 = "513eaa7d6034cc22b5abf14d080888cdd3e8782133e39f859b7703db123e1f80"
-role = "Pinned Command Code mod: readiness, native event journal, inbox admission, tool readback"
+role = "Pinned Command Code mod: canonical LF text digest; readiness, native event journal, inbox admission, tool readback"
 
 [[units]]
 id = "eliot-command-glue"
 path = "glue.mjs"
-sha256 = "2af38e4b327af03c471ae18149158c79d61c7ebb3b8d1a8d2a3c0505bf1ce5df"
-role = "Headless NDJSON driver: describe / open / snapshot over one run"
+sha256 = "04b2ad2108ae54568cbd9c6451cf6d5c7a192e0b63c8220fe7b1ceca2d36943b"
+role = "Headless NDJSON driver: explicit model, operation-keyed admission, one-shot batch and read-only reconciliation"
+
+[[units]]
+id = "eliot-command-bridge"
+path = "bridge.mjs"
+sha256 = "b12645c950e2855f79421e2ded35148aadc3ad4a16168db80194322ad039def6"
+role = "Host module IPC adapter: preflight, one-shot task dispatch, saved-evidence reconciliation"
+
+[[units]]
+id = "eliot-command-ipc-transport"
+path = "../claude/control.mjs"
+sha256 = "25328bb9084680fd298db343e329e5988e7a6cae65530475113543a48fc2bd72"
+role = "Shared newline JSON-RPC transport used by the module bridge"
 
 # Documented vendor surface used above (official docs, accessed 2026-10-02).
 # A moving web reference does not prove a function exists in an installed
@@ -45,6 +59,6 @@ basis = "Definitions re-read before the next turn; omitted tools mean an empty s
 
 [[native]]
 name = "Command Code CLI (cmd)"
-basis_version = "1.66 (manager brief); installed binary not present on the development machine"
+basis_version = "1.74.1 (native CLI canary observed 2026-10-02; controller module artifact remains unqualified)"
 installation = "Operator-installed native executable; this module installs nothing globally and downloads nothing"
 license_note = "Vendor CLI under its own terms; no vendor code is vendored here"

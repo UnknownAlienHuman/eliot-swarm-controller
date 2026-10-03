@@ -3,8 +3,7 @@
 // Drives the installed Command Code CLI (`cmd`) in its documented headless
 // print mode (`-p --output-format json`) with the pinned Eliot mod loaded via
 // `--mod`, and reduces the run to the module contract's describe / open /
-// snapshot facts. It speaks no host IPC yet: wiring this facade behind the
-// controller's RuntimePort is a later slice (see README "Remaining work").
+// snapshot facts. bridge.mjs owns module IPC and calls these functions.
 //
 // Evidence rules, from the architecture and runtime notes:
 // - The terminal fact of a run is the final NDJSON result line, corroborated
@@ -28,14 +27,14 @@ import {
   renameSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 
 export const RUNTIME = "command";
 export const ENTRYPOINT = "native_mod";
 export const TRANSPORT = "headless_ndjson";
-export const MODULE_ARTIFACT_ID = "command-mod-0.1.0-glue.1";
+export const MODULE_ARTIFACT_ID = "command-mod-0.1.0-glue.2";
 
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
 export const DEFAULT_MOD_PATH = join(MODULE_DIR, "mod", "eliot-command.ts");
@@ -61,6 +60,120 @@ const STDERR_LIMIT_BYTES = 256 * 1024;
 
 export function sha256Hex(text) {
   return createHash("sha256").update(text, "utf8").digest("hex");
+}
+
+export function buildTaskPrompt(taskSnapshot, text) {
+  if (taskSnapshot === null || typeof taskSnapshot !== "object" || Array.isArray(taskSnapshot)) {
+    throw new Error("TASK_SNAPSHOT_REQUIRED");
+  }
+  if (text !== undefined && typeof text !== "string") {
+    throw new Error("DISPATCH_TEXT_INVALID");
+  }
+  const body = typeof text === "string" && text.trim() ? text : null;
+  return [`Task specification: ${JSON.stringify(taskSnapshot)}`, body]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+function operationDigest(operationId) {
+  if (typeof operationId !== "string" || operationId.trim() === "") {
+    throw new Error("OPERATION_ID_REQUIRED");
+  }
+  return sha256Hex(operationId).slice(0, 32);
+}
+
+export function batchRunId(operationId) {
+  return `command-batch:${operationDigest(operationId)}`;
+}
+
+export function controlRecordRef(operationId) {
+  return `command-control:${operationDigest(operationId)}`;
+}
+
+export function resultRecordRef(operationId) {
+  return `command-result:${operationDigest(operationId)}`;
+}
+
+function artifactRefs(operationId) {
+  return [
+    { kind: "command_control_record", ref: controlRecordRef(operationId) },
+    { kind: "command_result_record", ref: resultRecordRef(operationId) },
+  ];
+}
+
+function resultExitAgrees(result, exit) {
+  if (!result || exit?.signal != null || typeof exit?.code !== "number") return false;
+  if (result.subtype === "success") return exit.code === 0;
+  if (result.subtype === "max_turns") return exit.code === 8;
+  return result.subtype === "error"
+    && exit.code !== 0
+    && Object.hasOwn(EXIT_MEANINGS, exit.code);
+}
+
+export function outcomeFromRun(run) {
+  const subtype = run?.result?.subtype ?? null;
+  const exitCode = run?.exit?.code ?? null;
+  const terminalExitAgrees = resultExitAgrees(run?.result, run?.exit);
+  const cleanEvidence = terminalExitAgrees
+    && (run?.events?.gaps?.length ?? 0) === 0
+    && (run?.anomalies?.length ?? 0) === 0
+    && run?.timed_out !== true;
+  const applied = cleanEvidence && subtype === "success";
+  const rejected = cleanEvidence && (subtype === "error" || subtype === "max_turns");
+  const resultText = run?.result?.final_text;
+  return {
+    outcome: applied ? "applied" : rejected ? "rejected" : "unknown",
+    details: {
+      execution_shape: "sessionless_batch",
+      batch_run_id: run?.batch_run_id ?? null,
+      ...(cleanEvidence ? { completion_condition: "native_result_observed" } : {}),
+      requested_model: run?.requested_model ?? null,
+      effective_model: null,
+      effective_model_status: "unknown",
+      result_subtype: subtype,
+      exit_code: exitCode,
+      signal: run?.exit?.signal ?? null,
+      anomalies: Array.isArray(run?.anomalies) ? run.anomalies : ["run_record_missing"],
+      native_session_id: run?.session_id ?? null,
+      prompt_sha256: run?.prompt_sha256 ?? null,
+      prompt_bytes: run?.prompt_bytes ?? null,
+      control_record_ref: run?.control_record_ref ?? null,
+      result_ref: run?.result_ref ?? null,
+      artifact_refs: Array.isArray(run?.artifact_refs) ? run.artifact_refs : [],
+      result_text_sha256: typeof resultText === "string" ? sha256Hex(resultText) : null,
+      result_text_bytes: typeof resultText === "string" ? Buffer.byteLength(resultText, "utf8") : null,
+      ...(!cleanEvidence ? { diagnostic_code: run?.anomalies?.[0] ?? "NATIVE_RESULT_NOT_VALIDATED" } : {}),
+    },
+  };
+}
+
+function createAdmission(options) {
+  return {
+    schema: 1,
+    operation_id: options.operationId,
+    execution_shape: "sessionless_batch",
+    batch_run_id: batchRunId(options.operationId),
+    requested_model: options.requestedModel,
+    prompt_sha256: sha256Hex(options.prompt),
+    prompt_bytes: Buffer.byteLength(options.prompt, "utf8"),
+    control_record_ref: controlRecordRef(options.operationId),
+    result_ref: resultRecordRef(options.operationId),
+    artifact_refs: artifactRefs(options.operationId),
+    admitted_at: new Date().toISOString(),
+  };
+}
+
+function readAdmission(controlDir) {
+  const path = join(controlDir, "admission.json");
+  return existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) : null;
+}
+
+function persistAdmission(controlDir, admission) {
+  const path = join(controlDir, "admission.json");
+  writeFileSync(path, JSON.stringify(admission, null, 2) + "\n", {
+    flag: "wx",
+    encoding: "utf8",
+  });
 }
 
 // Classify one NDJSON line from the headless stream. The stream has two
@@ -135,14 +248,17 @@ export async function describe(config) {
   let version = null;
   let versionNote = "not probed";
   if (executablePresent || !executable.includes("/")) {
-    const probe = await runProbe(executable, config.argsPrefix ?? []);
+    const probe = await runProbe(executable, config.commandArgs ?? []);
     version = probe.version;
     versionNote = probe.note;
   }
   let modSha256 = null;
   const modPath = config.modPath ?? DEFAULT_MOD_PATH;
   if (existsSync(modPath)) {
-    modSha256 = sha256Hex(readFileSync(modPath, "utf8"));
+    // The vendor pin is the canonical LF text digest from Git; Windows
+    // checkouts may materialize the same tracked source with CRLF endings.
+    const modText = readFileSync(modPath, "utf8").replace(/\r\n/g, "\n");
+    modSha256 = sha256Hex(modText);
   }
   return {
     runtime: RUNTIME,
@@ -156,16 +272,19 @@ export async function describe(config) {
     installed_runtime_verified: false,
     capabilities: {
       describe: "implemented",
-      open: "implemented_fixture_verified_live_unknown",
-      snapshot: "implemented",
-      queue_message: "admission_only_via_mod_inbox",
-      set_active_tools: "implemented_with_native_readback",
-      set_model: "requested_only_no_readback",
-      set_effort: "requested_only_no_readback",
-      goal: "unavailable_headless_setter_not_established",
-      resume: "unavailable_in_this_slice",
-      attach: "unavailable_in_this_slice",
-      live_steer: "unavailable_as_host_operation",
+      open: "executor_preflight_only_no_native_session",
+      task_dispatch: "one_shot_sessionless_batch",
+      reconcile: "saved_evidence_readback_only",
+      snapshot: "saved_run_readback",
+      send_next_turn: "unavailable_sessionless_batch",
+      configure_model: "unavailable",
+      configure_effort: "unavailable",
+      goal: "unavailable",
+      resume: "unavailable",
+      attach: "unavailable",
+      steer: "unavailable",
+      reply: "unavailable",
+      result_pages: "unavailable",
     },
   };
 }
@@ -218,23 +337,110 @@ function runProbe(executable, argsPrefix) {
 export async function openRun(config, options) {
   const controlDir = resolve(options.controlDir);
   const runPath = join(controlDir, "run.json");
-  if (existsSync(runPath)) {
-    throw new Error(`control directory already holds a run: ${controlDir}`);
+  const operationId = options.operationId;
+  const requestedModel = options.requestedModel;
+  if (typeof operationId !== "string" || operationId.trim() === "") {
+    throw new Error("OPERATION_ID_REQUIRED");
+  }
+  if (typeof requestedModel !== "string" || requestedModel.trim() === "" || requestedModel !== requestedModel.trim()) {
+    throw new Error("REQUESTED_MODEL_REQUIRED");
+  }
+  if (typeof options.prompt !== "string" || options.prompt.length === 0) {
+    throw new Error("PROMPT_REQUIRED");
+  }
+  const prefix = config.commandArgs ?? [];
+  if (!Array.isArray(prefix) || prefix.some((arg) => typeof arg !== "string")) {
+    throw new Error("INVALID_ARGS_PREFIX");
+  }
+  if (prefix.some((arg) =>
+    ["-p", "--print", "--output-format", "--mod", "--model", "--resume", "-r", "--continue", "-c"].includes(arg)
+      || arg.startsWith("--model=")
+      || arg.startsWith("--mod=")
+      || arg.startsWith("--output-format="))) {
+    throw new Error("ARGS_PREFIX_CONFLICTS_WITH_GLUE_OWNED_FLAGS");
   }
   mkdirSync(controlDir, { recursive: true });
+  const expectedAdmission = createAdmission(options);
+  const priorAdmission = readAdmission(controlDir);
+  if (priorAdmission) {
+    if (
+      priorAdmission.schema !== 1
+      || priorAdmission.operation_id !== operationId
+      || priorAdmission.batch_run_id !== expectedAdmission.batch_run_id
+      || priorAdmission.requested_model !== requestedModel
+      || priorAdmission.prompt_sha256 !== expectedAdmission.prompt_sha256
+      || priorAdmission.prompt_bytes !== expectedAdmission.prompt_bytes
+      || priorAdmission.control_record_ref !== expectedAdmission.control_record_ref
+      || priorAdmission.result_ref !== expectedAdmission.result_ref
+      || JSON.stringify(priorAdmission.artifact_refs) !== JSON.stringify(expectedAdmission.artifact_refs)
+    ) {
+      throw new Error("OPERATION_ID_CONFLICT");
+    }
+    const saved = existsSync(runPath) ? JSON.parse(readFileSync(runPath, "utf8")) : null;
+    if (saved) {
+      if (
+        saved.operation_id !== operationId
+        || saved.batch_run_id !== expectedAdmission.batch_run_id
+        || saved.requested_model !== requestedModel
+        || saved.prompt_sha256 !== expectedAdmission.prompt_sha256
+        || saved.prompt_bytes !== expectedAdmission.prompt_bytes
+        || saved.control_record_ref !== expectedAdmission.control_record_ref
+        || saved.result_ref !== expectedAdmission.result_ref
+        || JSON.stringify(saved.artifact_refs) !== JSON.stringify(expectedAdmission.artifact_refs)
+      ) {
+        throw new Error("CONTROL_RECORD_CONFLICT");
+      }
+      return { ...saved, replayed_from_saved_evidence: true };
+    }
+    return {
+      schema: 1,
+      runtime: RUNTIME,
+      entrypoint: ENTRYPOINT,
+      transport: TRANSPORT,
+      module_artifact_id: config.moduleArtifactId ?? MODULE_ARTIFACT_ID,
+      operation_id: operationId,
+      batch_run_id: priorAdmission.batch_run_id,
+      requested_model: requestedModel,
+      effective_model: null,
+      effective_model_status: "unknown",
+      control_dir: controlDir,
+      control_record_ref: priorAdmission.control_record_ref,
+      result_ref: priorAdmission.result_ref,
+      artifact_refs: artifactRefs(operationId),
+      prompt_sha256: priorAdmission.prompt_sha256,
+      prompt_bytes: priorAdmission.prompt_bytes,
+      result: null,
+      exit: { code: null, signal: null, spawn_error: null, meaning: null },
+      disposition: "unknown",
+      disposition_basis: "admission_without_terminal_record",
+      anomalies: ["native_result_missing_after_admission"],
+      events: { total: 0, by_type: {}, gaps: [] },
+      replayed_from_saved_evidence: true,
+    };
+  }
+  if (existsSync(runPath)) {
+    throw new Error("CONTROL_RECORD_WITHOUT_ADMISSION");
+  }
+  const cwd = options.cwd ?? config.cwd;
+  if (typeof cwd !== "string" || !isAbsolute(cwd)) {
+    throw new Error("WORKSPACE_ROOT_MUST_BE_ABSOLUTE");
+  }
+  persistAdmission(controlDir, expectedAdmission);
   const modPath = config.modPath ?? DEFAULT_MOD_PATH;
   const args = [
-    ...(config.argsPrefix ?? []),
+    ...prefix,
     "-p",
     "--output-format",
     "json",
+    "--model",
+    requestedModel,
     "--mod",
     modPath,
     options.prompt,
   ];
   const startedAt = new Date().toISOString();
   const child = spawn(config.command, args, {
-    cwd: options.cwd ?? config.cwd ?? process.cwd(),
+    cwd,
     env: { ...process.env, ELIOT_COMMAND_CONTROL_DIR: controlDir },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -266,7 +472,10 @@ export async function openRun(config, options) {
   const linesDone = new Promise((r) => lines.on("close", r));
   lines.on("line", (line) => {
     if (line.trim() === "") return;
-    const classified = classifyLine(line);
+    let classified = classifyLine(line);
+    if (classified.kind === "result" && result !== null) {
+      classified = { kind: "gap", reason: "duplicate_result_line", raw: line };
+    }
     const record = { seq: events.length + gaps.length + 1, ...classified };
     if (classified.kind === "event") {
       events.push(classified.event);
@@ -312,18 +521,30 @@ export async function openRun(config, options) {
 
   let disposition = "unknown";
   let dispositionBasis = "missing_result_line";
-  if (result) {
-    dispositionBasis = "result_line";
-    if (result.subtype === "success") disposition = "completed";
-    else if (result.subtype === "error") disposition = "failed";
-    else if (result.subtype === "max_turns") disposition = "max_turns";
-  }
   const anomalies = [];
   if (framesAfterResult > 0) anomalies.push("frames_after_result_line");
+  if (!result) anomalies.push("native_result_missing");
   if (result && result.subtype === "success" && exit.code !== 0) {
     anomalies.push("exit_result_mismatch");
   }
   if (timedOut) anomalies.push("glue_timeout_killed_owned_child");
+  if (exit.spawnError) anomalies.push("native_spawn_failed");
+  if (gaps.length > 0) anomalies.push("native_stream_protocol_gaps");
+  if (result) {
+    dispositionBasis = "result_line";
+    const terminalValidated = resultExitAgrees(result, exit)
+      && !timedOut
+      && exit.spawnError === null
+      && framesAfterResult === 0
+      && gaps.length === 0;
+    if (terminalValidated) {
+      if (result.subtype === "success") disposition = "completed";
+      else if (result.subtype === "error") disposition = "failed";
+      else if (result.subtype === "max_turns") disposition = "max_turns";
+    } else {
+      dispositionBasis = "result_exit_or_stream_mismatch";
+    }
+  }
 
   const eventTypes = {};
   for (const event of events) {
@@ -339,10 +560,21 @@ export async function openRun(config, options) {
     entrypoint: ENTRYPOINT,
     transport: TRANSPORT,
     module_artifact_id: config.moduleArtifactId ?? MODULE_ARTIFACT_ID,
+    operation_id: operationId,
+      batch_run_id: expectedAdmission.batch_run_id,
+    requested_model: requestedModel,
+    // Command's headless result/event contract has not yielded a documented
+    // effective-model identity field; never infer one from the request.
+    effective_model: null,
+    effective_model_status: "unknown",
     control_dir: controlDir,
+    control_record_ref: expectedAdmission.control_record_ref,
+    result_ref: expectedAdmission.result_ref,
+    artifact_refs: artifactRefs(operationId),
     started_at: startedAt,
     finished_at: finishedAt,
     prompt_sha256: sha256Hex(options.prompt),
+    prompt_bytes: Buffer.byteLength(options.prompt, "utf8"),
     prompt_length: options.prompt.length,
     session_id:
       typeof result?.sessionId === "string"
@@ -361,6 +593,10 @@ export async function openRun(config, options) {
           duration_ms: result.durationMs ?? null,
           usage: result.usage ?? null,
           final_text: result.finalText ?? null,
+          final_text_sha256:
+            typeof result.finalText === "string" ? sha256Hex(result.finalText) : null,
+          final_text_bytes:
+            typeof result.finalText === "string" ? Buffer.byteLength(result.finalText, "utf8") : null,
           error: result.error ?? null,
         }
       : null,
@@ -403,12 +639,14 @@ export function snapshotRun(controlDir) {
   const run = existsSync(runPath)
     ? JSON.parse(readFileSync(runPath, "utf8"))
     : null;
+  const admission = readAdmission(resolved);
   const journal = readModJournal(resolved);
   const eventRecords = readJsonLines(join(resolved, "events.ndjson"));
   return {
     scope: "single_headless_run",
     completeness: "partial",
     control_dir: resolved,
+    admission,
     terminal: run ? run.disposition : "not_observed",
     run,
     mod: {
@@ -447,6 +685,12 @@ async function main(argv) {
     const config = loadConfig(flag("--config"));
     const prompt = flag("--prompt");
     if (!prompt) throw new Error("open requires --prompt");
+    const operationId = flag("--operation-id");
+    const requestedModel = flag("--model");
+    const cwd = flag("--cwd");
+    if (!operationId) throw new Error("open requires --operation-id");
+    if (!requestedModel) throw new Error("open requires --model");
+    if (!cwd) throw new Error("open requires --cwd");
     let controlDir = flag("--control-dir");
     if (!controlDir) {
       if (!config.controlRoot) {
@@ -458,6 +702,9 @@ async function main(argv) {
       );
     }
     const record = await openRun(config, {
+      operationId,
+      requestedModel,
+      cwd,
       prompt,
       controlDir,
       timeoutMs: Number(flag("--timeout-ms") ?? 0),
@@ -472,7 +719,7 @@ async function main(argv) {
     return;
   }
   throw new Error(
-    "usage: glue.mjs describe --config FILE | open --config FILE --prompt TEXT [--control-dir DIR] | snapshot --control-dir DIR",
+    "usage: glue.mjs describe --config FILE | open --config FILE --operation-id ID --model MODEL --cwd DIR --prompt TEXT [--control-dir DIR] | snapshot --control-dir DIR",
   );
 }
 

@@ -204,6 +204,71 @@ async fn builtin_identity_cannot_authenticate_over_external_ipc() {
 }
 
 #[tokio::test]
+async fn rejected_open_preflight_retains_diagnostic_without_partial_native_identity() {
+    let f = Fixture::new().await;
+    f.override_get(
+        "/api/model",
+        crate::runtime::opencode_v2::tests::Reply::Json(
+            200,
+            json!({"location":{"directory":f.options.directory.clone()},"data":[]}),
+        ),
+    );
+    let (owner, p) = start(&f).await;
+    let (stop, receiver) = watch::channel(false);
+    let worker = tokio::spawn(owner.store.clone().supervise_opencode(receiver));
+    let open = write(
+        &owner.store,
+        &p,
+        "agent.open",
+        json!({"lane_id":"rejected-preflight","route":"fixture"}),
+    )
+    .await
+    .unwrap();
+    let operation = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let observed = read(
+                &owner.store,
+                &p,
+                "operation.get",
+                json!({"operation_id":open["operation_id"]}),
+            )
+            .await;
+            if observed["state"] == "rejected" {
+                return observed;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(operation["state"], "rejected");
+    assert_eq!(operation["result"]["outcome"], "rejected");
+    assert_eq!(
+        operation["result"]["details"]["code"],
+        "NATIVE_MODEL_UNAVAILABLE"
+    );
+    let binding = read(
+        &owner.store,
+        &p,
+        "agent.state",
+        json!({"binding_id":open["binding_id"],"generation":1}),
+    )
+    .await;
+    assert_eq!(binding["native_root_id"], Value::Null);
+    assert_eq!(binding["native_scope_key"], Value::Null);
+    assert_eq!(
+        binding["observation"]["opening_evidence"]["code"],
+        "NATIVE_MODEL_UNAVAILABLE"
+    );
+    assert_eq!(f.posts("/api/session"), 0);
+
+    stop.send(true).unwrap();
+    worker.await.unwrap();
+    owner.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn goal_receipts_survive_host_restart_without_replaying_native_work() {
     let f = Fixture::new().await;
     let (owner, p) = start(&f).await;

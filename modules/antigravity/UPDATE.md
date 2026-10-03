@@ -9,7 +9,7 @@
 | Vendor SDK | None exists for this entrypoint; the bridge depends on Node builtins only (`package.json` has no dependencies) |
 | Native binary | The owner's installed `agy` executable, named explicitly in the local module config; the bridge installs and pins no binary |
 | Installed-version evidence | None: runtime matrix records `installed_runtime_verified: false`; the docs' "installed 1.1.27" note from the old research map is explicitly unverified |
-| Bridge artifact | `antigravity-cli-warm-bridge.1` |
+| Bridge artifact | `antigravity-cli-warm-bridge.2` |
 | Executor version reporting | `null` — the native stream reports no version and no version readback is documented for this entrypoint |
 
 ## Local changes to the vendor surface
@@ -20,6 +20,17 @@ process and the host link. If a future docs revision moves event names or
 payload fields, the adaptation is re-derived in `codec.mjs` and the
 fixtures are re-authored from the new documentation examples — never by
 guessing from a live stream the qualification has not recorded.
+
+## bridge.2 changes
+
+Terminal warm results now have an adapter-local receipt bound to the exact
+operation, native conversation, bridge boot, monotonically increasing
+per-boot result ordinal, and SHA-256 of the exact UTF-8 response. The bridge
+records the matching observation before sending the Operation outcome and
+includes the acknowledged observation ID. It does not invent a native turn
+or inbox ID. Only `SUCCESS`, `ERROR`, `CANCELED`, and `INTERRUPTED` settle a
+result; `WAITING`, `RUNNING`, unknown statuses, and missing response bytes
+remain unresolved. Existing bridge.1 bindings retain their original artifact.
 
 ## Update procedure
 

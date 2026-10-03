@@ -13,17 +13,13 @@
 //! application method, and the application layer keeps validating the
 //! original request (field allow-lists, idempotency, role checks).
 //!
-//! Mutations follow the CLI's request-ID discipline. Only a caller-known
-//! `client_request_id`, chosen and retained by the caller **before**
-//! dispatch, makes a mutation safely retryable after a lost reply: the
-//! retry reuses that same ID and the host returns the retained receipt.
-//! When the caller omits it, one is generated for that call and echoed
-//! back in the result object — but that generated ID is correlation only
-//! for a response the caller actually received. It cannot rescue a call
-//! whose response itself was lost, because the caller never learns the
-//! generated ID in that case, so such a mutation cannot be safely
-//! retried. A failed transport is dropped, never silently retried: the
-//! next tool call reconnects first.
+//! Mutations follow the CLI's request-ID discipline. Restricted profiles
+//! require a caller-known `client_request_id`, chosen and retained before
+//! dispatch, so the caller can reconcile a lost reply without a hidden
+//! retry. The explicit local `full` compatibility profile may omit it; in
+//! that case one is generated and echoed only when a result arrives. A
+//! failed transport is dropped, never silently retried: the next tool call
+//! reconnects first.
 //!
 //! Tasks projection (R20, Documentation Program §17.1): the server
 //! advertises the `io.modelcontextprotocol/tasks` extension. When the
@@ -69,7 +65,7 @@
 //! to the host with no stale-on-error caching.
 
 use crate::{
-    config::{Config, Ipc},
+    config::{Config, Ipc, McpToolProfile},
     error::{Error, Result},
     ipc,
     model::{self, Credential},
@@ -149,8 +145,8 @@ const fn mutation(
     )
 }
 
-/// (read_only, spec). Mirrors the public method list in the README; the
-/// read/write split matches `Store`'s read classification plus the CLI's
+/// (read_only, spec). The read/write split matches `Store`'s read
+/// classification plus the CLI's
 /// request-ID treatment (`agent.result` and `host.mode` are mutations).
 static TOOLS: &[(bool, ToolSpec)] = &[
     // Read-only methods.
@@ -269,12 +265,25 @@ static TOOLS: &[(bool, ToolSpec)] = &[
         &[],
     ),
     read(
+        "report.attention",
+        "Page controller-owned attention items.",
+        &[f("after", I), f("limit", I)],
+        &[],
+    ),
+    read(
+        "report.capacity",
+        "Page active and reserved capacity accounting.",
+        &[f("after", I), f("limit", I)],
+        &[],
+    ),
+    read(
         "message.read",
         "Read directed mailbox messages after a cursor; reading does not delete.",
         &[f("after", I), f("limit", I)],
         &[],
     ),
-    // Mutations. All accept an optional stable client_request_id.
+    // Mutations. Restricted profiles require a stable client_request_id;
+    // only the explicit local Full compatibility profile permits omission.
     mutation(
         "host.mode",
         "Enable or disable admission of new work on the host: new_work is the string \"enabled\" or \"disabled\".",
@@ -427,6 +436,31 @@ static TOOLS: &[(bool, ToolSpec)] = &[
         ],
     ),
     mutation(
+        "forge.publish_ref",
+        "Publish an accepted source-snapshot commit to one locally allowlisted Git ref; never force-push or replay an uncertain push.",
+        &[
+            f("attempt_id", S),
+            f("expected_revision", I),
+            f("submission_ref", S),
+            f("accepted_operation_id", S),
+            f("candidate_ref", S),
+            f("expected_policy_revision", S),
+            f("target_ref", S),
+            f("expected_old_ref", SN),
+            f("expected_create", B),
+        ],
+        &[
+            "attempt_id",
+            "expected_revision",
+            "submission_ref",
+            "accepted_operation_id",
+            "candidate_ref",
+            "expected_policy_revision",
+            "target_ref",
+            "expected_create",
+        ],
+    ),
+    mutation(
         "task.invalidate_acceptance",
         "Revoke one named acceptance decision; never restarts its producer.",
         &[
@@ -560,10 +594,40 @@ static TOOLS: &[(bool, ToolSpec)] = &[
         &["operation_id", "reason"],
     ),
     mutation(
+        "gm.handover",
+        "Designate a registered client as GM under the current application epoch rules.",
+        &[
+            f("client_id", S),
+            f("binding_id", S),
+            f("binding_generation", I),
+        ],
+        &["client_id"],
+    ),
+    mutation(
+        "agent.background",
+        "Background one addressed native session through its existing operation contract.",
+        &[f("binding_id", S), f("generation", I), f("session_id", S)],
+        &["binding_id", "generation"],
+    ),
+    mutation(
         "message.send",
         "Send a durable directed mailbox message.",
-        &[f("recipient", S), f("text", S), f("in_reply_to", S)],
+        &[
+            f("recipient", S),
+            f("text", S),
+            f("in_reply_to", SN),
+            f("in_reply_to_digest", SN),
+            f("admission_deadline_ms", I),
+            f("delivery_deadline_ms", I),
+            f("reply_deadline_ms", I),
+        ],
         &["recipient", "text"],
+    ),
+    mutation(
+        "message.cancel",
+        "Cancel one sent mailbox delivery by its exact delivery ID and payload digest.",
+        &[f("delivery_id", S), f("payload_digest", S), f("reason", SN)],
+        &["delivery_id", "payload_digest"],
     ),
 ];
 
@@ -571,7 +635,7 @@ fn tool_name(method: &str) -> String {
     method.replace('.', "_")
 }
 
-fn input_schema(spec: &ToolSpec, read_only: bool) -> Arc<JsonObject> {
+fn input_schema(spec: &ToolSpec, read_only: bool, require_request_id: bool) -> Arc<JsonObject> {
     let mut properties = JsonObject::new();
     for field in spec.fields {
         properties.insert(field.name.to_string(), field_schema(field.kind));
@@ -581,7 +645,11 @@ fn input_schema(spec: &ToolSpec, read_only: bool) -> Arc<JsonObject> {
             "client_request_id".to_string(),
             json!({
                 "type": "string",
-                "description": "Stable logical request ID. Reuse it when retrying after a lost reply; when omitted, one is generated and echoed in the result."
+                "description": if require_request_id {
+                    "Caller-owned stable logical request ID. Choose it before dispatch and reuse it to reconcile a lost reply; the server does not retry mutations."
+                } else {
+                    "Caller-owned stable logical request ID. Reuse it to reconcile a lost reply; the local full compatibility profile generates one only when omitted and a result arrives."
+                }
             }),
         );
     }
@@ -590,8 +658,12 @@ fn input_schema(spec: &ToolSpec, read_only: bool) -> Arc<JsonObject> {
         "properties": properties,
         "additionalProperties": false,
     });
-    if !spec.required.is_empty() {
-        schema["required"] = json!(spec.required);
+    let mut required = spec.required.to_vec();
+    if !read_only && require_request_id {
+        required.push("client_request_id");
+    }
+    if !required.is_empty() {
+        schema["required"] = json!(required);
     }
     match schema {
         Value::Object(map) => Arc::new(map),
@@ -611,13 +683,129 @@ fn field_schema(kind: &str) -> Value {
     }
 }
 
+fn raw_schema(value: Value) -> Arc<JsonObject> {
+    match value {
+        Value::Object(map) => Arc::new(map),
+        _ => unreachable!("schema literal is an object"),
+    }
+}
+
+fn message_scope_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "client_id": {"type": "string"},
+            "role": {"type": ["string", "null"]},
+            "binding_id": {"type": ["string", "null"]},
+            "binding_generation": {"type": ["integer", "null"]},
+        },
+        "required": ["client_id", "role", "binding_id", "binding_generation"],
+        "additionalProperties": false,
+    })
+}
+
+fn message_actor_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "client_id": {"type": "string"},
+            "role": {"type": ["string", "null"]},
+            "generation": {"type": ["integer", "null"]},
+        },
+        "required": ["client_id", "role", "generation"],
+        "additionalProperties": false,
+    })
+}
+
+fn output_schema(method: &str) -> Option<Arc<JsonObject>> {
+    match method {
+        "message.send" => Some(raw_schema(json!({
+            "type": "object",
+            "properties": {
+                "operation_id": {"type": "string"},
+                "message_id": {"type": "string"},
+                "delivery_id": {"type": "string"},
+                "sender": {"type": "string"},
+                "recipient": {"type": "string"},
+                "source_scope": message_scope_schema(),
+                "target_scope": message_scope_schema(),
+                "actor": message_actor_schema(),
+                "payload_digest": {"type": "string"},
+                "admission_deadline_ms": {"type": ["integer", "null"]},
+                "delivery_deadline_ms": {"type": ["integer", "null"]},
+                "reply_deadline_ms": {"type": ["integer", "null"]},
+                "text": {"type": "string"},
+                "in_reply_to": {"type": ["string", "null"]},
+                "reply_to": {
+                    "type": ["object", "null"],
+                    "properties": {
+                        "delivery_id": {"type": ["string", "null"]},
+                        "payload_digest": {"type": ["string", "null"]},
+                    },
+                    "required": ["delivery_id", "payload_digest"],
+                    "additionalProperties": false,
+                },
+                "cancellation": {"type": "null"},
+                "delivery": {"type": "string"},
+            },
+            "required": [
+                "operation_id", "message_id", "delivery_id", "sender", "recipient",
+                "source_scope", "target_scope", "actor", "payload_digest",
+                "admission_deadline_ms", "delivery_deadline_ms", "reply_deadline_ms",
+                "text", "in_reply_to", "reply_to", "cancellation", "delivery",
+            ],
+            "additionalProperties": false,
+        }))),
+        "message.cancel" => Some(raw_schema(json!({
+            "type": "object",
+            "properties": {
+                "operation_id": {"type": "string"},
+                "cancellation": {
+                    "type": "object",
+                    "properties": {
+                        "delivery_id": {"type": "string"},
+                        "payload_digest": {"type": "string"},
+                    },
+                    "required": ["delivery_id", "payload_digest"],
+                    "additionalProperties": false,
+                },
+                "cancelled_by": message_actor_schema(),
+                "reason": {"type": ["string", "null"]},
+                "original_record_changed": {"type": "boolean"},
+                "delivery": {"type": "string"},
+            },
+            "required": [
+                "operation_id", "cancellation", "cancelled_by", "reason",
+                "original_record_changed", "delivery",
+            ],
+            "additionalProperties": false,
+        }))),
+        _ => None,
+    }
+}
+
+fn tool_from_spec(read_only: bool, spec: &ToolSpec, require_request_id: bool) -> Tool {
+    let mut tool = Tool::new(
+        tool_name(spec.method),
+        spec.description,
+        input_schema(spec, read_only, require_request_id),
+    );
+    if let Some(schema) = output_schema(spec.method) {
+        tool = tool.with_raw_output_schema(schema);
+    }
+    if read_only {
+        tool = tool.with_annotations(ToolAnnotations::new().read_only(true));
+    }
+    tool
+}
+
 fn find_tool(name: &str) -> Option<&'static (bool, ToolSpec)> {
     TOOLS
         .iter()
         .find(|(_, spec)| tool_name(spec.method) == name)
 }
 
-pub struct McpFacade {
+pub(crate) struct McpFacade {
     root: PathBuf,
     credential: Credential,
     ipc_config: Arc<Ipc>,
@@ -1063,11 +1251,14 @@ impl ServerHandler for McpFacade {
             .with_instructions(
                 "Tools map one-to-one onto the swarm controller's application API and are \
              executed against the running host over local IPC with the configured \
-             credential. Mutations accept a stable client_request_id: supply and \
-             retain your own before dispatch if a mutation must be safely retryable \
-             after a lost reply. When it is omitted, a generated ID is echoed only \
-             in a received result and cannot make a retry safe if that response \
-             itself was lost. Operations returned by mutations are durable handles \
+             credential. Restricted profiles require a caller-owned stable \
+             client_request_id before every mutation dispatch, so a lost reply can \
+             be reconciled without a hidden retry. Only the explicit local full \
+             compatibility profile permits omission; there, a generated ID is \
+             echoed only in a received result and cannot make a retry safe if that \
+             response itself was lost. Restricted-profile tasks/cancel likewise \
+             requires client_request_id in request _meta; full generates one if \
+             omitted. Operations returned by mutations are durable handles \
              to poll with operation_get. If the client declares the \
              io.modelcontextprotocol/tasks extension, a mutation whose operation is \
              still in flight instead returns an MCP task whose taskId is that \
@@ -1093,17 +1284,7 @@ impl ServerHandler for McpFacade {
     ) -> std::result::Result<ListToolsResult, McpError> {
         let tools = TOOLS
             .iter()
-            .map(|(read_only, spec)| {
-                let mut tool = Tool::new(
-                    tool_name(spec.method),
-                    spec.description,
-                    input_schema(spec, *read_only),
-                );
-                if *read_only {
-                    tool = tool.with_annotations(ToolAnnotations::new().read_only(true));
-                }
-                tool
-            })
+            .map(|(read_only, spec)| tool_from_spec(*read_only, spec, false))
             .collect();
         Ok(ListToolsResult {
             tools,
@@ -1159,7 +1340,7 @@ impl ServerHandler for McpFacade {
     async fn cancel_task(
         &self,
         request: CancelTaskParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> std::result::Result<(), McpError> {
         let operation = self
             .request("operation.get", json!({"operation_id": request.task_id}))
@@ -1183,7 +1364,12 @@ impl ServerHandler for McpFacade {
                 let cancel = json!({
                     "operation_id": request.task_id,
                     "reason": "mcp tasks/cancel",
-                    "client_request_id": model::new_id(),
+                    "client_request_id": context
+                        .meta
+                        .get("client_request_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .unwrap_or_else(model::new_id),
                 });
                 match self.request("operation.cancel", cancel).await {
                     Ok(_) => Ok(()),
@@ -1225,6 +1411,149 @@ impl ServerHandler for McpFacade {
     }
 }
 
+/// The production MCP boundary is a session-fixed view over the local facade.
+/// It filters both discovery and every manually addressed method before the
+/// inner facade can open or write local IPC.
+struct ProfiledFacade {
+    inner: McpFacade,
+    profile: McpToolProfile,
+}
+
+impl ProfiledFacade {
+    fn new(inner: McpFacade, profile: McpToolProfile) -> Self {
+        Self { inner, profile }
+    }
+}
+
+fn method_not_found(method: &str) -> McpError {
+    McpError::new(
+        rmcp::model::ErrorCode::METHOD_NOT_FOUND,
+        method.to_string(),
+        None,
+    )
+}
+
+fn require_caller_request_id(params: &Value) -> std::result::Result<(), McpError> {
+    if params
+        .get("client_request_id")
+        .and_then(Value::as_str)
+        .is_none_or(|request_id| request_id.trim().is_empty())
+    {
+        return Err(McpError::invalid_params(
+            "restricted-profile mutations require a caller-owned client_request_id before dispatch",
+            None,
+        ));
+    }
+    Ok(())
+}
+
+impl ServerHandler for ProfiledFacade {
+    fn get_info(&self) -> ServerConfig {
+        self.inner.get_info()
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> std::result::Result<ListToolsResult, McpError> {
+        let tools = TOOLS
+            .iter()
+            .filter(|(_, spec)| profiles::allows_method(self.profile, spec.method))
+            .map(|(read_only, spec)| {
+                tool_from_spec(*read_only, spec, self.profile != McpToolProfile::Full)
+            })
+            .collect();
+        Ok(ListToolsResult {
+            tools,
+            ..Default::default()
+        })
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> std::result::Result<CallToolResponse, McpError> {
+        let Some((read_only, spec)) = find_tool(&request.name) else {
+            return Err(McpError::method_not_found::<
+                rmcp::model::CallToolRequestMethod,
+            >());
+        };
+        if !profiles::allows_method(self.profile, spec.method) {
+            return Err(McpError::method_not_found::<
+                rmcp::model::CallToolRequestMethod,
+            >());
+        }
+        if self.profile != McpToolProfile::Full && !*read_only {
+            let arguments = request
+                .arguments
+                .as_ref()
+                .map(|arguments| Value::Object(arguments.clone()))
+                .unwrap_or_else(|| json!({}));
+            require_caller_request_id(&arguments)?;
+        }
+        self.inner.call_tool(request, context).await
+    }
+
+    async fn get_task(
+        &self,
+        request: GetTaskParams,
+        context: RequestContext<RoleServer>,
+    ) -> std::result::Result<GetTaskResult, McpError> {
+        if !profiles::allows_task_get(self.profile) {
+            return Err(method_not_found("tasks/get"));
+        }
+        self.inner.get_task(request, context).await
+    }
+
+    async fn cancel_task(
+        &self,
+        request: CancelTaskParams,
+        context: RequestContext<RoleServer>,
+    ) -> std::result::Result<(), McpError> {
+        if !profiles::allows_task_cancel(self.profile) {
+            return Err(method_not_found("tasks/cancel"));
+        }
+        if self.profile != McpToolProfile::Full
+            && context
+                .meta
+                .get("client_request_id")
+                .and_then(Value::as_str)
+                .is_none_or(|request_id| request_id.trim().is_empty())
+        {
+            return Err(McpError::invalid_params(
+                "restricted-profile tasks/cancel requires a caller-owned client_request_id in _meta",
+                None,
+            ));
+        }
+        self.inner.cancel_task(request, context).await
+    }
+
+    async fn on_custom_request(
+        &self,
+        request: CustomRequest,
+        context: RequestContext<RoleServer>,
+    ) -> std::result::Result<CustomResult, McpError> {
+        if request.method == subscriptions::SUBSCRIBE_METHOD {
+            let params = request
+                .params
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let (categories, _) =
+                subscriptions::parse_subscribe(&params).map_err(protocol_error)?;
+            if !categories
+                .iter()
+                .all(|category| profiles::allows_subscription_category(self.profile, *category))
+            {
+                return Err(method_not_found(subscriptions::SUBSCRIBE_METHOD));
+            }
+        }
+        self.inner.on_custom_request(request, context).await
+    }
+}
+
 /// Whether the connected client declared the tasks extension during
 /// initialize — the gate for returning task handles from `tools/call`
 /// and the same check the RMCP router applies to `tasks/*` methods.
@@ -1238,11 +1567,26 @@ fn client_tasks_negotiated(context: &RequestContext<RoleServer>) -> bool {
 /// established lazily on the first tool call, so discovery works before (and
 /// independently of) host availability.
 pub async fn run(config: Config, credential: Credential) -> Result<()> {
+    run_profiled(config, credential, None).await
+}
+
+/// Serve one MCP session after resolving its configured profile against the
+/// credential identity. The wrapper remains fixed for the entire session.
+pub async fn run_profiled(
+    config: Config,
+    credential: Credential,
+    profile_name: Option<&str>,
+) -> Result<()> {
+    config.mcp.validate()?;
+    let profile = config
+        .mcp
+        .selected_tool_profile(profile_name, &credential.client_id)?;
     let facade = McpFacade::new(
         config.storage.data_dir.clone(),
         credential,
         Arc::new(config.ipc.clone()),
     );
+    let facade = ProfiledFacade::new(facade, profile);
     let service = facade
         .serve(stdio())
         .await
@@ -1274,26 +1618,114 @@ mod tests {
                 );
             }
         }
-        // The public method list from the README: 20 reads + 27 mutations.
-        assert_eq!(methods.len(), 47);
-        assert_eq!(TOOLS.iter().filter(|(read_only, _)| *read_only).count(), 20);
+        let expected: BTreeSet<&str> = [
+            "host.status",
+            "route.list",
+            "client.list",
+            "task.get",
+            "task.list",
+            "task.submission",
+            "task.acceptance",
+            "attempt.get",
+            "operation.get",
+            "operation.list",
+            "agent.state",
+            "agent.list",
+            "agent.family",
+            "check.get",
+            "check.profiles",
+            "artifact.get",
+            "artifact.read",
+            "artifact.parts",
+            "report.delta",
+            "report.attention",
+            "report.capacity",
+            "message.read",
+            "host.mode",
+            "client.register",
+            "source.capture",
+            "check.run",
+            "check.cancel",
+            "task.create",
+            "task.revise",
+            "task.claim",
+            "task.dispatch",
+            "task.submit",
+            "task.request_changes",
+            "task.accept",
+            "forge.publish_ref",
+            "task.invalidate_acceptance",
+            "attempt.release",
+            "attempt.bind_producer",
+            "agent.open",
+            "agent.send",
+            "agent.reply",
+            "agent.configure",
+            "agent.goal",
+            "agent.refresh",
+            "agent.reconcile",
+            "agent.recover",
+            "agent.result",
+            "artifact.assemble",
+            "operation.cancel",
+            "gm.handover",
+            "agent.background",
+            "message.send",
+            "message.cancel",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(methods, expected);
+        assert_eq!(TOOLS.len(), 53);
+        assert_eq!(TOOLS.iter().filter(|(read_only, _)| *read_only).count(), 22);
+        assert_eq!(
+            TOOLS.iter().filter(|(read_only, _)| !*read_only).count(),
+            31
+        );
     }
 
     #[test]
     fn schemas_are_closed_objects() {
         for (read_only, spec) in TOOLS {
-            let schema = input_schema(spec, *read_only);
+            let schema = input_schema(spec, *read_only, false);
             assert_eq!(schema["type"], json!("object"));
             assert_eq!(schema["additionalProperties"], json!(false));
             if !read_only {
                 assert!(schema["properties"].get("client_request_id").is_some());
             }
         }
+        let send = find_tool("message_send").unwrap();
+        let schema = input_schema(&send.1, send.0, false);
+        for field in [
+            "in_reply_to",
+            "in_reply_to_digest",
+            "admission_deadline_ms",
+            "delivery_deadline_ms",
+            "reply_deadline_ms",
+        ] {
+            assert!(schema["properties"].get(field).is_some(), "{field}");
+        }
+        let output = output_schema("message.send").unwrap();
+        for field in [
+            "delivery_id",
+            "payload_digest",
+            "admission_deadline_ms",
+            "delivery_deadline_ms",
+            "reply_deadline_ms",
+            "in_reply_to",
+            "reply_to",
+            "cancellation",
+        ] {
+            assert!(output["properties"].get(field).is_some(), "{field}");
+        }
     }
 }
 
+mod profiles;
 mod subscriptions;
 
+#[cfg(test)]
+mod profiles_tests;
 #[cfg(test)]
 mod subscriptions_tests;
 #[cfg(test)]

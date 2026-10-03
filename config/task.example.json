@@ -6,6 +6,7 @@
     {"id": "A1", "statement": "Run focused formatting and Clippy; do not start the broad test phase."}
   ],
   "dependencies": [],
+  "owner_policy_id": "owner-policy-v1",
   "scope": {
     "initial_paths": ["src/"],
     "forbidden_paths": [],
