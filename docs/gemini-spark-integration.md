@@ -260,6 +260,7 @@ This is a **candidate architecture**, not yet a qualified fact.
 The pilot must prove:
 
 - Spark follows protected-resource and authorization-server metadata;
+- the installed Spark OAuth client supplies the RFC 8707 resource indicator required by Access Managed OAuth;
 - DCR reaches the expected endpoint;
 - redirect URI can be safely allowlisted;
 - PKCE/code exchange completes;
@@ -685,10 +686,14 @@ per operation/profile, with account/product version/date/evidence.
 [ ] DCR or exact pre-registration path
 [ ] redirect URI validation
 [ ] PKCE/code exchange
-[ ] token audience/issuer/scope
+[ ] Access Managed OAuth: RFC 8707 resource indicator from the installed Spark client
+[ ] Access Managed OAuth: assertion signature/issuer/application audience/expiry
+[ ] Access Managed OAuth: opaque Bearer token is not decoded as a JWT or used for scope claims
+[ ] gateway-owned OAuth: reviewed resource-server token validation and granted scopes where defined
 [ ] refresh
 [ ] revocation
-[ ] second-account isolation
+[ ] distinct authenticated Access subjects map to configured ELIOT principals without cross-subject credential reuse
+[ ] Spark Google-account isolation: proven IdP/claim binding, or explicitly UNQUALIFIED
 [ ] no credential in logs/artifacts
 ```
 
