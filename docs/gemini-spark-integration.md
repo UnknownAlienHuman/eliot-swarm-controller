@@ -265,9 +265,11 @@ The pilot must prove:
 - PKCE/code exchange completes;
 - refresh works;
 - revocation/disconnect works;
-- Cloudflare token audience/issuer are validated at origin;
-- a second Google account does not reuse the first account's ELIOT principal;
+- the origin validates the signature, issuer, application audience and expiry of Cloudflare's `Cf-Access-Jwt-Assertion`;
+- distinct authenticated Access subjects map to their configured ELIOT principals, without cross-subject credential reuse;
 - profile selection cannot be supplied or widened by the MCP caller.
+
+Managed OAuth access tokens are opaque; the origin must not decode the Bearer token as a JWT or assume it contains OAuth scope claims. Access policy and the configured subject-to-principal/profile mapping provide separate authorization boundaries. This flow proves the authenticated Access identity, not the identity of the Google account using Spark. Isolation between Spark Google accounts remains unqualified unless the selected IdP and reviewed claim mapping explicitly bind that account identity.
 
 ### 5.2 Alternative: gateway-owned MCP OAuth
 
@@ -500,7 +502,9 @@ remain independent capabilities.
 - bounded request and response sizes;
 - bounded handshake/auth timeouts;
 - no stale-on-error authoritative cache;
-- validate OAuth/Access token issuer, audience, expiry and scopes;
+- for Access Managed OAuth, validate the signature, issuer, application audience and expiry of `Cf-Access-Jwt-Assertion`; do not decode the opaque OAuth Bearer token or assume it carries scope claims;
+- for gateway-owned OAuth, validate the token using the chosen authorization server's reviewed resource-server contract, including granted scopes where defined;
+- enforce Access policy and the configured ELIOT principal/profile independently of OAuth token claims;
 - map one external identity to one configured local ELIOT principal;
 - redact endpoint/auth material;
 - retain only bounded security/audit facts;
