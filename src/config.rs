@@ -6,6 +6,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+const MAX_GATEWAY_BODY_BYTES: usize = 1_048_576;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -15,6 +17,7 @@ pub struct Config {
     pub routes: Vec<Route>,
     pub checks: crate::checks::model::CheckConfig,
     pub mcp: McpConfig,
+    pub gateway: GatewayConfig,
     pub forge: crate::forge::ForgeConfig,
     pub schedules: Vec<crate::scheduler::ScheduleConfig>,
 }
@@ -47,6 +50,21 @@ pub struct McpConfig {
     pub default_profile: String,
     pub profiles: BTreeMap<String, McpProfileConfig>,
 }
+
+/// Optional loopback Streamable HTTP facade. Its ELIOT principal and MCP
+/// profile are selected only by this local configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GatewayConfig {
+    pub enabled: bool,
+    pub bind: String,
+    pub profile: String,
+    pub credential_file: Option<PathBuf>,
+    pub local_bearer_file: Option<PathBuf>,
+    pub max_body_bytes: usize,
+    pub request_timeout_seconds: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Storage {
@@ -99,8 +117,22 @@ impl Default for Config {
             routes: Vec::new(),
             checks: crate::checks::model::CheckConfig::default(),
             mcp: McpConfig::default(),
+            gateway: GatewayConfig::default(),
             forge: crate::forge::ForgeConfig::default(),
             schedules: Vec::new(),
+        }
+    }
+}
+impl Default for GatewayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: "127.0.0.1:8787".into(),
+            profile: "local-observer".into(),
+            credential_file: None,
+            local_bearer_file: None,
+            max_body_bytes: 1_048_576,
+            request_timeout_seconds: 30,
         }
     }
 }
@@ -188,6 +220,78 @@ impl McpConfig {
         Ok(profile.tool_profile)
     }
 }
+
+impl GatewayConfig {
+    fn resolve_paths(&mut self, config_dir: &Path) {
+        for path in [&mut self.credential_file, &mut self.local_bearer_file]
+            .into_iter()
+            .flatten()
+        {
+            if path.is_relative() {
+                *path = config_dir.join(&*path);
+            }
+        }
+    }
+
+    fn validate(&self, mcp: &McpConfig, ipc: &Ipc) -> Result<()> {
+        let bind = self
+            .bind
+            .parse::<std::net::SocketAddr>()
+            .map_err(|_| Error::new("CONFIG_ERROR", "gateway.bind must be a socket address"))?;
+        if !bind.ip().is_loopback() {
+            return Err(Error::new(
+                "CONFIG_ERROR",
+                "gateway.bind must use a loopback address",
+            ));
+        }
+        if self.enabled {
+            if self.max_body_bytes < 1024
+                || self.max_body_bytes > MAX_GATEWAY_BODY_BYTES
+                || self.max_body_bytes > ipc.max_frame_bytes
+                || self.request_timeout_seconds == 0
+                || self.request_timeout_seconds > 300
+            {
+                return Err(Error::new(
+                    "CONFIG_ERROR",
+                    "gateway body limit must be 1 KiB through the IPC frame limit and request timeout must be 1 through 300 seconds",
+                ));
+            }
+            let profile = mcp.profiles.get(&self.profile).ok_or_else(|| {
+                Error::new(
+                    "CONFIG_ERROR",
+                    "enabled gateway.profile must name a configured MCP profile",
+                )
+            })?;
+            if profile.tool_profile == McpToolProfile::Full {
+                return Err(Error::new(
+                    "CONFIG_ERROR",
+                    "the gateway cannot use the full MCP profile",
+                ));
+            }
+            let credential_file = self
+                .credential_file
+                .as_ref()
+                .filter(|p| !p.as_os_str().is_empty());
+            let bearer_file = self
+                .local_bearer_file
+                .as_ref()
+                .filter(|p| !p.as_os_str().is_empty());
+            if credential_file.is_none() || bearer_file.is_none() {
+                return Err(Error::new(
+                    "CONFIG_ERROR",
+                    "enabled gateway requires credential_file and local_bearer_file",
+                ));
+            }
+            if credential_file == bearer_file {
+                return Err(Error::new(
+                    "CONFIG_ERROR",
+                    "gateway credential_file and local_bearer_file must be different files",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
 fn default_data_dir() -> PathBuf {
     if let Some(root) = std::env::var_os(if cfg!(windows) {
         "LOCALAPPDATA"
@@ -239,6 +343,8 @@ impl Config {
         cfg.mcp.validate()?;
         let config_dir =
             std::env::current_dir()?.join(path.and_then(Path::parent).unwrap_or(Path::new(".")));
+        cfg.gateway.resolve_paths(&config_dir);
+        cfg.gateway.validate(&cfg.mcp, &cfg.ipc)?;
         cfg.forge.resolve_paths(&config_dir)?;
         cfg.forge.validate()?;
         crate::scheduler::validate_schedules(&cfg.schedules)?;

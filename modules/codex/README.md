@@ -47,7 +47,7 @@ swarm module-run --state-dir C:\SwarmState\codex-owner --command ABSOLUTE_PYTHON
 ```
 
 The route must select `runtime = "codex"`, artifact
-`codex-sdk-18194bf-bridge.2`, and explicit `native_options.modelProvider`,
+`codex-sdk-18194bf-bridge.3`, and explicit `native_options.modelProvider`,
 `native_options.model`, and absolute `native_options.workspaceRoot`. Model
 configuration and effort changes are unavailable; the controller never
 silently chooses a model. `agent.open` records the requested route separately
@@ -61,6 +61,24 @@ digest, its actual item ID, and associated turn ID from history. A lost
 turn-input acknowledgment is reconciled by reading history; the input is never replayed.
 Steering requires the exact active turn ID. Resume is explicit through
 `agent.recover`; reconnecting the WebSocket alone does not resume a thread.
+
+Native child enumeration follows explicit `parentThreadId` links from
+paginated `thread/list` responses. Pagination does not provide an atomic
+family snapshot, so observations always report family completeness as
+`partial`; auxiliary-provider affinity is unavailable. A bounded lifecycle
+event window records native thread, turn, and item IDs/statuses observed on
+the current connection, without treating notifications as complete history.
+
+`agent.result` can publish bounded pages of native history for an exact prior
+input operation. It revalidates the acknowledged user item and completed
+native turn, and for direct-child results requires both the child parent link
+and its activity item in the exact parent turn. The result projection keeps
+native item IDs and allowlisted tool call names, arguments, and results while
+omitting reasoning. Root and child thread-configured provider/model fields are
+reported separately; per-turn served inference and billing remain `unknown`.
+Pages are capped at 64 KiB. This reports an allowlisted projection of observed
+native history only; it does not claim complete family coverage or execute
+tools.
 
 `thread/start` has no caller-selected correlation ID. A lost creation
 acknowledgment therefore leaves `agent.open` unknown and reserves that opening;

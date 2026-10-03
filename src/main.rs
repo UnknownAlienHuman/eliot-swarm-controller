@@ -39,6 +39,8 @@ enum Command {
         #[arg(long, value_name = "NAME")]
         profile: Option<String>,
     },
+    /// Serve one fixed restricted MCP profile over loopback Streamable HTTP.
+    Gateway,
     /// Independently run one bridge under a persistent, non-killing process owner.
     ModuleRun {
         #[arg(long)]
@@ -291,9 +293,9 @@ fn execute(cli: Cli) -> Result<()> {
     if let Command::CheckWorker { file } = &cli.command {
         return eliot_swarm_controller::checks::worker::run(file);
     }
-    // Only the long-lived host needs a worker pool. CLI calls perform one local
-    // exchange and must not create a CPU-sized pool for every status request.
-    let mut builder = if matches!(&cli.command, Command::Host) {
+    // The host and gateway are long-lived. CLI calls perform one local exchange
+    // and must not create a CPU-sized pool for every status request.
+    let mut builder = if matches!(&cli.command, Command::Host | Command::Gateway) {
         tokio::runtime::Builder::new_multi_thread()
     } else {
         tokio::runtime::Builder::new_current_thread()
@@ -305,6 +307,36 @@ async fn run(cli: Cli) -> Result<()> {
     let config = Config::load(cli.config.as_deref(), cli.data_dir.as_deref())?;
     if matches!(&cli.command, Command::Host) {
         return host::run(config).await;
+    }
+    if matches!(&cli.command, Command::Gateway) {
+        if cli.credential.is_some() {
+            return Err(Error::invalid(
+                "gateway principal is fixed by gateway.credential_file; --credential is not accepted",
+            ));
+        }
+        if cli.request_id.is_some() {
+            return Err(Error::invalid("--request-id is not accepted for gateway"));
+        }
+        if !config.gateway.enabled {
+            return Err(Error::invalid(
+                "gateway is disabled; set gateway.enabled = true in the local configuration",
+            ));
+        }
+        let credential_path = config.gateway.credential_file.as_ref().ok_or_else(|| {
+            Error::new("CONFIG_ERROR", "gateway credential_file is not configured")
+        })?;
+        let bearer_path = config.gateway.local_bearer_file.as_ref().ok_or_else(|| {
+            Error::new(
+                "CONFIG_ERROR",
+                "gateway local_bearer_file is not configured",
+            )
+        })?;
+        let credential = platform::load_credential(credential_path)?;
+        config
+            .mcp
+            .selected_tool_profile(Some(&config.gateway.profile), &credential.client_id)?;
+        let bearer_token = load_local_bearer(bearer_path)?;
+        return eliot_swarm_controller::gateway::run(config, credential, bearer_token).await;
     }
     let credential = platform::load_credential(
         &cli.credential
@@ -333,6 +365,7 @@ async fn run(cli: Cli) -> Result<()> {
     let (method, mut params) = match cli.command {
         Command::Host
         | Command::Mcp { .. }
+        | Command::Gateway
         | Command::CheckWorker { .. }
         | Command::ModuleRun { .. } => {
             unreachable!("executor returned above")
@@ -586,4 +619,27 @@ async fn run(cli: Cli) -> Result<()> {
         eprintln!("credential saved: {}", path.display());
     }
     Ok(())
+}
+
+fn load_local_bearer(path: &PathBuf) -> Result<String> {
+    use std::io::Read;
+
+    let mut contents = String::new();
+    std::fs::File::open(path)?
+        .take(515)
+        .read_to_string(&mut contents)?;
+    if contents.len() > 514 {
+        return Err(Error::new(
+            "AUTH_ERROR",
+            "gateway bearer file exceeds 512 bytes plus a final line ending",
+        ));
+    }
+    let token = contents.trim_end_matches(['\r', '\n']);
+    if !(32..=512).contains(&token.len()) || !token.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return Err(Error::new(
+            "AUTH_ERROR",
+            "gateway bearer file must contain one printable token of 32 to 512 bytes",
+        ));
+    }
+    Ok(token.to_owned())
 }

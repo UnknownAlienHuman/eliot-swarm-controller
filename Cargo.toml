@@ -17,11 +17,15 @@ path = "src/main.rs"
 [dependencies]
 atlas-redact = { path = "modules/atlas-redact" }
 base64 = "=0.22.1"
+bytes = "=1.12.1"
 clap = { version = "4.5", features = ["derive"] }
 eventsource-stream = "=0.2.3"
 futures-util = { version = "0.3", features = ["sink"] }
+http-body-util = "=0.1.5"
+hyper = { version = "=1.11.1", default-features = false, features = ["http1", "server"] }
+hyper-util = { version = "=0.1.21", default-features = false, features = ["http1", "server", "tokio"] }
 reqwest = { version = "=0.13.5", default-features = false, features = ["json", "stream"] }
-rmcp = { version = "3.5.0", default-features = false, features = ["server", "transport-io"] }
+rmcp = { version = "=3.5.0", default-features = false, features = ["server", "transport-io", "transport-streamable-http-server"] }
 rusqlite = { version = "=0.40.2", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -29,6 +33,7 @@ sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "signal", "time"] }
 tokio-util = { version = "0.7", features = ["codec"] }
+tower-service = "=0.3.3"
 toml = "0.9"
 uuid = { version = "1", features = ["v4", "serde"] }
 

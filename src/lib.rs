@@ -7,6 +7,7 @@ pub mod doctor;
 pub mod error;
 pub mod export;
 pub mod forge;
+pub mod gateway;
 pub mod host;
 pub mod ipc;
 pub mod mcp;

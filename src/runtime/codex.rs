@@ -7,7 +7,7 @@ use crate::{
 use serde_json::{Value, json};
 
 pub const RUNTIME: &str = "codex";
-pub const ARTIFACT_ID: &str = "codex-sdk-18194bf-bridge.2";
+pub const ARTIFACT_ID: &str = "codex-sdk-18194bf-bridge.3";
 
 pub fn is_controller_route(route: &Value) -> bool {
     route["runtime"] == RUNTIME && route["module_artifact_id"] == ARTIFACT_ID

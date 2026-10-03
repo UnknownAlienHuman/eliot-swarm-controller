@@ -16,6 +16,15 @@ parser = 'cargo_json'
 resource = 'rust-default'
 # These names match THIS repository. Set the real required targets of your project.
 expected_targets = ['eliot_swarm_controller', 'swarm']
+# This example does not opt into result reuse. Enable only when every build input
+# is fixed and Cargo is run offline or frozen; unknown inputs disable reuse.
+reproducible = false
+# A Cargo profile that opts into reuse must name its immutable external build
+# environment (for example an attested builder image/toolchain snapshot).
+# versioned_inputs = { build_environment = 'sha256:immutable-builder-image-v7' }
+# Values in this list are explicitly declared non-secret and may be hashed for
+# input identity. Do not list credentials or tokens.
+fingerprint_env = ['CARGO_INCREMENTAL', 'RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER']
 [checks.profiles.environment]
 CARGO_INCREMENTAL = '0'
 RUSTC_WRAPPER = ''

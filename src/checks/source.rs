@@ -33,6 +33,95 @@ pub struct SourceManifest {
     pub tree: String,
     pub files: Vec<SourceFile>,
 }
+
+/// A captured source snapshot whose stored manifest and complete file inventory
+/// were rechecked immediately before CheckRunner input resolution.
+#[derive(Debug, Clone)]
+pub struct VerifiedSource {
+    pub manifest: SourceManifest,
+    /// Content identity excludes commit, artifact, Task, Attempt and Operation IDs.
+    pub content_sha256: String,
+    pub directory: PathBuf,
+}
+
+/// Deterministic content-only descriptor passed to checks as
+/// `SWARM_CANDIDATE_FILE`. It deliberately omits commit/object/artifact IDs;
+/// all listed file facts are already covered by `content_sha256`.
+pub fn content_descriptor(source: &VerifiedSource) -> Result<Vec<u8>> {
+    let mut files: Vec<_> = source
+        .manifest
+        .files
+        .iter()
+        .map(|file| {
+            json!({
+                "path":file.path,
+                "mode":file.mode,
+                "byte_length":file.byte_length,
+                "sha256":file.sha256,
+            })
+        })
+        .collect();
+    files.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
+    let descriptor = json!({
+        "version":1,
+        "content_sha256":source.content_sha256,
+        "files":files,
+    });
+    Ok(model::canonical(&descriptor)?.into_bytes())
+}
+
+pub fn content_descriptor_sha256(source: &VerifiedSource) -> Result<String> {
+    Ok(model::digest(&content_descriptor(source)?))
+}
+
+/// Resolve and verify the immutable captured tree used by input and scope analysis.
+pub fn verified_content(
+    files: &ArtifactFiles,
+    source_root: &Path,
+    record: &ArtifactRecord,
+) -> Result<VerifiedSource> {
+    let manifest = manifest(files, record)?;
+    let root = fs::canonicalize(source_root)?;
+    let sources = root.join("sources");
+    let canonical_sources = fs::canonicalize(&sources)?;
+    let source_dir = path(&root, &record.artifact_id)?;
+    let entry = fs::symlink_metadata(&source_dir)?;
+    if entry.file_type().is_symlink() || !entry.is_dir() {
+        return Err(Error::new(
+            "SOURCE_CHANGED",
+            "captured source root is not a regular directory",
+        ));
+    }
+    let directory = fs::canonicalize(&source_dir)?;
+    if !canonical_sources.starts_with(&root) || !directory.starts_with(&canonical_sources) {
+        return Err(Error::new(
+            "SOURCE_CHANGED",
+            "captured source directory escaped the source store",
+        ));
+    }
+    verify_directory(&directory, &manifest)?;
+
+    let mut content_files: Vec<_> = manifest
+        .files
+        .iter()
+        .map(|file| {
+            json!({
+                "path": file.path,
+                "mode": file.mode,
+                "byte_length": file.byte_length,
+                "sha256": file.sha256,
+            })
+        })
+        .collect();
+    content_files.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
+    let identity = json!({"version":1,"files":content_files});
+    let content_sha256 = model::digest(model::canonical(&identity)?.as_bytes());
+    Ok(VerifiedSource {
+        manifest,
+        content_sha256,
+        directory,
+    })
+}
 pub fn path(root: &Path, id: &str) -> Result<PathBuf> {
     let suffix = id.strip_prefix("source-").unwrap_or("");
     if suffix.len() != 64 || !suffix.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -307,11 +396,33 @@ pub fn manifest(files: &ArtifactFiles, record: &ArtifactRecord) -> Result<Source
     if manifest.version != 1
         || manifest.commit != record.metadata["commit"]
         || manifest.tree != record.metadata["tree"]
+        || record.metadata["coverage"] != "complete"
+        || record.metadata["file_count"].as_u64() != Some(manifest.files.len() as u64)
+        || !matches!(manifest.commit.len(), 40 | 64)
+        || !manifest.commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !matches!(manifest.tree.len(), 40 | 64)
+        || !manifest.tree.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
         return Err(Error::new(
             "SOURCE_MANIFEST",
             "source version or identity differs",
         ));
+    }
+    let mut paths = BTreeSet::new();
+    for file in &manifest.files {
+        safe_path(&file.path)?;
+        if !paths.insert(file.path.to_ascii_lowercase())
+            || !matches!(file.mode.as_str(), "100644" | "100755")
+            || !matches!(file.object_id.len(), 40 | 64)
+            || !file.object_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || file.sha256.len() != 64
+            || !file.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(Error::new(
+                "SOURCE_MANIFEST",
+                "source file identity is invalid or duplicated",
+            ));
+        }
     }
     Ok(manifest)
 }
@@ -403,4 +514,79 @@ pub fn materialize(
     }
     verify_directory(destination, &manifest)?;
     Ok(manifest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn publish_source(
+        files: &ArtifactFiles,
+        root: &Path,
+        id: &str,
+        commit: &str,
+        tree: &str,
+        content: &[u8],
+    ) -> ArtifactRecord {
+        let snapshot = path(root, id).unwrap();
+        fs::create_dir_all(snapshot.join("src")).unwrap();
+        fs::write(snapshot.join("src/lib.rs"), content).unwrap();
+        let commit = model::digest(commit.as_bytes());
+        let tree = model::digest(tree.as_bytes());
+        let mut manifest = SourceManifest {
+            version: 1,
+            commit: commit.clone(),
+            tree: tree.clone(),
+            files: vec![SourceFile {
+                path: "src/lib.rs".into(),
+                mode: "100644".into(),
+                object_id: model::digest(content),
+                byte_length: content.len() as u64,
+                sha256: model::digest(content),
+            }],
+        };
+        manifest.files.sort_by(|a, b| a.path.cmp(&b.path));
+        let (record, bytes) = ArtifactFiles::document(
+            "source_snapshot",
+            id,
+            &json!(manifest),
+            json!({"commit":commit,"tree":tree,"file_count":1,"coverage":"complete"}),
+        )
+        .unwrap();
+        files.publish(&record, &bytes).unwrap();
+        record
+    }
+
+    #[test]
+    fn verified_content_uses_file_content_not_capture_commit_or_artifact_id() {
+        let root = std::env::temp_dir().join(format!("swarm-source-{}", model::new_id()));
+        fs::create_dir_all(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let files = ArtifactFiles::new(&root).unwrap();
+        let a_id = format!("source-{}", model::digest(b"capture-a"));
+        let b_id = format!("source-{}", model::digest(b"capture-b"));
+        let a = publish_source(&files, &root, &a_id, "commit-a", "tree-a", b"same bytes");
+        let b = publish_source(&files, &root, &b_id, "commit-b", "tree-b", b"same bytes");
+        let verified_a = verified_content(&files, &root, &a).unwrap();
+        let verified_b = verified_content(&files, &root, &b).unwrap();
+        assert_eq!(verified_a.content_sha256, verified_b.content_sha256);
+        assert_ne!(a.artifact_id, b.artifact_id);
+        let descriptor_a = content_descriptor(&verified_a).unwrap();
+        let descriptor_b = content_descriptor(&verified_b).unwrap();
+        assert_eq!(descriptor_a, descriptor_b);
+        let descriptor: Value = serde_json::from_slice(&descriptor_a).unwrap();
+        assert_eq!(descriptor["content_sha256"], verified_a.content_sha256);
+        assert!(descriptor.get("commit").is_none());
+        assert!(descriptor.get("tree").is_none());
+        assert!(
+            !String::from_utf8(descriptor_a)
+                .unwrap()
+                .contains(&a.artifact_id)
+        );
+
+        fs::write(verified_a.directory.join("src/lib.rs"), b"changed bytes").unwrap();
+        assert!(verified_content(&files, &root, &a).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
 }

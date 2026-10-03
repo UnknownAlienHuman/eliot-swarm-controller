@@ -1,3 +1,6 @@
+#[path = "task_sources.rs"]
+mod task_sources;
+
 use super::{acceptance, meta, operations};
 use crate::{
     error::{Error, Result},
@@ -11,6 +14,8 @@ pub(super) fn get_task(db: &Connection, id: &str) -> Result<Value> {
     let raw:Option<String>=db.query_row("SELECT json_object('task_id',task_id,'project_id',project_id,'revision',revision,'state',state,'origin_key',origin_key,'spec',json(spec_json),'accepted_attempt_id',accepted_attempt_id,'accepted_operation_id',accepted_operation_id,'accepted_revision',accepted_revision,'accepted_phase',accepted_phase,'accepted_candidate_ref',accepted_candidate_ref) FROM tasks WHERE task_id=?1",[id],|r|r.get(0)).optional()?;
     let mut task: Value =
         serde_json::from_str(&raw.ok_or_else(|| Error::new("NOT_FOUND", format!("Task {id}")))?)?;
+    let task_brief = task_sources::project_brief(&task["spec"]);
+    task["task_brief"] = task_brief;
     let owner: Option<String> = db
         .query_row(
             "SELECT attempt_id FROM attempts WHERE task_id=?1 AND released_at_ms IS NULL",
@@ -41,13 +46,15 @@ fn task_snapshot(
     revision: i64,
     dependency_acceptances: Vec<Value>,
     owner_policy: policy::OwnerPolicyEdition,
+    baseline_candidate: Value,
 ) -> Value {
     json!({
         "spec": spec,
         "revision": revision,
         "dependency_acceptances": dependency_acceptances,
+        "baseline_candidate": baseline_candidate,
         "owner_policy": owner_policy,
-        "brief": spec.brief(),
+        "brief": task_sources::brief(spec),
     })
 }
 fn spec(v: &Value) -> Result<TaskSpec> {
@@ -207,6 +214,11 @@ pub(super) fn claim(
     let spec: TaskSpec = serde_json::from_value(task["spec"].clone())?;
     spec.validate()?;
     let owner_policy = policy::accepted_edition(spec.owner_policy_id.as_deref())?;
+    let baseline_candidate = acceptance::freeze_baseline_candidate(
+        tx,
+        model::text(&task, "project_id")?,
+        spec.baseline_candidate_ref.as_deref(),
+    )?;
     let mut dependency_receipts = Vec::new();
     for d in &spec.dependencies {
         let accepted = acceptance::resolve_dependency(tx, d)?;
@@ -233,7 +245,13 @@ pub(super) fn claim(
         }
     };
     let attempt = model::new_id();
-    let snapshot = task_snapshot(&spec, revision, dependency_receipts, owner_policy);
+    let snapshot = task_snapshot(
+        &spec,
+        revision,
+        dependency_receipts,
+        owner_policy,
+        baseline_candidate,
+    );
     tx.execute("INSERT INTO attempts(attempt_id,task_id,task_revision,task_snapshot_json,owner_id,start_owner,binding_id,binding_generation,state,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'reserved',?9,?9)",params![attempt,task_id,revision,model::canonical(&snapshot)?,owner,start.as_str(),binding,generation,now])?;
     tx.execute(
         "UPDATE operations SET task_id=?2,attempt_id=?3 WHERE operation_id=?1",
@@ -345,8 +363,9 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn attempt_snapshot_freezes_policy_and_source_gap_without_inventing_text() {
+    fn attempt_snapshot_freezes_policy_and_ordered_source_index() {
         let text = "Malformed issue comment: acceptance details are unclear.";
+        let selected_text = "Issue body selected for the Task revision.";
         let spec = TaskSpec {
             acceptance: None,
             objective: "Implement issue 14".to_owned(),
@@ -357,16 +376,30 @@ mod tests {
             }],
             dependencies: Vec::new(),
             scope: None,
-            source_refs: vec!["docs/owner-decisions.md".to_owned()],
+            baseline_candidate_ref: None,
+            source_refs: vec![
+                "issue:14/comment:7".to_owned(),
+                "docs/owner-decisions.md".to_owned(),
+            ],
             owner_policy_id: Some(OWNER_POLICY_V1_ID.to_owned()),
-            source_index: vec![TaskSourceIndexEntry {
-                source_ref: "issue:14/comment:7".to_owned(),
-                revision: Some("issue-revision-3".to_owned()),
-                content_sha256: None,
-                text: Some(text.to_owned()),
-                status: SourceIndexStatus::Gap,
-                gap_reason: Some("comment_parse_incomplete".to_owned()),
-            }],
+            source_index: vec![
+                TaskSourceIndexEntry {
+                    source_ref: "issue:14/body".to_owned(),
+                    revision: Some("issue-revision-3".to_owned()),
+                    content_sha256: Some(model::digest(selected_text.as_bytes())),
+                    text: Some(selected_text.to_owned()),
+                    status: SourceIndexStatus::Selected,
+                    gap_reason: None,
+                },
+                TaskSourceIndexEntry {
+                    source_ref: "issue:14/comment:7".to_owned(),
+                    revision: Some("issue-revision-3".to_owned()),
+                    content_sha256: None,
+                    text: Some(text.to_owned()),
+                    status: SourceIndexStatus::Gap,
+                    gap_reason: Some("comment_parse_incomplete".to_owned()),
+                },
+            ],
         };
         spec.validate().unwrap();
         let snapshot = task_snapshot(
@@ -374,26 +407,159 @@ mod tests {
             3,
             Vec::new(),
             policy::accepted_edition(spec.owner_policy_id.as_deref()).unwrap(),
+            json!({"status":"wide","reason":"baseline_not_configured"}),
         );
 
         assert_eq!(snapshot["owner_policy"]["status"], "accepted");
         assert_eq!(snapshot["owner_policy"]["edition"], 1);
-        assert_eq!(snapshot["brief"]["source_index"][0]["status"], "gap");
-        assert_eq!(snapshot["brief"]["source_index"][0]["text"], text);
         assert_eq!(
             snapshot["brief"]["source_index"][0]["content_sha256"],
+            model::digest(selected_text.as_bytes())
+        );
+        assert_eq!(snapshot["brief"]["source_index"][0]["status"], "selected");
+        assert_eq!(snapshot["brief"]["source_index"][0]["text"], selected_text);
+        assert_eq!(snapshot["brief"]["source_index"][1]["status"], "gap");
+        assert_eq!(snapshot["brief"]["source_index"][1]["text"], text);
+        assert_eq!(
+            snapshot["brief"]["source_index"][1]["content_sha256"],
             model::digest(text.as_bytes())
         );
         assert_eq!(
-            snapshot["brief"]["source_index"][0]["gap_reason"],
+            snapshot["brief"]["source_index"][1]["gap_reason"],
             "comment_parse_incomplete"
         );
-        assert_eq!(snapshot["brief"]["source_index"][1]["status"], "gap");
+        assert_eq!(snapshot["brief"]["source_index"][2]["status"], "gap");
         assert_eq!(
-            snapshot["brief"]["source_index"][1]["gap_reason"],
+            snapshot["brief"]["source_index"][2]["gap_reason"],
             "legacy_source_ref_without_pinned_revision_or_content"
         );
         assert_eq!(snapshot["brief"]["objective"], spec.objective);
+    }
+
+    #[test]
+    fn legacy_unreadable_task_remains_readable_without_rewriting_its_spec() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(crate::store::SCHEMA).unwrap();
+        db.execute(
+            "INSERT INTO tasks(task_id,project_id,revision,state,spec_json,created_at_ms,updated_at_ms) VALUES('legacy-task','legacy-project',1,'open','{}',1,1)",
+            [],
+        )
+        .unwrap();
+
+        let task = get_task(&db, "legacy-task").unwrap();
+        assert_eq!(task["task_id"], "legacy-task");
+        assert_eq!(task["spec"], json!({}));
+        assert_eq!(
+            task["task_brief"],
+            json!({
+                "status": "unavailable",
+                "reason": "stored_task_spec_unreadable",
+            })
+        );
+        assert_eq!(task["current_attempt_id"], Value::Null);
+
+        let persisted_spec: String = db
+            .query_row(
+                "SELECT spec_json FROM tasks WHERE task_id='legacy-task'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(persisted_spec, "{}");
+    }
+
+    #[tokio::test]
+    async fn task_read_projection_exposes_selected_gap_and_legacy_source_order() {
+        let directory =
+            std::env::temp_dir().join(format!("swarm-task-source-projection-{}", model::new_id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let root = DataRoot::acquire(&directory).unwrap();
+        let credential = bootstrap_credential(&root.path).unwrap();
+        let mut config = Config::default();
+        config.storage.data_dir = directory.clone();
+        let owner = StoreOwner::start(root, Arc::new(config), credential.clone())
+            .await
+            .unwrap();
+        let principal = owner.store.authenticate(credential).await.unwrap();
+        let selected_text = "Canonical Issue body.";
+        let gap_text = "Unparsed source comment.";
+        let created = owner
+            .store
+            .call(
+                principal.clone(),
+                "task.create".into(),
+                json!({
+                    "client_request_id":model::new_id(),
+                    "project_id":"fixture",
+                    "spec":{
+                        "objective":"Project source inputs",
+                        "phase":"implementation",
+                        "requirements":[{"id":"R1","statement":"Retain source order and gaps"}],
+                        "source_refs":["issue:14/comment:2","canonical:design-doc"],
+                        "source_index":[
+                            {
+                                "source_ref":"issue:14/body",
+                                "revision":"issue-revision-3",
+                                "content_sha256":model::digest(selected_text.as_bytes()),
+                                "text":selected_text,
+                                "status":"selected"
+                            },
+                            {
+                                "source_ref":"issue:14/comment:2",
+                                "revision":"issue-revision-3",
+                                "text":gap_text,
+                                "status":"gap",
+                                "gap_reason":"comment_parse_incomplete"
+                            }
+                        ]
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        let task_id = created["task_id"].as_str().unwrap().to_owned();
+        let task = owner
+            .store
+            .call(
+                principal.clone(),
+                "task.get".into(),
+                json!({"task_id":task_id}),
+            )
+            .await
+            .unwrap();
+        {
+            let indexed = task["task_brief"]["source_index"].as_array().unwrap();
+            assert_eq!(indexed.len(), 3);
+            assert_eq!(indexed[0]["source_ref"], "issue:14/body");
+            assert_eq!(indexed[0]["status"], "selected");
+            assert_eq!(
+                indexed[0]["content_sha256"],
+                model::digest(selected_text.as_bytes())
+            );
+            assert_eq!(indexed[1]["source_ref"], "issue:14/comment:2");
+            assert_eq!(indexed[1]["status"], "gap");
+            assert_eq!(indexed[1]["text"], gap_text);
+            assert_eq!(
+                indexed[1]["content_sha256"],
+                model::digest(gap_text.as_bytes())
+            );
+            assert_eq!(indexed[1]["gap_reason"], "comment_parse_incomplete");
+            assert_eq!(indexed[2]["source_ref"], "canonical:design-doc");
+            assert_eq!(indexed[2]["status"], "gap");
+            assert_eq!(
+                indexed[2]["gap_reason"],
+                "legacy_source_ref_without_pinned_revision_or_content"
+            );
+        }
+
+        let listed = owner
+            .store
+            .call(principal, "task.list".into(), json!({"limit":10,"after":0}))
+            .await
+            .unwrap();
+        assert_eq!(listed["items"][0]["task_brief"], task["task_brief"]);
+        owner.close().await.unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

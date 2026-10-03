@@ -707,7 +707,11 @@ pub fn inspect(db: &Connection, config: &Config) -> Result<Inspection> {
             "checks": {
                 "enabled": config.checks.enabled,
                 "max_running": config.checks.max_running,
-                "cache_reuse": false,
+                "cache_reuse": "conditional_per_check",
+                "cache_reuse_policy": "requires_reproducible_opt_in_verified_versioned_inputs_original_process_pass_and_current_accepted_source",
+                "reverse_scope": "conditional_baseline",
+                "reverse_scope_policy": "current_verified_same_project_accepted_baseline_required_else_wide",
+                "reproducible_profiles_configured": config.checks.profiles.iter().filter(|p| p.reproducible).count(),
                 "profiles": config
                     .checks
                     .profiles

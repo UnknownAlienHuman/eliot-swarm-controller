@@ -16,6 +16,7 @@ accepted as an attach.
 
 from __future__ import annotations
 
+import base64
 import json
 import hashlib
 import subprocess
@@ -88,6 +89,40 @@ class _Args:
 
 
 class BridgeFixtureTests(unittest.TestCase):
+    def test_result_outcome_uses_durable_module_result_path(self):
+        class RecordingHost:
+            def __init__(self):
+                self.calls = []
+
+            def call(self, method, params):
+                self.calls.append((method, params))
+                return {"recorded": True}
+
+        host = RecordingHost()
+        page = {
+            "source": {"kind": "codex_turn_history"},
+            "offset_bytes": 0,
+            "byte_length": 3,
+            "total_bytes": 3,
+            "eof": True,
+            "media_type": "application/json",
+            "content_base64": "e30=",
+            "page_sha256": hashlib.sha256(b"{}").hexdigest(),
+        }
+        bridge._report_outcome(
+            host,
+            {"operation_id": "operation-result-fixture", "result_page": page},
+        )
+        self.assertEqual(
+            host.calls,
+            [
+                (
+                    "module.result",
+                    {"operation_id": "operation-result-fixture", "page": page},
+                )
+            ],
+        )
+
     def test_describe_reports_executor_and_sdk_versions_separately(self):
         client, _ = _client()
         try:
@@ -210,6 +245,409 @@ class BridgeFixtureTests(unittest.TestCase):
         child = out["threads"][1]
         self.assertEqual(child["parentThreadId"], "thr_fixture_root")
         self.assertIsNone(out["next_cursor"])
+
+    def test_native_tool_notification_window_preserves_ids_without_payload(self):
+        script = _controller_script()
+        script["notifications"] = {
+            "initialize": [
+                {
+                    "method": "thread/started",
+                    "params": {
+                        "thread": {
+                            "id": "thread-fixture-child",
+                            "parentThreadId": "thread-fixture-root",
+                        }
+                    },
+                },
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "completedAtMs": 10,
+                        "threadId": "thread-fixture-root",
+                        "turnId": "turn-fixture-tool",
+                        "item": {
+                            "id": "native-tool-call-17",
+                            "type": "mcpToolCall",
+                            "server": "fixture-server",
+                            "tool": "lookup",
+                            "arguments": {"private": "not copied into live state"},
+                            "status": "completed",
+                            "result": {
+                                "content": [{"type": "text", "text": "fixture result"}]
+                            },
+                        },
+                    },
+                }
+            ]
+        }
+        transport = ScriptedPeerTransport(script)
+        client = SharedCodexClient(
+            transport, allowed_methods=bridge.CONTROLLER_METHODS
+        )
+        client.start()
+        try:
+            client.initialize()
+            snapshot = client.native_event_snapshot({"thread-fixture-root"})
+        finally:
+            client.close()
+        self.assertFalse(snapshot["complete"])
+        self.assertEqual(snapshot["coverage"], "current_connection_window_only")
+        self.assertEqual(len(snapshot["events"]), 2)
+        child_event = snapshot["events"][0]
+        self.assertEqual(child_event["event"], "thread/started")
+        self.assertEqual(child_event["native_thread_id"], "thread-fixture-child")
+        self.assertEqual(child_event["parent_thread_id"], "thread-fixture-root")
+        event = snapshot["events"][1]
+        self.assertEqual(event["event"], "item/completed")
+        self.assertEqual(event["native_thread_id"], "thread-fixture-root")
+        self.assertEqual(event["native_turn_id"], "turn-fixture-tool")
+        self.assertEqual(event["native_item_id"], "native-tool-call-17")
+        self.assertEqual(event["tool_server"], "fixture-server")
+        self.assertEqual(event["tool_name"], "lookup")
+        self.assertEqual(event["tool_status"], "completed")
+        self.assertNotIn("arguments", event)
+        self.assertNotIn("result", event)
+
+    def test_native_child_history_result_keeps_tool_ids_and_partial_family_claim(self):
+        script = _controller_script()
+        root_thread = script["responses"]["thread/start"]["result"]["thread"]
+        child = json.loads(json.dumps(root_thread))
+        child.update(
+            {
+                "id": "thread-fixture-child",
+                "parentThreadId": "thread-fixture-root",
+                "sessionId": "session-fixture-root",
+                "model": "fixture-child-model",
+                "modelProvider": "fixture-child-provider",
+                "preview": "synthetic child thread",
+                "source": {
+                    "subAgent": {
+                        "thread_spawn": {
+                            "depth": 1,
+                            "parent_thread_id": "thread-fixture-root",
+                        }
+                    }
+                },
+            }
+        )
+        unrelated = json.loads(json.dumps(child))
+        unrelated.update(
+            {
+                "id": "thread-unrelated-child",
+                "parentThreadId": "another-root",
+                "source": {
+                    "subAgent": {
+                        "thread_spawn": {
+                            "depth": 1,
+                            "parent_thread_id": "another-root",
+                        }
+                    }
+                },
+            }
+        )
+        script["responses"]["thread/list"] = [
+            {"result": {"data": [child], "nextCursor": "children-page-2"}},
+            {"result": {"data": [unrelated], "nextCursor": None}},
+        ]
+        root_input = {
+            "turnId": "turn-fixture-root-input",
+            "item": {
+                "id": "native-user-fixture-22",
+                "clientId": "operation-fixture-dispatch",
+                "content": [{"type": "text", "text": "Task specification: {}\n\nreturn marker"}],
+                "type": "userMessage",
+            },
+        }
+        parent_activity = {
+            "turnId": "turn-fixture-root-input",
+            "item": {
+                "id": "native-subagent-activity-3",
+                "agentPath": "fixture:subagent",
+                "agentThreadId": "thread-fixture-child",
+                "kind": "started",
+                "type": "subAgentActivity",
+            },
+        }
+        child_history = [
+            {
+                "turnId": "turn-fixture-child-result",
+                "item": {
+                    "id": "native-assistant-fixture-30",
+                    "text": "child result from native history",
+                    "phase": "final_answer",
+                    "type": "agentMessage",
+                },
+            },
+            {
+                "turnId": "turn-fixture-child-result",
+                "item": {
+                    "id": "native-tool-call-31",
+                    "server": "fixture-server",
+                    "tool": "lookup",
+                    "arguments": {"key": "fixture"},
+                    "status": "completed",
+                    "result": {
+                        "content": [{"type": "text", "text": "exact tool output"}],
+                        "structuredContent": {"answer": "exact"},
+                    },
+                    "type": "mcpToolCall",
+                },
+            },
+            {
+                "turnId": "turn-fixture-child-result",
+                "item": {
+                    "id": "native-reasoning-fixture-32",
+                    "content": ["private reasoning fixture"],
+                    "summary": [],
+                    "type": "reasoning",
+                },
+            },
+        ]
+        script["responses"]["thread/items/list"] = [
+            {"result": {"data": [root_input], "nextCursor": None}},
+            {"result": {"data": [parent_activity], "nextCursor": None}},
+            {"result": {"data": [parent_activity], "nextCursor": None}},
+            {"result": {"data": child_history, "nextCursor": None}},
+            {"result": {"data": child_history, "nextCursor": None}},
+        ]
+        script["responses"]["thread/turns/list"] = [
+            {
+                "result": {
+                    "data": [
+                        {"id": "turn-fixture-root-input", "status": "completed", "items": []}
+                    ],
+                    "nextCursor": None,
+                }
+            },
+            {
+                "result": {
+                    "data": [
+                        {"id": "turn-fixture-child-result", "status": "completed", "items": []}
+                    ],
+                    "nextCursor": None,
+                }
+            },
+        ]
+
+        transport = ScriptedPeerTransport(script)
+        client = SharedCodexClient(
+            transport, allowed_methods=bridge.CONTROLLER_METHODS
+        )
+        client.start()
+        try:
+            init = client.initialize()
+            executor = bridge._executor_block(client, init)
+            scope_key = "codex-appserver:fixture:codex-app-server-fixture:0.153.4"
+            owner = {"version": 1, "process": {"purpose": "module"}, "token": "boot-result"}
+            with tempfile.TemporaryDirectory() as temp_dir:
+                checkpoint = Checkpoint(Path(temp_dir), owner)
+                prompt = "Task specification: {}\n\nreturn marker"
+                checkpoint.data.update(
+                    native_root_id="thread-fixture-root",
+                    native_scope_key=scope_key,
+                    requested_model_provider="fixture-provider",
+                    requested_model="fixture-model",
+                    effective_model_provider="fixture-provider",
+                    effective_model="fixture-model",
+                    effective_model_status="thread_configuration_exact",
+                    workspace_root=FIXTURE_WORKSPACE,
+                    operations={
+                        "operation-fixture-dispatch": {
+                            "method": "task.dispatch",
+                            "kind": "send",
+                            "native_root_id": "thread-fixture-root",
+                            "native_scope_key": scope_key,
+                            "client_user_message_id": "operation-fixture-dispatch",
+                            "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+                            "prompt_bytes": len(prompt.encode()),
+                            "delivery": "next_turn",
+                            "returned_turn_id": "turn-fixture-root-input",
+                            "turn_id": "turn-fixture-root-input",
+                            "native_input_id": "native-user-fixture-22",
+                        }
+                    },
+                )
+                checkpoint.save()
+                engine = ControllerEngine(
+                    checkpoint, lambda: (client, executor, scope_key)
+                )
+                result = engine.handle(
+                    {
+                        "operation_id": "operation-fixture-result",
+                        "method": "agent.result",
+                        "native_root_id": "thread-fixture-root",
+                        "input": {
+                            "selector": {
+                                "kind": "codex_turn_history",
+                                "input_operation_id": "operation-fixture-dispatch",
+                                "native_thread_id": "thread-fixture-child",
+                                "native_turn_id": "turn-fixture-child-result",
+                            }
+                        },
+                    }
+                )[0]
+
+                self.assertEqual(result["outcome"], "applied", result)
+                self.assertEqual(
+                    result["details"]["completion_condition"], "native_result_observed"
+                )
+                page = result["result_page"]
+                self.assertTrue(page["eof"])
+                self.assertEqual(page["source"]["native_thread_id"], "thread-fixture-child")
+                self.assertEqual(page["source"]["parent_thread_id"], "thread-fixture-root")
+                self.assertEqual(page["source"]["root_thread_model_provider"], "fixture-provider")
+                self.assertEqual(page["source"]["thread_model_provider"], "fixture-child-provider")
+                self.assertNotEqual(
+                    page["source"]["root_thread_model_provider"],
+                    page["source"]["thread_model_provider"],
+                )
+                self.assertEqual(page["source"]["history_projection"], "allowlisted_native_item_fields_v1")
+                self.assertEqual(result["details"]["served_model_status"], "unknown")
+                self.assertEqual(result["details"]["billing_status"], "unknown")
+                self.assertFalse(page["source"]["family_complete"])
+                document = json.loads(base64.b64decode(page["content_base64"]))
+                tool_item = next(
+                    entry["item"]
+                    for entry in document["items"]
+                    if entry["item"]["type"] == "mcpToolCall"
+                )
+                self.assertEqual(tool_item["id"], "native-tool-call-31")
+                self.assertEqual(tool_item["tool"], "lookup")
+                self.assertEqual(tool_item["arguments"], {"key": "fixture"})
+                self.assertEqual(tool_item["result"]["structuredContent"], {"answer": "exact"})
+                self.assertNotIn("private reasoning fixture", page["content_base64"])
+                observed = engine.observation()
+                self.assertEqual(
+                    [child["native_thread_id"] for child in observed["observed_children"]],
+                    ["thread-fixture-child"],
+                )
+                self.assertEqual(observed["family_enumeration"]["status"], "complete")
+                self.assertEqual(observed["family_enumeration"]["family_completeness"], "partial")
+                self.assertFalse(observed["family_enumeration"]["atomic"])
+        finally:
+            client.close()
+
+    def test_selected_child_identity_conflict_rejects_result(self):
+        script = _controller_script()
+        root_thread = script["responses"]["thread/start"]["result"]["thread"]
+        child = json.loads(json.dumps(root_thread))
+        child.update(
+            {
+                "id": "thread-fixture-conflicted-child",
+                "parentThreadId": "thread-fixture-root",
+                "sessionId": "session-fixture-root",
+                "preview": "synthetic child thread",
+                "source": {
+                    "subAgent": {
+                        "thread_spawn": {
+                            "depth": 1,
+                            "parent_thread_id": "thread-fixture-root",
+                        }
+                    }
+                },
+            }
+        )
+        conflicting_child = json.loads(json.dumps(child))
+        conflicting_child.update(
+            {
+                "parentThreadId": "thread-other-root",
+                "source": {
+                    "subAgent": {
+                        "thread_spawn": {
+                            "depth": 1,
+                            "parent_thread_id": "thread-other-root",
+                        }
+                    }
+                },
+            }
+        )
+        script["responses"]["thread/list"] = [
+            {"result": {"data": [child], "nextCursor": "conflict-page-2"}},
+            {"result": {"data": [conflicting_child], "nextCursor": None}},
+        ]
+        prompt = "Task specification: {}\n\nreturn marker"
+        script["responses"]["thread/items/list"] = [
+            {
+                "result": {
+                    "data": [
+                        {
+                            "turnId": "turn-fixture-root-input",
+                            "item": {
+                                "id": "native-user-fixture-conflict",
+                                "clientId": "operation-fixture-conflict-dispatch",
+                                "content": [{"type": "text", "text": prompt}],
+                                "type": "userMessage",
+                            },
+                        }
+                    ],
+                    "nextCursor": None,
+                }
+            }
+        ]
+
+        transport = ScriptedPeerTransport(script)
+        client = SharedCodexClient(transport, allowed_methods=bridge.CONTROLLER_METHODS)
+        client.start()
+        try:
+            init = client.initialize()
+            executor = bridge._executor_block(client, init)
+            scope_key = "codex-appserver:fixture:codex-app-server-fixture:0.153.4"
+            owner = {"version": 1, "process": {"purpose": "module"}, "token": "boot-conflict"}
+            with tempfile.TemporaryDirectory() as temp_dir:
+                checkpoint = Checkpoint(Path(temp_dir), owner)
+                checkpoint.data.update(
+                    native_root_id="thread-fixture-root",
+                    native_scope_key=scope_key,
+                    effective_model_provider="fixture-provider",
+                    effective_model="fixture-model",
+                    operations={
+                        "operation-fixture-conflict-dispatch": {
+                            "method": "task.dispatch",
+                            "kind": "send",
+                            "native_root_id": "thread-fixture-root",
+                            "native_scope_key": scope_key,
+                            "client_user_message_id": "operation-fixture-conflict-dispatch",
+                            "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+                            "prompt_bytes": len(prompt.encode()),
+                            "delivery": "next_turn",
+                            "returned_turn_id": "turn-fixture-root-input",
+                            "turn_id": "turn-fixture-root-input",
+                            "native_input_id": "native-user-fixture-conflict",
+                        }
+                    },
+                )
+                checkpoint.save()
+                engine = ControllerEngine(checkpoint, lambda: (client, executor, scope_key))
+                result = engine.handle(
+                    {
+                        "operation_id": "operation-fixture-conflict-result",
+                        "method": "agent.result",
+                        "native_root_id": "thread-fixture-root",
+                        "input": {
+                            "selector": {
+                                "kind": "codex_turn_history",
+                                "input_operation_id": "operation-fixture-conflict-dispatch",
+                                "native_thread_id": "thread-fixture-conflicted-child",
+                                "native_turn_id": "turn-fixture-child-result",
+                            }
+                        },
+                    }
+                )[0]
+
+                self.assertEqual(result["outcome"], "rejected", result)
+                self.assertEqual(
+                    result["details"]["diagnostic_code"],
+                    "RESULT_CHILD_IDENTITY_CONFLICT",
+                )
+                self.assertFalse(result["details"]["native_replay"])
+                self.assertNotIn("result_page", result)
+                family = engine.observation()["family_enumeration"]
+                self.assertEqual(family["conflicting_thread_ids"], ["thread-fixture-conflicted-child"])
+                self.assertEqual(family["family_completeness"], "partial")
+                self.assertEqual(family["status"], "partial")
+                self.assertFalse(family["atomic"])
+        finally:
+            client.close()
 
     def test_write_allowlist_blocks_mutating_methods_before_socket(self):
         client, transport = _client()

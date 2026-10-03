@@ -9,6 +9,7 @@ an ambiguous model write.
 from __future__ import annotations
 
 import ctypes
+import base64
 import hashlib
 import json
 import os
@@ -25,6 +26,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from openai_codex.errors import CodexError
 from openai_codex.generated.v2_all import (
     ThreadItemsListResponse,
+    ThreadListResponse,
     ThreadStartParams,
     ThreadTurnsListResponse,
     TurnStartParams,
@@ -32,10 +34,20 @@ from openai_codex.generated.v2_all import (
     TurnSteerResponse,
 )
 
-MODULE_ARTIFACT_ID = "codex-sdk-18194bf-bridge.2"
+MODULE_ARTIFACT_ID = "codex-sdk-18194bf-bridge.3"
 MAX_FRAME_BYTES = 1_048_576
 MAX_HISTORY_PAGES = 100
 PAGE_SIZE = 100
+MAX_FAMILY_PAGES = 100
+MAX_RESULT_BYTES = 64 * 1024 * 1024
+MAX_RESULT_PAGE_BYTES = 65_536
+SUBAGENT_SOURCE_KINDS = (
+    "subAgent",
+    "subAgentReview",
+    "subAgentCompact",
+    "subAgentThreadSpawn",
+    "subAgentOther",
+)
 
 
 class _ThreadStartIdentity(BaseModel):
@@ -62,13 +74,16 @@ CAPABILITIES = {
     "refresh": "implemented",
     "reconcile": "implemented",
     "recover": "implemented",
+    "family": "implemented",
+    "result_pages": "implemented",
+    "tool_events": "implemented",
+    "tool_execution": "unavailable",
+    "auxiliary_affinity": "unavailable",
     "configure_model": "unavailable",
     "configure_effort": "unavailable",
     "goal": "unavailable",
     "reply": "unavailable",
     "background": "unavailable",
-    "family": "unavailable",
-    "result_pages": "unavailable",
     "artifact_publication": "unavailable",
 }
 
@@ -93,6 +108,94 @@ def _digest_text(text: str) -> tuple[str, int]:
 
 def _canonical_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _native_json(value: Any) -> Any:
+    if hasattr(value, "model_dump"):
+        return value.model_dump(by_alias=True, mode="json", exclude_none=True)
+    if hasattr(value, "value"):
+        return value.value
+    return value
+
+
+def _native_thread_projection(thread: Any) -> dict[str, Any]:
+    return {
+        "native_thread_id": getattr(thread, "id", None),
+        "parent_thread_id": getattr(thread, "parent_thread_id", None),
+        "session_id": getattr(thread, "session_id", None),
+        "source": _native_json(getattr(thread, "source", None)),
+        "status": _native_json(getattr(thread, "status", None)),
+        "model_provider": getattr(thread, "model_provider", None),
+        # Thread configuration is not per-turn served-model telemetry.
+        "thread_model": getattr(thread, "model", None),
+        "cwd": _native_json(getattr(thread, "cwd", None)),
+        "updated_at": getattr(thread, "updated_at", None),
+        "agent_role": getattr(thread, "agent_role", None),
+        "agent_nickname": getattr(thread, "agent_nickname", None),
+    }
+
+
+def _native_item_projection(entry: Any) -> dict[str, Any]:
+    item = entry.item.root
+    native = _native_json(item)
+    item_type = native.get("type") if isinstance(native, dict) else None
+    item_id = native.get("id") if isinstance(native, dict) else None
+    projected: dict[str, Any] = {
+        "turn_id": getattr(entry, "turn_id", None),
+        "item": {"type": item_type, "id": item_id},
+    }
+    started = getattr(entry, "started_at_ms", None)
+    completed = getattr(entry, "completed_at_ms", None)
+    if started is not None:
+        projected["started_at_ms"] = started
+    if completed is not None:
+        projected["completed_at_ms"] = completed
+
+    # Preserve tool inputs and outputs exactly as the native item recorded
+    # them. Exclude MCP app presentation metadata and do not export reasoning.
+    fields_by_type = {
+        "userMessage": ("clientId", "content"),
+        "agentMessage": ("text", "phase", "delivery"),
+        "mcpToolCall": (
+            "server",
+            "tool",
+            "arguments",
+            "status",
+            "result",
+            "error",
+            "durationMs",
+        ),
+        "dynamicToolCall": (
+            "namespace",
+            "tool",
+            "arguments",
+            "status",
+            "success",
+            "contentItems",
+            "durationMs",
+        ),
+        "functionCallOutput": ("name", "namespace", "output"),
+        "commandExecution": (
+            "command",
+            "status",
+            "exitCode",
+            "aggregatedOutput",
+            "durationMs",
+            "source",
+        ),
+        "fileChange": ("status", "changes"),
+        "subAgentActivity": ("agentThreadId", "kind"),
+        "plan": ("text",),
+        "webSearch": ("query", "action", "results"),
+        "imageGeneration": ("status", "result", "failure"),
+    }
+    item_projection = projected["item"]
+    for key in fields_by_type.get(item_type, ()):
+        if key in native:
+            item_projection[key] = native[key]
+    if item_type == "reasoning":
+        item_projection["content_status"] = "omitted"
+    return projected
 
 
 def _absolute_workspace(value: Any) -> str:
@@ -250,6 +353,15 @@ class Checkpoint:
             "workspace_status": "workspace_unknown",
             "effective_model_provider": None,
             "effective_model": None,
+            "observed_children": [],
+            "family_enumeration": {
+                "status": "unobserved",
+                "pages_read": 0,
+                "pagination_complete": False,
+                "family_completeness": "partial",
+                "atomic": False,
+                "gaps": [],
+            },
             "operations": {},
         }
         self._load()
@@ -519,6 +631,7 @@ class ControllerEngine:
         scope_key: str | None = None,
         turn_id: str | None = None,
         native_input_id: str | None = None,
+        result_page: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         result: dict[str, Any] = {
             "operation_id": operation_id,
@@ -535,6 +648,8 @@ class ControllerEngine:
             result["turn_id"] = turn_id
         if native_input_id:
             result["native_input_id"] = native_input_id
+        if result_page is not None:
+            result["result_page"] = result_page
         self.outcomes[operation_id] = result
         record = self.data["operations"].get(operation_id)
         if isinstance(record, dict):
@@ -618,6 +733,158 @@ class ControllerEngine:
                 return matches, False
         return matches, True
 
+    @staticmethod
+    def _read_family(client: Any, root_id: str) -> dict[str, Any]:
+        """Read exact child links; a complete page walk is still non-atomic."""
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        threads: dict[str, dict[str, Any]] = {}
+        conflicting_thread_ids: set[str] = set()
+        pages_read = 0
+        gaps: list[str] = []
+        pagination_complete = False
+
+        for _ in range(MAX_FAMILY_PAGES):
+            params: dict[str, Any] = {
+                "limit": PAGE_SIZE,
+                "sortDirection": "desc",
+                "sourceKinds": list(SUBAGENT_SOURCE_KINDS),
+                # Avoid app-server rollout repair while passively observing.
+                "useStateDbOnly": True,
+            }
+            if cursor:
+                params["cursor"] = cursor
+            response = client.request(
+                "thread/list", params, response_model=ThreadListResponse
+            )
+            pages_read += 1
+            for thread in response.data:
+                thread_id = getattr(thread, "id", None)
+                parent_id = getattr(thread, "parent_thread_id", None)
+                if not isinstance(thread_id, str) or not thread_id:
+                    gaps.append("native_child_id_missing")
+                    continue
+                if not isinstance(parent_id, str) or not parent_id:
+                    # A sub-agent source without the native parent link is
+                    # not attributed to this family by session or cwd.
+                    continue
+                projection = _native_thread_projection(thread)
+                prior = threads.get(thread_id)
+                if prior is not None and prior != projection:
+                    conflicting_thread_ids.add(thread_id)
+                    gaps.append("native_child_identity_conflict")
+                    continue
+                threads[thread_id] = projection
+
+            next_cursor = response.next_cursor
+            if not next_cursor:
+                pagination_complete = True
+                break
+            if next_cursor == cursor or next_cursor in seen_cursors:
+                gaps.append("native_child_cursor_not_advancing")
+                break
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+        else:
+            gaps.append("native_child_page_limit")
+
+        children: list[dict[str, Any]] = []
+        for thread_id, projection in threads.items():
+            parent_id = projection.get("parent_thread_id")
+            visited = {thread_id}
+            depth = 1
+            while parent_id != root_id and parent_id in threads:
+                if parent_id in visited:
+                    gaps.append("native_child_parent_cycle")
+                    parent_id = None
+                    break
+                visited.add(parent_id)
+                ancestor = threads[parent_id]
+                parent_id = ancestor.get("parent_thread_id")
+                depth += 1
+            if parent_id == root_id:
+                children.append(
+                    {
+                        **projection,
+                        "depth": depth,
+                        "freshness": "current",
+                        "list_presence": "listed",
+                    }
+                )
+
+        return {
+            "children": children,
+            "conflicting_thread_ids": sorted(conflicting_thread_ids),
+            "pages_read": pages_read,
+            "pagination_complete": pagination_complete,
+            "family_completeness": "partial",
+            "atomic": False,
+            "gaps": sorted(set(gaps)),
+        }
+
+    def _record_family(self, observed: dict[str, Any], *, status: str) -> dict[str, Any]:
+        current = {
+            child["native_thread_id"]: child
+            for child in observed.get("children", [])
+            if isinstance(child.get("native_thread_id"), str)
+        }
+        prior_children = {
+            child["native_thread_id"]: child
+            for child in self.data.get("observed_children", [])
+            if isinstance(child, dict) and isinstance(child.get("native_thread_id"), str)
+        }
+        merged: dict[str, dict[str, Any]] = {}
+        for thread_id, child in prior_children.items():
+            if thread_id not in current:
+                merged[thread_id] = {
+                    **child,
+                    "freshness": "stale",
+                    "list_presence": (
+                        "not_returned"
+                        if observed.get("pagination_complete")
+                        else "not_in_observed_pages"
+                    ),
+                }
+        merged.update(current)
+        family = {
+            "status": status,
+            "pages_read": observed.get("pages_read", 0),
+            "pagination_complete": bool(observed.get("pagination_complete")),
+            "conflicting_thread_ids": list(observed.get("conflicting_thread_ids", [])),
+            # thread/list pagination is not an atomic family snapshot.
+            "family_completeness": "partial",
+            "atomic": False,
+            "gaps": list(observed.get("gaps", [])),
+        }
+        self.data["observed_children"] = sorted(
+            merged.values(), key=lambda child: (child.get("depth", 0), child["native_thread_id"])
+        )
+        self.data["family_enumeration"] = family
+        self.checkpoint.save()
+        return family
+
+    def _refresh_family(self, client: Any, root_id: str) -> dict[str, Any]:
+        try:
+            observed = self._read_family(client, root_id)
+        except Exception:
+            return self._record_family(
+                {
+                    "children": [],
+                    "pages_read": 0,
+                    "pagination_complete": False,
+                    "gaps": ["native_child_list_read_failed"],
+                },
+                status="failed",
+            )
+        return self._record_family(
+            observed,
+            status=(
+                "complete"
+                if observed["pagination_complete"] and not observed.get("gaps")
+                else "partial"
+            ),
+        )
+
     def _resolve_send(self, record: dict[str, Any], client: Any) -> tuple[dict[str, Any] | None, str]:
         is_steer = record.get("delivery") == "steer"
         expected_turn = record.get("expected_turn_id")
@@ -694,6 +961,9 @@ class ControllerEngine:
                         match["client_user_message_id"],
                     )
                 ]
+                self.last_native["native_events"] = self._native_event_snapshot(
+                    client, previous["native_root_id"]
+                )
                 return self._finish(
                     operation_id,
                     "applied",
@@ -907,6 +1177,9 @@ class ControllerEngine:
                     client_user_message_id,
                 )
             ]
+            self.last_native["native_events"] = self._native_event_snapshot(
+                client, root_id
+            )
             record["turn_id"] = match["turn_id"]
             record["native_input_id"] = match["native_input_id"]
             self.checkpoint.save()
@@ -1008,6 +1281,290 @@ class ControllerEngine:
             for turn in response.data
             if str(getattr(turn.status, "value", turn.status)) == "inProgress"
         ]
+
+    def _native_event_snapshot(self, client: Any, root_id: str) -> dict[str, Any]:
+        snapshot = getattr(client, "native_event_snapshot", None)
+        if not callable(snapshot):
+            return {"events": [], "coverage": "unavailable", "complete": False}
+        thread_ids = {root_id}
+        thread_ids.update(
+            child["native_thread_id"]
+            for child in self.data.get("observed_children", [])
+            if isinstance(child, dict)
+            and child.get("freshness") == "current"
+            and isinstance(child.get("native_thread_id"), str)
+        )
+        try:
+            return snapshot(thread_ids)
+        except Exception:
+            return {"events": [], "coverage": "unavailable", "complete": False}
+
+    @staticmethod
+    def _read_turn_status(client: Any, thread_id: str, turn_id: str) -> str | None:
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        for _ in range(MAX_HISTORY_PAGES):
+            params: dict[str, Any] = {
+                "threadId": thread_id,
+                "limit": PAGE_SIZE,
+                "sortDirection": "desc",
+            }
+            if cursor:
+                params["cursor"] = cursor
+            response = client.request(
+                "thread/turns/list", params, response_model=ThreadTurnsListResponse
+            )
+            for turn in response.data:
+                if turn.id == turn_id:
+                    return str(getattr(turn.status, "value", turn.status))
+            next_cursor = response.next_cursor
+            if not next_cursor:
+                return None
+            if next_cursor == cursor or next_cursor in seen_cursors:
+                raise ControllerError("NATIVE_TURN_CURSOR_NOT_ADVANCING")
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+        raise ControllerError("NATIVE_TURN_PAGE_LIMIT")
+
+    @staticmethod
+    def _read_turn_items(client: Any, thread_id: str, turn_id: str) -> list[dict[str, Any]]:
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        items: list[dict[str, Any]] = []
+        for _ in range(MAX_HISTORY_PAGES):
+            params: dict[str, Any] = {
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "limit": PAGE_SIZE,
+                "sortDirection": "asc",
+            }
+            if cursor:
+                params["cursor"] = cursor
+            response = client.request(
+                "thread/items/list", params, response_model=ThreadItemsListResponse
+            )
+            for entry in response.data:
+                if entry.turn_id != turn_id:
+                    raise ControllerError("NATIVE_RESULT_TURN_MISMATCH")
+                items.append(_native_item_projection(entry))
+            next_cursor = response.next_cursor
+            if not next_cursor:
+                return items
+            if next_cursor == cursor or next_cursor in seen_cursors:
+                raise ControllerError("NATIVE_RESULT_CURSOR_NOT_ADVANCING")
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+        raise ControllerError("NATIVE_RESULT_HISTORY_PAGE_LIMIT")
+
+    def _result(self, command: dict[str, Any]) -> dict[str, Any]:
+        operation_id = _required_string(command.get("operation_id"), "operation_id")
+        root_id = self._assert_root(command)
+        selector = (command.get("input") or {}).get("selector")
+        if not isinstance(selector, dict) or not selector:
+            raise ControllerError("RESULT_SELECTOR_REQUIRED")
+        allowed_selector_keys = {
+            "kind",
+            "input_operation_id",
+            "native_thread_id",
+            "native_turn_id",
+            "expected_digest",
+        }
+        if set(selector) - allowed_selector_keys:
+            raise ControllerError("UNKNOWN_RESULT_SELECTOR_FIELD")
+        if selector.get("kind") != "codex_turn_history":
+            raise ControllerError("UNSUPPORTED_RESULT_KIND")
+        input_operation_id = _required_string(
+            selector.get("input_operation_id"), "input_operation_id"
+        )
+        native_thread_id = _required_string(
+            selector.get("native_thread_id"), "native_thread_id"
+        )
+        native_turn_id = _required_string(
+            selector.get("native_turn_id"), "native_turn_id"
+        )
+        expected_digest = selector.get("expected_digest")
+        if expected_digest is not None and (
+            not isinstance(expected_digest, str)
+            or len(expected_digest) != 71
+            or not expected_digest.startswith("sha256:")
+            or any(c not in "0123456789abcdefABCDEF" for c in expected_digest[7:])
+        ):
+            raise ControllerError("INVALID_RESULT_EXPECTED_DIGEST")
+        selector_canonical = _canonical_json(selector)
+
+        previous = self.data["operations"].get(operation_id)
+        if isinstance(previous, dict):
+            if previous.get("kind") != "result" or previous.get("selector_canonical") != selector_canonical:
+                raise ControllerError("RESULT_OPERATION_ID_REUSED")
+            if previous.get("outcome"):
+                self.outcomes[operation_id] = previous["outcome"]
+                return previous["outcome"]
+        else:
+            previous = {
+                "method": "agent.result",
+                "kind": "result",
+                "state": "native_read_may_have_started",
+                "native_root_id": root_id,
+                "native_scope_key": self.data.get("native_scope_key"),
+                "selector_canonical": selector_canonical,
+                "outcome": None,
+            }
+            self.data["operations"][operation_id] = previous
+            self.checkpoint.save()
+
+        input_record = self.data["operations"].get(input_operation_id)
+        if (
+            not isinstance(input_record, dict)
+            or input_record.get("kind") != "send"
+            or input_record.get("native_root_id") != root_id
+        ):
+            raise ControllerError("RESULT_INPUT_OPERATION_NOT_BOUND")
+
+        client, executor, scope_key = self._client()
+        match, disposition = self._resolve_send(input_record, client)
+        if not match:
+            raise ControllerError(f"RESULT_INPUT_{disposition.upper()}")
+        if match["turn_id"] != input_record.get("turn_id"):
+            raise ControllerError("RESULT_INPUT_TURN_MISMATCH")
+
+        child: dict[str, Any] | None = None
+        if native_thread_id == root_id:
+            if native_turn_id != match["turn_id"]:
+                raise ControllerError("RESULT_ROOT_TURN_NOT_BOUND_TO_INPUT")
+        else:
+            family = self._read_family(client, root_id)
+            if not family.get("pagination_complete"):
+                raise ControllerError("RESULT_FAMILY_ENUMERATION_INCOMPLETE")
+            self._record_family(
+                family,
+                status="partial" if family.get("gaps") else "complete",
+            )
+            if native_thread_id in family.get("conflicting_thread_ids", []):
+                raise ControllerError("RESULT_CHILD_IDENTITY_CONFLICT")
+            child = next(
+                (
+                    entry
+                    for entry in family["children"]
+                    if entry.get("native_thread_id") == native_thread_id
+                ),
+                None,
+            )
+            if child is None or child.get("parent_thread_id") != root_id:
+                raise ControllerError("RESULT_CHILD_PARENT_NOT_VERIFIED")
+            parent_status = self._read_turn_status(client, root_id, match["turn_id"])
+            if parent_status != "completed":
+                raise ControllerError("RESULT_PARENT_TURN_NOT_COMPLETED")
+            parent_items = self._read_turn_items(client, root_id, match["turn_id"])
+            parent_items_again = self._read_turn_items(client, root_id, match["turn_id"])
+            if _canonical_json(parent_items) != _canonical_json(parent_items_again):
+                raise ControllerError("RESULT_PARENT_HISTORY_CHANGED")
+            linked = any(
+                entry.get("item", {}).get("type") == "subAgentActivity"
+                and entry.get("item", {}).get("agentThreadId") == native_thread_id
+                for entry in parent_items
+            )
+            if not linked:
+                raise ControllerError("RESULT_CHILD_ACTIVITY_LINK_NOT_OBSERVED")
+
+        turn_status = self._read_turn_status(client, native_thread_id, native_turn_id)
+        if turn_status != "completed":
+            raise ControllerError("RESULT_TURN_NOT_COMPLETED")
+        items = self._read_turn_items(client, native_thread_id, native_turn_id)
+        items_again = self._read_turn_items(client, native_thread_id, native_turn_id)
+        if _canonical_json(items) != _canonical_json(items_again):
+            raise ControllerError("RESULT_SOURCE_CHANGED")
+        if not items:
+            raise ControllerError("RESULT_HISTORY_EMPTY")
+        document = {
+            "kind": "codex_turn_history",
+            "input_operation_id": input_operation_id,
+            "native_root_id": root_id,
+            "native_thread_id": native_thread_id,
+            "native_turn_id": native_turn_id,
+            "items": items,
+        }
+        full_bytes = _canonical_json(document).encode("utf-8")
+        if len(full_bytes) > MAX_RESULT_BYTES:
+            raise ControllerError("RESULT_HISTORY_TOO_LARGE")
+        full_digest = "sha256:" + hashlib.sha256(full_bytes).hexdigest()
+        if expected_digest is not None and expected_digest.lower() != full_digest:
+            raise ControllerError("RESULT_SOURCE_DIGEST_CHANGED")
+
+        input_data = command.get("input") or {}
+        offset = input_data.get("offset_bytes", 0)
+        length = input_data.get("length_bytes", MAX_RESULT_PAGE_BYTES)
+        if type(offset) is not int or offset < 0:
+            raise ControllerError("INVALID_RESULT_OFFSET")
+        if type(length) is not int or length < 1 or length > MAX_RESULT_PAGE_BYTES:
+            raise ControllerError("INVALID_RESULT_LENGTH")
+        if offset > len(full_bytes):
+            raise ControllerError("RESULT_OFFSET_OUT_OF_RANGE")
+        end = min(len(full_bytes), offset + length)
+        page_bytes = full_bytes[offset:end]
+        tool_items = [
+            entry["item"]
+            for entry in items
+            if entry.get("item", {}).get("type")
+            in ("mcpToolCall", "dynamicToolCall", "functionCallOutput", "commandExecution")
+        ]
+        source = {
+            "kind": "codex_turn_history",
+            "native_root_id": root_id,
+            "native_thread_id": native_thread_id,
+            "native_turn_id": native_turn_id,
+            "parent_thread_id": child.get("parent_thread_id") if child else None,
+            "input_operation_id": input_operation_id,
+            "native_input_id": match["native_input_id"],
+            "client_user_message_id": match["client_user_message_id"],
+            "native_turn_status": turn_status,
+            "root_thread_model_provider": self.data.get("effective_model_provider"),
+            "root_thread_model": self.data.get("effective_model"),
+            "thread_model_provider": (
+                child.get("model_provider")
+                if child
+                else self.data.get("effective_model_provider")
+            ),
+            "thread_model": (
+                child.get("thread_model")
+                if child
+                else self.data.get("effective_model")
+            ),
+            "read_method": "thread/turns/list+thread/items/list",
+            "read_consistency": "repeated_equal_history_not_atomic_snapshot",
+            "history_projection": "allowlisted_native_item_fields_v1",
+            "content_digest": full_digest,
+            "digest_basis": "canonical_projected_native_turn_history_v1",
+            "tool_item_count": len(tool_items),
+            "family_complete": False,
+        }
+        if len(_canonical_json(source)) > 8192:
+            raise ControllerError("RESULT_SOURCE_METADATA_TOO_LARGE")
+        result_page = {
+            "source": source,
+            "offset_bytes": offset,
+            "byte_length": len(page_bytes),
+            "total_bytes": len(full_bytes),
+            "eof": end == len(full_bytes),
+            "media_type": "application/json",
+            "content_base64": base64.b64encode(page_bytes).decode("ascii"),
+            "page_sha256": hashlib.sha256(page_bytes).hexdigest(),
+        }
+        return self._finish(
+            operation_id,
+            "applied",
+            {
+                **self._base_details(executor),
+                "completion_condition": "native_result_observed",
+                "native_result_readback": "verified",
+                "native_replay": False,
+                "native_turn_status": turn_status,
+                "tool_item_count": len(tool_items),
+                "content_digest": full_digest,
+            },
+            root_id=root_id,
+            scope_key=scope_key,
+            result_page=result_page,
+        )
 
     def _open(self, command: dict[str, Any]) -> dict[str, Any]:
         operation_id = _required_string(command.get("operation_id"), "operation_id")
@@ -1220,6 +1777,7 @@ class ControllerEngine:
             (turn["turnId"] for turn in turns if turn.get("status") == "inProgress"),
             None,
         )
+        family = self._refresh_family(client, root_id)
         native = {
             "thread": _thread_details(
                 thread,
@@ -1228,6 +1786,9 @@ class ControllerEngine:
             "turns": turns,
             "truncated": bool(cursor),
             "model": self._model_facts(),
+            "observed_children": self.data.get("observed_children", []),
+            "family_enumeration": family,
+            "native_events": self._native_event_snapshot(client, root_id),
         }
         self.last_native = native
         self.last_native["turns"] = turns
@@ -1435,6 +1996,8 @@ class ControllerEngine:
                 return [self._refresh(command)]
             if method == "agent.reconcile":
                 return self._reconcile(command)
+            if method == "agent.result":
+                return [self._result(command)]
             if method == "agent.recover":
                 return [self._recover(command)]
             capability = {
@@ -1501,7 +2064,22 @@ class ControllerEngine:
                 "activeTurnId": active_turn_id,
             },
             "turns": native_turns,
-            "observed_children": [],
+            "observed_children": self.data.get("observed_children", []),
+            "family_enumeration": self.data.get(
+                "family_enumeration",
+                {
+                    "status": "unobserved",
+                    "pages_read": 0,
+                    "pagination_complete": False,
+                    "family_completeness": "partial",
+                    "atomic": False,
+                    "gaps": [],
+                },
+            ),
+            "native_events": self.last_native.get(
+                "native_events",
+                {"events": [], "coverage": "unavailable", "complete": False},
+            ),
         }
 
     def mark_reported(self, operation_id: str) -> None:

@@ -42,7 +42,7 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --lib --bins --no-deps -- -D warnings
       - name: Rust application and protocol tests
-        run: cargo test --locked -p eliot-swarm-controller --lib --bins
+        run: cargo test --locked -p eliot-swarm-controller --lib --bins --tests
       - name: Muse bridge syntax and pinned SDK import
         shell: bash
         run: |

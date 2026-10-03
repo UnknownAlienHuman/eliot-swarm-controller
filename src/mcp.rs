@@ -1414,7 +1414,7 @@ impl ServerHandler for McpFacade {
 /// The production MCP boundary is a session-fixed view over the local facade.
 /// It filters both discovery and every manually addressed method before the
 /// inner facade can open or write local IPC.
-struct ProfiledFacade {
+pub(crate) struct ProfiledFacade {
     inner: McpFacade,
     profile: McpToolProfile,
 }
@@ -1423,6 +1423,26 @@ impl ProfiledFacade {
     fn new(inner: McpFacade, profile: McpToolProfile) -> Self {
         Self { inner, profile }
     }
+}
+
+/// Build the same session-fixed, profile-enforced facade used by stdio MCP.
+/// The caller supplies the configured principal and profile; neither is
+/// derived from transport metadata.
+pub(crate) fn profiled_facade(
+    config: &Config,
+    credential: Credential,
+    profile_name: Option<&str>,
+) -> Result<ProfiledFacade> {
+    config.mcp.validate()?;
+    let profile = config
+        .mcp
+        .selected_tool_profile(profile_name, &credential.client_id)?;
+    let facade = McpFacade::new(
+        config.storage.data_dir.clone(),
+        credential,
+        Arc::new(config.ipc.clone()),
+    );
+    Ok(ProfiledFacade::new(facade, profile))
 }
 
 fn method_not_found(method: &str) -> McpError {
@@ -1577,16 +1597,7 @@ pub async fn run_profiled(
     credential: Credential,
     profile_name: Option<&str>,
 ) -> Result<()> {
-    config.mcp.validate()?;
-    let profile = config
-        .mcp
-        .selected_tool_profile(profile_name, &credential.client_id)?;
-    let facade = McpFacade::new(
-        config.storage.data_dir.clone(),
-        credential,
-        Arc::new(config.ipc.clone()),
-    );
-    let facade = ProfiledFacade::new(facade, profile);
+    let facade = profiled_facade(&config, credential, profile_name)?;
     let service = facade
         .serve(stdio())
         .await

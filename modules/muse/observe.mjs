@@ -97,14 +97,12 @@ export function gapFillObservation(params, atMs) {
 }
 
 // How a failed explicit reconciliation classifies the pending command.
-// An already-recorded ACK still means the native side accepted the
-// command. Only a durable protocol rejection kind proves non-admission;
-// every other failure (transport, protocol, internal, a non-MspError)
-// settles nothing, so the command stays 'unknown' — pending, never
-// rejected (program section 15 norm 2/4; SDK SS4.13: only a durable
-// commandRejected settles a submission).
-const RECONCILE_REJECTION_KINDS = ['invalidParams','commandRejected','overloaded','backpressured'];
-export function failedReconcileOutcome(nativeKind, hasAck) {
+// The pinned SDK's PendingCommandSet settles only when the durable
+// commandRejected code (-32030) OR its kind is present. Other protocol
+// errors, including overload/backpressure and invalid parameters, admit
+// nothing but remain held for exact-ID reconciliation (SS4.13).
+export function failedReconcileOutcome(nativeError, hasAck) {
   if (hasAck) return 'accepted';
-  return RECONCILE_REJECTION_KINDS.includes(nativeKind) ? 'rejected' : 'unknown';
+  if (nativeError?.code === -32030 || nativeError?.kind === 'commandRejected') return 'rejected';
+  return 'unknown';
 }

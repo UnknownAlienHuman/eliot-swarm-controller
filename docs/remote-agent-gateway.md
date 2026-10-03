@@ -59,7 +59,7 @@ Current `main` already contains:
 - bounded MCP subscriptions over committed report/mailbox/Operation facts, with explicit lag and authoritative read-resync;
 - GM designation, epoch and explicit handover;
 - OpenCode V2 direct HTTP adapter with exact input/log correlation, child reads, result export and addressed `agent.background`;
-- Muse Code SDK bridge.6 with exact steer/settings/goal/replies, checkpoint recovery and durability/host-death/gap observations;
+- Muse Code SDK bridge.7 with exact steer/settings/goal/replies, checkpoint recovery, explicit child freshness and durability/host-death/gap observations;
 - OpenCodex 2.75 observer/configuration bridge.3;
 - typed mailbox delivery identity, reply binding and cancellation;
 - bounded report/family projections;

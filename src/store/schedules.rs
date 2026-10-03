@@ -1,7 +1,7 @@
 //! Durable, transaction-coupled schedule admission using the existing meta
 //! and Operation records. There is no separate scheduler database/table.
 
-use super::{Store, meta, mutate_in_transaction, set_meta};
+use super::{Store, meta, mutate_in_transaction_with_check_plan, set_meta};
 use crate::{
     config::Config,
     error::{Error, Result},
@@ -279,6 +279,53 @@ fn request(schedule: &ScheduleConfig, slot: i64) -> Result<Value> {
     }))
 }
 
+/// Snapshot only when a scheduled slot can create a new CheckRun. The caller
+/// resolves source bytes after this read and revalidates the result in the final
+/// IMMEDIATE transaction below.
+pub(super) fn check_plan_request(
+    db: &Connection,
+    schedule: &ScheduleConfig,
+    config: &Config,
+    now_ms: i64,
+) -> Result<Option<Value>> {
+    if !schedule.enabled {
+        return Ok(None);
+    }
+    let digest = definition_digest(schedule)?;
+    let registry = registry(db)?;
+    let state = registry.schedules.get(&schedule.schedule_id);
+    if state.is_some_and(|state| state.definition_sha256 != digest) {
+        return Ok(None);
+    }
+    let last_admitted = state.and_then(|state| state.last_admitted_slot);
+    let Some(due) = scheduler::latest_due_slot(schedule, now_ms, last_admitted)? else {
+        return Ok(None);
+    };
+    if meta(db, "execution_mode")?.unwrap_or(Value::Null)["new_work"] != "enabled" {
+        return Ok(None);
+    }
+    if let Some(last) = state.and_then(|state| state.last_operation.as_ref())
+        && operation_state(db, &last.work_operation_id)?
+            .is_some_and(|state| ACTIVE_OPERATION_STATES.contains(&state.as_str()))
+    {
+        return Ok(None);
+    }
+    let params = request(schedule, due.slot)?;
+    let request_id = model::text(&params, "client_request_id")?;
+    if operation_for_request(db, request_id)?.is_some() {
+        return Ok(None);
+    }
+    let (facts, error) = input_facts(db, schedule, config)?;
+    if error.is_some() {
+        return Ok(None);
+    }
+    let fingerprint = model::digest(model::canonical(&facts)?.as_bytes());
+    if state.and_then(|state| state.failure_input_sha256.as_deref()) == Some(&fingerprint) {
+        return Ok(None);
+    }
+    Ok(Some(params))
+}
+
 fn record_failure(state: &mut ScheduleState, slot: i64, fingerprint: &str, error: &Error) {
     state.last_considered_slot = Some(slot);
     state.failure_input_sha256 = Some(fingerprint.to_owned());
@@ -321,7 +368,8 @@ fn consider(
     schedule: &ScheduleConfig,
     config: &Config,
     now_ms: i64,
-) -> Result<(Option<i64>, bool)> {
+    check_plan: Option<super::checks::CheckPlanResolution>,
+) -> Result<(Option<i64>, bool, bool)> {
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let digest = definition_digest(schedule)?;
     let mut registry = registry(&tx)?;
@@ -383,7 +431,7 @@ fn consider(
         }
         save_registry(&tx, &registry)?;
         tx.commit()?;
-        return Ok((scheduler::next_due_at_ms(schedule, now_ms)?, false));
+        return Ok((scheduler::next_due_at_ms(schedule, now_ms)?, false, false));
     }
 
     if let Some(due) = due {
@@ -392,7 +440,7 @@ fn consider(
             state.last_observed_due_slot = Some(due.slot);
             save_registry(&tx, &registry)?;
             tx.commit()?;
-            return Ok((scheduler::next_due_at_ms(schedule, now_ms)?, false));
+            return Ok((scheduler::next_due_at_ms(schedule, now_ms)?, false, false));
         }
 
         if let Some(last) = state.last_operation.as_ref()
@@ -402,7 +450,7 @@ fn consider(
             state.last_observed_due_slot = Some(due.slot);
             save_registry(&tx, &registry)?;
             tx.commit()?;
-            return Ok((scheduler::next_due_at_ms(schedule, now_ms)?, false));
+            return Ok((scheduler::next_due_at_ms(schedule, now_ms)?, false, false));
         }
 
         let (facts, preflight_error) = input_facts(&tx, schedule, config)?;
@@ -411,7 +459,7 @@ fn consider(
             state.last_observed_due_slot = Some(due.slot);
             save_registry(&tx, &registry)?;
             tx.commit()?;
-            return Ok((scheduler::next_due_at_ms(schedule, now_ms)?, false));
+            return Ok((scheduler::next_due_at_ms(schedule, now_ms)?, false, false));
         }
         if let Some(error) = preflight_error {
             state.last_failure = None;
@@ -419,7 +467,7 @@ fn consider(
             state.last_observed_due_slot = Some(due.slot);
             save_registry(&tx, &registry)?;
             tx.commit()?;
-            return Ok((scheduler::next_due_at_ms(schedule, now_ms)?, false));
+            return Ok((scheduler::next_due_at_ms(schedule, now_ms)?, false, false));
         }
         state.last_failure = None;
         state.failure_input_sha256 = None;
@@ -439,7 +487,7 @@ fn consider(
             state.last_observed_due_slot = Some(due.slot);
             save_registry(&tx, &registry)?;
             tx.commit()?;
-            return Ok((scheduler::next_due_at_ms(schedule, now_ms)?, false));
+            return Ok((scheduler::next_due_at_ms(schedule, now_ms)?, false, false));
         }
 
         let principal = Principal {
@@ -447,7 +495,36 @@ fn consider(
             link_id: format!("schedule:{}", schedule.schedule_id),
             role: Role::Scheduler,
         };
-        let receipt = mutate_in_transaction(&tx, &principal, "check.run", &params, config, now_ms)?;
+        if operation_for_request(&tx, &request_id)?.is_none() {
+            let Some(check_plan) = check_plan.as_ref() else {
+                tx.rollback()?;
+                return Ok((Some(now_ms.saturating_add(250)), false, true));
+            };
+            let current_plan = super::checks::plan_inputs(&tx, &principal, &params, config)?;
+            if check_plan.context_fingerprint != current_plan.context_fingerprint {
+                tx.rollback()?;
+                return Ok((Some(now_ms.saturating_add(250)), false, true));
+            }
+            if let Err(error) = &check_plan.result {
+                // Suppression is keyed to the same DB-owned inputs that
+                // check_plan_request recomputes. A stable off-transaction
+                // resolver error must not be retried on every scheduler tick.
+                record_failure(state, due.slot, &fingerprint, error);
+                state.last_observed_due_slot = Some(due.slot);
+                save_registry(&tx, &registry)?;
+                tx.commit()?;
+                return Ok((scheduler::next_due_at_ms(schedule, now_ms)?, false, false));
+            }
+        }
+        let receipt = mutate_in_transaction_with_check_plan(
+            &tx,
+            &principal,
+            "check.run",
+            &params,
+            config,
+            now_ms,
+            check_plan.as_ref(),
+        )?;
         match receipt {
             Ok(value) => {
                 update_operation_record(
@@ -464,7 +541,7 @@ fn consider(
                 )?;
                 state.last_failure = None;
                 state.failure_input_sha256 = None;
-                wake_check_worker = value["coalesced"] != true;
+                wake_check_worker = value["coalesced"] != true && value["cached"] != true;
             }
             Err(error) => {
                 let (operation_id, _) = result_by_request(&tx, &request_id)?;
@@ -488,6 +565,7 @@ fn consider(
     Ok((
         scheduler::next_due_at_ms(schedule, now_ms)?,
         wake_check_worker,
+        false,
     ))
 }
 
@@ -568,14 +646,66 @@ impl Store {
         now_ms: i64,
     ) -> Result<Option<i64>> {
         let config = self.config.clone();
-        let (next_due, wake_worker) = self
-            .run(move |db| consider(db, &schedule, &config, now_ms))
+        let schedule_for_read = schedule.clone();
+        let config_for_read = config.clone();
+        let request = self
+            .run(move |db| check_plan_request(db, &schedule_for_read, &config_for_read, now_ms))
             .await?;
-        if wake_worker {
-            self.changed
-                .send_modify(|revision| *revision = revision.wrapping_add(1));
+        let mut resolution = if let Some(request) = request {
+            Some(
+                self.resolve_check_plan(
+                    Principal {
+                        client_id: INTERNAL_SCHEDULER_CLIENT_ID.to_owned(),
+                        link_id: format!("schedule:{}", schedule.schedule_id),
+                        role: Role::Scheduler,
+                    },
+                    request,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+
+        // A changed final-TX snapshot gets one fresh resolve. Persistent churn
+        // leaves the same due slot pending and sleeps briefly before retrying.
+        for _ in 0..2 {
+            let schedule_for_tx = schedule.clone();
+            let config_for_tx = config.clone();
+            let prepared = resolution.clone();
+            let (next_due, wake_worker, stale_plan) = self
+                .run(move |db| consider(db, &schedule_for_tx, &config_for_tx, now_ms, prepared))
+                .await?;
+            if wake_worker {
+                self.changed
+                    .send_modify(|revision| *revision = revision.wrapping_add(1));
+            }
+            if !stale_plan {
+                return Ok(next_due);
+            }
+
+            let schedule_for_read = schedule.clone();
+            let config_for_read = config.clone();
+            let request = self
+                .run(move |db| check_plan_request(db, &schedule_for_read, &config_for_read, now_ms))
+                .await?;
+            resolution = if let Some(request) = request {
+                Some(
+                    self.resolve_check_plan(
+                        Principal {
+                            client_id: INTERNAL_SCHEDULER_CLIENT_ID.to_owned(),
+                            link_id: format!("schedule:{}", schedule.schedule_id),
+                            role: Role::Scheduler,
+                        },
+                        request,
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            };
         }
-        Ok(next_due)
+        Ok(Some(now_ms.saturating_add(250)))
     }
 }
 
@@ -583,7 +713,9 @@ impl Store {
 mod tests {
     use super::*;
     use crate::{
+        artifacts::ArtifactFiles,
         checks::model::{CheckProfile, Parser},
+        checks::source::{SourceFile, SourceManifest},
         platform::{DataRoot, bootstrap_credential},
         store::{StoreOwner, schedules},
     };
@@ -595,6 +727,7 @@ mod tests {
             std::env::temp_dir().join(format!("swarm-schedule-test-{}", model::new_id()));
         std::fs::create_dir_all(&directory).unwrap();
         let root = DataRoot::acquire(&directory).unwrap();
+        let directory = root.path.clone();
         let credential = bootstrap_credential(&root.path).unwrap();
         let mut config = Config::default();
         config.storage.data_dir = directory.clone();
@@ -602,13 +735,16 @@ mod tests {
         config.checks.profiles = vec![CheckProfile {
             profile_id: "strict".into(),
             profile_revision: "v1".into(),
-            executable: "check-runner".into(),
-            args: vec!["check".into()],
+            executable: std::env::current_exe().unwrap(),
+            args: Vec::new(),
             parser: Parser::ExitCode,
             resource: "checks".into(),
             environment: BTreeMap::new(),
             inherit_env: Vec::new(),
             expected_targets: Vec::new(),
+            fingerprint_env: Vec::new(),
+            reproducible: false,
+            versioned_inputs: BTreeMap::new(),
         }];
         let config = Arc::new(config);
         let owner = StoreOwner::start(root, config.clone(), credential.clone())
@@ -648,16 +784,51 @@ mod tests {
             .await
             .unwrap();
         let attempt_id = claim["attempt_id"].as_str().unwrap().to_owned();
-        let candidate_ref = model::new_id();
-        let metadata = json!({"attempt_id":attempt_id,"task_revision":1});
+        let candidate_ref = format!("source-{}", model::digest(task_id.as_bytes()));
+        let content = b"scheduled fixture source";
+        let metadata = json!({
+            "task_id":task_id,
+            "attempt_id":attempt_id,
+            "task_revision":1,
+            "commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "tree":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "file_count":1,
+            "coverage":"complete"
+        });
+        let manifest = SourceManifest {
+            version: 1,
+            commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            tree: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            files: vec![SourceFile {
+                path: "fixture.txt".into(),
+                mode: "100644".into(),
+                object_id: "cccccccccccccccccccccccccccccccccccccccc".into(),
+                byte_length: content.len() as u64,
+                sha256: model::digest(content),
+            }],
+        };
+        let (record, bytes) = ArtifactFiles::document(
+            "source_snapshot",
+            &candidate_ref,
+            &json!(manifest),
+            metadata.clone(),
+        )
+        .unwrap();
+        let source_dir = directory.join("sources").join(&candidate_ref);
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::write(source_dir.join("fixture.txt"), content).unwrap();
+        ArtifactFiles::new(&directory)
+            .unwrap()
+            .publish(&record, &bytes)
+            .unwrap();
         owner
             .store
             .run({
-                let candidate_ref = candidate_ref.clone();
+                let record = record.clone();
                 move |db| {
                     db.execute(
-                        "INSERT INTO artifacts(artifact_id,relative_path,kind,byte_length,content_digest,created_at_ms,metadata_json) VALUES(?1,?2,'source_snapshot',0,?3,?4,?5)",
-                        params![candidate_ref,format!("artifacts/{candidate_ref}.json"),model::digest(b"snapshot"),model::now_ms()?,model::canonical(&metadata)?],
+                        "INSERT INTO artifacts(artifact_id,relative_path,kind,byte_length,content_digest,created_at_ms,metadata_json) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                        params![record.artifact_id,record.relative_path,record.kind,record.byte_length as i64,record.content_digest,model::now_ms()?,model::canonical(&metadata)?],
                     )?;
                     Ok(())
                 }
@@ -705,7 +876,7 @@ mod tests {
     #[tokio::test]
     async fn admission_is_atomic_latest_only_and_status_is_read_only() {
         let (directory, owner, _, schedule, now) = fixture().await;
-        let latest = ((now - schedule.anchor_ms) / schedule.period_ms.unwrap()) as i64;
+        let latest = (now - schedule.anchor_ms) / schedule.period_ms.unwrap();
         owner
             .store
             .run(|db| super::super::set_meta(db, "execution_mode", &json!({"new_work":"disabled"})))
@@ -767,6 +938,87 @@ mod tests {
         assert_eq!(check_count, 1, "one slot starts at most one CheckRun");
         assert_eq!(recorded_slot, latest, "catch-up admits only latest slot");
         assert_eq!(status["items"][0]["last_operation"]["state"], "queued");
+        owner.close().await.unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_resolved_plan_keeps_due_slot_pending_without_receipt() {
+        let (directory, owner, config, schedule, now) = fixture().await;
+        owner
+            .store
+            .run(|db| super::super::set_meta(db, "execution_mode", &json!({"new_work":"enabled"})))
+            .await
+            .unwrap();
+        let scheduler = Principal {
+            client_id: INTERNAL_SCHEDULER_CLIENT_ID.to_owned(),
+            link_id: format!("schedule:{}", schedule.schedule_id),
+            role: Role::Scheduler,
+        };
+        let request = owner
+            .store
+            .run({
+                let schedule = schedule.clone();
+                let config = config.clone();
+                move |db| check_plan_request(db, &schedule, &config, now)
+            })
+            .await
+            .unwrap()
+            .expect("fixture has one due valid source candidate");
+        let plan = owner
+            .store
+            .resolve_check_plan(scheduler, request)
+            .await
+            .unwrap();
+        // The candidate/profile/Attempt remain admissible to input_facts, but
+        // the claim-time baseline trust snapshot changes after off-TX source
+        // resolution. The final transaction must detect that resolved plan as
+        // stale and preserve the due slot for a fresh resolve.
+        let attempt_id = match &schedule.action {
+            ScheduleAction::CheckRun { attempt_id, .. } => attempt_id.clone(),
+        };
+        owner
+            .store
+            .run(move |db| {
+                db.execute(
+                    "UPDATE attempts SET task_snapshot_json=json_set(task_snapshot_json,'$.baseline_candidate.reason','changed_after_resolution') WHERE attempt_id=?1",
+                    [&attempt_id],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let (next_due, wake_worker, stale) = owner
+            .store
+            .run({
+                let schedule = schedule.clone();
+                let config = config.clone();
+                move |db| consider(db, &schedule, &config, now, Some(plan))
+            })
+            .await
+            .unwrap();
+        assert!(stale);
+        assert!(!wake_worker);
+        assert_eq!(next_due, Some(now.saturating_add(250)));
+        let (operations, checks, registry) = owner
+            .store
+            .run(|db| {
+                let operations = db.query_row(
+                    "SELECT count(*) FROM operations WHERE caller_id=?1",
+                    [INTERNAL_SCHEDULER_CLIENT_ID],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                let checks = db.query_row("SELECT count(*) FROM check_runs", [], |row| {
+                    row.get::<_, i64>(0)
+                })?;
+                Ok((operations, checks, registry(db)?))
+            })
+            .await
+            .unwrap();
+        assert_eq!(operations, 0);
+        assert_eq!(checks, 0);
+        assert!(!registry.schedules.contains_key(&schedule.schedule_id));
         owner.close().await.unwrap();
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -882,7 +1134,7 @@ mod tests {
         );
         assert_eq!(
             last_observed_due_slot,
-            Some(((later - schedule.anchor_ms) / period) as i64),
+            Some((later - schedule.anchor_ms) / period),
             "the later due slot remains observed but unadmitted"
         );
         owner.close().await.unwrap();

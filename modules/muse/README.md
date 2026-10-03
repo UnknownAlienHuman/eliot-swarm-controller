@@ -1,6 +1,6 @@
 # Muse SDK bridge — native integration
 
-Uses the complete locked `@muse-code/sdk` **1.3.0** and pinned [MSP schema](https://github.com/meta-models/muse-code-sdk/blob/a7c10c5dd3f66be412077d29f9d11111af70317b/schema/msp/msp.d.ts). New bindings use **`muse-sdk-1.3.0-bridge.6`**. Live Muse/Max and Windows native launch remain unqualified; syntax/import and compilation do not attest model execution.
+Uses the complete locked `@muse-code/sdk` **1.3.0** and pinned [MSP schema](https://github.com/meta-models/muse-code-sdk/blob/a7c10c5dd3f66be412077d29f9d11111af70317b/schema/msp/msp.d.ts). New bindings use **`muse-sdk-1.3.0-bridge.7`**. Live Muse/Max and Windows native launch remain unqualified; syntax/import and fixture results do not attest model execution.
 
 ## Ownership and setup
 
@@ -16,7 +16,7 @@ The bridge owns one `muse serve` connection. Host IPC exposes `module.hello/next
 [[routes]]
 alias = 'muse-manager'
 runtime = 'muse'
-module_artifact_id = 'muse-sdk-1.3.0-bridge.6'
+module_artifact_id = 'muse-sdk-1.3.0-bridge.7'
 enabled = true
 [routes.native_options]
 workspaceRoot = 'C:\Projects\YourRepository'
@@ -60,9 +60,11 @@ swarm call operation.get --file operation.json
 
 This is explicit native work, **not a healthcheck**. New-work-disabled prevents admission. It reads the exact recorded session/model in the original native namespace and uses `session/resume` with excludeItems; no `session/start`, fork or original-prompt replay is a fallback. The current connection becomes ready only upon its correlated resume result. Retained outcomes are reported without native resend. Unresolved commands require targeted `agent.reconcile` with their original IDs; nothing repeatedly replays them merely because the bridge restarted.
 
-Binding/generation denotes the same retained conversation here; bridge boot and managed process-group identity separately denote its replacement process owner. Historical run identities and Task-specific ownership are not erased. Root/known-child subscriptions and pending questions are refreshed, but family completeness stays partial and stale terminal evidence cannot close a newer run.
+For native command outcomes, only the pinned SDK's durable `commandRejected` signal (code `-32030` or kind `commandRejected`) settles an admitted command as rejected. `invalidParams`, `overloaded` and `backpressured` admit nothing but remain unknown/held for explicit same-ID reconciliation; the bridge does not retry them automatically.
 
-## SDK delegation and recorded observations — bridge.6
+Binding/generation denotes the same retained conversation here; bridge boot and managed process-group identity separately denote its replacement process owner. Historical run identities and Task-specific ownership are not erased. Root/known-child subscriptions and pending questions are refreshed, but family completeness stays partial and stale terminal evidence cannot close a newer run. Each known child records `snapshot_freshness`: an exact retained snapshot is `stale` after checkpoint restore, a failed read or a later native event; it is `fresh` only after an exact `session/read` remains stable through subscription and pending-request reads; and it is `unknown` when no exact snapshot exists or a read races without a retained snapshot. Failed/missing reads retain the prior snapshot, exact child/item identity and last successful `last_refresh` as historical evidence; `last_refresh_attempt` records the current failure separately. An idle parent does not imply child completion.
+
+## SDK delegation and recorded observations — bridge.7
 
 "Use the whole official SDK" is a supply-chain decision, not a delegation of every protocol state machine. The bridge imports only the SDK's low-level public surface (`spawnMspConnection`, `Connection`, `checkServedFingerprint`, `MspError`); the facade's `Session`, `PendingCommandSet` and `GapFiller` are not in this module. The exact split:
 
@@ -76,7 +78,7 @@ Binding/generation denotes the same retained conversation here; bridge boot and 
 | host-death durability classification | SDK handshake facts + ELIOT module owner/recovery |
 | Task/Attempt/acceptance | ELIOT host |
 
-On an SDK upgrade, the fixture selftest (`node selftest.mjs`) must keep passing against these invariants, not only import/syntax checks: the derivations it pins live in `observe.mjs`, the checkpoint round-trip runs the real `checkpoint.mjs`.
+The fixture selftest (`node selftest.mjs`) pins these derivations, runs the real checkpoint implementation, and drives the actual bridge with local fixture host/native processes for B5 protocol behavior. It does not start installed Muse or make model calls.
 
 Bridge.6 records three observation facts that bridge.5 only implied:
 
@@ -119,7 +121,7 @@ swarm --request-id bind-worker-1 task bind ATTEMPT --assignment worker-1 --sessi
 
 Normal host/data-dir/credential options apply. Claim defaults to native_manager. A repeated child session has different assignments for different turns. Registration checks owner, binding, namespace and retained run evidence; an old terminal cannot finish a new run. Family pages reuse observation_id; end-of-page is not proof of complete native discovery. Unresolved registered runs hold their Task, not unrelated Tasks.
 
-The bridge retains child snapshot/last-turn state across parent item updates, tags result summaries with source item/revision and observes turn/unqueued distinctly. `resultReady` does not mean accepted. `subagent/readResult` changes native state and is never an observation helper.
+The bridge retains child snapshot/last-turn state across parent item updates, tags result summaries with source item/revision and observes turn/unqueued distinctly. Equal-revision replay of the same parent item is ignored; a changed item ID remains a distinct assignment. `resultReady` does not mean accepted. `subagent/readResult` changes native state and is never an observation helper.
 
 ## Result retrieval and complete local export
 
@@ -152,7 +154,7 @@ Recorded-session recovery was saved before the chat interruption, through `8a84e
 
 For **`d385498b00fe1a049c357613a7777cc4a1c83f72`**, [CI 36872022736](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/36872022736) passed Windows/Linux formatting, warnings-denied Clippy, release builds and Muse syntax/SDK import. The downloaded corrected Linux artifact/source identity was verified separately from the pre-fix binary.
 
-The bounded invocation passed 13 assertions: real launcher/descendant ownership after explicit fixture-process loss, replacement refusal until group departure, changed-boot admission, stale-link exclusion, historical open receipt retaining reconciling, normal-input refusal until resume, stale/disabled recovery rejection, current-boot resume readiness, serialized Node checkpoint publication/read and clean shutdown. The process fixture was Python, and native open/resume outcomes were synthetic module RPC messages. This is not a live Muse resume, Max measurement, complete native-child recovery or Windows-runtime qualification. No new test module or cargo test was added.
+The bounded invocation passed 13 process-owner/host assertions: explicit fixture-process loss, replacement refusal until group departure, changed-boot admission, stale-link exclusion, historical open receipt retaining reconciling, normal-input refusal until resume, stale/disabled recovery rejection, current-boot resume readiness, serialized Node checkpoint publication/read and clean shutdown. The module selftest also drives the actual bridge over local fixture host/native processes for restored-child freshness, unknown server request handling and exact-turn stale rejection. These fixtures do not start Muse or call a model and do not qualify live resume, Max inference, complete native-child recovery or Windows-runtime behavior. No Cargo test was added.
 
 Next code: direct OpenCode V2 through the same host contract. Qualify actual Muse resume/children on the installed runtime separately; do not reimplement the already saved local recovery path. Complete native family discovery, automatic service/module activation and all missing-identity recovery cases remain separate work. Do not reimplement already completed host results, submission, acceptance or CheckRunner. [OpenCodex Issue #1](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/1) stays after the main code.
 

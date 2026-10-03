@@ -1,0 +1,36 @@
+{
+  "comment": "A steer against a stale expected turn must reach native turn/steer with that exact ID and settle from native commandRejected. The bridge must never convert it to turn/start or queue it as next-turn input.",
+  "input": {
+    "delivery": "steer",
+    "expected_turn_id": "turn_stale_fixture",
+    "text": "fixture correction"
+  },
+  "native": {
+    "active_turn_id": "turn_current_fixture",
+    "stale_error": {
+      "code": -32030,
+      "message": "Expected turn is stale",
+      "data": { "kind": "commandRejected" }
+    }
+  },
+  "nonsettling": {
+    "input": {
+      "delivery": "next_turn",
+      "text": "fixture next-turn request"
+    },
+    "native_error": {
+      "code": -32602,
+      "message": "Fixture parameters rejected before admission",
+      "data": { "kind": "invalidParams" }
+    },
+    "expected_outcome": "unknown",
+    "expected_kind": "invalidParams"
+  },
+  "expected": {
+    "native_method": "turn/steer",
+    "expectedTurnId": "turn_stale_fixture",
+    "operation_outcome": "rejected",
+    "native_kind": "commandRejected",
+    "turn_start_count": 0
+  }
+}

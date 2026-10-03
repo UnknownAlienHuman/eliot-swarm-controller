@@ -50,6 +50,22 @@ pub struct CheckProfile {
     /// Cargo artifact target names, not guessed from a worker's claims.
     #[serde(default)]
     pub expected_targets: Vec<String>,
+    /// Enables completed-result reuse only when every resolved input is versioned.
+    /// Trusted profiles remain non-reusable unless they opt in explicitly.
+    #[serde(default)]
+    pub reproducible: bool,
+    /// Environment names whose values the trusted profile explicitly declares
+    /// non-secret and stable enough to include as digests in reusable identity.
+    /// Other non-built-in environment inputs disable reuse without hashing or
+    /// persisting their values.
+    #[serde(default)]
+    pub fingerprint_env: Vec<String>,
+    /// Named, immutable identities for external inputs such as container images
+    /// or service snapshots. Cargo reuse requires `build_environment` to attest
+    /// external tools that CheckRunner does not discover individually. Values
+    /// are fingerprinted by digest, never copied into the resolved receipt.
+    #[serde(default)]
+    pub versioned_inputs: BTreeMap<String, String>,
 }
 fn name(value: &str) -> bool {
     !value.is_empty()
@@ -95,6 +111,31 @@ impl CheckConfig {
             {
                 return Err(Error::invalid("check arguments/environment contain a NUL"));
             }
+            let mut fingerprint_env = BTreeSet::new();
+            for key in &p.fingerprint_env {
+                let upper = key.to_ascii_uppercase();
+                if key.is_empty()
+                    || key.contains(['=', '\0'])
+                    || !fingerprint_env.insert(upper.clone())
+                    || matches!(upper.as_str(), "CARGO_TARGET_DIR" | "SWARM_CANDIDATE_FILE")
+                    || !p
+                        .environment
+                        .keys()
+                        .chain(&p.inherit_env)
+                        .any(|declared| declared.eq_ignore_ascii_case(key))
+                {
+                    return Err(Error::invalid(
+                        "fingerprint_env must uniquely name declared, non-reserved environment inputs",
+                    ));
+                }
+            }
+            if p.versioned_inputs.iter().any(|(key, value)| {
+                !name(key) || value.trim().is_empty() || value.len() > 512 || value.contains('\0')
+            }) {
+                return Err(Error::invalid(
+                    "versioned check inputs require a valid name and a nonempty immutable identity of at most 512 bytes",
+                ));
+            }
             if p.parser == Parser::CargoJson {
                 let command = p
                     .args
@@ -116,6 +157,16 @@ impl CheckConfig {
                 {
                     return Err(Error::invalid(
                         "target directory is owned by the CheckRunner resource",
+                    ));
+                }
+                if p.args.iter().any(|s| {
+                    s == "--manifest-path"
+                        || s.starts_with("--manifest-path=")
+                        || s == "--config"
+                        || s.starts_with("--config=")
+                }) {
+                    return Err(Error::invalid(
+                        "Cargo checks use the captured workspace and its captured configuration",
                     ));
                 }
             }

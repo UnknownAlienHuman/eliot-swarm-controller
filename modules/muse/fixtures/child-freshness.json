@@ -1,0 +1,84 @@
+{
+  "comment": "An exact checkpoint snapshot starts stale, a checkpoint child without an exact snapshot starts unknown, and only a stable exact session/read becomes fresh. A failed read retains prior evidence as stale; a later native child event invalidates a fresh marker. The root is idle while the child remains running; that does not synthesize child completion. An equal-revision parent replay must not replace the checkpointed child declaration.",
+  "root_session": {
+    "sessionId": "ses_root_fixture",
+    "status": "idle",
+    "activeTurnId": null,
+    "modelId": "fixture-model",
+    "providerId": "fixture-provider",
+    "turnCount": 4
+  },
+  "child_session": {
+    "sessionId": "ses_child_fixture",
+    "status": "running",
+    "activeTurnId": "turn_child_current_fixture",
+    "modelId": "fixture-model",
+    "providerId": "fixture-provider",
+    "turnCount": 4
+  },
+  "first_child_read_error": {
+    "code": -32004,
+    "message": "Fixture child session is missing",
+    "data": { "kind": "notFound" }
+  },
+  "checkpoint_child": {
+    "sessionId": "ses_child_fixture",
+    "parentSessionId": "ses_root_fixture",
+    "itemId": "item_child_fixture",
+    "subagentId": "subagent_fixture",
+    "parentTurnId": "turn_parent_fixture",
+    "status": "running",
+    "controlStatus": "running",
+    "revision": 7,
+    "snapshot": {
+      "sessionId": "ses_child_fixture",
+      "status": "running",
+      "activeTurnId": "turn_child_checkpoint_fixture",
+      "modelId": "fixture-model",
+      "providerId": "fixture-provider",
+      "turnCount": 3
+    },
+    "last_refresh": {
+      "at_ms": 1770000000000,
+      "session_id": "ses_child_fixture",
+      "metadata_applied": true,
+      "viewCursor": "cursor_checkpoint_fixture",
+      "coverage": "observed_child_metadata_and_pending_requests"
+    }
+  },
+  "unverified_child": {
+    "sessionId": "ses_child_unverified_fixture",
+    "parentSessionId": "ses_root_fixture",
+    "itemId": "item_child_unverified_fixture",
+    "subagentId": "subagent_unverified_fixture",
+    "parentTurnId": "turn_parent_fixture",
+    "status": "running",
+    "controlStatus": "running",
+    "revision": 1
+  },
+  "equal_revision_replay": {
+    "itemId": "item_child_fixture",
+    "revision": 7,
+    "status": "completed",
+    "controlStatus": "completed",
+    "result": { "summary": "historical stale replay" }
+  },
+  "native_event_after_fresh": {
+    "method": "session/statusChanged",
+    "params": { "sessionId": "ses_child_fixture", "status": "completed" }
+  },
+  "expected": {
+    "restored_snapshot_freshness": "stale",
+    "unverified_snapshot_freshness": "unknown",
+    "failed_read_snapshot_freshness": "stale",
+    "stable_read_snapshot_freshness": "fresh",
+    "after_event_snapshot_freshness": "stale",
+    "after_event_snapshot_freshness_reason": "native_event_after_read",
+    "retained_snapshot_status_after_failed_read": "running",
+    "stable_snapshot_status": "running",
+    "itemId": "item_child_fixture",
+    "subagentId": "subagent_fixture",
+    "status_after_equal_revision_replay": "running",
+    "parent_status": "idle"
+  }
+}

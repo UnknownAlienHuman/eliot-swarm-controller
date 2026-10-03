@@ -1,0 +1,17 @@
+schema_version = 1
+
+[mcp]
+default_profile = "gateway-observer"
+
+[mcp.profiles.gateway-observer]
+tool_profile = "observer"
+expected_client_id = "remote-gateway-observer"
+
+[gateway]
+enabled = true
+bind = "127.0.0.1:8787"
+profile = "gateway-observer"
+credential_file = "C:/REPLACE/with/private/path/gateway-credential.json"
+local_bearer_file = "C:/REPLACE/with/private/path/gateway-bearer.txt"
+max_body_bytes = 1048576
+request_timeout_seconds = 30

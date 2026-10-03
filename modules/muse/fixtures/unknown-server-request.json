@@ -1,0 +1,15 @@
+{
+  "comment": "An unrecognized native-to-bridge MSP request must receive the bridge's explicit JSON-RPC method-not-found response. The selftest drives this fixture through the running bridge and pinned SDK Connection.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 901,
+    "method": "fixture/futureServerRequest",
+    "params": { "sessionId": "ses_root_fixture" }
+  },
+  "expected": {
+    "error": {
+      "code": -32601,
+      "data": { "kind": "methodNotFound" }
+    }
+  }
+}

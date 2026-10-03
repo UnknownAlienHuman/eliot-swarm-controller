@@ -44,6 +44,7 @@ import os
 import queue
 import sys
 import threading
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -59,7 +60,7 @@ from openai_codex._initialize_metadata import _split_user_agent  # noqa: E402
 SDK_UPSTREAM_COMMIT = "18194bfd3534ca567d886eac454028dafaa68b6c"
 SDK_PACKAGE_VERSION = "0.0.0-dev"
 MATCHING_BINARY_PIN = "openai-codex-cli-bin==0.153.4"
-MODULE_ARTIFACT_ID = "codex-sdk-18194bf-bridge.2"
+MODULE_ARTIFACT_ID = "codex-sdk-18194bf-bridge.3"
 
 # The complete client-originated surface of this slice. Server-request
 # responses (an ``id`` with no ``method``) are replies, not new calls, and
@@ -185,6 +186,7 @@ class ScriptedPeerTransport:
 
     def __init__(self, script: dict[str, Any]) -> None:
         self._responses: dict[str, Any] = script.get("responses", {})
+        self._response_positions: dict[str, int] = {}
         self._notifications: dict[str, list[Any]] = script.get("notifications", {})
         self._inbox: queue.Queue[str] = queue.Queue()
         self._closed = False
@@ -203,6 +205,12 @@ class ScriptedPeerTransport:
         if method not in self._responses:
             raise CodexError(f"fixture script has no response for {method!r}")
         outcome = self._responses[method]
+        if isinstance(outcome, list):
+            position = self._response_positions.get(method, 0)
+            if position >= len(outcome):
+                raise CodexError(f"fixture response sequence exhausted for {method!r}")
+            self._response_positions[method] = position + 1
+            outcome = outcome[position]
         if "error" in outcome:
             reply = {"id": message["id"], "error": outcome["error"]}
         else:
@@ -242,6 +250,10 @@ class SharedCodexClient(CodexClient):
         super().__init__(config=config, approval_handler=_decline_all_approvals)
         self._shared_transport = transport
         self._allowed_methods = allowed_methods
+        self._native_event_lock = threading.Lock()
+        self._native_event_sequence = 0
+        self._native_event_dropped = 0
+        self._native_events: deque[dict[str, Any]] = deque(maxlen=256)
 
     def start(self) -> None:
         self._start_reader_thread()
@@ -279,6 +291,114 @@ class SharedCodexClient(CodexClient):
         if not isinstance(message, dict):
             raise CodexError(f"Invalid JSON-RPC payload: {message!r}")
         return message
+
+    def _coerce_notification(self, method: str, params: object) -> Any:
+        self._record_native_event(method, params)
+        return super()._coerce_notification(method, params)
+
+    def _record_native_event(self, method: str, params: object) -> None:
+        """Keep a bounded, ID-only live event window; history remains source."""
+        if not isinstance(params, dict):
+            return
+        thread_id: Any = params.get("threadId")
+        turn_id: Any = params.get("turnId")
+        item: Any = params.get("item")
+        event: dict[str, Any] = {"event": method}
+
+        if method == "thread/started":
+            thread = params.get("thread")
+            if not isinstance(thread, dict):
+                return
+            thread_id = thread.get("id")
+            parent_id = thread.get("parentThreadId")
+            if not isinstance(thread_id, str) or not thread_id:
+                return
+            event.update(
+                native_thread_id=thread_id,
+                parent_thread_id=parent_id if isinstance(parent_id, str) else None,
+            )
+        elif method in {"turn/started", "turn/completed"}:
+            turn = params.get("turn")
+            if not isinstance(turn, dict):
+                return
+            turn_id = turn.get("id")
+            if not isinstance(thread_id, str) or not isinstance(turn_id, str):
+                return
+            event.update(
+                native_thread_id=thread_id,
+                native_turn_id=turn_id,
+                native_turn_status=turn.get("status"),
+            )
+        elif method in {"item/started", "item/completed"}:
+            if not isinstance(thread_id, str) or not isinstance(turn_id, str):
+                return
+            if not isinstance(item, dict):
+                return
+            item_id = item.get("id")
+            item_type = item.get("type")
+            if not isinstance(item_id, str) or not isinstance(item_type, str):
+                return
+            event.update(
+                native_thread_id=thread_id,
+                native_turn_id=turn_id,
+                native_item_id=item_id,
+                native_item_type=item_type,
+            )
+            if item_type == "mcpToolCall":
+                event["tool_server"] = item.get("server")
+                event["tool_name"] = item.get("tool")
+                event["tool_status"] = item.get("status")
+            elif item_type == "dynamicToolCall":
+                event["tool_namespace"] = item.get("namespace")
+                event["tool_name"] = item.get("tool")
+                event["tool_status"] = item.get("status")
+                if isinstance(item.get("success"), bool):
+                    event["tool_success"] = item["success"]
+            elif item_type == "functionCallOutput":
+                event["tool_name"] = item.get("name")
+            elif item_type == "commandExecution":
+                event["tool_status"] = item.get("status")
+            else:
+                return
+        elif method == "item/mcpToolCall/progress":
+            item_id = params.get("itemId")
+            if not isinstance(thread_id, str) or not isinstance(turn_id, str):
+                return
+            if not isinstance(item_id, str):
+                return
+            event.update(
+                native_thread_id=thread_id,
+                native_turn_id=turn_id,
+                native_item_id=item_id,
+            )
+        else:
+            return
+
+        with self._native_event_lock:
+            self._native_event_sequence += 1
+            if len(self._native_events) == self._native_events.maxlen:
+                self._native_event_dropped += 1
+            event["connection_sequence"] = self._native_event_sequence
+            self._native_events.append(event)
+
+    def native_event_snapshot(self, thread_ids: set[str]) -> dict[str, Any]:
+        with self._native_event_lock:
+            events = [
+                dict(event)
+                for event in self._native_events
+                if event.get("native_thread_id") in thread_ids
+                or (
+                    event.get("event") == "thread/started"
+                    and event.get("parent_thread_id") in thread_ids
+                )
+            ]
+            return {
+                "events": events,
+                "connection_sequence": self._native_event_sequence,
+                "events_dropped": self._native_event_dropped,
+                "coverage": "current_connection_window_only",
+                "complete": False,
+            }
 
 
 def _executor_block(client: SharedCodexClient, init: Any) -> dict[str, Any]:
@@ -352,6 +472,18 @@ def _native_scope_key(
     if expected_scope is None or expected_scope == observed_scope:
         return observed_scope, False
     raise NativeScopeChanged("NATIVE_SCOPE_CHANGED")
+
+
+def _report_outcome(link: Any, outcome: dict[str, Any]) -> None:
+    """Persist result bytes through the host artifact path, otherwise report outcome."""
+    result_page = outcome.get("result_page")
+    if result_page is not None:
+        operation_id = outcome.get("operation_id")
+        if not isinstance(operation_id, str) or not operation_id:
+            raise ValueError("result outcome has no operation identity")
+        link.call("module.result", {"operation_id": operation_id, "page": result_page})
+        return
+    link.call("module.outcome", outcome)
 
 
 def _dump(model: Any) -> Any:
@@ -505,7 +637,7 @@ def run_controller(config: dict[str, Any]) -> None:
     def report(link: HostLink) -> None:
         nonlocal sequence
         for operation_id, result in list(engine.outcomes.items()):
-            link.call("module.outcome", result)
+            _report_outcome(link, result)
             engine.mark_reported(operation_id)
         sequence += 1
         checkpoint.data["observe_sequence"] = sequence

@@ -324,6 +324,10 @@ pub struct TaskSpec {
     pub owner_policy_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_index: Vec<TaskSourceIndexEntry>,
+    /// Exact accepted source candidate to use as a CheckRunner reverse-scope baseline.
+    /// Claim freezes the verified acceptance identity; absent or unproven input widens scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_candidate_ref: Option<String>,
 }
 impl TaskSpec {
     pub fn brief(&self) -> TaskBrief {
@@ -367,6 +371,17 @@ impl TaskSpec {
             .is_some_and(|policy_id| policy_id.trim().is_empty())
         {
             return Err(Error::invalid("owner_policy_id cannot be empty"));
+        }
+        if self
+            .baseline_candidate_ref
+            .as_ref()
+            .is_some_and(|reference| {
+                reference.trim().is_empty() || reference.len() > 512 || reference.contains('\0')
+            })
+        {
+            return Err(Error::invalid(
+                "baseline_candidate_ref must be a nonempty artifact reference of at most 512 bytes",
+            ));
         }
         if self.objective.trim().is_empty()
             || self.phase.trim().is_empty()

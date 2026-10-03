@@ -26,6 +26,12 @@ attempt read projection exposes the frozen `owner_policy` and `task_brief`;
 Doctor reports counts for accepted, legacy-unknown and unrecognized policy
 records, plus the known accepted edition identity.
 
+`task.get` and `task.list` expose the same normalized `task_brief` while keeping
+the raw stored `spec`. A historical spec that cannot be decoded remains
+readable with `task_brief.status=unavailable` and
+`reason=stored_task_spec_unreadable`. This does not relax validation for a new
+Attempt or invent missing source or objective fields.
+
 `source_index` entries preserve source order and have a `source_ref`, status,
 and optional revision, exact text and SHA-256 digest. A `selected` entry must
 carry a nonempty revision, exact text and a matching lowercase SHA-256 digest.

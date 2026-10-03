@@ -1,1 +1,16 @@
-{"cases":[{"expected":"rejected","has_ack":false,"name":"durable commandRejected settles as rejected","native_kind":"commandRejected"},{"expected":"rejected","has_ack":false,"name":"invalidParams settles as rejected","native_kind":"invalidParams"},{"expected":"rejected","has_ack":false,"name":"overloaded settles as rejected","native_kind":"overloaded"},{"expected":"rejected","has_ack":false,"name":"backpressured settles as rejected","native_kind":"backpressured"},{"expected":"unknown","has_ack":false,"name":"non-settling internal error stays unknown","native_kind":"internal"},{"expected":"unknown","has_ack":false,"name":"transport failure after admission stays unknown (review section 13 case 6)","native_kind":"transportClosed"},{"expected":"unknown","has_ack":false,"name":"non-protocol exception stays unknown","native_kind":null},{"expected":"accepted","has_ack":true,"name":"recorded ACK outranks a later non-settling error","native_kind":"internal"},{"expected":"accepted","has_ack":true,"name":"recorded ACK outranks even a rejection kind","native_kind":"commandRejected"}],"comment":"Failed explicit reconciliation -> recorded outcome (observe.mjs failedReconcileOutcome; program section 15 norms 2/4, SDK SS4.13). Only a durable protocol rejection kind proves non-admission; any other failure settles nothing and the command stays unknown, never rejected. A recorded ACK outranks the error."}
+{
+  "comment": "Failed explicit reconciliation follows the pinned SDK PendingCommandSet settlement rule: code -32030 OR kind commandRejected is a durable rejection; other admission/envelope failures admit nothing but remain held/unknown. A recorded ACK outranks either rejection signal.",
+  "cases": [
+    { "expected": "rejected", "has_ack": false, "name": "durable commandRejected code and kind settle", "native_error": { "code": -32030, "kind": "commandRejected" } },
+    { "expected": "rejected", "has_ack": false, "name": "durable code signal settles even when the kind disagrees", "native_error": { "code": -32030, "kind": "internal" } },
+    { "expected": "rejected", "has_ack": false, "name": "durable kind signal settles even when the code disagrees", "native_error": { "code": -32602, "kind": "commandRejected" } },
+    { "expected": "unknown", "has_ack": false, "name": "invalidParams admits nothing but does not settle", "native_error": { "code": -32602, "kind": "invalidParams" } },
+    { "expected": "unknown", "has_ack": false, "name": "overloaded is retryable nothing-admitted, not settlement", "native_error": { "code": -32001, "kind": "overloaded" } },
+    { "expected": "unknown", "has_ack": false, "name": "backpressured is retryable nothing-admitted, not settlement", "native_error": { "code": -32031, "kind": "backpressured" } },
+    { "expected": "unknown", "has_ack": false, "name": "internal error stays unknown", "native_error": { "code": -32603, "kind": "internal" } },
+    { "expected": "unknown", "has_ack": false, "name": "transport failure after admission stays unknown", "native_error": { "code": null, "kind": "transportClosed" } },
+    { "expected": "unknown", "has_ack": false, "name": "non-protocol exception stays unknown", "native_error": null },
+    { "expected": "accepted", "has_ack": true, "name": "recorded ACK outranks a later non-settling error", "native_error": { "code": -32603, "kind": "internal" } },
+    { "expected": "accepted", "has_ack": true, "name": "recorded ACK outranks even a rejection signal", "native_error": { "code": -32030, "kind": "commandRejected" } }
+  ]
+}

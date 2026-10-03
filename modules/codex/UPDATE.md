@@ -10,7 +10,7 @@
 | Package / version | `openai-codex`, `0.0.0-dev` (vendored source, not installed from a registry) |
 | Matching binary pin | `openai-codex-cli-bin==0.153.4` (donor manifest provenance; this bridge attaches to an existing server) |
 | License | Apache-2.0 (`vendor_bridge/LICENSE`) |
-| Bridge artifact | `codex-sdk-18194bf-bridge.2` |
+| Current bridge artifact | `codex-sdk-18194bf-bridge.3` |
 | Runtime dependencies | exact pins in `requirements.txt` |
 
 ## ELIOT-owned changes in bridge.2
@@ -30,6 +30,19 @@ approvals and elicitation, returns an empty permission profile, declines
 dynamic-tool execution, and sends no answers to user-input prompts. Unknown
 server request methods fail the local reader closed; they do not receive an
 empty object that could be mistaken for successful handling.
+
+## ELIOT-owned changes in bridge.3
+
+The controller reads native child threads only through `thread/list` parent
+IDs and preserves an explicit partial-family status because pagination is not
+an atomic family snapshot. It can publish bounded native turn-history result
+pages for a previously acknowledged input operation after validating the
+exact thread, turn, completion status, and child-to-parent activity link.
+Native tool item IDs, names, arguments, and results are retained in the
+allowlisted result projection; reasoning content is omitted. Native lifecycle
+notifications are a bounded current-connection observation window and do not
+claim complete family or result coverage. Dynamic tool execution and
+auxiliary-provider affinity remain unavailable.
 
 `vendor_bridge/` is not edited. Its donor source, generated models, and pins
 remain unchanged; `verify_vendor.py` continues to hash the donor bytes.

@@ -4,6 +4,7 @@ use super::{current_principal, operations, results, submissions, tasks};
 use crate::{
     acceptance::{AcceptRequest, InvalidateRequest},
     artifacts::ArtifactRecord,
+    checks::{model::CheckProfile, worker},
     error::{Error, Result},
     model::{self, Dependency, Principal, TaskSpec},
 };
@@ -76,6 +77,104 @@ pub(super) fn accepted_attempt(db: &Connection, attempt: &Value) -> Result<bool>
         "SELECT EXISTS(SELECT 1 FROM operations o WHERE method='task.accept' AND state='settled' AND attempt_id=?1 AND json_extract(result_json,'$.outcome')='applied' AND json_extract(result_json,'$.acceptance_operation_id')=operation_id AND json_extract(result_json,'$.submission_ref')=?2 AND json_extract(result_json,'$.candidate_ref')=?3 AND NOT EXISTS(SELECT 1 FROM observations WHERE source_stream_id='controller:acceptance' AND source_event_key='invalidate:'||o.operation_id))",
         params![attempt["attempt_id"].as_str(), attempt["submission_ref"].as_str(), attempt["candidate_ref"].as_str()], |row| row.get(0),
     )?)
+}
+
+/// Freeze only a current accepted source candidate from the same project. A
+/// missing, stale, cross-project or otherwise unproven reference is preserved
+/// as an explicit wide-scope reason; it does not prevent claiming the Task.
+pub(super) fn freeze_baseline_candidate(
+    db: &Connection,
+    project_id: &str,
+    candidate_ref: Option<&str>,
+) -> Result<Value> {
+    let Some(candidate_ref) = candidate_ref else {
+        return Ok(json!({"status":"wide","reason":"baseline_not_configured"}));
+    };
+    let candidate = match results::get(db, candidate_ref) {
+        Ok(candidate) => candidate,
+        Err(error) if error.code == "NOT_FOUND" => {
+            return Ok(json!({
+                "status":"wide",
+                "candidate_ref":candidate_ref,
+                "reason":"baseline_artifact_unregistered"
+            }));
+        }
+        Err(error) => return Err(error),
+    };
+    if candidate.kind != "source_snapshot" || candidate.metadata["coverage"] != "complete" {
+        return Ok(json!({
+            "status":"wide",
+            "candidate_ref":candidate_ref,
+            "reason":"baseline_not_complete_source_snapshot"
+        }));
+    }
+
+    let task_ids = {
+        let mut statement = db.prepare(
+            "SELECT task_id FROM tasks WHERE project_id=?1 AND state='accepted' AND accepted_candidate_ref=?2 ORDER BY task_id",
+        )?;
+        statement
+            .query_map(params![project_id, candidate_ref], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    let mut matches = Vec::new();
+    for task_id in task_ids {
+        let task = tasks::get_task(db, &task_id)?;
+        let attempt_id = model::text(&task, "accepted_attempt_id")?;
+        let attempt = tasks::get_attempt(db, attempt_id)?;
+        let operation_id = model::text(&task, "accepted_operation_id")?;
+        let accepted = match decision(db, operation_id) {
+            Ok(accepted) => accepted,
+            Err(error) if matches!(error.code.as_str(), "NOT_ACCEPTANCE" | "NOT_FOUND") => {
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        if revoked(db, operation_id)?
+            || task["project_id"] != project_id
+            || task["accepted_candidate_ref"] != candidate_ref
+            || attempt["task_id"] != task_id
+            || attempt["task_revision"] != task["accepted_revision"]
+            || attempt["state"] != "accepted"
+            || attempt["candidate_ref"] != candidate_ref
+            || accepted["task_id"] != task_id
+            || accepted["attempt_id"] != attempt_id
+            || accepted["task_revision"] != task["accepted_revision"]
+            || accepted["candidate_ref"] != candidate_ref
+            || candidate.metadata["task_id"] != task_id
+            || candidate.metadata["attempt_id"] != attempt_id
+            || candidate.metadata["task_revision"] != task["accepted_revision"]
+            || !accepted_attempt(db, &attempt)?
+        {
+            continue;
+        }
+        matches.push(json!({
+            "status":"verified",
+            "project_id":project_id,
+            "task_id":task_id,
+            "task_revision":task["accepted_revision"],
+            "attempt_id":attempt_id,
+            "acceptance_operation_id":operation_id,
+            "candidate_ref":candidate_ref,
+            "content_sha256":candidate.content_digest,
+            "byte_length":candidate.byte_length
+        }));
+    }
+    match matches.len() {
+        1 => Ok(matches.remove(0)),
+        0 => Ok(json!({
+            "status":"wide",
+            "candidate_ref":candidate_ref,
+            "reason":"baseline_lacks_current_same_project_acceptance"
+        })),
+        _ => Ok(json!({
+            "status":"wide",
+            "candidate_ref":candidate_ref,
+            "reason":"baseline_acceptance_provenance_ambiguous"
+        })),
+    }
 }
 
 fn validate_dependencies(db: &Connection, attempt: &Value, spec: &TaskSpec) -> Result<()> {
@@ -206,19 +305,31 @@ fn evidence(
                 "required check is not a complete pass for this Attempt/candidate",
             ));
         }
-        let requested = c["coverage"]["requested"]
-            .as_array()
-            .ok_or_else(|| Error::new("CHECK_INCOMPLETE", "check has no requested coverage"))?;
-        let checked = c["coverage"]["checked"]
-            .as_array()
-            .ok_or_else(|| Error::new("CHECK_INCOMPLETE", "check has no observed coverage"))?;
-        if requested
-            .iter()
-            .any(|id| !id.is_string() || !checked.contains(id))
+        let check_profile: CheckProfile = serde_json::from_value(c["spec"]["profile"].clone())
+            .map_err(|_| Error::new("CHECK_EVIDENCE_MISSING", "check profile is malformed"))?;
+        let expected_targets: Vec<String> =
+            if c["spec"]["resolved_inputs"]["expected_targets"].is_array() {
+                serde_json::from_value(c["spec"]["resolved_inputs"]["expected_targets"].clone())
+                    .map_err(|_| {
+                        Error::new("CHECK_EVIDENCE_MISSING", "resolved targets are malformed")
+                    })?
+            } else {
+                check_profile.expected_targets.clone()
+            };
+        worker::validate_passed_coverage(
+            &check_profile.parser,
+            &expected_targets,
+            &c["spec"]["scope_plan"],
+            &c["coverage"],
+        )
+        .map_err(|_| Error::new("CHECK_INCOMPLETE", "check parser coverage is incomplete"))?;
+        if c["spec"]["resolved_inputs"]["profile_identity"].is_object()
+            && c["spec"]["resolved_inputs"]["profile_identity"]["parser"]
+                != json!(check_profile.parser)
         {
             return Err(Error::new(
-                "CHECK_INCOMPLETE",
-                "check coverage is absent or incomplete",
+                "CHECK_EVIDENCE_MISSING",
+                "check profile differs from its resolved identity",
             ));
         }
         let op = operations::get_operation(db, model::text(&c, "operation_id")?)?;
@@ -235,18 +346,94 @@ fn evidence(
             ));
         }
         if !c["cached_from"].is_null() {
-            // The source process is validated too; cache rows never acquire fake PIDs.
+            // Cache rows point directly at one original, completed process row.
+            // Input identity is stable across Tasks/Attempts, so the full spec
+            // JSON is intentionally not required to match.
             let source = model::text(&c, "cached_from")?;
-            let valid: bool = db.query_row(
-                "SELECT EXISTS(SELECT 1 FROM check_runs s JOIN check_runs c ON c.check_id=?1 WHERE s.check_id=?2 AND s.cached_from_check_id IS NULL AND s.state='passed' AND s.exit_code=0 AND s.resource_released_at_ms IS NOT NULL AND s.cache_key=c.cache_key AND s.result_ref=c.result_ref AND s.spec_json=c.spec_json AND s.coverage_json=c.coverage_json AND EXISTS(SELECT 1 FROM operations op WHERE op.operation_id=s.operation_id AND op.method='check.run' AND op.state='settled' AND json_extract(op.result_json,'$.outcome')='applied' AND json_extract(op.result_json,'$.check_id')=s.check_id AND json_extract(op.result_json,'$.result_ref')=s.result_ref))",
-                params![id, source], |r| r.get(0),
-            )?;
+            let source_row: Option<(String, String, String, Option<String>)> = db
+                .query_row(
+                    "SELECT s.candidate_ref,s.spec_json,s.coverage_json,s.process_identity_json FROM check_runs s JOIN check_runs c ON c.check_id=?1 WHERE s.check_id=?2 AND s.cached_from_check_id IS NULL AND s.state='passed' AND s.exit_code=0 AND s.resource_released_at_ms IS NOT NULL AND s.cache_key=c.cache_key AND s.result_ref=c.result_ref AND s.coverage_json=c.coverage_json AND json_extract(s.spec_json,'$.cache_policy')='reusable' AND json_extract(s.spec_json,'$.reproducible')=1 AND json_extract(s.spec_json,'$.input_fingerprint')=json_extract(c.spec_json,'$.input_fingerprint') AND json_extract(s.spec_json,'$.resolved_inputs')=json_extract(c.spec_json,'$.resolved_inputs') AND json_extract(s.spec_json,'$.scope_plan')=json_extract(c.spec_json,'$.scope_plan') AND EXISTS(SELECT 1 FROM operations op WHERE op.operation_id=s.operation_id AND op.method='check.run' AND op.state='settled' AND json_extract(op.result_json,'$.outcome')='applied' AND json_extract(op.result_json,'$.state')='passed' AND json_extract(op.result_json,'$.exit_code')=0 AND json_extract(op.result_json,'$.source_checkout_verified')=1 AND json_extract(op.result_json,'$.cached') IS NULL AND json_extract(op.result_json,'$.cached_from_check_id') IS NULL AND json_extract(op.result_json,'$.check_id')=s.check_id AND json_extract(op.result_json,'$.result_ref')=s.result_ref))",
+                    params![id, source],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()?;
+            let source_candidate_ref = source_row.as_ref().map(|row| row.0.clone());
+            if let Some((_, spec_raw, coverage_raw, process_raw)) = source_row.as_ref() {
+                let source_spec: Value = serde_json::from_str(spec_raw)?;
+                let source_profile: CheckProfile =
+                    serde_json::from_value(source_spec["profile"].clone()).map_err(|_| {
+                        Error::new("CHECK_NOT_READY", "cached source profile is malformed")
+                    })?;
+                let source_targets: Vec<String> =
+                    if source_spec["resolved_inputs"]["expected_targets"].is_array() {
+                        serde_json::from_value(
+                            source_spec["resolved_inputs"]["expected_targets"].clone(),
+                        )
+                        .map_err(|_| {
+                            Error::new("CHECK_NOT_READY", "cached source targets are malformed")
+                        })?
+                    } else {
+                        source_profile.expected_targets.clone()
+                    };
+                let source_coverage: Value = serde_json::from_str(coverage_raw)?;
+                let source_process: Value = process_raw
+                    .as_deref()
+                    .map(serde_json::from_str)
+                    .transpose()?
+                    .ok_or_else(|| {
+                        Error::new("CHECK_NOT_READY", "cached source process is missing")
+                    })?;
+                if !source_spec["cache_source_acceptance"].is_null()
+                    || !source_spec["cached_from_check_id"].is_null()
+                    || source_spec["resolved_inputs"]["profile_identity"]["parser"]
+                        != json!(source_profile.parser)
+                    || !super::checks::valid_process_receipt(&source_process, &source_spec)
+                    || worker::validate_passed_coverage(
+                        &source_profile.parser,
+                        &source_targets,
+                        &source_spec["scope_plan"],
+                        &source_coverage,
+                    )
+                    .is_err()
+                {
+                    return Err(Error::new(
+                        "CHECK_NOT_READY",
+                        "cached source is not an original parser-complete process result",
+                    ));
+                }
+            }
+            let original = operations::get_operation(db, source)?;
+            let valid = source_candidate_ref.is_some()
+                && original["method"] == "check.run"
+                && original["state"] == "settled"
+                && original["result"]["cached"].is_null()
+                && original["result"]["cached_from_check_id"].is_null()
+                && original["result"]["output_refs"] == op["result"]["output_refs"]
+                && op["result"]["cached_from_check_id"] == source;
             if !valid {
                 return Err(Error::new(
                     "CHECK_NOT_READY",
                     "cached process evidence is not valid",
                 ));
             }
+            let source_candidate_ref = source_candidate_ref
+                .ok_or_else(|| Error::new("CHECK_NOT_READY", "cached process row disappeared"))?;
+            let source_candidate = results::get(db, &source_candidate_ref)?;
+            let current_acceptance = freeze_baseline_candidate(
+                db,
+                model::text(&t, "project_id")?,
+                Some(&source_candidate_ref),
+            )?;
+            if current_acceptance["status"] != "verified"
+                || model::canonical(&current_acceptance)?
+                    != model::canonical(&c["spec"]["cache_source_acceptance"])?
+            {
+                return Err(Error::new(
+                    "CHECK_NOT_READY",
+                    "cached source is no longer the same accepted project candidate",
+                ));
+            }
+            files.push(source_candidate);
         } else if c["exit_code"] != 0 || c["released_at_ms"].is_null() {
             return Err(Error::new(
                 "CHECK_NOT_READY",
@@ -254,6 +441,26 @@ fn evidence(
             ));
         }
         files.push(results::get(db, model::text(&c, "result_ref")?)?);
+        let output_refs = op["result"]["output_refs"]
+            .as_array()
+            .ok_or_else(|| Error::new("CHECK_EVIDENCE_MISSING", "check output list is absent"))?;
+        let output_owner = c["cached_from"].as_str().unwrap_or(id.as_str());
+        for reference in output_refs {
+            let reference = reference.as_str().ok_or_else(|| {
+                Error::new(
+                    "CHECK_EVIDENCE_MISSING",
+                    "check output reference is malformed",
+                )
+            })?;
+            let output = results::get(db, reference)?;
+            if output.kind != "check_output" || output.metadata["check_id"] != output_owner {
+                return Err(Error::new(
+                    "CHECK_EVIDENCE_MISSING",
+                    "check output is not owned by its original process",
+                ));
+            }
+            files.push(output);
+        }
         checks.push(c);
     }
     if profiles.len() != policy.required_check_profiles.len() {

@@ -13,7 +13,8 @@ mod os {
     use windows_sys::Win32::{
         Foundation::{
             CloseHandle, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER,
-            ERROR_MORE_DATA, FILETIME, GetLastError, HANDLE, WAIT_OBJECT_0,
+            ERROR_MORE_DATA, FILETIME, GetLastError, HANDLE, WAIT_FAILED, WAIT_OBJECT_0,
+            WAIT_TIMEOUT,
         },
         System::{
             JobObjects::{
@@ -33,6 +34,23 @@ mod os {
     // Win32 documented job-specific access mask (not exposed by the enabled bindings).
     // https://learn.microsoft.com/windows/win32/procthread/job-object-security-and-access-rights
     const JOB_QUERY_ACCESS: u32 = 0x0004;
+    // TerminateProcess is asynchronous. A short wait resolves the common race
+    // where a repeated termination request reaches a process already exiting.
+    const TERMINATION_WAIT_MS: u32 = 250;
+
+    fn wait_process_signaled(handle: HANDLE, timeout_ms: u32) -> Result<bool> {
+        // SAFETY: callers keep the opened process handle alive throughout the wait.
+        match unsafe { WaitForSingleObject(handle, timeout_ms) } {
+            WAIT_OBJECT_0 => Ok(true),
+            WAIT_TIMEOUT => Ok(false),
+            WAIT_FAILED => Err(std::io::Error::last_os_error().into()),
+            status => Err(Error::new(
+                "PROCESS_WAIT",
+                format!("unexpected process wait status {status:#x}"),
+            )),
+        }
+    }
+
     pub struct Group {
         job: HANDLE,
         pub identity: Value,
@@ -149,7 +167,7 @@ mod os {
                         return Err(error.into());
                     }
                     let result = (|| -> Result<()> {
-                        if WaitForSingleObject(handle, 0) == WAIT_OBJECT_0 {
+                        if wait_process_signaled(handle, 0)? {
                             return Ok(());
                         }
                         let mut owned = 0;
@@ -159,11 +177,14 @@ mod os {
                         if owned != 0 {
                             if TerminateProcess(handle, 1) == 0 {
                                 let error = std::io::Error::last_os_error();
-                                if WaitForSingleObject(handle, 0) != WAIT_OBJECT_0 {
+                                if !wait_process_signaled(handle, TERMINATION_WAIT_MS)? {
                                     return Err(error.into());
                                 }
                             } else {
                                 sent += 1;
+                                // A successful request is not proof of exit, but
+                                // waiting here reduces repeated termination races.
+                                let _ = wait_process_signaled(handle, TERMINATION_WAIT_MS)?;
                             }
                         }
                         Ok(())

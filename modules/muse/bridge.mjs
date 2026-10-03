@@ -60,7 +60,14 @@ if(saved) {
   bindingContext=saved.binding;
   for(const [id,value] of saved.outcomes??[])outcomes.set(id,value);
   for(const [id,value] of saved.native_pending??[])nativePending.set(id,value);
-  for(const [id,value] of saved.children??[])children.set(id,value);
+  for(const [id,value] of saved.children??[]) {
+    // A checkpoint preserves evidence, not currentness. Keep every recorded
+    // child identity and snapshot, but require a successful exact read in
+    // this bridge boot before calling that snapshot fresh again.
+    const hasExactSnapshot=value?.snapshot?.sessionId===id;
+    children.set(id,{...value,snapshot_freshness:hasExactSnapshot?'stale':'unknown',
+      snapshot_freshness_reason:hasExactSnapshot?'checkpoint_restored':'checkpoint_snapshot_unverified'});
+  }
   for(const [id,value] of saved.turns??[])turns.set(id,value);
   latest={...saved.latest,execution:'recovery_required',gaps:(saved.latest?.gaps??0)+1,
     family_completeness:'partial',recovered_checkpoint:true};
@@ -95,6 +102,13 @@ function acceptModel(entry, session, evidence) {
 }
 
 function changed() { revision++; }
+function invalidateChildSnapshot(id, reason) {
+  const child=children.get(id);
+  if (!child || child.snapshot_freshness!=='fresh') return false;
+  children.set(id,{...child,snapshot_freshness:'stale',snapshot_freshness_reason:reason});
+  changed();
+  return true;
+}
 function observation() {
   return { ...latest, native_root_id:rootId, native_scope_key:nativeScope,
     observed_children:[...children.values()], pending_requests:[...pendingRequests.values()].map(x=>x.view),
@@ -106,6 +120,11 @@ function onNotification(n) {
   if (n.method === 'item/delta') return;
   eventsSeen++;
   if (p.sessionId) sessionVersions.set(p.sessionId, (sessionVersions.get(p.sessionId)??0)+1);
+  if (p.sessionId && children.has(p.sessionId)) {
+    invalidateChildSnapshot(p.sessionId,
+      n.method==='view/gap'||n.method==='session/viewHealthChanged'
+        ?'native_view_gap_after_read':'native_event_after_read');
+  }
   // A correlated event can resolve a lost turn admission reply. It never
   // submits another prompt and never claims that the Task was accepted.
   const inputCommand = p.commandId ?? p.item?.commandId;
@@ -151,10 +170,16 @@ function onNotification(n) {
       && (p.sessionId === rootId || children.has(p.sessionId))) {
     if (children.has(item.childSessionId) || children.size < 2000) {
       const old = children.get(item.childSessionId);
-      if (!old || item.itemId !== old.itemId || Number(item.revision ?? 0) >= Number(old.revision ?? 0)) {
+      // Replayed equal revisions are historical evidence, not a newer parent
+      // declaration. A changed item ID is a distinct assignment even when the
+      // native session ID is reused.
+      if (!old || item.itemId !== old.itemId || !Number.isSafeInteger(old.revision) || item.revision > old.revision) {
+        const wasFresh=old?.snapshot_freshness==='fresh';
         children.set(item.childSessionId, { ...old, sessionId:item.childSessionId, parentSessionId:p.sessionId,
           itemId:item.itemId, subagentId:item.subagentId, parentTurnId:item.turnId,
           status:item.status, controlStatus:item.controlStatus, revision:item.revision,
+          snapshot_freshness:wasFresh?'stale':old?.snapshot_freshness??'unknown',
+          snapshot_freshness_reason:wasFresh?'parent_child_event_after_read':old?.snapshot_freshness_reason??'native_read_not_yet_verified',
           result_available:Boolean(item.result),
           result_summary:typeof item.result?.summary==='string'?item.result.summary.slice(0,512):undefined,
           result_error_kind:item.result?.errorKind,
@@ -290,7 +315,7 @@ async function reconcileNative(target) {
     const ack = await msp.connection.command(entry.method, entry.params, {maxAttempts:1,commandId:entry.id});
     await completeNative(entry, ack);
   } catch (error) {
-    saveOutcome(target, {outcome:failedReconcileOutcome(error instanceof MspError?error.kind:null, Boolean(entry.ack)),native_root_id:rootId,native_scope_key:nativeScope,
+    saveOutcome(target, {outcome:failedReconcileOutcome(error instanceof MspError?{code:error.code,kind:error.kind}:null, Boolean(entry.ack)),native_root_id:rootId,native_scope_key:nativeScope,
       details:{evidence_kind:'explicit_same_command_reconciliation',native_code:error instanceof MspError?error.code:null,native_kind:error instanceof MspError?error.kind:null}});
     throw error;
   }
@@ -301,26 +326,52 @@ async function refreshChild(id) {
   if (childReads.has(id)) return childReads.get(id);
   if (!children.has(id)) throw new Error('CHILD_OUTSIDE_OBSERVED_FAMILY');
   const pending = (async () => {
+    let stage='session_read';
     const before = sessionVersions.get(id)??0;
-    const r = await msp.connection.request('session/read', {sessionId:id,excludeItems:true});
-    const snapshot = compactSession(r.session);
-    if (snapshot.sessionId!==id) throw new Error('SNAPSHOT_IDENTITY_MISMATCH');
-    const fresh = before===(sessionVersions.get(id)??0);
-    if (fresh) children.set(id, {...children.get(id),snapshot});
-    // Resume observation from the read cursor, never acquire a child's writer
-    // lease or consume its result through subagent/readResult.
-    await msp.connection.request('view/subscribe', {sessionId:id,after:required(r,'viewCursor')});
-    const pendingAt = sessionVersions.get(id)??0;
-    const questions = await msp.connection.request('approval/listPending',{sessionId:id});
-    if (!Array.isArray(questions.approvals) || !Array.isArray(questions.userInputs)) throw new Error('INVALID_PENDING_INVENTORY');
-    if (pendingAt===(sessionVersions.get(id)??0)) {
-      for (const [key, entry] of pendingRequests) if (entry.view.params?.sessionId===id) pendingRequests.delete(key);
-      for (const params of questions.approvals) pendingRequests.set(`approval:${required(params,'approvalId')}`,{view:{method:'approval/request',params}});
-      for (const params of questions.userInputs) pendingRequests.set(`input:${required(params,'userInputId')}`,{view:{method:'userInput/request',params}});
+    try {
+      const r = await msp.connection.request('session/read', {sessionId:id,excludeItems:true});
+      const snapshot = compactSession(r.session);
+      if (snapshot.sessionId!==id) throw new Error('SNAPSHOT_IDENTITY_MISMATCH');
+      // Subscribe from the read cursor, then verify no event arrived during
+      // either subscription replay or pending-request inventory. The previous
+      // snapshot stays intact until that whole read window is stable.
+      stage='view_subscribe';
+      await msp.connection.request('view/subscribe', {sessionId:id,after:required(r,'viewCursor')});
+      const pendingAt = sessionVersions.get(id)??0;
+      stage='pending_inventory';
+      const questions = await msp.connection.request('approval/listPending',{sessionId:id});
+      if (!Array.isArray(questions.approvals) || !Array.isArray(questions.userInputs)) throw new Error('INVALID_PENDING_INVENTORY');
+      if (pendingAt===(sessionVersions.get(id)??0)) {
+        for (const [key, entry] of pendingRequests) if (entry.view.params?.sessionId===id) pendingRequests.delete(key);
+        for (const params of questions.approvals) pendingRequests.set(`approval:${required(params,'approvalId')}`,{view:{method:'approval/request',params}});
+        for (const params of questions.userInputs) pendingRequests.set(`input:${required(params,'userInputId')}`,{view:{method:'userInput/request',params}});
+      }
+      const fresh = before===(sessionVersions.get(id)??0);
+      const refreshed={at_ms:Date.now(),session_id:id,metadata_applied:fresh,viewCursor:r.viewCursor,coverage:'observed_child_metadata_and_pending_requests'};
+      const current=children.get(id);
+      if (fresh) {
+        children.set(id,{...current,snapshot,snapshot_freshness:'fresh',snapshot_freshness_reason:'stable_native_read',
+          last_refresh:refreshed,last_refresh_attempt:{...refreshed,status:'applied'}});
+      } else {
+        children.set(id,{...current,snapshot_freshness:current?.snapshot?'stale':'unknown',snapshot_freshness_reason:'native_event_during_refresh',
+          last_refresh_attempt:{...refreshed,status:'raced',snapshot_retained:true}});
+      }
+      changed();
+      return refreshed;
+    } catch(error) {
+      // Preserve the exact child identity, last snapshot, and last successful
+      // refresh as stale evidence. A failed/missing read only changes the
+      // currentness marker and records a bounded diagnostic for this attempt.
+      const current=children.get(id);
+      children.set(id,{...current,snapshot_freshness:current?.snapshot?'stale':'unknown',snapshot_freshness_reason:'native_read_failed',
+        last_refresh_attempt:{at_ms:Date.now(),status:'failed',stage,
+          error_type:error?.name??'Error',
+          native_kind:error instanceof MspError?error.kind:undefined,
+          diagnostic_code:typeof error?.message==='string'&&/^[A-Z0-9_]{1,80}$/.test(error.message)?error.message:'NATIVE_READ_FAILED',
+          snapshot_retained:Boolean(current?.snapshot)}});
+      changed();
+      throw error;
     }
-    const refreshed={at_ms:Date.now(),session_id:id,metadata_applied:fresh,viewCursor:r.viewCursor,coverage:'observed_child_metadata_and_pending_requests'};
-    children.set(id,{...children.get(id),last_refresh:refreshed});changed();
-    return refreshed;
   })();
   childReads.set(id,pending);
   try {return await pending;} finally {childReads.delete(id);}
@@ -469,8 +520,10 @@ async function execute(command) {
     }
     saveOutcome(command.operation_id,{outcome:'applied',...result});
   } catch(error) {
-    // Only protocol rejection proves non-admission. Transport/parsing/spawn failures may have effects.
-    const rejected=!nativeAdmissionPossible || error instanceof MspError && ['invalidParams','commandRejected','overloaded','backpressured'].includes(error.kind);
+    // Only the pinned durable commandRejected code/kind settles admitted
+    // native work. Other errors can prove nothing or mean nothing was admitted;
+    // keep those operations unknown for explicit same-ID reconciliation.
+    const rejected=!nativeAdmissionPossible || error instanceof MspError && (error.code===-32030 || error.kind==='commandRejected');
     const accepted = nativePending.get(command.operation_id)?.ack;
     const outcome={...base,outcome:accepted?'accepted':rejected?'rejected':'unknown',details:{error_type:error.name,native_kind:error instanceof MspError?error.kind:null,native_code:error instanceof MspError?error.code:null,diagnostic_code:error instanceof MspError?'NATIVE_ERROR':String(error.message).slice(0,120)}};
     if(rootId){outcome.native_root_id=rootId;outcome.native_scope_key=nativeScope;}

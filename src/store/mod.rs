@@ -5,6 +5,7 @@ pub(crate) mod capacity;
 mod checks;
 mod forge;
 mod gm;
+mod message_batch;
 mod opencode;
 mod operations;
 mod prerequisites;
@@ -13,6 +14,7 @@ mod projection;
 mod results;
 mod runtime;
 mod schedules;
+mod status_reader;
 mod submissions;
 mod tasks;
 use crate::{
@@ -32,10 +34,15 @@ use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 const SCHEMA: &str = include_str!("../../migrations/001_core.sql");
 const APPLICATION_ID: i64 = 0x45534331;
 const LOCAL_OPERATOR_CLIENT_ID_KEY: &str = "local_operator_client_id";
-type Job = Box<dyn FnOnce(&mut Connection) + Send>;
+type RunJob = Box<dyn FnOnce(&mut Connection) + Send>;
+enum Job {
+    Run(RunJob),
+    MessageSend(message_batch::Request),
+}
 #[derive(Clone)]
 pub struct Store {
     tx: mpsc::Sender<Job>,
+    status_reader: status_reader::Sender,
     config: Arc<Config>,
     changed: watch::Sender<u64>,
     artifacts: ArtifactFiles,
@@ -44,6 +51,7 @@ pub struct Store {
 }
 pub struct StoreOwner {
     thread: JoinHandle<()>,
+    status_thread: JoinHandle<()>,
     pub store: Store,
 }
 
@@ -57,6 +65,7 @@ impl StoreOwner {
         let data_dir = root.path.clone();
         let (tx, mut rx) = mpsc::channel::<Job>(config.storage.queue_capacity);
         let (ready_tx, ready_rx) = oneshot::channel();
+        let writer_config = config.clone();
         let thread = std::thread::Builder::new()
             .name("swarm-store".into())
             .spawn(move || {
@@ -64,8 +73,36 @@ impl StoreOwner {
                 match open_database(&root.path, &credential) {
                     Ok(mut db) => {
                         if ready_tx.send(Ok(())).is_ok() {
-                            while let Some(job) = rx.blocking_recv() {
-                                job(&mut db);
+                            let mut pending = None;
+                            loop {
+                                let job = match pending.take() {
+                                    Some(job) => Some(job),
+                                    None => rx.blocking_recv(),
+                                };
+                                let Some(job) = job else { break };
+                                match job {
+                                    Job::Run(job) => job(&mut db),
+                                    Job::MessageSend(first) => {
+                                        let mut batch =
+                                            Vec::with_capacity(message_batch::MAX_BATCH_SIZE);
+                                        batch.push(first);
+                                        while batch.len() < message_batch::MAX_BATCH_SIZE {
+                                            match rx.try_recv() {
+                                                Ok(Job::MessageSend(request)) => {
+                                                    batch.push(request);
+                                                }
+                                                Ok(other) => {
+                                                    // Preserve the single queue's FIFO order:
+                                                    // a non-send job ends this batch and runs next.
+                                                    pending = Some(other);
+                                                    break;
+                                                }
+                                                Err(_) => break,
+                                            }
+                                        }
+                                        message_batch::process(&mut db, batch, &writer_config);
+                                    }
+                                }
                             }
                         }
                     }
@@ -74,13 +111,37 @@ impl StoreOwner {
                     }
                 }
             })?;
-        ready_rx
-            .await
-            .map_err(|_| Error::new("STORE_CLOSED", "initialization thread ended"))??;
+        match ready_rx.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                join_store_thread(thread, "database owner").await?;
+                return Err(error);
+            }
+            Err(_) => {
+                join_store_thread(thread, "database owner").await?;
+                return Err(Error::new("STORE_CLOSED", "initialization thread ended"));
+            }
+        }
+        let (status_reader, status_thread) = match status_reader::start(
+            data_dir.join("swarm.db"),
+            config.storage.queue_capacity,
+            config.clone(),
+        )
+        .await
+        {
+            Ok(reader) => reader,
+            Err(error) => {
+                drop(tx);
+                join_store_thread(thread, "database owner").await?;
+                return Err(error);
+            }
+        };
         Ok(Self {
             thread,
+            status_thread,
             store: Store {
                 tx,
+                status_reader,
                 config,
                 changed: watch::channel(0).0,
                 artifacts,
@@ -90,12 +151,29 @@ impl StoreOwner {
         })
     }
     pub async fn close(self) -> Result<()> {
-        drop(self.store);
-        tokio::task::spawn_blocking(move || self.thread.join())
-            .await
-            .map_err(|e| Error::new("STORE_CLOSED", e.to_string()))?
-            .map_err(|_| Error::new("STORE_PANIC", "database owner panicked"))
+        let StoreOwner {
+            thread,
+            status_thread,
+            store,
+        } = self;
+        drop(store);
+        join_store_threads(status_thread, thread).await
     }
+}
+async fn join_store_threads(
+    status_thread: JoinHandle<()>,
+    database_thread: JoinHandle<()>,
+) -> Result<()> {
+    let status_result = join_store_thread(status_thread, "status reader").await;
+    let database_result = join_store_thread(database_thread, "database owner").await;
+    status_result?;
+    database_result
+}
+async fn join_store_thread(thread: JoinHandle<()>, name: &'static str) -> Result<()> {
+    tokio::task::spawn_blocking(move || thread.join())
+        .await
+        .map_err(|error| Error::new("STORE_CLOSED", format!("{name} join failed: {error}")))?
+        .map_err(|_| Error::new("STORE_PANIC", format!("{name} panicked")))
 }
 impl Store {
     async fn run<T: Send + 'static>(
@@ -104,12 +182,26 @@ impl Store {
     ) -> Result<T> {
         let (tx, rx) = oneshot::channel();
         self.tx
-            .send(Box::new(move |db| {
+            .send(Job::Run(Box::new(move |db| {
                 let _ = tx.send(f(db));
-            }))
+            })))
             .await
             .map_err(|_| Error::new("STORE_CLOSED", "database owner stopped"))?;
         rx.await
+            .map_err(|_| Error::new("STORE_CLOSED", "database operation lost its response"))?
+    }
+    async fn message_send(&self, principal: Principal, params: Value) -> Result<Value> {
+        let (response, receive) = oneshot::channel();
+        self.tx
+            .send(Job::MessageSend(message_batch::Request {
+                principal,
+                params,
+                response,
+            }))
+            .await
+            .map_err(|_| Error::new("STORE_CLOSED", "database owner stopped"))?;
+        receive
+            .await
             .map_err(|_| Error::new("STORE_CLOSED", "database operation lost its response"))?
     }
     pub async fn authenticate(&self, credential: Credential) -> Result<Principal> {
@@ -139,6 +231,12 @@ impl Store {
         .await
     }
     pub async fn call(&self, principal: Principal, method: String, params: Value) -> Result<Value> {
+        if method == "host.status" {
+            return self.status_reader.host_status(principal, params).await;
+        }
+        if method == "message.send" {
+            return self.message_send(principal, params).await;
+        }
         if method == "forge.publish_ref" {
             return self.publish_ref(principal, params).await;
         }
@@ -173,6 +271,9 @@ impl Store {
         }
         if method == "source.capture" {
             return self.capture_source(principal, params).await;
+        }
+        if method == "check.run" {
+            return self.check_run(principal, params).await;
         }
         if method == "task.accept" {
             return self.accept_task(principal, params).await;
@@ -466,6 +567,11 @@ impl Store {
     }
 }
 fn current_principal(db: &Connection, principal: Principal) -> Result<Principal> {
+    if principal.role == Role::Scheduler
+        && principal.client_id == model::INTERNAL_SCHEDULER_CLIENT_ID
+    {
+        return Ok(principal);
+    }
     let current = meta(db, &format!("client:{}", principal.client_id))?
         .ok_or_else(|| Error::new("UNAUTHORIZED", "client no longer registered"))?;
     if current["disabled"] == true {
@@ -651,7 +757,6 @@ fn is_read(method: &str) -> bool {
             | "check.profiles"
             | "artifact.get"
             | "artifact.parts"
-            | "host.status"
             | "task.submission"
             | "task.acceptance"
             | "task.get"
@@ -783,9 +888,29 @@ fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config
         "check.get" => checks::describe(db, v),
         "check.profiles" => {
             model::fields(v, &[])?;
-            Ok(
-                json!({"enabled":config.checks.enabled,"profiles":config.checks.profiles,"cache_reuse":false}),
-            )
+            let profiles = config
+                .checks
+                .profiles
+                .iter()
+                .map(|profile| {
+                    json!({
+                        "profile_id":profile.profile_id,
+                        "profile_revision":profile.profile_revision,
+                        "parser":profile.parser,
+                        "resource":profile.resource,
+                        "reproducible_opt_in":profile.reproducible,
+                        "configured_environment_names":profile.environment.keys().collect::<Vec<_>>(),
+                        "inherited_environment_names":profile.inherit_env,
+                        "versioned_input_names":profile.versioned_inputs.keys().collect::<Vec<_>>(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            Ok(json!({
+                "enabled":config.checks.enabled,
+                "profiles":profiles,
+                "cache_reuse":"conditional",
+                "cache_reuse_policy":"per_check_requires_verified_versioned_inputs"
+            }))
         }
 
         "artifact.get" => results::describe(db, p, v),
@@ -1038,6 +1163,18 @@ fn mutate_in_transaction(
     config: &Config,
     now: i64,
 ) -> Result<Result<Value>> {
+    mutate_in_transaction_with_check_plan(tx, p, method, v, config, now, None)
+}
+
+fn mutate_in_transaction_with_check_plan(
+    tx: &Transaction<'_>,
+    p: &Principal,
+    method: &str,
+    v: &Value,
+    config: &Config,
+    now: i64,
+    check_plan: Option<&checks::CheckPlanResolution>,
+) -> Result<Result<Value>> {
     if p.role == Role::Scheduler
         && (p.client_id != model::INTERNAL_SCHEDULER_CLIENT_ID || method != "check.run")
     {
@@ -1063,7 +1200,18 @@ fn mutate_in_transaction(
     let id = model::new_id();
     tx.execute("INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,effective_request_json,state,due_at_ms,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,?5,'{}','queued',?6,?6,?6)",params![id,p.client_id,request_id,method,original,now])?;
     tx.execute_batch("SAVEPOINT mutation_effect")?;
-    let result = apply(tx, p, method, v, config, &id, now);
+    let result = apply(
+        tx,
+        p,
+        method,
+        v,
+        config,
+        ApplyContext {
+            operation_id: &id,
+            now,
+            check_plan,
+        },
+    );
     let receipt = match &result {
         Ok((value, queued)) => {
             tx.execute_batch("RELEASE mutation_effect")?;
@@ -1096,19 +1244,29 @@ fn receipt_result(value: &Value) -> Result<Value> {
         ))
     }
 }
+struct ApplyContext<'a> {
+    operation_id: &'a str,
+    now: i64,
+    check_plan: Option<&'a checks::CheckPlanResolution>,
+}
+
 fn apply(
     tx: &Transaction<'_>,
     p: &Principal,
     method: &str,
     v: &Value,
     config: &Config,
-    id: &str,
-    now: i64,
+    context: ApplyContext<'_>,
 ) -> Result<(Value, bool)> {
+    let ApplyContext {
+        operation_id: id,
+        now,
+        check_plan,
+    } = context;
     match method {
         "forge.publish_ref" => forge::reserve(tx, p, v, id, config).map(|v| (v, true)),
         "source.capture" => checks::reserve_source(tx, p, v, id, config).map(|v| (v, true)),
-        "check.run" => checks::reserve(tx, p, v, id, config),
+        "check.run" => checks::reserve(tx, p, v, id, config, check_plan),
         "check.cancel" => checks::cancel(tx, p, v, id).map(|v| (v, false)),
 
         "artifact.assemble" => assembly::reserve(tx, p, v, id).map(|v| (v, true)),

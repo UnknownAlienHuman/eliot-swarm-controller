@@ -1,7 +1,9 @@
 //! One short-lived worker per check. It owns no DB or model session and executes
 //! at most one configured command, after the host durably acknowledges its identity.
 use super::{
+    inputs,
     model::{CheckProfile, Parser},
+    scope::CargoTargetIdentity,
     source,
 };
 use crate::{
@@ -30,6 +32,12 @@ pub struct Work {
     pub data_dir: PathBuf,
     pub candidate: ArtifactRecord,
     pub profile: CheckProfile,
+    #[serde(default)]
+    pub resolved_inputs: Option<Value>,
+    #[serde(default)]
+    pub scope_plan: Option<Value>,
+    #[serde(default)]
+    pub input_fingerprint: Option<String>,
     #[serde(default)]
     pub preflight_error: Option<Value>,
     #[serde(default)]
@@ -115,6 +123,20 @@ fn read_value(path: &Path) -> Result<Value> {
         ));
     }
     Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn profile_report_matches(work: &Work, reported: &Value) -> Result<bool> {
+    if reported == &inputs::profile_identity(&work.profile)? {
+        return Ok(true);
+    }
+    // Accept a previously admitted pre-resolver worker during rolling upgrades.
+    // Its legacy report contains the original profile; compare only in memory
+    // and never copy that raw profile into a newly published report.
+    let Ok(previous) = serde_json::from_value::<CheckProfile>(reported.clone()) else {
+        return Ok(false);
+    };
+    Ok(model::canonical(&serde_json::to_value(previous)?)?
+        == model::canonical(&serde_json::to_value(&work.profile)?)?)
 }
 pub fn prepare_and_spawn(work: &Work) -> Result<Value> {
     let dir = directory(&work.data_dir, &work.check_id)?;
@@ -285,6 +307,223 @@ pub fn completion(work: &Work, files: &ArtifactFiles) -> Result<Option<Completio
     let c: Completion = serde_json::from_value(read_value(&p)?)?;
     validate_completion(work, files, c).map(Some)
 }
+
+/// Validate the retained coverage receipt before either Store or a worker may
+/// treat it as a pass or a reusable result.
+pub(crate) fn validate_passed_coverage(
+    parser: &Parser,
+    expected_targets: &[String],
+    scope_plan: &Value,
+    coverage: &Value,
+) -> Result<()> {
+    let invalid = || {
+        Error::new(
+            "CHECK_COVERAGE_INVALID",
+            "passed CheckRun does not prove its parser-specific required coverage",
+        )
+    };
+    let strings = |field: &str| -> Result<BTreeSet<String>> {
+        let values = coverage[field].as_array().ok_or_else(invalid)?;
+        let parsed: BTreeSet<String> = values
+            .iter()
+            .map(|value| value.as_str().map(str::to_owned).ok_or_else(invalid))
+            .collect::<Result<_>>()?;
+        if parsed.len() != values.len() {
+            return Err(invalid());
+        }
+        Ok(parsed)
+    };
+    if coverage["gaps"]
+        .as_array()
+        .is_none_or(|gaps| !gaps.is_empty())
+    {
+        return Err(invalid());
+    }
+    let requested = strings("requested")?;
+    let checked = strings("checked")?;
+    match parser {
+        Parser::ExitCode => {
+            let process_exit = BTreeSet::from(["process_exit".to_string()]);
+            if requested != process_exit || checked != process_exit {
+                return Err(invalid());
+            }
+        }
+        Parser::CargoJson => {
+            let expected: BTreeSet<String> = expected_targets.iter().cloned().collect();
+            let identities: BTreeMap<String, Vec<CargoTargetIdentity>> =
+                serde_json::from_value(scope_plan["target_identities"].clone())
+                    .map_err(|_| invalid())?;
+            let mut expected_identity_keys = BTreeSet::new();
+            for target in &expected {
+                let Some(target_identities) = identities.get(target) else {
+                    return Err(invalid());
+                };
+                // Profile target names are intentionally simple. Until the
+                // profile schema can name package IDs directly, ambiguous names
+                // cannot be accepted as complete evidence.
+                if target_identities.len() != 1 {
+                    return Err(invalid());
+                }
+                let identity = &target_identities[0];
+                if identity.name != *target
+                    || identity.package_name.trim().is_empty()
+                    || identity.package_version.trim().is_empty()
+                    || identity.manifest_path.is_empty()
+                    || identity.src_path.is_empty()
+                    || identity.manifest_path.starts_with('/')
+                    || identity.src_path.starts_with('/')
+                    || identity.manifest_path.split('/').any(|part| part == "..")
+                    || identity.src_path.split('/').any(|part| part == "..")
+                    || identity.kinds.is_empty()
+                {
+                    return Err(invalid());
+                }
+                expected_identity_keys.insert(target_identity_key(identity)?);
+            }
+            let checked_identity_values = coverage["checked_target_identities"]
+                .as_array()
+                .ok_or_else(invalid)?;
+            let checked_identity_keys: BTreeSet<String> = checked_identity_values
+                .iter()
+                .map(|identity| identity.as_str().map(str::to_owned).ok_or_else(invalid))
+                .collect::<Result<_>>()?;
+            if expected.is_empty()
+                || expected.len() != expected_targets.len()
+                || requested != expected
+                || expected != checked
+                || checked_identity_keys.len() != checked_identity_values.len()
+                || expected_identity_keys != checked_identity_keys
+                || coverage["build_finished"] != true
+                || coverage["errors"].as_u64() != Some(0)
+            {
+                return Err(invalid());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn target_identity_key(identity: &CargoTargetIdentity) -> Result<String> {
+    model::canonical(&serde_json::to_value(identity)?)
+}
+
+fn workspace_relative_target_source(workspace: &Path, source: &str) -> Option<String> {
+    let workspace = fs::canonicalize(workspace).ok()?;
+    let source = fs::canonicalize(source).ok()?;
+    let relative = source.strip_prefix(workspace).ok()?;
+    Some(relative.to_string_lossy().replace('\\', "/"))
+}
+
+fn decode_cargo_file_url(source: &str) -> Option<PathBuf> {
+    let encoded = source
+        .strip_prefix("path+file://")
+        .or_else(|| source.strip_prefix("file://"))?;
+    if !encoded.starts_with('/') {
+        // Do not accept URL authorities (for example, a UNC host) without a
+        // platform-specific canonical identity implementation.
+        return None;
+    }
+    let bytes = encoded.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let hex = std::str::from_utf8(bytes.get(index + 1..index + 3)?).ok()?;
+            decoded.push(u8::from_str_radix(hex, 16).ok()?);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    let mut path = String::from_utf8(decoded).ok()?;
+    #[cfg(windows)]
+    {
+        if path.as_bytes().get(2) == Some(&b':') && path.starts_with('/') {
+            path.remove(0);
+        }
+        path = path.replace('/', "\\");
+    }
+    Some(PathBuf::from(path))
+}
+
+fn same_canonical_path(left: &Path, right: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        left.to_string_lossy()
+            .eq_ignore_ascii_case(&right.to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
+}
+
+fn package_id_matches_target_owner(
+    package_id: &str,
+    identity: &CargoTargetIdentity,
+    workspace: &Path,
+) -> bool {
+    let Some((source, coordinates)) = package_id.rsplit_once('#') else {
+        return false;
+    };
+    let named_coordinates = format!("{}@{}", identity.package_name, identity.package_version);
+    // Cargo emits path package IDs with either the package name and version or
+    // just the version (for example, `path+file:///workspace/crate#0.1.0`).
+    // In the version-only form, the exact canonical package root below is the
+    // owner binding; the name came from metadata for that same manifest.
+    if coordinates != named_coordinates && coordinates != identity.package_version {
+        return false;
+    }
+    let Some(package_root) = decode_cargo_file_url(source) else {
+        return false;
+    };
+    let Some(manifest_parent) = Path::new(&identity.manifest_path).parent() else {
+        return false;
+    };
+    let expected_root = workspace.join(manifest_parent);
+    let (Ok(package_root), Ok(expected_root)) = (
+        fs::canonicalize(package_root),
+        fs::canonicalize(expected_root),
+    ) else {
+        return false;
+    };
+    same_canonical_path(&package_root, &expected_root)
+}
+
+fn artifact_matches_target_identity(
+    package_id: &str,
+    target: &Value,
+    identity: &CargoTargetIdentity,
+    workspace: &Path,
+) -> bool {
+    if !package_id_matches_target_owner(package_id, identity, workspace) {
+        return false;
+    }
+    let Some(name) = target["name"].as_str() else {
+        return false;
+    };
+    if name != identity.name {
+        return false;
+    }
+    let Some(kinds) = target["kind"].as_array() else {
+        return false;
+    };
+    let kinds: BTreeSet<String> = kinds
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect();
+    if kinds.len() != target["kind"].as_array().map_or(0, Vec::len) || kinds != identity.kinds {
+        return false;
+    }
+    let Some(src_path) = target["src_path"].as_str() else {
+        return false;
+    };
+    workspace_relative_target_source(workspace, src_path).as_deref()
+        == Some(identity.src_path.as_str())
+}
+
 fn validate_completion(work: &Work, files: &ArtifactFiles, c: Completion) -> Result<Completion> {
     if c.token != work.token
         || c.operation_id != work.operation_id
@@ -310,7 +549,7 @@ fn validate_completion(work: &Work, files: &ArtifactFiles, c: Completion) -> Res
         || report["state"] != c.state
         || report["coverage"] != c.coverage
         || report["exit_code"] != json!(c.exit_code)
-        || report["profile"] != json!(work.profile)
+        || !profile_report_matches(work, &report["profile"])?
         || report["resource_released"] != true
         || report["cancellation"] != json!(c.cancellation)
     {
@@ -318,14 +557,33 @@ fn validate_completion(work: &Work, files: &ArtifactFiles, c: Completion) -> Res
             "check receipt differs from its published report",
         ));
     }
-    if c.state == "passed"
-        && (c.exit_code != Some(0)
-            || report["source_checkout_verified"] != true
-            || c.coverage["gaps"].as_array().is_none_or(|g| !g.is_empty()))
+    if work.input_fingerprint.is_some()
+        && (report["input_fingerprint"] != json!(work.input_fingerprint)
+            || report["resolved_inputs"] != json!(work.resolved_inputs)
+            || report["scope_plan"] != json!(work.scope_plan))
+    {
+        return Err(Error::conflict(
+            "check report input plan differs from the admitted CheckRun",
+        ));
+    }
+    if c.state == "passed" && (c.exit_code != Some(0) || report["source_checkout_verified"] != true)
     {
         return Err(Error::conflict(
             "incomplete execution cannot be a passed CheckRun",
         ));
+    }
+    if c.state == "passed" {
+        let expected_targets = match work.resolved_inputs.as_ref() {
+            Some(inputs) => serde_json::from_value(inputs["expected_targets"].clone())?,
+            None => work.profile.expected_targets.clone(),
+        };
+        let empty_scope_plan = Value::Null;
+        validate_passed_coverage(
+            &work.profile.parser,
+            &expected_targets,
+            work.scope_plan.as_ref().unwrap_or(&empty_scope_plan),
+            &c.coverage,
+        )?;
     }
     Ok(c)
 }
@@ -336,7 +594,10 @@ pub fn failure(work: &Work, files: &ArtifactFiles, error: Value) -> Result<Compl
         "error"
     };
     let coverage = json!({"requested":work.profile.expected_targets,"checked":[],"gaps":["command_not_started"]});
-    let report = json!({"version":1,"check_id":work.check_id,"operation_id":work.operation_id,"candidate_ref":work.candidate.artifact_id,"profile":work.profile,"state":state,"exit_code":null,"source_checkout_verified":false,"resource_released":true,"coverage":coverage,"error":error,"process":null,"outputs":[]});
+    let report = json!({"version":1,"check_id":work.check_id,"operation_id":work.operation_id,"candidate_ref":work.candidate.artifact_id,
+        "input_fingerprint":work.input_fingerprint,"resolved_inputs":work.resolved_inputs,"scope_plan":work.scope_plan,
+        "cache_reusable":work.resolved_inputs.as_ref().is_some_and(|inputs|inputs["cache_reusable"]==true),
+        "profile":inputs::profile_identity(&work.profile)? ,"state":state,"exit_code":null,"source_checkout_verified":false,"resource_released":true,"coverage":coverage,"error":error,"process":null,"outputs":[]});
     let id = format!("check-{}", model::digest(work.operation_id.as_bytes()));
     let (record, bytes) = ArtifactFiles::document(
         "check_result",
@@ -429,7 +690,10 @@ pub fn recover(work: &Work, files: &ArtifactFiles) -> Result<Option<Completion>>
     let coverage = json!({"requested":work.profile.expected_targets,"checked":[],"gaps":["worker_lost_without_terminal_receipt"]});
     // An absent worker and empty group do not prove success, exit code or coverage.
     let report = json!({"version":1,"check_id":work.check_id,"operation_id":work.operation_id,
-        "candidate_ref":work.candidate.artifact_id,"profile":work.profile,"state":"incomplete",
+        "candidate_ref":work.candidate.artifact_id,"input_fingerprint":work.input_fingerprint,
+        "resolved_inputs":work.resolved_inputs,"scope_plan":work.scope_plan,
+        "cache_reusable":work.resolved_inputs.as_ref().is_some_and(|inputs|inputs["cache_reusable"]==true),
+        "profile":inputs::profile_identity(&work.profile)? ,"state":"incomplete",
         "exit_code":null,"resource_released":true,"source_checkout_verified":false,"coverage":coverage,
         "process":identity["process"],"recovery":{"disposition":"departed_group_observed_empty","command_replayed":false},
         "outputs":outputs.iter().map(|r|json!({"artifact_ref":r.artifact_id,"stream":r.metadata["stream"],"sha256":r.content_digest,"length":r.byte_length})).collect::<Vec<_>>()});
@@ -496,7 +760,10 @@ pub fn recover_pre_identity(work: &Work, files: &ArtifactFiles) -> Result<Option
     }
     let coverage = json!({"requested":work.profile.expected_targets,"checked":[],"gaps":["worker_lost_before_identity"]});
     let report = json!({"version":1,"check_id":work.check_id,"operation_id":work.operation_id,
-        "candidate_ref":work.candidate.artifact_id,"profile":work.profile,"state":"incomplete",
+        "candidate_ref":work.candidate.artifact_id,"input_fingerprint":work.input_fingerprint,
+        "resolved_inputs":work.resolved_inputs,"scope_plan":work.scope_plan,
+        "cache_reusable":work.resolved_inputs.as_ref().is_some_and(|inputs|inputs["cache_reusable"]==true),
+        "profile":inputs::profile_identity(&work.profile)? ,"state":"incomplete",
         "exit_code":null,"resource_released":true,"source_checkout_verified":false,"coverage":coverage,
         "process":launch["process"],"launch":launch,
         "recovery":{"disposition":"pre_identity_launch_departed","command_replayed":false,"worker_identity_recorded":false},
@@ -534,43 +801,98 @@ pub fn recover_pre_identity(work: &Work, files: &ArtifactFiles) -> Result<Option
 }
 
 fn environment(profile: &CheckProfile) -> BTreeMap<String, String> {
-    let mut values = BTreeMap::new();
-    for name in [
-        "PATH",
-        "SystemRoot",
-        "WINDIR",
-        "USERPROFILE",
-        "HOME",
-        "LOCALAPPDATA",
-        "APPDATA",
-        "TEMP",
-        "TMP",
-        "TMPDIR",
-        "RUSTUP_HOME",
-        "CARGO_HOME",
-    ]
-    .iter()
-    .copied()
-    .chain(profile.inherit_env.iter().map(String::as_str))
-    {
-        if let Some((key, value)) = std::env::vars().find(|(k, _)| {
-            if cfg!(windows) {
-                k.eq_ignore_ascii_case(name)
-            } else {
-                k == name
-            }
-        }) {
-            values.insert(key, value);
-        }
-    }
-    for (key, value) in &profile.environment {
-        if cfg!(windows) {
-            values.retain(|k, _| !k.eq_ignore_ascii_case(key));
-        }
-        values.insert(key.clone(), value.clone());
-    }
-    values
+    inputs::effective_environment(profile)
 }
+
+fn ensure_owned_directories(root: &Path, directory: &Path) -> Result<()> {
+    let root = fs::canonicalize(root)?;
+    let relative = directory.strip_prefix(&root).map_err(|_| {
+        Error::new(
+            "CHECK_INPUTS_STALE",
+            "content-addressed CheckRunner input escaped its data directory",
+        )
+    })?;
+    let mut current = root;
+    for component in relative.components() {
+        let std::path::Component::Normal(part) = component else {
+            return Err(Error::new(
+                "CHECK_INPUTS_STALE",
+                "content-addressed CheckRunner path is not normalized",
+            ));
+        };
+        current.push(part);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(Error::new(
+                    "CHECK_INPUTS_STALE",
+                    "content-addressed CheckRunner directory is not a regular directory",
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&current)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn ensure_execution_inputs(
+    data_dir: &Path,
+    files: &ArtifactFiles,
+    candidate: &ArtifactRecord,
+    verified: &source::VerifiedSource,
+    profile: &CheckProfile,
+) -> Result<(PathBuf, PathBuf, source::SourceManifest)> {
+    let data_root = fs::canonicalize(data_dir)?;
+    let (workspace, descriptor) = inputs::execution_paths(&data_root, profile, verified)?;
+    let parent = workspace
+        .parent()
+        .ok_or_else(|| Error::invalid("content-addressed workspace has no parent"))?;
+    ensure_owned_directories(&data_root, parent)?;
+    match fs::symlink_metadata(&workspace) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(Error::new(
+                "CHECK_INPUTS_STALE",
+                "content-addressed source workspace is not a regular directory",
+            ));
+        }
+        Ok(_) => source::verify_directory(&workspace, &verified.manifest)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            source::materialize(&data_root, files, candidate, &workspace)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+
+    let descriptor_bytes = source::content_descriptor(verified)?;
+    match fs::symlink_metadata(&descriptor) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(Error::new(
+                "CHECK_INPUTS_STALE",
+                "content-addressed candidate descriptor is not a regular file",
+            ));
+        }
+        Ok(_) if fs::read(&descriptor)? != descriptor_bytes => {
+            return Err(Error::new(
+                "CHECK_INPUTS_STALE",
+                "content-addressed candidate descriptor changed",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&descriptor)?;
+            file.write_all(&descriptor_bytes)?;
+            file.sync_all()?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok((workspace, descriptor, verified.manifest.clone()))
+}
+
 fn executable(program: &Path, env: &BTreeMap<String, String>) -> Result<PathBuf> {
     if program.is_absolute() {
         if program.is_file() {
@@ -617,11 +939,19 @@ fn executable(program: &Path, env: &BTreeMap<String, String>) -> Result<PathBuf>
         program.display().to_string(),
     ))
 }
-fn parse_cargo(path: &Path, targets: &[String]) -> Result<Value> {
+fn parse_cargo(
+    path: &Path,
+    targets: &[String],
+    scope_plan: &Value,
+    workspace: &Path,
+) -> Result<Value> {
+    let target_identities: BTreeMap<String, Vec<CargoTargetIdentity>> =
+        serde_json::from_value(scope_plan["target_identities"].clone()).unwrap_or_default();
     let mut reader = BufReader::new(File::open(path)?);
     let mut line = Vec::new();
     let mut oversized = false;
     let mut checked = BTreeSet::new();
+    let mut checked_target_identities = BTreeSet::new();
     let mut errors = 0u64;
     let mut warnings = 0u64;
     let mut finished = None;
@@ -657,9 +987,26 @@ fn parse_cargo(path: &Path, targets: &[String]) -> Result<Value> {
                         finished = v["success"].as_bool();
                     }
                     Some("compiler-artifact") => {
-                        if let Some(name) = v["target"]["name"].as_str() {
-                            checked.insert(name.to_string());
-                        } else {
+                        if let (Some(name), Some(package_id)) =
+                            (v["target"]["name"].as_str(), v["package_id"].as_str())
+                            && targets.iter().any(|expected| expected == name)
+                            && let Some(identities) = target_identities.get(name)
+                        {
+                            for identity in identities {
+                                if artifact_matches_target_identity(
+                                    package_id,
+                                    &v["target"],
+                                    identity,
+                                    workspace,
+                                ) {
+                                    checked.insert(name.to_string());
+                                    checked_target_identities
+                                        .insert(target_identity_key(identity)?);
+                                }
+                            }
+                        } else if v["target"]["name"].is_null()
+                            || v["package_id"].as_str().is_none()
+                        {
                             gaps.push("artifact_without_target".into());
                         }
                     }
@@ -696,14 +1043,23 @@ fn parse_cargo(path: &Path, targets: &[String]) -> Result<Value> {
             gaps.push(format!("target_not_observed:{t}"));
         }
     }
+    for target in targets {
+        if !target_identities.contains_key(target) {
+            gaps.push(format!("target_identity_unavailable:{target}"));
+        }
+    }
     gaps.sort();
     gaps.dedup();
     Ok(
-        json!({"requested":targets,"checked":checked,"gaps":gaps,"build_finished":finished,"errors":errors,"warnings":warnings,"diagnostic_preview":examples}),
+        json!({"requested":targets,"checked":checked,"checked_target_identities":checked_target_identities,"gaps":gaps,"build_finished":finished,"errors":errors,"warnings":warnings,"diagnostic_preview":examples}),
     )
 }
 pub fn run(file: &Path) -> Result<()> {
-    let work: Work = serde_json::from_value(read_value(file)?)?;
+    let value = read_value(file)?;
+    if value.get("check_probe").is_some() {
+        return inputs::run_probe(file);
+    }
+    let work: Work = serde_json::from_value(value)?;
     let dir = directory(&work.data_dir, &work.check_id)?;
     if fs::canonicalize(file)? != fs::canonicalize(dir.join("work.json"))? {
         return Err(Error::invalid(
@@ -769,26 +1125,61 @@ pub fn run(file: &Path) -> Result<()> {
                 "cancelled before command execution",
             ));
         }
-        let source_dir = dir.join("source");
-        let manifest = source::materialize(&work.data_dir, &files, &work.candidate, &source_dir)?;
+        let verified = source::verified_content(&files, &work.data_dir, &work.candidate)?;
+        let (resolved_argv, expected_targets, program) = if let Some(resolved) =
+            &work.resolved_inputs
+        {
+            if work.input_fingerprint.as_deref() != resolved["input_fingerprint"].as_str() {
+                return Err(Error::new(
+                    "CHECK_INPUTS_STALE",
+                    "worker input fingerprint does not match its resolved plan",
+                ));
+            }
+            if resolved["candidate_content_sha256"] != verified.content_sha256
+                || resolved["execution_workspace"]
+                    != inputs::execution_workspace_identity(&work.profile, &verified)?
+            {
+                return Err(Error::new(
+                    "CHECK_INPUTS_STALE",
+                    "candidate content or stable workspace differs from its resolved plan",
+                ));
+            }
+            inputs::verify_runtime_environment(&work.profile, &verified, &resolved["environment"])?;
+            let argv: Vec<String> = serde_json::from_value(resolved["argv"].clone())
+                .map_err(|_| Error::new("CHECK_INPUTS_STALE", "resolved argv is invalid"))?;
+            let targets: Vec<String> = serde_json::from_value(resolved["expected_targets"].clone())
+                .map_err(|_| Error::new("CHECK_INPUTS_STALE", "resolved targets are invalid"))?;
+            (argv, targets, inputs::verify_executable(resolved)?)
+        } else {
+            let environment = environment(&work.profile);
+            let program = executable(&work.profile.executable, &environment)?;
+            (
+                work.profile.args.clone(),
+                work.profile.expected_targets.clone(),
+                program,
+            )
+        };
+        let (source_dir, candidate_file, manifest) = ensure_execution_inputs(
+            &work.data_dir,
+            &files,
+            &work.candidate,
+            &verified,
+            &work.profile,
+        )?;
         let mut env = environment(&work.profile);
-        let target = work
-            .data_dir
+        let data_root = fs::canonicalize(&work.data_dir)?;
+        let target = data_root
             .join("targets")
             .join(work.profile.resource.to_lowercase());
-        fs::create_dir_all(&target)?;
+        ensure_owned_directories(&data_root, &target)?;
         env.insert(
             "CARGO_TARGET_DIR".into(),
             target.to_string_lossy().to_string(),
         );
         env.insert(
             "SWARM_CANDIDATE_FILE".into(),
-            work.data_dir
-                .join(&work.candidate.relative_path)
-                .to_string_lossy()
-                .to_string(),
+            candidate_file.to_string_lossy().to_string(),
         );
-        let program = executable(&work.profile.executable, &env)?;
         #[cfg(windows)]
         if !program
             .extension()
@@ -809,7 +1200,7 @@ pub fn run(file: &Path) -> Result<()> {
             .open(dir.join("stderr"))?;
         let mut command = Command::new(&program);
         command
-            .args(&work.profile.args)
+            .args(&resolved_argv)
             .current_dir(&source_dir)
             .env_clear()
             .envs(&env)
@@ -850,8 +1241,14 @@ pub fn run(file: &Path) -> Result<()> {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
+        let empty_scope_plan = Value::Null;
         let mut coverage = if work.profile.parser == Parser::CargoJson {
-            parse_cargo(&dir.join("stdout"), &work.profile.expected_targets)?
+            parse_cargo(
+                &dir.join("stdout"),
+                &expected_targets,
+                work.scope_plan.as_ref().unwrap_or(&empty_scope_plan),
+                &source_dir,
+            )?
         } else {
             json!({"requested":["process_exit"],"checked":["process_exit"],"gaps":[]})
         };
@@ -885,13 +1282,23 @@ pub fn run(file: &Path) -> Result<()> {
             )?);
         }
     }
-    let (coverage, error) = match outcome {
+    let (mut coverage, error) = match outcome {
         Ok(c) => (c, None),
         Err(e) => (
             json!({"requested":work.profile.expected_targets,"checked":[],"gaps":[e.code]}),
             Some(e),
         ),
     };
+    if let Some(gaps) = work
+        .scope_plan
+        .as_ref()
+        .and_then(|plan| plan["coverage_gaps"].as_array())
+        && let Some(coverage_gaps) = coverage["gaps"].as_array_mut()
+    {
+        coverage_gaps.extend(gaps.iter().filter(|gap| gap.is_string()).cloned());
+        coverage_gaps.sort_by(|a, b| a.as_str().cmp(&b.as_str()));
+        coverage_gaps.dedup();
+    }
     let state = if cancellation.applied() {
         "cancelled"
     } else if error.is_some() {
@@ -907,7 +1314,9 @@ pub fn run(file: &Path) -> Result<()> {
         "passed"
     };
     let report = json!({"version":1,"check_id":work.check_id,"operation_id":work.operation_id,"candidate_ref":work.candidate.artifact_id,"candidate_sha256":work.candidate.content_digest,
-        "profile":work.profile,"cancellation":cancellation.evidence(),"worker_version":env!("CARGO_PKG_VERSION"),"process":group.identity,"state":state,"exit_code":code,"resource_released":true,"source_checkout_verified":source_verified,"coverage":coverage,"error":error,
+        "input_fingerprint":work.input_fingerprint,"resolved_inputs":work.resolved_inputs,"scope_plan":work.scope_plan,
+        "cache_reusable":work.resolved_inputs.as_ref().is_some_and(|inputs|inputs["cache_reusable"]==true),
+        "profile":inputs::profile_identity(&work.profile)? ,"cancellation":cancellation.evidence(),"worker_version":env!("CARGO_PKG_VERSION"),"process":group.identity,"state":state,"exit_code":code,"resource_released":true,"source_checkout_verified":source_verified,"coverage":coverage,"error":error,
         "outputs":outputs.iter().map(|r|json!({"artifact_ref":r.artifact_id,"stream":r.metadata["stream"],"sha256":r.content_digest,"length":r.byte_length})).collect::<Vec<_>>(),"started_at_ms":started,"finished_at_ms":model::now_ms()?});
     let id = format!("check-{}", model::digest(work.operation_id.as_bytes()));
     let (record, bytes) = ArtifactFiles::document(
@@ -938,6 +1347,238 @@ pub fn run(file: &Path) -> Result<()> {
 
 fn waiting_identity(group: &Group, token: &str) -> Value {
     json!({"token":token,"process":group.identity,"ready_at_ms":model::now_ms().unwrap_or(0),"control_version":2})
+}
+
+#[cfg(test)]
+mod coverage_validation_tests {
+    use super::*;
+
+    fn package_id_for_root(root: &Path) -> String {
+        let root = fs::canonicalize(root)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        let root = if cfg!(windows) {
+            let root = root.strip_prefix("//?/").unwrap_or(&root);
+            format!("/{root}")
+        } else {
+            root
+        };
+        let mut encoded = String::new();
+        for byte in root.bytes() {
+            if byte.is_ascii_alphanumeric() || b"/-._~:".contains(&byte) {
+                encoded.push(char::from(byte));
+            } else {
+                encoded.push_str(&format!("%{byte:02X}"));
+            }
+        }
+        format!("file://{encoded}#1.0.0")
+    }
+
+    fn named_package_id_for_root(root: &Path) -> String {
+        let root = fs::canonicalize(root)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        let root = if cfg!(windows) {
+            let root = root.strip_prefix("//?/").unwrap_or(&root);
+            format!("/{root}")
+        } else {
+            root
+        };
+        let mut encoded = String::new();
+        for byte in root.bytes() {
+            if byte.is_ascii_alphanumeric() || b"/-._~:".contains(&byte) {
+                encoded.push(char::from(byte));
+            } else {
+                encoded.push_str(&format!("%{byte:02X}"));
+            }
+        }
+        format!("path+file://{encoded}#workspace_pkg@1.0.0")
+    }
+
+    #[test]
+    fn passed_receipts_need_complete_parser_specific_coverage() {
+        let targets = vec!["eliot_swarm_controller".to_string(), "swarm".to_string()];
+        let identity = |name: &str, kind: &str, src_path: &str| CargoTargetIdentity {
+            package_name: "eliot_swarm_controller".into(),
+            package_version: "1.0.0".into(),
+            manifest_path: "Cargo.toml".into(),
+            name: name.into(),
+            kinds: BTreeSet::from([kind.into()]),
+            src_path: src_path.into(),
+        };
+        let identities = BTreeMap::from([
+            (
+                "eliot_swarm_controller".to_string(),
+                vec![identity("eliot_swarm_controller", "lib", "src/lib.rs")],
+            ),
+            (
+                "swarm".to_string(),
+                vec![identity("swarm", "bin", "src/main.rs")],
+            ),
+        ]);
+        let scope_plan = json!({"target_identities":identities});
+        let checked_identities: Vec<_> = [
+            identity("eliot_swarm_controller", "lib", "src/lib.rs"),
+            identity("swarm", "bin", "src/main.rs"),
+        ]
+        .iter()
+        .map(|identity| target_identity_key(identity).unwrap())
+        .collect();
+        let complete_cargo = json!({
+            "requested":["eliot_swarm_controller","swarm"],
+            "checked":["eliot_swarm_controller","swarm"],
+            "checked_target_identities":checked_identities,
+            "gaps":[],
+            "build_finished":true,
+            "errors":0
+        });
+        assert!(
+            validate_passed_coverage(&Parser::CargoJson, &targets, &scope_plan, &complete_cargo)
+                .is_ok()
+        );
+
+        let mut missing_target = complete_cargo.clone();
+        missing_target["checked"] = json!(["eliot_swarm_controller"]);
+        assert!(
+            validate_passed_coverage(&Parser::CargoJson, &targets, &scope_plan, &missing_target)
+                .is_err()
+        );
+        let mut missing_finished = complete_cargo.clone();
+        missing_finished["build_finished"] = Value::Null;
+        assert!(
+            validate_passed_coverage(&Parser::CargoJson, &targets, &scope_plan, &missing_finished)
+                .is_err()
+        );
+        let mut compile_error = complete_cargo.clone();
+        compile_error["errors"] = json!(1);
+        assert!(
+            validate_passed_coverage(&Parser::CargoJson, &targets, &scope_plan, &compile_error)
+                .is_err()
+        );
+        let mut wrong_identity = complete_cargo;
+        wrong_identity["checked_target_identities"] = json!(["wrong"]);
+        assert!(
+            validate_passed_coverage(&Parser::CargoJson, &targets, &scope_plan, &wrong_identity)
+                .is_err()
+        );
+
+        let empty_scope = Value::Null;
+        let exit_code = json!({"requested":["process_exit"],"checked":["process_exit"],"gaps":[]});
+        assert!(validate_passed_coverage(&Parser::ExitCode, &[], &empty_scope, &exit_code).is_ok());
+        let forged_exit = json!({"requested":[],"checked":[],"gaps":[]});
+        assert!(
+            validate_passed_coverage(&Parser::ExitCode, &[], &empty_scope, &forged_exit).is_err()
+        );
+    }
+
+    #[test]
+    fn dependency_artifact_with_same_name_cannot_prove_workspace_bin() {
+        let root = std::env::temp_dir().join(format!("swarm-target-identity-{}", model::new_id()));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("external")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='workspace_pkg'\nversion='1.0.0'\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("external/Cargo.toml"),
+            "[package]\nname='workspace_pkg'\nversion='1.0.0'\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+        let identity = CargoTargetIdentity {
+            package_name: "workspace_pkg".into(),
+            package_version: "1.0.0".into(),
+            manifest_path: "Cargo.toml".into(),
+            name: "foo".into(),
+            kinds: BTreeSet::from(["bin".into()]),
+            src_path: "src/main.rs".into(),
+        };
+        let scope_plan = json!({"target_identities":{"foo":[identity]}});
+        let targets = vec!["foo".to_string()];
+        let output = root.join("cargo-output.jsonl");
+        let dependency_artifact = json!({
+            "reason":"compiler-artifact",
+            "package_id":"registry+https://example.invalid#index#dependency@9.0.0",
+            "target":{"name":"foo","kind":["lib"],"src_path":"C:/registry/dependency/src/lib.rs"},
+        });
+        fs::write(
+            &output,
+            format!(
+                "{}\n{}\n",
+                dependency_artifact,
+                json!({"reason":"build-finished","success":true})
+            ),
+        )
+        .unwrap();
+        let coverage = parse_cargo(&output, &targets, &scope_plan, &root).unwrap();
+        assert!(coverage["checked"].as_array().unwrap().is_empty());
+        assert!(
+            validate_passed_coverage(&Parser::CargoJson, &targets, &scope_plan, &coverage).is_err()
+        );
+
+        let external_path_artifact = json!({
+            "reason":"compiler-artifact",
+            "package_id":package_id_for_root(&root.join("external")),
+            "target":{"name":"foo","kind":["bin"],"src_path":root.join("src/main.rs")},
+        });
+        fs::write(
+            &output,
+            format!(
+                "{}\n{}\n",
+                external_path_artifact,
+                json!({"reason":"build-finished","success":true})
+            ),
+        )
+        .unwrap();
+        let coverage = parse_cargo(&output, &targets, &scope_plan, &root).unwrap();
+        assert!(coverage["checked"].as_array().unwrap().is_empty());
+        assert!(
+            validate_passed_coverage(&Parser::CargoJson, &targets, &scope_plan, &coverage).is_err()
+        );
+
+        let workspace_artifact = json!({
+            "reason":"compiler-artifact",
+            "package_id":package_id_for_root(&root),
+            "target":{"name":"foo","kind":["bin"],"src_path":root.join("src/main.rs")},
+        });
+        fs::write(
+            &output,
+            format!(
+                "{}\n{}\n",
+                workspace_artifact,
+                json!({"reason":"build-finished","success":true})
+            ),
+        )
+        .unwrap();
+        let coverage = parse_cargo(&output, &targets, &scope_plan, &root).unwrap();
+        assert!(
+            validate_passed_coverage(&Parser::CargoJson, &targets, &scope_plan, &coverage).is_ok()
+        );
+
+        let named_workspace_artifact = json!({
+            "reason":"compiler-artifact",
+            "package_id":named_package_id_for_root(&root),
+            "target":{"name":"foo","kind":["bin"],"src_path":root.join("src/main.rs")},
+        });
+        fs::write(
+            &output,
+            format!(
+                "{}\n{}\n",
+                named_workspace_artifact,
+                json!({"reason":"build-finished","success":true})
+            ),
+        )
+        .unwrap();
+        let coverage = parse_cargo(&output, &targets, &scope_plan, &root).unwrap();
+        assert!(
+            validate_passed_coverage(&Parser::CargoJson, &targets, &scope_plan, &coverage).is_ok()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -971,7 +1612,13 @@ mod tests {
                 environment: Default::default(),
                 inherit_env: Vec::new(),
                 expected_targets: Vec::new(),
+                reproducible: false,
+                fingerprint_env: Vec::new(),
+                versioned_inputs: BTreeMap::new(),
             },
+            resolved_inputs: None,
+            scope_plan: None,
+            input_fingerprint: None,
             preflight_error: None,
             cancel_request: None,
             expected_worker: None,
