@@ -10,6 +10,7 @@ use crate::{
     coordination as keys,
     error::{Error, Result},
     model::{self, Principal, Role},
+    store::launcher::LaunchActor,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
@@ -1049,6 +1050,86 @@ fn authorize_attempt_manager(
     ))
 }
 
+#[derive(Clone, Copy)]
+enum ParticipantRegistrationActor<'a> {
+    Direct(&'a Principal),
+    Launch(&'a LaunchActor),
+}
+
+impl ParticipantRegistrationActor<'_> {
+    fn effective_owner_id(self) -> String {
+        match self {
+            Self::Direct(principal) => principal.client_id.clone(),
+            Self::Launch(actor) => actor.effective_manager_id().to_owned(),
+        }
+    }
+
+    fn authorize_attempt(self, db: &Connection, attempt: &Value) -> Result<()> {
+        match self {
+            Self::Direct(principal) => authorize_attempt_manager(db, principal, attempt),
+            Self::Launch(actor) => {
+                if let Some(principal) = actor.direct_principal() {
+                    authorize_attempt_manager(db, principal, attempt)
+                } else {
+                    let manager_id = actor.effective_manager_id();
+                    let registration =
+                        meta(db, &format!("client:{manager_id}"))?.ok_or_else(|| {
+                            Error::new("FORBIDDEN", "effective Manager is no longer registered")
+                        })?;
+                    if actor.role() != Role::Manager
+                        || registration["disabled"] == true
+                        || registration["role"] != "manager"
+                        || attempt["owner_id"].as_str() != Some(manager_id)
+                    {
+                        return Err(Error::new(
+                            "FORBIDDEN",
+                            "on-behalf Participant must be issued by the current owning Manager",
+                        ));
+                    }
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    fn normalize_basis(
+        self,
+        db: &Connection,
+        value: Option<&Value>,
+        task: &Value,
+        attempt: &Value,
+    ) -> Result<Value> {
+        match self {
+            Self::Direct(principal) => normalize_basis(db, value, principal, task, attempt),
+            Self::Launch(actor) => {
+                let basis =
+                    value.ok_or_else(|| Error::invalid("participation_basis is required"))?;
+                model::fields(basis, &["kind", "assignment_id", "review_scope"])?;
+                if model::text(basis, "kind")? != "attempt_owner"
+                    || basis
+                        .get("assignment_id")
+                        .is_some_and(|value| !value.is_null())
+                    || basis
+                        .get("review_scope")
+                        .is_some_and(|value| !value.is_null())
+                    || actor.effective_manager_id()
+                        != attempt["owner_id"].as_str().unwrap_or_default()
+                {
+                    return Err(Error::new(
+                        "FORBIDDEN",
+                        "launch issuance requires exact owning-Manager Attempt participation",
+                    ));
+                }
+                Ok(json!({
+                    "kind":"attempt_owner",
+                    "assignment_id":null,
+                    "review_scope":null
+                }))
+            }
+        }
+    }
+}
+
 fn manager_scope(
     db: &Connection,
     principal: &Principal,
@@ -1080,6 +1161,42 @@ fn manager_scope(
 fn register_participant(
     tx: &Transaction<'_>,
     principal: &Principal,
+    value: &Value,
+    operation_id: &str,
+    now: i64,
+) -> Result<Value> {
+    register_participant_with_actor(
+        tx,
+        ParticipantRegistrationActor::Direct(principal),
+        value,
+        operation_id,
+        now,
+    )
+}
+
+/// Launch-only enrollment adapter. The outer Store launch-child path validates
+/// the typed actor and exact held launch scope in this same transaction; this
+/// shared core preserves technical caller identity while recording the
+/// effective manager as the Participant creator.
+pub(crate) fn register_participant_for_launch(
+    tx: &Transaction<'_>,
+    actor: &LaunchActor,
+    value: &Value,
+    operation_id: &str,
+    now: i64,
+) -> Result<Value> {
+    register_participant_with_actor(
+        tx,
+        ParticipantRegistrationActor::Launch(actor),
+        value,
+        operation_id,
+        now,
+    )
+}
+
+fn register_participant_with_actor(
+    tx: &Transaction<'_>,
+    authority: ParticipantRegistrationActor<'_>,
     value: &Value,
     operation_id: &str,
     now: i64,
@@ -1128,15 +1245,9 @@ fn register_participant(
     }
     let attempt = tasks::get_attempt(tx, attempt_id)?;
     validate_current_attempt(&task, &attempt, task_id, task_revision, attempt_id)?;
-    authorize_attempt_manager(tx, principal, &attempt)?;
+    authority.authorize_attempt(tx, &attempt)?;
 
-    let basis = normalize_basis(
-        tx,
-        value.get("participation_basis"),
-        principal,
-        &task,
-        &attempt,
-    )?;
+    let basis = authority.normalize_basis(tx, value.get("participation_basis"), &task, &attempt)?;
     let requested_binding_id = optional_nonempty_text(value.get("binding_id"), "binding_id")?;
     let requested_binding_generation =
         optional_positive_value(value.get("binding_generation"), "binding_generation")?;
@@ -1222,6 +1333,7 @@ fn register_participant(
         ));
     }
     let scope_id = keys::scope_id(task_id, task_revision, attempt_id)?;
+    let effective_owner_id = authority.effective_owner_id();
     let registration = json!({
         "role": "participant",
         "token_hash": token_hash.to_lowercase(),
@@ -1236,10 +1348,10 @@ fn register_participant(
         "display_alias": alias,
         "inbound_policy": policy,
         "grant_revision": 1,
-        "created_by": principal.client_id,
+        "created_by": effective_owner_id,
         "created_operation_id": operation_id,
         "created_at_ms": now,
-        "review_sponsor_client_id": if review_profile.is_some() || basis["kind"] == "sponsored_reviewer" { json!(principal.client_id) } else { Value::Null },
+        "review_sponsor_client_id": if review_profile.is_some() || basis["kind"] == "sponsored_reviewer" { json!(effective_owner_id) } else { Value::Null },
         "review_profile": review_profile,
     });
     set_meta(tx, &format!("client:{client_id}"), &registration)?;
@@ -1252,7 +1364,7 @@ fn register_participant(
         && let Some(profile) = review_profile.as_deref()
     {
         let review_scope = &basis["review_scope"];
-        let sponsor_client_id = principal.client_id.as_str();
+        let sponsor_client_id = effective_owner_id.as_str();
         set_meta(
             tx,
             &keys::pending_review_profile_key(review_scope, sponsor_client_id, profile, client_id)?,

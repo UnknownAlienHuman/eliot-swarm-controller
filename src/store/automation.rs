@@ -1,7 +1,7 @@
 //! Revisioned manager-owned automation configuration stored in authenticated,
 //! schema-versioned per-record `meta` entries. No migration is required.
 
-use super::{automation_dispatch, operations, page, review_disposition};
+use super::{automation_dispatch, automation_work_dispatch, operations, page, review_disposition};
 use crate::{
     automation::{
         actions::AutomationStep,
@@ -94,6 +94,7 @@ pub(super) fn apply(
     p: &Principal,
     value: &Value,
     operation_id: &str,
+    launcher_config: &crate::config::Config,
     now_ms: i64,
 ) -> Result<Value> {
     require_manager(p)?;
@@ -124,6 +125,7 @@ pub(super) fn apply(
     let cut = observation_cut(tx)?;
     let mut entries = Vec::with_capacity(planned.len());
     let mut dispatch = Vec::new();
+    let mut work_dispatch = Vec::new();
     let mut disabled_or_narrowed = Vec::new();
     for change in &planned {
         if change.changed {
@@ -149,14 +151,24 @@ pub(super) fn apply(
                 cut,
                 now_ms,
             )?;
-            let removed_review_dispatch = change.before.as_ref().is_some_and(|before| {
+            automation_work_dispatch::configure_activation(
+                tx,
+                change.before.as_ref(),
+                &change.after,
+                change.include_existing,
+                now_ms,
+            )?;
+            let removed_or_narrowed_dispatch = change.before.as_ref().is_some_and(|before| {
                 (before.enabled && !change.after.enabled)
                     || (before.steps.contains(&AutomationStep::ReviewDispatch)
                         && !change.after.steps.contains(&AutomationStep::ReviewDispatch))
+                    || (before.steps.contains(&AutomationStep::WorkDispatch)
+                        && !change.after.steps.contains(&AutomationStep::WorkDispatch))
+                    || (before.work_dispatch_ready() && !change.after.work_dispatch_ready())
                     || (before.review.profile != change.after.review.profile)
                     || (before.scope.work_pool_id != change.after.scope.work_pool_id)
             });
-            if removed_review_dispatch {
+            if removed_or_narrowed_dispatch {
                 disabled_or_narrowed.push(change.after.automation_id.as_str());
             }
             entries.push(entry_projection(&change.after)?);
@@ -164,15 +176,23 @@ pub(super) fn apply(
             entries.push(entry_projection(&change.after)?);
         }
     }
-    // Activate every changed entry before one shared intake pass. Disable-only
-    // edits do not depend on source reconciliation or an available producer.
-    if planned
-        .iter()
-        .any(|change| change.changed && change.include_existing && change.after.enabled)
-    {
+    // Activate every changed entry before any include-existing consumer pass.
+    // Disable-only edits do not depend on source reconciliation or a launch
+    // admission callback.
+    let include_existing_review = planned.iter().any(|change| {
+        change.changed
+            && change.include_existing
+            && change.after.enabled
+            && change.after.steps.contains(&AutomationStep::ReviewDispatch)
+    });
+    if include_existing_review {
         let intake = automation_dispatch::reconcile_source_intake(tx, 64, now_ms)?;
         for change in &planned {
-            if change.changed && change.include_existing && change.after.enabled {
+            if change.changed
+                && change.include_existing
+                && change.after.enabled
+                && change.after.steps.contains(&AutomationStep::ReviewDispatch)
+            {
                 let budget = 16usize.saturating_sub(dispatch.len());
                 if budget > 0 {
                     dispatch.push(automation_dispatch::reconcile_entry(
@@ -183,6 +203,27 @@ pub(super) fn apply(
                         now_ms,
                     )?);
                 }
+            }
+        }
+    }
+    for change in &planned {
+        if change.changed
+            && change.include_existing
+            && change.after.enabled
+            && change.after.steps.contains(&AutomationStep::WorkDispatch)
+        {
+            let budget = 16usize.saturating_sub(work_dispatch.len());
+            if budget > 0 {
+                work_dispatch.push(automation_work_dispatch::reconcile_entry(
+                    tx,
+                    &change.after,
+                    change.after.work_dispatch.as_ref(),
+                    budget,
+                    now_ms,
+                    |tx, prepared| {
+                        super::launcher::admit_work_dispatch(tx, prepared, launcher_config, now_ms)
+                    },
+                )?);
             }
         }
     }
@@ -202,6 +243,7 @@ pub(super) fn apply(
         "activation_cut":cut,
         "entries":entries,
         "dispatch":dispatch,
+        "work_dispatch":work_dispatch,
         "affected_work":impacted
     }))
 }
@@ -214,12 +256,14 @@ pub(super) fn explain(db: &Connection, p: &Principal, value: &Value) -> Result<V
     let entry = config::load_entry(db, &p.client_id, project, automation_id)?
         .ok_or_else(|| Error::new("NOT_FOUND", "automation entry was not found in this scope"))?;
     let state = automation_dispatch::dispatch_state(db, &entry)?;
+    let work_dispatch = automation_work_dispatch::dispatch_state(db, &entry)?;
     let disposition = review_disposition::disposition_state(db, &entry)?;
     let work = operation_impacts(db, &p.client_id, project, automation_id)?;
     let operation_history = linked_operation_history(db, &p.client_id, project, automation_id)?;
     Ok(json!({
         "entry":entry_projection(&entry)?,
         "dispatch":state,
+        "work_dispatch":work_dispatch,
         "review_disposition":disposition,
         "linked_operations":work,
         "linked_operation_history":operation_history
@@ -384,7 +428,19 @@ fn build_plan(
                 .is_none_or(|prior| !prior.steps.contains(step))
         });
         let enabled_now = after.enabled && before.as_ref().is_none_or(|prior| !prior.enabled);
-        let new_coverage = after.enabled && (enabled_now || added_steps);
+        let new_work_dispatch_coverage = after.work_dispatch_ready()
+            && before
+                .as_ref()
+                .is_none_or(|prior| !prior.work_dispatch_ready());
+        let new_review_dispatch_coverage = after.review_dispatch_ready()
+            && before
+                .as_ref()
+                .is_none_or(|prior| !prior.review_dispatch_ready());
+        let new_coverage = after.enabled
+            && (enabled_now
+                || added_steps
+                || new_work_dispatch_coverage
+                || new_review_dispatch_coverage);
         if change.include_existing && !new_coverage {
             return Err(Error::invalid(
                 "include_existing is meaningful only when enabling an entry or adding step coverage",

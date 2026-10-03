@@ -41,8 +41,44 @@ struct LaunchSnapshot {
     profile_name: String,
     surface: String,
     surface_facts: Value,
+    current_authority_facts: Value,
+    lease_facts: Value,
     route_json: String,
     options: Options,
+}
+
+/// Opaque, immutable proof that a launch is still in the exact pre-dispatch
+/// native-MCP readback phase. Raw route and lease facts stay Store-private;
+/// consumers receive only the bounded fields needed to contact the adapter.
+pub(crate) struct NativeMcpLaunchSnapshot {
+    snapshot: LaunchSnapshot,
+    identity_digest: String,
+}
+
+impl NativeMcpLaunchSnapshot {
+    pub(crate) fn launch_operation_id(&self) -> &str {
+        &self.snapshot.operation_id
+    }
+
+    pub(crate) fn participant_id(&self) -> &str {
+        &self.snapshot.client_id
+    }
+
+    pub(crate) fn credential_ref(&self) -> &str {
+        &self.snapshot.credential_ref
+    }
+
+    pub(crate) fn profile_config_ref(&self) -> &str {
+        &self.snapshot.profile_config_ref
+    }
+
+    pub(crate) fn options(&self) -> &Options {
+        &self.snapshot.options
+    }
+
+    pub(crate) fn identity_digest(&self) -> Result<String> {
+        Ok(self.identity_digest.clone())
+    }
 }
 
 struct ReadbackClaim {
@@ -510,7 +546,9 @@ fn validate_launch_snapshot(
     {
         return Err(stale_readback());
     }
-    let _actor = launcher::launch_actor(db, &row.operation_id)?;
+    let actor = launcher::launch_actor(db, &row.operation_id)?;
+    let current_gm = meta(db, "gm")?.unwrap_or(Value::Null);
+    let local_operator = meta(db, "local_operator_client_id")?.unwrap_or(Value::Null);
     let task_id = text_at(&manifest["task"], "task_id")?;
     let task_revision = positive_at(&manifest["task"], "observed_revision")?;
     let attempt_id = text_at(&manifest["task"], "attempt_id")?;
@@ -519,6 +557,15 @@ fn validate_launch_snapshot(
     let binding_id = text_at(&manifest["binding"], "binding_id")?;
     let binding_generation = positive_at(&manifest["binding"], "generation")?;
     let owner_id = text_at(&attempt, "owner_id")?;
+    actor.require_bound_launch_attempt(
+        db,
+        &row.operation_id,
+        task_id,
+        task_revision,
+        attempt_id,
+        binding_id,
+        binding_generation,
+    )?;
     if task["state"] != "open"
         || task["revision"] != task_revision
         || task["current_attempt_id"].as_str() != Some(attempt_id)
@@ -532,6 +579,8 @@ fn validate_launch_snapshot(
         || row.attempt_id.as_deref() != Some(attempt_id)
         || row.binding_id.as_deref() != Some(binding_id)
         || row.binding_generation != Some(binding_generation)
+        || row.caller_id.as_deref() != Some(actor.technical_requester_id())
+        || owner_id != actor.effective_manager_id()
     {
         return Err(stale_readback());
     }
@@ -552,8 +601,7 @@ fn validate_launch_snapshot(
     });
     let participant = &manifest["participant"];
     let mcp = &manifest["mcp"];
-    if row.caller_id.as_deref() != manifest["actor"]["client_id"].as_str()
-        || participant["role"] != "participant"
+    if participant["role"] != "participant"
         || participant["task_id"].as_str() != Some(task_id)
         || participant["task_revision"] != task_revision
         || participant["attempt_id"].as_str() != Some(attempt_id)
@@ -634,11 +682,55 @@ fn validate_launch_snapshot(
         || lease_view["project_id"] != task["project_id"]
         || lease_view["task_id"].as_str() != Some(task_id)
         || lease_view["task_revision"] != task_revision
-        || lease_view["owner_client_id"].as_str() != Some(owner_id)
+        || lease_view["owner_client_id"].as_str() != Some(actor.effective_manager_id())
         || lease_view["attempt_id"].as_str() != Some(attempt_id)
     {
         return Err(stale_readback());
     }
+
+    let current_authority_facts = json!({
+        "actor":launch_actor_facts(db, &actor)?,
+        "local_operator_client_id":local_operator,
+        "gm":{
+            "client_id":current_gm["client_id"],
+            "epoch":current_gm["epoch"],
+        },
+        "task":{
+            "project_id":task["project_id"],
+            "state":task["state"],
+            "revision":task["revision"],
+            "current_attempt_id":task["current_attempt_id"],
+        },
+        "attempt":{
+            "task_id":attempt["task_id"],
+            "task_revision":attempt["task_revision"],
+            "owner_id":attempt["owner_id"],
+            "start_owner":attempt["start_owner"],
+            "state":attempt["state"],
+            "released_at_ms":attempt["released_at_ms"],
+            "binding_id":attempt["binding_id"],
+            "binding_generation":attempt["binding_generation"],
+        },
+        "binding":{
+            "state":state,
+            "module_artifact_id":artifact_id,
+            "native_root_id":native_root_id,
+        },
+        "participant_registration":{
+            "role":registration["role"],
+            "disabled":registration["disabled"],
+            "task_id":registration["task_id"],
+            "task_revision":registration["task_revision"],
+            "attempt_id":registration["attempt_id"],
+            "binding_id":registration["binding_id"],
+            "binding_generation":registration["binding_generation"],
+            "created_by":registration["created_by"],
+            "created_operation_id":registration["created_operation_id"],
+            "grant_revision":registration["grant_revision"],
+            "participation_basis":registration["participation_basis"],
+            "native_session_id":registration["native_session_id"],
+        },
+    });
 
     let options = Options::parse(&route["native_options"]).map_err(|_| stale_readback())?;
     Ok(LaunchSnapshot {
@@ -656,9 +748,84 @@ fn validate_launch_snapshot(
         profile_name,
         surface,
         surface_facts: mcp["surface_facts"].clone(),
+        current_authority_facts,
+        lease_facts: lease_view,
         route_json,
         options,
     })
+}
+
+fn launch_actor_facts(db: &Connection, actor: &launcher::LaunchActor) -> Result<Value> {
+    let role = match actor.role() {
+        Role::Manager => "manager",
+        Role::Operator => "operator",
+        _ => return Err(stale_readback()),
+    };
+    let direct_registration = if let Some(principal) = actor.direct_principal() {
+        let registration =
+            meta(db, &format!("client:{}", principal.client_id))?.ok_or_else(stale_readback)?;
+        let registered_role: Role =
+            serde_json::from_value(registration["role"].clone()).map_err(|_| stale_readback())?;
+        if registration["disabled"] == true || registered_role != principal.role {
+            return Err(stale_readback());
+        }
+        json!({
+            "client_id":principal.client_id,
+            "role":registration["role"],
+            "disabled":registration["disabled"],
+            "link_id":actor.link_id(),
+        })
+    } else {
+        Value::Null
+    };
+    let work_dispatch = actor
+        .work_dispatch_context()
+        .map(|context| context.linkage_value())
+        .unwrap_or(Value::Null);
+    Ok(json!({
+        "kind":if actor.work_dispatch_context().is_some() {"work_dispatch"} else {"direct"},
+        "technical_requester_id":actor.technical_requester_id(),
+        "effective_manager_id":actor.effective_manager_id(),
+        "role":role,
+        "link_id":actor.link_id(),
+        "direct_registration":direct_registration,
+        "work_dispatch":work_dispatch,
+    }))
+}
+
+/// Capture an opaque pre-dispatch launch snapshot. The existing validator
+/// remains authoritative for the queued phase, live actor rights, current
+/// Task/Attempt/Binding, Participant grant and held workspace lease.
+pub(crate) fn current_mcp_launch_snapshot(
+    db: &Connection,
+    operation_id: &str,
+) -> Result<NativeMcpLaunchSnapshot> {
+    if operation_id.is_empty()
+        || operation_id.len() > 256
+        || operation_id.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return Err(Error::invalid("launch Operation ID is invalid"));
+    }
+    let (row, manifest) = load_launch_manifest(db, operation_id)?;
+    let snapshot = validate_launch_snapshot(db, &row, &manifest)?;
+    let identity_digest = launch_identity_digest(&snapshot)?;
+    Ok(NativeMcpLaunchSnapshot {
+        snapshot,
+        identity_digest,
+    })
+}
+
+/// Re-read the exact pre-dispatch scope and reject any stale snapshot. No
+/// post-dispatch or settled launch state is accepted by this interface.
+pub(crate) fn revalidate_mcp_launch_snapshot(
+    db: &Connection,
+    snapshot: &NativeMcpLaunchSnapshot,
+) -> Result<()> {
+    let current = current_mcp_launch_snapshot(db, &snapshot.snapshot.operation_id)?;
+    if current.identity_digest != snapshot.identity_digest {
+        return Err(stale_readback());
+    }
+    Ok(())
 }
 
 fn load_launch_manifest(db: &Connection, operation_id: &str) -> Result<(LaunchRow, Value)> {
@@ -971,8 +1138,17 @@ fn snapshot_identity(snapshot: &LaunchSnapshot) -> Value {
         "profile_name":snapshot.profile_name,
         "surface":snapshot.surface,
         "surface_facts":snapshot.surface_facts,
+        "current_authority_facts":snapshot.current_authority_facts,
+        "lease_facts":snapshot.lease_facts,
         "route_json":snapshot.route_json,
     })
+}
+
+fn launch_identity_digest(snapshot: &LaunchSnapshot) -> Result<String> {
+    Ok(format!(
+        "sha256:{}",
+        model::digest(model::canonical(&snapshot_identity(snapshot))?.as_bytes())
+    ))
 }
 
 fn clone_snapshot(snapshot: &LaunchSnapshot) -> LaunchSnapshot {
@@ -991,6 +1167,8 @@ fn clone_snapshot(snapshot: &LaunchSnapshot) -> LaunchSnapshot {
         profile_name: snapshot.profile_name.clone(),
         surface: snapshot.surface.clone(),
         surface_facts: snapshot.surface_facts.clone(),
+        current_authority_facts: snapshot.current_authority_facts.clone(),
+        lease_facts: snapshot.lease_facts.clone(),
         route_json: snapshot.route_json.clone(),
         options: snapshot.options.clone(),
     }

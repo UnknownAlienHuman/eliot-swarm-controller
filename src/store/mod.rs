@@ -5,6 +5,7 @@ mod automation;
 mod automation_dispatch;
 mod automation_disposition;
 mod automation_intake;
+pub(crate) mod automation_work_dispatch;
 pub(crate) mod capacity;
 mod checks;
 mod coordination;
@@ -13,8 +14,9 @@ mod forge;
 mod gm;
 mod integration;
 mod launch_registration;
-mod launcher;
+pub(crate) mod launcher;
 mod launcher_issuance;
+mod launcher_mcp_tools;
 mod launcher_native_mcp;
 mod launcher_participant;
 mod message_batch;
@@ -33,6 +35,8 @@ mod schedules;
 mod status_reader;
 mod submissions;
 mod tasks;
+#[cfg(test)]
+mod work_dispatch_regression;
 mod workspace;
 mod workspace_lifecycle;
 use crate::{
@@ -75,7 +79,7 @@ pub struct StoreOwner {
 }
 
 struct LaunchWorkspaceWork {
-    actor: Principal,
+    actor: launcher::LaunchActor,
     plan: crate::workspace::WorkspaceLeasePlan,
     registration: crate::workspace::WorkspaceRegistration,
     reservation: crate::workspace::LeaseReservation,
@@ -279,7 +283,7 @@ impl Store {
                         return Ok(None);
                     }
                     let plan = launcher::launch_workspace_plan(&tx, &actor, &intent, &config)?;
-                    let reservation = workspace::reserve_lease(&tx, &actor, &plan, model::now_ms()?)?;
+                    let reservation = workspace::reserve_lease_for_launch(&tx, &actor, &plan, model::now_ms()?)?;
                     let registration = workspace::get_registration(&tx, &plan.project_id, &config)?;
                     (plan,reservation,registration,false)
                 };
@@ -349,9 +353,15 @@ impl Store {
             let result = self
                 .run(move |db| {
                     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                    let actor = current_principal(&tx, work.actor)?;
+                    let actor = launcher::launch_actor(&tx, &intent)?;
+                    if !actor.same_authority_identity(&work.actor) {
+                        return Err(Error::new(
+                            "STALE_LAUNCH",
+                            "launch actor changed during workspace preparation",
+                        ));
+                    }
                     let lease = if work.readback_only {
-                        workspace::reconcile_lease(
+                        workspace::reconcile_lease_for_launch(
                             &tx,
                             &actor,
                             &work.registration,
@@ -361,7 +371,7 @@ impl Store {
                             model::now_ms()?,
                         )?
                     } else {
-                        workspace::commit_lease(
+                        workspace::commit_lease_for_launch(
                             &tx,
                             &actor,
                             &work.registration,
@@ -420,13 +430,16 @@ impl Store {
     }
 
     pub(crate) async fn reconcile_automations_once(&self) -> Result<Value> {
+        let config = self.config.clone();
         self.run(move |db| {
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let result = automation_dispatch::reconcile(&tx, 16, 64, model::now_ms()?)?;
+            let now = model::now_ms()?;
+            let review_dispatch = automation_dispatch::reconcile(&tx, 16, 64, now)?;
+            let work_dispatch = automation_work_dispatch::reconcile(&tx, &config, 16, 64, now)?;
             // The cursor, pending reasons, semantic slot and Operation are
             // durable before the host can observe an admitted action.
             tx.commit()?;
-            Ok(result)
+            Ok(json!({"review_dispatch":review_dispatch,"work_dispatch":work_dispatch}))
         })
         .await
     }
@@ -1239,6 +1252,153 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
         )
     )
     OR (
+        op.caller_id = 'eliot-internal-automation-v1'
+        AND op.method = 'swarm.launch'
+        AND EXISTS (
+            SELECT 1 FROM meta AS link
+            WHERE link.key = 'work-dispatch:v1:operation-link:' || op.operation_id
+              AND json_extract(link.value_json, '$.record.operation_id') = op.operation_id
+              AND json_extract(link.value_json, '$.record.action') = op.method
+              AND json_extract(link.value_json, '$.record.technical_requester_id') = op.caller_id
+              AND json_extract(link.value_json, '$.record.effective_manager_id') = :client
+              AND EXISTS (
+                  SELECT 1 FROM tasks AS target JOIN meta AS manager
+                    ON manager.key = 'client:' || :client
+                  WHERE target.task_id = json_extract(link.value_json, '$.record.task_id')
+                    AND target.project_id = json_extract(link.value_json, '$.record.project_id')
+                    AND json_extract(manager.value_json, '$.role') = 'manager'
+                    AND COALESCE(json_extract(manager.value_json, '$.disabled'),0) = 0
+                    AND (EXISTS (SELECT 1 FROM attempts AS owned WHERE owned.task_id=target.task_id AND owned.owner_id=:client AND owned.released_at_ms IS NULL)
+                         OR EXISTS (SELECT 1 FROM meta AS gm WHERE gm.key='gm' AND json_extract(gm.value_json,'$.client_id')=:client))
+              )
+        )
+    )
+    OR (
+        op.caller_id = 'eliot-internal-automation-v1'
+        AND op.method IN ('task.claim','coordination.participant.register','agent.open')
+        AND EXISTS (
+            SELECT 1 FROM operations AS parent JOIN meta AS link
+              ON link.key='work-dispatch:v1:operation-link:' || parent.operation_id
+            WHERE parent.operation_id = CASE op.method
+                WHEN 'task.claim' THEN json_extract(op.effective_request_json,'$.launch_child.launch_operation_id')
+                WHEN 'coordination.participant.register' THEN json_extract(op.effective_request_json,'$.launch_registration.launch_operation_id')
+                ELSE json_extract(op.effective_request_json,'$.operation_contract.parent_launch_operation_id') END
+              AND parent.method='swarm.launch' AND parent.caller_id=op.caller_id
+              AND json_extract(link.value_json,'$.record.operation_id')=parent.operation_id
+              AND json_extract(link.value_json,'$.record.effective_manager_id')=:client
+              AND json_extract(link.value_json,'$.record.technical_requester_id')=op.caller_id
+              AND parent.task_id=json_extract(link.value_json,'$.record.task_id')
+              AND json_extract(parent.effective_request_json,'$.launch_manifest.task.task_id')=parent.task_id
+              AND json_extract(parent.effective_request_json,'$.launch_manifest.task.observed_revision')=json_extract(link.value_json,'$.record.task_revision')
+              AND parent.attempt_id IS json_extract(parent.effective_request_json,'$.launch_manifest.task.attempt_id')
+              AND CASE WHEN json_extract(link.value_json,'$.record.attempt_id') IS NULL
+                       THEN json_extract(parent.effective_request_json,'$.launch_manifest.task.attempt_action')='claim_new'
+                       ELSE json_extract(parent.effective_request_json,'$.launch_manifest.task.attempt_action')='use_existing' END
+              AND (json_extract(link.value_json,'$.record.attempt_id') IS NULL OR json_extract(link.value_json,'$.record.attempt_id')=parent.attempt_id)
+              AND (parent.attempt_id IS NULL OR EXISTS (SELECT 1 FROM attempts AS bound_attempt
+                    WHERE bound_attempt.attempt_id=parent.attempt_id
+                      AND bound_attempt.task_id=parent.task_id
+                      AND bound_attempt.task_revision=json_extract(link.value_json,'$.record.task_revision')
+                      AND bound_attempt.owner_id=json_extract(link.value_json,'$.record.effective_manager_id')))
+              AND op.client_request_id='launch:' || parent.operation_id || CASE op.method WHEN 'task.claim' THEN ':claim' WHEN 'coordination.participant.register' THEN ':participant' ELSE ':open' END
+              AND CASE op.method
+                  WHEN 'task.claim' THEN json_extract(op.original_request_json,'$.task_id')=parent.task_id
+                    AND json_extract(op.original_request_json,'$.expected_revision')=json_extract(link.value_json,'$.record.task_revision')
+                    AND json_extract(op.original_request_json,'$.owner_id')=json_extract(link.value_json,'$.record.effective_manager_id')
+                    AND json_extract(op.original_request_json,'$.start_owner')='controller'
+                    AND json_extract(parent.effective_request_json,'$.launch_manifest.task.attempt_action')='claim_new'
+                    AND ((op.state='rejected' AND op.task_id IS NULL AND op.attempt_id IS NULL
+                          AND json_type(op.result_json,'$.code')='text'
+                          AND json_extract(op.effective_request_json,'$.receipt.ok')=0
+                          AND json_extract(op.effective_request_json,'$.receipt.error.code')=json_extract(op.result_json,'$.code')
+                          AND json_extract(op.effective_request_json,'$.receipt.error.message')=json_extract(op.result_json,'$.message'))
+                      OR (op.state<>'rejected' AND op.task_id=parent.task_id
+                          AND op.attempt_id=json_extract(op.result_json,'$.attempt_id')
+                          AND json_extract(op.result_json,'$.operation_id')=op.operation_id
+                          AND json_extract(op.result_json,'$.task_id')=op.task_id
+                          AND json_extract(op.result_json,'$.created')=1
+                          AND json_extract(op.effective_request_json,'$.receipt.ok')=1
+                          AND json_extract(op.effective_request_json,'$.receipt.value.operation_id')=op.operation_id
+                          AND json_extract(op.effective_request_json,'$.receipt.value.task_id')=op.task_id
+                          AND json_extract(op.effective_request_json,'$.receipt.value.attempt_id')=op.attempt_id
+                          AND parent.attempt_id=op.attempt_id
+                          AND json_extract(parent.effective_request_json,'$.launch_manifest.task.attempt_id')=op.attempt_id))
+                  WHEN 'coordination.participant.register' THEN json_extract(op.original_request_json,'$.task_id')=parent.task_id
+                    AND json_extract(op.original_request_json,'$.task_revision')=json_extract(link.value_json,'$.record.task_revision')
+                    AND json_extract(op.original_request_json,'$.attempt_id')=parent.attempt_id
+                    AND json_extract(parent.effective_request_json,'$.launch_manifest.task.attempt_id')=parent.attempt_id
+                    AND ((op.state='rejected' AND op.task_id IS NULL AND op.attempt_id IS NULL
+                          AND json_type(op.result_json,'$.code')='text'
+                          AND json_extract(op.effective_request_json,'$.receipt.ok')=0
+                          AND json_extract(op.effective_request_json,'$.receipt.error.code')=json_extract(op.result_json,'$.code')
+                          AND json_extract(op.effective_request_json,'$.receipt.error.message')=json_extract(op.result_json,'$.message'))
+                      OR (op.state<>'rejected' AND op.task_id=parent.task_id AND op.attempt_id=parent.attempt_id
+                          AND op.binding_id=parent.binding_id AND op.binding_generation=parent.binding_generation
+                          AND json_extract(op.result_json,'$.operation_id')=op.operation_id
+                          AND json_extract(op.result_json,'$.task_id')=op.task_id
+                          AND json_extract(op.result_json,'$.task_revision')=json_extract(link.value_json,'$.record.task_revision')
+                          AND json_extract(op.result_json,'$.attempt_id')=op.attempt_id
+                          AND json_extract(op.effective_request_json,'$.receipt.ok')=1
+                          AND json_extract(op.effective_request_json,'$.receipt.value.operation_id')=op.operation_id
+                          AND json_extract(op.effective_request_json,'$.receipt.value.task_id')=op.task_id
+                          AND json_extract(op.effective_request_json,'$.receipt.value.task_revision')=json_extract(link.value_json,'$.record.task_revision')
+                          AND json_extract(op.effective_request_json,'$.receipt.value.attempt_id')=op.attempt_id
+                          AND EXISTS (SELECT 1 FROM meta AS registration WHERE registration.key='client:' || json_extract(op.original_request_json,'$.client_id')
+                            AND json_extract(registration.value_json,'$.created_operation_id')=op.operation_id
+                            AND json_extract(registration.value_json,'$.task_id')=op.task_id
+                            AND json_extract(registration.value_json,'$.task_revision')=json_extract(link.value_json,'$.record.task_revision')
+                            AND json_extract(registration.value_json,'$.attempt_id')=op.attempt_id
+                            AND json_extract(registration.value_json,'$.binding_id')=op.binding_id
+                            AND json_extract(registration.value_json,'$.binding_generation')=op.binding_generation)))
+                  ELSE json_extract(op.original_request_json,'$.route')=json_extract(parent.original_request_json,'$.route')
+                    AND json_extract(op.original_request_json,'$.lane_id') LIKE 'launch-%'
+                    AND op.prerequisite_operation_id=parent.operation_id
+                    AND EXISTS (SELECT 1 FROM workspace_leases AS lease WHERE lease.operation_id=parent.operation_id
+                      AND 'launch-' || lease.lease_id=json_extract(op.original_request_json,'$.lane_id')
+                      AND lease.project_id=json_extract(link.value_json,'$.record.project_id')
+                      AND lease.task_id=parent.task_id
+                      AND lease.task_revision=json_extract(link.value_json,'$.record.task_revision')
+                      AND lease.attempt_id=parent.attempt_id
+                      AND lease.owner_client_id=json_extract(link.value_json,'$.record.effective_manager_id')
+                      AND ((op.state='rejected' AND json_type(op.effective_request_json,'$.operation_contract') IS NULL
+                            AND op.task_id IS NULL AND op.attempt_id IS NULL
+                            AND op.binding_id IS NULL AND op.binding_generation IS NULL
+                            AND json_extract(op.effective_request_json,'$.receipt.ok')=0
+                            AND json_extract(op.effective_request_json,'$.receipt.error.code')=json_extract(op.result_json,'$.code')
+                            AND json_extract(op.effective_request_json,'$.receipt.error.message')=json_extract(op.result_json,'$.message')
+                            AND json_type(op.result_json,'$.code')='text')
+                        OR (json_type(op.effective_request_json,'$.operation_contract')='object'
+                            AND op.task_id=parent.task_id AND op.attempt_id=parent.attempt_id
+                            AND op.binding_id=parent.binding_id AND op.binding_generation=parent.binding_generation
+                            AND json_extract(op.effective_request_json,'$.operation_contract.effect_scope')='one_exact_launch_binding'
+                            AND json_extract(op.effective_request_json,'$.operation_contract.completion_condition')='binding_ready_readback'
+                            AND json_extract(op.effective_request_json,'$.operation_contract.replay_policy')='exact_binding_readback_only_after_unknown'
+                            AND json_extract(op.effective_request_json,'$.operation_contract.parent_launch_operation_id')=parent.operation_id
+                            AND json_extract(op.effective_request_json,'$.workspace_lease.lease_id')=json_extract(parent.effective_request_json,'$.launch_manifest.workspace.lease_authority.lease_id')
+                            AND json_extract(op.effective_request_json,'$.workspace_lease.generation')=json_extract(parent.effective_request_json,'$.launch_manifest.workspace.lease_authority.generation')
+                            AND json_extract(op.effective_request_json,'$.workspace_lease.binding_digest')=json_extract(parent.effective_request_json,'$.launch_manifest.workspace.lease_authority.binding_digest')
+                            AND json_extract(op.effective_request_json,'$.workspace_lease.lease_id')=lease.lease_id
+                            AND json_extract(op.effective_request_json,'$.workspace_lease.generation')=lease.generation
+                            AND json_extract(op.effective_request_json,'$.workspace_lease.binding_digest')=lease.binding_digest
+                            AND json_extract(op.effective_request_json,'$.receipt.ok')=1
+                            AND json_extract(op.effective_request_json,'$.receipt.value.binding_id')=op.binding_id
+                            AND json_extract(op.effective_request_json,'$.receipt.value.generation')=op.binding_generation
+                            AND json_extract(op.effective_request_json,'$.receipt.value.operation_id')=op.operation_id
+                            AND json_extract(parent.effective_request_json,'$.launch_manifest.binding.operation_id')=op.operation_id
+                            AND json_extract(parent.effective_request_json,'$.launch_manifest.binding.binding_id')=op.binding_id
+                            AND json_extract(parent.effective_request_json,'$.launch_manifest.binding.generation')=op.binding_generation))) END
+              AND EXISTS (
+                  SELECT 1 FROM tasks AS target JOIN meta AS manager ON manager.key='client:' || :client
+                  WHERE target.task_id=json_extract(link.value_json,'$.record.task_id')
+                    AND target.project_id=json_extract(link.value_json,'$.record.project_id')
+                    AND json_extract(manager.value_json,'$.role')='manager'
+                    AND COALESCE(json_extract(manager.value_json,'$.disabled'),0)=0
+                    AND (EXISTS (SELECT 1 FROM attempts AS owned WHERE owned.task_id=target.task_id AND owned.owner_id=:client AND owned.released_at_ms IS NULL)
+                         OR EXISTS (SELECT 1 FROM meta AS gm WHERE gm.key='gm' AND json_extract(gm.value_json,'$.client_id')=:client))
+              )
+        )
+    )
+    OR (
         op.method = 'review.submit'
         AND json_extract(op.result_json, '$.sponsor_client_id') = :client
         AND EXISTS (
@@ -1308,6 +1468,7 @@ fn timeline_visibility_sql() -> String {
                         AND o.kind NOT LIKE 'coordination.%'
                         AND o.kind NOT LIKE 'review.%'
                         AND o.kind NOT LIKE 'automation.%'
+                        AND NOT EXISTS (SELECT 1 FROM operations AS automatic WHERE automatic.operation_id=o.operation_id AND automatic.caller_id='eliot-internal-automation-v1')
                     )
                     OR (:operator = 1 AND o.kind IN ('message.send', 'message.cancel', 'coordination.send'))
                     OR (
@@ -1318,6 +1479,7 @@ fn timeline_visibility_sql() -> String {
                             OR o.kind LIKE 'coordination.%'
                             OR o.kind LIKE 'review.%'
                             OR o.kind LIKE 'automation.%'
+                            OR EXISTS (SELECT 1 FROM operations AS automatic WHERE automatic.operation_id=o.operation_id AND automatic.caller_id='eliot-internal-automation-v1')
                         )
                         AND EXISTS (
                             SELECT 1 FROM operations AS op
@@ -1344,10 +1506,21 @@ fn operation_visible_to(db: &Connection, p: &Principal, id: &str) -> Result<bool
     {
         // SQL performs visibility filtering before page/count decisions;
         // verify the retained link's digest and requester before projection.
+        let target =
+            if crate::automation::authorization::any_on_behalf_operation_link(db, id)?.is_some() {
+                id.to_owned()
+            } else if let Some(parent) = launch_child_parent(db, id)? {
+                parent
+            } else {
+                return Ok(false);
+            };
         return if p.role == Role::Operator {
-            Ok(crate::automation::authorization::operation_link(db, id)?.is_some())
+            Ok(
+                crate::automation::authorization::any_on_behalf_operation_link(db, &target)?
+                    .is_some(),
+            )
         } else {
-            crate::automation::authorization::on_behalf_visible_to(db, p, id)
+            crate::automation::authorization::on_behalf_visible_to(db, p, &target)
         };
     }
     let sql = format!(
@@ -1362,6 +1535,351 @@ fn operation_visible_to(db: &Connection, p: &Principal, id: &str) -> Result<bool
         },
         |row| row.get(0),
     )?)
+}
+
+/// Internal child receipts inherit only their validated exact launch's scope.
+/// Public request parameters cannot supply any of these admission contexts.
+fn launch_child_parent(db: &Connection, id: &str) -> Result<Option<String>> {
+    type RetainedLaunchLeaseRow = (
+        String,
+        String,
+        i64,
+        String,
+        String,
+        String,
+        Option<String>,
+        String,
+        i64,
+        String,
+    );
+    type ChildRow = (
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+    );
+    let row: Option<ChildRow> = db.query_row(
+        "SELECT caller_id,method,client_request_id,effective_request_json,prerequisite_operation_id,
+                original_request_json,state,task_id,attempt_id,binding_id,binding_generation,result_json
+         FROM operations WHERE operation_id=?1",
+        [id],
+        |row| {
+            Ok((
+                row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?,
+                row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?, row.get(10)?, row.get(11)?,
+            ))
+        },
+    ).optional()?;
+    let Some((
+        caller,
+        method,
+        request_id,
+        effective,
+        prerequisite,
+        original,
+        state,
+        child_task,
+        child_attempt,
+        child_binding_id,
+        child_binding_generation,
+        result_raw,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    if caller != crate::automation::authorization::AUTOMATION_TECHNICAL_REQUESTER_ID {
+        return Ok(None);
+    }
+    let effective: Value = serde_json::from_str(&effective)?;
+    let original: Value = serde_json::from_str(&original)?;
+    let (context, phase) = match method.as_str() {
+        "task.claim" => (&effective["launch_child"], "claim"),
+        "coordination.participant.register" => (&effective["launch_registration"], "participant"),
+        "agent.open" => (&effective["operation_contract"], "open"),
+        _ => return Ok(None),
+    };
+    let key = if method == "agent.open" {
+        "parent_launch_operation_id"
+    } else {
+        "launch_operation_id"
+    };
+    let Some(parent_id) = context[key].as_str() else {
+        return Ok(None);
+    };
+    if request_id != format!("launch:{parent_id}:{phase}")
+        || (method == "agent.open" && prerequisite.as_deref() != Some(parent_id))
+    {
+        return Err(Error::new(
+            "INVALID_RECEIPT",
+            "launch child linkage is inconsistent",
+        ));
+    }
+    let Some(link) = automation_work_dispatch::operation_link(db, parent_id)? else {
+        return Ok(None);
+    };
+    let parent = operations::get_operation(db, parent_id)?;
+    let (parent_original_raw, parent_effective_raw): (String, String) = db.query_row(
+        "SELECT original_request_json,effective_request_json FROM operations WHERE operation_id=?1 AND method='swarm.launch'",
+        [parent_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let parent_original: Value = serde_json::from_str(&parent_original_raw)?;
+    let parent_effective: Value = serde_json::from_str(&parent_effective_raw)?;
+    let manifest = &parent_effective["launch_manifest"];
+    let parent_task_id = model::text(&manifest["task"], "task_id")?;
+    let parent_revision = model::positive(&manifest["task"], "observed_revision")?;
+    let parent_attempt = manifest["task"]["attempt_id"].as_str();
+    if parent["method"] != "swarm.launch"
+        || parent["caller_id"] != caller
+        || parent["task_id"] != link.task_id
+        || parent_task_id != link.task_id
+        || manifest["task"]["project_id"] != link.project_id
+        || parent_revision != link.task_revision
+        || (link
+            .attempt_id
+            .as_deref()
+            .is_some_and(|attempt| Some(attempt) != parent_attempt))
+        || (link.attempt_id.is_none() && manifest["task"]["attempt_action"] != "claim_new")
+        || parent["attempt_id"].as_str() != parent_attempt
+    {
+        return Err(Error::new(
+            "INVALID_RECEIPT",
+            "launch child parent is inconsistent",
+        ));
+    }
+    if let Some(attempt_id) = parent_attempt {
+        let attempt = tasks::get_attempt(db, attempt_id)?;
+        if attempt["task_id"] != link.task_id
+            || attempt["task_revision"] != link.task_revision
+            || attempt["owner_id"] != link.effective_manager_id
+        {
+            return Err(Error::new(
+                "INVALID_RECEIPT",
+                "launch child Attempt differs from its retained parent scope",
+            ));
+        }
+    }
+    let result: Value = result_raw
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()?
+        .unwrap_or(Value::Null);
+    let rejected = state == "rejected";
+    let subject_matches = match method.as_str() {
+        "task.claim" => {
+            effective["launch_child"]
+                .as_object()
+                .is_some_and(|fields| fields.len() == 1)
+                && original["client_request_id"] == request_id
+                && original["task_id"] == link.task_id
+                && original["expected_revision"] == link.task_revision
+                && original["owner_id"] == link.effective_manager_id
+                && original["start_owner"] == "controller"
+                && original.as_object().is_some_and(|fields| fields.len() == 5)
+                && manifest["task"]["attempt_action"] == "claim_new"
+                && if rejected {
+                    child_task.is_none()
+                        && child_attempt.is_none()
+                        && child_binding_id.is_none()
+                        && child_binding_generation.is_none()
+                        && effective["receipt"]["ok"] == false
+                        && effective["receipt"]["error"] == result
+                        && result.get("code").and_then(Value::as_str).is_some()
+                } else {
+                    let attempt_id = result.get("attempt_id").and_then(Value::as_str);
+                    attempt_id.is_some()
+                        && child_task.as_deref() == Some(link.task_id.as_str())
+                        && child_attempt.as_deref() == attempt_id
+                        && child_binding_id.is_none()
+                        && child_binding_generation.is_none()
+                        && parent_attempt == attempt_id
+                        && manifest["attempt"]["action"] == "claim_new"
+                        && result["operation_id"] == id
+                        && result["task_id"] == link.task_id
+                        && result["created"] == true
+                        && effective["receipt"]["ok"] == true
+                        && effective["receipt"]["value"] == result
+                        && if let Some(attempt_id) = attempt_id {
+                            let attempt = tasks::get_attempt(db, attempt_id)?;
+                            attempt["task_id"] == link.task_id
+                                && attempt["task_revision"] == link.task_revision
+                                && attempt["owner_id"] == link.effective_manager_id
+                                && attempt["start_owner"] == "controller"
+                        } else {
+                            false
+                        }
+                }
+        }
+        "coordination.participant.register" => {
+            let exact_attempt = parent_attempt.is_some_and(|attempt| {
+                original["attempt_id"] == attempt
+                    && parent["attempt_id"] == attempt
+                    && manifest["task"]["attempt_action"]
+                        == if link.attempt_id.is_some() {
+                            "use_existing"
+                        } else {
+                            "claim_new"
+                        }
+            });
+            let exact_request = effective["launch_registration"]
+                .as_object()
+                .is_some_and(|fields| fields.len() == 1)
+                && original["client_request_id"] == request_id
+                && original["task_id"] == link.task_id
+                && original["task_revision"] == link.task_revision
+                && exact_attempt;
+            if rejected {
+                exact_request
+                    && child_task.is_none()
+                    && child_attempt.is_none()
+                    && child_binding_id.is_none()
+                    && child_binding_generation.is_none()
+                    && effective["receipt"]["ok"] == false
+                    && effective["receipt"]["error"] == result
+                    && result.get("code").and_then(Value::as_str).is_some()
+            } else {
+                let client_id = original.get("client_id").and_then(Value::as_str);
+                let registration = match client_id {
+                    Some(client) => meta(db, &format!("client:{client}"))?,
+                    None => None,
+                };
+                exact_request
+                    && child_task.as_deref() == Some(link.task_id.as_str())
+                    && child_attempt.as_deref() == parent_attempt
+                    && child_binding_id.as_deref() == parent["binding_id"].as_str()
+                    && child_binding_id.as_deref() == manifest["binding"]["binding_id"].as_str()
+                    && child_binding_generation == parent["binding_generation"].as_i64()
+                    && child_binding_generation == manifest["binding"]["generation"].as_i64()
+                    && result["operation_id"] == id
+                    && result["client_id"].as_str() == client_id
+                    && result["task_id"] == link.task_id
+                    && result["task_revision"] == link.task_revision
+                    && result["attempt_id"].as_str() == parent_attempt
+                    && registration.is_some_and(|record| {
+                        record["role"] == "participant"
+                            && record["created_operation_id"] == id
+                            && record["task_id"] == link.task_id
+                            && record["task_revision"] == link.task_revision
+                            && record["attempt_id"].as_str() == parent_attempt
+                            && record["binding_id"] == manifest["binding"]["binding_id"]
+                            && record["binding_generation"] == manifest["binding"]["generation"]
+                    })
+            }
+        }
+        "agent.open" => {
+            let child = operations::get_operation(db, id)?;
+            let parent_request = crate::launcher::LaunchRequest::parse(&parent_original)?;
+            let lease_id = original["lane_id"]
+                .as_str()
+                .and_then(|lane| lane.strip_prefix("launch-"));
+            let lease_id = lease_id.unwrap_or_default();
+            let lease: Option<RetainedLaunchLeaseRow> = db.query_row(
+                "SELECT lease_id,project_id,task_revision,task_id,operation_id,owner_client_id,attempt_id,binding_digest,generation,state
+                 FROM workspace_leases WHERE operation_id=?1 AND lease_id=?2",
+                params![parent_id,lease_id],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?)),
+            ).optional()?;
+            let Some((
+                stored_lease_id,
+                project_id,
+                lease_revision,
+                lease_task,
+                lease_operation,
+                lease_owner,
+                lease_attempt,
+                lease_digest,
+                lease_generation,
+                _lease_state,
+            )) = lease
+            else {
+                return Err(Error::new(
+                    "INVALID_RECEIPT",
+                    "launch open child has no exact retained workspace lease",
+                ));
+            };
+            let lease = &effective["workspace_lease"];
+            let rejected_before_admission =
+                state == "rejected" && effective.get("operation_contract").is_none();
+            let lease_tuple_matches = stored_lease_id == lease_id
+                && project_id == link.project_id
+                && lease_revision == link.task_revision
+                && lease_task == link.task_id
+                && lease_operation == parent_id
+                && lease_owner == link.effective_manager_id
+                && lease_attempt.as_deref() == parent_attempt
+                && original["client_request_id"] == request_id
+                && original.as_object().is_some_and(|fields| fields.len() == 3)
+                && original["lane_id"] == format!("launch-{stored_lease_id}")
+                && original["route"].as_str() == Some(parent_request.preview.route.as_str())
+                && parent_attempt.is_some();
+            if rejected_before_admission {
+                lease_tuple_matches
+                    && result.get("code").and_then(Value::as_str).is_some()
+                    && child_binding_generation.is_none()
+                    && child["task_id"].is_null()
+                    && child["attempt_id"].is_null()
+                    && child["binding_id"].is_null()
+                    && effective["receipt"]["ok"] == false
+                    && effective["receipt"]["error"] == result
+            } else {
+                let contract = &effective["operation_contract"];
+                let manifest_lease = &manifest["workspace"]["lease_authority"];
+                let manifest_binding = &manifest["binding"];
+                let retained_receipt = &effective["receipt"];
+                lease_tuple_matches
+                    && child_task.as_deref() == Some(link.task_id.as_str())
+                    && child_attempt.as_deref() == parent_attempt
+                    && child["task_id"] == parent["task_id"]
+                    && child["attempt_id"] == parent["attempt_id"]
+                    && child["binding_id"] == parent["binding_id"]
+                    && child_binding_id.as_deref() == parent["binding_id"].as_str()
+                    && child["binding_generation"] == parent["binding_generation"]
+                    && child_binding_generation == parent["binding_generation"].as_i64()
+                    && child["prerequisite_operation_id"] == parent_id
+                    && original["route"].as_str() == Some(parent_request.preview.route.as_str())
+                    && lease["lease_id"] == stored_lease_id
+                    && lease["generation"] == lease_generation
+                    && lease["binding_digest"] == lease_digest
+                    && lease["lease_id"] == manifest_lease["lease_id"]
+                    && lease["generation"] == manifest_lease["generation"]
+                    && lease["binding_digest"] == manifest_lease["binding_digest"]
+                    && Some(lease_task.as_str()) == manifest_lease["task_id"].as_str()
+                    && lease_revision == manifest_lease["task_revision"]
+                    && lease_attempt.as_deref() == manifest_lease["attempt_id"].as_str()
+                    && Some(lease_owner.as_str()) == manifest_lease["owner_client_id"].as_str()
+                    && lease_digest.len() == 64
+                    && child["binding_id"] == manifest_binding["binding_id"]
+                    && child["binding_generation"] == manifest_binding["generation"]
+                    && manifest_binding["operation_id"] == id
+                    && contract["effect_scope"] == "one_exact_launch_binding"
+                    && contract["completion_condition"] == "binding_ready_readback"
+                    && contract["replay_policy"] == "exact_binding_readback_only_after_unknown"
+                    && contract["parent_launch_operation_id"] == parent_id
+                    && contract.as_object().is_some_and(|fields| fields.len() == 4)
+                    && lease.as_object().is_some_and(|fields| fields.len() == 3)
+                    && retained_receipt["ok"] == true
+                    && retained_receipt["value"]["binding_id"] == child["binding_id"]
+                    && retained_receipt["value"]["generation"] == child["binding_generation"]
+                    && retained_receipt["value"]["operation_id"] == id
+            }
+        }
+        _ => false,
+    };
+    if !subject_matches {
+        return Err(Error::new(
+            "INVALID_RECEIPT",
+            "launch child subject differs from its exact retained launch",
+        ));
+    }
+    Ok(Some(parent_id.to_owned()))
 }
 
 /// Internal MCP discovery context. This is not an execution grant: the
@@ -1743,7 +2261,22 @@ fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config
             // silently skips a source row.
             let mut projected = Vec::with_capacity(rows.len());
             for (id, kind, raw, time, operation_id) in rows {
-                if (kind.starts_with("coordination.")
+                let internal_operation = if let Some(operation_id) = operation_id.as_deref() {
+                    db.query_row(
+                        "SELECT caller_id=?2 FROM operations WHERE operation_id=?1",
+                        params![
+                            operation_id,
+                            crate::automation::authorization::AUTOMATION_TECHNICAL_REQUESTER_ID
+                        ],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .optional()?
+                    .unwrap_or(false)
+                } else {
+                    false
+                };
+                if (internal_operation
+                    || kind.starts_with("coordination.")
                     || kind.starts_with("review.")
                     || kind.starts_with("automation.")
                     || matches!(
@@ -1867,18 +2400,26 @@ fn mutate_in_transaction_with_check_plan(
     )
 }
 
-fn mutate_in_transaction_with_launch_admission(
+pub(crate) fn mutate_launch_child_in_transaction(
     tx: &Transaction<'_>,
-    p: &Principal,
+    actor: &launcher::LaunchActor,
+    method: &str,
     v: &Value,
     config: &Config,
     now: i64,
     launch_operation_id: &str,
 ) -> Result<Result<Value>> {
-    mutate_in_transaction_with_plan(
+    if !matches!(method, "task.claim" | "coordination.participant.register") {
+        return Err(Error::new("FORBIDDEN", "unsupported launch child action"));
+    }
+    let current = launcher::launch_actor(tx, launch_operation_id)?;
+    if !current.same_authority_identity(actor) {
+        return Err(Error::new("STALE_LAUNCH", "launch child authority changed"));
+    }
+    mutate_in_transaction_with_authority(
         tx,
-        p,
-        "coordination.participant.register",
+        MutationAuthority::Launch(actor),
+        method,
         v,
         config,
         now,
@@ -1895,6 +2436,20 @@ struct MutationPlan<'a> {
     launch_operation_id: Option<&'a str>,
 }
 
+enum MutationAuthority<'a> {
+    Direct(&'a Principal),
+    Launch(&'a launcher::LaunchActor),
+}
+
+impl MutationAuthority<'_> {
+    fn caller_id(&self) -> &str {
+        match self {
+            Self::Direct(principal) => &principal.client_id,
+            Self::Launch(actor) => actor.technical_requester_id(),
+        }
+    }
+}
+
 fn mutate_in_transaction_with_plan(
     tx: &Transaction<'_>,
     p: &Principal,
@@ -1904,7 +2459,28 @@ fn mutate_in_transaction_with_plan(
     now: i64,
     plan: MutationPlan<'_>,
 ) -> Result<Result<Value>> {
-    if p.role == Role::Scheduler
+    mutate_in_transaction_with_authority(
+        tx,
+        MutationAuthority::Direct(p),
+        method,
+        v,
+        config,
+        now,
+        plan,
+    )
+}
+
+fn mutate_in_transaction_with_authority(
+    tx: &Transaction<'_>,
+    authority: MutationAuthority<'_>,
+    method: &str,
+    v: &Value,
+    config: &Config,
+    now: i64,
+    plan: MutationPlan<'_>,
+) -> Result<Result<Value>> {
+    if let MutationAuthority::Direct(p) = &authority
+        && p.role == Role::Scheduler
         && (p.client_id != model::INTERNAL_SCHEDULER_CLIENT_ID || method != "check.run")
     {
         return Err(Error::new(
@@ -1915,7 +2491,16 @@ fn mutate_in_transaction_with_plan(
     model::validate_mutation(method, v)?;
     let request_id = model::text(v, "client_request_id")?;
     let original = model::canonical(v)?;
-    let old:Option<(String,String,String)> = tx.query_row("SELECT method,original_request_json,effective_request_json FROM operations WHERE caller_id=?1 AND client_request_id=?2", params![p.client_id,request_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+    let caller_id = authority.caller_id();
+    let admission_key = if method == "coordination.participant.register" {
+        "launch_registration"
+    } else {
+        "launch_child"
+    };
+    if let Some(receipt) = launch_alias_receipt(tx, caller_id, request_id, method, &original)? {
+        return Ok(receipt_result(&receipt));
+    }
+    let old:Option<(String,String,String)> = tx.query_row("SELECT method,original_request_json,effective_request_json FROM operations WHERE caller_id=?1 AND client_request_id=?2", params![caller_id,request_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
     if let Some((old_method, body, effective)) = old {
         if old_method != method || body != original {
             return Err(Error::new(
@@ -1924,7 +2509,7 @@ fn mutate_in_transaction_with_plan(
             ));
         }
         let receipt: Value = serde_json::from_str(&effective)?;
-        let retained_launch_id = match receipt.get("launch_registration") {
+        let retained_launch_id = match receipt.get(admission_key) {
             None => None,
             Some(value) if value.as_object().is_some_and(|object| object.len() == 1) => {
                 Some(model::text(value, "launch_operation_id").map_err(|_| {
@@ -1951,10 +2536,14 @@ fn mutate_in_transaction_with_plan(
             // A retained successful registration cannot become a new rejected
             // credential. Stale retry authority is an outer error, leaving
             // any accepted secret intact for exact recovery.
-            if receipt["receipt"]["ok"] == true {
+            if method == "coordination.participant.register" && receipt["receipt"]["ok"] == true {
+                let actor = match &authority {
+                    MutationAuthority::Direct(p) => launcher::LaunchActor::Direct((*p).clone()),
+                    MutationAuthority::Launch(actor) => (*actor).clone(),
+                };
                 participant_credentials::validate_launch_registration(
                     tx,
-                    p,
+                    &actor,
                     launch_operation_id,
                     config,
                     v,
@@ -1963,24 +2552,84 @@ fn mutate_in_transaction_with_plan(
         }
         return Ok(receipt_result(&receipt["receipt"]));
     }
+    if method == "swarm.launch"
+        && let MutationAuthority::Direct(principal) = &authority
+    {
+        let request = crate::launcher::LaunchRequest::parse(v)?;
+        let actor = launcher::LaunchActor::Direct((*principal).clone());
+        match launcher::resolve_launch_slot(tx, &actor, &request.preview)? {
+            automation_work_dispatch::LaunchSlotResolution::Vacant => {}
+            automation_work_dispatch::LaunchSlotResolution::Reuse {
+                operation_id,
+                operation_state,
+            } => {
+                // Mutation retries return the immutable admission receipt.
+                // Mutable launch progress is read through operation.get; do
+                // not copy its result/state into a success-shaped snapshot.
+                let value = json!({
+                    "operation_id": operation_id,
+                    "operation_state_at_receipt": operation_state,
+                    "receipt_recorded_at_ms": now,
+                    "current_state_read_method": "operation.get",
+                    "semantic_reuse": true,
+                });
+                save_launch_alias(
+                    tx,
+                    caller_id,
+                    request_id,
+                    &original,
+                    &operation_id,
+                    &value,
+                    now,
+                )?;
+                return Ok(Ok(value));
+            }
+            automation_work_dispatch::LaunchSlotResolution::Conflict {
+                operation_id,
+                operation_state,
+            } => {
+                return Err(Error::new(
+                    "LAUNCH_SLOT_CONFLICT",
+                    format!(
+                        "launch slot is retained by Operation {operation_id} ({operation_state})"
+                    ),
+                ));
+            }
+        }
+    }
     let id = model::new_id();
-    tx.execute("INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,effective_request_json,state,due_at_ms,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,?5,'{}','queued',?6,?6,?6)",params![id,p.client_id,request_id,method,original,now])?;
+    tx.execute("INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,effective_request_json,state,due_at_ms,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,?5,'{}','queued',?6,?6,?6)",params![id,caller_id,request_id,method,original,now])?;
     if let Some(launch_operation_id) = plan.launch_operation_id {
-        tx.execute("UPDATE operations SET effective_request_json=json_set(effective_request_json,'$.launch_registration',json(?2)) WHERE operation_id=?1", params![id, model::canonical(&json!({"launch_operation_id":launch_operation_id}))?])?;
+        let admission_path = format!("$.{admission_key}");
+        tx.execute("UPDATE operations SET effective_request_json=json_set(effective_request_json,?3,json(?2)) WHERE operation_id=?1", params![id, model::canonical(&json!({"launch_operation_id":launch_operation_id}))?, admission_path])?;
     }
     tx.execute_batch("SAVEPOINT mutation_effect")?;
-    let result = apply(
-        tx,
-        p,
-        method,
-        v,
-        config,
-        ApplyContext {
-            operation_id: &id,
-            now,
-            plan,
-        },
-    );
+    let result = match &authority {
+        MutationAuthority::Direct(p) => apply(
+            tx,
+            p,
+            method,
+            v,
+            config,
+            ApplyContext {
+                operation_id: &id,
+                now,
+                plan,
+            },
+        ),
+        MutationAuthority::Launch(actor) => apply_launch_child(
+            tx,
+            actor,
+            method,
+            v,
+            config,
+            ApplyContext {
+                operation_id: &id,
+                now,
+                plan,
+            },
+        ),
+    };
     let receipt = match &result {
         Ok((value, queued)) => {
             tx.execute_batch("RELEASE mutation_effect")?;
@@ -2013,10 +2662,119 @@ fn receipt_result(value: &Value) -> Result<Value> {
         ))
     }
 }
+
+fn launch_alias_key(caller: &str, request_id: &str) -> Result<String> {
+    Ok(format!(
+        "launcher:request-alias:v1:{}",
+        model::digest(model::canonical(&json!([caller, request_id]))?.as_bytes())
+    ))
+}
+
+fn launch_alias_receipt(
+    db: &Connection,
+    caller: &str,
+    request_id: &str,
+    method: &str,
+    original: &str,
+) -> Result<Option<Value>> {
+    let key = launch_alias_key(caller, request_id)?;
+    let Some(alias) = crate::automation::config::read_record(db, &key, "launch request alias")?
+    else {
+        return Ok(None);
+    };
+    if alias["schema_version"] != 1
+        || alias["caller_id"] != caller
+        || alias["client_request_id"] != request_id
+        || alias["method"] != "swarm.launch"
+    {
+        return Err(Error::new(
+            "INVALID_RECEIPT",
+            "launch request alias identity is invalid",
+        ));
+    }
+    if alias["method"] != method || alias["original_request_json"] != original {
+        return Err(Error::new(
+            "REQUEST_ID_CONFLICT",
+            "request ID was used with a different method or payload",
+        ));
+    }
+    let target = model::text(&alias, "operation_id")?;
+    let operation = operations::get_operation(db, target)?;
+    if operation["method"] != "swarm.launch"
+        || alias["receipt"]["ok"] != true
+        || alias["receipt"]["value"]["operation_id"] != target
+    {
+        return Err(Error::new(
+            "INVALID_RECEIPT",
+            "launch request alias target is invalid",
+        ));
+    }
+    Ok(Some(alias["receipt"].clone()))
+}
+
+fn save_launch_alias(
+    tx: &Transaction<'_>,
+    caller: &str,
+    request_id: &str,
+    original: &str,
+    operation_id: &str,
+    value: &Value,
+    now: i64,
+) -> Result<()> {
+    if value["operation_id"] != operation_id {
+        return Err(Error::new(
+            "INVALID_RECEIPT",
+            "retained launch receipt has a different Operation",
+        ));
+    }
+    let key = launch_alias_key(caller, request_id)?;
+    let alias = json!({"schema_version":1,"caller_id":caller,"client_request_id":request_id,"method":"swarm.launch","original_request_json":original,"operation_id":operation_id,"receipt":{"ok":true,"value":value},"created_at_ms":now});
+    if crate::automation::config::read_record(tx, &key, "launch request alias")?.is_some() {
+        return Err(Error::new(
+            "REQUEST_ID_CONFLICT",
+            "launch request alias already exists",
+        ));
+    }
+    crate::automation::config::write_record(tx, &key, &alias)
+}
 struct ApplyContext<'a> {
     operation_id: &'a str,
     now: i64,
     plan: MutationPlan<'a>,
+}
+
+fn apply_launch_child(
+    tx: &Transaction<'_>,
+    actor: &launcher::LaunchActor,
+    method: &str,
+    value: &Value,
+    config: &Config,
+    context: ApplyContext<'_>,
+) -> Result<(Value, bool)> {
+    let parent = context
+        .plan
+        .launch_operation_id
+        .ok_or_else(|| Error::new("FORBIDDEN", "launch child requires its admitted parent"))?;
+    match method {
+        "task.claim" => {
+            tasks::claim_for_launch(tx, actor, value, context.operation_id, context.now)
+                .map(|value| (value, false))
+        }
+        "coordination.participant.register" => {
+            participant_credentials::validate_launch_registration(
+                tx, actor, parent, config, value,
+            )?;
+            coordination::register_participant_for_launch(
+                tx,
+                actor,
+                value,
+                context.operation_id,
+                context.now,
+            )
+            .map(|value| (value, false))
+        }
+        _ => Err(Error::new("FORBIDDEN", "unsupported launch child action")),
+    }
 }
 
 fn apply(
@@ -2041,7 +2799,7 @@ fn apply(
         }
         participant_credentials::validate_launch_registration(
             tx,
-            p,
+            &launcher::LaunchActor::Direct(p.clone()),
             launch_operation_id,
             config,
             v,
@@ -2071,7 +2829,7 @@ fn apply(
             reviews::reserve_submit(tx, p, &request, id, now).map(|value| (value, false))
         }
         "automation.config.apply" => {
-            automation::apply(tx, p, v, id, now).map(|value| (value, false))
+            automation::apply(tx, p, v, id, config, now).map(|value| (value, false))
         }
         "forge.publish_ref" => forge::reserve(tx, p, v, id, config).map(|v| (v, true)),
         "source.capture" => checks::reserve_source(tx, p, v, id, config).map(|v| (v, true)),

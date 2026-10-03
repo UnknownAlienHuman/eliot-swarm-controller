@@ -9,9 +9,10 @@ use crate::{
     config::{Config, Ipc, McpConfig, McpProfileConfig, McpToolProfile},
     error::{Error, Result},
     mcp,
-    model::{self, Credential, Principal, Role},
+    model::{self, Credential, Role},
     platform,
     store::Store,
+    store::launcher::LaunchActor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -94,6 +95,44 @@ pub(crate) struct ResolvedParticipantArtifacts {
     profile_config_path: PathBuf,
 }
 
+fn launch_actor_caller_id(actor: &LaunchActor) -> &str {
+    match actor {
+        LaunchActor::Direct(principal) => &principal.client_id,
+        LaunchActor::OnBehalf(context) => context.technical_requester_id(),
+    }
+}
+
+fn launch_identity(actor: &LaunchActor, request: &IssueRequest) -> Value {
+    let mut identity = json!({
+        "caller_id":launch_actor_caller_id(actor),
+        "launch_operation_id":request.launch_operation_id,
+        "client_request_id":request.client_request_id,
+        "task_id":request.task_id,
+        "task_revision":request.task_revision,
+        "attempt_id":request.attempt_id,
+        "binding_id":request.binding_id,
+        "binding_generation":request.binding_generation,
+        "participation_basis":request.participation_basis.as_value(),
+        "mcp_profile":request.mcp_profile,
+        "mcp_surface":request.mcp_surface,
+        "display_alias":request.display_alias,
+        "inbound_policy":request.inbound_policy.map(InboundPolicy::as_str).unwrap_or("pull_only"),
+        "native_session_id":request.native_session_id,
+    });
+    if let LaunchActor::OnBehalf(context) = actor {
+        identity["effective_manager_id"] = json!(context.effective_manager_id());
+        identity["work_dispatch"] = context.linkage_value();
+    }
+    identity
+}
+
+/// Keep the Store-side registration validator aligned with the host's
+/// deterministic participant identity without exposing credential material.
+pub(crate) fn client_id_for_launch(actor: &LaunchActor, request: &IssueRequest) -> Result<String> {
+    let digest = model::digest(model::canonical(&launch_identity(actor, request))?.as_bytes());
+    Ok(format!("participant-{}", &digest[..48]))
+}
+
 impl ResolvedParticipantArtifacts {
     pub(crate) fn credential_path(&self) -> &Path {
         &self.credential_path
@@ -157,11 +196,13 @@ struct ReferenceIndex {
 /// response can be retried with the same token and caller-owned request ID.
 pub(crate) async fn issue_for_launch(
     store: &Store,
-    principal: Principal,
+    actor: LaunchActor,
     config: &Config,
     request: IssueRequest,
 ) -> Result<IssuedParticipant> {
-    if principal.role != Role::Manager && principal.role != Role::Operator {
+    if matches!(&actor, LaunchActor::Direct(principal)
+        if principal.role != Role::Manager && principal.role != Role::Operator)
+    {
         return Err(Error::new(
             "FORBIDDEN",
             "manager or verified local operator authority required",
@@ -170,30 +211,15 @@ pub(crate) async fn issue_for_launch(
     validate_request(&request)?;
     let source_profile = selected_participant_profile(config, &request)?;
 
-    let identity = json!({
-        "caller_id":principal.client_id,
-        "launch_operation_id":request.launch_operation_id,
-        "client_request_id":request.client_request_id,
-        "task_id":request.task_id,
-        "task_revision":request.task_revision,
-        "attempt_id":request.attempt_id,
-        "binding_id":request.binding_id,
-        "binding_generation":request.binding_generation,
-        "participation_basis":request.participation_basis.as_value(),
-        "mcp_profile":request.mcp_profile,
-        "mcp_surface":request.mcp_surface,
-        "display_alias":request.display_alias,
-        "inbound_policy":request.inbound_policy.map(InboundPolicy::as_str).unwrap_or("pull_only"),
-        "native_session_id":request.native_session_id,
-    });
+    let identity = launch_identity(&actor, &request);
     let identity_digest = model::digest(model::canonical(&identity)?.as_bytes());
-    let client_id = format!("participant-{}", &identity_digest[..48]);
+    let client_id = client_id_for_launch(&actor, &request)?;
     // The directory is stable for the caller-owned Store idempotency slot.
     // Reusing one request ID with different assignment data reaches the
     // existing private files and is rejected before another credential can be
     // minted for that slot.
     let request_slot = json!({
-        "caller_id":principal.client_id,
+        "caller_id":launch_actor_caller_id(&actor),
         "client_request_id":request.client_request_id,
     });
     let request_slot_digest = model::digest(model::canonical(&request_slot)?.as_bytes());
@@ -266,7 +292,7 @@ pub(crate) async fn issue_for_launch(
 
     let result = crate::store::participant_credentials::register_for_launch(
         store,
-        principal,
+        actor,
         request.launch_operation_id.clone(),
         registration,
     )

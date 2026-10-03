@@ -5,11 +5,12 @@
 //! the exact request and commits opaque references after rechecking Store
 //! authority; it never reads or writes credential files.
 
+use super::launcher::LaunchActor;
 use crate::{
     config::{Config, McpToolProfile},
     error::{Error, Result},
     launcher::LaunchRequest,
-    model::{self, Principal},
+    model,
     participant_credentials::{InboundPolicy, IssueRequest, IssuedParticipant, ParticipationBasis},
     workspace::LeaseAuthorityRef,
 };
@@ -45,12 +46,17 @@ fn retained_manifest(db: &Connection, operation_id: &str) -> Result<Value> {
         .ok_or_else(|| Error::new("INVALID_LAUNCH_MANIFEST", "launch manifest is missing"))
 }
 
-fn require_same_live_actor(db: &Connection, actor: &Principal, operation_id: &str) -> Result<()> {
+fn actor_caller_id(actor: &LaunchActor) -> &str {
+    actor.technical_requester_id()
+}
+
+fn actor_owner_id(actor: &LaunchActor) -> &str {
+    actor.effective_manager_id()
+}
+
+fn require_same_live_actor(db: &Connection, actor: &LaunchActor, operation_id: &str) -> Result<()> {
     let current = super::launcher::launch_actor(db, operation_id)?;
-    if current.client_id != actor.client_id
-        || current.role != actor.role
-        || current.link_id != actor.link_id
-    {
+    if !current.same_authority_identity(actor) {
         return Err(Error::new(
             "FORBIDDEN",
             "launch issuance actor differs from the currently authorized launch actor",
@@ -61,7 +67,7 @@ fn require_same_live_actor(db: &Connection, actor: &Principal, operation_id: &st
 
 fn validated_scope(
     db: &Connection,
-    actor: &Principal,
+    actor: &LaunchActor,
     operation_id: &str,
     config: &Config,
     accepted_phases: &[&str],
@@ -69,7 +75,7 @@ fn validated_scope(
     require_same_live_actor(db, actor, operation_id)?;
     let operation = super::operations::get_operation(db, operation_id)?;
     if operation["method"] != "swarm.launch"
-        || operation["caller_id"].as_str() != Some(actor.client_id.as_str())
+        || operation["caller_id"].as_str() != Some(actor_caller_id(actor))
     {
         return Err(Error::new(
             "FORBIDDEN",
@@ -142,7 +148,6 @@ fn validated_scope(
             "participant issuance requires the exact current unstarted Attempt",
         ));
     }
-
     let binding_id = model::text(&manifest["binding"], "binding_id")?.to_owned();
     let binding_generation = model::positive(&manifest["binding"], "generation")?;
     if manifest["binding"]["state"] != "ready"
@@ -163,11 +168,20 @@ fn validated_scope(
             "participant issuance requires the exact ready, unreleased binding",
         ));
     }
+    actor.require_bound_launch_attempt(
+        db,
+        operation_id,
+        &task_id,
+        task_revision,
+        &attempt_id,
+        &binding_id,
+        binding_generation,
+    )?;
     let open_operation_id = model::text(&manifest["binding"], "operation_id")?;
     let open_operation = super::operations::get_operation(db, open_operation_id)?;
     if open_operation["method"] != "agent.open"
         || open_operation["state"] != "settled"
-        || open_operation["caller_id"].as_str() != Some(actor.client_id.as_str())
+        || open_operation["caller_id"].as_str() != Some(actor_caller_id(actor))
         || open_operation["prerequisite_operation_id"].as_str() != Some(operation_id)
         || open_operation["task_id"].as_str() != Some(task_id.as_str())
         || open_operation["attempt_id"].as_str() != Some(attempt_id.as_str())
@@ -194,7 +208,8 @@ fn validated_scope(
         || lease.task_revision != task_revision
         || lease.attempt_id.as_deref() != Some(attempt_id.as_str())
         || Some(lease.owner_client_id.as_str()) != attempt["owner_id"].as_str()
-        || lease.owner_client_id != actor.client_id
+        || lease.owner_client_id != actor_owner_id(actor)
+        || attempt["owner_id"].as_str() != Some(actor_owner_id(actor))
         || lease.project_id != task["project_id"]
         || lease.plan_digest != manifest["plan_digest"]
         || lease_view["state"] != "held"
@@ -306,33 +321,8 @@ fn build_issue_request(scope: &LaunchIssuanceScope, operation_id: &str) -> Resul
     })
 }
 
-fn expected_participant_client_id(actor: &Principal, request: &IssueRequest) -> Result<String> {
-    // Keep this identity envelope byte-for-byte aligned with
-    // participant_credentials::issue_for_launch. The Store compares the full
-    // canonical registration request for a repeated caller/request ID, so a
-    // conflicting token hash or scope cannot replay an unrelated registration.
-    let identity = json!({
-        "caller_id":actor.client_id,
-        "launch_operation_id":request.launch_operation_id,
-        "client_request_id":request.client_request_id,
-        "task_id":request.task_id,
-        "task_revision":request.task_revision,
-        "attempt_id":request.attempt_id,
-        "binding_id":request.binding_id,
-        "binding_generation":request.binding_generation,
-        "participation_basis":{
-            "kind":"attempt_owner",
-            "assignment_id":Value::Null,
-            "review_scope":Value::Null,
-        },
-        "mcp_profile":request.mcp_profile,
-        "mcp_surface":request.mcp_surface,
-        "display_alias":request.display_alias,
-        "inbound_policy":"pull_only",
-        "native_session_id":request.native_session_id,
-    });
-    let identity_digest = model::digest(model::canonical(&identity)?.as_bytes());
-    Ok(format!("participant-{}", &identity_digest[..48]))
+fn expected_participant_client_id(actor: &LaunchActor, request: &IssueRequest) -> Result<String> {
+    crate::participant_credentials::client_id_for_launch(actor, request)
 }
 
 /// Recheck launch authority inside the same Store transaction that will write
@@ -341,7 +331,7 @@ fn expected_participant_client_id(actor: &Principal, request: &IssueRequest) -> 
 /// and an earlier read-only validation do not substitute for this check.
 pub(super) fn validate_launch_registration(
     tx: &Transaction<'_>,
-    actor: &Principal,
+    actor: &LaunchActor,
     launch_operation_id: &str,
     config: &Config,
     registration_params: &Value,
@@ -403,7 +393,7 @@ pub(super) fn validate_launch_registration(
 /// performed later by the host issuer using this stable request ID.
 pub(super) fn prepare_launch_issuance(
     db: &Connection,
-    actor: &Principal,
+    actor: &LaunchActor,
     operation_id: &str,
     config: &Config,
 ) -> Result<IssueRequest> {
@@ -412,7 +402,7 @@ pub(super) fn prepare_launch_issuance(
     let prior_registration: Option<(String, String, String)> = db
         .query_row(
             "SELECT method,state,operation_id FROM operations WHERE caller_id=?1 AND client_request_id=?2",
-            params![actor.client_id, request.client_request_id],
+            params![actor_caller_id(actor), request.client_request_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
@@ -455,7 +445,7 @@ fn validate_opaque_ref(value: &str, prefix: &str) -> Result<()> {
 
 fn check_registered_participant(
     tx: &Transaction<'_>,
-    actor: &Principal,
+    actor: &LaunchActor,
     scope: &LaunchIssuanceScope,
     operation_id: &str,
     request: &IssueRequest,
@@ -502,7 +492,7 @@ fn check_registered_participant(
         || registration["binding_id"].as_str() != Some(scope.binding_id.as_str())
         || registration["binding_generation"] != scope.binding_generation
         || registration["created_by"].as_str() != attempt["owner_id"].as_str()
-        || registration["created_by"].as_str() != Some(actor.client_id.as_str())
+        || registration["created_by"].as_str() != Some(actor_owner_id(actor))
         || registration["created_operation_id"].as_str() != Some(registration_operation_id.as_str())
         || registration["grant_revision"] != issued.registration["grant_revision"]
         || issued.registration["grant_revision"] != 1
@@ -570,7 +560,7 @@ fn check_registered_participant(
         InboundPolicy::PullOnly => "pull_only",
     };
     if method != "coordination.participant.register"
-        || caller_id != actor.client_id
+        || caller_id != actor_caller_id(actor)
         || request_id != request.client_request_id
         || state == "outcome_unknown"
         || original["client_id"] != client_id
@@ -687,7 +677,7 @@ fn retain_launch_issuance(
 /// and held workspace lease in this transaction.
 pub(super) fn commit_launch_issuance(
     tx: &Transaction<'_>,
-    actor: &Principal,
+    actor: &LaunchActor,
     operation_id: &str,
     config: &Config,
     issued: &IssuedParticipant,

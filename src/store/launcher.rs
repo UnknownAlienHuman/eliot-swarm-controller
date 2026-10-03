@@ -27,6 +27,355 @@ const MAX_INSPECT_SNAPSHOT_FIELD_ITEMS: usize = 64;
 const MAX_LAUNCH_OPERATION_ROWS: i64 = 8;
 const MAX_LAUNCH_BRIEF_BYTES: usize = 8_192;
 
+/// Authority carried by the shared launcher from admission through native
+/// readback. WorkDispatch is deliberately an opaque context, never a forged
+/// manager Principal or a deserializable request field.
+#[derive(Debug, Clone)]
+pub(crate) enum LaunchActor {
+    Direct(Principal),
+    OnBehalf(Box<crate::automation::work_dispatch::WorkDispatchContext>),
+}
+
+pub(crate) type WorkDispatchLaunchSlotOutcome =
+    super::automation_work_dispatch::LaunchSlotResolution;
+pub(crate) type LaunchSlotRetentionOutcome = super::automation_work_dispatch::LaunchSlotRetention;
+
+impl LaunchActor {
+    /// The identity recorded as the Operation caller / technical requester.
+    pub(crate) fn technical_requester_id(&self) -> &str {
+        match self {
+            Self::Direct(principal) => &principal.client_id,
+            Self::OnBehalf(context) => context.technical_requester_id(),
+        }
+    }
+
+    /// The manager whose Task and Attempt scope is being acted on.
+    pub(crate) fn effective_manager_id(&self) -> &str {
+        match self {
+            Self::Direct(principal) => &principal.client_id,
+            Self::OnBehalf(context) => context.effective_manager_id(),
+        }
+    }
+
+    /// Role proof used by bounded metadata projections. OnBehalf has a
+    /// manager-only constructor and returns its effective role, not a
+    /// Principal that can be passed to generic Store authorization.
+    pub(crate) fn role(&self) -> Role {
+        match self {
+            Self::Direct(principal) => principal.role.clone(),
+            Self::OnBehalf(_) => Role::Manager,
+        }
+    }
+
+    /// A link identity exists only for an authenticated direct caller.
+    pub(crate) fn link_id(&self) -> Option<&str> {
+        match self {
+            Self::Direct(principal) => Some(&principal.link_id),
+            Self::OnBehalf(_) => None,
+        }
+    }
+
+    pub(crate) fn direct_principal(&self) -> Option<&Principal> {
+        match self {
+            Self::Direct(principal) => Some(principal),
+            Self::OnBehalf(_) => None,
+        }
+    }
+
+    pub(crate) fn work_dispatch_context(
+        &self,
+    ) -> Option<&crate::automation::work_dispatch::WorkDispatchContext> {
+        match self {
+            Self::Direct(_) => None,
+            Self::OnBehalf(context) => Some(context),
+        }
+    }
+
+    /// Require the caller's current registration or the exact active
+    /// WorkDispatch action context. This never upgrades either authority.
+    pub(crate) fn require_current(&self, db: &Connection) -> Result<()> {
+        match self {
+            Self::Direct(principal) => {
+                require_manager(db, principal)?;
+                let registration = meta(db, &format!("client:{}", principal.client_id))?
+                    .ok_or_else(|| {
+                        Error::new("FORBIDDEN", "launch actor is no longer registered")
+                    })?;
+                let role: Role = serde_json::from_value(registration["role"].clone())?;
+                if registration["disabled"] == true || role != principal.role {
+                    return Err(Error::new(
+                        "FORBIDDEN",
+                        "launch actor registration changed after admission",
+                    ));
+                }
+                Ok(())
+            }
+            Self::OnBehalf(context) => context.require_current(db),
+        }
+    }
+
+    pub(crate) fn require_action_object(
+        &self,
+        db: &Connection,
+        action: &str,
+        task_id: &str,
+        task_revision: i64,
+        attempt_id: Option<&str>,
+    ) -> Result<()> {
+        if action != "swarm.launch" {
+            return Err(Error::new(
+                "FORBIDDEN",
+                "launch actor cannot authorize this action",
+            ));
+        }
+        match self {
+            Self::OnBehalf(context) => {
+                context.require_action_object(db, action, task_id, task_revision, attempt_id)?;
+                if attempt_id.is_none()
+                    && super::gm::record(db)?
+                        .as_ref()
+                        .and_then(|record| record["client_id"].as_str())
+                        != Some(context.effective_manager_id())
+                {
+                    return Err(Error::new(
+                        "WORK_DISPATCH_GM_REQUIRED",
+                        "initial WorkDispatch launch requires the current GM",
+                    ));
+                }
+                Ok(())
+            }
+            Self::Direct(principal) => {
+                self.require_current(db)?;
+                let task = query_task(db, task_id)?;
+                if task.revision != task_revision || task.state != "open" {
+                    return Err(Error::new(
+                        "STALE_LAUNCH",
+                        "launch Task is not current at the admitted revision",
+                    ));
+                }
+                let current_attempt = task
+                    .current_attempt_id
+                    .as_deref()
+                    .map(|id| get_attempt_row(db, id))
+                    .transpose()?
+                    .flatten()
+                    .filter(|attempt| {
+                        attempt.task_id == task.task_id && attempt.released_at_ms.is_none()
+                    });
+                if current_attempt.as_ref().map(|row| row.attempt_id.as_str()) != attempt_id {
+                    return Err(Error::new(
+                        "STALE_LAUNCH",
+                        "launch Attempt differs from the current Task assignment",
+                    ));
+                }
+                if principal.role == Role::Manager
+                    && !crate::automation::authorization::current_manager_has_task_scope(
+                        db,
+                        principal,
+                        &task.task_id,
+                        &task.project_id,
+                    )?
+                {
+                    return Err(Error::new(
+                        "FORBIDDEN",
+                        "manager no longer has current rights to this Task project",
+                    ));
+                }
+                authorize_launch_project(db, principal, current_attempt.as_ref())
+            }
+        }
+    }
+
+    pub(crate) fn require_claimed_launch_attempt(
+        &self,
+        db: &Connection,
+        operation_id: &str,
+        task_id: &str,
+        task_revision: i64,
+        attempt_id: &str,
+    ) -> Result<()> {
+        match self {
+            Self::OnBehalf(context) => context.require_claimed_launch_attempt(
+                db,
+                operation_id,
+                task_id,
+                task_revision,
+                attempt_id,
+            ),
+            Self::Direct(principal) => {
+                let operation: Option<(String, String, Option<String>, Option<String>)> = db
+                    .query_row(
+                        "SELECT caller_id,method,task_id,attempt_id FROM operations WHERE operation_id=?1",
+                        [operation_id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    )
+                    .optional()?;
+                if !operation.is_some_and(|(caller, method, task, attempt)| {
+                    caller == principal.client_id
+                        && method == "swarm.launch"
+                        && task.as_deref() == Some(task_id)
+                        && attempt.as_deref() == Some(attempt_id)
+                }) {
+                    return Err(Error::new(
+                        "FORBIDDEN",
+                        "launch Operation is not bound to the exact claimed Attempt",
+                    ));
+                }
+                self.require_action_object(
+                    db,
+                    "swarm.launch",
+                    task_id,
+                    task_revision,
+                    Some(attempt_id),
+                )?;
+                let active_attempts: i64 = db.query_row(
+                    "SELECT count(*) FROM attempts WHERE task_id=?1 AND released_at_ms IS NULL",
+                    [task_id],
+                    |row| row.get(0),
+                )?;
+                let exact = db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM attempts WHERE attempt_id=?1 AND task_id=?2 \
+                     AND task_revision=?3 AND owner_id=?4 AND state='reserved' \
+                     AND released_at_ms IS NULL AND start_operation_id IS NULL \
+                     AND binding_id IS NULL AND binding_generation IS NULL)",
+                    params![attempt_id, task_id, task_revision, principal.client_id],
+                    |row| row.get::<_, bool>(0),
+                )?;
+                if active_attempts != 1 || !exact {
+                    return Err(Error::new(
+                        "STALE_LAUNCH",
+                        "claimed launch Attempt is no longer the exact unstarted reservation",
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    // Keep the independently checked launch subject and binding tuple explicit.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn require_bound_launch_attempt(
+        &self,
+        db: &Connection,
+        operation_id: &str,
+        task_id: &str,
+        task_revision: i64,
+        attempt_id: &str,
+        binding_id: &str,
+        binding_generation: i64,
+    ) -> Result<()> {
+        match self {
+            Self::OnBehalf(context) => context.require_bound_launch_attempt(
+                db,
+                operation_id,
+                task_id,
+                task_revision,
+                attempt_id,
+                binding_id,
+                binding_generation,
+            ),
+            Self::Direct(principal) => {
+                self.require_current(db)?;
+                type BoundLaunchOperationRow = (
+                    String,
+                    String,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    Option<i64>,
+                );
+                let operation: Option<BoundLaunchOperationRow> = db
+                    .query_row(
+                        "SELECT caller_id,method,task_id,attempt_id,binding_id,binding_generation \
+                         FROM operations WHERE operation_id=?1",
+                        [operation_id],
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                                row.get(5)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                if !operation.is_some_and(
+                    |(caller, method, task, attempt, operation_binding, operation_generation)| {
+                        caller == principal.client_id
+                            && method == "swarm.launch"
+                            && task.as_deref() == Some(task_id)
+                            && attempt.as_deref() == Some(attempt_id)
+                            && operation_binding.as_deref() == Some(binding_id)
+                            && operation_generation == Some(binding_generation)
+                    },
+                ) {
+                    return Err(Error::new(
+                        "FORBIDDEN",
+                        "launch Operation is not bound to the exact current Attempt",
+                    ));
+                }
+                self.require_action_object(
+                    db,
+                    "swarm.launch",
+                    task_id,
+                    task_revision,
+                    Some(attempt_id),
+                )?;
+                let active_attempts: i64 = db.query_row(
+                    "SELECT count(*) FROM attempts WHERE task_id=?1 AND released_at_ms IS NULL",
+                    [task_id],
+                    |row| row.get(0),
+                )?;
+                let exact: bool = db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM attempts WHERE attempt_id=?1 AND task_id=?2 \
+                     AND task_revision=?3 AND owner_id=?4 AND state='reserved' \
+                     AND released_at_ms IS NULL AND start_operation_id IS NULL \
+                     AND binding_id=?5 AND binding_generation=?6)",
+                    params![
+                        attempt_id,
+                        task_id,
+                        task_revision,
+                        principal.client_id,
+                        binding_id,
+                        binding_generation
+                    ],
+                    |row| row.get(0),
+                )?;
+                let binding: Value =
+                    super::operations::get_binding(db, binding_id, binding_generation)?;
+                if active_attempts != 1
+                    || !exact
+                    || binding["state"] != "ready"
+                    || !binding["released_at_ms"].is_null()
+                {
+                    return Err(Error::new(
+                        "STALE_LAUNCH",
+                        "binding readback is not the exact current launch Attempt binding",
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn same_authority_identity(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Direct(left), Self::Direct(right)) => {
+                left.client_id == right.client_id
+                    && left.role == right.role
+                    && left.link_id == right.link_id
+            }
+            (Self::OnBehalf(left), Self::OnBehalf(right)) => {
+                left.linkage_value() == right.linkage_value()
+                    && left.semantic_slot_id() == right.semantic_slot_id()
+            }
+            _ => false,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct TaskRow {
     task_id: String,
@@ -933,6 +1282,74 @@ fn authorize_launch_project(
     Ok(())
 }
 
+/// Resolve the shared manual/WorkDispatch semantic launch slot from the
+/// caller's already validated actor and exact current Task assignment.
+pub(crate) fn resolve_launch_slot(
+    db: &Connection,
+    actor: &LaunchActor,
+    preview: &launcher::LaunchPreviewRequest,
+) -> Result<WorkDispatchLaunchSlotOutcome> {
+    let task = query_task(db, &preview.task_id)?;
+    if task.revision != preview.expected_task_revision || task.state != "open" {
+        // Preserve the ordinary manual launch's retained blocked receipt for
+        // stale revisions. An on-behalf context must never drift from its
+        // verified source assignment.
+        if actor.work_dispatch_context().is_some() {
+            return Err(Error::new(
+                "AUTOMATION_WORK_SUBJECT_STALE",
+                "WorkDispatch launch subject is no longer current",
+            ));
+        }
+        return Ok(super::automation_work_dispatch::LaunchSlotResolution::Vacant);
+    }
+    let attempt = task
+        .current_attempt_id
+        .as_deref()
+        .map(|attempt_id| get_attempt_row(db, attempt_id))
+        .transpose()?
+        .flatten()
+        .filter(|attempt| attempt.task_id == task.task_id && attempt.released_at_ms.is_none());
+    let attempt_id = attempt.as_ref().map(|attempt| attempt.attempt_id.as_str());
+    actor.require_action_object(db, "swarm.launch", &task.task_id, task.revision, attempt_id)?;
+    super::automation_work_dispatch::resolve_assignment_slot(
+        db,
+        actor.effective_manager_id(),
+        &task.task_id,
+        task.revision,
+        attempt_id,
+        preview,
+    )
+}
+
+pub(crate) fn retain_launch_slot(
+    tx: &Transaction<'_>,
+    actor: &LaunchActor,
+    preview: &launcher::LaunchPreviewRequest,
+    operation_id: &str,
+    now_ms: i64,
+) -> Result<LaunchSlotRetentionOutcome> {
+    let task = query_task(tx, &preview.task_id)?;
+    let attempt = task
+        .current_attempt_id
+        .as_deref()
+        .map(|attempt_id| get_attempt_row(tx, attempt_id))
+        .transpose()?
+        .flatten()
+        .filter(|attempt| attempt.task_id == task.task_id && attempt.released_at_ms.is_none());
+    let attempt_id = attempt.as_ref().map(|attempt| attempt.attempt_id.as_str());
+    actor.require_action_object(tx, "swarm.launch", &task.task_id, task.revision, attempt_id)?;
+    super::automation_work_dispatch::retain_assignment_slot(
+        tx,
+        actor.effective_manager_id(),
+        &task.task_id,
+        task.revision,
+        attempt_id,
+        preview,
+        operation_id,
+        now_ms,
+    )
+}
+
 fn launch_operation_projection(
     db: &Connection,
     task_id: &str,
@@ -1322,6 +1739,170 @@ fn validate_workspace_scope_path(path: &str) -> bool {
 /// preview before recording a manifest. It does not claim an Attempt, open a
 /// binding, dispatch work, or assert that an external effect occurred. The
 /// Host prepares a verified workspace lease before advancing this intent.
+fn launch_actor_manifest(actor: &LaunchActor) -> Value {
+    match actor {
+        LaunchActor::Direct(principal) => json!({
+            "kind":"direct",
+            "client_id":principal.client_id,
+            "role":principal.role,
+            "link_id":principal.link_id,
+        }),
+        LaunchActor::OnBehalf(context) => json!({
+            "kind":"work_dispatch",
+            "client_id":context.technical_requester_id(),
+            "role":"manager",
+            "link_id":null,
+            "effective_manager_id":context.effective_manager_id(),
+            "automation_id":context.automation_id(),
+            "automation_revision":context.automation_revision(),
+            "semantic_slot_id":context.semantic_slot_id(),
+        }),
+    }
+}
+
+fn launch_preview_value(preview: &launcher::LaunchPreviewRequest) -> Value {
+    json!({
+        "task_id":preview.task_id,
+        "expected_task_revision":preview.expected_task_revision,
+        "route":preview.route,
+        "agent_profile":preview.agent_profile,
+        "mcp_profile":preview.mcp_profile,
+        "mcp_surface":preview.mcp_surface,
+        "workspace_policy":preview.workspace_policy,
+        "requested_model":preview.requested_model,
+        "requested_effort":preview.requested_effort,
+        "budget":preview.budget,
+        "stop_conditions":preview.stop_conditions,
+        "purpose":preview.purpose,
+    })
+}
+
+/// Convert committed WorkDispatch facts into the same durable launch
+/// Operation used by direct callers. The callback is transaction-only: it
+/// reserves authority and returns a receipt, but never starts Host/native work.
+pub(crate) fn admit_work_dispatch(
+    tx: &Transaction<'_>,
+    prepared: &super::automation_work_dispatch::PreparedWorkDispatch,
+    config: &Config,
+    now_ms: i64,
+) -> Result<super::automation_work_dispatch::WorkDispatchOutcome> {
+    use super::automation_work_dispatch::{LaunchSlotResolution, WorkDispatchOutcome};
+
+    let context = prepared.context();
+    let actor = LaunchActor::OnBehalf(Box::new(context.clone()));
+    actor.require_current(tx)?;
+    let preview_request = prepared.preview();
+    let resolution = match resolve_launch_slot(tx, &actor, preview_request) {
+        Ok(resolution) => resolution,
+        Err(error) if error.code == "WORK_DISPATCH_GM_REQUIRED" => {
+            return Ok(WorkDispatchOutcome::Pending {
+                reason: "current_gm_required".to_owned(),
+                wake_when: vec!["current_gm_changed".to_owned()],
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    match resolution {
+        LaunchSlotResolution::Reuse { operation_id, .. } => {
+            return Ok(WorkDispatchOutcome::Admitted { operation_id });
+        }
+        LaunchSlotResolution::Conflict { .. } => {
+            return Ok(WorkDispatchOutcome::Skipped {
+                reason: "semantic_launch_slot_conflict".to_owned(),
+            });
+        }
+        LaunchSlotResolution::Vacant => {}
+    }
+
+    let preview_params = launch_preview_value(preview_request);
+    let preview = match launch_preview_for_actor(tx, &actor, &preview_params, config) {
+        Ok(preview) => preview,
+        Err(error) if error.code == "WORK_DISPATCH_GM_REQUIRED" => {
+            return Ok(WorkDispatchOutcome::Pending {
+                reason: "current_gm_required".to_owned(),
+                wake_when: vec!["current_gm_changed".to_owned()],
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    let hard_blocks = preview["hard_blocks"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if let Some(reason) = hard_blocks.first().and_then(Value::as_str) {
+        return Ok(WorkDispatchOutcome::Pending {
+            reason: reason.chars().take(128).collect(),
+            wake_when: vec![
+                "launch_readiness_changed".to_owned(),
+                "task_assignment_changed".to_owned(),
+            ],
+        });
+    }
+    if preview["attempt_action"] == "forbidden" {
+        return Ok(WorkDispatchOutcome::Pending {
+            reason: "launch_attempt_action_unavailable".to_owned(),
+            wake_when: vec!["task_assignment_changed".to_owned()],
+        });
+    }
+    let plan_digest = model::text(&preview, "plan_digest")?;
+    let (request, original_request) = prepared.launch_request(plan_digest)?;
+    model::validate_mutation("swarm.launch", &original_request)?;
+    let canonical_request = model::canonical(&original_request)?;
+    let prior: Option<(String, String)> = tx
+        .query_row(
+            "SELECT method,original_request_json FROM operations \
+             WHERE caller_id=?1 AND client_request_id=?2",
+            params![context.technical_requester_id(), request.client_request_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if prior.is_some() {
+        return Err(Error::new(
+            "AUTOMATION_IDEMPOTENCY_CORRUPT",
+            "deterministic WorkDispatch request exists without its semantic slot",
+        ));
+    }
+
+    let operation_id = model::new_id();
+    tx.execute(
+        "INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,\
+         effective_request_json,state,due_at_ms,created_at_ms,updated_at_ms)\
+         VALUES(?1,?2,?3,'swarm.launch',?4,'{}','queued',?5,?5,?5)",
+        params![
+            operation_id,
+            context.technical_requester_id(),
+            request.client_request_id,
+            canonical_request,
+            now_ms
+        ],
+    )?;
+    let (result, queued) =
+        launch_for_actor(tx, &actor, &original_request, config, &operation_id, now_ms)?;
+    if !queued {
+        return Err(Error::new(
+            "AUTOMATION_LAUNCH_READINESS_CHANGED",
+            "launch readiness changed before WorkDispatch admission committed",
+        ));
+    }
+    tx.execute(
+        "UPDATE operations SET state='queued',result_json=?2,settled_at_ms=NULL,updated_at_ms=?3 \
+         WHERE operation_id=?1 AND caller_id=?4 AND method='swarm.launch' AND state='queued'",
+        params![
+            operation_id,
+            model::canonical(&result)?,
+            now_ms,
+            context.technical_requester_id()
+        ],
+    )?;
+    super::capacity::sync_operation(tx, &operation_id, now_ms)?;
+    tx.execute(
+        "INSERT INTO observations(source_stream_id,source_event_key,operation_id,kind,payload_json,recorded_at_ms) \
+         VALUES('controller',?1,?1,'swarm.launch',?2,?3)",
+        params![operation_id, model::canonical(&result)?, now_ms],
+    )?;
+    Ok(WorkDispatchOutcome::Admitted { operation_id })
+}
+
 pub(super) fn launch(
     tx: &Transaction<'_>,
     p: &Principal,
@@ -1330,10 +1911,29 @@ pub(super) fn launch(
     operation_id: &str,
     now: i64,
 ) -> Result<(Value, bool)> {
+    launch_for_actor(
+        tx,
+        &LaunchActor::Direct(p.clone()),
+        params_value,
+        config,
+        operation_id,
+        now,
+    )
+}
+
+pub(crate) fn launch_for_actor(
+    tx: &Transaction<'_>,
+    actor: &LaunchActor,
+    params_value: &Value,
+    config: &Config,
+    operation_id: &str,
+    now: i64,
+) -> Result<(Value, bool)> {
     let request = launcher::LaunchRequest::parse(params_value)?;
-    require_manager(tx, p)?;
+    actor.require_current(tx)?;
     let preview_params = request.preview_params();
-    let preview = launch_preview_for_operation(tx, p, &preview_params, config, operation_id)?;
+    let preview =
+        launch_preview_for_operation_actor(tx, actor, &preview_params, config, operation_id)?;
     if preview["plan_digest"] != request.plan_digest {
         return Err(Error::new(
             "STALE_LAUNCH_PLAN",
@@ -1360,11 +1960,7 @@ pub(super) fn launch(
         "manifest_version":"eliot-launch-manifest-v1",
         "state":launch_state,
         "created_at_ms":now,
-        "actor":{
-            "client_id":p.client_id,
-            "role":p.role,
-            "link_id":p.link_id,
-        },
+        "actor":launch_actor_manifest(actor),
         "client_request_id":request.client_request_id,
         "plan_digest":request.plan_digest,
         "request":preview_params,
@@ -1429,7 +2025,7 @@ pub(super) fn launch(
             task_id,
             attempt_id,
             model::canonical(&effective)?,
-            p.client_id,
+            actor.technical_requester_id(),
             request.client_request_id,
             original_request,
         ],
@@ -1438,6 +2034,25 @@ pub(super) fn launch(
         return Err(Error::conflict(
             "launch Operation changed before its manifest could be committed",
         ));
+    }
+
+    if !blocked {
+        // Persist the private manager attribution first. Slot verification
+        // reloads an automated Operation and requires that attribution; both
+        // records remain invisible until this admission transaction commits.
+        if let Some(context) = actor.work_dispatch_context() {
+            super::automation_work_dispatch::save_operation_link(tx, operation_id, context, now)?;
+        }
+        match retain_launch_slot(tx, actor, &request.preview, operation_id, now)? {
+            super::automation_work_dispatch::LaunchSlotRetention::Retained => {}
+            super::automation_work_dispatch::LaunchSlotRetention::Reuse { .. }
+            | super::automation_work_dispatch::LaunchSlotRetention::Conflict { .. } => {
+                return Err(Error::new(
+                    "LAUNCH_SLOT_CONFLICT",
+                    "semantic launch slot changed after admission preflight",
+                ));
+            }
+        }
     }
 
     if blocked {
@@ -1567,21 +2182,47 @@ fn persist_launch_progress(
     Ok(())
 }
 
-/// Reconstruct the exact admitted manager/operator identity only while its
-/// registered role remains enabled and the same authority still applies.
-pub(super) fn launch_actor(db: &Connection, operation_id: &str) -> Result<Principal> {
+/// Reconstruct an admitted actor from the immutable launch manifest and,
+/// for WorkDispatch, its integrity-checked private Operation link.
+pub(crate) fn launch_actor(db: &Connection, operation_id: &str) -> Result<LaunchActor> {
     let operation = super::operations::get_operation(db, operation_id)?;
     if operation["method"] != "swarm.launch" {
         return Err(Error::new("FORBIDDEN", "Operation is not a launch"));
     }
     let manifest = retained_launch_manifest(db, operation_id)?;
-    let client_id = model::text(&manifest["actor"], "client_id")?.to_owned();
-    if operation["caller_id"] != client_id {
+    let caller_id = model::text(&operation, "caller_id")?;
+    let retained_client_id = model::text(&manifest["actor"], "client_id")?;
+    if caller_id == crate::automation::authorization::AUTOMATION_TECHNICAL_REQUESTER_ID {
+        if retained_client_id != caller_id || manifest["actor"]["kind"] != "work_dispatch" {
+            return Err(Error::new(
+                "FORBIDDEN",
+                "on-behalf launch manifest does not match its technical Operation caller",
+            ));
+        }
+        let context = super::automation_work_dispatch::context_for_operation(db, operation_id)?
+            .ok_or_else(|| Error::new("FORBIDDEN", "WorkDispatch launch link is missing"))?;
+        if manifest["actor"]["effective_manager_id"] != context.effective_manager_id()
+            || manifest["actor"]["automation_id"] != context.automation_id()
+            || manifest["actor"]["automation_revision"] != context.automation_revision()
+            || manifest["actor"]["semantic_slot_id"] != context.semantic_slot_id()
+        {
+            return Err(Error::new(
+                "FORBIDDEN",
+                "on-behalf launch manifest differs from its retained Store link",
+            ));
+        }
+        return Ok(LaunchActor::OnBehalf(Box::new(context)));
+    }
+
+    if retained_client_id != caller_id
+        || !matches!(manifest["actor"]["kind"].as_str(), None | Some("direct"))
+    {
         return Err(Error::new(
             "FORBIDDEN",
-            "launch actor does not match its admitted Operation caller",
+            "direct launch actor does not match its admitted Operation caller",
         ));
     }
+    let client_id = retained_client_id.to_owned();
     let admitted_role = model::text(&manifest["actor"], "role")?;
     let link_id = model::text(&manifest["actor"], "link_id")?.to_owned();
     let profile = meta(db, &format!("client:{client_id}"))?
@@ -1607,16 +2248,13 @@ pub(super) fn launch_actor(db: &Connection, operation_id: &str) -> Result<Princi
         client_id,
         role,
     };
-    require_manager(db, &principal)?;
+    let actor = LaunchActor::Direct(principal);
+    actor.require_current(db)?;
     let task_id = model::text(&manifest["task"], "task_id")?;
-    let task = super::tasks::get_task(db, task_id)?;
-    let attempt = task["current_attempt_id"]
-        .as_str()
-        .map(|attempt_id| get_attempt_row(db, attempt_id))
-        .transpose()?
-        .flatten();
-    authorize_launch_project(db, &principal, attempt.as_ref())?;
-    Ok(principal)
+    let task_revision = model::positive(&manifest["task"], "observed_revision")?;
+    let attempt_id = manifest["task"]["attempt_id"].as_str();
+    actor.require_action_object(db, "swarm.launch", task_id, task_revision, attempt_id)?;
+    Ok(actor)
 }
 
 /// Bounded host selector. Unknown launches are selected for readback only;
@@ -1722,21 +2360,21 @@ pub(super) fn fail_launch(
 /// preparation and return only the exact Task scope bound by its digest.
 pub(super) fn launch_workspace_plan(
     db: &Connection,
-    p: &Principal,
+    actor: &LaunchActor,
     operation_id: &str,
     config: &Config,
 ) -> Result<crate::workspace::WorkspaceLeasePlan> {
-    launch_workspace_plan_inner(db, p, operation_id, config, false)
+    launch_workspace_plan_inner(db, actor, operation_id, config, false)
 }
 
 fn launch_workspace_plan_inner(
     db: &Connection,
-    p: &Principal,
+    actor: &LaunchActor,
     operation_id: &str,
     config: &Config,
     allow_exact_unknown_readback: bool,
 ) -> Result<crate::workspace::WorkspaceLeasePlan> {
-    require_manager(db, p)?;
+    actor.require_current(db)?;
     let operation = super::operations::get_operation(db, operation_id)?;
     let pending = operation["state"] == "queued"
         && operation["result"]["launch_state"] == "pending_workspace";
@@ -1745,7 +2383,7 @@ fn launch_workspace_plan_inner(
         && operation["result"]["launch_state"] == "outcome_unknown"
         && retained_launch_manifest(db, operation_id)?["state"] == "outcome_unknown";
     if operation["method"] != "swarm.launch"
-        || operation["caller_id"] != p.client_id
+        || operation["caller_id"] != actor.technical_requester_id()
         || !(pending || unknown_readback)
     {
         return Err(Error::new(
@@ -1771,8 +2409,13 @@ fn launch_workspace_plan_inner(
             "retained launch request identity changed",
         ));
     }
-    let preview =
-        launch_preview_for_operation(db, p, &request.preview_params(), config, operation_id)?;
+    let preview = launch_preview_for_operation_actor(
+        db,
+        actor,
+        &request.preview_params(),
+        config,
+        operation_id,
+    )?;
     if preview["plan_digest"] != request.plan_digest
         || operation["task_id"] != preview["task"]["task_id"]
         || operation["attempt_id"] != preview["current_attempt"]["attempt_id"]
@@ -1852,7 +2495,7 @@ fn launch_workspace_plan_inner(
             .map(|attempt| attempt.owner_id)
             .ok_or_else(|| Error::new("STALE_LAUNCH", "current Attempt owner is unavailable"))?
     } else {
-        p.client_id.clone()
+        actor.effective_manager_id().to_owned()
     };
     let plan = crate::workspace::WorkspaceLeasePlan {
         project_id: row.project_id,
@@ -1888,7 +2531,7 @@ struct LaunchOpenOperationRow {
 
 fn admit_launch_open(
     tx: &Transaction<'_>,
-    p: &Principal,
+    actor: &LaunchActor,
     parent_operation_id: &str,
     params_value: &Value,
     lease: &crate::workspace::LeaseAuthorityRef,
@@ -1902,7 +2545,7 @@ fn admit_launch_open(
             "SELECT operation_id,method,original_request_json,state,result_json,effective_request_json,\
                     prerequisite_operation_id\
              FROM operations WHERE caller_id=?1 AND client_request_id=?2",
-            params![p.client_id, request_id],
+            params![actor.technical_requester_id(), request_id],
             |row| {
                 Ok(LaunchOpenOperationRow {
                     operation_id: row.get(0)?,
@@ -1959,7 +2602,14 @@ fn admit_launch_open(
         "INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,\
          effective_request_json,prerequisite_operation_id,state,due_at_ms,created_at_ms,updated_at_ms)\
          VALUES(?1,?2,?3,'agent.open',?4,'{}',?5,'queued',?6,?6,?6)",
-        params![child_id, p.client_id, request_id, original, parent_operation_id, now],
+        params![
+            child_id,
+            actor.technical_requester_id(),
+            request_id,
+            original,
+            parent_operation_id,
+            now
+        ],
     )?;
     Ok((child_id, true))
 }
@@ -2065,15 +2715,17 @@ fn final_workspace_manifest_digest(
 /// binding after Host evidence has moved the precise lease to held.
 pub(super) fn launch_after_workspace_held(
     tx: &Transaction<'_>,
-    p: &Principal,
+    actor: &LaunchActor,
     config: &Config,
     operation_id: &str,
     lease: &crate::workspace::LeaseAuthorityRef,
     now: i64,
 ) -> Result<Value> {
-    require_manager(tx, p)?;
+    actor.require_current(tx)?;
     let operation = super::operations::get_operation(tx, operation_id)?;
-    if operation["method"] != "swarm.launch" || operation["caller_id"] != p.client_id {
+    if operation["method"] != "swarm.launch"
+        || operation["caller_id"] != actor.technical_requester_id()
+    {
         return Err(Error::new(
             "FORBIDDEN",
             "launch is not owned by this manager",
@@ -2100,8 +2752,13 @@ pub(super) fn launch_after_workspace_held(
             "launch Operation is no longer queued",
         ));
     }
-    let plan =
-        launch_workspace_plan_inner(tx, p, operation_id, config, recovering_unknown_workspace)?;
+    let plan = launch_workspace_plan_inner(
+        tx,
+        actor,
+        operation_id,
+        config,
+        recovering_unknown_workspace,
+    )?;
     if lease.state != "held"
         || lease.operation_id != operation_id
         || lease.plan_digest != plan.plan_digest
@@ -2155,9 +2812,9 @@ pub(super) fn launch_after_workspace_held(
     )?;
     let launch_request =
         launcher::LaunchRequest::parse(&serde_json::from_str::<Value>(&request_raw)?)?;
-    let preview = launch_preview_for_operation(
+    let preview = launch_preview_for_operation_actor(
         tx,
-        p,
+        actor,
         &launch_request.preview_params(),
         config,
         operation_id,
@@ -2184,11 +2841,18 @@ pub(super) fn launch_after_workspace_held(
                 "client_request_id":launch_child_request_id(operation_id, "claim"),
                 "task_id":task_id,
                 "expected_revision":task_revision,
-                "owner_id":p.client_id,
+                "owner_id":actor.effective_manager_id(),
                 "start_owner":"controller",
             });
-            let claimed =
-                super::mutate_in_transaction(tx, p, "task.claim", &claim_request, config, now)??;
+            let claimed = super::mutate_launch_child_in_transaction(
+                tx,
+                actor,
+                "task.claim",
+                &claim_request,
+                config,
+                now,
+                operation_id,
+            )??;
             model::text(&claimed, "attempt_id")?.to_owned()
         }
         "use_existing" => {
@@ -2210,6 +2874,24 @@ pub(super) fn launch_after_workspace_held(
             ));
         }
     };
+    let attempt_bound = tx.execute(
+        "UPDATE operations SET task_id=?2,attempt_id=?3,updated_at_ms=?4 \
+         WHERE operation_id=?1 AND caller_id=?5 AND method='swarm.launch' \
+           AND state IN ('queued','outcome_unknown') AND task_id=?2 \
+           AND (attempt_id IS NULL OR attempt_id=?3)",
+        params![
+            operation_id,
+            task_id,
+            attempt_id,
+            now,
+            actor.technical_requester_id()
+        ],
+    )?;
+    if attempt_bound != 1 {
+        return Err(Error::conflict(
+            "launch Operation could not retain its exact current Attempt",
+        ));
+    }
     let task = super::tasks::get_task(tx, &task_id)?;
     let attempt = super::tasks::get_attempt(tx, &attempt_id)?;
     if task["state"] != "open"
@@ -2228,6 +2910,7 @@ pub(super) fn launch_after_workspace_held(
             "current Attempt no longer matches its unstarted launch reservation",
         ));
     }
+    actor.require_claimed_launch_attempt(tx, operation_id, &task_id, task_revision, &attempt_id)?;
     let lease = if plan.attempt_id.is_some() {
         if lease.attempt_id.as_deref() != Some(attempt_id.as_str()) {
             return Err(Error::new(
@@ -2237,7 +2920,7 @@ pub(super) fn launch_after_workspace_held(
         }
         lease.clone()
     } else {
-        super::workspace::pin_lease_attempt(tx, p, lease, &plan, &attempt_id, now)?
+        super::workspace::pin_lease_attempt_for_launch(tx, actor, lease, &plan, &attempt_id, now)?
     };
     super::workspace::assert_held_for_claim(tx, &lease, &plan)?;
     let lease_view = if recovering_unknown_workspace && plan.attempt_id.is_none() {
@@ -2258,11 +2941,11 @@ pub(super) fn launch_after_workspace_held(
         "route":launch_request.preview.route,
     });
     let (open_operation_id, is_new_open) =
-        admit_launch_open(tx, p, operation_id, &open_request, &lease, now)?;
+        admit_launch_open(tx, actor, operation_id, &open_request, &lease, now)?;
     let open_result = if is_new_open {
-        let result = super::operations::open_for_launch(
+        let result = super::operations::open_for_launch_for_actor(
             tx,
-            p,
+            actor,
             &open_request,
             config,
             &open_operation_id,
@@ -2308,7 +2991,6 @@ pub(super) fn launch_after_workspace_held(
             "Attempt binding association changed before launch CAS",
         ));
     }
-
     let workspace_manifest_digest =
         final_workspace_manifest_digest(&launch_request.plan_digest, &lease, &lease_view)?;
     manifest["state"] = json!("awaiting_binding");
@@ -2492,7 +3174,7 @@ pub(super) fn reconcile_launch(
     let open_operation_id = model::text(&manifest["binding"], "operation_id")?.to_owned();
     let open_operation = super::operations::get_operation(tx, &open_operation_id)?;
     if open_operation["method"] != "agent.open"
-        || open_operation["caller_id"] != actor.client_id
+        || open_operation["caller_id"] != actor.technical_requester_id()
         || open_operation["prerequisite_operation_id"] != operation_id
         || open_operation["attempt_id"].as_str() != Some(attempt_id.as_str())
         || open_operation["task_id"].as_str() != Some(task_id.as_str())
@@ -2638,28 +3320,36 @@ pub(super) fn launch_preview(
     params_value: &Value,
     config: &Config,
 ) -> Result<Value> {
-    launch_preview_inner(db, p, params_value, config, None)
+    launch_preview_for_actor(db, &LaunchActor::Direct(p.clone()), params_value, config)
 }
 
-pub(super) fn launch_preview_for_operation(
+pub(crate) fn launch_preview_for_actor(
     db: &Connection,
-    p: &Principal,
+    actor: &LaunchActor,
+    params_value: &Value,
+    config: &Config,
+) -> Result<Value> {
+    launch_preview_inner(db, actor, params_value, config, None)
+}
+
+pub(crate) fn launch_preview_for_operation_actor(
+    db: &Connection,
+    actor: &LaunchActor,
     params_value: &Value,
     config: &Config,
     operation_id: &str,
 ) -> Result<Value> {
-    launch_preview_inner(db, p, params_value, config, Some(operation_id))
+    launch_preview_inner(db, actor, params_value, config, Some(operation_id))
 }
 
 fn launch_preview_inner(
     db: &Connection,
-    p: &Principal,
+    actor: &LaunchActor,
     params_value: &Value,
     config: &Config,
     exclude_operation_id: Option<&str>,
 ) -> Result<Value> {
     let request = launcher::LaunchPreviewRequest::parse(params_value)?;
-    require_manager(db, p)?;
 
     let row = query_task(db, &request.task_id)?;
     let attempt = row
@@ -2668,13 +3358,18 @@ fn launch_preview_inner(
         .map(|attempt_id| get_attempt_row(db, attempt_id))
         .transpose()?
         .flatten();
-    authorize_launch_project(db, p, attempt.as_ref())?;
-
     let exact_current_attempt = attempt.as_ref().filter(|attempt| {
         attempt.task_id == row.task_id
             && attempt.released_at_ms.is_none()
             && row.current_attempt_id.as_deref() == Some(attempt.attempt_id.as_str())
     });
+    actor.require_action_object(
+        db,
+        "swarm.launch",
+        &row.task_id,
+        row.revision,
+        exact_current_attempt.map(|attempt| attempt.attempt_id.as_str()),
+    )?;
     let task_revision_current = request.expected_task_revision == row.revision;
     let (task_brief, task_brief_reference, spec) = source_brief(&row);
     let task_brief =
@@ -2781,7 +3476,7 @@ fn launch_preview_inner(
         Some(attempt) => {
             if attempt.task_revision != row.revision {
                 ("forbidden", Some("current_attempt_revision_is_stale"))
-            } else if p.role == Role::Manager && attempt.owner_id != p.client_id {
+            } else if attempt.owner_id != actor.effective_manager_id() {
                 (
                     "forbidden",
                     Some("current_attempt_is_owned_by_another_manager"),

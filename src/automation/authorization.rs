@@ -231,6 +231,23 @@ pub(crate) struct OnBehalfOperationLink {
     pub(crate) linked_at_ms: i64,
 }
 
+/// A validated retained attribution for an Operation admitted by automation.
+/// Review links and WorkDispatch links have separate contracts; this enum is
+/// only their shared visibility boundary and does not widen either contract.
+pub(crate) enum AnyOnBehalfOperationLink {
+    Review(OnBehalfOperationLink),
+    WorkDispatch(crate::store::automation_work_dispatch::WorkDispatchOperationLink),
+}
+
+impl AnyOnBehalfOperationLink {
+    pub(crate) fn belongs_to(&self, principal: &Principal) -> bool {
+        match self {
+            Self::Review(link) => link.belongs_to(principal),
+            Self::WorkDispatch(link) => link.belongs_to(principal),
+        }
+    }
+}
+
 impl OnBehalfOperationLink {
     pub(crate) fn belongs_to(&self, principal: &Principal) -> bool {
         principal.role == Role::Manager && principal.client_id == self.effective_manager_id
@@ -484,7 +501,111 @@ pub(crate) fn on_behalf_visible_to(
     principal: &Principal,
     operation_id: &str,
 ) -> Result<bool> {
-    Ok(operation_link(db, operation_id)?.is_some_and(|link| link.belongs_to(principal)))
+    let Some(link) = any_on_behalf_operation_link(db, operation_id)? else {
+        return Ok(false);
+    };
+    if !link.belongs_to(principal) {
+        return Ok(false);
+    }
+    match link {
+        AnyOnBehalfOperationLink::Review(_) => Ok(true),
+        AnyOnBehalfOperationLink::WorkDispatch(link) => {
+            current_work_dispatch_scope_visible_to(db, principal, &link)
+        }
+    }
+}
+
+/// Load a retained review or WorkDispatch link and validate its own durable
+/// provenance. This is intended for the local Operator's global diagnostic
+/// branch; manager authorization must additionally use
+/// `on_behalf_visible_to` so current Task/project rights are rechecked.
+pub(crate) fn any_on_behalf_operation_link(
+    db: &Connection,
+    operation_id: &str,
+) -> Result<Option<AnyOnBehalfOperationLink>> {
+    let review = operation_link(db, operation_id)?;
+    let work_dispatch = crate::store::automation_work_dispatch::operation_link(db, operation_id)?;
+    match (review, work_dispatch) {
+        (Some(_), Some(_)) => Err(Error::new(
+            "AUTOMATION_LINK_CORRUPT",
+            "Operation has both review and WorkDispatch attribution records",
+        )),
+        (Some(link), None) => Ok(Some(AnyOnBehalfOperationLink::Review(link))),
+        (None, Some(link)) => Ok(Some(AnyOnBehalfOperationLink::WorkDispatch(link))),
+        (None, None) => Ok(None),
+    }
+}
+
+fn current_work_dispatch_scope_visible_to(
+    db: &Connection,
+    principal: &Principal,
+    link: &crate::store::automation_work_dispatch::WorkDispatchOperationLink,
+) -> Result<bool> {
+    current_manager_has_task_scope(db, principal, &link.task_id, &link.project_id)
+}
+
+/// Current manager project/object policy shared by WorkDispatch history and
+/// launcher admission. An active Attempt grants only its current owner access;
+/// an unassigned or differently owned Task remains current-GM scoped. This
+/// intentionally does not consult the Automation entry's enabled flag/revision.
+pub(crate) fn current_manager_has_task_scope(
+    db: &Connection,
+    principal: &Principal,
+    task_id: &str,
+    project_id: &str,
+) -> Result<bool> {
+    if principal.role != Role::Manager {
+        return Ok(false);
+    }
+    current_manager_id_has_task_scope(db, &principal.client_id, task_id, project_id)
+}
+
+fn current_manager_id_has_task_scope(
+    db: &Connection,
+    manager_id: &str,
+    task_id: &str,
+    project_id: &str,
+) -> Result<bool> {
+    if let Err(error) = require_registered_manager(db, manager_id) {
+        if error.code == "FORBIDDEN" {
+            return Ok(false);
+        }
+        return Err(error);
+    }
+
+    // Match the ordinary launcher read policy: a manager can read their
+    // current Task scope when they own its current unreleased Attempt; an
+    // unassigned or differently owned Task is visible only to the current GM.
+    // The historical automation configuration revision is deliberately not
+    // part of this check, so disabling or revising the entry does not erase
+    // access to its retained Operation history.
+    let scope: Option<(String, Option<String>)> = db
+        .query_row(
+            "SELECT t.project_id,(SELECT a.owner_id FROM attempts AS a \
+             WHERE a.task_id=t.task_id AND a.released_at_ms IS NULL \
+             ORDER BY a.created_at_ms DESC,a.attempt_id DESC LIMIT 1) \
+             FROM tasks AS t WHERE t.task_id=?1",
+            [task_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((current_project_id, current_attempt_owner)) = scope else {
+        return Ok(false);
+    };
+    if current_project_id != project_id {
+        return Ok(false);
+    }
+    if current_attempt_owner.as_deref() == Some(manager_id) {
+        return Ok(true);
+    }
+    let current_gm: Option<String> = db
+        .query_row(
+            "SELECT json_extract(value_json,'$.client_id') FROM meta WHERE key='gm'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(current_gm.as_deref() == Some(manager_id))
 }
 
 pub(crate) fn entry_operation_links(
@@ -495,6 +616,10 @@ pub(crate) fn entry_operation_links(
     after: &str,
     limit: usize,
 ) -> Result<Vec<OnBehalfOperationLink>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let limit = limit.min(100);
     let prefix = config::entry_operation_prefix(owner, project, automation_id)?;
     let after_key = if after.is_empty() {
         prefix.clone()
@@ -509,7 +634,8 @@ pub(crate) fn entry_operation_links(
             row.get::<_, String>(0)
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    let mut links = Vec::with_capacity(keys.len());
+    drop(statement);
+    let mut links = Vec::with_capacity(limit);
     for key in keys {
         let operation_id = key.strip_prefix(&prefix).ok_or_else(|| {
             Error::new("AUTOMATION_LINK_CORRUPT", "operation index key is invalid")
@@ -531,6 +657,74 @@ pub(crate) fn entry_operation_links(
         }
         links.push(link);
     }
+
+    let mut dispatch_after = after.to_owned();
+    let mut dispatch_scanned = 0usize;
+    let mut dispatch_visible = 0usize;
+    const MAX_WORK_DISPATCH_HISTORY_SCAN: usize = 100;
+    while dispatch_visible < limit && dispatch_scanned < MAX_WORK_DISPATCH_HISTORY_SCAN {
+        let page_limit = limit.min(MAX_WORK_DISPATCH_HISTORY_SCAN - dispatch_scanned);
+        let work_dispatch = crate::store::automation_work_dispatch::entry_operation_links(
+            db,
+            owner,
+            project,
+            automation_id,
+            &dispatch_after,
+            page_limit,
+        )?;
+        if work_dispatch.is_empty() {
+            break;
+        }
+        let page_len = work_dispatch.len();
+        if let Some(last) = work_dispatch.last() {
+            dispatch_after.clone_from(&last.operation_id);
+        }
+        dispatch_scanned += page_len;
+        for link in work_dispatch {
+            if links
+                .iter()
+                .any(|existing| existing.operation_id == link.operation_id)
+            {
+                return Err(Error::new(
+                    "AUTOMATION_LINK_CORRUPT",
+                    "Operation appears in both review and WorkDispatch entry indexes",
+                ));
+            }
+            // `store::automation::explain` has already authenticated a Manager
+            // and loaded this exact owner/project Automation entry. Filter each
+            // WorkDispatch history item through the current Task scope before it
+            // participates in the bounded response page.
+            if !current_manager_id_has_task_scope(db, owner, &link.task_id, &link.project_id)? {
+                continue;
+            }
+            dispatch_visible += 1;
+            links.push(OnBehalfOperationLink {
+                schema_version: 1,
+                operation_id: link.operation_id,
+                technical_requester_id: link.technical_requester_id,
+                effective_manager_id: link.effective_manager_id,
+                automation_id: link.automation_id,
+                automation_revision: link.automation_revision,
+                project_id: link.project_id,
+                action: link.action,
+                cause: json!({
+                    "kind":link.semantic_cause_kind,
+                    "id":link.semantic_cause_id,
+                    "semantic_slot_id":link.semantic_slot_id,
+                    "task_id":link.task_id,
+                    "task_revision":link.task_revision,
+                    "attempt_id":link.attempt_id,
+                    "source":link.source
+                }),
+                linked_at_ms: link.linked_at_ms,
+            });
+        }
+        if page_len < page_limit {
+            break;
+        }
+    }
+    links.sort_by(|left, right| left.operation_id.cmp(&right.operation_id));
+    links.truncate(limit);
     Ok(links)
 }
 

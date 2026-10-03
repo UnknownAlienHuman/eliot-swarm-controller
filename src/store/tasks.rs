@@ -145,6 +145,11 @@ pub(super) fn revise(
         json!({"operation_id":id,"task_id":task_id,"revision":next,"existing_attempt_preserved":true}),
     )
 }
+enum ClaimAuthority<'a> {
+    Direct(&'a Principal),
+    Launch(&'a super::launcher::LaunchActor),
+}
+
 pub(super) fn claim(
     tx: &Transaction<'_>,
     p: &Principal,
@@ -152,6 +157,29 @@ pub(super) fn claim(
     id: &str,
     now: i64,
 ) -> Result<Value> {
+    claim_with_authority(tx, ClaimAuthority::Direct(p), v, id, now)
+}
+
+/// Launch-only Task claim. A WorkDispatch actor retains its technical caller
+/// separately from the effective manager who owns the Task Attempt.
+pub(super) fn claim_for_launch(
+    tx: &Transaction<'_>,
+    actor: &super::launcher::LaunchActor,
+    v: &Value,
+    id: &str,
+    now: i64,
+) -> Result<Value> {
+    claim_with_authority(tx, ClaimAuthority::Launch(actor), v, id, now)
+}
+
+fn claim_with_authority(
+    tx: &Transaction<'_>,
+    authority: ClaimAuthority<'_>,
+    v: &Value,
+    id: &str,
+    now: i64,
+) -> Result<Value> {
+    let launch_claim = matches!(&authority, ClaimAuthority::Launch(_));
     model::fields(
         v,
         &[
@@ -166,11 +194,40 @@ pub(super) fn claim(
     )?;
     let task_id = model::text(v, "task_id")?;
     let revision = model::positive(v, "expected_revision")?;
-    let owner = v
-        .get("owner_id")
-        .and_then(Value::as_str)
-        .unwrap_or(&p.client_id);
-    p.owns(owner)?;
+    let owner = match &authority {
+        ClaimAuthority::Direct(principal) => {
+            let owner = v
+                .get("owner_id")
+                .and_then(Value::as_str)
+                .unwrap_or(&principal.client_id);
+            principal.owns(owner)?;
+            owner
+        }
+        ClaimAuthority::Launch(actor) => {
+            let owner = actor.effective_manager_id();
+            if v.get("owner_id").and_then(Value::as_str) != Some(owner) {
+                return Err(Error::new(
+                    "FORBIDDEN",
+                    "launch claim owner must be the effective manager",
+                ));
+            }
+            let caller: Option<String> = tx
+                .query_row(
+                    "SELECT caller_id FROM operations WHERE operation_id=?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if caller.as_deref() != Some(actor.technical_requester_id()) {
+                return Err(Error::new(
+                    "FORBIDDEN",
+                    "launch claim Operation caller differs from its technical requester",
+                ));
+            }
+            actor.require_action_object(tx, "swarm.launch", task_id, revision, None)?;
+            owner
+        }
+    };
     let profile = meta(tx, &format!("client:{owner}"))?
         .ok_or_else(|| Error::new("NOT_FOUND", "owner is not registered"))?;
     if profile["disabled"] == true
@@ -183,6 +240,12 @@ pub(super) fn claim(
     } else {
         StartOwner::NativeManager
     };
+    if launch_claim && start.as_str() != "controller" {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "launch claims require controller-owned Attempt start",
+        ));
+    }
     let task = get_task(tx, task_id)?;
     if task["revision"] != revision || task["state"] != "open" {
         return Err(Error::new(

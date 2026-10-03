@@ -7,8 +7,8 @@
 use crate::{
     config::Config,
     error::{Error, Result},
-    model::Principal,
     store::Store,
+    store::launcher::LaunchActor,
 };
 use rusqlite::Transaction;
 use serde_json::Value;
@@ -23,12 +23,12 @@ pub(crate) enum LaunchRegistrationOutcome {
 
 pub(crate) async fn register_for_launch(
     store: &Store,
-    principal: Principal,
+    actor: LaunchActor,
     launch_operation_id: String,
     params: Value,
 ) -> Result<LaunchRegistrationOutcome> {
     store
-        .register_participant_for_launch(principal, launch_operation_id, params)
+        .register_participant_for_launch(actor, launch_operation_id, params)
         .await
 }
 
@@ -37,7 +37,7 @@ pub(crate) async fn register_for_launch(
 /// the ordinary Participant registration handler runs.
 pub(super) fn validate_launch_registration(
     tx: &Transaction<'_>,
-    actor: &Principal,
+    actor: &LaunchActor,
     launch_operation_id: &str,
     config: &Config,
     registration_params: &Value,

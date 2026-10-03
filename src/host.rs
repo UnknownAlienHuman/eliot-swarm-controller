@@ -57,6 +57,14 @@ pub async fn run(config: Config) -> Result<()> {
     supervisors.spawn(async move { ("native-mcp", supervise_native_mcp(store, stop).await) });
     let store = owner.store.clone();
     let stop = stopping.clone();
+    supervisors.spawn(async move {
+        (
+            "native-mcp-tools",
+            supervise_native_mcp_tools(store, stop).await,
+        )
+    });
+    let store = owner.store.clone();
+    let stop = stopping.clone();
     supervisors.spawn(async move { ("forge", supervise_forge(store, stop).await) });
     let semaphore = Arc::new(Semaphore::new(config.ipc.max_connections));
     let mut connections = JoinSet::new();
@@ -170,6 +178,30 @@ async fn supervise_native_mcp(store: Store, mut stopping: watch::Receiver<bool>)
                 // Await the bounded readback through shutdown, independently
                 // of launch preparation and passive watch reconciliation.
                 store.reconcile_native_mcp_once().await?;
+            }
+        }
+    }
+}
+
+async fn supervise_native_mcp_tools(
+    store: Store,
+    mut stopping: watch::Receiver<bool>,
+) -> Result<()> {
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        if *stopping.borrow() {
+            return Ok(());
+        }
+        tokio::select! {
+            result = stopping.changed() => {
+                if result.is_err() || *stopping.borrow() { return Ok(()); }
+            }
+            _ = tick.tick() => {
+                if *stopping.borrow() { return Ok(()); }
+                // Store coalescing and durable backoff bound discovery work;
+                // shutdown awaits the admitted pass rather than detaching it.
+                store.reconcile_native_mcp_tools_once().await?;
             }
         }
     }

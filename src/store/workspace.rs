@@ -291,17 +291,39 @@ pub(crate) fn get_registration(
     Ok(registration)
 }
 
-/// Reserve the exact Task scope and launch operation. This phase is SQL-only;
-/// the returned reservation must be prepared outside the Store transaction.
-pub(crate) fn reserve_lease(
+/// Reserve a lease for the typed launcher actor. A WorkDispatch caller remains
+/// the Operation caller while its current Manager owns the lease.
+pub(crate) fn reserve_lease_for_launch(
     tx: &Transaction<'_>,
-    principal: &Principal,
+    actor: &super::launcher::LaunchActor,
     plan: &WorkspaceLeasePlan,
     now: i64,
 ) -> Result<LeaseReservation> {
     plan.validate()?;
-    require_manager_owner(tx, principal, &plan.owner_client_id)?;
-    verify_launch_operation(tx, plan)?;
+    authorize_launch_actor(tx, actor, plan, plan.attempt_id.as_deref())?;
+    reserve_lease_inner(
+        tx,
+        actor.technical_requester_id(),
+        actor.effective_manager_id(),
+        plan,
+        now,
+    )
+}
+
+fn reserve_lease_inner(
+    tx: &Transaction<'_>,
+    technical_requester_id: &str,
+    effective_manager_id: &str,
+    plan: &WorkspaceLeasePlan,
+    now: i64,
+) -> Result<LeaseReservation> {
+    verify_launch_operation(
+        tx,
+        plan,
+        technical_requester_id,
+        effective_manager_id,
+        false,
+    )?;
     verify_task_authority(tx, plan)?;
     reject_scope_conflicts(tx, plan)?;
 
@@ -384,21 +406,29 @@ pub(crate) fn reserve_lease(
     ))
 }
 
-/// Persist verified host evidence and atomically move one preparing lease to
-/// held. Every external fact is compared with the exact reservation and the
-/// current active registration before the CAS.
-pub(crate) fn commit_lease(
+/// Commit verified host evidence for the same typed launch authority used to
+/// reserve the lease. No Principal is reconstructed for WorkDispatch.
+pub(crate) fn commit_lease_for_launch(
     tx: &Transaction<'_>,
-    principal: &Principal,
+    actor: &super::launcher::LaunchActor,
     registration: &WorkspaceRegistration,
     reservation: &LeaseReservation,
     plan: &WorkspaceLeasePlan,
     evidence: &LeaseEvidence,
     now: i64,
 ) -> Result<LeaseAuthorityRef> {
+    plan.validate()?;
+    authorize_launch_actor(tx, actor, plan, plan.attempt_id.as_deref())?;
+    verify_launch_operation(
+        tx,
+        plan,
+        actor.technical_requester_id(),
+        actor.effective_manager_id(),
+        false,
+    )?;
     persist_verified_evidence(
         tx,
-        principal,
+        actor.effective_manager_id(),
         registration,
         reservation,
         plan,
@@ -408,20 +438,29 @@ pub(crate) fn commit_lease(
     )
 }
 
-/// Restart recovery can hold only an exact readback of the original lease;
-/// this shares commit validation but CASes from `outcome_unknown`.
-pub(crate) fn reconcile_lease(
+/// Reconcile an unknown host effect only under the same exact current actor,
+/// Task and lease identity that authorized the original reservation.
+pub(crate) fn reconcile_lease_for_launch(
     tx: &Transaction<'_>,
-    principal: &Principal,
+    actor: &super::launcher::LaunchActor,
     registration: &WorkspaceRegistration,
     reservation: &LeaseReservation,
     plan: &WorkspaceLeasePlan,
     evidence: &LeaseEvidence,
     now: i64,
 ) -> Result<LeaseAuthorityRef> {
+    plan.validate()?;
+    authorize_launch_actor(tx, actor, plan, plan.attempt_id.as_deref())?;
+    verify_launch_operation(
+        tx,
+        plan,
+        actor.technical_requester_id(),
+        actor.effective_manager_id(),
+        true,
+    )?;
     persist_verified_evidence(
         tx,
-        principal,
+        actor.effective_manager_id(),
         registration,
         reservation,
         plan,
@@ -437,7 +476,7 @@ pub(crate) fn reconcile_lease(
 #[allow(clippy::too_many_arguments)]
 fn persist_verified_evidence(
     tx: &Transaction<'_>,
-    principal: &Principal,
+    effective_manager_id: &str,
     registration: &WorkspaceRegistration,
     reservation: &LeaseReservation,
     plan: &WorkspaceLeasePlan,
@@ -445,8 +484,13 @@ fn persist_verified_evidence(
     expected_state: &str,
     now: i64,
 ) -> Result<LeaseAuthorityRef> {
-    require_manager_owner(tx, principal, &plan.owner_client_id)?;
     plan.validate()?;
+    if effective_manager_id != plan.owner_client_id {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "workspace lease owner differs from the effective manager",
+        ));
+    }
     workspace::evidence_matches_reservation(evidence, reservation, plan, registration)?;
     let current = registration_row(tx, &plan.project_id)?;
     if current.state != "active"
@@ -549,18 +593,51 @@ pub(crate) fn assert_held_for_claim(
     Ok(())
 }
 
-/// Pin the lease to the Attempt created by `task.claim`. The updated reference
-/// must be used by all later open/dispatch phases.
-pub(crate) fn pin_lease_attempt(
+/// Pin the exact post-claim Attempt without converting a WorkDispatch actor
+/// into a Principal. Its technical parent Operation and effective owner are
+/// revalidated against the retained context before the lease CAS.
+pub(crate) fn pin_lease_attempt_for_launch(
     tx: &Transaction<'_>,
-    principal: &Principal,
+    actor: &super::launcher::LaunchActor,
     reference: &LeaseAuthorityRef,
     plan: &WorkspaceLeasePlan,
     attempt_id: &str,
     now: i64,
 ) -> Result<LeaseAuthorityRef> {
     plan.validate()?;
-    require_manager_owner(tx, principal, &plan.owner_client_id)?;
+    if actor.effective_manager_id() != plan.owner_client_id {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "workspace lease owner differs from the effective manager",
+        ));
+    }
+    actor.require_claimed_launch_attempt(
+        tx,
+        &plan.operation_id,
+        &plan.task_id,
+        plan.task_revision,
+        attempt_id,
+    )?;
+    verify_operation_caller(tx, &plan.operation_id, actor.technical_requester_id())?;
+    pin_lease_attempt_inner(
+        tx,
+        actor.effective_manager_id(),
+        reference,
+        plan,
+        attempt_id,
+        now,
+    )
+}
+
+fn pin_lease_attempt_inner(
+    tx: &Transaction<'_>,
+    effective_manager_id: &str,
+    reference: &LeaseAuthorityRef,
+    plan: &WorkspaceLeasePlan,
+    attempt_id: &str,
+    now: i64,
+) -> Result<LeaseAuthorityRef> {
+    plan.validate()?;
     if reference.attempt_id.is_some() || plan.attempt_id.is_some() {
         return Err(Error::new(
             "WORKSPACE_ATTEMPT_PINNED",
@@ -577,7 +654,7 @@ pub(crate) fn pin_lease_attempt(
         || row.project_id != plan.project_id
         || row.operation_id != plan.operation_id
         || row.plan_digest != plan.plan_digest
-        || row.owner_client_id != principal.client_id
+        || row.owner_client_id != effective_manager_id
     {
         return Err(Error::new(
             "WORKSPACE_LEASE_STALE",
@@ -604,6 +681,7 @@ pub(crate) fn pin_lease_attempt(
     if attempt.0 != plan.task_id
         || attempt.1 != plan.task_revision
         || attempt.2 != plan.owner_client_id
+        || attempt.2 != effective_manager_id
         || attempt.4.is_some()
         || !matches!(
             attempt.3.as_str(),
@@ -1040,7 +1118,13 @@ fn verify_task_authority_with_pinned_attempt(
     }
 }
 
-fn verify_launch_operation(db: &Connection, plan: &WorkspaceLeasePlan) -> Result<()> {
+fn verify_launch_operation(
+    db: &Connection,
+    plan: &WorkspaceLeasePlan,
+    technical_requester_id: &str,
+    effective_manager_id: &str,
+    allow_unknown: bool,
+) -> Result<()> {
     let row: Option<(String, String, Option<String>, String, String)> = db
         .query_row(
             "SELECT caller_id,method,task_id,state,effective_request_json
@@ -1061,10 +1145,13 @@ fn verify_launch_operation(db: &Connection, plan: &WorkspaceLeasePlan) -> Result
         row.ok_or_else(|| Error::new("STALE_LAUNCH", "launch Operation is unavailable"))?;
     let manifest: Value = serde_json::from_str(&effective)?;
     let manifest = &manifest["launch_manifest"];
-    if caller != plan.owner_client_id
+    let state_matches = (state == "queued" && manifest["state"] == "pending_workspace")
+        || (allow_unknown && state == "outcome_unknown" && manifest["state"] == "outcome_unknown");
+    if caller != technical_requester_id
+        || effective_manager_id != plan.owner_client_id
         || method != "swarm.launch"
         || task_id.as_deref() != Some(plan.task_id.as_str())
-        || state != "queued"
+        || !state_matches
         || manifest["plan_digest"] != plan.plan_digest
         || manifest["task"]["task_id"] != plan.task_id
         || manifest["task"]["project_id"] != plan.project_id
@@ -1075,11 +1162,31 @@ fn verify_launch_operation(db: &Connection, plan: &WorkspaceLeasePlan) -> Result
                 .clone()
                 .map(Value::String)
                 .unwrap_or(Value::Null)
-        || manifest["state"] != "pending_workspace"
     {
         return Err(Error::new(
             "STALE_LAUNCH",
             "launch Operation does not retain this exact manager-owned plan",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_operation_caller(
+    db: &Connection,
+    operation_id: &str,
+    technical_requester_id: &str,
+) -> Result<()> {
+    let caller: Option<String> = db
+        .query_row(
+            "SELECT caller_id FROM operations WHERE operation_id=?1",
+            [operation_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if caller.as_deref() != Some(technical_requester_id) {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "launch Operation caller differs from its technical requester",
         ));
     }
     Ok(())
@@ -1154,6 +1261,28 @@ fn require_manager_owner(tx: &Transaction<'_>, principal: &Principal, owner: &st
             "workspace lease requires a Manager or the local Operator",
         )),
     }
+}
+
+fn authorize_launch_actor(
+    tx: &Transaction<'_>,
+    actor: &super::launcher::LaunchActor,
+    plan: &WorkspaceLeasePlan,
+    attempt_id: Option<&str>,
+) -> Result<()> {
+    plan.validate()?;
+    if actor.effective_manager_id() != plan.owner_client_id {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "workspace lease owner differs from the effective manager",
+        ));
+    }
+    actor.require_action_object(
+        tx,
+        "swarm.launch",
+        &plan.task_id,
+        plan.task_revision,
+        attempt_id,
+    )
 }
 
 #[derive(Debug)]

@@ -1,6 +1,6 @@
 use super::{meta, prerequisites, tasks};
 use crate::{
-    automation::authorization::operation_link,
+    automation::authorization::{on_behalf_visible_to, operation_link},
     config::Config,
     error::{Error, Result},
     model::{self, Principal, Role},
@@ -308,12 +308,13 @@ pub(super) fn open(
     reserve_open(tx, v, config, id, now)
 }
 
-/// Launcher admission carries a verified workspace lease rather than global
-/// Operator authority. The regular agent.open authorization stays unchanged.
+/// The admitted launcher may be a direct authenticated Manager or a verified
+/// WorkDispatch actor. Both routes use the same held-lease and reserved-open
+/// checks; only their typed identity/Task authorization differs.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn open_for_launch(
+pub(super) fn open_for_launch_for_actor(
     tx: &Transaction<'_>,
-    p: &Principal,
+    actor: &super::launcher::LaunchActor,
     v: &Value,
     config: &Config,
     id: &str,
@@ -321,12 +322,22 @@ pub(super) fn open_for_launch(
     lease_id: &str,
     lease_generation: i64,
 ) -> Result<Value> {
-    p.require_writer()?;
-    if p.role == crate::model::Role::Operator {
-        super::require_local_operator(tx, &p.client_id)?;
-    }
-    let row: Option<(String, i64, String, Option<String>, String, String)> = tx.query_row(
-        "SELECT l.task_id,l.task_revision,l.owner_client_id,l.attempt_id,l.workspace_path,parent.original_request_json \
+    let (caller_id, effective_manager_id) = match actor {
+        super::launcher::LaunchActor::Direct(p) => {
+            p.require_writer()?;
+            if p.role == Role::Operator {
+                super::require_local_operator(tx, &p.client_id)?;
+            }
+            (p.client_id.as_str(), p.client_id.as_str())
+        }
+        super::launcher::LaunchActor::OnBehalf(context) => (
+            context.technical_requester_id(),
+            context.effective_manager_id(),
+        ),
+    };
+    type LaunchLeaseRow = (String, String, i64, String, Option<String>, String, String);
+    let row: Option<LaunchLeaseRow> = tx.query_row(
+        "SELECT l.operation_id,l.task_id,l.task_revision,l.owner_client_id,l.attempt_id,l.workspace_path,parent.original_request_json \
          FROM workspace_leases l JOIN workspace_registrations r ON r.registration_id=l.registration_id \
          JOIN operations parent ON parent.operation_id=l.operation_id \
          WHERE l.lease_id=?1 AND l.generation=?2 AND l.state='held' \
@@ -334,23 +345,59 @@ pub(super) fn open_for_launch(
            AND l.baseline_commit<>'' AND l.binding_digest<>'' \
            AND parent.method='swarm.launch' AND parent.caller_id=?3 \
            AND parent.state NOT IN ('rejected','cancelled','outcome_unknown')",
-        params![lease_id,lease_generation,p.client_id],
-        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
+        params![lease_id,lease_generation,caller_id],
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?)),
     ).optional()?;
-    let (task_id, revision, owner, attempt_id, workspace_path, parent_request) =
+    let (parent_operation_id, task_id, revision, owner, attempt_id, workspace_path, parent_request) =
         row.ok_or_else(|| {
             Error::new(
                 "WORKSPACE_LEASE_REQUIRED",
                 "launch requires its own held current workspace lease",
             )
         })?;
-    p.owns(&owner)?;
+    if owner != effective_manager_id {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "held workspace lease belongs to a different effective manager",
+        ));
+    }
     let attempt_id = attempt_id.ok_or_else(|| {
         Error::new(
             "WORKSPACE_LEASE_REQUIRED",
             "lease must be pinned to an Attempt before opening",
         )
     })?;
+    match actor {
+        super::launcher::LaunchActor::Direct(p) => {
+            p.owns(&owner)?;
+            actor.require_action_object(
+                tx,
+                "swarm.launch",
+                &task_id,
+                revision,
+                Some(&attempt_id),
+            )?;
+        }
+        super::launcher::LaunchActor::OnBehalf(context) => {
+            if context.subject().attempt_id().is_some() {
+                actor.require_action_object(
+                    tx,
+                    "swarm.launch",
+                    &task_id,
+                    revision,
+                    Some(&attempt_id),
+                )?;
+            } else {
+                actor.require_claimed_launch_attempt(
+                    tx,
+                    &parent_operation_id,
+                    &task_id,
+                    revision,
+                    &attempt_id,
+                )?;
+            }
+        }
+    }
     let task = tasks::get_task(tx, &task_id)?;
     let attempt = tasks::get_attempt(tx, &attempt_id)?;
     if task["state"] != "open"
@@ -374,7 +421,7 @@ pub(super) fn open_for_launch(
             |row| row.get(0),
         )
         .optional()?;
-    if child.as_deref() != Some(p.client_id.as_str()) {
+    if child.as_deref() != Some(caller_id) {
         return Err(Error::new(
             "FORBIDDEN",
             "launch opening must retain its real manager Operation",
@@ -382,10 +429,13 @@ pub(super) fn open_for_launch(
     }
     model::fields(v, &["client_request_id", "lane_id", "route"])?;
     let parent_request: Value = serde_json::from_str(&parent_request)?;
-    if v["route"] != parent_request["route"] {
+    if parent_request["task_id"] != task_id
+        || parent_request["expected_task_revision"] != revision
+        || v["route"] != parent_request["route"]
+    {
         return Err(Error::new(
             "STALE_LAUNCH",
-            "binding route differs from the admitted launch",
+            "binding lease or route differs from the admitted launch",
         ));
     }
     let mut route = config.route(model::text(v, "route")?)?.clone();
@@ -563,8 +613,10 @@ pub(super) fn cancel(
     let reason = model::text(v, "reason")?;
     let o = get_operation(tx, target)?;
     let linked = operation_link(tx, target)?;
-    let manager_owns_link =
-        o["method"] == "review.assign" && linked.as_ref().is_some_and(|link| link.belongs_to(p));
+    let manager_owns_link = matches!(o["method"].as_str(), Some("review.assign" | "swarm.launch"))
+        && on_behalf_visible_to(tx, p, target)?
+        && (o["method"] != "review.assign"
+            || linked.as_ref().is_some_and(|link| link.belongs_to(p)));
     if !manager_owns_link {
         p.owns(model::text(&o, "caller_id")?)?;
     }

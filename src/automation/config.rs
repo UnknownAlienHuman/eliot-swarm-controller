@@ -1,6 +1,7 @@
 //! Typed, manager-scoped automation definitions and patch semantics.
 
 use super::actions::{AutomationStep, supported_action_for};
+use super::work_dispatch::WorkDispatchLaunchSettings;
 use crate::error::{Error, Result};
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -45,6 +46,8 @@ pub(crate) struct AutomationEntry {
     pub(crate) scope: AutomationScope,
     #[serde(default)]
     pub(crate) steps: Vec<AutomationStep>,
+    #[serde(default)]
+    pub(crate) work_dispatch: Option<WorkDispatchLaunchSettings>,
     pub(crate) review: ReviewSettings,
     pub(crate) created_at_ms: i64,
     pub(crate) updated_at_ms: i64,
@@ -71,6 +74,7 @@ impl AutomationEntry {
             preset: None,
             scope: AutomationScope { work_pool_id: None },
             steps: Vec::new(),
+            work_dispatch: None,
             review: ReviewSettings {
                 profile: None,
                 required_reviewers: 1,
@@ -96,6 +100,21 @@ impl AutomationEntry {
                 "code":"work_pool_scope_unavailable",
                 "reason":"the current Task source has no committed work-pool membership reader"
             }));
+        }
+        if self.steps.contains(&AutomationStep::WorkDispatch) {
+            if self.work_dispatch.is_none() {
+                gaps.push(json!({
+                    "code":"work_dispatch_settings_required",
+                    "step":"work_dispatch",
+                    "reason":"select every launcher setting explicitly; no route, profile, workspace policy, or budget default is inferred"
+                }));
+            } else {
+                gaps.push(json!({
+                    "code":"launch_effect_qualification_pending",
+                    "step":"work_dispatch",
+                    "reason":"WorkDispatch can admit the normal retained launch Operation; hosted route, workspace, MCP, and productive runtime readiness remain separate launch gates"
+                }));
+            }
         }
         if self.steps.contains(&AutomationStep::ReviewDispatch) {
             if self.review.profile.is_none() {
@@ -130,6 +149,13 @@ impl AutomationEntry {
             && self.steps.contains(&AutomationStep::ReviewDispatch)
             && self.review.profile.is_some()
             && self.review.required_reviewers == 1
+            && self.scope.work_pool_id.is_none()
+    }
+
+    pub(crate) fn work_dispatch_ready(&self) -> bool {
+        self.enabled
+            && self.steps.contains(&AutomationStep::WorkDispatch)
+            && self.work_dispatch.is_some()
             && self.scope.work_pool_id.is_none()
     }
 }
@@ -284,6 +310,7 @@ pub(crate) fn apply_patch(
             }
             "scope" => patch_scope(&mut next.scope, value)?,
             "steps" => next.steps = parse_steps(value)?,
+            "work_dispatch" => patch_work_dispatch(&mut next.work_dispatch, value)?,
             "review" => patch_review(&mut next.review, value)?,
             _ => return Err(Error::invalid(format!("unknown automation field: {field}"))),
         }
@@ -296,6 +323,56 @@ pub(crate) fn apply_patch(
         next.updated_at_ms = now_ms;
     }
     Ok(next)
+}
+
+fn patch_work_dispatch(
+    settings: &mut Option<WorkDispatchLaunchSettings>,
+    patch: &Value,
+) -> Result<()> {
+    if patch.is_null() {
+        *settings = None;
+        return Ok(());
+    }
+    if !patch.is_object() {
+        return Err(Error::invalid(
+            "work_dispatch patch must be an object or null",
+        ));
+    }
+    let mut merged = match settings {
+        Some(settings) => serde_json::to_value(settings)?,
+        None => json!({}),
+    };
+    merge_object_patch(&mut merged, patch)?;
+    *settings = Some(WorkDispatchLaunchSettings::parse(&merged)?);
+    Ok(())
+}
+
+/// Merge nested objects and replace arrays/scalars with the patch value.
+/// `null` is an explicit value, which is required for nullable launcher
+/// model/effort selectors; removing the whole settings object uses top-level
+/// `work_dispatch: null`.
+fn merge_object_patch(target: &mut Value, patch: &Value) -> Result<()> {
+    let patch_object = patch
+        .as_object()
+        .ok_or_else(|| Error::invalid("nested WorkDispatch patch must be an object"))?;
+    let target_object = target
+        .as_object_mut()
+        .ok_or_else(|| Error::invalid("stored WorkDispatch settings are not an object"))?;
+    for (key, value) in patch_object {
+        if value.is_object() {
+            match target_object.get_mut(key) {
+                Some(existing) if existing.is_object() => merge_object_patch(existing, value)?,
+                _ => {
+                    let mut nested = json!({});
+                    merge_object_patch(&mut nested, value)?;
+                    target_object.insert(key.clone(), nested);
+                }
+            }
+        } else {
+            target_object.insert(key.clone(), value.clone());
+        }
+    }
+    Ok(())
 }
 
 fn patch_scope(scope: &mut AutomationScope, value: &Value) -> Result<()> {
@@ -433,6 +510,20 @@ pub(crate) fn validate_entry(entry: &AutomationEntry) -> Result<()> {
             Error::new(
                 "AUTOMATION_RECORD_INVALID",
                 "stored work-pool scope is invalid",
+            )
+        })?;
+    }
+    if let Some(settings) = entry.work_dispatch.as_ref() {
+        let value = serde_json::to_value(settings).map_err(|_| {
+            Error::new(
+                "AUTOMATION_RECORD_INVALID",
+                "stored work-dispatch settings cannot be serialized",
+            )
+        })?;
+        WorkDispatchLaunchSettings::parse(&value).map_err(|_| {
+            Error::new(
+                "AUTOMATION_RECORD_INVALID",
+                "stored work-dispatch settings do not match the launcher request contract",
             )
         })?;
     }

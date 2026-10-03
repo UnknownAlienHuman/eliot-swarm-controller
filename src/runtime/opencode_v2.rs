@@ -7,6 +7,8 @@ mod execution;
 mod goal;
 mod http;
 mod mcp;
+pub(crate) mod mcp_install;
+pub(crate) mod mcp_tools;
 mod prerequisites;
 mod results;
 mod snapshot;

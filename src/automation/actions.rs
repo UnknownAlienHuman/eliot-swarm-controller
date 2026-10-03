@@ -5,8 +5,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 /// Steps retained in the manager-owned configuration format.
-/// `review_dispatch` and bounded `review_disposition` have execution consumers;
-/// the others remain visible capability gaps rather than simulated effects.
+/// `work_dispatch`, `review_dispatch`, and bounded `review_disposition` have
+/// Store consumers; the other steps remain visible capability gaps rather
+/// than simulated effects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum AutomationStep {
@@ -46,7 +47,10 @@ impl AutomationStep {
     }
 
     pub(crate) fn has_consumer(self) -> bool {
-        matches!(self, Self::ReviewDispatch | Self::ReviewDisposition)
+        matches!(
+            self,
+            Self::WorkDispatch | Self::ReviewDispatch | Self::ReviewDisposition
+        )
     }
 
     pub(crate) fn capability_gap(self) -> Option<Value> {
@@ -103,6 +107,7 @@ impl AutomationCause {
 
 pub(crate) fn supported_action_for(step: AutomationStep) -> Option<&'static str> {
     match step {
+        AutomationStep::WorkDispatch => Some("swarm.launch"),
         AutomationStep::ReviewDispatch => Some("review.assign"),
         _ => None,
     }
