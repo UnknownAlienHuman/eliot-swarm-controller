@@ -1,7 +1,7 @@
 # ELIOT Remote Agent Gateway
 ## OpenAI Dot, Meta Muse Agent and Cloudflare integration program
 
-**Revision:** 1 â€” 2026-10-02  
+**Revision:** 2 â€” 2026-10-02  
 **Repository baseline:** `0ff7129d11a15a71a94e1ed2c265f7a3eeb0e1db`  
 **Status:** documentation and implementation handoff. No remote control path described here is qualified merely because this document exists.
 
@@ -23,12 +23,16 @@ OpenAI Dot
       -> ELIOT host
 
 Meta Muse personal agent
-  current supported path:
-    Muse Secure VM browser
-      -> Cloudflare Access
-      -> thin web operator surface / Streamable HTTP gateway
+  preferred typed pilot:
+    Muse Custom Connector
+      -> Cloudflare-protected narrow HTTPS API
+      -> loopback Remote Agent Gateway
       -> local ELIOT IPC
       -> ELIOT host
+  fallback:
+    Muse Secure VM browser
+      -> Cloudflare Access
+      -> thin read-only operator surface
 
 Other external agents
   optional public path:
@@ -40,7 +44,7 @@ Other external agents
       -> ELIOT host
 ```
 
-OpenAI Secure MCP Tunnel is the default for Dot because it keeps the MCP server private and needs no public domain. Cloudflare remains the general external ingress for Muse and other clients. Connectivity is not authorization: every path terminates in the same ELIOT principal, method allowlist, idempotency and GM checks.
+OpenAI Secure MCP Tunnel is the default for Dot because it keeps the MCP server private and needs no public domain. Cloudflare remains the general external ingress for Muse and other clients. Muse Custom Connectors are preferred over browser automation when their installed API/auth contract is qualified; the browser surface remains a fallback. Connectivity is not authorization: every path terminates in the same ELIOT principal, method allowlist, idempotency and GM checks.
 
 ## 1. Current repository stage
 
@@ -78,13 +82,17 @@ These are controller facts, not live qualification of the installed external pro
 - automatic module/service installation;
 - remote HTTP/Streamable MCP endpoint;
 - OpenAI MCP Events;
-- Meta Muse custom connector/MCP contract.
+- installed Meta Muse Custom Connector API/auth qualification; official docs confirm Custom Connectors, but do not publish an MCP wire contract.
 
 ### 1.3. Documentation drift
 
 `docs/documentation-program-implementation-review.md` is a dated review of baseline `c99a71f`. Several items it listed as Phase B work have since landed. It remains historical evidence, not the current readiness matrix.
 
 The README still contains a sentence saying the Documentation Program path will exist only after PR #13 is merged. PR #13 is already merged. That sentence should be removed in the next small documentation cleanup.
+
+### 1.4. Owner decisions and open-Issue audit
+
+[Owner Decisions](owner-decisions.md) publishes the single workflow-policy edition and resolves the contract choices requested by issues #2, #6, #7, #8, #10, #12, #14 and #15. It does not replace live qualification. Issues #3, #4, #5, #9 and #11 remain evidence work; #19 stays gated because this gateway is MCP/HTTP rather than an ACP consumer; #20 is the immediate MCP facade dependency for remote profiles.
 
 ## 2. Product identities must not be conflated
 
@@ -96,12 +104,18 @@ The README still contains a sentence saying the Documentation Program path will 
 
 Meta Muse is a separate cloud personal-agent product running in a Muse Secure VM with its own browser and connected apps. The reviewed official Meta material describes first-party and partner connectors, user approvals and browser/computer work.
 
-No reviewed official Meta source currently defines a public custom-MCP, custom-connector or skill SDK for arbitrary private services. Therefore:
+Official Meta material now establishes two connector paths:
 
-- direct `Meta Muse -> custom MCP` is `UNVERIFIED`;
+- a reviewed partner Connector Platform for directory-distributed connectors;
+- user-created **Custom Connectors**, which Muse can build for a service after retrieving API information and whose credentials are stored in Muse's Secure Credentials Store.
+
+The public documentation does **not** establish that Muse Custom Connectors speak MCP, nor does it publish a complete connector wire/schema/auth contract. Therefore:
+
+- `Meta Muse -> Custom Connector -> narrow ELIOT HTTPS API` is the preferred typed pilot;
+- `Meta Muse -> custom MCP` remains `UNVERIFIED` until the installed product demonstrates MCP support;
 - the Muse Code SDK is not a control API for the personal Muse agent;
-- a browser path through a protected operator surface is the first implementable pilot;
-- a typed connector path may be added only when Meta publishes an official contract or an installed product exposes and qualifies one.
+- the partner Connector Platform is for reviewed/distributed integrations and is not required for a private single-operator connector;
+- browser automation is a fallback, not the primary design, when the installed Custom Connector cannot express the required API or authentication.
 
 ### 2.3. OpenAI Dot
 
@@ -123,731 +137,4 @@ Do not promise Dot-as-full-GM through custom write MCP on a plan that does not e
 ELIOT Store
   owns Task / Attempt / Operation / Submission / Acceptance
 
-Remote Agent Gateway
-  authenticates, filters and forwards
-
-OpenAI / Meta / Cloudflare
-  transport or agent runtime only
-```
-
-A tunnel acknowledgement, browser click, MCP tool result or agent statement never becomes Task acceptance by itself.
-
-### 3.2. One physical-session owner
-
-For each native Muse Code, OpenCode, Codex or other physical session, exactly one ELIOT runtime adapter/backend owns control. Dot and Meta Muse control ELIOT; they do not attach directly as competing owners to native worker sessions.
-
-### 3.3. One GM epoch
-
-At most one external agent is designated GM. Another external agent may be observer, reviewer or standby. Promotion uses existing explicit `gm.handover`; no hostname, connector login or recent activity grants GM authority.
-
-### 3.4. Transport is not policy
-
-Cloudflare Tunnel, OpenAI Secure MCP Tunnel and HTTPS solve reachability. ELIOT decides:
-
-- authenticated principal;
-- role and GM epoch;
-- visible tools;
-- method admission;
-- binding and generation scope;
-- request identity;
-- budgets and capacity;
-- approvals;
-- result evidence;
-- audit;
-- shutdown and handover.
-
-### 3.5. Unknown remains unknown
-
-Loss of an MCP response, tunnel disconnect, browser timeout or Access session expiry does not prove that a mutation failed. A caller that performs a mutation creates and retains `client_request_id` before dispatch, then reconciles the resulting Operation instead of inventing a new request.
-
-## 4. Remote Agent Gateway boundary
-
-### 4.1. Initial implementation shape
-
-The first gateway is not another daemon with its own state machine. It is a client of the running ELIOT host, like the CLI and current MCP facade.
-
-```text
-external connection
-  -> authenticated remote profile
-  -> method/tool allowlist
-  -> local IPC client
-  -> existing application API
-  -> durable Operation
-```
-
-No gateway component opens the SQLite database.
-
-### 4.2. Two transport forms
-
-#### Private stdio profile
-
-Used by OpenAI Secure MCP Tunnel:
-
-```text
-tunnel-client --mcp-command
-  -> `swarm mcp --credential <local profile credential>`
-```
-
-This reuses current RMCP stdio and adds no inbound listener.
-
-#### Loopback Streamable HTTP profile
-
-Used behind Cloudflare:
-
-```text
-cloudflared
-  -> 127.0.0.1:<gateway-port>/mcp
-  -> Streamable HTTP MCP facade
-  -> local IPC
-```
-
-This is not currently implemented. Prefer native RMCP Streamable HTTP support or a small reviewed complete bridge. Do not maintain another hand-written SSE/JSON-RPC state machine if an upstream package supplies the transport.
-
-The HTTP listener binds loopback only. `cloudflared` is the only expected ingress peer.
-
-### 4.3. Tool filtering must occur twice
-
-A remote profile:
-
-1. exposes only allowed tools in `tools/list`;
-2. rejects every non-allowed method before local IPC dispatch.
-
-Filtering only the manifest is cosmetic and is not a security boundary.
-
-Application role/GM checks remain mandatory after the gateway allowlist.
-
-### 4.4. Separate source-reading service
-
-A read-only filesystem/code search MCP is a different service from Swarm control. Keep separate:
-
-```text
-swarm-control
-workspace-read
-```
-
-They use separate endpoints, credentials, tool catalogs and audit records. The Remote Agent Gateway does not add arbitrary filesystem, shell or Git tools to the Swarm control catalog.
-
-## 5. OpenAI Dot integration
-
-### 5.1. Preferred read-only path: Secure MCP Tunnel
-
-Use OpenAI's outbound-only `tunnel-client` next to the local controller. Point it to the existing stdio MCP command. The local server remains private and no domain is required.
-
-Local setup facts:
-
-- tunnel identity belongs in the local tunnel-client profile;
-- the tunnel runtime API key belongs in a protected local secret/environment reference;
-- the MCP command names a local ELIOT credential file;
-- ChatGPT/Plugin setup receives only the tunnel association/ID;
-- the repository contains no tunnel IDs, organization IDs, workspace IDs, API keys or local endpoint values.
-
-Initial Dot principal: `observer`.
-
-Initial Dot tools:
-
-- `host.status`
-- `route.list`
-- `task.get`, `task.list`, `task.submission`, `task.acceptance`
-- `attempt.get`
-- `operation.get`, `operation.list`
-- `agent.state`, `agent.list`, `agent.family`
-- `check.get`, `check.profiles`
-- `artifact.get`, `artifact.read`, `artifact.parts`
-- `report.delta`, `report.capacity`, `report.attention`
-- `message.read`
-- `doctor.inspect`
-
-Actual names must follow the application API/tool registry on the implementing commit. A tool not present in code is not advertised from this document.
-
-### 5.2. Pro write-path fallback: local computer skill
-
-Until full custom write MCP is available to the user's plan, Dot can use its explicitly connected local computer to run a narrow local skill that invokes the existing `swarm` CLI/application methods.
-
-Requirements:
-
-- separate manager credential, never operator credential;
-- no generic shell instruction exposed to Dot;
-- the skill maps named actions to exact `swarm` commands and closed JSON schemas;
-- every mutation requires caller-minted `client_request_id`;
-- high-impact methods require user/local approval;
-- stdout/stderr and Operation IDs are returned without secrets;
-- local computer access remains optional and revocable.
-
-This is a compatibility path, not the long-term transport. Once full MCP writes are available, the same action schemas move behind the MCP manager profile.
-
-### 5.3. Future full-MCP manager profile
-
-Candidate write methods:
-
-- task creation/revision/claim/dispatch;
-- addressed message send/cancel;
-- addressed agent input/background/reply/goal;
-- source capture/check start;
-- request changes and submission reads.
-
-Keep out of unattended default:
-
-- `task.accept`;
-- acceptance invalidation;
-- `gm.handover`;
-- host admission mode;
-- cancellation of active native work;
-- forge publication/merge/push;
-- module install/update;
-- service lifecycle;
-- credential/client administration.
-
-Those operations require explicit policy and normally a user approval or local operator.
-
-### 5.4. Dot rules
-
-Dot Custom Rules are defense in depth, not the authorization boundary. Recommended rules:
-
-- use only tools exposed by the selected ELIOT profile;
-- never invent a new request ID when the previous mutation outcome is unknown;
-- do not accept or publish work without the configured human/local approval;
-- do not change host mode, GM designation, credentials or services;
-- do not treat silence, idle or a disconnected tunnel as completion;
-- hand off consequential or ambiguous actions.
-
-Server-side policy must remain correct if these prose rules are ignored.
-
-## 6. Meta Muse personal-agent integration
-
-### 6.1. Current supported pilot: protected browser surface
-
-Because no public custom-MCP contract was established, the first Muse path is a thin web operator surface accessible from Muse's cloud browser through Cloudflare Access.
-
-The UI is not a new scheduler. It renders typed ELIOT projections and submits the same closed application methods.
-
-First pilot is read-only:
-
-- host readiness;
-- open Tasks and Attempts;
-- current Operations;
-- attention queue;
-- capacity/quota incidents;
-- pending native questions;
-- check/submission/acceptance state;
-- artifact excerpts through bounded reads.
-
-The page must expose structured, accessible labels and stable identifiers. Do not make Muse scrape terminal output or infer control state from colors.
-
-### 6.2. Controlled write pilot
-
-Only after read-only qualification:
-
-- one exact addressed message;
-- one Task create/revise operation;
-- one addressed agent input;
-- one reply to an exact current native request.
-
-Every action page shows target identity, generation, scope and expected result before submission. Consequential operations require local/user confirmation.
-
-Muse browser automation is not called a typed connector. Its result must be read back from ELIOT.
-
-### 6.3. Future connector path
-
-If Meta publishes a custom connector/MCP/OAuth contract:
-
-- prefer Streamable HTTP MCP;
-- authenticate through the official connector flow;
-- map connector identity to a dedicated ELIOT principal;
-- reuse the same server-side tool profiles;
-- qualify admission, unknown outcome, approvals and reconnect;
-- remove browser automation only after equivalent typed behavior is demonstrated.
-
-Do not build against reverse-engineered internal Muse APIs.
-
-### 6.4. Muse approvals
-
-Meta's own Sentinel/user approval does not replace ELIOT approval. It is an outer safeguard. ELIOT still enforces principal, GM epoch, tool allowlist, target generation and method-specific rules.
-
-## 7. Cloudflare path
-
-### 7.1. Role
-
-Cloudflare provides:
-
-- outbound tunnel from the Windows host;
-- TLS, DDoS/WAF and hostname routing;
-- Access identity/service authentication;
-- an immediate route-level killswitch.
-
-It does not own ELIOT Tasks, agents, sessions or authorization policy.
-
-### 7.2. Current local runbook status
-
-The supplied local runbook records:
-
-- `cloudflared` service is running;
-- the MCP ingress is intentionally disabled with an HTTP 403 route;
-- the local gateway and upstream filesystem MCP are stopped;
-- the previous filesystem backend binary is absent and must be replaced.
-
-That local runbook contains private infrastructure identifiers. It must not be copied into this repository.
-
-### 7.3. Authentication
-
-Preferred choices:
-
-#### Human/browser Muse access
-
-Cloudflare Access browser authentication. The origin validates `Cf-Access-Jwt-Assertion`, including signature, audience and expiry.
-
-#### OAuth-capable MCP client
-
-Cloudflare Access Managed OAuth for an MCP server application, provided the client supports the required OAuth flow and the origin validates the Access JWT.
-
-#### Headless machine client
-
-Access service token with a Service Auth policy. Use the normal two headers, or the documented single-header mode only when a client cannot send both. Test the exact client before relying on it.
-
-In all cases, Access identity maps to a fixed ELIOT principal/profile. The origin may also require an application-level credential as defense in depth.
-
-### 7.4. Protocol
-
-New public MCP work uses Streamable HTTP. Historical SSE aliases or an existing SSE bridge do not justify maintaining deprecated transport semantics.
-
-Required endpoint shape in repository examples:
-
-```text
-https://YOUR_DOMAIN/swarm/mcp
-```
-
-The actual hostname is local deployment data.
-
-### 7.5. Gateway hardening
-
-- bind loopback only;
-- mandatory Access validation;
-- closed request schemas and body limits;
-- post-auth per-principal rate/concurrency budgets;
-- no arbitrary upstream URL;
-- no arbitrary headers passed to native tools;
-- server-side tool allowlist before dispatch;
-- no raw database, filesystem or shell passthrough;
-- redact tokens, headers, endpoints and native diagnostic secrets;
-- preserve Operation ID and `client_request_id`;
-- record Cloudflare subject/service-token identity separately from ELIOT principal;
-- return typed gaps rather than fabricated empty states.
-
-## 8. Local enrollment and domain privacy
-
-### 8.1. Repository rule
-
-Public repository content may contain only placeholders:
-
-```text
-https://YOUR_DOMAIN/swarm/mcp
-https://mcp.example.com/swarm/mcp
-${ELIOT_REMOTE_MCP_URL}
-${ELIOT_CLOUDFLARE_ACCESS_AUD}
-${ELIOT_CLOUDFLARE_TEAM}
-${ELIOT_DOT_TUNNEL_ID}
-```
-
-Forbidden in source, documentation, examples, commits, PR bodies, fixtures and test snapshots:
-
-- the operator's real domain or subdomains;
-- Cloudflare account/zone/tunnel/team identifiers;
-- Access audience values;
-- OpenAI tunnel, organization or workspace IDs;
-- API keys, service-token IDs/secrets or bearer tokens;
-- local usernames and credential paths copied from a real installation.
-
-### 8.2. Install-time profile
-
-Proposed local-only profile location:
-
-```text
-%LOCALAPPDATA%\Eliot\remote-agents\<profile>\
-  profile.toml
-  credential.json
-  transport\
-```
-
-Exact storage may reuse existing ELIOT configuration conventions. The invariant is that it is outside the repository, user-restricted and excluded from source capture.
-
-A local setup command or installer asks the operator for:
-
-- channel: `openai_tunnel`, `cloudflare_browser`, `cloudflare_mcp`;
-- principal/profile;
-- local host data directory/config;
-- tunnel ID or external endpoint;
-- secret references, never literal secrets in generated public examples;
-- allowed tool profile;
-- approval policy;
-- whether this agent may be a GM candidate.
-
-It validates connectivity locally, then provides setup instructions to the external product. Agents receive endpoint/tunnel association during local installation, not from repository text or Task prompts.
-
-### 8.3. Logging
-
-Persist:
-
-- remote profile ID;
-- transport kind;
-- authenticated external subject hash/stable ID;
-- ELIOT principal;
-- tool/method;
-- request and Operation IDs;
-- decision/outcome;
-- timestamp.
-
-Do not persist:
-
-- raw secrets;
-- authorization headers;
-- full private endpoint when a profile ID suffices;
-- browser cookies;
-- Cloudflare tunnel credentials;
-- OpenAI runtime API keys.
-
-## 9. Tool profiles and principals
-
-### 9.1. `remote_observer`
-
-Read-only. No mutation is merely hidden: it is rejected before dispatch.
-
-### 9.2. `remote_manager`
-
-Can create/claim/dispatch work and send addressed communication under normal ownership rules. Cannot become GM by profile alone.
-
-### 9.3. `remote_gm_candidate`
-
-Same tool catalog as the accepted GM policy permits, but GM-only application methods work only after explicit `gm.handover` advances the current epoch to this client.
-
-### 9.4. `remote_reviewer`
-
-Reads exact candidate/check/submission evidence and may issue an addressed review verdict only if the existing application role/acceptance policy permits it. It does not inherit writer credentials.
-
-### 9.5. Profile implementation
-
-Current MCP tool catalog is static. Add an explicit profile filter to the facade:
-
-```text
-configured profile
-  -> tool catalog
-  -> pre-dispatch method allowlist
-  -> application authorization
-```
-
-Do not fork separate copies of every application method or create a second remote API.
-
-## 10. GM ownership and failover
-
-Recommended initial deployment:
-
-```text
-Dot        = primary GM candidate after qualification
-Meta Muse  = observer/reviewer/standby
-local user = operator and ultimate recovery authority
-```
-
-Reasons:
-
-- Dot has an official private MCP tunnel and shared plugin permissions;
-- Meta Muse currently lacks a reviewed custom private-service connector contract;
-- only one external agent should mutate the controller as GM.
-
-Promotion sequence:
-
-1. disable new high-impact remote actions;
-2. reconcile outstanding Operations;
-3. inspect attention/mailbox;
-4. explicitly hand over GM;
-5. verify new GM epoch;
-6. re-enable only the accepted profile;
-7. former GM becomes observer or is disconnected.
-
-Network failover does not perform GM handover automatically.
-
-## 11. Wake and events
-
-### 11.1. Initial mode
-
-Use the implemented `checkpoint_poll`:
-
-- `report.delta`;
-- `report.attention`;
-- `message.read`;
-- `operation.get`.
-
-No hidden model heartbeat is introduced.
-
-### 11.2. OpenAI MCP Events
-
-A future Dot plugin may expose typed events such as:
-
-```text
-attention.created
-operation.terminal
-submission.ready
-check.terminal
-gm.handover.required
-quota.changed
-```
-
-MCP Events require the standard event catalog/subscription contract, durable webhook subscriptions, verified HTTPS callbacks, signing, expiration/refresh, retry/backoff and replay/gap semantics. Current ELIOT RMCP stdio facade implements its own bounded session-scoped freshness subscriptions over committed facts; those are useful for connected MCP clients but are not the OpenAI MCP Events webhook contract.
-
-Event delivery is notification, not acceptance or a new Operation.
-
-### 11.3. Muse wake
-
-Until an official connector event contract exists, Muse uses browser refresh/polling or a supported connected communication channel. Natural-language messages are not workflow authority and cannot carry implicit approval for high-impact actions.
-
-## 12. Lifecycle and killswitch
-
-### 12.1. Dot
-
-- revoke/disable the Dot plugin connection or tunnel association;
-- stop `tunnel-client`;
-- revoke its runtime API key;
-- revoke the dedicated ELIOT credential;
-- remove GM designation through explicit handover if applicable.
-
-### 12.2. Cloudflare/Muse
-
-- disable the Access policy/service token;
-- change the ingress route to an explicit denial;
-- stop the loopback gateway;
-- revoke the dedicated ELIOT credential;
-- leave unrelated local runtimes and already admitted work untouched.
-
-### 12.3. Controller
-
-`host.mode new_work=disabled` stops new work admission; it does not kill ongoing native families. Emergency cancellation remains an explicit, addressed operation with the existing ownership/evidence rules.
-
-## 13. Implementation program
-
-### G0 â€” documentation and privacy
-
-**Status:** this document.
-
-Acceptance:
-
-- no private domain or infrastructure identifier in repository content;
-- Dot, Meta Muse personal agent and Muse Code are distinct;
-- transport and authority are distinct;
-- plan/feature limitations are explicit.
-
-### G1 â€” MCP tool profiles
-
-Add profile selection to `swarm mcp`:
-
-- closed named profiles;
-- filtered `tools/list`;
-- pre-dispatch rejection;
-- same application API;
-- dedicated credential;
-- profile reported in server info/audit.
-
-Negative cases:
-
-- observer invokes mutation by guessed tool name;
-- remote manager invokes operator/GM-only method;
-- profile changes while a process is running;
-- unknown profile.
-
-### G2 â€” Dot read-only Secure MCP Tunnel pilot
-
-No controller network listener.
-
-Qualification:
-
-- local stdio MCP through `tunnel-client`;
-- exact tool discovery;
-- tunnel reconnect;
-- 256 KiB/64 KiB projection boundaries;
-- read-only enforcement;
-- plugin disconnect does not stop host or native work;
-- no domain or runtime key in logs/repository;
-- current Pro plan behavior recorded.
-
-### G3 â€” Dot local skill control pilot
-
-- narrow local skill/Codex task;
-- exact command/schema mapping;
-- dedicated manager credential;
-- caller-owned request IDs;
-- approval gates;
-- unknown outcome reconciliation;
-- no general shell surface.
-
-This slice may be retired when full write MCP is available and qualified.
-
-### G4 â€” loopback Streamable HTTP gateway
-
-- reuse RMCP transport or reviewed complete bridge;
-- loopback only;
-- local IPC client;
-- Cloudflare identity mapping;
-- Access JWT validation;
-- tool profiles;
-- bounded request/result bodies;
-- no DB access;
-- disconnect-independent controller work.
-
-### G5 â€” Cloudflare/Muse read-only browser pilot
-
-- Access-protected semantic operator view;
-- exact read projections only;
-- no secrets/domain in generated artifacts;
-- browser session expiry/relogin;
-- prompt-injection probes;
-- stale/partial/unknown rendered honestly.
-
-### G6 â€” Muse controlled actions
-
-Only after G5:
-
-- one addressed message;
-- one Task mutation;
-- one addressed input;
-- one native-request reply;
-- readback after every action;
-- explicit local/user approval for consequential actions.
-
-No GM role yet.
-
-### G7 â€” GM pilot and handover
-
-- Dot as first GM candidate;
-- Muse remains standby;
-- exact epoch and stale former-GM denial;
-- disconnect does not imply handover;
-- pending Operations remain addressable;
-- local operator can recover.
-
-This depends on the unresolved GM rotation contract in issue #8.
-
-### G8 â€” typed events
-
-- MCP Events for Dot when protocol/runtime support is selected;
-- durable subscription identity and expiration;
-- callback verification/signing;
-- delivery retry and explicit gaps;
-- event-specific authorization;
-- no duplicate model work from repeated delivery.
-
-## 14. Acceptance matrix
-
-### Privacy
-
-```text
-[ ] repository scan contains no deployment hostname, account/tunnel/audience ID or secret
-[ ] examples use only placeholders
-[ ] source capture excludes local profiles
-[ ] diagnostics redact endpoint/auth material
-[ ] support bundle contains profile IDs, not secrets
-```
-
-### Authority
-
-```text
-[ ] one ELIOT Task/Operation authority
-[ ] one session owner per native binding
-[ ] one current GM epoch
-[ ] gateway cannot bypass application authorization
-[ ] tool manifest and dispatch allowlists agree
-[ ] network disconnect does not settle work
-```
-
-### Dot
-
-```text
-[ ] Secure MCP Tunnel reaches local stdio MCP without public ingress
-[ ] observer profile is genuinely read-only
-[ ] Pro plan limitation recorded
-[ ] local skill write path has no generic shell
-[ ] caller retains request ID before mutation
-[ ] lost reply is reconciled, not replayed with a new ID
-[ ] plugin/tunnel disconnect leaves host and admitted work running
-```
-
-### Cloudflare
-
-```text
-[ ] cloudflared ingress reaches loopback gateway only
-[ ] catch-all denies unknown routes
-[ ] Access authentication required
-[ ] Access JWT signature/audience/expiry validated at origin
-[ ] service-token header mode qualified against exact client
-[ ] Streamable HTTP initialization and reconnect qualified
-[ ] route-level denial is an effective killswitch
-```
-
-### Meta Muse
-
-```text
-[ ] no claim of custom MCP support without official/installed evidence
-[ ] browser view is read-only in first pilot
-[ ] stable identifiers and explicit stale/partial/unknown states
-[ ] action target and result readback are shown
-[ ] Sentinel/user approval is not substituted for ELIOT authorization
-[ ] prompt-injection and stale-browser-session cases exercised
-[ ] Muse never competes for native worker-session ownership
-```
-
-### GM
-
-```text
-[ ] explicit handover only
-[ ] old epoch denied at admission and begin-send
-[ ] no automatic handover on outage
-[ ] mailbox/attention behavior across rotation follows issue #8 decision
-[ ] high-impact actions require accepted policy/approval
-```
-
-## 15. Source registry
-
-### ELIOT
-
-- [README](../README.md)
-- [Architecture](agent_swarm.md)
-- [Module contract](agent_swarm.module-contract-v2.md)
-- [Implementation plan](agent_swarm.implementation-v6.md)
-- [Documentation Program](documentation-program.md)
-- [Implementation Review](documentation-program-implementation-review.md)
-- [MCP facade](../src/mcp.rs)
-- [Muse Code module](../modules/muse/README.md)
-
-### OpenAI
-
-- [Getting started with your dot](https://help.openai.com/en/articles/20001530-getting-started-with-your-dot)
-- [Dots privacy, security, and safety](https://help.openai.com/en/articles/20001529-dots-privacy-security-and-safety-faqs)
-- [Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)
-- [MCP servers](https://developers.openai.com/api/docs/guides/tools-connectors-mcp)
-- [Developer mode and MCP apps](https://help.openai.com/en/articles/12584461-developer-mode-and-full-mcp-connectors-in-chatgpt-beta)
-- [MCP Events](https://developers.openai.com/plugins/build/mcp-events)
-
-### Meta
-
-- [Introducing Muse](https://about.fb.com/news/2026/09/introducing-muse-personal-ai-agent/)
-- [Muse for Small Business](https://about.fb.com/news/2026/09/introducing-muse-small-business/)
-
-### Cloudflare
-
-- [Cloudflare Tunnel](https://developers.cloudflare.com/tunnel/)
-- [Managed OAuth for MCP applications](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/managed-oauth/)
-- [Service tokens](https://developers.cloudflare.com/cloudflare-one/access-controls/service-credentials/service-tokens/)
-- [Validate Access JWTs](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/authorization-cookie/validating-json/)
-- [Cloudflare MCP transport guidance](https://developers.cloudflare.com/agents/model-context-protocol/cloudflare/servers-for-cloudflare/)
-
-## 16. Final recommendation
-
-Implement in this order:
-
-```text
-1. MCP tool profiles
-2. Dot observer through OpenAI Secure MCP Tunnel
-3. Dot local-skill manager pilot
-4. loopback Streamable HTTP gateway behind Cloudflare Access
-5. Muse read-only browser pilot
-6. controlled Muse actions
-7. one explicit GM handover pilot
-8. typed events
-```
-
-Do not block completion of the local controller on remote-agent integration. Remote agents are additional clients of the existing authority, not a replacement core.
+²È="24(-¥¼ØĞ-¥ÁÉ½©•Ñ¥½¸‰½Õ¹‘…É¥•Ìì(´É•…µ½¹±ä•¹™½É•µ•¹Ğì(´Á±Õ¥¸‘¥Í½¹¹•Ğ‘½•Ì¹½ĞÍÑ½À¡½ÍĞ½È¹…Ñ¥Ù”İ½É¬ì(´¹¼‘½µ…¥¸½ÈÉÕ¹Ñ¥µ”­•ä¥¸±½Ì½É•Á½Í¥Ñ½Éäì(´ÕÉÉ•¹ĞAÉ¼Á±…¸‰•¡…Ù¥½ÈÉ•½É‘•¸((ŒŒŒÌƒŠP½Ğ±½…°Í­¥±°½¹ÑÉ½°Á¥±½Ğ((´¹…ÉÉ½Ü±½…°Í­¥±°½½‘•àÑ…Í¬ì(´•á…Ğ½µµ…¹½Í¡•µ„µ…ÁÁ¥¹œì(´‘•‘¥…Ñ•µ…¹…•ÈÉ•‘•¹Ñ¥…°ì(´…±±•Èµ½İ¹•É•ÅÕ•ÍĞ%Ìì(´…ÁÁÉ½Ù…°…Ñ•Ìì(´Õ¹­¹½İ¸½ÕÑ½µ”É•½¹¥±¥…Ñ¥½¸ì(´¹¼•¹•É…°Í¡•±°ÍÕÉ™…”¸()Q¡¥ÌÍ±¥”µ…ä‰”É•Ñ¥É•İ¡•¸™Õ±°İÉ¥Ñ”5@¥Ì…Ù…¥±…‰±”…¹ÅÕ…±¥™¥•¸((ŒŒŒĞƒŠP±½½Á‰…¬MÑÉ•…µ…‰±”!QQ@…Ñ•İ…ä((´É•ÕÍ”I5@ÑÉ…¹ÍÁ½ÉĞ½ÈÉ•Ù¥•İ•½µÁ±•Ñ”‰É¥‘”ì(´±½½Á‰…¬½¹±äì(´±½…°%A±¥•¹Ğì(´…ÕÑ¡•¹Ñ¥…Ñ••áÑ•É¹…°¥‘•¹Ñ¥Ñä½ÁÉ½™¥±”µ…ÁÁ¥¹œì(´•ÍÌ)]PÙ…±¥‘…Ñ¥½¸İ¡•¸•ÍÌ¥ÌÍ•±•Ñ•°½È•á…Ğ…ÁÁ±¥…Ñ¥½¸µ‰•…É•ÈÙ…±¥‘…Ñ¥½¸™½È„ÅÕ…±¥™¥•±¥•¹Ğì(´Ñ½½°ÁÉ½™¥±•Ìì(´‰½Õ¹‘•É•ÅÕ•ÍĞ½É•ÍÕ±Ğ‰½‘¥•Ìì(´¹¼…•ÍÌì(´‘¥Í½¹¹•Ğµ¥¹‘•Á•¹‘•¹Ğ½¹ÑÉ½±±•Èİ½É¬¸((ŒŒŒÔƒŠP5ÕÍ”ÕÍÑ½´½¹¹•Ñ½ÈÉ•…µ½¹±äÁ¥±½Ğ((´¥¹ÍÑ…±±•5ÕÍ”É•…Ñ•Ì„ÁÉ¥Ù…Ñ”ÕÍÑ½´½¹¹•Ñ½È™É½´Ñ¡”¹…ÉÉ½ÜA$¥¹™½Éµ…Ñ¥½¸ì(´•á…Ğ½¹¹•Ñ½ÈÉ•ÅÕ•ÍĞ½…ÕÑ ½É•ÍÁ½¹Í”‰•¡…Ù¥½È¥ÌÉ•½É‘•ì(´É•…µ½¹±ä1%=PÁÉ¥¹¥Á…°…¹ÁÉ½™¥±”ì(´¹¼Í•É•ÑÌ½‘½µ…¥¸¥¸•¹•É…Ñ•…ÉÑ¥™…ÑÌì(´ÁÉ½µÁĞµ¥¹©•Ñ¥½¸…¹¡½ÍÑ¥±”½¹¹•Ñ½Èµ‘…Ñ„ÁÉ½‰•Ìì(´ÍÑ…±”½Á…ÉÑ¥…°½Õ¹­¹½İ¸É•¹‘•É•¡½¹•ÍÑ±äì(´‰É½İÍ•È½•ÍÌ½Á•É…Ñ½ÈÍÕÉ™…”½¹±ä…Ì„Ñ•ÍÑ•™…±±‰…¬¸((ŒŒŒØƒŠP5ÕÍ”½¹ÑÉ½±±•½¹¹•Ñ½È…Ñ¥½¹Ì()=¹±ä…™Ñ•ÈÔè((´½¹”…‘‘É•ÍÍ•µ•ÍÍ…”ì(´½¹”Q…Í¬µÕÑ…Ñ¥½¸ì(´½¹”…‘‘É•ÍÍ•¥¹ÁÕĞì(´½¹”¹…Ñ¥Ù”µÉ•ÅÕ•ÍĞÉ•Á±äì(´…±±•Èµ½İ¹•É•ÅÕ•ÍĞ¥‘•¹Ñ¥Ñä…¹É•…‘‰…¬…™Ñ•È•Ù•Éä…Ñ¥½¸ì(´•áÁ±¥¥Ğ±½…°½ÕÍ•È…ÁÁÉ½Ù…°™½È½¹Í•ÅÕ•¹Ñ¥…°…Ñ¥½¹Ì¸()9¼4É½±”å•Ğ¸((ŒŒŒÜƒŠP4Á¥±½Ğ…¹¡…¹‘½Ù•È((´½Ğ…Ì™¥ÉÍĞ4…¹‘¥‘…Ñ”ì(´5ÕÍ”É•µ…¥¹ÌÍÑ…¹‘‰äì(´•á…Ğ•Á½ …¹ÍÑ…±”™½Éµ•Èµ4‘•¹¥…°ì(´‘¥Í½¹¹•Ğ‘½•Ì¹½Ğ¥µÁ±ä¡…¹‘½Ù•Èì(´Á•¹‘¥¹œ=Á•É…Ñ¥½¹ÌÉ•µ…¥¸…‘‘É•ÍÍ…‰±”ì(´±½…°½Á•É…Ñ½È…¸É•½Ù•È¸()Q¡¥Ì™½±±½İÌÑ¡”…•ÁÑ•4É½Ñ…Ñ¥½¸½¹ÑÉ…Ğ¥¸m=İ¹•È•¥Í¥½¹Ít¡½İ¹•Èµ‘•¥Í¥½¹Ì¹µ¤ì¥ÍÍÕ”€ŒàÉ•µ…¥¹Ì™½È¥µÁ±•µ•¹Ñ…Ñ¥½¸½±¥Ù”ÅÕ…±¥™¥…Ñ¥½¸½¹±ä¸((ŒŒŒàƒŠPÑåÁ••Ù•¹ÑÌ((´5@Ù•¹ÑÌ™½È½Ğİ¡•¸ÁÉ½Ñ½½°½ÉÕ¹Ñ¥µ”ÍÕÁÁ½ÉĞ¥ÌÍ•±•Ñ•ì(´‘ÕÉ…‰±”ÍÕ‰ÍÉ¥ÁÑ¥½¸¥‘•¹Ñ¥Ñä…¹•áÁ¥É…Ñ¥½¸ì(´…±±‰…¬Ù•É¥™¥…Ñ¥½¸½Í¥¹¥¹œì(´‘•±¥Ù•ÉäÉ•ÑÉä…¹•áÁ±¥¥Ğ…ÁÌì(´•Ù•¹ĞµÍÁ•¥™¥Œ…ÕÑ¡½É¥é…Ñ¥½¸ì(´¹¼‘ÕÁ±¥…Ñ”µ½‘•°İ½É¬™É½´É•Á•…Ñ•‘•±¥Ù•Éä¸((ŒŒ€ÄĞ¸•ÁÑ…¹”µ…ÑÉ¥à((ŒŒŒAÉ¥Ù…ä()Ñ•áĞ)ltÉ•Á½Í¥Ñ½ÉäÍ…¸½¹Ñ…¥¹Ì¹¼‘•Á±½åµ•¹Ğ¡½ÍÑ¹…µ”°…½Õ¹Ğ½ÑÕ¹¹•°½…Õ‘¥•¹”%½ÈÍ•É•Ğ)lt•á…µÁ±•ÌÕÍ”½¹±äÁ±…•¡½±‘•ÉÌ)ltÍ½ÕÉ”…ÁÑÕÉ”•á±Õ‘•Ì±½…°ÁÉ½™¥±•Ì)lt‘¥…¹½ÍÑ¥ÌÉ•‘…Ğ•¹‘Á½¥¹Ğ½…ÕÑ µ…Ñ•É¥…°)ltÍÕÁÁ½ÉĞ‰Õ¹‘±”½¹Ñ…¥¹ÌÁÉ½™¥±”%Ì°¹½ĞÍ•É•ÑÌ)€((ŒŒŒÕÑ¡½É¥Ñä()Ñ•áĞ)lt½¹”1%=PQ…Í¬½=Á•É…Ñ¥½¸…ÕÑ¡½É¥Ñä)lt½¹”Í•ÍÍ¥½¸½İ¹•ÈÁ•È¹…Ñ¥Ù”‰¥¹‘¥¹œ)lt½¹”ÕÉÉ•¹Ğ4•Á½ )lt…Ñ•İ…ä…¹¹½Ğ‰åÁ…ÍÌ…ÁÁ±¥…Ñ¥½¸…ÕÑ¡½É¥é…Ñ¥½¸)ltÑ½½°µ…¹¥™•ÍĞ…¹‘¥ÍÁ…Ñ …±±½İ±¥ÍÑÌ…É•”)lt¹•Ñİ½É¬‘¥Í½¹¹•Ğ‘½•Ì¹½ĞÍ•ÑÑ±”İ½É¬)€((ŒŒŒ½Ğ()Ñ•áĞ)ltM•ÕÉ”5@QÕ¹¹•°É•…¡•Ì±½…°ÍÑ‘¥¼5@İ¥Ñ¡½ÕĞÁÕ‰±¥Œ¥¹É•ÍÌ)lt½‰Í•ÉÙ•ÈÁÉ½™¥±”¥Ì•¹Õ¥¹•±äÉ•…µ½¹±ä)ltAÉ¼Á±…¸±¥µ¥Ñ…Ñ¥½¸É•½É‘•)lt±½…°Í­¥±°İÉ¥Ñ”Á…Ñ ¡…Ì¹¼•¹•É¥ŒÍ¡•±°)lt…±±•ÈÉ•Ñ…¥¹ÌÉ•ÅÕ•ÍĞ%‰•™½É”µÕÑ…Ñ¥½¸)lt±½ÍĞÉ•Á±ä¥ÌÉ•½¹¥±•°¹½ĞÉ•Á±…å•İ¥Ñ „¹•Ü%)ltÁ±Õ¥¸½ÑÕ¹¹•°‘¥Í½¹¹•Ğ±•…Ù•Ì¡½ÍĞ…¹…‘µ¥ÑÑ•İ½É¬ÉÕ¹¹¥¹œ)€((ŒŒŒ±½Õ‘™±…É”()Ñ•áĞ)lt±½Õ‘™±…É•¥¹É•ÍÌÉ•…¡•Ì±½½Á‰…¬…Ñ•İ…ä½¹±ä)lt…Ñ µ…±°‘•¹¥•ÌÕ¹­¹½İ¸É½ÕÑ•Ì)lt•ÍÌ…ÕÑ¡•¹Ñ¥…Ñ¥½¸É•ÅÕ¥É•)lt•ÍÌ)]PÍ¥¹…ÑÕÉ”½…Õ‘¥•¹”½•áÁ¥ÉäÙ…±¥‘…Ñ•…Ğ½É¥¥¸)ltÍ•ÉÙ¥”µÑ½­•¸¡•…‘•Èµ½‘”ÅÕ…±¥™¥•……¥¹ÍĞ•á…Ğ±¥•¹Ğ)ltMÑÉ•…µ…‰±”!QQ@¥¹¥Ñ¥…±¥é…Ñ¥½¸…¹É•½¹¹•ĞÅÕ…±¥™¥•)ltÉ½ÕÑ”µ±•Ù•°‘•¹¥…°¥Ì…¸•™™•Ñ¥Ù”­¥±±Íİ¥Ñ )€((ŒŒŒ5•Ñ„5ÕÍ”()Ñ•áĞ)ltÕÍÑ½´½¹¹•Ñ½ÈÉ•…Ñ•……¥¹ÍĞÑ¡”¹…ÉÉ½ÜA$İ¥Ñ¡½ÕĞ•áÁ½Í¥¹œÁÉ¥Ù…Ñ”‘•Á±½åµ•¹Ğ‘…Ñ„)lt•á…Ğ½¹¹•Ñ½ÈÍ¡•µ„½…ÕÑ ½É•ÑÉä‰•¡…Ù¥½ÈÉ•½É‘•™É½´Ñ¡”¥¹ÍÑ…±±•ÁÉ½‘ÕĞ)lt¹¼±…¥´½˜5@ÍÕÁÁ½ÉĞİ¥Ñ¡½ÕĞ¥¹ÍÑ…±±••Ù¥‘•¹”)lt™¥ÉÍĞ½¹¹•Ñ½ÈÁÉ½™¥±”¥Ì•¹Õ¥¹•±äÉ•…µ½¹±ä)lt‰É½İÍ•ÈÍÕÉ™…”¥Ì™…±±‰…¬…¹É•µ…¥¹ÌÉ•…µ½¹±ä¥¸¥ÑÌ™¥ÉÍĞÁ¥±½Ğ)ltÍÑ…‰±”¥‘•¹Ñ¥™¥•ÉÌ…¹•áÁ±¥¥ĞÍÑ…±”½Á…ÉÑ¥…°½Õ¹­¹½İ¸ÍÑ…Ñ•Ì)lt…Ñ¥½¸Ñ…É•Ğ…¹É•ÍÕ±ĞÉ•…‘‰…¬…É”Í¡½İ¸)lt5ÕÍ”½M•¹Ñ¥¹•°…ÁÁÉ½Ù…°¥Ì¹½ĞÍÕ‰ÍÑ¥ÑÕÑ•™½È1%=P…ÕÑ¡½É¥é…Ñ¥½¸)ltÁÉ½µÁĞµ¥¹©•Ñ¥½¸°¡½ÍÑ¥±”½¹¹•Ñ½È‘…Ñ„…¹ÍÑ…±”µÍ•ÍÍ¥½¸…Í•Ì•á•É¥Í•)lt5ÕÍ”¹•Ù•È½µÁ•Ñ•Ì™½È¹…Ñ¥Ù”İ½É­•ÈµÍ•ÍÍ¥½¸½İ¹•ÉÍ¡¥À)€((ŒŒŒ4()Ñ•áĞ)lt•áÁ±¥¥Ğ¡…¹‘½Ù•È½¹±ä)lt½±•Á½ ‘•¹¥•…Ğ…‘µ¥ÍÍ¥½¸…¹‰•¥¸µÍ•¹)lt¹¼…ÕÑ½µ…Ñ¥Œ¡…¹‘½Ù•È½¸½ÕÑ…”)ltµ…¥±‰½à½…ÑÑ•¹Ñ¥½¸‰•¡…Ù¥½È…É½ÍÌÉ½Ñ…Ñ¥½¸™½±±½İÌ¥ÍÍÕ”€Œà‘•¥Í¥½¸)lt¡¥ µ¥µÁ…Ğ…Ñ¥½¹ÌÉ•ÅÕ¥É”…•ÁÑ•Á½±¥ä½…ÁÁÉ½Ù…°)€((ŒŒ€ÄÔ¸M½ÕÉ”É•¥ÍÑÉä((ŒŒŒ1%=P((´mI5t ¸¸½I5¹µ¤(´mÉ¡¥Ñ•ÑÕÉ•t¡…•¹Ñ}Íİ…É´¹µ¤(´m5½‘Õ±”½¹ÑÉ…Ñt¡…•¹Ñ}Íİ…É´¹µ½‘Õ±”µ½¹ÑÉ…ĞµØÈ¹µ¤(´m%µÁ±•µ•¹Ñ…Ñ¥½¸Á±…¹t¡…•¹Ñ}Íİ…É´¹¥µÁ±•µ•¹Ñ…Ñ¥½¸µØØ¹µ¤(´m½Õµ•¹Ñ…Ñ¥½¸AÉ½É…µt¡‘½Õµ•¹Ñ…Ñ¥½¸µÁÉ½É…´¹µ¤(´m%µÁ±•µ•¹Ñ…Ñ¥½¸I•Ù¥•İt¡‘½Õµ•¹Ñ…Ñ¥½¸µÁÉ½É…´µ¥µÁ±•µ•¹Ñ…Ñ¥½¸µÉ•Ù¥•Ü¹µ¤(´m=İ¹•È•¥Í¥½¹Ít¡½İ¹•Èµ‘•¥Í¥½¹Ì¹µ¤(´m5@™……‘•t ¸¸½ÍÉŒ½µÀ¹ÉÌ¤(´m5ÕÍ”½‘”µ½‘Õ±•t ¸¸½µ½‘Õ±•Ì½µÕÍ”½I5¹µ¤((ŒŒŒ=Á•¹$((´m•ÑÑ¥¹œÍÑ…ÉÑ•İ¥Ñ å½ÕÈ‘½Ñt¡¡ÑÑÁÌè¼½¡•±À¹½Á•¹…¤¹½´½•¸½…ÉÑ¥±•Ì¼ÈÀÀÀÄÔÌÀµ•ÑÑ¥¹œµÍÑ…ÉÑ•µİ¥Ñ µå½ÕÈµ‘½Ğ¤(´m½ÑÌÁÉ¥Ù…ä°Í•ÕÉ¥Ñä°…¹Í…™•Ñåt¡¡ÑÑÁÌè¼½¡•±À¹½Á•¹…¤¹½´½•¸½…ÉÑ¥±•Ì¼ÈÀÀÀÄÔÈäµ‘½ÑÌµÁÉ¥Ù…äµÍ•ÕÉ¥Ñäµ…¹µÍ…™•Ñäµ™…ÅÌ¤(´mM•ÕÉ”5@QÕ¹¹•±t¡¡ÑÑÁÌè¼½‘•Ù•±½Á•ÉÌ¹½Á•¹…¤¹½´½…Á¤½‘½Ì½Õ¥‘•Ì½Í•ÕÉ”µµÀµÑÕ¹¹•±Ì¤(´m5@Í•ÉÙ•ÉÍt¡¡ÑÑÁÌè¼½‘•Ù•±½Á•ÉÌ¹½Á•¹…¤¹½´½…Á¤½‘½Ì½Õ¥‘•Ì½Ñ½½±Ìµ½¹¹•Ñ½ÉÌµµÀ¤(´m•Ù•±½Á•Èµ½‘”…¹5@…ÁÁÍt¡¡ÑÑÁÌè¼½¡•±À¹½Á•¹…¤¹½´½•¸½…ÉÑ¥±•Ì¼ÄÈÔàĞĞØÄµ‘•Ù•±½Á•Èµµ½‘”µ…¹µ™Õ±°µµÀµ½¹¹•Ñ½ÉÌµ¥¸µ¡…ÑÁĞµ‰•Ñ„¤(´m5@Ù•¹ÑÍt¡¡ÑÑÁÌè¼½‘•Ù•±½Á•ÉÌ¹½Á•¹…¤¹½´½Á±Õ¥¹Ì½‰Õ¥±½µÀµ•Ù•¹ÑÌ¤((ŒŒŒ5•Ñ„((´m%¹ÑÉ½‘Õ¥¹œ5ÕÍ•t¡¡ÑÑÁÌè¼½…‰½ÕĞ¹™ˆ¹½´½¹•İÌ¼ÈÀÈØ¼Àä½¥¹ÑÉ½‘Õ¥¹œµµÕÍ”µÁ•ÉÍ½¹…°µ…¤µ…•¹Ğ¼¤(´m5ÕÍ”™½ÈMµ…±°	ÕÍ¥¹•ÍÍt¡¡ÑÑÁÌè¼½…‰½ÕĞ¹™ˆ¹½´½¹•İÌ¼ÈÀÈØ¼Àä½¥¹ÑÉ½‘Õ¥¹œµµÕÍ”µÍµ…±°µ‰ÕÍ¥¹•ÍÌ¼¤(´m!½Ü5ÕÍ”İ½É­Ìİ¥Ñ ½¹¹•Ñ½ÉÍt¡¡ÑÑÁÌè¼½İİÜ¹µ•Ñ„¹½´½¡•±À½…ÉÑ¥™¥¥…°µ¥¹Ñ•±±¥•¹”¼ÄØàÜÈÔÌÀĞàääØÄĞä¼¤(´m5ÕÍ”½¹¹•Ñ½ÈA±…Ñ™½Éµt¡¡ÑÑÁÌè¼½µÕÍ”¹…¤½Á±…Ñ™½É´¤((ŒŒŒ±½Õ‘™±…É”((´m±½Õ‘™±…É”QÕ¹¹•±t¡¡ÑÑÁÌè¼½‘•Ù•±½Á•ÉÌ¹±½Õ‘™±…É”¹½´½ÑÕ¹¹•°¼¤(´m5…¹…•=ÕÑ ™½È5@…ÁÁ±¥…Ñ¥½¹Ít¡¡ÑÑÁÌè¼½‘•Ù•±½Á•ÉÌ¹±½Õ‘™±…É”¹½´½±½Õ‘™±…É”µ½¹”½…•ÍÌµ½¹ÑÉ½±Ì½…ÁÁ±¥…Ñ¥½¹Ì½¡ÑÑÀµ…ÁÁÌ½µ…¹…•µ½…ÕÑ ¼¤(´mM•ÉÙ¥”Ñ½­•¹Ít¡¡ÑÑÁÌè¼½‘•Ù•±½Á•ÉÌ¹±½Õ‘™±…É”¹½´½±½Õ‘™±…É”µ½¹”½…•ÍÌµ½¹ÑÉ½±Ì½Í•ÉÙ¥”µÉ•‘•¹Ñ¥…±Ì½Í•ÉÙ¥”µÑ½­•¹Ì¼¤(´mY…±¥‘…Ñ”•ÍÌ)]QÍt¡¡ÑÑÁÌè¼½‘•Ù•±½Á•ÉÌ¹±½Õ‘™±…É”¹½´½±½Õ‘™±…É”µ½¹”½…•ÍÌµ½¹ÑÉ½±Ì½…ÁÁ±¥…Ñ¥½¹Ì½¡ÑÑÀµ…ÁÁÌ½…ÕÑ¡½É¥é…Ñ¥½¸µ½½­¥”½Ù…±¥‘…Ñ¥¹œµ©Í½¸¼¤(´m±½Õ‘™±…É”5@ÑÉ…¹ÍÁ½ÉĞÕ¥‘…¹•t¡¡ÑÑÁÌè¼½‘•Ù•±½Á•ÉÌ¹±½Õ‘™±…É”¹½´½…•¹ÑÌ½µ½‘•°µ½¹Ñ•áĞµÁÉ½Ñ½½°½±½Õ‘™±…É”½Í•ÉÙ•ÉÌµ™½Èµ±½Õ‘™±…É”¼¤(´m±½Õ‘™±…É”5@M•ÉÙ•ÈA½ÉÑ…±Ít¡¡ÑÑÁÌè¼½‘•Ù•±½Á•ÉÌ¹±½Õ‘™±…É”¹½´½±½Õ‘™±…É”µ½¹”½…•ÍÌµ½¹ÑÉ½±Ì½…¤µ½¹ÑÉ½±Ì½µÀµÁ½ÉÑ…±Ì¼¤((ŒŒ€ÄØ¸¥¹…°É•½µµ•¹‘…Ñ¥½¸()%µÁ±•µ•¹Ğ¥¸Ñ¡¥Ì½É‘•Èè()Ñ•áĞ(Ä¸5@A¡…Í”ÁÉ½©•Ñ¥½¸…ÁÌ€¬¹…µ•Ñ½½°ÁÉ½™¥±•Ì(È¸½Ğ½‰Í•ÉÙ•ÈÑ¡É½Õ =Á•¹$M•ÕÉ”5@QÕ¹¹•°(Ì¸½Ğ±½…°µÍ­¥±°µ…¹…•ÈÁ¥±½Ğ(Ğ¸±½½Á‰…¬MÑÉ•…µ…‰±”!QQ@€¼¹…ÉÉ½ÜIMP¹…Ñ•İ…ä‰•¡¥¹±½Õ‘™±…É”(Ô¸5ÕÍ”ÕÍÑ½´½¹¹•Ñ½ÈÉ•…µ½¹±äÁ¥±½Ğ(Ø¸½¹ÑÉ½±±•5ÕÍ”½¹¹•Ñ½È…Ñ¥½¹Ìì‰É½İÍ•È™…±±‰…¬½¹±äİ¡•¸É•ÅÕ¥É•(Ü¸½¹”•áÁ±¥¥Ğ4¡…¹‘½Ù•ÈÁ¥±½ĞÕ¹‘•È=İ¹•ÈA½±¥äØÄ(à¸ÑåÁ••Ù•¹ÑÌ)€()¼¹½Ğ‰±½¬½µÁ±•Ñ¥½¸½˜Ñ¡”±½…°½¹ÑÉ½±±•È½¸É•µ½Ñ”µ…•¹Ğ¥¹Ñ•É…Ñ¥½¸¸I•µ½Ñ”…•¹ÑÌ…É”…‘¥Ñ¥½¹…°±¥•¹ÑÌ½˜Ñ¡”•á¥ÍÑ¥¹œ…ÕÑ¡½É¥Ñä°¹½Ğ„É•Á±…•µ•¹Ğ½É”¸
