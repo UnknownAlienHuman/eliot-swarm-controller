@@ -663,13 +663,14 @@ pub(crate) fn owned_service_for_binding(
 ) -> Result<Option<VerifiedOwnedServiceBinding>> {
     let binding = binding_row(db, binding_id, generation)?;
     let stored_route = parse_route(&binding.route_json)?;
-    let configured = current_route(config, &stored_route)?;
-    let Some(definition) = configured.owned_service.clone() else {
+    let route = config.route(&stored_route.alias)?;
+    if route.owned_service.is_none() {
+        current_route(config, &stored_route)?;
         if load_start_row(db, binding_id, generation)?.is_some() {
             return Err(scope_changed());
         }
         return Ok(None);
-    };
+    }
     let row = load_start_row(db, binding_id, generation)?.ok_or_else(|| {
         Error::new(
             "OWNED_SERVICE_NOT_OBSERVED",
@@ -681,6 +682,8 @@ pub(crate) fn owned_service_for_binding(
     }
     let workspace_directory =
         retained_scope(db, binding_id, generation, &binding, &stored_route, &row)?;
+    let configured = current_owned_route(config, &stored_route, &workspace_directory)?;
+    let definition = configured.owned_service.clone().ok_or_else(scope_changed)?;
     let base_route = OwnedServiceRoute::from_config(&definition)?;
     let route = base_route.for_launch(&row.owner_nonce, &workspace_directory)?;
     let proof: Value = serde_json::from_str(&row.proof_json)
@@ -759,13 +762,6 @@ fn opening_scope(
         return Err(scope_changed());
     }
     let stored_route = parse_route(&binding.route_json)?;
-    let configured = current_route(config, &stored_route)?;
-    let service_config = configured.owned_service.clone().ok_or_else(|| {
-        Error::new(
-            "OWNED_SERVICE_ROUTE_REQUIRED",
-            "route does not declare a fresh owned service",
-        )
-    })?;
     let parent_rows = launch_rows_for_binding(db, binding_id, generation)?;
     if parent_rows.len() != 1 {
         return Err(scope_changed());
@@ -851,6 +847,13 @@ fn opening_scope(
     }
     workspace::get_lease_view(db, &lease)?;
     let workspace_directory = held_workspace_path(db, &lease)?;
+    let configured = current_owned_route(config, &stored_route, &workspace_directory)?;
+    let service_config = configured.owned_service.clone().ok_or_else(|| {
+        Error::new(
+            "OWNED_SERVICE_ROUTE_REQUIRED",
+            "route does not declare a fresh owned service",
+        )
+    })?;
     actor.require_opening_launch_attempt(
         db,
         &parent.operation_id,
@@ -2235,6 +2238,46 @@ fn current_route(config: &Config, stored: &Route) -> Result<Route> {
         || current.module_artifact_id != crate::runtime::opencode_v2::ARTIFACT_ID
         || model::canonical(&serde_json::to_value(&current)?)?
             != model::canonical(&serde_json::to_value(stored)?)?
+    {
+        return Err(scope_changed());
+    }
+    Ok(current)
+}
+
+fn current_owned_route(
+    config: &Config,
+    stored: &Route,
+    expected_workspace_directory: &std::path::Path,
+) -> Result<Route> {
+    let mut current = config.route(&stored.alias)?;
+    if current.runtime != crate::runtime::opencode_v2::RUNTIME
+        || current.module_artifact_id != crate::runtime::opencode_v2::ARTIFACT_ID
+        || current.owned_service.is_none()
+    {
+        return Err(scope_changed());
+    }
+    let workspace_directory = expected_workspace_directory
+        .to_str()
+        .filter(|path| !path.is_empty())
+        .ok_or_else(scope_changed)?;
+    if stored
+        .native_options
+        .get("directory")
+        .and_then(Value::as_str)
+        != Some(workspace_directory)
+    {
+        return Err(scope_changed());
+    }
+    let native_options = current
+        .native_options
+        .as_object_mut()
+        .ok_or_else(scope_changed)?;
+    native_options.insert(
+        "directory".to_owned(),
+        Value::String(workspace_directory.to_owned()),
+    );
+    if model::canonical(&serde_json::to_value(&current)?)?
+        != model::canonical(&serde_json::to_value(stored)?)?
     {
         return Err(scope_changed());
     }
