@@ -2893,11 +2893,11 @@ mod tests {
         .into_iter()
         .collect();
         assert_eq!(methods, expected);
-        assert_eq!(TOOLS.len(), 91);
+        assert_eq!(TOOLS.len(), 92);
         assert_eq!(TOOLS.iter().filter(|(read_only, _)| *read_only).count(), 45);
         assert_eq!(
             TOOLS.iter().filter(|(read_only, _)| !*read_only).count(),
-            46
+            47
         );
     }
 
