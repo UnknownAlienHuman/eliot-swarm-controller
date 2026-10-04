@@ -131,6 +131,7 @@ pub(super) fn apply(
     let mut entries = Vec::with_capacity(planned.len());
     let mut dispatch = Vec::new();
     let mut work_dispatch = Vec::new();
+    let mut goal_progression = Vec::new();
     let mut disabled_or_narrowed = Vec::new();
     for change in &planned {
         if change.changed {
@@ -172,6 +173,13 @@ pub(super) fn apply(
                 now_ms,
             )?;
             super::automation_cron::configure_activation(
+                tx,
+                change.before.as_ref(),
+                &change.after,
+                change.include_existing,
+                now_ms,
+            )?;
+            super::automation_goal_progression::configure_activation(
                 tx,
                 change.before.as_ref(),
                 &change.after,
@@ -263,6 +271,27 @@ pub(super) fn apply(
             }
         }
     }
+    for change in &planned {
+        if change.changed && change.include_existing && change.after.goal_progression_ready() {
+            let budget = 16usize.saturating_sub(goal_progression.len());
+            if budget > 0 {
+                goal_progression.push(super::automation_goal_progression::reconcile_entry(
+                    tx,
+                    &change.after,
+                    budget,
+                    now_ms,
+                    |tx, admission| {
+                        super::admit_goal_progression_operation(
+                            tx,
+                            admission,
+                            launcher_config,
+                            now_ms,
+                        )
+                    },
+                )?);
+            }
+        }
+    }
     let impacted = disabled_or_narrowed
         .iter()
         .map(|automation_id| {
@@ -280,6 +309,7 @@ pub(super) fn apply(
         "entries":entries,
         "dispatch":dispatch,
         "work_dispatch":work_dispatch,
+        "goal_progression":goal_progression,
         "affected_work":impacted
     }))
 }
@@ -297,6 +327,7 @@ pub(super) fn explain(db: &Connection, p: &Principal, value: &Value) -> Result<V
     let disposition = review_disposition::disposition_state(db, &entry)?;
     let publication = automation_publication::state(db, &entry)?;
     let cron = super::automation_cron::state(db, &entry)?;
+    let goal_progression = super::automation_goal_progression::state(db, &entry)?;
     let work = operation_impacts(db, &owner_manager_id, project, automation_id)?;
     let operation_history =
         linked_operation_history(db, &owner_manager_id, project, automation_id)?;
@@ -312,6 +343,7 @@ pub(super) fn explain(db: &Connection, p: &Principal, value: &Value) -> Result<V
         "review_disposition":disposition,
         "publication":publication,
         "cron":cron,
+        "goal_progression":goal_progression,
         "linked_operations":work,
         "linked_operation_history":operation_history
     }))
@@ -475,6 +507,16 @@ fn entry_projection(entry: &AutomationEntry) -> Result<Value> {
             .collect::<Vec<_>>()
     );
     value["capability_gaps"] = json!(entry.capability_gaps());
+    if entry
+        .steps
+        .contains(&crate::automation::actions::AutomationStep::GoalProgression)
+    {
+        value["goal_progression_support"] = json!({
+            "action":"agent.goal",
+            "supported_runtime":crate::runtime::opencode_v2::RUNTIME,
+            "other_runtimes":"explicitly_unsupported"
+        });
+    }
     Ok(value)
 }
 

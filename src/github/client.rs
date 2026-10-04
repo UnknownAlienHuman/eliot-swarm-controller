@@ -1,10 +1,11 @@
-//! Bounded read-only GitHub API access through the installed `gh` CLI.
+//! Bounded GitHub API access through the installed `gh` CLI.
 
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
+use std::{future::Future, pin::Pin};
 use std::{process::Stdio, time::Duration};
 use tokio::{io::AsyncReadExt, process::Command, time::timeout};
 
@@ -39,6 +40,49 @@ pub struct RepositoryReadback {
     pub id: i64,
     pub full_name: String,
     pub html_url: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct IssueLabelEntry {
+    name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct IssueLabelResponse {
+    id: i64,
+    number: i64,
+    labels: Vec<IssueLabelEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueLabelSnapshot {
+    pub id: i64,
+    pub number: i64,
+    pub labels: Vec<String>,
+}
+
+/// Narrow transport contract used by the durable Store effect and its local
+/// HTTP fixture. Production calls continue through the installed `gh`
+/// account, so Store code never loads or persists a GitHub credential.
+pub trait GitHubLabelApi: Send + Sync {
+    fn repository<'a>(
+        &'a self,
+        repository: &'a RepositoryRef,
+    ) -> Pin<Box<dyn Future<Output = Result<RepositoryReadback>> + Send + 'a>>;
+
+    fn issue_labels<'a>(
+        &'a self,
+        repository: &'a RepositoryRef,
+        number: i64,
+    ) -> Pin<Box<dyn Future<Output = Result<IssueLabelSnapshot>> + Send + 'a>>;
+
+    fn set_label<'a>(
+        &'a self,
+        repository: &'a RepositoryRef,
+        number: i64,
+        label: &'a str,
+        present: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -211,6 +255,63 @@ impl GhCli {
         Ok(readback)
     }
 
+    async fn issue_labels(
+        &self,
+        repository: &RepositoryRef,
+        number: i64,
+    ) -> Result<IssueLabelSnapshot> {
+        if number <= 0 {
+            return Err(Error::invalid("issue number must be positive"));
+        }
+        let endpoint = format!("{}/issues/{number}", repository.repo_path());
+        let value = self.api_json(repository, &endpoint, &[]).await?;
+        let issue: IssueLabelResponse = serde_json::from_value(value).map_err(|_| {
+            Error::new(
+                "GITHUB_RESPONSE_INVALID",
+                "issue readback omitted its immutable ID, number, or labels",
+            )
+        })?;
+        validate_managed_label_snapshot(issue.id, issue.number, &issue.labels)?;
+        Ok(IssueLabelSnapshot {
+            id: issue.id,
+            number: issue.number,
+            labels: issue.labels.into_iter().map(|entry| entry.name).collect(),
+        })
+    }
+
+    async fn set_label(
+        &self,
+        repository: &RepositoryRef,
+        number: i64,
+        label: &str,
+        present: bool,
+    ) -> Result<()> {
+        validate_managed_label_name(label)?;
+        if number <= 0 {
+            return Err(Error::invalid("issue number must be positive"));
+        }
+        let endpoint = if present {
+            format!("{}/issues/{number}/labels", repository.repo_path())
+        } else {
+            format!("{}/issues/{number}/labels/{label}", repository.repo_path())
+        };
+        let mut arguments = vec![
+            "api".to_owned(),
+            endpoint,
+            "--hostname".to_owned(),
+            repository.host.clone(),
+            "--method".to_owned(),
+            if present { "POST" } else { "DELETE" }.to_owned(),
+        ];
+        if present {
+            arguments.push("--raw-field".to_owned());
+            arguments.push(format!("labels[]={label}"));
+        }
+        // This is one explicit effect invocation. Rust never retries it.
+        run_gh_api(&arguments).await?;
+        Ok(())
+    }
+
     async fn api_json(
         &self,
         repository: &RepositoryRef,
@@ -237,6 +338,75 @@ impl GhCli {
             )
         })
     }
+}
+
+impl GitHubLabelApi for GhCli {
+    fn repository<'a>(
+        &'a self,
+        repository: &'a RepositoryRef,
+    ) -> Pin<Box<dyn Future<Output = Result<RepositoryReadback>> + Send + 'a>> {
+        Box::pin(GhCli::repository(self, repository))
+    }
+
+    fn issue_labels<'a>(
+        &'a self,
+        repository: &'a RepositoryRef,
+        number: i64,
+    ) -> Pin<Box<dyn Future<Output = Result<IssueLabelSnapshot>> + Send + 'a>> {
+        Box::pin(GhCli::issue_labels(self, repository, number))
+    }
+
+    fn set_label<'a>(
+        &'a self,
+        repository: &'a RepositoryRef,
+        number: i64,
+        label: &'a str,
+        present: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(GhCli::set_label(self, repository, number, label, present))
+    }
+}
+
+fn validate_managed_label_snapshot(
+    issue_id: i64,
+    number: i64,
+    labels: &[IssueLabelEntry],
+) -> Result<()> {
+    if issue_id <= 0 || number <= 0 || labels.len() > 256 {
+        return Err(Error::new(
+            "GITHUB_RESPONSE_INVALID",
+            "issue label readback exceeded identity or collection bounds",
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for label in labels {
+        if label.name.is_empty()
+            || label.name.len() > 100
+            || label.name.chars().any(char::is_control)
+            || !seen.insert(label.name.as_str())
+        {
+            return Err(Error::new(
+                "GITHUB_RESPONSE_INVALID",
+                "issue label readback contained an invalid or duplicate name",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_managed_label_name(label: &str) -> Result<()> {
+    if !(10..=50).contains(&label.len())
+        || !label.starts_with("eliot-")
+        || !label
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        || label.ends_with('-')
+    {
+        return Err(Error::invalid(
+            "label is outside the managed eliot-* namespace",
+        ));
+    }
+    Ok(())
 }
 
 async fn run_gh_api(arguments: &[String]) -> Result<Vec<u8>> {

@@ -4,8 +4,9 @@
 //! matrix records `coverage.goal` as "No durable goal API established"). The
 //! goal therefore lives in the native durable instruction-entry backend under
 //! the controller-owned `eliot.goal` key, and activation reuses the existing
-//! single prompt admission. This is not a native goal, not automatic
-//! continuation after a terminal turn and not Task acceptance. The goal
+//! single prompt admission. Explicit manager-enabled Goal progression may
+//! issue one continuation after an authenticated completed terminal EventRef;
+//! it does not create a hidden model loop, a native Goal, or Task acceptance. The goal
 //! result keeps admission and execution start as separate facts: an admitted
 //! activation input never by itself proves the model started; start is proven
 //! only by the durable execution log (see `execution.rs`). A lost
@@ -40,6 +41,7 @@ enum GoalAction {
     Pause,
     Resume,
     Clear,
+    Continue,
 }
 
 impl GoalAction {
@@ -50,6 +52,7 @@ impl GoalAction {
             Self::Pause => "pause",
             Self::Resume => "resume",
             Self::Clear => "clear",
+            Self::Continue => "continue",
         }
     }
 }
@@ -57,11 +60,12 @@ impl GoalAction {
 struct GoalRequest {
     action: GoalAction,
     objective: Option<String>,
+    expected_revision: Option<u64>,
 }
 
 impl GoalRequest {
-    /// Mirror the Store-side goal validation as defense in depth, the same
-    /// way `configuration::Change::parse` revalidates configure settings.
+    /// Mirror Store validation as defense in depth. Continue is an explicit
+    /// one-input activation of the exact currently active controller Goal.
     fn parse(input: &Value) -> Result<Self> {
         let action = match model::text(input, "action")? {
             "set" => GoalAction::Set,
@@ -69,14 +73,27 @@ impl GoalRequest {
             "pause" => GoalAction::Pause,
             "resume" => GoalAction::Resume,
             "clear" => GoalAction::Clear,
+            "continue" => GoalAction::Continue,
             _ => {
                 return Err(Error::invalid(
-                    "goal action must be set/edit/pause/resume/clear",
+                    "goal action must be set/edit/pause/resume/clear/continue",
                 ));
             }
         };
+        let expected_revision = if action == GoalAction::Continue {
+            Some(input.get("expected_revision").and_then(Value::as_u64).ok_or_else(|| {
+                Error::invalid("continue requires a nonnegative expected_revision (0 means no native Goal exists)")
+            })?)
+        } else {
+            if input.get("expected_revision").is_some() {
+                return Err(Error::invalid(
+                    "expected_revision is only valid for continue",
+                ));
+            }
+            None
+        };
         let objective = match action {
-            GoalAction::Set | GoalAction::Edit => {
+            GoalAction::Set | GoalAction::Edit | GoalAction::Continue => {
                 let objective = model::text(input, "objective")?;
                 if objective.len() > MAX_OBJECTIVE_BYTES {
                     return Err(Error::invalid(
@@ -87,15 +104,20 @@ impl GoalRequest {
             }
             _ => {
                 if input.get("objective").is_some() {
-                    return Err(Error::invalid("objective is only valid for set/edit"));
+                    return Err(Error::invalid(
+                        "objective is only valid for set/edit/continue",
+                    ));
                 }
                 None
             }
         };
-        Ok(Self { action, objective })
+        Ok(Self {
+            action,
+            objective,
+            expected_revision,
+        })
     }
 }
-
 #[derive(Clone, PartialEq, Eq)]
 struct GoalRecord {
     objective: String,
@@ -201,8 +223,9 @@ fn goal_inbox_matches(item: &Value, root: &str, id: &str, text: &str, marker: &V
 /// durable log's exact `session.inbox.enqueued` event), while execution start
 /// is proven only by the durable execution log correlating the input's
 /// `inbox.delivered` to an active `session.execution.started` event. Neither
-/// fact is Task acceptance or family completion, and neither rewrites the
-/// Operation's completion boundary, which stays `native_goal_recorded`.
+/// fact is Task acceptance or Goal completion. For `continue`, exact input
+/// admission is the Operation's completion boundary; ordinary record actions
+/// retain their `native_goal_recorded` boundary.
 #[derive(Default)]
 struct GoalActivation {
     input_id: Option<String>,
@@ -221,7 +244,7 @@ fn goal_details(
 ) -> Result<Value> {
     let objective_digest = record.map(GoalRecord::objective_digest).transpose()?;
     Ok(json!({
-        "completion_condition":"native_goal_recorded",
+        "completion_condition":if action == GoalAction::Continue { "native_input_admitted" } else { "native_goal_recorded" },
         "goal":{
             "action":action.name(),
             "present":record.is_some(),
@@ -234,7 +257,7 @@ fn goal_details(
             "application_scope":"session",
             "continuation_owner":"controller_record",
             "native_goal_api":false,
-            "record_applied":true,
+            "record_applied":action != GoalAction::Continue || mutation_sent,
             "activation_input_id":activation.input_id,
             "activation_admitted":activation.admitted,
             "activation_execution_started":activation.execution_started,
@@ -252,6 +275,8 @@ enum GoalDecision {
     Noop,
     /// Write this record; activation admits one prompt afterwards.
     Write(GoalRecord, bool),
+    /// Admit one prompt without mutating an exact active record.
+    Activate(GoalRecord),
     /// Delete the entry; clear never activates.
     Remove,
 }
@@ -290,16 +315,13 @@ fn decide(
                 return Ok(GoalDecision::Noop);
             }
             let activate = before.status == "active";
-            let status = before.status.clone();
-            Ok(write(objective, &status, activate))
+            Ok(write(objective, &before.status, activate))
         }
         GoalAction::Pause => {
             let before = before.ok_or_else(absent)?;
             if before.status == "paused" {
                 return Ok(GoalDecision::Noop);
             }
-            // Pause changes only the record. It never interrupts the current
-            // native turn and never touches the inbox.
             Ok(write(before.objective.clone(), "paused", false))
         }
         GoalAction::Resume => {
@@ -314,9 +336,59 @@ fn decide(
         } else {
             GoalDecision::Remove
         }),
+        GoalAction::Continue => {
+            let objective = request
+                .objective
+                .as_deref()
+                .ok_or_else(|| Error::invalid("continue objective is required"))?;
+            match (request.expected_revision, before) {
+                (Some(0), None) => Ok(write(objective.to_owned(), "active", true)),
+                (Some(expected), Some(record))
+                    if expected == record.revision
+                        && record.status == "active"
+                        && record.objective == objective =>
+                {
+                    Ok(GoalDecision::Activate(record.clone()))
+                }
+                _ => Err(Error::new(
+                    "NATIVE_GOAL_CONFLICT",
+                    "continue expected an absent Goal or the exact active revision and objective",
+                )),
+            }
+        }
     }
 }
-
+/// Reconstruct the exact deterministic activation input for the persistent
+/// terminal reader. The original request commits both objective and native
+/// revision, so no mutable native readback is needed to derive its descriptor.
+pub(super) fn continuation_execution_descriptor(
+    command: &RuntimeCommand,
+) -> Result<NativeInputDescriptor> {
+    let request = GoalRequest::parse(&command.input)?;
+    if request.action != GoalAction::Continue {
+        return Err(Error::invalid(
+            "terminal execution scan requires agent.goal continue",
+        ));
+    }
+    let revision = match request.expected_revision {
+        Some(0) => 1,
+        Some(revision) => revision,
+        None => return Err(Error::invalid("continue expected_revision is missing")),
+    };
+    let record = GoalRecord {
+        objective: request
+            .objective
+            .ok_or_else(|| Error::invalid("continue objective is missing"))?,
+        status: "active".to_owned(),
+        revision,
+        operation_id: command.operation_id.clone(),
+    };
+    NativeInputDescriptor::for_goal_activation(
+        command,
+        &goal_prompt_text(&record),
+        goal_marker(command, &record),
+    )
+}
 impl Service {
     async fn goal_readback(
         &self,
@@ -365,11 +437,10 @@ impl Service {
         }
     }
 
-    /// Best-effort activation lookup for reconciliation. The completion
-    /// condition of this contract is the record itself (`native_goal_recorded`);
-    /// when the original execution stopped at a lost entry response the
-    /// activation prompt was never sent, so absence here is reported in the
-    /// details (`activation_input_id: null`), not treated as a failed record.
+    /// Best-effort activation lookup for reconciliation. For ordinary Goal
+    /// edits, the record itself remains the completion condition. For an
+    /// explicit `continue`, the admitted activation input is the effect and
+    /// must be observed before the Operation can settle.
     async fn goal_activation_observed(
         &self,
         root: &str,
@@ -411,11 +482,11 @@ impl Service {
     /// from inbox/message readback or from the durable log, and — from the
     /// log only — whether that input's delivery correlated to an active
     /// `session.execution.started`. Strictly best-effort and additive: the
-    /// record readback has already settled the Operation at
-    /// `native_goal_recorded`, so any log failure, gap or uncertainty only
-    /// leaves the execution facts unproven (`activation_execution_started:
-    /// false`); it never fails reconciliation and never replays a mutation
-    /// or a prompt.
+    /// record readback has already settled ordinary record actions at
+    /// `native_goal_recorded`. A `continue` Operation is settled only after
+    /// its exact input admission is observed. Any later log failure, gap or
+    /// uncertainty leaves execution-start facts unproven; this path never
+    /// replays a mutation or prompt.
     async fn goal_activation_evidence(
         &self,
         root: &str,
@@ -483,6 +554,7 @@ impl Service {
         let desired: Option<GoalRecord> = match &decision {
             GoalDecision::Noop => before.record.clone(),
             GoalDecision::Write(record, _) => Some(record.clone()),
+            GoalDecision::Activate(record) => Some(record.clone()),
             GoalDecision::Remove => None,
         };
         if matches!(decision, GoalDecision::Noop) {
@@ -500,10 +572,12 @@ impl Service {
         }
         let path =
             format!("/api/experimental/session/{root}/instructions/entries/{GOAL_ENTRY_KEY}");
+        let mutation_sent = matches!(decision, GoalDecision::Write(_, _) | GoalDecision::Remove);
         let written = match &decision {
             GoalDecision::Write(record, _) => {
                 self.put(&path, json!({"value":record.value()})).await
             }
+            GoalDecision::Activate(_) => Ok(Value::Null),
             GoalDecision::Remove => self.delete(&path).await,
             GoalDecision::Noop => unreachable!(),
         };
@@ -524,17 +598,20 @@ impl Service {
         }
         let after = match self.goal_readback(&root, options, command).await {
             Ok(readback) => readback,
-            Err(error) => return failed(command, options, &error, true),
+            Err(error) => return failed(command, options, &error, mutation_sent),
         };
         if after.record != desired {
             return failed(
                 command,
                 options,
                 &unresolved("native goal record did not match after mutation acknowledgement"),
-                true,
+                mutation_sent,
             );
         }
-        let activate = matches!(decision, GoalDecision::Write(_, true));
+        let activate = matches!(
+            decision,
+            GoalDecision::Write(_, true) | GoalDecision::Activate(_)
+        );
         let mut activation_input_id = None;
         if activate {
             if let Err(error) = self
@@ -549,7 +626,7 @@ impl Service {
                 // The goal record is already durable, but this activation
                 // input has not crossed its POST boundary. Keep the Operation
                 // unresolved so readback cannot imply that provider work ran.
-                return failed(command, options, &error, true);
+                return failed(command, options, &error, mutation_sent);
             }
             let record = desired.as_ref().expect("activation requires a record");
             match self.admit_goal_activation(&root, command, record).await {
@@ -560,10 +637,10 @@ impl Service {
         let activation = GoalActivation {
             input_id: activation_input_id.clone(),
             admitted: activation_input_id.is_some(),
-            // The Operation completes at `native_goal_recorded`; the verified
-            // admission receipt proves admission only. Execution start is a
-            // later fact, proven solely by the durable log when the Operation
-            // is reconciled, so it is honestly false at this boundary.
+            // Ordinary Goal record actions complete at `native_goal_recorded`;
+            // continue completes at `native_input_admitted`. This immediate
+            // receipt proves only that the input was admitted. Execution start
+            // is a later fact proven solely by the durable log.
             execution_started: false,
             execution_ref: None,
         };
@@ -571,8 +648,12 @@ impl Service {
             request.action,
             desired.as_ref(),
             &after,
-            "post_mutation_exact_readback",
-            true,
+            if mutation_sent {
+                "post_mutation_exact_readback"
+            } else {
+                "exact_active_record_readback_before_activation"
+            },
+            mutation_sent,
             &activation,
         ) {
             Ok(details) => details,
@@ -620,7 +701,8 @@ impl Service {
                 .record
                 .as_ref()
                 .ok_or_else(|| unresolved("the goal record is absent"))?;
-            if record.operation_id != command.operation_id {
+            if request.action != GoalAction::Continue && record.operation_id != command.operation_id
+            {
                 return Err(unresolved(
                     "the goal record was not written by this operation",
                 ));
@@ -641,12 +723,25 @@ impl Service {
                     .as_deref()
                     .is_none_or(|objective| objective == record.objective),
                 GoalAction::Pause => record.status == "paused",
+                GoalAction::Continue => {
+                    let expected = request.expected_revision.unwrap_or(0);
+                    let revision = if expected == 0 { 1 } else { expected };
+                    record.status == "active"
+                        && record.revision == revision
+                        && request.objective.as_deref() == Some(record.objective.as_str())
+                        && (expected != 0 || record.operation_id == command.operation_id)
+                }
                 GoalAction::Clear => unreachable!(),
             };
             if !recorded {
                 return Err(unresolved("the goal record does not match this operation"));
             }
             let activation = self.goal_activation_evidence(root, command, record).await;
+            if request.action == GoalAction::Continue && !activation.admitted {
+                return Err(unresolved(
+                    "exact Goal continuation input admission is not observed",
+                ));
+            }
             let activation_input_id = activation.input_id.clone();
             let details = goal_details(
                 request.action,

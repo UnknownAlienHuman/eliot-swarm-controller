@@ -56,10 +56,26 @@ pub fn revision_identity(db: &Connection, script_id: &str, revision: i64) -> Res
             |row| row.get(0),
         )
         .optional()?;
-    serde_json::from_str(
+    let mut identity: Value = serde_json::from_str(
         &value.ok_or_else(|| Error::new("NOT_FOUND", "script revision is not registered"))?,
     )
-    .map_err(Into::into)
+    .map_err(Error::from)?;
+    let bundle = bundle_record(db, script_id, revision)?;
+    let effects: Vec<super::manifest::ScriptControllerEffect> = serde_json::from_value(
+        bundle
+            .metadata
+            .get("controller_effects")
+            .cloned()
+            .unwrap_or_else(|| json!([])),
+    )
+    .map_err(|_| {
+        Error::new(
+            "SCRIPT_REGISTRY_DAMAGED",
+            "script bundle controller effect metadata is invalid",
+        )
+    })?;
+    identity["controller_effects"] = json!(effects);
+    Ok(identity)
 }
 
 pub fn describe(db: &Connection, script_id: &str, revision: Option<i64>) -> Result<Value> {

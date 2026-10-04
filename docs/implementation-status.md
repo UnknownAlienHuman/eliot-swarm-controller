@@ -2,6 +2,47 @@
 
 ## Current state
 
+### Five-module integration — 2026-10-04
+
+The integrated source adds five independently authored Luna slices:
+
+- **O4:** manual `github.effect.managed_label` for one `eliot-*` label on a
+  selected exact-revision Task's mapped Issue. Ordinary Operation and semantic
+  slot precede the single write; unknown outcomes reconcile by readback only.
+  PR creation/update and Check Run writes remain separate work.
+- **O5:** `hook.emit` retries only `HOST_UNAVAILABLE` and `OUTCOME_UNKNOWN`, at
+  most three attempts with the same source/commit identity. Store deduplication
+  returns the original observation. This does not add a durable retry queue.
+- **O6:** one declared invocation-scoped `task_owner_message` effect uses the
+  normal `message.send` path. Completion rechecks current Manager, active script
+  revision and exact Task/Attempt; revoked grants produce `effects_incomplete`.
+  An existing caller/request Operation cannot be relabeled as a script effect.
+- **O8:** a closed `task.submission` / `applied` / `review_dispatch` rule routes
+  through existing admission and semantic slots. Empty rules disable automatic
+  ReviewDispatch, including hook-assisted joins; fact intake, other selected
+  actions and direct manual review remain available.
+- **O9:** manager-enabled shared Goal progression admits one ordinary
+  `agent.goal` continuation for a verified completed OpenCode turn. Exact Goal,
+  Task/Attempt, binding generation, current rights and terminal EventRef are
+  checked; explicit automation transfer preserves its cursor and history.
+  A queued continuation proves admission intent, not native execution or Goal
+  achievement. The native continuation boundary is `native_input_admitted`.
+
+Production formatting and strict Clippy passed gate
+`eea45400-176d-41a3-8053-29173ca88915`. The initial batch retained 44 passing
+checks. The corrected HookCommit fixture passed gate
+`c258f2ab-c641-44d0-9749-4d942327b7cc`; the complete Goal
+admission/transfer/EventRef-replay fixture and debug build passed final gate
+`68eff712-1ec0-43c2-9492-4b6fb42c9473` with unchanged source. This is 46
+distinct focused checks, including MCP contracts, script grants and collision
+rejection, and ambiguous GitHub write recovery without resending. The Goal
+fixture's sealed-record corrections passed an independent source audit; no
+production guard was weakened and the 45 other passing checks were retained.
+Full CI for this new batch and live native qualification remain pending. These
+slices remain **PARTIAL_PROGRESS** for the complete program. Next Luna code
+work covers PR description updates, event-driven script invocation, passive
+review-result watches and startup diagnostics in Windows adapters.
+
 ### Native RPC schema compatibility and actionable errors — 2026-10-04
 
 The pinned OpenCode 2.0.7 RPC decoder cannot compile the JSON Schema
@@ -35,13 +76,20 @@ The final JS-only correction passed gate
 `final-cbcca750-95ce-49b0-b643-9f9368736ae1`; every other source pin and the
 candidate remained identical. Candidate SHA-256:
 `5D79C31E552CB4E6FF4DCD1E97E05D8A1E3FA9EBC869CED68DC346C04DC68EAA`.
-Fresh C30 native qualification remains pending; hosted Bunny execution is not
-qualified by these offline checks. The installed launcher has not been replaced.
+C30 ended with `NATIVE_MCP_INVENTORY_READBACK_INVALID` in retained run
+`9bec4e52-d5c2-45f2-aabd-a3f857b7aa1c`; its claim is consumed and must not be
+replayed. The service returned nine observed MCP tools and a valid inventory
+digest. Both model-dependent hook statuses were unknown, so their sequence was
+correctly zero; the harness had incorrectly required a positive sequence.
+The fresh C31 preparation corrects that predicate and namespace labels and
+passes its bounded offline regression and independent source review. C31 has
+not run. Full native lifecycle and hosted Bunny execution remain unqualified.
+The installed launcher and protected Codex processes were unchanged.
 
-Luna implementation workers are preparing GitHub write effects (O4), hook
-runtime intake (O5), invocation-scoped script effects (O6), typed event rules
-(O8) and shared Goal progression (O9). Their private overlays are not part of
-the published build until root integrates and qualifies them.
+Full Windows and remote Ubuntu CI succeeded for this RPC source increment,
+`f338d4ed2cbf6a463b0de8d0ea377bef49391bc3`, in
+[run 37240206914](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37240206914).
+This historical CI does not qualify the newer module batch above.
 
 ### Manual automation invocation and correction cycle — 2026-10-04
 
@@ -701,29 +749,33 @@ and qualification follow it.
 6. **O4 Git/GitHub intake, work pools and distribution — Partial.** Local
    non-force Git ref publication exists as a first slice, with live Git/remote
    qualification pending. GitHub Issue GET intake/reconciliation and work-pool
-   handling exist. Broader GitHub write effects, PR/check effects and shared
+   handling exist. Manual managed-label writes now have the bounded source
+   flow recorded above. Broader GitHub write effects, PR/check effects and shared
    bounded Git-scope inspection remain.
 
 7. **O5 Rust hook observation — Partial.** Authenticated bounded HookCommit
    intake and private hook issuance/install/readback exist in source. Runtime
-   integration and end-to-end native qualification remain.
+   callback retry now shares exact source/commit deduplication. Further runtime
+   integrations and end-to-end native qualification remain.
 
 8. **O6 optional script bundles and runner — Partial.** Immutable bundle
    registration/revision, interpreter capture, activation, direct authorized
    run, owned-process handling, bounded output and durable readback exist.
-   Scoped script-controller API grants/triggers and full native qualification
-   remain.
+   One invocation-scoped Task-owner message grant is now implemented with
+   completion-time revocation checks and a retained child Operation. Broader
+   declared effects/triggers and full native qualification remain.
 
 9. **O8 cron/typed rules and O9 shared Goal progression — Partial.**
    Manager-owned calendar CheckRuns now share the legacy scheduler, entry
    enablement, durable occurrence identities, normal CheckRunner and explicit
    transfer/restart paths. The current source gates are recorded above.
    Manual `schedule.run_now` admission with disabled recurrence now passes the
-   Store and MCP source checks recorded above. Typed event rules, remaining
-   editor/client parity and shared Goal progression remain. Task-scoped Goal
-   reminders exist. OpenCode has a controller-recorded
-    Goal with one activation;
-   native Goal APIs and shared manager-enabled progression remain incomplete.
+   Store and MCP source checks recorded above. Closed applied-submission review
+   rules and selected shared Goal continuation are implemented as the current
+   bounded slices above. Remaining rule types and editor/client parity remain.
+   Task-scoped Goal reminders exist independently of progression. OpenCode has
+   a controller-recorded Goal; its continuation path still needs native workflow
+   qualification, and native Goal APIs in other adapters remain incomplete.
 
 10. **O10 cross-contract parity and O11 integrated qualification — Partial /
     qualification pending.** Current source gates and retained native evidence are

@@ -175,7 +175,7 @@ fn next_read(
     let (id, generation, _) = runtime::scope(db, p, true)?;
     let query = |after: &str| -> Result<Option<String>> {
         Ok(db.query_row("SELECT operation_id FROM operations WHERE binding_id=?1 AND binding_generation=?2
-          AND method IN ('task.dispatch','agent.send') AND state IN ('sending','native_accepted','outcome_unknown','settled')
+          AND method IN ('task.dispatch','agent.send','agent.goal') AND (method!='agent.goal' OR json_extract(original_request_json,'$.action')='continue') AND state IN ('sending','native_accepted','outcome_unknown','settled')
           AND COALESCE(json_extract(native_refs_json,'$.input_execution.disposition'),'') NOT IN ('completed','failed','cancelled')
           AND operation_id>?3 ORDER BY operation_id LIMIT 1", params![id,generation,after], |r| r.get(0)).optional()?)
     };

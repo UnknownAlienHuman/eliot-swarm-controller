@@ -102,6 +102,25 @@ fn profile_tables_are_closed_and_keep_gm_authority_separate() {
     ));
     assert!(profiles::allows_method(
         McpToolProfile::Manager,
+        "github.effect.managed_label"
+    ));
+    assert!(profiles::allows_method(
+        McpToolProfile::Gm,
+        "github.effect.managed_label"
+    ));
+    for profile in [
+        McpToolProfile::Observer,
+        McpToolProfile::Reviewer,
+        McpToolProfile::Participant,
+        McpToolProfile::AssignedReviewer,
+    ] {
+        assert!(
+            !profiles::allows_method(profile, "github.effect.managed_label"),
+            "{profile:?} must not expose a GitHub write effect"
+        );
+    }
+    assert!(profiles::allows_method(
+        McpToolProfile::Manager,
         "swarm.overlap.check"
     ));
     assert!(!profiles::allows_method(

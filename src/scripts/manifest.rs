@@ -34,6 +34,8 @@ pub const MAX_SCHEMA_PROPERTIES: usize = 64;
 pub const MAX_SCHEMA_BYTES: usize = 32 * 1024;
 pub const MAX_PATH_BYTES: usize = 240;
 pub const MAX_INTERPRETER_BYTES: u64 = 512 * 1024 * 1024;
+pub const MAX_CONTROLLER_EFFECTS: usize = 1;
+pub const MAX_CONTROLLER_EFFECT_TEXT_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -49,6 +51,14 @@ pub enum ScriptTrust {
     Isolated,
 }
 
+/// Closed invocation capability set. New variants are new authority and must
+/// stay deliberately narrow instead of naming arbitrary Store methods.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ScriptControllerEffect {
+    TaskOwnerMessage,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScriptBundleRequest {
@@ -61,6 +71,8 @@ pub struct ScriptBundleRequest {
     pub trust: ScriptTrust,
     #[serde(default)]
     pub inherit_environment: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub controller_effects: Vec<ScriptControllerEffect>,
     pub input_schema: ScriptValueSchema,
     pub result_schema: ScriptValueSchema,
     pub files: Vec<BundleFileRequest>,
@@ -127,6 +139,8 @@ pub struct ScriptBundle {
     pub argv: Vec<String>,
     pub trust: ScriptTrust,
     pub inherit_environment: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub controller_effects: Vec<ScriptControllerEffect>,
     pub input_schema: ScriptValueSchema,
     pub result_schema: ScriptValueSchema,
     pub files: Vec<BundleFile>,
@@ -197,6 +211,7 @@ impl ScriptBundleRequest {
                 "script may inherit at most 32 named environment variables",
             ));
         }
+        validate_controller_effects(&self.controller_effects)?;
         let mut environment_names = BTreeSet::new();
         for name in &self.inherit_environment {
             if !valid_environment_name(name) || !environment_names.insert(name.to_ascii_uppercase())
@@ -238,6 +253,7 @@ impl ScriptBundleRequest {
             argv: self.argv.clone(),
             trust: self.trust.clone(),
             inherit_environment: self.inherit_environment.clone(),
+            controller_effects: self.controller_effects.clone(),
             input_schema: self.input_schema.clone(),
             result_schema: self.result_schema.clone(),
             files,
@@ -424,6 +440,12 @@ impl ScriptBundle {
                 "retained environment list is too large",
             ));
         }
+        validate_controller_effects(&self.controller_effects).map_err(|_| {
+            Error::new(
+                "SCRIPT_BUNDLE_DAMAGED",
+                "retained controller effect grant is invalid",
+            )
+        })?;
         let mut environment_names = BTreeSet::new();
         for name in &self.inherit_environment {
             if !valid_environment_name(name) || !environment_names.insert(name.to_ascii_uppercase())
@@ -447,6 +469,21 @@ impl ScriptBundle {
         }
         Ok(())
     }
+}
+
+fn validate_controller_effects(effects: &[ScriptControllerEffect]) -> Result<()> {
+    if effects.len() > MAX_CONTROLLER_EFFECTS {
+        return Err(Error::invalid(
+            "a script bundle may declare at most one controller effect",
+        ));
+    }
+    let mut unique = BTreeSet::new();
+    if effects.iter().any(|effect| !unique.insert(*effect)) {
+        return Err(Error::invalid(
+            "script controller effect grants must be unique",
+        ));
+    }
+    Ok(())
 }
 
 pub fn validate_script_id(id: &str) -> Result<()> {

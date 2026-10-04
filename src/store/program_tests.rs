@@ -1375,6 +1375,38 @@ async fn add_submission_source_fact(store: &Store, suffix: &str, subject: &Revie
         .unwrap();
 }
 
+async fn add_submission_source_fact_with_key(
+    store: &Store,
+    suffix: &str,
+    event_key: &str,
+    subject: &ReviewSubject,
+) {
+    let operation_id = format!("submit-op-{suffix}");
+    let event_key = event_key.to_owned();
+    let attempt_id = subject.attempt_id.clone();
+    let submission_ref = subject.submission_ref.clone();
+    let candidate_ref = subject.candidate_ref.clone();
+    let payload = json!({
+        "operation_id":operation_id,
+        "outcome":"applied",
+        "attempt_id":attempt_id,
+        "submission_ref":submission_ref,
+        "candidate_ref":candidate_ref,
+        "task_accepted":false,
+    });
+    store
+        .run(move |db| {
+            db.execute(
+                "INSERT INTO observations(source_stream_id,source_event_key,operation_id,kind,payload_json,recorded_at_ms) \
+                 VALUES('controller',?1,?2,'task.submission',?3,3)",
+                params![event_key, operation_id, model::canonical(&payload)?],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+}
+
 async fn attach_ready_repair_binding(store: &Store, subject: &ReviewSubject) -> String {
     let binding_id = format!("repair-binding-{}", subject.attempt_id);
     let module_client_id = format!("repair-module-{}", subject.attempt_id);
@@ -2477,6 +2509,552 @@ async fn assigned_reviewer_can_record_and_read_only_the_historical_result_after_
     std::fs::remove_dir_all(directory).unwrap();
 }
 
+#[tokio::test]
+async fn typed_applied_submission_rule_uses_review_operation_and_live_entry_authority() {
+    let (owner, directory, bootstrap) = start_store("typed-event-review-rule").await;
+    let _operator = owner.store.authenticate(bootstrap).await.unwrap();
+    seed_clients(&owner.store).await;
+    let manager = principal("review-gm", Role::Manager);
+    let admitted = seed_subject(
+        &owner.store,
+        "typed-event-admitted",
+        "review-gm",
+        crate::policy::OWNER_POLICY_V2_ID,
+        false,
+    )
+    .await;
+    register_profile_reviewer(
+        &owner.store,
+        &manager,
+        &admitted,
+        "typed-event-reviewer",
+        "typed-event-reviewer-token",
+        "typed-event-reviewers",
+    )
+    .await;
+
+    let configured = owner
+        .store
+        .call(
+            manager.clone(),
+            "automation.config.apply".into(),
+            json!({
+                "client_request_id":"configure-typed-event-review-rule",
+                "project_id":"fixture",
+                "changes":[{
+                    "automation_id":"typed-event-review-rule",
+                    "expected_revision":0,
+                    "include_existing":false,
+                    "patch":{
+                        "enabled":true,
+                        "steps":["review_dispatch"],
+                        "review":{"profile":"typed-event-reviewers","required_reviewers":1},
+                        "event_rules":[{
+                            "source":"task.submission",
+                            "predicate":"applied",
+                            "action":"review_dispatch"
+                        }]
+                    }
+                }]
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(configured["applied"], true);
+    assert_eq!(
+        configured["entries"][0]["event_rules"][0]["source"],
+        "task.submission"
+    );
+
+    let primary_event_key = format!("submission:typed-rule:{}", admitted.submission_ref);
+    let duplicate_event_key = format!(
+        "submission:typed-rule-duplicate:{}",
+        admitted.submission_ref
+    );
+    add_submission_source_fact_with_key(
+        &owner.store,
+        "typed-event-admitted",
+        &primary_event_key,
+        &admitted,
+    )
+    .await;
+    add_submission_source_fact_with_key(
+        &owner.store,
+        "typed-event-admitted",
+        &duplicate_event_key,
+        &admitted,
+    )
+    .await;
+
+    let pass = owner.store.reconcile_automations_once().await.unwrap();
+    assert!(pass["review_dispatch"]["entries"].is_array());
+    let (_operation_id, operation_caller, operation_state, effective, linked_operation, receipts) = owner
+        .store
+        .run({
+            let task_id = admitted.task_id.clone();
+            let submission_ref = admitted.submission_ref.clone();
+            move |db| {
+                let count: i64 = db.query_row(
+                    "SELECT COUNT(*) FROM operations WHERE method='review.assign' AND caller_id=?1 AND task_id=?2",
+                    params![
+                        crate::automation::authorization::AUTOMATION_TECHNICAL_REQUESTER_ID,
+                        task_id
+                    ],
+                    |row| row.get(0),
+                )?;
+                let (operation_id, caller, state, effective_raw): (String, String, String, String) = db.query_row(
+                    "SELECT operation_id,caller_id,state,effective_request_json FROM operations \
+                     WHERE method='review.assign' AND caller_id=?1 AND task_id=?2 \
+                     ORDER BY created_at_ms,operation_id LIMIT 1",
+                    params![
+                        crate::automation::authorization::AUTOMATION_TECHNICAL_REQUESTER_ID,
+                        task_id
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )?;
+                let link = crate::automation::authorization::operation_link(db, &operation_id)?
+                    .ok_or_else(|| Error::new("TEST_LINK_MISSING", "typed rule Operation lacks its manager link"))?;
+                let intake = crate::store::automation_intake::pending_page(
+                    db,
+                    crate::automation::intake::LocalProducer::TaskSubmission.source_id(),
+                    0,
+                    64,
+                )?;
+                let receipts = intake
+                    .items
+                    .into_iter()
+                    .filter_map(|item| match item {
+                        crate::automation::intake::IntakeItem::Receipt(receipt)
+                            if receipt.payload["submission_ref"] == submission_ref =>
+                        {
+                            Some((receipt.source_id, receipt.event_kind, receipt.source_event_key))
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                if count != 1 {
+                    return Err(Error::new(
+                        "TEST_AUTOMATION_OPERATION_COUNT",
+                        format!("expected one typed review Operation, found {count}"),
+                    ));
+                }
+                Ok((
+                    operation_id,
+                    caller,
+                    state,
+                    serde_json::from_str::<Value>(&effective_raw)?,
+                    serde_json::to_value(link)?,
+                    receipts,
+                ))
+            }
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        operation_caller,
+        crate::automation::authorization::AUTOMATION_TECHNICAL_REQUESTER_ID
+    );
+    assert_eq!(operation_state, "settled");
+    assert_eq!(effective["automation_on_behalf"]["action"], "review.assign");
+    assert_eq!(
+        effective["automation_on_behalf"]["automation_id"],
+        "typed-event-review-rule"
+    );
+    assert_eq!(linked_operation["effective_manager_id"], manager.client_id);
+    assert_eq!(linked_operation["automation_id"], "typed-event-review-rule");
+    assert_eq!(linked_operation["automation_revision"], 1);
+    assert_eq!(linked_operation["action"], "review.assign");
+    let linked_cause = &linked_operation["cause"];
+    assert_eq!(linked_cause["kind"], "applied_submission");
+    assert_eq!(
+        linked_cause["operation_id"],
+        "submit-op-typed-event-admitted"
+    );
+    assert_eq!(linked_cause["id"], admitted.submission_ref);
+    assert_eq!(receipts.len(), 2);
+    assert!(receipts.iter().all(|(source, kind, _)| {
+        source == crate::automation::intake::LocalProducer::TaskSubmission.source_id()
+            && kind == crate::automation::intake::LocalProducer::TaskSubmission.event_kind()
+    }));
+    let mut observed_event_keys = receipts
+        .iter()
+        .map(|(_, _, event_key)| event_key.clone())
+        .collect::<Vec<_>>();
+    observed_event_keys.sort();
+    let mut expected_event_keys = vec![primary_event_key, duplicate_event_key];
+    expected_event_keys.sort();
+    assert_eq!(observed_event_keys, expected_event_keys);
+
+    let stale_context = owner
+        .store
+        .run({
+            let manager_id = manager.client_id.clone();
+            let submission_ref = admitted.submission_ref.clone();
+            let cause_operation_id = linked_cause["operation_id"]
+                .as_str()
+                .expect("retained applied submission cause has its Operation ID")
+                .to_owned();
+            let cause_observation_id = linked_cause["observation_id"]
+                .as_i64()
+                .expect("retained applied submission cause has its observation ID");
+            move |db| {
+                let entry = crate::automation::config::load_entry(
+                    db,
+                    &manager_id,
+                    "fixture",
+                    "typed-event-review-rule",
+                )?
+                .ok_or_else(|| Error::new("TEST_ENTRY_MISSING", "typed event entry disappeared"))?;
+                let cause = crate::automation::actions::AutomationCause::AppliedSubmission {
+                    observation_id: cause_observation_id,
+                    operation_id: cause_operation_id,
+                    submission_ref,
+                };
+                crate::automation::authorization::ManagerExecutionContext::from_committed_entry(
+                    db, &entry, cause,
+                )
+            }
+        })
+        .await
+        .unwrap();
+
+    let narrowed = owner
+        .store
+        .call(
+            manager.clone(),
+            "automation.config.apply".into(),
+            json!({
+                "client_request_id":"narrow-typed-event-review-target",
+                "project_id":"fixture",
+                "changes":[{
+                    "automation_id":"typed-event-review-rule",
+                    "expected_revision":1,
+                    "include_existing":false,
+                    "patch":{"review":{"profile":"typed-event-reviewers-v2"}}
+                }]
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(narrowed["applied"], true);
+    let changed_target = owner
+        .store
+        .run({
+            let stale_context = stale_context.clone();
+            let attempt_id = admitted.attempt_id.clone();
+            let submission_ref = admitted.submission_ref.clone();
+            let candidate_ref = admitted.candidate_ref.clone();
+            move |db| {
+                let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let request = crate::review::ReviewAssignRequest::for_automation(
+                    "stale-event-rule-target".to_owned(),
+                    attempt_id,
+                    1,
+                    submission_ref,
+                    candidate_ref,
+                    "typed-event-reviewers".to_owned(),
+                );
+                let result = super::reviews::reserve_assign(
+                    &tx,
+                    super::reviews::ReviewActor::OnBehalf(&stale_context),
+                    &request,
+                    "stale-event-rule-target-operation",
+                    model::now_ms()?,
+                );
+                let code = result.err().map(|error| error.code);
+                drop(tx);
+                Ok(code)
+            }
+        })
+        .await
+        .unwrap();
+    assert_eq!(changed_target.as_deref(), Some("FORBIDDEN"));
+
+    let disabled = owner
+        .store
+        .call(
+            manager.clone(),
+            "automation.config.apply".into(),
+            json!({
+                "client_request_id":"disable-typed-event-review-rule",
+                "project_id":"fixture",
+                "changes":[{
+                    "automation_id":"typed-event-review-rule",
+                    "expected_revision":2,
+                    "include_existing":false,
+                    "patch":{"enabled":false}
+                }]
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(disabled["applied"], true);
+
+    let manual_subject = seed_subject(
+        &owner.store,
+        "typed-event-disabled",
+        "review-gm",
+        crate::policy::OWNER_POLICY_V2_ID,
+        false,
+    )
+    .await;
+    add_submission_source_fact_with_key(
+        &owner.store,
+        "typed-event-disabled",
+        "submission:typed-rule-disabled-entry",
+        &manual_subject,
+    )
+    .await;
+    owner.store.reconcile_automations_once().await.unwrap();
+    let automatic_count = owner
+        .store
+        .run({
+            let task_id = manual_subject.task_id.clone();
+            move |db| {
+                db.query_row(
+                    "SELECT COUNT(*) FROM operations WHERE method='review.assign' AND caller_id=?1 AND task_id=?2",
+                    params![
+                        crate::automation::authorization::AUTOMATION_TECHNICAL_REQUESTER_ID,
+                        task_id
+                    ],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(Into::into)
+            }
+        })
+        .await
+        .unwrap();
+    assert_eq!(automatic_count, 0);
+
+    let (_reviewer, _assignment_id) = assign_sponsored_reviewer(
+        &owner.store,
+        manager.clone(),
+        &manual_subject,
+        "typed-event-manual-reviewer",
+        "typed-event-manual-reviewer-token",
+    )
+    .await;
+    let manual_count = owner
+        .store
+        .run({
+            let task_id = manual_subject.task_id.clone();
+            move |db| {
+                db.query_row(
+                    "SELECT COUNT(*) FROM operations WHERE method='review.assign' AND caller_id=?1 AND task_id=?2",
+                    params![manager.client_id, task_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(Into::into)
+            }
+        })
+        .await
+        .unwrap();
+    assert_eq!(manual_count, 1);
+
+    owner.close().await.unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
 #[cfg(test)]
 #[path = "o7_repair_cycle_tests.rs"]
 mod o7_repair_cycle_tests;
+
+#[tokio::test]
+async fn hook_emit_replay_is_one_durable_source_observation_with_exact_registration_readback() {
+    use std::{fs, process::Command};
+
+    fn run_git(
+        git: &std::path::Path,
+        repository: &std::path::Path,
+        hooks: &std::path::Path,
+        args: &[&str],
+    ) -> String {
+        let output = Command::new(git)
+            .arg("-c")
+            .arg(format!("core.hooksPath={}", hooks.display()))
+            .arg("-C")
+            .arg(repository)
+            .args(args)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "fixture Git command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    let fixture_root = std::env::temp_dir().join(format!("swarm-hook-runtime-{}", model::new_id()));
+    let repository = fixture_root.join("repository");
+    let workspace_root = fixture_root.join("workspaces");
+    let empty_hooks = fixture_root.join("empty-hooks");
+    std::fs::create_dir_all(&repository).unwrap();
+    std::fs::create_dir_all(&workspace_root).unwrap();
+    std::fs::create_dir_all(&empty_hooks).unwrap();
+    let configured_repository_path = fs::canonicalize(&repository).unwrap();
+
+    let git = fixture_git_executable();
+    run_git(&git, &repository, &empty_hooks, &["init", "--quiet"]);
+    run_git(
+        &git,
+        &repository,
+        &empty_hooks,
+        &["config", "user.name", "Hook Fixture"],
+    );
+    run_git(
+        &git,
+        &repository,
+        &empty_hooks,
+        &["config", "user.email", "hook-fixture@example.invalid"],
+    );
+    fs::write(repository.join("candidate.txt"), "committed hook fixture\n").unwrap();
+    run_git(&git, &repository, &empty_hooks, &["add", "candidate.txt"]);
+    run_git(
+        &git,
+        &repository,
+        &empty_hooks,
+        &["commit", "--quiet", "-m", "hook fixture"],
+    );
+    let commit_oid = run_git(
+        &git,
+        &repository,
+        &empty_hooks,
+        &["rev-parse", "--verify", "HEAD^{commit}"],
+    );
+
+    let mut config = Config::default();
+    config.forge.enabled = true;
+    config.forge.git_executable = git;
+    config.forge.projects.insert(
+        "fixture".into(),
+        crate::forge::ForgeProject {
+            canonical_repository: "github.com/owner/hook-fixture".into(),
+            repository_path: configured_repository_path,
+            remote_name: "origin".into(),
+            policy_revision: crate::policy::OWNER_POLICY_V2_ID.into(),
+            target_refs: vec!["refs/heads/main".into()],
+        },
+    );
+    config.workspace.projects.insert(
+        "fixture".into(),
+        crate::workspace::WorkspaceProjectConfig {
+            allowed_roots: vec![workspace_root],
+        },
+    );
+    let (owner, data_directory, bootstrap) =
+        start_store_with_config("hook-runtime-replay", config).await;
+    owner.store.initialize_workspace_authority().await.unwrap();
+    let operator = owner.store.authenticate(bootstrap).await.unwrap();
+
+    let source_id = model::new_id();
+    let credential = Credential {
+        client_id: format!("hook-source:{source_id}"),
+        token: format!("{}{}", model::new_id(), model::new_id()),
+    };
+    owner
+        .store
+        .call(
+            operator,
+            "hook.source.setup".into(),
+            json!({
+                "client_request_id":model::new_id(),
+                "project_id":"fixture",
+                "source_id":source_id,
+                "credential":credential,
+            }),
+        )
+        .await
+        .unwrap();
+    let hook_source = owner.store.authenticate(credential).await.unwrap();
+
+    let emit = json!({"source_id":source_id,"commit_oid":commit_oid});
+    let first = owner
+        .store
+        .call(hook_source.clone(), "hook.emit".into(), emit.clone())
+        .await
+        .unwrap();
+    assert_eq!(first["recorded"], true);
+    assert_eq!(first["duplicate"], false);
+    assert_eq!(first["readback_verified"], true);
+    let observation_id = first["observation_id"].as_i64().unwrap();
+
+    // This is the lost-ack retry path: resend the immutable native envelope.
+    // It must resolve to the first observation, never append another fact.
+    let replay = owner
+        .store
+        .call(hook_source.clone(), "hook.emit".into(), emit)
+        .await
+        .unwrap();
+    assert_eq!(replay["recorded"], false);
+    assert_eq!(replay["duplicate"], true);
+    assert_eq!(replay["observation_id"], observation_id);
+
+    let readback = owner
+        .store
+        .call(
+            hook_source.clone(),
+            "hook.source.get".into(),
+            json!({"source_id":source_id,"after":0,"limit":64}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(readback["events"].as_array().unwrap().len(), 1);
+    assert_eq!(readback["events"][0]["observation_id"], observation_id);
+    assert_eq!(readback["events"][0]["fact"]["source_id"], source_id);
+    assert_eq!(readback["events"][0]["fact"]["commit_oid"], commit_oid);
+    assert_eq!(
+        readback["events"][0]["fact"]["registration_id"],
+        readback["source"]["registration_id"]
+    );
+    assert_eq!(
+        readback["events"][0]["fact"]["registration_generation"],
+        readback["source"]["registration_generation"]
+    );
+
+    let exact_source = source_id.clone();
+    let exact_commit = commit_oid.clone();
+    let (hook_intake, indexed) = owner
+        .store
+        .run(move |db| {
+            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let intake =
+                automation_dispatch::reconcile_source_intake(&tx, 64, true, model::now_ms()?)?;
+            let hook_page = intake.hook_commit.ok_or_else(|| {
+                Error::new("TEST_INTAKE_MISSING", "HookCommit was not reconciled")
+            })?;
+            let indexed = automation_intake::hook_commit_by_identity(
+                &tx,
+                &exact_source,
+                "fixture",
+                &exact_commit,
+            )?;
+            tx.commit()?;
+            Ok((hook_page, indexed))
+        })
+        .await
+        .unwrap();
+    assert_eq!(hook_intake.processed, 1);
+    let (receipt, fact) = indexed.expect("exact source and commit have one retained receipt");
+    assert_eq!(receipt.observation_id, observation_id);
+    assert_eq!(fact.source_id, source_id);
+    assert_eq!(fact.commit_oid, commit_oid);
+    assert_eq!(
+        fact.registration_id,
+        readback["source"]["registration_id"].as_str().unwrap()
+    );
+    assert_eq!(
+        fact.registration_generation,
+        readback["source"]["registration_generation"]
+            .as_i64()
+            .unwrap()
+    );
+
+    owner.close().await.unwrap();
+    std::fs::remove_dir_all(data_directory).unwrap();
+    std::fs::remove_dir_all(fixture_root).unwrap();
+}
+
+#[cfg(test)]
+mod o9_goal_progression_transfer_regression;

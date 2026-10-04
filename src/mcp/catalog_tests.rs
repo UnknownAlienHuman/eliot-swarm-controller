@@ -56,3 +56,74 @@ fn scoped_filter_precedes_search_and_stales_existing_page_cursor() {
     .expect_err("cursor must be bound to the authorized grant revision");
     assert_eq!(stale, CatalogError::StaleCursor);
 }
+
+#[test]
+fn manager_discovers_manual_github_effect_and_lists_it_only_after_explicit_loading() {
+    let profile = McpToolProfile::Manager;
+    let authorization = AuthorizationRevision {
+        value: "manager-scope-rev-1",
+        basis: AuthorizationBasis::AuthenticatedStoreScope,
+    };
+    let default_surface = Surface::role_default(profile);
+    let discovery = search_catalog(
+        profile,
+        &default_surface,
+        SearchRequest {
+            query: "managed label",
+            purpose: None,
+            task_id: None,
+            exact_method: Some("github.effect.managed_label"),
+            loaded_catalog_revision: None,
+            max_results: 5,
+        },
+        authorization,
+        |_, _| true,
+    )
+    .expect("the authorized manager can discover the manual-only effect");
+    assert_eq!(discovery.matches.len(), 1);
+    assert_eq!(discovery.matches[0].method, "github.effect.managed_label");
+    assert_eq!(
+        discovery.matches[0].activation,
+        super::ActivationDisposition::ReconnectSurfaceRequired
+    );
+    assert_eq!(
+        discovery.matches[0].suggested_surface.exact_manual_methods,
+        ["github.effect.managed_label"]
+    );
+
+    let manual_methods = vec!["github.effect.managed_label".to_owned()];
+    let loaded_surface = Surface::configured(profile, None, &[], &manual_methods)
+        .expect("the manager may explicitly load this manual-only tool");
+    let mut cursor = None;
+    let mut listed = false;
+    loop {
+        let page = list_tools_page(
+            profile,
+            &loaded_surface,
+            cursor.as_deref(),
+            authorization,
+            |_, _| true,
+        )
+        .expect("the explicit manager surface is listable");
+        let tools = serde_json::to_value(&page.tools).expect("tool page serializes");
+        listed |= tools.as_array().is_some_and(|items| {
+            items.iter().any(|tool| {
+                tool["name"].as_str() == Some("github_effect_managed_label")
+                    && tool["annotations"]["readOnlyHint"] != true
+                    && tool["inputSchema"]["required"]
+                        .as_array()
+                        .is_some_and(|required| {
+                            required.iter().any(|field| field == "client_request_id")
+                        })
+            })
+        });
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    assert!(
+        listed,
+        "loaded manager surface lists the closed mutation schema"
+    );
+}

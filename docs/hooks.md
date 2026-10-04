@@ -81,3 +81,33 @@ Repository registration changes make the source stale for new events. Facts
 already recorded remain historical evidence and can still be read back. The
 installer is optional and does not change ordinary commit behavior when the
 ELIOT process or Store is unavailable.
+
+## Bounded delivery retries and event-rule boundary
+
+A direct `swarm hook emit` makes at most three `hook.emit` attempts for the
+same `{source_id, commit_oid}`: the first call, then at most two retries after
+100 ms and 400 ms. It retries only `HOST_UNAVAILABLE` and `OUTCOME_UNKNOWN`.
+Every attempt carries that fixed identity; Store verifies and deduplicates the
+source/commit pair against the immutable observation. Other errors and an
+invalid acknowledgment stop immediately. A successful CLI acknowledgment
+names the same source and commit, reports `readback_verified: true`, and
+includes the retained observation ID.
+
+When all three attempts fail, the CLI returns the last bounded error. There is
+no durable retry queue or timer replay. A later invocation of the installed
+post-commit wrapper may resubmit the same fact, which Store deduplicates if the
+source and commit match. The installed wrapper runs the callback detached and
+suppresses its output, so a callback error cannot change Git's already-completed
+commit or appear as a hook failure. Use `hook.source.get` readback to resolve
+whether a fact was retained.
+
+`event_rules` controls downstream automatic ReviewDispatch. An absent or
+`null` value preserves the compatibility TaskSubmission route; `[]` explicitly
+selects no event route. With `[]`, an enabled entry does not automatically
+assign reviews from TaskSubmission facts and does not join hook commits to
+applied submissions for ReviewDispatch. This changes routing, not fact intake:
+`hook.emit` still authenticates and retains verified commit facts, and Store
+continues to retain TaskSubmission observations. Direct `review.assign` and
+other explicitly selected actions remain available under their own authority.
+The exact typed rule and configuration examples are in
+[Module API contracts](agent-operations/module-api.md).

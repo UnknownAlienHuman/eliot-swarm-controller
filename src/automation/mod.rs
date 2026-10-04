@@ -5,6 +5,7 @@ pub(crate) mod actions;
 pub(crate) mod authorization;
 pub(crate) mod config;
 pub(crate) mod disposition;
+pub(crate) mod event_rules;
 pub(crate) mod intake;
 pub(crate) mod publication;
 pub(crate) mod repair;

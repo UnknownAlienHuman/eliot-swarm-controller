@@ -1,12 +1,12 @@
 //! Explicit current-GM transfer of one manager-owned automation entry.
 //!
 //! The source entry remains as a disabled historical snapshot. Its Operations,
-//! callers, causal links, and global cursors are not rewritten. Only the five
-//! typed per-entry ledgers are relocated in this transaction.
+//! callers, causal links, and global cursors are not rewritten. Module-owned
+//! per-entry ledgers are relocated in this transaction.
 
 use super::{
-    automation_cron, automation_dispatch, automation_publication, automation_work_dispatch,
-    review_disposition,
+    automation_cron, automation_dispatch, automation_goal_progression, automation_publication,
+    automation_work_dispatch, review_disposition,
 };
 use crate::{
     automation::{
@@ -157,6 +157,7 @@ pub(super) fn apply(
     automation_work_dispatch::relocate_state(tx, &former, &successor)?;
     automation_publication::relocate_state(tx, &former, &successor)?;
     review_disposition::relocate_state(tx, &former, &successor)?;
+    automation_goal_progression::relocate_state(tx, &former, &successor)?;
 
     config::write_record(
         tx,
@@ -228,6 +229,6 @@ pub(super) fn apply(
         "former_owner_revision":former.revision,
         "new_owner_revision":successor.revision,
         "gm_epoch":gm_epoch,
-        "state_ledgers_relocated":5
+        "state_ledgers_relocated":6
     }))
 }

@@ -1,8 +1,16 @@
 # Agent Operations — Manager-Owned Automation
 
-Revision 5 · 2026-10-03 · design baseline `36cfb652` plus the active implementation increment.
+Revision 6 · 2026-10-04 · design baseline `36cfb652` plus the active implementation increments.
 
-**Status: partial implementation, not a completed or live-qualified program.** C4 commit `2607c8858e573ae40459c27d76d8ae9e1ca9f8fc` added 29 methods and 83 `ToolSpec` entries; its 221 Rust tests apply only to that SHA. C4 CI run 37137719451 failed on Linux environment defaults and the Muse fixture realpath; repairs are committed in C5, with remote CI pending. C5 commit `b36e84b506a60fb09ecfe7a8adbb6da8e5ed0748` extends CLI/MCP to 88 `ToolSpec` entries and adds canonical card-answer/exact-bounded-ask consultation, `operation_terminal` watch create/list/cancel with passive inbox/shared tick, and read-only `launch.preview`. C5 Clippy passed in 8.85s and the changed canonical-path Muse selftest passed in 7.4s; no new Cargo test run. Other watch kinds, productive launch, integration/scope-Git, Concilium, cron, Goal, native-Rust conversion and actual native-MCP harness loading remain planned or unknown.
+**Status: partial implementation.** Current source includes manager-owned action
+admission and transfer, durable intake and peer coordination, the reviewed
+return/repair cycle, calendar CheckRuns and manual run-now, bounded hooks,
+invocation-scoped script effects, typed review rules and shared Goal
+continuation. Each implemented slice uses the same Store and ordinary Operation
+path. Source checks, exact CI commits, native failures and remaining gaps are
+recorded in [Implementation status](../implementation-status.md); successful
+source tests do not establish productive native/model execution. The documents
+below retain the complete requirements, including work still outstanding.
 
 ## Product rule
 
@@ -27,6 +35,7 @@ Enabling audit assignment does not enable distribution, repair or push. Importin
 | Document | Owns |
 |---|---|
 | [Configuration](configuration.md) | The editable schema, enable/disable, preferences and effects of changing settings. |
+| [Module API contracts](module-api.md) | Current bounded GitHub, hook, script, typed-rule and Goal call shapes and execution boundaries. |
 | [Architecture](architecture.md) | On-behalf execution, durable dispatch, monitoring, hooks, cron, Goal, scripts and recovery. |
 | [Delivery](delivery.md) | Queue assignment, submission, audit, return, repair and GitHub effects. |
 | [Donor map](donor-map.md) | Source observations and precisely limited reuse. |

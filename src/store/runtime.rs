@@ -2449,6 +2449,7 @@ pub(super) fn user_command(
 enum UserCommandActor<'a> {
     Direct(&'a Principal),
     Repair(&'a crate::automation::repair::RepairDispatchContext),
+    GoalProgression(&'a crate::store::automation_goal_progression::GoalProgressionAdmission),
 }
 
 impl UserCommandActor<'_> {
@@ -2456,6 +2457,7 @@ impl UserCommandActor<'_> {
         match self {
             Self::Direct(principal) => &principal.client_id,
             Self::Repair(context) => context.effective_manager_id(),
+            Self::GoalProgression(context) => context.effective_manager_id(),
         }
     }
 
@@ -2469,6 +2471,10 @@ impl UserCommandActor<'_> {
             Self::Repair(_) => Err(Error::new(
                 "FORBIDDEN",
                 "repair authority cannot recover a binding",
+            )),
+            Self::GoalProgression(_) => Err(Error::new(
+                "FORBIDDEN",
+                "Goal progression authority cannot recover a binding",
             )),
         }
     }
@@ -2531,6 +2537,33 @@ pub(super) fn user_command_for_repair(
         UserCommandActor::Repair(context),
         "agent.send",
         &request,
+        operation_id,
+        config,
+    )
+}
+
+/// Admit the exact manager-owned Goal continuation through the ordinary
+/// runtime command path. The Store-derived context grants only one input for
+/// the selected terminal EventRef; it is not a general Manager principal.
+pub(super) fn user_command_for_goal_progression(
+    tx: &Connection,
+    context: &crate::store::automation_goal_progression::GoalProgressionAdmission,
+    operation_id: &str,
+    config: &crate::config::Config,
+    now_ms: i64,
+) -> Result<Value> {
+    context.require_current_for_operation(tx, operation_id, now_ms)?;
+    if meta(tx, "execution_mode")?.unwrap_or(Value::Null)["new_work"] != "enabled" {
+        return Err(Error::new(
+            "ADMISSION_DISABLED",
+            "new work is disabled before Goal continuation admission",
+        ));
+    }
+    user_command_with_actor(
+        tx,
+        UserCommandActor::GoalProgression(context),
+        "agent.goal",
+        context.request(),
         operation_id,
         config,
     )
@@ -2607,6 +2640,37 @@ fn user_command_with_actor(
                         "the exact repair Attempt is no longer current on this binding",
                     ));
                 }
+            }
+            UserCommandActor::GoalProgression(context) => {
+                if method != "agent.goal"
+                    || v["action"] != "continue"
+                    || id != context.binding_id()
+                    || generation != context.binding_generation()
+                    || model::canonical(v)? != model::canonical(context.request())?
+                {
+                    return Err(Error::new(
+                        "FORBIDDEN",
+                        "Goal progression is limited to its exact admitted continuation request and binding",
+                    ));
+                }
+                let task = tasks::get_task(tx, context.task_id())?;
+                let attempt = tasks::get_attempt(tx, context.attempt_id())?;
+                if task["state"] != "open"
+                    || task["revision"] != context.task_revision()
+                    || task["current_attempt_id"] != context.attempt_id()
+                    || attempt["task_id"] != context.task_id()
+                    || attempt["task_revision"] != context.task_revision()
+                    || attempt["attempt_id"] != context.attempt_id()
+                    || !attempt["released_at_ms"].is_null()
+                    || attempt["binding_id"] != id
+                    || attempt["binding_generation"] != generation
+                {
+                    return Err(Error::new(
+                        "AUTOMATION_ACTION_CHANGED",
+                        "exact Goal Task Attempt changed before native command admission",
+                    ));
+                }
+                manager_attempt = Some(attempt);
             }
             UserCommandActor::Direct(principal) if principal.role == Role::Manager => {
                 let principal = super::current_principal(tx, (*principal).clone())?;
@@ -2704,15 +2768,30 @@ fn user_command_with_actor(
         match model::text(v, "action")? {
             "set" | "edit" => {
                 model::text(v, "objective")?;
+                if v.get("expected_revision").is_some() {
+                    return Err(Error::invalid(
+                        "expected_revision is only valid for continue",
+                    ));
+                }
+            }
+            "continue" => {
+                model::text(v, "objective")?;
+                if v.get("expected_revision").and_then(Value::as_u64).is_none() {
+                    return Err(Error::invalid(
+                        "continue requires a nonnegative expected_revision",
+                    ));
+                }
             }
             "pause" | "resume" | "clear" => {
-                if v.get("objective").is_some() {
-                    return Err(Error::invalid("objective is only valid for set/edit"));
+                if v.get("objective").is_some() || v.get("expected_revision").is_some() {
+                    return Err(Error::invalid(
+                        "objective and expected_revision are only valid for set/edit/continue",
+                    ));
                 }
             }
             _ => {
                 return Err(Error::invalid(
-                    "goal action must be set/edit/pause/resume/clear",
+                    "goal action must be set/edit/pause/resume/clear/continue",
                 ));
             }
         }
@@ -2786,8 +2865,8 @@ fn user_command_with_actor(
         effective["operation_contract"] = json!({
             "effect_scope":"native_session",
             "order_scope":{"binding_id":id,"generation":generation},
-            "completion_condition":"native_goal_recorded",
-            "application_boundary":"next_step_boundary+prompt_admission",
+            "completion_condition":if v["action"] == "continue" { "native_input_admitted" } else { "native_goal_recorded" },
+            "application_boundary":if v["action"] == "continue" { "exact_goal_revision+prompt_admission" } else { "next_step_boundary+prompt_admission" },
             "replay_policy":"readback_only_no_mutation_replay",
             "fallback_used":false,
             "continuation_owner":"controller_record",
@@ -2839,6 +2918,9 @@ fn user_command_with_actor(
                 context.identity().attempt_id
             ],
         )?;
+    }
+    if let UserCommandActor::GoalProgression(context) = &actor {
+        effective["automation_on_behalf"] = context.linkage().clone();
     }
     if let Some(attempt) = manager_attempt {
         tx.execute(

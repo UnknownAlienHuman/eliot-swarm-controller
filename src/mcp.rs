@@ -1054,12 +1054,13 @@ static TOOLS: &[(bool, ToolSpec)] = &[
     ),
     mutation(
         "agent.goal",
-        "Set, edit, pause, resume or clear the goal of one binding.",
+        "Set, edit, pause, resume, continue or clear the goal of one binding; continue admits one input for an exact active revision.",
         &[
             f("binding_id", S),
             f("generation", I),
             f("action", S),
             f("objective", S),
+            f("expected_revision", I),
         ],
         &["binding_id", "generation", "action"],
     ),
@@ -1299,19 +1300,19 @@ static TOOLS: &[(bool, ToolSpec)] = &[
     ),
     mutation(
         "script.register",
-        "Register one complete bounded trusted-local script bundle; no API capabilities or trigger are enabled.",
+        "Register one complete bounded trusted-local script bundle; invocation effects are explicit and limited to the bundle's closed grant list.",
         &[f("bundle", O)],
         &["bundle"],
     ),
     mutation(
         "script.revise",
-        "Publish a complete replacement script bundle under revision compare-and-swap.",
+        "Publish a complete replacement bundle under revision compare-and-swap, including its closed invocation effect grants.",
         &[f("script_id", S), f("expected_revision", I), f("bundle", O)],
         &["script_id", "expected_revision", "bundle"],
     ),
     read(
         "script.validate",
-        "Validate one retained script revision and report metadata only; it does not execute the script.",
+        "Validate one retained revision and report its declared invocation effects; it does not execute the script.",
         &[f("script_id", S), f("revision", I)],
         &["script_id", "revision"],
     ),
@@ -1323,7 +1324,7 @@ static TOOLS: &[(bool, ToolSpec)] = &[
     ),
     mutation(
         "script.run",
-        "Start exactly one authorized invocation of an activated script for one exact Attempt and Task revision.",
+        "Start one authorized invocation for an exact Attempt and Task revision. A granted task_owner_message request is rechecked through message.send and linked to this script.run; the completion reports whether the effect applied.",
         &[
             f("script_id", S),
             f("expected_script_revision", I),
@@ -1400,6 +1401,24 @@ static TOOLS: &[(bool, ToolSpec)] = &[
         "Apply an explicit bounded selection of source-mapped Tasks to the existing local work pool.",
         &[f("source_id", S), f("task_ids", A)],
         &["source_id", "task_ids"],
+    ),
+    mutation(
+        "github.effect.managed_label",
+        "Set or remove one Eliot-managed label on a selected source-mapped Issue.",
+        &[
+            f("source_id", S),
+            f("task_id", S),
+            f("expected_task_revision", I),
+            f("label", S),
+            f("present", B),
+        ],
+        &[
+            "source_id",
+            "task_id",
+            "expected_task_revision",
+            "label",
+            "present",
+        ],
     ),
 ];
 
@@ -1761,6 +1780,15 @@ fn refine_input_schema(method: &str, schema: &mut Value) {
                 "items":{"type":"string","minLength":1,"maxLength":512,"pattern":"^\\S+$"}
             });
         }
+        "github.effect.managed_label" => {
+            properties["source_id"] = json!({"type":"string","minLength":1,"maxLength":128,"pattern":"^[A-Za-z0-9_.-]+$"});
+            properties["task_id"] =
+                json!({"type":"string","minLength":1,"maxLength":512,"pattern":"^\\S+$"});
+            properties["expected_task_revision"] =
+                json!({"type":"integer","minimum":1,"maximum":9223372036854775807_i64});
+            properties["label"] = json!({"type":"string","minLength":10,"maxLength":50,"pattern":"^eliot-[a-z0-9-]+$"});
+            properties["present"] = json!({"type":"boolean"});
+        }
         "swarm.launch.preview" | "swarm.launch" => {
             properties["task_id"] = json!({"type":"string","minLength":1,"maxLength":512});
             properties["expected_task_revision"] =
@@ -1811,6 +1839,7 @@ fn script_bundle_request_schema() -> Value {
             "argv":{"type":"array","maxItems":32,"items":{"type":"string","maxLength":4096}},
             "trust":{"const":"trusted_local"},
             "inherit_environment":{"type":"array","maxItems":32,"items":{"type":"string","minLength":1,"maxLength":256}},
+            "controller_effects":{"type":"array","maxItems":1,"uniqueItems":true,"items":{"const":"task_owner_message"}},
             "input_schema":{"$ref":"#/$defs/ScriptValueSchema"},
             "result_schema":{"$ref":"#/$defs/ScriptValueSchema"},
             "files":{
@@ -3388,15 +3417,16 @@ mod tests {
             "github.source.poll",
             "github.work_pool.preview",
             "github.work_pool.apply",
+            "github.effect.managed_label",
         ]
         .into_iter()
         .collect();
         assert_eq!(methods, expected);
-        assert_eq!(TOOLS.len(), 116);
+        assert_eq!(TOOLS.len(), 117);
         assert_eq!(TOOLS.iter().filter(|(read_only, _)| *read_only).count(), 54);
         assert_eq!(
             TOOLS.iter().filter(|(read_only, _)| !*read_only).count(),
-            62
+            63
         );
     }
 
@@ -3442,6 +3472,19 @@ mod tests {
         ] {
             assert!(output["properties"].get(field).is_some(), "{field}");
         }
+        let register = find_tool("script_register").unwrap();
+        let schema = input_schema(&register.1, register.0, false);
+        let grants = &schema["properties"]["bundle"]["properties"]["controller_effects"];
+        assert_eq!(grants["maxItems"], json!(1));
+        assert_eq!(grants["uniqueItems"], json!(true));
+        assert_eq!(grants["items"]["const"], json!("task_owner_message"));
+        assert!(
+            !schema["properties"]["bundle"]["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field == "controller_effects")
+        );
     }
 }
 

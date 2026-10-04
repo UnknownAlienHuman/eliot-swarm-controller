@@ -621,7 +621,10 @@ pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
             crate::hooks::contract::HookSetupRequest::parse(params)?;
             return Ok(());
         }
-        "github.source.setup" | "github.source.poll" | "github.work_pool.apply" => {
+        "github.source.setup"
+        | "github.source.poll"
+        | "github.work_pool.apply"
+        | "github.effect.managed_label" => {
             crate::github::protocol::validate_mutation(method, params)?;
             return Ok(());
         }
@@ -767,6 +770,7 @@ pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
             "generation",
             "action",
             "objective",
+            "expected_revision",
             "prerequisite_operation_id",
         ],
         "agent.background" => &[

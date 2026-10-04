@@ -1,7 +1,11 @@
 //! Typed, manager-scoped automation definitions and patch semantics.
 
-use super::actions::{AutomationStep, supported_action_for};
 use super::work_dispatch::WorkDispatchLaunchSettings;
+use super::{
+    actions::{AutomationCause, AutomationStep, supported_action_for},
+    event_rules::{self, EventRule},
+    intake::EventReceipt,
+};
 use crate::error::{Error, Result};
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -82,6 +86,22 @@ impl PublicationSettings {
     }
 }
 
+/// One manager-selected shared Goal for terminal-turn progression.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GoalProgressionSettings {
+    pub(crate) goal_id: String,
+}
+
+impl GoalProgressionSettings {
+    fn validate(&self) -> Result<()> {
+        validate_name(
+            &self.goal_id,
+            "goal_progression.goal_id",
+            crate::goals::MAX_GOAL_ID_BYTES,
+        )
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AutomationEntry {
@@ -99,11 +119,15 @@ pub(crate) struct AutomationEntry {
     #[serde(default)]
     pub(crate) work_dispatch: Option<WorkDispatchLaunchSettings>,
     #[serde(default)]
+    pub(crate) goal_progression: Option<GoalProgressionSettings>,
+    #[serde(default)]
     pub(crate) publication: Option<PublicationSettings>,
     #[serde(default)]
     pub(crate) cron: Option<crate::scheduler::CronSettings>,
     #[serde(default)]
     pub(crate) hook_commit: Option<HookCommitSettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) event_rules: Option<Vec<EventRule>>,
     pub(crate) review: ReviewSettings,
     pub(crate) created_at_ms: i64,
     pub(crate) updated_at_ms: i64,
@@ -131,9 +155,11 @@ impl AutomationEntry {
             scope: AutomationScope { work_pool_id: None },
             steps: Vec::new(),
             work_dispatch: None,
+            goal_progression: None,
             publication: None,
             cron: None,
             hook_commit: None,
+            event_rules: None,
             review: ReviewSettings {
                 profile: None,
                 required_reviewers: 1,
@@ -158,6 +184,14 @@ impl AutomationEntry {
             gaps.push(json!({
                 "code":"work_pool_scope_unavailable",
                 "reason":"the current Task source has no committed work-pool membership reader"
+            }));
+        }
+        if self.steps.contains(&AutomationStep::GoalProgression) && self.goal_progression.is_none()
+        {
+            gaps.push(json!({
+                "code":"goal_progression_settings_required",
+                "step":"goal_progression",
+                "reason":"select the exact existing shared Goal ID before enabling progression"
             }));
         }
         if self.steps.contains(&AutomationStep::WorkDispatch) {
@@ -220,11 +254,18 @@ impl AutomationEntry {
     pub(crate) fn review_dispatch_ready(&self) -> bool {
         self.enabled
             && self.steps.contains(&AutomationStep::ReviewDispatch)
+            && self.task_submission_review_rule_selected()
             && self.review.profile.is_some()
             && self.review.required_reviewers == 1
             && self.scope.work_pool_id.is_none()
     }
 
+    pub(crate) fn goal_progression_ready(&self) -> bool {
+        self.enabled
+            && self.steps.contains(&AutomationStep::GoalProgression)
+            && self.goal_progression.is_some()
+            && self.scope.work_pool_id.is_none()
+    }
     pub(crate) fn work_dispatch_ready(&self) -> bool {
         self.enabled
             && self.steps.contains(&AutomationStep::WorkDispatch)
@@ -244,6 +285,22 @@ impl AutomationEntry {
             && self.steps.contains(&AutomationStep::CheckRun)
             && self.cron.is_some()
             && self.scope.work_pool_id.is_none()
+    }
+
+    pub(crate) fn task_submission_review_rule_selected(&self) -> bool {
+        self.event_rules
+            .as_ref()
+            .is_none_or(|rules| !rules.is_empty())
+    }
+
+    pub(crate) fn accepts_task_submission_review_event(
+        &self,
+        receipt: &EventReceipt,
+        cause: &AutomationCause,
+    ) -> bool {
+        self.event_rules
+            .as_ref()
+            .is_none_or(|rules| rules.iter().any(|rule| rule.matches(receipt, cause)))
     }
 }
 
@@ -693,10 +750,12 @@ pub(crate) fn apply_patch(
             }
             "scope" => patch_scope(&mut next.scope, value)?,
             "steps" => next.steps = parse_steps(value)?,
+            "goal_progression" => patch_goal_progression(&mut next.goal_progression, value)?,
             "work_dispatch" => patch_work_dispatch(&mut next.work_dispatch, value)?,
             "publication" => patch_publication(&mut next.publication, value)?,
             "cron" => patch_cron(&mut next.cron, value)?,
             "hook_commit" => patch_hook_commit(&mut next.hook_commit, value)?,
+            "event_rules" => next.event_rules = event_rules::parse_settings(value)?,
             "review" => patch_review(&mut next.review, value)?,
             _ => return Err(Error::invalid(format!("unknown automation field: {field}"))),
         }
@@ -765,6 +824,20 @@ fn patch_cron(settings: &mut Option<crate::scheduler::CronSettings>, patch: &Val
     Ok(())
 }
 
+fn patch_goal_progression(
+    settings: &mut Option<GoalProgressionSettings>,
+    patch: &Value,
+) -> Result<()> {
+    if patch.is_null() {
+        *settings = None;
+        return Ok(());
+    }
+    let parsed: GoalProgressionSettings = serde_json::from_value(patch.clone())
+        .map_err(|_| Error::invalid("goal_progression requires exactly one goal_id"))?;
+    parsed.validate()?;
+    *settings = Some(parsed);
+    Ok(())
+}
 fn patch_work_dispatch(
     settings: &mut Option<WorkDispatchLaunchSettings>,
     patch: &Value,
@@ -953,6 +1026,14 @@ pub(crate) fn validate_entry(entry: &AutomationEntry) -> Result<()> {
             )
         })?;
     }
+    if let Some(settings) = entry.goal_progression.as_ref() {
+        settings.validate().map_err(|_| {
+            Error::new(
+                "AUTOMATION_RECORD_INVALID",
+                "stored Goal progression settings do not identify one bounded Goal ID",
+            )
+        })?;
+    }
     if let Some(settings) = entry.work_dispatch.as_ref() {
         let value = serde_json::to_value(settings).map_err(|_| {
             Error::new(
@@ -994,6 +1075,14 @@ pub(crate) fn validate_entry(entry: &AutomationEntry) -> Result<()> {
             Error::new(
                 "AUTOMATION_RECORD_INVALID",
                 "stored HookCommit source identity is invalid",
+            )
+        })?;
+    }
+    if let Some(rules) = entry.event_rules.as_ref() {
+        event_rules::validate(rules, &entry.steps).map_err(|_| {
+            Error::new(
+                "AUTOMATION_RECORD_INVALID",
+                "stored event rules must use a registered source/action and selected action step",
             )
         })?;
     }

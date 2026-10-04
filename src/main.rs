@@ -1,13 +1,16 @@
 use clap::{Parser, Subcommand};
 use eliot_swarm_controller::{
-    config::Config,
+    config::{Config, Ipc},
     error::{Error, Result},
     host, ipc,
     model::{self, Credential},
     platform,
 };
 use serde_json::{Value, json};
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 #[derive(Parser)]
 #[command(
@@ -1365,14 +1368,18 @@ async fn run(cli: Cli) -> Result<()> {
             model::text(&params, "client_request_id")?
         );
     }
-    let result = ipc::call(
-        &config.storage.data_dir,
-        &credential,
-        &method,
-        params,
-        &config.ipc,
-    )
-    .await?;
+    let result = if is_hook_emit {
+        hook_emit_with_retry(&config.storage.data_dir, &credential, &params, &config.ipc).await?
+    } else {
+        ipc::call(
+            &config.storage.data_dir,
+            &credential,
+            &method,
+            params,
+            &config.ipc,
+        )
+        .await?
+    };
     println!("{}", serde_json::to_string_pretty(&result)?);
     if let Some(path) = pending_credential {
         eprintln!("credential saved: {}", path.display());
@@ -1380,6 +1387,78 @@ async fn run(cli: Cli) -> Result<()> {
     Ok(())
 }
 
+// A post-commit fact is safe to resend only because Store owns the stable
+// (source_id, commit_oid) identity and verifies an identical duplicate against
+// the retained observation. Keep this recovery specific to hook.emit; ordinary
+// mutations continue to use ipc::call's no-retry behavior.
+const HOOK_EMIT_ATTEMPTS: usize = 3;
+const HOOK_EMIT_RETRY_DELAY_MS: [Option<u64>; HOOK_EMIT_ATTEMPTS] = [Some(100), Some(400), None];
+
+async fn hook_emit_with_retry(
+    data_dir: &Path,
+    credential: &Credential,
+    params: &Value,
+    ipc_config: &Ipc,
+) -> Result<Value> {
+    model::fields(params, &["source_id", "commit_oid", "client_request_id"])?;
+    let source_id = model::text(params, "source_id")?.to_owned();
+    let commit_oid = model::text(params, "commit_oid")?.to_owned();
+    let exact_params = json!({"source_id":source_id,"commit_oid":commit_oid});
+
+    for retry_delay_ms in HOOK_EMIT_RETRY_DELAY_MS {
+        match ipc::call(
+            data_dir,
+            credential,
+            "hook.emit",
+            exact_params.clone(),
+            ipc_config,
+        )
+        .await
+        {
+            Ok(reply) if hook_emit_ack_matches(&reply, &source_id, &commit_oid) => {
+                return Ok(reply);
+            }
+            Ok(_) => {
+                return Err(Error::new(
+                    "HOOK_EMIT_ACK_INVALID",
+                    "hook acknowledgment did not identify the requested source and commit",
+                ));
+            }
+            Err(error) if matches!(error.code.as_str(), "HOST_UNAVAILABLE" | "OUTCOME_UNKNOWN") => {
+                let Some(delay_ms) = retry_delay_ms else {
+                    return Err(Error::new(
+                        error.code,
+                        "post-commit fact remains unconfirmed after bounded same-identity retry; a later replay of this source and commit is deduplicated",
+                    ));
+                };
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(Error::new(
+        "HOOK_EMIT_RETRY_EXHAUSTED",
+        "post-commit fact did not receive a durable acknowledgment",
+    ))
+}
+
+fn hook_emit_ack_matches(reply: &Value, source_id: &str, commit_oid: &str) -> bool {
+    let (Some(recorded), Some(duplicate)) = (
+        reply.get("recorded").and_then(Value::as_bool),
+        reply.get("duplicate").and_then(Value::as_bool),
+    ) else {
+        return false;
+    };
+    reply["event"] == "git.post_commit"
+        && reply["source_id"].as_str() == Some(source_id)
+        && reply["commit_oid"]
+            .as_str()
+            .is_some_and(|oid| oid.eq_ignore_ascii_case(commit_oid))
+        && reply["readback_verified"] == true
+        && reply["observation_id"].as_i64().is_some_and(|id| id > 0)
+        && recorded != duplicate
+}
 fn hook_install_context<'a>(config: &'a Config, project_id: &str) -> Result<(&'a Path, &'a Path)> {
     let project = config.forge.projects.get(project_id).ok_or_else(|| {
         Error::new(

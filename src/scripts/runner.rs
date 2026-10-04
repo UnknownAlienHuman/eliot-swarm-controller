@@ -30,7 +30,7 @@ use super::{
         self, InterpreterIdentity, MAX_INVOCATION_BYTES, MAX_RESULT_BYTES, MAX_SCRIPT_DURATION_MS,
         MAX_STDERR_BYTES, ScriptBundle,
     },
-    protocol::{ScriptInvocation, ScriptResult},
+    protocol::{ScriptEffectRequest, ScriptInvocation, ScriptResult},
     registry,
 };
 
@@ -93,6 +93,8 @@ pub struct Completion {
     pub stdout: ArtifactRecord,
     pub stderr: ArtifactRecord,
     pub result_value: Option<Value>,
+    #[serde(default)]
+    pub controller_effects: Vec<ScriptEffectRequest>,
     pub error_code: Option<String>,
 }
 
@@ -106,6 +108,7 @@ struct CompletionPublication<'a> {
     stdout: &'a [u8],
     stderr: &'a [u8],
     result_value: Option<Value>,
+    controller_effects: &'a [ScriptEffectRequest],
     error_code: Option<String>,
     state: &'a str,
     started_at_ms: Option<i64>,
@@ -536,7 +539,13 @@ pub fn completion(work: &Work, files: &ArtifactFiles) -> Result<Option<Completio
                 || completion.result_value.is_none()
                 || completion.started_at_ms.is_none()))
         || (completion.state != "completed"
-            && (completion.error_code.is_none() || completion.result_value.is_some()))
+            && (completion.error_code.is_none()
+                || completion.result_value.is_some()
+                || !completion.controller_effects.is_empty()))
+        || completion.controller_effects.len() > manifest::MAX_CONTROLLER_EFFECTS
+        || completion.controller_effects.iter().any(|effect| {
+            !work.bundle.controller_effects.contains(&effect.effect) || effect.validate().is_err()
+        })
         || completion.result.byte_length > (MAX_RESULT_BYTES + 16 * 1024) as u64
         || completion.stdout.byte_length > MAX_RESULT_BYTES as u64
         || completion.stderr.byte_length > MAX_STDERR_BYTES as u64
@@ -586,7 +595,7 @@ pub fn completion(work: &Work, files: &ArtifactFiles) -> Result<Option<Completio
         || result_value["result"] != json!(completion.result_value)
         || result_value["stdout_ref"] != completion.stdout.artifact_id
         || result_value["stderr_ref"] != completion.stderr.artifact_id
-        || result_value["controller_effects"] != json!([])
+        || result_value["controller_effects"] != json!(completion.controller_effects)
     {
         return Err(Error::conflict(
             "script result document differs from its completion receipt",
@@ -934,6 +943,8 @@ fn execute(work: &Work, dir: &Path, group: &Group, identity: &Value) -> Result<(
     } else {
         None
     };
+    let result_value = parsed.as_ref().map(|parsed| parsed.result.clone());
+    let controller_effects = parsed.map(|parsed| parsed.effects).unwrap_or_default();
     let state = if error_code.is_none() {
         "completed"
     } else {
@@ -944,7 +955,8 @@ fn execute(work: &Work, dir: &Path, group: &Group, identity: &Value) -> Result<(
         CompletionPublication {
             stdout: &stdout.bytes,
             stderr: &stderr.bytes,
-            result_value: parsed,
+            result_value,
+            controller_effects: &controller_effects,
             error_code,
             state,
             started_at_ms: Some(started_at_ms),
@@ -954,7 +966,12 @@ fn execute(work: &Work, dir: &Path, group: &Group, identity: &Value) -> Result<(
     )
 }
 
-fn parse_script_result(bytes: &[u8], work: &Work) -> Result<Value> {
+struct ParsedScriptResult {
+    result: Value,
+    effects: Vec<ScriptEffectRequest>,
+}
+
+fn parse_script_result(bytes: &[u8], work: &Work) -> Result<ParsedScriptResult> {
     if bytes.is_empty() || bytes.len() > MAX_RESULT_BYTES {
         return Err(Error::new(
             "SCRIPT_RESULT_INVALID",
@@ -977,7 +994,30 @@ fn parse_script_result(bytes: &[u8], work: &Work) -> Result<Value> {
         ));
     }
     work.bundle.result_schema.validate_value(&result.result)?;
-    Ok(result.result)
+    if result.effects.len() > manifest::MAX_CONTROLLER_EFFECTS {
+        return Err(Error::new(
+            "SCRIPT_EFFECTS_INVALID",
+            "script requested more controller effects than the invocation permits",
+        ));
+    }
+    for effect in &result.effects {
+        if !work.invocation.controller_effects.contains(&effect.effect) {
+            return Err(Error::new(
+                "SCRIPT_EFFECTS_UNGRANTED",
+                "script requested a controller effect outside this invocation grant",
+            ));
+        }
+        effect.validate().map_err(|_| {
+            Error::new(
+                "SCRIPT_EFFECTS_INVALID",
+                "script controller effect payload is invalid",
+            )
+        })?;
+    }
+    Ok(ParsedScriptResult {
+        result: result.result,
+        effects: result.effects,
+    })
 }
 
 fn publish_completion(work: &Work, publication: CompletionPublication<'_>) -> Result<()> {
@@ -985,6 +1025,7 @@ fn publish_completion(work: &Work, publication: CompletionPublication<'_>) -> Re
         stdout: stdout_bytes,
         stderr: stderr_bytes,
         result_value,
+        controller_effects,
         error_code,
         state,
         started_at_ms,
@@ -1009,7 +1050,7 @@ fn publish_completion(work: &Work, publication: CompletionPublication<'_>) -> Re
         "result":result_value,
         "stdout_ref":stdout.0.artifact_id,
         "stderr_ref":stderr.0.artifact_id,
-        "controller_effects":[],
+        "controller_effects":controller_effects,
     });
     let result_id = format!(
         "scriptresult-{}",
@@ -1034,6 +1075,7 @@ fn publish_completion(work: &Work, publication: CompletionPublication<'_>) -> Re
         stdout: stdout.0,
         stderr: stderr.0,
         result_value,
+        controller_effects: controller_effects.to_vec(),
         error_code,
     };
     let dir = directory(&work.data_dir, &work.run_id)?;
@@ -1096,6 +1138,7 @@ fn finish_worker_error(
             stdout: &[],
             stderr: &[],
             result_value: None,
+            controller_effects: &[],
             error_code: Some(error_code),
             state,
             started_at_ms,
@@ -1346,7 +1389,7 @@ fn validate_work(work: &Work) -> Result<()> {
         || work.invocation.protocol_version != 1
         || work.invocation.operation_id != work.operation_id
         || work.invocation.run_id != work.run_id
-        || !work.invocation.controller_effects.is_empty()
+        || work.invocation.controller_effects != work.bundle.controller_effects
         || environment_sha256(&work.environment)? != work.environment_sha256
     {
         return Err(Error::new(

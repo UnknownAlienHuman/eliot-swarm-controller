@@ -503,7 +503,7 @@ async fn current_gm_transfer_preserves_all_entry_journals_and_retires_old_owner(
         .await
         .unwrap();
     assert_eq!(transfer["status"], "transferred");
-    assert_eq!(transfer["state_ledgers_relocated"], 5);
+    assert_eq!(transfer["state_ledgers_relocated"], 6);
     assert_eq!(transfer["new_owner_manager_id"], successor.client_id);
     let transfer_operation_id = transfer["transfer_operation_id"].as_str().unwrap();
 

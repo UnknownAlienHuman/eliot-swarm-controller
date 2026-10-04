@@ -6,6 +6,7 @@ mod automation_acceptance;
 mod automation_cron;
 mod automation_dispatch;
 mod automation_disposition;
+pub(crate) mod automation_goal_progression;
 mod automation_intake;
 mod automation_publication;
 pub(crate) mod automation_repair;
@@ -17,6 +18,9 @@ mod coordination;
 mod coordination_watch;
 mod forge;
 mod github;
+#[cfg(test)]
+mod github_effect_tests;
+mod github_effects;
 mod gm;
 mod goals;
 mod hooks;
@@ -73,6 +77,7 @@ const WORKSPACE_SCHEMA: &str = include_str!("../../migrations/002_workspace.sql"
 const OWNED_SERVICE_SCHEMA: &str = include_str!("../../migrations/003_owned_services.sql");
 const SCRIPT_SCHEMA: &str = include_str!("../../migrations/004_scripts.sql");
 const GITHUB_SCHEMA: &str = include_str!("../../migrations/006_github.sql");
+const GITHUB_EFFECTS_SCHEMA: &str = include_str!("../../migrations/007_github_label_effects.sql");
 const APPLICATION_ID: i64 = 0x45534331;
 const LOCAL_OPERATOR_CLIENT_ID_KEY: &str = "local_operator_client_id";
 type RunJob = Box<dyn FnOnce(&mut Connection) + Send>;
@@ -487,10 +492,17 @@ impl Store {
             let review_dispatch = automation_dispatch::reconcile(&tx, &config, 16, 64, now)?;
             let work_dispatch = automation_work_dispatch::reconcile(&tx, &config, 16, 64, now)?;
             let publication = automation_publication::reconcile(&tx, &config, 16, 64, now)?;
+            let goal_progression = automation_goal_progression::reconcile(
+                &tx,
+                16,
+                64,
+                now,
+                |tx, admission| admit_goal_progression_operation(tx, admission, &config, now),
+            )?;
             // The cursor, pending reasons, semantic slot and Operation are
             // durable before the host can observe an admitted action.
             tx.commit()?;
-            Ok(json!({"review_dispatch":review_dispatch,"work_dispatch":work_dispatch,"publication":publication}))
+            Ok(json!({"review_dispatch":review_dispatch,"work_dispatch":work_dispatch,"publication":publication,"goal_progression":goal_progression}))
         })
         .await
     }
@@ -674,6 +686,9 @@ impl Store {
             return self.script_call(principal, method, params).await;
         }
         if method.starts_with("github.") {
+            if method == "github.effect.managed_label" {
+                return github_effects::call(self, principal, params).await;
+            }
             return self.github_call(principal, method, params).await;
         }
         if matches!(
@@ -1400,6 +1415,12 @@ fn open_database(root: &Path, credential: &Credential) -> Result<Connection> {
             "github_poll_leases",
         ],
     )?;
+    install_schema_extension(
+        &tx,
+        "schema_extension:github_label_effects:v1",
+        GITHUB_EFFECTS_SCHEMA,
+        &["github_label_effect_slots"],
+    )?;
     let scheduler_key = format!("client:{}", model::INTERNAL_SCHEDULER_CLIENT_ID);
     match meta(&tx, &scheduler_key)? {
         None => set_meta(
@@ -1425,6 +1446,12 @@ fn open_database(root: &Path, credential: &Credential) -> Result<Connection> {
     set_meta(&tx, "host_epoch", &json!(epoch))?;
     tx.execute(
         "UPDATE operations SET state='outcome_unknown',result_json=CASE \
+         WHEN method='github.effect.managed_label' AND state='sending' THEN \
+           json_set(COALESCE(result_json,'{}'), \
+             '$.outcome','outcome_unknown', \
+             '$.readback','required', \
+             '$.write_attempted',json('true'), \
+             '$.current_state_read_method','operation.get') \
          WHEN method='forge.publish_ref' AND state='sending' THEN \
            json_set(COALESCE(result_json,'{}'), \
              '$.outcome','unknown', \
@@ -3153,6 +3180,94 @@ fn mutate_cron_check_in_transaction(
     })
 }
 
+/// Admit one Goal follow-up through the regular mutation receipt and Runtime
+/// Operation ledger, bound to the manager-owned entry and authenticated
+/// terminal EventRef that selected it.
+fn admit_goal_progression_operation(
+    tx: &Transaction<'_>,
+    admission: &automation_goal_progression::GoalProgressionAdmission,
+    config: &Config,
+    now: i64,
+) -> Result<automation_goal_progression::AdmissionResult> {
+    admission.require_current_for_admission(tx, now)?;
+    let caller = crate::automation::authorization::AUTOMATION_TECHNICAL_REQUESTER_ID;
+    let request = admission.request();
+    let request_id = model::text(request, "client_request_id")?;
+    let original = model::canonical(request)?;
+    let prior: Option<(String, String)> = tx
+        .query_row(
+            "SELECT method,original_request_json FROM operations WHERE caller_id=?1 AND client_request_id=?2",
+            params![caller, request_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if prior
+        .as_ref()
+        .is_some_and(|(method, body)| method != "agent.goal" || body != &original)
+    {
+        return Ok(automation_goal_progression::AdmissionResult::Conflict {
+            code: "REQUEST_ID_CONFLICT".to_owned(),
+            reason: "terminal-event request ID already belongs to another Goal request".to_owned(),
+        });
+    }
+    let receipt = mutate_in_transaction_with_authority(
+        tx,
+        MutationAuthority::GoalProgression(admission),
+        "agent.goal",
+        request,
+        config,
+        now,
+        MutationPlan {
+            check_plan: None,
+            launch_operation_id: None,
+        },
+    );
+    let value = match receipt {
+        Ok(Ok(value)) => value,
+        Ok(Err(error)) => {
+            return Ok(automation_goal_progression::AdmissionResult::Conflict {
+                code: error.code,
+                reason: error.message,
+            });
+        }
+        Err(error) if goal_progression_admission_conflict(&error.code) => {
+            return Ok(automation_goal_progression::AdmissionResult::Conflict {
+                code: error.code,
+                reason: error.message,
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    let operation_id: Option<String> = tx
+        .query_row(
+            "SELECT operation_id FROM operations WHERE caller_id=?1 AND client_request_id=?2 AND method='agent.goal' AND original_request_json=?3",
+            params![caller, request_id, original],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let operation_id = operation_id
+        .or_else(|| value["operation_id"].as_str().map(str::to_owned))
+        .ok_or_else(|| {
+            Error::new(
+                "AUTOMATION_GOAL_ADMISSION_LOST",
+                "normal Goal admission returned no retained Operation ID",
+            )
+        })?;
+    if prior.is_some() {
+        Ok(automation_goal_progression::AdmissionResult::Reused { operation_id })
+    } else {
+        Ok(automation_goal_progression::AdmissionResult::Admitted { operation_id })
+    }
+}
+
+fn goal_progression_admission_conflict(code: &str) -> bool {
+    code.contains("CONFLICT")
+        || code == "FORBIDDEN"
+        || code == "AUTOMATION_ACTION_CHANGED"
+        || code.starts_with("GOAL_")
+        || code.starts_with("BINDING_")
+}
+
 fn mutate_in_transaction_with_check_plan(
     tx: &Transaction<'_>,
     p: &Principal,
@@ -3216,6 +3331,7 @@ enum MutationAuthority<'a> {
     Direct(&'a Principal),
     Launch(&'a launcher::LaunchActor),
     Cron(&'a crate::automation::authorization::CronExecutionContext),
+    GoalProgression(&'a automation_goal_progression::GoalProgressionAdmission),
 }
 
 impl MutationAuthority<'_> {
@@ -3224,6 +3340,9 @@ impl MutationAuthority<'_> {
             Self::Direct(principal) => &principal.client_id,
             Self::Launch(actor) => actor.technical_requester_id(),
             Self::Cron(_) => crate::automation::authorization::AUTOMATION_TECHNICAL_REQUESTER_ID,
+            Self::GoalProgression(_) => {
+                crate::automation::authorization::AUTOMATION_TECHNICAL_REQUESTER_ID
+            }
         }
     }
 }
@@ -3274,6 +3393,16 @@ fn mutate_in_transaction_with_authority(
             ));
         }
         context.require_current_check_target(tx)?;
+    }
+    if let MutationAuthority::GoalProgression(context) = &authority {
+        if method != "agent.goal" || plan.launch_operation_id.is_some() || plan.check_plan.is_some()
+        {
+            return Err(Error::new(
+                "FORBIDDEN",
+                "Goal progression authority permits only agent.goal continue",
+            ));
+        }
+        context.require_current_for_admission(tx, now)?;
     }
     model::validate_mutation(method, v)?;
     let request_id = model::text(v, "client_request_id")?;
@@ -3334,6 +3463,12 @@ fn mutate_in_transaction_with_authority(
                         return Err(Error::new(
                             "FORBIDDEN",
                             "cron authority cannot register a participant",
+                        ));
+                    }
+                    MutationAuthority::GoalProgression(_) => {
+                        return Err(Error::new(
+                            "FORBIDDEN",
+                            "Goal progression cannot admit a launch child",
                         ));
                     }
                 };
@@ -3475,6 +3610,18 @@ fn mutate_in_transaction_with_authority(
             },
         ),
         MutationAuthority::Cron(context) => apply_cron(
+            tx,
+            context,
+            method,
+            v,
+            config,
+            ApplyContext {
+                operation_id: &id,
+                now,
+                plan,
+            },
+        ),
+        MutationAuthority::GoalProgression(context) => apply_goal_progression(
             tx,
             context,
             method,
@@ -3755,6 +3902,35 @@ fn apply_cron(
     )
 }
 
+fn apply_goal_progression(
+    tx: &Transaction<'_>,
+    context: &automation_goal_progression::GoalProgressionAdmission,
+    method: &str,
+    value: &Value,
+    config: &Config,
+    apply: ApplyContext<'_>,
+) -> Result<(Value, bool)> {
+    if method != "agent.goal"
+        || apply.plan.launch_operation_id.is_some()
+        || apply.plan.check_plan.is_some()
+        || model::canonical(value)? != model::canonical(context.request())?
+    {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "Goal progression permits only its exact admitted agent.goal continue request",
+        ));
+    }
+    let result = runtime::user_command_for_goal_progression(
+        tx,
+        context,
+        apply.operation_id,
+        config,
+        apply.now,
+    )?;
+    automation_goal_progression::retain_operation_link(tx, apply.operation_id, context, apply.now)?;
+    Ok((result, true))
+}
+
 fn apply(
     tx: &Transaction<'_>,
     p: &Principal,
@@ -3787,9 +3963,10 @@ fn apply(
         "goal.create" | "goal.revise" | "goal.enable" | "goal.disable" | "goal.readback" => {
             goals::apply(tx, p, method, v, id, now)
         }
-        "github.source.setup" | "github.source.poll" | "github.work_pool.apply" => {
-            github::apply(tx, p, method, v, config, id, now)
-        }
+        "github.source.setup"
+        | "github.source.poll"
+        | "github.work_pool.apply"
+        | "github.effect.managed_label" => github::apply(tx, p, method, v, config, id, now),
         "hook.source.revoke" => hooks::revoke(
             tx,
             p,

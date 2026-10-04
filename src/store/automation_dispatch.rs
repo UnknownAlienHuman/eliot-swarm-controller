@@ -217,12 +217,15 @@ pub(super) fn configure_activation(
     now_ms: i64,
 ) -> Result<()> {
     let had_review_coverage = before.is_some_and(|entry| {
-        entry.enabled && entry.steps.contains(&AutomationStep::ReviewDispatch)
+        entry.enabled
+            && entry.steps.contains(&AutomationStep::ReviewDispatch)
+            && entry.task_submission_review_rule_selected()
     });
-    let has_review_coverage =
-        after.enabled && after.steps.contains(&AutomationStep::ReviewDispatch);
+    let has_review_coverage = after.enabled
+        && after.steps.contains(&AutomationStep::ReviewDispatch)
+        && after.task_submission_review_rule_selected();
     let before_hook_source = before
-        .filter(|entry| entry.enabled && entry.steps.contains(&AutomationStep::ReviewDispatch))
+        .filter(|_| had_review_coverage)
         .and_then(|entry| entry.hook_commit.as_ref())
         .map(|hook| hook.source_id.as_str());
     let after_hook_source = after
@@ -329,7 +332,10 @@ pub(super) fn reconcile_entry(
     config: &Config,
     now_ms: i64,
 ) -> Result<Value> {
-    if !entry.enabled || !entry.steps.contains(&AutomationStep::ReviewDispatch) {
+    if !entry.enabled
+        || !entry.steps.contains(&AutomationStep::ReviewDispatch)
+        || !entry.task_submission_review_rule_selected()
+    {
         return Ok(
             json!({"automation_id":entry.automation_id,"processed":0,"waiting_for":"disabled_or_unselected"}),
         );
@@ -752,6 +758,21 @@ fn consume_submission_page(
                             "reason":"submission_not_applied"
                         }),
                     ),
+                    Ok(Some(cause))
+                        if !pass
+                            .entry
+                            .accepts_task_submission_review_event(receipt, &cause) =>
+                    {
+                        remember_recent(
+                            state,
+                            json!({
+                                "observation_id":observation_id,
+                                "submission_ref":cause.id(),
+                                "source_event_key":receipt.source_event_key,
+                                "disposition":"rule_unmatched"
+                            }),
+                        );
+                    }
                     Ok(Some(cause))
                         if state
                             .pending

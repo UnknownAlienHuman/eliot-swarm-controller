@@ -131,6 +131,62 @@ pub struct WorkPoolApplyRequest {
     pub task_ids: Vec<String>,
 }
 
+/// One direct desired-state update for a source-mapped, manager-selected Issue.
+/// Labels outside Eliot's reserved prefix are never accepted by this surface.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedLabelRequest {
+    pub client_request_id: String,
+    pub source_id: String,
+    pub task_id: String,
+    pub expected_task_revision: i64,
+    pub label: String,
+    pub present: bool,
+}
+
+impl ManagedLabelRequest {
+    pub fn parse(value: &Value) -> Result<Self> {
+        model::fields(
+            value,
+            &[
+                "client_request_id",
+                "source_id",
+                "task_id",
+                "expected_task_revision",
+                "label",
+                "present",
+            ],
+        )?;
+        let request: Self = serde_json::from_value(value.clone())
+            .map_err(|_| Error::invalid("managed-label request is invalid"))?;
+        if request.expected_task_revision <= 0 {
+            return Err(Error::invalid("expected_task_revision must be positive"));
+        }
+        validate_source_id(&request.source_id)?;
+        if request.task_id.trim().is_empty()
+            || request.task_id.len() > 512
+            || request.task_id.chars().any(char::is_control)
+        {
+            return Err(Error::invalid("task_id must be bounded printable text"));
+        }
+        // The fixed prefix gives this method a narrow ownership boundary and
+        // keeps the path segment safe for GitHub's per-label endpoints.
+        if !(10..=50).contains(&request.label.len())
+            || !request.label.starts_with("eliot-")
+            || !request
+                .label
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+            || request.label.ends_with('-')
+        {
+            return Err(Error::invalid(
+                "label must be a 10..=50 byte lowercase eliot-* label",
+            ));
+        }
+        Ok(request)
+    }
+}
+
 impl WorkPoolApplyRequest {
     pub fn parse(value: &Value) -> Result<Self> {
         model::fields(value, &["client_request_id", "source_id", "task_ids"])?;
@@ -167,6 +223,8 @@ pub fn validate_mutation(method: &str, value: &Value) -> Result<Value> {
             .map_err(|_| Error::invalid("GitHub source poll request is invalid")),
         "github.work_pool.apply" => serde_json::to_value(WorkPoolApplyRequest::parse(value)?)
             .map_err(|_| Error::invalid("GitHub work-pool request is invalid")),
+        "github.effect.managed_label" => serde_json::to_value(ManagedLabelRequest::parse(value)?)
+            .map_err(|_| Error::invalid("managed-label request is invalid")),
         _ => Err(Error::new("METHOD_NOT_FOUND", method)),
     }
 }

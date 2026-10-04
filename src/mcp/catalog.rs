@@ -775,11 +775,23 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
         RuntimeControl,
         MANAGER_AUDIENCES,
         Searchable,
-        "Set or inspect a manager-owned agent goal.",
-        "Use when updating the explicit goal of an exact binding.",
-        &["agent", "goal", "objective"],
-        &["binding_id", "generation"],
-        "One goal operation."
+        "Set, edit, pause, resume, continue or clear the goal of one exact binding.",
+        "Use continue only to admit one input for an exact active controller Goal revision; expected_revision is required and 0 means no native Goal exists.",
+        &[
+            "agent",
+            "goal",
+            "objective",
+            "continue",
+            "expected revision"
+        ],
+        &[
+            "binding_id",
+            "generation",
+            "action",
+            "objective",
+            "expected_revision"
+        ],
+        "One goal operation; continue admits one input and does not assert execution start or Goal completion."
     ),
     entry!(
         "agent.refresh",
@@ -1902,6 +1914,23 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
         &["github", "work pool", "apply", "task", "issue intake"],
         &["source_id", "task_ids", "client_request_id"],
         "One local admission receipt; does not start Task execution or call a model."
+    ),
+    entry!(
+        "github.effect.managed_label",
+        GitHub,
+        MANAGER_GM_AUDIENCES,
+        ManualOnly,
+        "Set or remove one explicitly requested Eliot-managed label on a selected GitHub Issue.",
+        "Use only for a source-mapped Task in the selected work pool; inspect its Operation after dispatch.",
+        &["github", "issue", "managed label", "effect", "reconcile"],
+        &[
+            "source_id",
+            "task_id",
+            "expected_task_revision",
+            "label",
+            "present"
+        ],
+        "One durable desired-state effect; unknown writes are read back and never resent."
     ),
 ];
 

@@ -375,6 +375,9 @@ pub(super) fn apply(
             apply_pool_selection(tx, principal, &request, operation_id, now, config)
                 .map(|value| (value, false))
         }
+        "github.effect.managed_label" => {
+            super::github_effects::apply(tx, principal, value, operation_id, now)
+        }
         _ => Err(Error::new("METHOD_NOT_FOUND", method)),
     }
 }

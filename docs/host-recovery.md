@@ -128,6 +128,21 @@ native MCP proof nor model consumption is qualified. Preserve the consumed C29
 claim and uncertain arm without replay; further diagnosis does not authorize
 resending either.
 
+The subsequent RPC source repair uses schemas accepted by the installed
+OpenCode decoder while retaining exact handler validation. New arm/read HTTP
+rejections retain only a closed safe `rejection_class`, alongside stage, code
+and time, through the current-Manager Operation projection. A successor Manager
+can read the same receipt; no original chat identity is required. Raw HTTP
+bodies, native messages and credentials are not projected.
+
+C30's consumed run `9bec4e52-d5c2-45f2-aabd-a3f857b7aa1c` stopped at the
+harness inventory predicate. Its retained inventory contains nine observed
+tools and a valid digest; hook observation sequence zero is valid when both
+model-dependent hook statuses are unknown. This is a qualification-harness
+failure, not proof of a rejected native inventory. Preserve that run and claim
+without replay. C31 is a fresh corrected preparation; full lifecycle and model
+execution require their own run evidence.
+
 An OpenCode snapshot requires a validated root-session read. Its independent
 optional read axes share a bounded deadline inside the existing whole-snapshot
 budget. A slow configuration, family, request or child-log read produces a

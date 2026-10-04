@@ -158,6 +158,7 @@ pub(super) fn allows_method(profile: McpToolProfile, method: &str) -> bool {
                 | "swarm.launch.preview"
                 | "swarm.launch"
                 | "swarm.overlap.check"
+                | "github.effect.managed_label"
                 | "coordination.watch.create"
                 | "coordination.watch.list"
                 | "coordination.watch.cancel"
@@ -180,6 +181,7 @@ pub(super) fn allows_method(profile: McpToolProfile, method: &str) -> bool {
                         | "github.source.get"
                         | "github.work_pool.preview"
                         | "github.work_pool.apply"
+                        | "github.effect.managed_label"
                         | "gm.handover"
                 )
         }

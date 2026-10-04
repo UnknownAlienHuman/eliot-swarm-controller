@@ -7,6 +7,7 @@
 use super::{Store, current_principal, gm, meta, results, tasks};
 use crate::{
     artifacts::{ArtifactFiles, ArtifactRecord},
+    config::Config,
     error::{Error, Result},
     model::{self, Principal, Role},
     scripts::{manifest, protocol, registry, runner},
@@ -18,6 +19,22 @@ use tokio::sync::watch;
 
 const RECONCILE_INTERVAL: Duration = Duration::from_millis(200);
 const STARTING_WORKER_TIMEOUT_MS: i64 = 120_000;
+
+type ScriptCompletionRow = (
+    String,
+    String,
+    i64,
+    String,
+    i64,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+);
 
 #[derive(Debug, Clone)]
 struct RevisionSnapshot {
@@ -115,6 +132,7 @@ impl Store {
             "bundle_sha256":bundle_sha256,
             "interpreter_kind":bundle.interpreter.kind,
             "interpreter_sha256":bundle.interpreter.sha256,
+            "controller_effects":bundle.controller_effects,
         });
         let (record, bytes) = ArtifactFiles::document(
             registry::BUNDLE_KIND,
@@ -164,6 +182,7 @@ impl Store {
                     "state":"registered",
                     "validated":true,
                     "activation":"not_selected",
+                    "controller_effects":bundle_for_tx.controller_effects,
                 });
                 record_operation(
                     &tx,
@@ -257,6 +276,7 @@ impl Store {
             "bundle_sha256":bundle_sha256,
             "interpreter_kind":bundle.interpreter.kind,
             "interpreter_sha256":bundle.interpreter.sha256,
+            "controller_effects":bundle.controller_effects,
         });
         let (record, bytes) = ArtifactFiles::document(
             registry::BUNDLE_KIND,
@@ -315,6 +335,7 @@ impl Store {
                     "state":"registered",
                     "validated":true,
                     "activation":"not_selected",
+                    "controller_effects":bundle_for_tx.controller_effects,
                 });
                 record_operation(
                     &tx,
@@ -364,7 +385,7 @@ impl Store {
             "validated_at_ms":snapshot.validated_at_ms,
             "checked_at_ms":model::now_ms()?,
             "execution_started":false,
-            "controller_effects":[],
+            "controller_effects":checked.controller_effects,
         }))
     }
 
@@ -427,6 +448,7 @@ impl Store {
                     "bundle_ref":current_snapshot.record.artifact_id,
                     "state":"activated",
                     "execution_started":false,
+                    "controller_effects":artifact_controller_effects(&current_snapshot.record.metadata)?,
                 });
                 record_operation(
                     &tx,
@@ -505,7 +527,7 @@ impl Store {
             task_revision: request.expected_task_revision,
             attempt_id: request.attempt_id.clone(),
             input: request.input.clone(),
-            controller_effects: Vec::new(),
+            controller_effects: bundle.controller_effects.clone(),
         };
         let work = runner::Work {
             run_id: run_id.clone(),
@@ -575,6 +597,27 @@ impl Store {
                     return Err(Error::new("SCRIPT_SCOPE_CHANGED", "script invocation identity differs from the current Task"));
                 }
                 let now = model::now_ms()?;
+                if !work_for_tx.invocation.controller_effects.is_empty()
+                    && current.role != Role::Manager
+                {
+                    return Err(Error::new(
+                        "FORBIDDEN",
+                        "script controller effects require the current Manager",
+                    ));
+                }
+                if !work_for_tx.invocation.controller_effects.is_empty() {
+                    let script_owner: String = tx.query_row(
+                        "SELECT owner_id FROM scripts WHERE script_id=?1",
+                        [&script_id],
+                        |row| row.get(0),
+                    )?;
+                    if script_owner != current.client_id {
+                        return Err(Error::new(
+                            "FORBIDDEN",
+                            "only the script-owning Manager may admit its controller effect grant",
+                        ));
+                    }
+                }
                 let admitted = json!({
                     "operation_id":operation_id,
                     "run_id":run_id,
@@ -586,7 +629,7 @@ impl Store {
                     "attempt_id":current_attempt["attempt_id"],
                     "state":"queued",
                     "admission":"durable_local",
-                    "controller_effects":[],
+                    "controller_effects":work_for_tx.invocation.controller_effects,
                 });
                 tx.execute(
                     "INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,effective_request_json,task_id,attempt_id,state,result_json,due_at_ms,settled_at_ms,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,'script.run',?4,?5,?6,?7,'queued',?8,?9,NULL,?9,?9)",
@@ -596,7 +639,7 @@ impl Store {
                         request_id,
                         request_json,
                         model::canonical(&json!({
-                            "script_run":{"run_id":run_id,"bundle_ref":current_revision.record.artifact_id,"work_digest":digest_for_tx,"environment_sha256":work_for_tx.environment_sha256,"controller_effects":[]},
+                            "script_run":{"run_id":run_id,"bundle_ref":current_revision.record.artifact_id,"work_digest":digest_for_tx,"environment_sha256":work_for_tx.environment_sha256,"controller_effects":work_for_tx.invocation.controller_effects},
                             "receipt":{"ok":true,"value":admitted},
                         }))?,
                         current_task["task_id"].as_str(),
@@ -620,7 +663,18 @@ impl Store {
                         model::canonical(&json!({
                             "environment_sha256":work_for_tx.environment_sha256,
                             "input_sha256":model::digest(model::canonical(&work_for_tx.invocation.input)?.as_bytes()),
-                            "capabilities":[],
+                            "capabilities":work_for_tx.invocation.controller_effects,
+                            "invocation":{
+                                "operation_id":operation_id,
+                                "run_id":run_id,
+                                "script_id":script_id,
+                                "script_revision":requested_revision,
+                                "task_id":current_task["task_id"],
+                                "task_revision":current_task["revision"],
+                                "attempt_id":current_attempt["attempt_id"],
+                                "effective_manager_id":current.client_id,
+                                "cause":{"kind":"script.run","operation_id":operation_id,"run_id":run_id},
+                            },
                             "trust":"trusted_local",
                         }))?,
                         now,
@@ -796,7 +850,10 @@ impl Store {
                 let execution_may_have_started =
                     observed.has_go || completion.started_at_ms.is_some();
                 let id = pending.run_id.clone();
-                let result = self.run(move |db| finish(db, &id, completion)).await;
+                let config = self.config.clone();
+                let result = self
+                    .run(move |db| finish(db, &id, completion, &config))
+                    .await;
                 if let Err(error) = result {
                     if completion_failure_is_terminal(&error) {
                         self.record_run_error(&pending, error.clone()).await?;
@@ -1123,6 +1180,7 @@ fn insert_revision(
     if bundle.script_id != record.metadata["script_id"]
         || record.metadata["revision"] != revision
         || record.content_digest != record.metadata["bundle_sha256"].as_str().unwrap_or("")
+        || bundle.controller_effects != artifact_controller_effects(&record.metadata)?
     {
         return Err(Error::new(
             "SCRIPT_BUNDLE_DAMAGED",
@@ -1165,6 +1223,12 @@ fn verify_revision_files(
 ) -> Result<manifest::ScriptBundle> {
     let bytes = files.document_bytes(record)?;
     let bundle = registry::parse_bundle(&bytes, record)?;
+    if bundle.controller_effects != artifact_controller_effects(&record.metadata)? {
+        return Err(Error::new(
+            "SCRIPT_REGISTRY_DAMAGED",
+            "bundle controller effects differ from the retained revision metadata",
+        ));
+    }
     if bundle.interpreter != *expected_interpreter {
         return Err(Error::new(
             "SCRIPT_REGISTRY_DAMAGED",
@@ -1182,6 +1246,21 @@ fn verify_revision_files(
         ));
     }
     Ok(bundle)
+}
+
+fn artifact_controller_effects(metadata: &Value) -> Result<Vec<manifest::ScriptControllerEffect>> {
+    serde_json::from_value(
+        metadata
+            .get("controller_effects")
+            .cloned()
+            .unwrap_or_else(|| json!([])),
+    )
+    .map_err(|_| {
+        Error::new(
+            "SCRIPT_REGISTRY_DAMAGED",
+            "retained script controller effect metadata is invalid",
+        )
+    })
 }
 
 fn require_run_scope(
@@ -1561,6 +1640,8 @@ fn completion_failure_is_terminal(error: &Error) -> bool {
     matches!(
         error.code.as_str(),
         "SCRIPT_COMPLETION_DAMAGED"
+            | "SCRIPT_RUN_DAMAGED"
+            | "SCRIPT_EFFECT_DAMAGED"
             | "SCRIPT_REGISTRY_DAMAGED"
             | "ARTIFACT_DAMAGED"
             | "NOT_FOUND"
@@ -1568,19 +1649,47 @@ fn completion_failure_is_terminal(error: &Error) -> bool {
     )
 }
 
-fn finish(db: &mut Connection, run_id: &str, completion: runner::Completion) -> Result<()> {
+fn finish(
+    db: &mut Connection,
+    run_id: &str,
+    completion: runner::Completion,
+    config: &Config,
+) -> Result<()> {
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let row: Option<(String, String, i64, i64, String, String)> = tx
+    let row: Option<ScriptCompletionRow> = tx
         .query_row(
-            "SELECT r.operation_id,r.script_id,r.revision,r.task_revision,r.state,o.state FROM script_runs r JOIN operations o ON o.operation_id=r.operation_id WHERE r.run_id=?1",
+            "SELECT r.operation_id,r.script_id,r.revision,r.task_id,r.task_revision,r.attempt_id,r.state,o.state,o.method,o.task_id,o.attempt_id,o.caller_id,r.spec_json FROM script_runs r JOIN operations o ON o.operation_id=r.operation_id WHERE r.run_id=?1",
             [run_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?, row.get(10)?, row.get(11)?, row.get(12)?)),
         )
         .optional()?;
-    let Some((operation_id, script_id, revision, task_revision, run_state, operation_state)) = row
+    let Some((
+        operation_id,
+        script_id,
+        revision,
+        task_id,
+        task_revision,
+        attempt_id,
+        run_state,
+        operation_state,
+        operation_method,
+        operation_task_id,
+        operation_attempt_id,
+        caller_id,
+        spec_json,
+    )) = row
     else {
         return Err(Error::new("NOT_FOUND", "script run is not registered"));
     };
+    if operation_method != "script.run"
+        || operation_task_id.as_deref() != Some(task_id.as_str())
+        || operation_attempt_id.as_deref() != Some(attempt_id.as_str())
+    {
+        return Err(Error::new(
+            "SCRIPT_RUN_DAMAGED",
+            "script run Operation no longer identifies its exact Task and Attempt",
+        ));
+    }
     if completion.run_id != run_id || completion.operation_id != operation_id {
         return Err(Error::new(
             "SCRIPT_COMPLETION_DAMAGED",
@@ -1634,12 +1743,92 @@ fn finish(db: &mut Connection, run_id: &str, completion: runner::Completion) -> 
         ));
     }
     let now = model::now_ms()?;
+    let spec: Value = serde_json::from_str(&spec_json).map_err(|_| {
+        Error::new(
+            "SCRIPT_RUN_DAMAGED",
+            "retained script invocation grant cannot be parsed",
+        )
+    })?;
+    let declared_effects: Vec<manifest::ScriptControllerEffect> = serde_json::from_value(
+        spec.get("capabilities")
+            .cloned()
+            .unwrap_or_else(|| json!([])),
+    )
+    .map_err(|_| {
+        Error::new(
+            "SCRIPT_RUN_DAMAGED",
+            "retained script invocation grant is invalid",
+        )
+    })?;
+    if artifact_controller_effects(&work_record.metadata)? != declared_effects {
+        return Err(Error::new(
+            "SCRIPT_RUN_DAMAGED",
+            "invocation grant differs from its immutable script revision",
+        ));
+    }
+    if completion.controller_effects.len() > manifest::MAX_CONTROLLER_EFFECTS
+        || completion
+            .controller_effects
+            .iter()
+            .any(|effect| !declared_effects.contains(&effect.effect) || effect.validate().is_err())
+        || (completion.state != "completed" && !completion.controller_effects.is_empty())
+    {
+        return Err(Error::new(
+            "SCRIPT_COMPLETION_DAMAGED",
+            "completion requests effects outside its retained invocation grant",
+        ));
+    }
+    if !completion.controller_effects.is_empty()
+        && (spec["invocation"]["operation_id"] != operation_id
+            || spec["invocation"]["run_id"] != run_id
+            || spec["invocation"]["script_id"] != script_id
+            || spec["invocation"]["script_revision"] != revision
+            || spec["invocation"]["task_id"] != task_id
+            || spec["invocation"]["task_revision"] != task_revision
+            || spec["invocation"]["attempt_id"] != attempt_id
+            || spec["invocation"]["effective_manager_id"] != caller_id
+            || spec["invocation"]["cause"]
+                != json!({"kind":"script.run","operation_id":operation_id,"run_id":run_id}))
+    {
+        return Err(Error::new(
+            "SCRIPT_COMPLETION_DAMAGED",
+            "effect invocation does not match its exact retained Manager/cause scope",
+        ));
+    }
     let artifacts = [&completion.result, &completion.stdout, &completion.stderr];
     for artifact in artifacts {
         register_output_artifact(&tx, artifact, now)?;
     }
+    let controller_effects = if completion.state == "completed" {
+        completion
+            .controller_effects
+            .iter()
+            .map(|effect| {
+                apply_controller_effect(
+                    &tx,
+                    &caller_id,
+                    &operation_id,
+                    run_id,
+                    &script_id,
+                    revision,
+                    &task_id,
+                    task_revision,
+                    &attempt_id,
+                    effect,
+                    config,
+                    now,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
+    let effects_complete = controller_effects
+        .iter()
+        .all(|effect| effect["status"] == "applied");
     let outcome = match completion.state.as_str() {
-        "completed" => "applied",
+        "completed" if effects_complete => "applied",
+        "completed" => "effects_incomplete",
         "incomplete" => "incomplete",
         _ => "failed",
     };
@@ -1656,7 +1845,7 @@ fn finish(db: &mut Connection, run_id: &str, completion: runner::Completion) -> 
         "result":completion.result_value,
         "error_code":completion.error_code,
         "task_revision":task_revision,
-        "controller_effects":[],
+        "controller_effects":controller_effects,
     });
     tx.execute(
         "UPDATE script_runs SET state=?2,result_ref=?3,stdout_ref=?4,stderr_ref=?5,exit_code=?6,started_at_ms=COALESCE(?7,started_at_ms),finished_at_ms=?8 WHERE run_id=?1",
@@ -1671,6 +1860,285 @@ fn finish(db: &mut Connection, run_id: &str, completion: runner::Completion) -> 
         params![format!("terminal:{operation_id}"), operation_id, model::canonical(&result)?, now],
     )?;
     tx.commit()?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_controller_effect(
+    tx: &Transaction<'_>,
+    caller_id: &str,
+    operation_id: &str,
+    run_id: &str,
+    script_id: &str,
+    script_revision: i64,
+    task_id: &str,
+    task_revision: i64,
+    attempt_id: &str,
+    effect: &protocol::ScriptEffectRequest,
+    config: &Config,
+    now: i64,
+) -> Result<Value> {
+    effect.validate()?;
+    match effect.effect {
+        manifest::ScriptControllerEffect::TaskOwnerMessage => {}
+    }
+    let actor = match registered_actor(tx, caller_id).and_then(|actor| {
+        if actor.role != Role::Manager {
+            return Err(Error::new(
+                "FORBIDDEN",
+                "script controller effects require the admitting Manager",
+            ));
+        }
+        let current = require_script_authority(tx, &actor)?;
+        let (task, attempt) = require_run_scope(tx, &current, attempt_id, task_revision)?;
+        if model::text(&task, "task_id")? != task_id
+            || task["revision"] != task_revision
+            || attempt["attempt_id"] != attempt_id
+        {
+            return Err(Error::new(
+                "SCRIPT_SCOPE_CHANGED",
+                "script invocation no longer identifies the same Task and Attempt",
+            ));
+        }
+        let owner_id: String = tx.query_row(
+            "SELECT owner_id FROM scripts WHERE script_id=?1",
+            [script_id],
+            |row| row.get(0),
+        )?;
+        if owner_id != caller_id {
+            return Err(Error::new(
+                "FORBIDDEN",
+                "only the Manager who owns this script revision may use its effect grant",
+            ));
+        }
+        let (active_revision, _) = script_head(tx, script_id)?;
+        if active_revision != Some(script_revision) {
+            return Err(Error::new(
+                "SCRIPT_REVISION_NOT_ACTIVE",
+                "script effect requires the same revision to remain active",
+            ));
+        }
+        Ok((current, attempt))
+    }) {
+        Ok(actor) => actor,
+        Err(error) if error.code != "STORE_ERROR" => {
+            return Ok(controller_effect_rejection(
+                effect,
+                caller_id,
+                operation_id,
+                run_id,
+                script_id,
+                script_revision,
+                task_id,
+                task_revision,
+                attempt_id,
+                &error,
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+    let (actor, attempt) = actor;
+    let recipient = model::text(&attempt, "owner_id")?.to_owned();
+    let request_id = script_effect_request_id(operation_id, run_id, effect)?;
+    let request_exists: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM operations WHERE caller_id=?1 AND client_request_id=?2)",
+        params![caller_id, request_id],
+        |row| row.get(0),
+    )?;
+    if request_exists {
+        return Ok(controller_effect_rejection(
+            effect,
+            caller_id,
+            operation_id,
+            run_id,
+            script_id,
+            script_revision,
+            task_id,
+            task_revision,
+            attempt_id,
+            &Error::new(
+                "SCRIPT_EFFECT_REQUEST_CONFLICT",
+                "script effect request identity is already used by an existing Operation",
+            ),
+        ));
+    }
+    let request = json!({
+        "client_request_id":request_id,
+        "recipient":recipient,
+        "text":effect.text,
+    });
+    let action = super::mutate_in_transaction(tx, &actor, "message.send", &request, config, now)?;
+    let (action_value, action_error) = match action {
+        Ok(value) => (Some(value), None),
+        Err(error) if error.code != "STORE_ERROR" => (None, Some(error)),
+        Err(error) => return Err(error),
+    };
+    let action_operation_id: Option<String> = tx
+        .query_row(
+            "SELECT operation_id FROM operations WHERE caller_id=?1 AND client_request_id=?2 AND method='message.send'",
+            params![caller_id, request_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let cause = script_effect_cause(
+        caller_id,
+        operation_id,
+        run_id,
+        script_id,
+        script_revision,
+        task_id,
+        task_revision,
+        attempt_id,
+    );
+    if let Some(effect_operation_id) = action_operation_id.as_deref() {
+        retain_script_effect_link(
+            tx,
+            caller_id,
+            &request_id,
+            effect_operation_id,
+            &request,
+            &cause,
+        )?;
+    }
+    match (action_value, action_error) {
+        (Some(value), None) => Ok(json!({
+            "effect":"task_owner_message",
+            "status":"applied",
+            "operation_id":action_operation_id,
+            "message_id":value["message_id"],
+            "recipient":recipient,
+            "cause":cause,
+        })),
+        (_, Some(error)) => Ok(json!({
+            "effect":"task_owner_message",
+            "status":"rejected",
+            "operation_id":action_operation_id,
+            "error":{"code":error.code,"message":error.message},
+            "cause":cause,
+        })),
+        _ => Err(Error::new(
+            "SCRIPT_EFFECT_DAMAGED",
+            "script effect mutation returned neither a result nor a rejection",
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn controller_effect_rejection(
+    effect: &protocol::ScriptEffectRequest,
+    caller_id: &str,
+    operation_id: &str,
+    run_id: &str,
+    script_id: &str,
+    script_revision: i64,
+    task_id: &str,
+    task_revision: i64,
+    attempt_id: &str,
+    error: &Error,
+) -> Value {
+    json!({
+        "effect":effect.effect,
+        "status":"rejected",
+        "operation_id":Value::Null,
+        "error":{"code":error.code,"message":error.message},
+        "cause":script_effect_cause(caller_id,operation_id,run_id,script_id,script_revision,task_id,task_revision,attempt_id),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn script_effect_cause(
+    manager_id: &str,
+    operation_id: &str,
+    run_id: &str,
+    script_id: &str,
+    script_revision: i64,
+    task_id: &str,
+    task_revision: i64,
+    attempt_id: &str,
+) -> Value {
+    json!({
+        "kind":"script_invocation",
+        "id":operation_id,
+        "script_run_operation_id":operation_id,
+        "script_run_id":run_id,
+        "identity":{
+            "script_id":script_id,
+            "script_revision":script_revision,
+            "task_id":task_id,
+            "task_revision":task_revision,
+            "attempt_id":attempt_id,
+        },
+        "effective_manager_id":manager_id,
+    })
+}
+
+fn script_effect_request_id(
+    operation_id: &str,
+    run_id: &str,
+    effect: &protocol::ScriptEffectRequest,
+) -> Result<String> {
+    let identity = json!(["script-effect-v1", operation_id, run_id, effect.effect]);
+    Ok(format!(
+        "script-effect-{}",
+        model::digest(model::canonical(&identity)?.as_bytes())
+    ))
+}
+
+fn retain_script_effect_link(
+    tx: &Transaction<'_>,
+    caller_id: &str,
+    request_id: &str,
+    effect_operation_id: &str,
+    request: &Value,
+    cause: &Value,
+) -> Result<()> {
+    let row: Option<(String, String, String, String)> = tx
+        .query_row(
+            "SELECT method,caller_id,original_request_json,effective_request_json FROM operations WHERE operation_id=?1",
+            [effect_operation_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((method, caller, original, effective)) = row else {
+        return Err(Error::new(
+            "SCRIPT_EFFECT_DAMAGED",
+            "effect Operation disappeared before its script link was retained",
+        ));
+    };
+    if method != "message.send"
+        || caller != caller_id
+        || model::canonical(&serde_json::from_str::<Value>(&original)?)?
+            != model::canonical(request)?
+    {
+        return Err(Error::new(
+            "SCRIPT_EFFECT_DAMAGED",
+            "effect Operation differs from the exact Manager request",
+        ));
+    }
+    let mut effective: Value = serde_json::from_str(&effective)?;
+    let link = json!({
+        "schema_version":1,
+        "operation_id":effect_operation_id,
+        "technical_requester_id":caller_id,
+        "effective_manager_id":caller_id,
+        "action":"message.send",
+        "grant":"task_owner_message",
+        "cause":cause,
+    });
+    if let Some(prior) = effective.get("script_invocation") {
+        if prior != &link {
+            return Err(Error::new(
+                "SCRIPT_EFFECT_DAMAGED",
+                "effect Operation is already linked to another invocation",
+            ));
+        }
+    } else {
+        effective["script_invocation"] = link;
+        tx.execute(
+            "UPDATE operations SET effective_request_json=?2 WHERE operation_id=?1 AND caller_id=?3 AND client_request_id=?4",
+            params![effect_operation_id, model::canonical(&effective)?, caller_id, request_id],
+        )?;
+    }
     Ok(())
 }
 
@@ -1746,6 +2214,455 @@ fn record_incident(db: &Connection, run_id: &str, operation_id: &str, error: Err
         params![model::new_id(), key, operation_id, model::canonical(&evidence)?, now],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod controller_effect_tests {
+    use super::*;
+
+    const MANAGER_ID: &str = "script-effect-manager";
+    const NEXT_MANAGER_ID: &str = "script-effect-next-manager";
+    const TASK_OWNER_ID: &str = "script-effect-task-owner";
+    const TASK_ID: &str = "script-effect-task";
+    const ATTEMPT_ID: &str = "script-effect-attempt";
+    const SCRIPT_ID: &str = "script_effect_fixture";
+    const RUN_ID: &str = "script-effect-run";
+    const OPERATION_ID: &str = "script-effect-run-operation";
+
+    struct Fixture {
+        db: Connection,
+        config: Config,
+    }
+
+    fn fixture(grants: Vec<manifest::ScriptControllerEffect>) -> Fixture {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        db.execute_batch(super::super::SCHEMA).unwrap();
+        db.execute_batch(super::super::SCRIPT_SCHEMA).unwrap();
+
+        for manager in [MANAGER_ID, NEXT_MANAGER_ID, TASK_OWNER_ID] {
+            super::super::set_meta(
+                &db,
+                &format!("client:{manager}"),
+                &json!({"role":"manager","disabled":false}),
+            )
+            .unwrap();
+        }
+        super::super::set_meta(
+            &db,
+            "gm",
+            &json!({"client_id":MANAGER_ID,"binding_id":null,"binding_generation":null,"epoch":1}),
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO tasks(task_id,project_id,revision,state,spec_json,created_at_ms,updated_at_ms) VALUES(?1,'script-effect-project',1,'open','{}',1,1)",
+            [TASK_ID],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO attempts(attempt_id,task_id,task_revision,task_snapshot_json,owner_id,start_owner,state,producers_json,created_at_ms,updated_at_ms) VALUES(?1,?2,1,'{}',?3,'controller','running','[]',1,1)",
+            params![ATTEMPT_ID, TASK_ID, TASK_OWNER_ID],
+        )
+        .unwrap();
+
+        let bundle_ref = format!("script-{}", "d".repeat(64));
+        let bundle_digest = "b".repeat(64);
+        let interpreter = manifest::InterpreterIdentity {
+            kind: manifest::InterpreterKind::Powershell,
+            canonical_path: std::env::temp_dir().join("script-effect-fixture-interpreter"),
+            sha256: "a".repeat(64),
+            byte_length: 512,
+        };
+        let effects = json!(grants);
+        let metadata = json!({
+            "script_id":SCRIPT_ID,
+            "revision":1,
+            "bundle_sha256":bundle_digest,
+            "interpreter_kind":"powershell",
+            "interpreter_sha256":interpreter.sha256,
+            "controller_effects":effects,
+        });
+        db.execute(
+            "INSERT INTO artifacts(artifact_id,relative_path,kind,byte_length,content_digest,created_at_ms,metadata_json) VALUES(?1,?2,'script_bundle',1,?3,1,?4)",
+            params![bundle_ref, format!("artifacts/{bundle_ref}.bin"), bundle_digest, model::canonical(&metadata).unwrap()],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO scripts(script_id,owner_id,active_revision,created_at_ms,updated_at_ms) VALUES(?1,?2,NULL,1,1)",
+            params![SCRIPT_ID, MANAGER_ID],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO script_revisions(script_id,revision,bundle_ref,bundle_sha256,interpreter_json,validated_at_ms,created_by,created_at_ms) VALUES(?1,1,?2,?3,?4,1,?5,1)",
+            params![SCRIPT_ID, bundle_ref, bundle_digest, model::canonical(&json!(interpreter)).unwrap(), MANAGER_ID],
+        )
+        .unwrap();
+        db.execute(
+            "UPDATE scripts SET active_revision=1 WHERE script_id=?1",
+            [SCRIPT_ID],
+        )
+        .unwrap();
+
+        let invocation = json!({
+            "operation_id":OPERATION_ID,
+            "run_id":RUN_ID,
+            "script_id":SCRIPT_ID,
+            "script_revision":1,
+            "task_id":TASK_ID,
+            "task_revision":1,
+            "attempt_id":ATTEMPT_ID,
+            "effective_manager_id":MANAGER_ID,
+            "cause":{"kind":"script.run","operation_id":OPERATION_ID,"run_id":RUN_ID},
+        });
+        db.execute(
+            "INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,effective_request_json,task_id,attempt_id,state,due_at_ms,created_at_ms,updated_at_ms) VALUES(?1,?2,'fixture-script-run','script.run','{}','{}',?3,?4,'native_accepted',1,1,1)",
+            params![OPERATION_ID, MANAGER_ID, TASK_ID, ATTEMPT_ID],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO script_runs(run_id,operation_id,script_id,revision,bundle_ref,task_id,task_revision,attempt_id,work_digest,spec_json,state,process_identity_json,started_at_ms,created_at_ms) VALUES(?1,?2,?3,1,?4,?5,1,?6,?7,?8,'running','{}',1,1)",
+            params![
+                RUN_ID,
+                OPERATION_ID,
+                SCRIPT_ID,
+                bundle_ref,
+                TASK_ID,
+                ATTEMPT_ID,
+                "c".repeat(64),
+                model::canonical(&json!({"capabilities":grants,"invocation":invocation})).unwrap(),
+            ],
+        )
+        .unwrap();
+
+        Fixture {
+            db,
+            config: Config::default(),
+        }
+    }
+
+    fn effect_completion(effect: protocol::ScriptEffectRequest) -> runner::Completion {
+        let run_id = RUN_ID.to_owned();
+        let operation_id = OPERATION_ID.to_owned();
+        let make_artifact = |kind: &str, artifact_id: String, metadata: Value| ArtifactRecord {
+            kind: kind.to_owned(),
+            relative_path: format!("artifacts/{artifact_id}.bin"),
+            artifact_id,
+            byte_length: 1,
+            content_digest: "e".repeat(64),
+            metadata,
+        };
+        runner::Completion {
+            run_id,
+            operation_id,
+            token: "fixture-token".to_owned(),
+            state: "completed".to_owned(),
+            started_at_ms: Some(1),
+            exit_code: Some(0),
+            process: json!({"fixture":"store-only"}),
+            result: make_artifact(
+                "script_result",
+                format!("scriptresult-{}", "1".repeat(64)),
+                json!({"run_id":RUN_ID,"operation_id":OPERATION_ID}),
+            ),
+            stdout: make_artifact(
+                "script_output",
+                format!("scriptlog-{}", "2".repeat(64)),
+                json!({"run_id":RUN_ID,"stream":"stdout"}),
+            ),
+            stderr: make_artifact(
+                "script_output",
+                format!("scriptlog-{}", "3".repeat(64)),
+                json!({"run_id":RUN_ID,"stream":"stderr"}),
+            ),
+            result_value: Some(json!({"done":true})),
+            controller_effects: vec![effect],
+            error_code: None,
+        }
+    }
+
+    fn task_owner_message() -> protocol::ScriptEffectRequest {
+        protocol::ScriptEffectRequest {
+            effect: manifest::ScriptControllerEffect::TaskOwnerMessage,
+            text: "The bounded fixture finished.".to_owned(),
+        }
+    }
+
+    fn operation_result(db: &Connection) -> Value {
+        let raw: String = db
+            .query_row(
+                "SELECT result_json FROM operations WHERE operation_id=?1",
+                [OPERATION_ID],
+                |row| row.get(0),
+            )
+            .unwrap();
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    #[test]
+    fn declared_effect_uses_message_send_and_retains_exact_invocation_link() {
+        let mut fixture = fixture(vec![manifest::ScriptControllerEffect::TaskOwnerMessage]);
+        finish(
+            &mut fixture.db,
+            RUN_ID,
+            effect_completion(task_owner_message()),
+            &fixture.config,
+        )
+        .unwrap();
+
+        let result = operation_result(&fixture.db);
+        assert_eq!(result["outcome"], "applied");
+        assert_eq!(result["controller_effects"][0]["status"], "applied");
+        assert_eq!(result["controller_effects"][0]["recipient"], TASK_OWNER_ID);
+        let child_operation_id = result["controller_effects"][0]["operation_id"]
+            .as_str()
+            .unwrap();
+        let (method, raw): (String, String) = fixture
+            .db
+            .query_row(
+                "SELECT method,effective_request_json FROM operations WHERE operation_id=?1",
+                [child_operation_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(method, "message.send");
+        let effective: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            effective["script_invocation"]["operation_id"],
+            child_operation_id
+        );
+        assert_eq!(
+            effective["script_invocation"]["effective_manager_id"],
+            MANAGER_ID
+        );
+        assert_eq!(effective["script_invocation"]["action"], "message.send");
+        assert_eq!(
+            effective["script_invocation"]["grant"],
+            "task_owner_message"
+        );
+        assert_eq!(
+            effective["script_invocation"]["cause"],
+            json!({
+                "kind":"script_invocation",
+                "id":OPERATION_ID,
+                "script_run_operation_id":OPERATION_ID,
+                "script_run_id":RUN_ID,
+                "identity":{
+                    "script_id":SCRIPT_ID,
+                    "script_revision":1,
+                    "task_id":TASK_ID,
+                    "task_revision":1,
+                    "attempt_id":ATTEMPT_ID,
+                },
+                "effective_manager_id":MANAGER_ID,
+            })
+        );
+        let child_original: Value = serde_json::from_str(
+            &fixture
+                .db
+                .query_row(
+                    "SELECT original_request_json FROM operations WHERE operation_id=?1",
+                    [child_operation_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(child_original["recipient"], TASK_OWNER_ID);
+        assert_eq!(child_original["text"], "The bounded fixture finished.");
+    }
+
+    #[test]
+    fn ungranted_effect_is_rejected_before_any_message_operation_is_created() {
+        let mut fixture = fixture(Vec::new());
+        let error = finish(
+            &mut fixture.db,
+            RUN_ID,
+            effect_completion(task_owner_message()),
+            &fixture.config,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "SCRIPT_COMPLETION_DAMAGED");
+        let messages: i64 = fixture
+            .db
+            .query_row(
+                "SELECT count(*) FROM operations WHERE method='message.send'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(messages, 0);
+    }
+
+    #[test]
+    fn manager_handover_revokes_effect_before_current_message_admission() {
+        let mut fixture = fixture(vec![manifest::ScriptControllerEffect::TaskOwnerMessage]);
+        super::super::set_meta(
+            &fixture.db,
+            "gm",
+            &json!({"client_id":NEXT_MANAGER_ID,"binding_id":null,"binding_generation":null,"epoch":2}),
+        )
+        .unwrap();
+
+        finish(
+            &mut fixture.db,
+            RUN_ID,
+            effect_completion(task_owner_message()),
+            &fixture.config,
+        )
+        .unwrap();
+
+        let result = operation_result(&fixture.db);
+        assert_eq!(result["outcome"], "effects_incomplete");
+        assert_eq!(result["controller_effects"][0]["status"], "rejected");
+        assert_eq!(
+            result["controller_effects"][0]["error"]["code"],
+            "FORBIDDEN"
+        );
+        let messages: i64 = fixture
+            .db
+            .query_row(
+                "SELECT count(*) FROM operations WHERE method='message.send'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(messages, 0);
+    }
+
+    #[test]
+    fn deactivating_the_exact_revision_revokes_its_effect_grant() {
+        let mut fixture = fixture(vec![manifest::ScriptControllerEffect::TaskOwnerMessage]);
+        fixture
+            .db
+            .execute(
+                "UPDATE scripts SET active_revision=NULL WHERE script_id=?1",
+                [SCRIPT_ID],
+            )
+            .unwrap();
+
+        finish(
+            &mut fixture.db,
+            RUN_ID,
+            effect_completion(task_owner_message()),
+            &fixture.config,
+        )
+        .unwrap();
+
+        let result = operation_result(&fixture.db);
+        assert_eq!(result["outcome"], "effects_incomplete");
+        assert_eq!(result["controller_effects"][0]["status"], "rejected");
+        assert_eq!(
+            result["controller_effects"][0]["error"]["code"],
+            "SCRIPT_REVISION_NOT_ACTIVE"
+        );
+        let messages: i64 = fixture
+            .db
+            .query_row(
+                "SELECT count(*) FROM operations WHERE method='message.send'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(messages, 0);
+    }
+    // Append this test inside `#[cfg(test)] mod controller_effect_tests` in
+    // `src/store/scripts.rs`. It deliberately reuses that module's real in-memory
+    // Store schema and helpers; it does not launch a script or process.
+
+    #[test]
+    fn deterministic_effect_request_collision_preserves_manual_message_without_script_link() {
+        let mut fixture = fixture(vec![manifest::ScriptControllerEffect::TaskOwnerMessage]);
+        let effect = task_owner_message();
+        let request_id = script_effect_request_id(OPERATION_ID, RUN_ID, &effect).unwrap();
+        let manual_request = json!({
+            "client_request_id":request_id.clone(),
+            "recipient":TASK_OWNER_ID,
+            "text":effect.text.clone(),
+        });
+        let manual_request_json = crate::model::canonical(&manual_request).unwrap();
+
+        let manual_receipt = {
+            let tx = fixture.db.transaction().unwrap();
+            let actor = registered_actor(&tx, MANAGER_ID).unwrap();
+            let receipt = super::super::mutate_in_transaction(
+                &tx,
+                &actor,
+                "message.send",
+                &manual_request,
+                &fixture.config,
+                2,
+            )
+            .unwrap()
+            .unwrap();
+            tx.commit().unwrap();
+            receipt
+        };
+        let manual_operation_id = manual_receipt["operation_id"].as_str().unwrap().to_owned();
+        assert_eq!(
+            manual_receipt["message_id"].as_str(),
+            Some(manual_operation_id.as_str())
+        );
+
+        finish(
+            &mut fixture.db,
+            RUN_ID,
+            effect_completion(effect),
+            &fixture.config,
+        )
+        .unwrap();
+
+        let run_result = operation_result(&fixture.db);
+        assert_eq!(run_result["outcome"], "effects_incomplete");
+        assert_eq!(run_result["controller_effects"][0]["status"], "rejected");
+        assert_eq!(
+            run_result["controller_effects"][0]["error"]["code"],
+            "SCRIPT_EFFECT_REQUEST_CONFLICT"
+        );
+        assert!(run_result["controller_effects"][0]["operation_id"].is_null());
+
+        let message_count: i64 = fixture
+            .db
+            .query_row(
+                "SELECT count(*) FROM operations WHERE method='message.send'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            message_count, 1,
+            "collision must not create a second message"
+        );
+
+        let retained_operation = fixture
+        .db
+        .query_row(
+            "SELECT operation_id,method,original_request_json,effective_request_json,result_json FROM operations WHERE caller_id=?1 AND client_request_id=?2",
+            params![MANAGER_ID, request_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .unwrap();
+        let (operation_id, method, original, effective, result) = retained_operation;
+        assert_eq!(operation_id, manual_operation_id);
+        assert_eq!(method, "message.send");
+        assert_eq!(original, manual_request_json);
+
+        let effective: Value = serde_json::from_str(&effective).unwrap();
+        let result: Value = serde_json::from_str(&result).unwrap();
+        assert!(effective.get("script_invocation").is_none());
+        assert_eq!(effective["receipt"]["ok"], true);
+        assert_eq!(result["text"], manual_request["text"]);
+        assert_eq!(result["recipient"], TASK_OWNER_ID);
+        assert_eq!(result["message_id"], manual_operation_id);
+    }
 }
 
 pub(super) fn authorize_artifact_read(

@@ -539,6 +539,52 @@ fn readback_value(db: &Connection, record: &GoalRecord, now: i64, actor: &str) -
     }))
 }
 
+/// Exact task/attempt snapshot consumed by explicit manager-enabled
+/// progression. Reminder `enabled` is intentionally absent from eligibility:
+/// it controls only the existing one-shot reminder workflow.
+pub(crate) fn progression_target(
+    db: &Connection,
+    project_id: &str,
+    task_id: &str,
+    goal_id: &str,
+    now: i64,
+) -> Result<Option<Value>> {
+    let record = match load_record(db, project_id, task_id, goal_id) {
+        Ok(record) => record,
+        Err(error) if error.code == "NOT_FOUND" => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let task = tasks::get_task(db, task_id)?;
+    let attempt = tasks::get_attempt(db, &record.scope.attempt_id)?;
+    if task["project_id"] != project_id || attempt["task_id"] != task_id {
+        return Err(damaged("Goal progression target crossed its Task scope"));
+    }
+    let completion = readback_value(db, &record, now, "automation_goal_progression")?;
+    let binding_id = attempt["binding_id"].as_str().map(str::to_owned);
+    let binding_generation = attempt["binding_generation"].as_i64();
+    let current = task["state"] == "open"
+        && task["revision"] == record.scope.task_revision
+        && task["current_attempt_id"] == record.scope.attempt_id
+        && attempt["attempt_id"] == record.scope.attempt_id
+        && attempt["task_revision"] == record.scope.task_revision
+        && attempt["released_at_ms"].is_null()
+        && binding_id.is_some()
+        && binding_generation.is_some_and(|generation| generation > 0);
+    Ok(Some(json!({
+        "goal_id":record.goal_id,
+        "project_id":record.scope.project_id,
+        "scope":record.scope,
+        "revision":record.revision,
+        "objective":record.objective,
+        "created_by_manager_id":record.created_by_manager_id,
+        "updated_by_manager_id":record.updated_by_manager_id,
+        "completion":completion,
+        "active":current && completion["status"] == "pending",
+        "binding_id":binding_id,
+        "binding_generation":binding_generation,
+    })))
+}
+
 fn scope_is_current_assignment(db: &Connection, scope: &Scope) -> Result<bool> {
     let task = tasks::get_task(db, &scope.task_id)?;
     if task["project_id"] != scope.project_id || task["revision"] != scope.task_revision {

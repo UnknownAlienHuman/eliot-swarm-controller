@@ -841,6 +841,7 @@ pub(crate) enum AnyOnBehalfOperationLink {
     Acceptance(OnBehalfOperationLink),
     Publication(OnBehalfOperationLink),
     CronCheckRun(OnBehalfOperationLink),
+    GoalProgression(OnBehalfOperationLink),
     WorkDispatch(crate::store::automation_work_dispatch::WorkDispatchOperationLink),
     Repair(Box<crate::store::automation_repair::RepairDispatchOperationLink>),
 }
@@ -1005,6 +1006,7 @@ impl AnyOnBehalfOperationLink {
             Self::Acceptance(link) => link.belongs_to(principal),
             Self::Publication(link) => link.belongs_to(principal),
             Self::CronCheckRun(link) => link.belongs_to(principal),
+            Self::GoalProgression(link) => link.belongs_to(principal),
             Self::WorkDispatch(link) => link.belongs_to(principal),
             Self::Repair(link) => {
                 principal.role == Role::Manager && principal.client_id == link.effective_manager_id
@@ -1043,6 +1045,7 @@ pub(crate) fn operation_link(
         ("task.accept", Some("review_result")) => "task.accept",
         ("forge.publish_ref", Some("task.acceptance")) => "forge.publish_ref",
         ("check.run", Some("cron_occurrence")) => "check.run",
+        ("agent.goal", Some("goal_progression")) => "agent.goal",
         _ => "",
     };
     if link.schema_version != 1
@@ -1083,6 +1086,8 @@ pub(crate) fn operation_link(
         validate_publication_link(db, &link)?;
     } else if link.action == "check.run" {
         validate_cron_check_run_link(db, &link)?;
+    } else if link.action == "agent.goal" {
+        crate::store::automation_goal_progression::validate_operation_link(db, &link)?;
     }
     Ok(Some(link))
 }
@@ -2203,6 +2208,48 @@ pub(crate) fn save_cron_operation_link(
     Ok(link)
 }
 
+/// Retain the exact terminal-event/Goal attribution for one normally admitted
+/// `agent.goal continue` Operation.
+pub(crate) fn save_goal_progression_operation_link(
+    db: &Connection,
+    operation_id: &str,
+    linkage: &Value,
+    now_ms: i64,
+) -> Result<OnBehalfOperationLink> {
+    if linkage["action"] != "agent.goal"
+        || linkage["semantic_cause_kind"] != "goal_progression"
+        || linkage["cause"]["kind"] != "goal_progression"
+        || linkage["cause"]["id"].as_str().is_none_or(str::is_empty)
+    {
+        return Err(Error::new(
+            "AUTOMATION_LINK_CORRUPT",
+            "Goal progression attribution is incomplete",
+        ));
+    }
+    let link = OnBehalfOperationLink {
+        schema_version: 1,
+        operation_id: operation_id.to_owned(),
+        technical_requester_id: model::text(linkage, "technical_requester_id")?.to_owned(),
+        effective_manager_id: model::text(linkage, "effective_manager_id")?.to_owned(),
+        automation_id: model::text(linkage, "automation_id")?.to_owned(),
+        automation_revision: model::positive(linkage, "automation_revision")?,
+        project_id: model::text(linkage, "project_id")?.to_owned(),
+        action: "agent.goal".to_owned(),
+        cause: linkage["cause"].clone(),
+        linked_at_ms: now_ms,
+    };
+    let key = config::operation_link_key(operation_id)?;
+    config::write_record(db, &key, &link.value()?)?;
+    let index_key = config::entry_operation_key(
+        &link.effective_manager_id,
+        &link.project_id,
+        &link.automation_id,
+        operation_id,
+    )?;
+    config::write_record(db, &index_key, &link.value()?)?;
+    Ok(link)
+}
+
 pub(crate) fn on_behalf_visible_to(
     db: &Connection,
     principal: &Principal,
@@ -2216,6 +2263,15 @@ pub(crate) fn on_behalf_visible_to(
     }
     match link {
         AnyOnBehalfOperationLink::Review(_) => Ok(true),
+        AnyOnBehalfOperationLink::GoalProgression(link) => {
+            let task_id = link.cause["task_id"].as_str().ok_or_else(|| {
+                Error::new(
+                    "AUTOMATION_LINK_CORRUPT",
+                    "Goal progression link has no exact Task identity",
+                )
+            })?;
+            current_manager_has_task_scope(db, principal, task_id, &link.project_id)
+        }
         AnyOnBehalfOperationLink::CronCheckRun(link) => {
             let task_id = link.cause["task_id"].as_str().ok_or_else(|| {
                 Error::new(
@@ -2337,6 +2393,15 @@ fn current_gm_on_behalf_scope_visible_to(
             })?;
             current_gm_has_task_project(db, task_id, &link.project_id)
         }
+        AnyOnBehalfOperationLink::GoalProgression(link) => {
+            let task_id = link.cause["task_id"].as_str().ok_or_else(|| {
+                Error::new(
+                    "AUTOMATION_LINK_CORRUPT",
+                    "Goal progression link has no exact Task identity",
+                )
+            })?;
+            current_gm_has_task_project(db, task_id, &link.project_id)
+        }
         AnyOnBehalfOperationLink::Acceptance(link) => {
             let task_id = link.cause["identity"]["task_id"].as_str().ok_or_else(|| {
                 Error::new(
@@ -2434,6 +2499,9 @@ pub(crate) fn any_on_behalf_operation_link(
         }
         (Some(link), None, None) if link.action == "forge.publish_ref" => {
             Ok(Some(AnyOnBehalfOperationLink::Publication(link)))
+        }
+        (Some(link), None, None) if link.action == "agent.goal" => {
+            Ok(Some(AnyOnBehalfOperationLink::GoalProgression(link)))
         }
         (Some(link), None, None) => Ok(Some(AnyOnBehalfOperationLink::Review(link))),
         (None, Some(link), None) => Ok(Some(AnyOnBehalfOperationLink::WorkDispatch(link))),
@@ -3107,6 +3175,14 @@ fn current_transfer_continuation_at_phase(
             link.automation_id.as_str(),
             link.action.as_str(),
         ),
+        AnyOnBehalfOperationLink::GoalProgression(link) => (
+            link.operation_id.as_str(),
+            link.effective_manager_id.as_str(),
+            link.automation_revision,
+            link.project_id.as_str(),
+            link.automation_id.as_str(),
+            link.action.as_str(),
+        ),
         AnyOnBehalfOperationLink::WorkDispatch(link) => (
             link.operation_id.as_str(),
             link.effective_manager_id.as_str(),
@@ -3278,6 +3354,7 @@ fn current_transfer_continuation_at_phase(
         }
         AutomationStep::CheckRun => current_entry.check_run_ready(),
         AutomationStep::GithubProjection => false,
+        AutomationStep::GoalProgression => false,
     };
     if !ready {
         return Err(Error::new(

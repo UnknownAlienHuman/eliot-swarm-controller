@@ -314,7 +314,9 @@ impl RootCreationScan {
 
 impl ExecutionScan {
     pub(crate) fn restore(command: &RuntimeCommand, saved: Option<&Value>) -> Result<Self> {
-        if !matches!(command.method.as_str(), "task.dispatch" | "agent.send") {
+        if !matches!(command.method.as_str(), "task.dispatch" | "agent.send")
+            && !(command.method == "agent.goal" && command.input["action"] == "continue")
+        {
             return Err(Error::invalid(
                 "execution read requires an already-sent input",
             ));
@@ -336,6 +338,15 @@ impl ExecutionScan {
         Self::restore_for(descriptor.session_id(), descriptor.fingerprint()?, None)
     }
 
+    /// Restore a manager-triggered Goal activation scan against its exact
+    /// prompt and marker descriptor, rather than hashing unrelated operation
+    /// readback state.
+    pub(crate) fn restore_goal(
+        descriptor: &NativeInputDescriptor,
+        saved: Option<&Value>,
+    ) -> Result<Self> {
+        Self::restore_for(descriptor.session_id(), descriptor.fingerprint()?, saved)
+    }
     fn restore_for(session: &str, fingerprint: String, saved: Option<&Value>) -> Result<Self> {
         if let Some(saved) = saved {
             let scan: Self = serde_json::from_value(saved.clone())
@@ -927,7 +938,16 @@ impl Service {
         options: &Options,
         saved: Option<&Value>,
     ) -> Result<ExecutionRead> {
-        let scan = ExecutionScan::restore(command, saved)?;
+        let (descriptor, scan) =
+            if command.method == "agent.goal" && command.input["action"] == "continue" {
+                let descriptor = super::goal::continuation_execution_descriptor(command)?;
+                let scan = ExecutionScan::restore_goal(&descriptor, saved)?;
+                (descriptor, scan)
+            } else {
+                let scan = ExecutionScan::restore(command, saved)?;
+                let descriptor = NativeInputDescriptor::from_command(command)?;
+                (descriptor, scan)
+            };
         let root = &scan.session_id;
         self.verify().await?;
         self.verify_binding(root, options, &command.binding_id, command.generation)
@@ -936,7 +956,6 @@ impl Service {
         if !session["fork"].is_null() || !session["revert"].is_null() {
             return Err(gap("NATIVE_INPUT_HISTORY_CHANGED"));
         }
-        let descriptor = NativeInputDescriptor::from_command(command)?;
         let read = self.execution_log(&descriptor, scan).await?;
         self.verify_binding(
             &read.scan.session_id,
