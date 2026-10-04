@@ -146,12 +146,6 @@ fn shell() -> PathBuf {
     PathBuf::from("/bin/sh")
 }
 
-#[cfg(windows)]
-fn shell() -> PathBuf {
-    let root = std::env::var_os("SystemRoot").expect("Windows SystemRoot");
-    PathBuf::from(root).join("System32\\cmd.exe")
-}
-
 #[test]
 fn owned_probe_bounds_output_deadline_and_descendant_lifetime() {
     #[cfg(target_os = "linux")]
@@ -195,11 +189,12 @@ fn owned_probe_bounds_output_deadline_and_descendant_lifetime() {
 
     #[cfg(windows)]
     {
-        let program = shell();
-        // Disable Command Processor AutoRun so the success fixture remains a
-        // leaf command even on hosts with registry-configured startup hooks.
-        let success = run_probe(&program, &["/D", "/C", "echo probe-ok"], 5_000, 1024);
-        assert_probe_success(&success, b"probe-ok", 1024);
+        // Use the already-built controller CLI as a deterministic leaf. A
+        // system shell can have environment-specific Job descendants even
+        // when its command body is only an internal echo.
+        let leaf = PathBuf::from(env!("CARGO_BIN_EXE_swarm"));
+        let success = run_probe(&leaf, &["--version"], 5_000, 1024);
+        assert_probe_success(&success, b"swarm ", 1024);
         assert!(
             success.group_empty,
             "success response: {}",
