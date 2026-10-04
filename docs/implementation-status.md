@@ -2,7 +2,8 @@
 
 ## Current state
 
-The delivered source is main `7061e455f04a76bfaa19699edba7f58c14a27748`.
+The previous delivered and installed source is
+`7061e455f04a76bfaa19699edba7f58c14a27748`.
 It implements successor-GM continuation of the retained work, including exact
 repair dispatch across explicit automation transfers. Full Windows/Ubuntu CI
 [37195035427](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37195035427)
@@ -10,11 +11,23 @@ passed. The matching controller was installed on 2026-10-04 at 10:25 UTC;
 its SHA-256 is `C4A28DA65495FAC229EE1202DA7F4E75EA642F4B909F6F375DE0CED07102EF9E`.
 The prior installed controller is preserved in the private installation receipt.
 
-The next source increment adds manager-owned calendar CheckRun automation,
+The current source increment `8ae72e3c1330a603d413b345336dbeddee979c26`
+adds manager-owned calendar CheckRun automation,
 Command native event envelopes (`command-mod-0.1.0-glue.4`), and bounded parent-side
 OpenCode startup failure observations. The Command fixtures passed 17 glue checks
 and the bridge checks; that artifact has no new native qualification yet. The
-Rust increment is still being integrated and has not passed its source gates.
+Rust increment passed warnings-denied production Clippy, the real Store
+admission/coalescing/foreign-owner/transfer/restart regression, three calendar
+boundary/DST checks, exact Command artifact admission, and debug build on
+2026-10-04 at 11:37 UTC. The successful Clippy was retained after verifying
+that the subsequent Windows fixture path correction changed test code only.
+All source stayed unchanged during the final gate. Candidate SHA-256 is
+`BC74D592B6C422E82B0E1E9277C0D1C33DA59E037D1A92A88C95F0E6F5C55910`.
+Luna's bounded authority/consumer and native-diagnostic reviews passed after
+the transferred-CheckRun allowlist and coalesced-receipt corrections. The
+current source is locally verified; its full cross-platform CI and native C16
+startup result remain pending. The installed controller is still the prior
+qualified `7061e45` candidate.
 The project remains **PARTIAL_PROGRESS**, with the full O7 workflow, the remaining
 automation programs and cross-environment qualification outstanding. All local
 model and inference work remains deferred.
@@ -256,10 +269,13 @@ and qualification follow it.
    registry, immutable environment capture, runner ownership, bounded output
    and durable result readback are not present.
 
-9. **O8 cron/typed rules and O9 shared Goal progression — Partial.** A legacy
-   interval scheduler exists, but the cron program remains separate. OpenCode
-   has a controller-recorded Goal with one activation; native Goal APIs and
-   shared manager-enabled progression remain incomplete.
+9. **O8 cron/typed rules and O9 shared Goal progression — Partial.**
+   Manager-owned calendar CheckRuns now share the legacy scheduler, entry
+   enablement, durable occurrence identities, normal CheckRunner and explicit
+   transfer/restart paths. The current source gates are recorded above.
+   Typed event rules, the manual run-now editor and shared Goal progression
+   remain. OpenCode has a controller-recorded Goal with one activation;
+   native Goal APIs and shared manager-enabled progression remain incomplete.
 
 10. **O10 cross-contract parity and O11 integrated qualification — Partial /
     qualification pending.** Current source gates and retained native evidence are
