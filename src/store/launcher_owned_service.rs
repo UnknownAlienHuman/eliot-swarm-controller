@@ -1615,9 +1615,7 @@ fn validate_actor_link(
     manifest: &Value,
     row: &OwnedStartRow,
 ) -> Result<()> {
-    if manifest["actor"]["client_id"] != row.technical_requester_id
-        || manifest["actor"]["effective_manager_id"] != row.effective_manager_id
-    {
+    if manifest["actor"]["client_id"] != row.technical_requester_id {
         return Err(corrupt(
             "owned service actor attribution differs from its parent manifest",
         ));
@@ -1638,6 +1636,11 @@ fn validate_actor_link(
             }
         }
         Some("work_dispatch") => {
+            if manifest["actor"]["effective_manager_id"] != row.effective_manager_id {
+                return Err(corrupt(
+                    "owned service WorkDispatch manager attribution differs from its parent manifest",
+                ));
+            }
             let link =
                 super::automation_work_dispatch::operation_link(db, &row.launch_operation_id)?
                     .ok_or_else(|| corrupt("owned service WorkDispatch link is missing"))?;
@@ -2608,3 +2611,7 @@ fn is_sha256(value: &str) -> bool {
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
+
+#[cfg(test)]
+#[path = "owned_actor_provenance_tests.rs"]
+mod owned_actor_provenance_tests;

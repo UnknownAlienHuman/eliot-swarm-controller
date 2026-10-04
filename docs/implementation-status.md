@@ -14,8 +14,29 @@ four public Store failure/readback tests, formatting and debug build passed on
 2026-10-04. Production stayed unchanged after Clippy; the final test/build gate
 retained unchanged source. The qualified debug candidate SHA-256 is
 `74B869D818794AEF3242C74863744212996C67A20E3846BBDADEA7B9FC928F9E`.
-Fresh C18 startup qualification remains pending; hosted-model execution and the
-full native delivery cycle remain unqualified.
+Full Windows and remote Ubuntu CI for source
+`2ec9952af65b69977a6489fe7043407208ae71b6`
+[37212505477](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37212505477)
+passed, verified on 2026-10-04. No local Linux or WSL was used.
+
+C18 run `79a8236e-4bbb-498b-a26e-5ea455a27692` stopped at
+`runtime_command_select` with `OWNED_SERVICE_RECEIPT_CORRUPT`. Both
+`operation.get` and `swarm.exceptions.get` returned the same retained manager
+action diagnostic. The exact open remained queued and unsent; no model call
+occurred. This qualifies actual manager error delivery for that startup failure,
+while hosted-model execution and the full native delivery cycle remain
+unqualified. Preserve the consumed run without replay.
+
+The failure was traced to a producer/consumer mismatch: the canonical Direct
+actor manifest omits `effective_manager_id`, but the owned-service validator
+required it before selecting the actor kind. The compatibility fix retains
+Direct requester/manager/caller checks and requires the explicit manager field
+plus retained operation link for WorkDispatch. Package formatting, strict
+production Clippy, the actor regression, the real-Store WorkDispatch regression
+and debug build passed on unchanged source on 2026-10-04. Independent Luna
+review found no authority regression. The resulting debug candidate SHA-256 is
+`FB792948EF9908D34CBC0F9CC7A03FF17D495EA0E11E10D20A753ADD42236298`.
+Fresh C19 native startup qualification remains pending.
 
 The previous core increment is `3c1a93b476fc31a4d60345fcac627291e9fe4e54`.
 Full Windows and Ubuntu CI for that source
