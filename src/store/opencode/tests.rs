@@ -190,7 +190,7 @@ async fn builtin_identity_cannot_authenticate_over_external_ipc() {
     .await;
     let internal = owner
         .store
-        .run(move |db| attach(db, &b, "fixture-boot"))
+        .run(move |db| attach(db, &b, "fixture-boot", "external_shared_service"))
         .await
         .unwrap();
     let result = owner
