@@ -323,7 +323,8 @@ fn successor_gm_recovers_only_an_existing_exact_submission_artifact() {
     )
     .unwrap();
     let finalized = finish_recovery(&mut db, &successor_gm, &pending_published_recovery).unwrap();
-    assert_eq!(finalized["outcome"], "applied");
+    assert_eq!(finalized["outcome"], "recovered");
+    assert_eq!(finalized["target_outcome"], "applied");
     let published_state: (String, String, String, String) = db
         .query_row(
             "SELECT o.state,o.caller_id,json_extract(o.effective_request_json,'$.submission_document.submitted_by'),a.state \
@@ -346,6 +347,29 @@ fn successor_gm_recovers_only_an_existing_exact_submission_artifact() {
     assert_eq!(
         published_ref,
         published_target.expected_submission.artifact_id
+    );
+    let repeat_receipt = super::mutate(
+        &mut db,
+        &successor_gm,
+        "task.submit.recover",
+        &json!({"client_request_id":"recover-already-settled","operation_id":published_target.operation_id}),
+        &config,
+    )
+    .unwrap();
+    let super::submissions::SubmissionRecoveryStart::Complete(repeat_result) =
+        super::submissions::begin_recovery(
+            &mut db,
+            successor_gm.clone(),
+            repeat_receipt["operation_id"].as_str().unwrap(),
+        )
+        .unwrap()
+    else {
+        panic!("settled target requested another file read");
+    };
+    assert_eq!(repeat_result["outcome"], "already_settled");
+    assert_eq!(
+        repeat_result["target_result"]["submission_ref"],
+        published_ref
     );
 
     recover(
@@ -381,7 +405,8 @@ fn successor_gm_recovers_only_an_existing_exact_submission_artifact() {
         "recover-stale",
         &config,
     );
-    assert_eq!(stale_result["outcome"], "stale_submission_scope");
+    assert_eq!(stale_result["outcome"], "recovered");
+    assert_eq!(stale_result["target_outcome"], "stale_submission_scope");
     assert!(
         files
             .verify_existing(&stale_target.expected_submission)
