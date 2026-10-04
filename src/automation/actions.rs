@@ -5,9 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 /// Steps retained in the manager-owned configuration format.
-/// `work_dispatch`, `review_dispatch`, and bounded `review_disposition` have
-/// Store consumers; the other steps remain visible capability gaps rather
-/// than simulated effects.
+/// Selected delivery and acceptance steps use the existing Store ledgers.
+/// Publication and GitHub projection retain explicit capability gaps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum AutomationStep {
@@ -49,7 +48,11 @@ impl AutomationStep {
     pub(crate) fn has_consumer(self) -> bool {
         matches!(
             self,
-            Self::WorkDispatch | Self::ReviewDispatch | Self::ReviewDisposition
+            Self::WorkDispatch
+                | Self::ReviewDispatch
+                | Self::ReviewDisposition
+                | Self::RepairDispatch
+                | Self::Acceptance
         )
     }
 

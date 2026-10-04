@@ -745,6 +745,7 @@ static TOOLS: &[(bool, ToolSpec)] = &[
             f("coverage", S),
             f("findings", A),
             f("evidence_refs", A),
+            f("requirement_reviews", A),
         ],
         &[
             "review_assignment_id",
@@ -1174,6 +1175,26 @@ fn refine_input_schema(method: &str, schema: &mut Value) {
                 "maxLength":128,
                 "pattern":"^\\S+$",
                 "description":"Exact parent swarm.launch Operation for a launch-owned Attempt. Omit only for a legacy unlinked Attempt; prerequisite_operation_id remains a runtime configuration prerequisite."
+            });
+        }
+        "review.submit" => {
+            properties["requirement_reviews"] = json!({
+                "type":"array",
+                "description":"Optional structured evidence for acceptance; when supplied it must cover every frozen Task requirement on a complete pass with no findings.",
+                "items":{
+                    "type":"object",
+                    "properties":{
+                        "requirement_id":{"type":"string","minLength":1},
+                        "rationale":{"type":"string","minLength":1},
+                        "evidence":{
+                            "type":"array",
+                            "minItems":1,
+                            "items":{"type":"string","minLength":1,"description":"Exact assigned submission_ref or candidate_ref artifact ID."}
+                        }
+                    },
+                    "required":["requirement_id","rationale","evidence"],
+                    "additionalProperties":false
+                }
             });
         }
         "coordination.sync_integration" => {

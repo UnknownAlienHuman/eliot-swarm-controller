@@ -448,7 +448,7 @@ fn optional_text(value: &Value, name: &str, max_bytes: usize) -> Result<Option<S
     Ok(Some(text.to_owned()))
 }
 
-fn validate_automation_id(value: &str) -> Result<()> {
+pub(crate) fn validate_automation_id(value: &str) -> Result<()> {
     validate_name(value, "automation_id", MAX_AUTOMATION_ID_BYTES)?;
     if value
         .bytes()

@@ -3,12 +3,17 @@
 
 use super::{actions::AutomationCause, config};
 use crate::{
+    acceptance::AcceptRequest,
     error::{Error, Result},
-    model::{Principal, Role},
+    model::{self, Principal, Role},
+    review::{
+        PRIMARY_REVIEW_SLOT, ReviewCoverage, ReviewSlotIdentity, ReviewSubmitRequest, ReviewVerdict,
+    },
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 
 pub(crate) const AUTOMATION_TECHNICAL_REQUESTER_ID: &str = "eliot-internal-automation-v1";
 
@@ -34,6 +39,24 @@ struct CurrentReviewSubject {
     task_state: String,
     current_task_revision: i64,
 }
+
+type AcceptanceOperationRow = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+);
+type AcceptanceAssignmentOperationRow = (String, String, String, Option<String>);
+type AcceptanceResultOperationRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+);
 
 impl ManagerExecutionContext {
     /// Created only from a currently stored, digest-verified enabled entry.
@@ -232,18 +255,24 @@ pub(crate) struct OnBehalfOperationLink {
 }
 
 /// A validated retained attribution for an Operation admitted by automation.
-/// Review links and WorkDispatch links have separate contracts; this enum is
-/// only their shared visibility boundary and does not widen either contract.
+/// Review, Acceptance, WorkDispatch and Repair links keep separate provenance
+/// contracts; this enum is only their shared visibility boundary.
 pub(crate) enum AnyOnBehalfOperationLink {
     Review(OnBehalfOperationLink),
+    Acceptance(OnBehalfOperationLink),
     WorkDispatch(crate::store::automation_work_dispatch::WorkDispatchOperationLink),
+    Repair(Box<crate::store::automation_repair::RepairDispatchOperationLink>),
 }
 
 impl AnyOnBehalfOperationLink {
     pub(crate) fn belongs_to(&self, principal: &Principal) -> bool {
         match self {
             Self::Review(link) => link.belongs_to(principal),
+            Self::Acceptance(link) => link.belongs_to(principal),
             Self::WorkDispatch(link) => link.belongs_to(principal),
+            Self::Repair(link) => {
+                principal.role == Role::Manager && principal.client_id == link.effective_manager_id
+            }
         }
     }
 }
@@ -275,6 +304,7 @@ pub(crate) fn operation_link(
     let expected_method = match (link.action.as_str(), link.cause["kind"].as_str()) {
         ("review.assign", Some("applied_submission")) => "review.assign",
         ("task.request_changes", Some("review_result")) => "task.request_changes",
+        ("task.accept", Some("review_result")) => "task.accept",
         _ => "",
     };
     if link.schema_version != 1
@@ -309,8 +339,321 @@ pub(crate) fn operation_link(
     }
     if link.action == "task.request_changes" {
         validate_review_disposition_link(db, &link)?;
+    } else if link.action == "task.accept" {
+        validate_acceptance_link(db, &link)?;
     }
     Ok(Some(link))
+}
+
+fn validate_acceptance_link(db: &Connection, link: &OnBehalfOperationLink) -> Result<()> {
+    let corrupt = || {
+        Error::new(
+            "AUTOMATION_LINK_CORRUPT",
+            "acceptance link does not match its retained request and assigned review pass",
+        )
+    };
+    let assignment_id = link.cause["review_assignment_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(corrupt)?;
+    let result_operation_id = link.cause["review_result_operation_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(corrupt)?;
+    let identity: ReviewSlotIdentity =
+        serde_json::from_value(link.cause["identity"].clone()).map_err(|_| corrupt())?;
+    if identity.task_revision <= 0
+        || identity.review_slot != PRIMARY_REVIEW_SLOT
+        || identity.task_id.trim().is_empty()
+        || identity.attempt_id.trim().is_empty()
+        || identity.submission_ref.trim().is_empty()
+        || identity.candidate_ref.trim().is_empty()
+        || identity.review_policy_generation.trim().is_empty()
+        || link.linked_at_ms < 0
+        || link.cause["kind"] != "review_result"
+        || link.cause["id"] != assignment_id
+    {
+        return Err(corrupt());
+    }
+    let identity_value = serde_json::to_value(&identity).map_err(|_| corrupt())?;
+
+    let operation: Option<AcceptanceOperationRow> = db
+        .query_row(
+            "SELECT caller_id,method,task_id,attempt_id,original_request_json,effective_request_json \
+             FROM operations WHERE operation_id=?1",
+            [&link.operation_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((caller, method, task_id, attempt_id, original_raw, effective_raw)) = operation else {
+        return Err(corrupt());
+    };
+    let original: Value = serde_json::from_str(&original_raw).map_err(|_| corrupt())?;
+    let request = AcceptRequest::parse(&original).map_err(|_| corrupt())?;
+    let effective: Value = serde_json::from_str(&effective_raw).map_err(|_| corrupt())?;
+    let saved_link = effective
+        .get("automation_on_behalf")
+        .filter(|value| value.is_object())
+        .ok_or_else(corrupt)?;
+    let gm_epoch = saved_link["gm_epoch"]
+        .as_i64()
+        .filter(|epoch| *epoch > 0)
+        .ok_or_else(corrupt)?;
+    let assignment_cause = json!({
+        "kind":"review_result",
+        "review_assignment_id":assignment_id,
+        "review_result_operation_id":result_operation_id,
+        "identity":identity_value,
+        "check_ids":request.check_ids
+    });
+    let mut linked_cause = assignment_cause.clone();
+    linked_cause["id"] = json!(assignment_id);
+    let mut sorted_check_ids = request.check_ids.clone();
+    sorted_check_ids.sort();
+    let semantic_input = model::canonical(&json!([
+        link.effective_manager_id,
+        identity.task_id,
+        identity.task_revision,
+        identity.attempt_id,
+        identity.submission_ref,
+        identity.candidate_ref,
+        identity.digest().map_err(|_| corrupt())?,
+        request.expected_feedback_observation_id,
+        request.check_ids,
+    ]))
+    .map_err(|_| corrupt())?;
+    let semantic_request_id = model::digest(semantic_input.as_bytes());
+    let expected_reason = format!(
+        "Assigned review {assignment_id} recorded a complete pass for candidate {} in review.submit Operation {result_operation_id}.",
+        identity.candidate_ref
+    );
+    if request.check_ids != sorted_check_ids
+        || link.cause != linked_cause
+        || caller != AUTOMATION_TECHNICAL_REQUESTER_ID
+        || method != "task.accept"
+        || task_id.as_deref() != Some(identity.task_id.as_str())
+        || attempt_id.as_deref() != Some(identity.attempt_id.as_str())
+        || request.expected_revision != identity.task_revision
+        || request.attempt_id != identity.attempt_id
+        || request.submission_ref != identity.submission_ref
+        || request.candidate_ref != identity.candidate_ref
+        || request.client_request_id != semantic_request_id
+        || request.reason != expected_reason
+        || request.expected_feedback_observation_id
+            != saved_link["expected_feedback_observation_id"]
+        || effective["request"] != original
+    {
+        return Err(corrupt());
+    }
+
+    let expected_saved_link = json!({
+        "schema_version":1,
+        "technical_requester_id":link.technical_requester_id,
+        "effective_manager_id":link.effective_manager_id,
+        "automation_id":link.automation_id,
+        "automation_revision":link.automation_revision,
+        "project_id":link.project_id,
+        "action":"task.accept",
+        "semantic_cause_kind":"review_result",
+        "semantic_cause_id":assignment_id,
+        "gm_epoch":gm_epoch,
+        "expected_feedback_observation_id":request.expected_feedback_observation_id,
+        "cause":assignment_cause,
+        "check_ids":request.check_ids
+    });
+    if saved_link != &expected_saved_link {
+        return Err(corrupt());
+    }
+
+    validate_acceptance_review_pass(
+        db,
+        link,
+        &identity,
+        assignment_id,
+        result_operation_id,
+        &request,
+    )
+}
+
+fn validate_acceptance_review_pass(
+    db: &Connection,
+    link: &OnBehalfOperationLink,
+    identity: &ReviewSlotIdentity,
+    assignment_id: &str,
+    result_operation_id: &str,
+    acceptance_request: &AcceptRequest,
+) -> Result<()> {
+    let corrupt = || {
+        Error::new(
+            "AUTOMATION_LINK_CORRUPT",
+            "acceptance link does not match its retained request and assigned review pass",
+        )
+    };
+    let assignment_key = format!("assignment:{assignment_id}");
+    let assignment_row: Option<(String, String)> = db
+        .query_row(
+            "SELECT payload_json,operation_id FROM observations \
+             WHERE source_stream_id='controller:review' AND source_event_key=?1 \
+               AND kind='review.assignment'",
+            [&assignment_key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((assignment_raw, assignment_operation_id)) = assignment_row else {
+        return Err(corrupt());
+    };
+    let assignment: Value = serde_json::from_str(&assignment_raw).map_err(|_| corrupt())?;
+    if assignment["schema_version"] != 1
+        || assignment["review_assignment_id"] != assignment_id
+        || assignment["operation_id"] != assignment_operation_id
+        || assignment["identity"] != serde_json::to_value(identity).map_err(|_| corrupt())?
+        || assignment["sponsor_client_id"] != link.effective_manager_id
+        || assignment["reviewer_client_id"]
+            .as_str()
+            .is_none_or(str::is_empty)
+    {
+        return Err(corrupt());
+    }
+
+    let assignment_operation: Option<AcceptanceAssignmentOperationRow> = db
+        .query_row(
+            "SELECT caller_id,method,state,result_json FROM operations WHERE operation_id=?1",
+            [&assignment_operation_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((assignment_caller, method, state, result_raw)) = assignment_operation else {
+        return Err(corrupt());
+    };
+    let assignment_result: Value =
+        serde_json::from_str(&result_raw.ok_or_else(corrupt)?).map_err(|_| corrupt())?;
+    if method != "review.assign"
+        || state != "settled"
+        || assignment["technical_requester_id"] != assignment_caller
+        || assignment_result != assignment["result"]
+        || assignment_result["review_assignment_id"] != assignment_id
+        || assignment_result["identity"] != assignment["identity"]
+        || assignment_result["sponsor_client_id"] != link.effective_manager_id
+        || assignment_result["reviewer_client_id"] != assignment["reviewer_client_id"]
+    {
+        return Err(corrupt());
+    }
+
+    let result_key = format!("result:{assignment_id}");
+    let result_row: Option<(String, String)> = db
+        .query_row(
+            "SELECT payload_json,operation_id FROM observations \
+             WHERE source_stream_id='controller:review' AND source_event_key=?1 \
+               AND kind='review.result'",
+            [&result_key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((result_raw, observed_operation_id)) = result_row else {
+        return Err(corrupt());
+    };
+    let record: Value = serde_json::from_str(&result_raw).map_err(|_| corrupt())?;
+    if observed_operation_id != result_operation_id
+        || record["schema_version"] != 1
+        || record["operation_id"] != result_operation_id
+        || record["review_assignment_id"] != assignment_id
+        || record["identity"] != assignment["identity"]
+    {
+        return Err(corrupt());
+    }
+
+    let result_operation: Option<AcceptanceResultOperationRow> = db
+        .query_row(
+            "SELECT caller_id,method,state,task_id,attempt_id,result_json \
+             FROM operations WHERE operation_id=?1",
+            [result_operation_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((reviewer_id, method, state, task_id, attempt_id, result_json)) = result_operation
+    else {
+        return Err(corrupt());
+    };
+    let result: Value = serde_json::from_str(&result_json).map_err(|_| corrupt())?;
+    let submit_raw: String = db
+        .query_row(
+            "SELECT original_request_json FROM operations WHERE operation_id=?1",
+            [result_operation_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or_else(corrupt)?;
+    let submit_value: Value = serde_json::from_str(&submit_raw).map_err(|_| corrupt())?;
+    let submit = ReviewSubmitRequest::parse(&submit_value).map_err(|_| corrupt())?;
+    let required_ids: Vec<String> =
+        serde_json::from_value(assignment["required_coverage"]["requirement_ids"].clone())
+            .map_err(|_| corrupt())?;
+    let required_ids = required_ids.into_iter().collect::<BTreeSet<_>>();
+    let submitted_ids = submit
+        .requirement_reviews
+        .iter()
+        .map(|review| review.requirement_id.clone())
+        .collect::<BTreeSet<_>>();
+    let accepted_reviews =
+        serde_json::to_value(&acceptance_request.reviews).map_err(|_| corrupt())?;
+    let submitted_reviews =
+        serde_json::to_value(&submit.requirement_reviews).map_err(|_| corrupt())?;
+    if reviewer_id != assignment["reviewer_client_id"]
+        || method != "review.submit"
+        || state != "settled"
+        || task_id.as_deref() != Some(identity.task_id.as_str())
+        || attempt_id.as_deref() != Some(identity.attempt_id.as_str())
+        || result != record["result"]
+        || result["review_assignment_id"] != assignment_id
+        || result["reviewer_client_id"] != assignment["reviewer_client_id"]
+        || result["sponsor_client_id"] != link.effective_manager_id
+        || result["task_id"] != identity.task_id
+        || result["attempt_id"] != identity.attempt_id
+        || result["task_revision"] != identity.task_revision
+        || result["submission_ref"] != identity.submission_ref
+        || result["candidate_ref"] != identity.candidate_ref
+        || result["verdict"] != "pass"
+        || result["coverage"] != "complete"
+        || result["findings"] != json!([])
+        || result["applicability"] != "current_candidate"
+        || result["task_transition"] != "none"
+        || submit.review_assignment_id != assignment_id
+        || submit.submission_ref != identity.submission_ref
+        || submit.candidate_ref != identity.candidate_ref
+        || submit.verdict != ReviewVerdict::Pass
+        || submit.coverage != ReviewCoverage::Complete
+        || !submit.findings.is_empty()
+        || submit.requirement_reviews.is_empty()
+        || required_ids.is_empty()
+        || required_ids.len()
+            != assignment["required_coverage"]["requirement_ids"]
+                .as_array()
+                .map_or(0, Vec::len)
+        || submitted_ids != required_ids
+        || submitted_reviews != result["requirement_reviews"]
+        || accepted_reviews != submitted_reviews
+    {
+        return Err(corrupt());
+    }
+    Ok(())
 }
 
 fn validate_review_disposition_link(db: &Connection, link: &OnBehalfOperationLink) -> Result<()> {
@@ -509,30 +852,66 @@ pub(crate) fn on_behalf_visible_to(
     }
     match link {
         AnyOnBehalfOperationLink::Review(_) => Ok(true),
+        AnyOnBehalfOperationLink::Acceptance(link) => {
+            let task_id = link.cause["identity"]["task_id"].as_str().ok_or_else(|| {
+                Error::new(
+                    "AUTOMATION_LINK_CORRUPT",
+                    "acceptance link has no exact Task identity",
+                )
+            })?;
+            current_manager_has_task_scope(db, principal, task_id, &link.project_id)
+        }
         AnyOnBehalfOperationLink::WorkDispatch(link) => {
             current_work_dispatch_scope_visible_to(db, principal, &link)
         }
+        AnyOnBehalfOperationLink::Repair(link) => current_manager_id_has_task_scope(
+            db,
+            &principal.client_id,
+            &link.task_id,
+            &link.project_id,
+        ),
     }
 }
 
-/// Load a retained review or WorkDispatch link and validate its own durable
-/// provenance. This is intended for the local Operator's global diagnostic
-/// branch; manager authorization must additionally use
-/// `on_behalf_visible_to` so current Task/project rights are rechecked.
+/// Load a retained on-behalf link and validate its own durable provenance.
+/// This is intended for the local Operator's global diagnostic branch; manager
+/// authorization must additionally use `on_behalf_visible_to` so current
+/// Task/project rights are rechecked.
 pub(crate) fn any_on_behalf_operation_link(
     db: &Connection,
     operation_id: &str,
 ) -> Result<Option<AnyOnBehalfOperationLink>> {
     let review = operation_link(db, operation_id)?;
     let work_dispatch = crate::store::automation_work_dispatch::operation_link(db, operation_id)?;
-    match (review, work_dispatch) {
-        (Some(_), Some(_)) => Err(Error::new(
+    let repair = crate::store::automation_repair::operation_link(db, operation_id)?;
+    let mut count = 0;
+    if review.is_some() {
+        count += 1;
+    }
+    if work_dispatch.is_some() {
+        count += 1;
+    }
+    if repair.is_some() {
+        count += 1;
+    }
+    if count > 1 {
+        return Err(Error::new(
             "AUTOMATION_LINK_CORRUPT",
-            "Operation has both review and WorkDispatch attribution records",
+            "Operation has multiple on-behalf attribution records",
+        ));
+    }
+    match (review, work_dispatch, repair) {
+        (Some(link), None, None) if link.action == "task.accept" => {
+            Ok(Some(AnyOnBehalfOperationLink::Acceptance(link)))
+        }
+        (Some(link), None, None) => Ok(Some(AnyOnBehalfOperationLink::Review(link))),
+        (None, Some(link), None) => Ok(Some(AnyOnBehalfOperationLink::WorkDispatch(link))),
+        (None, None, Some(link)) => Ok(Some(AnyOnBehalfOperationLink::Repair(Box::new(link)))),
+        (None, None, None) => Ok(None),
+        _ => Err(Error::new(
+            "AUTOMATION_LINK_CORRUPT",
+            "Operation has multiple on-behalf attribution records",
         )),
-        (Some(link), None) => Ok(Some(AnyOnBehalfOperationLink::Review(link))),
-        (None, Some(link)) => Ok(Some(AnyOnBehalfOperationLink::WorkDispatch(link))),
-        (None, None) => Ok(None),
     }
 }
 
@@ -636,6 +1015,7 @@ pub(crate) fn entry_operation_links(
         .collect::<std::result::Result<Vec<_>, _>>()?;
     drop(statement);
     let mut links = Vec::with_capacity(limit);
+    let mut seen_operation_ids = BTreeSet::new();
     for key in keys {
         let operation_id = key.strip_prefix(&prefix).ok_or_else(|| {
             Error::new("AUTOMATION_LINK_CORRUPT", "operation index key is invalid")
@@ -654,6 +1034,23 @@ pub(crate) fn entry_operation_links(
                 "AUTOMATION_LINK_CORRUPT",
                 "indexed operation link has a different owner or entry",
             ));
+        }
+        if !seen_operation_ids.insert(link.operation_id.clone()) {
+            return Err(Error::new(
+                "AUTOMATION_LINK_CORRUPT",
+                "Operation appears more than once in the review entry index",
+            ));
+        }
+        if link.action == "task.accept" {
+            let task_id = link.cause["identity"]["task_id"].as_str().ok_or_else(|| {
+                Error::new(
+                    "AUTOMATION_LINK_CORRUPT",
+                    "acceptance link has no exact Task identity",
+                )
+            })?;
+            if !current_manager_id_has_task_scope(db, owner, task_id, project)? {
+                continue;
+            }
         }
         links.push(link);
     }
@@ -681,10 +1078,7 @@ pub(crate) fn entry_operation_links(
         }
         dispatch_scanned += page_len;
         for link in work_dispatch {
-            if links
-                .iter()
-                .any(|existing| existing.operation_id == link.operation_id)
-            {
+            if !seen_operation_ids.insert(link.operation_id.clone()) {
                 return Err(Error::new(
                     "AUTOMATION_LINK_CORRUPT",
                     "Operation appears in both review and WorkDispatch entry indexes",
@@ -716,6 +1110,57 @@ pub(crate) fn entry_operation_links(
                     "attempt_id":link.attempt_id,
                     "source":link.source
                 }),
+                linked_at_ms: link.linked_at_ms,
+            });
+        }
+        if page_len < page_limit {
+            break;
+        }
+    }
+
+    let mut repair_after = after.to_owned();
+    let mut repair_scanned = 0usize;
+    let mut repair_visible = 0usize;
+    const MAX_REPAIR_HISTORY_SCAN: usize = 100;
+    while repair_visible < limit && repair_scanned < MAX_REPAIR_HISTORY_SCAN {
+        let page_limit = (limit - repair_visible).min(MAX_REPAIR_HISTORY_SCAN - repair_scanned);
+        let repairs = crate::store::automation_repair::entry_operation_links(
+            db,
+            owner,
+            project,
+            automation_id,
+            &repair_after,
+            page_limit,
+        )?;
+        if repairs.is_empty() {
+            break;
+        }
+        let page_len = repairs.len();
+        if let Some(last) = repairs.last() {
+            repair_after.clone_from(&last.operation_id);
+        }
+        repair_scanned += page_len;
+        for link in repairs {
+            if !seen_operation_ids.insert(link.operation_id.clone()) {
+                return Err(Error::new(
+                    "AUTOMATION_LINK_CORRUPT",
+                    "Operation appears in more than one on-behalf entry index",
+                ));
+            }
+            if !current_manager_id_has_task_scope(db, owner, &link.task_id, &link.project_id)? {
+                continue;
+            }
+            repair_visible += 1;
+            links.push(OnBehalfOperationLink {
+                schema_version: 1,
+                operation_id: link.operation_id,
+                technical_requester_id: link.technical_requester_id,
+                effective_manager_id: link.effective_manager_id,
+                automation_id: link.automation_id,
+                automation_revision: link.automation_revision,
+                project_id: link.project_id,
+                action: link.action,
+                cause: link.cause,
                 linked_at_ms: link.linked_at_ms,
             });
         }

@@ -642,6 +642,8 @@ pub(crate) fn reserve_submit(
         .map(|requirement| requirement.id.clone())
         .collect::<BTreeSet<_>>();
     request.validate_findings(&requirement_ids)?;
+    request.validate_requirement_reviews(&requirement_ids)?;
+    validate_requirement_review_evidence(request, &retained.identity)?;
     let semantic_input = semantic_result_input(request);
     if let Some(existing) = result_observation(tx, assignment_id)? {
         if existing["input"] == semantic_input {
@@ -660,7 +662,7 @@ pub(crate) fn reserve_submit(
         ));
     }
     let current = current_applicability(tx, &identity)?;
-    let result = json!({
+    let mut result = json!({
         "operation_id":operation_id,
         "review_assignment_id":assignment_id,
         "task_id":identity.task_id,
@@ -685,6 +687,9 @@ pub(crate) fn reserve_submit(
         "publication_started":false,
         "coalesced":false,
     });
+    if !request.requirement_reviews.is_empty() {
+        result["requirement_reviews"] = json!(&request.requirement_reviews);
+    }
     let record = json!({
         "schema_version":1,
         "review_assignment_id":assignment_id,
@@ -783,7 +788,7 @@ pub(crate) fn actionable_finding(
 }
 
 fn semantic_result_input(request: &ReviewSubmitRequest) -> Value {
-    json!({
+    let mut input = json!({
         "review_assignment_id":request.review_assignment_id,
         "submission_ref":request.submission_ref,
         "candidate_ref":request.candidate_ref,
@@ -791,7 +796,32 @@ fn semantic_result_input(request: &ReviewSubmitRequest) -> Value {
         "coverage":request.coverage,
         "findings":request.findings,
         "evidence_refs":request.evidence_refs,
-    })
+    });
+    if !request.requirement_reviews.is_empty() {
+        input["requirement_reviews"] = json!(&request.requirement_reviews);
+    }
+    input
+}
+
+/// Structured acceptance evidence may cite only artifacts already exposed by
+/// the exact assigned-review surface. `load_submission_context` has verified
+/// the retained submission Operation/digest and candidate artifact/digest
+/// against this slot before this check runs; no evidence-read scope is added.
+fn validate_requirement_review_evidence(
+    request: &ReviewSubmitRequest,
+    identity: &ReviewSlotIdentity,
+) -> Result<()> {
+    for review in &request.requirement_reviews {
+        if review.evidence.iter().any(|reference| {
+            reference != &identity.submission_ref && reference != &identity.candidate_ref
+        }) {
+            return Err(Error::new(
+                "REVIEW_EVIDENCE_SCOPE",
+                "structured evidence must reference this assigned submission or candidate artifact",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn current_applicability(db: &Connection, identity: &ReviewSlotIdentity) -> Result<bool> {

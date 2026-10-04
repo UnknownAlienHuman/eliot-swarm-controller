@@ -196,7 +196,9 @@ fn owned_probe_bounds_output_deadline_and_descendant_lifetime() {
     #[cfg(windows)]
     {
         let program = shell();
-        let success = run_probe(&program, &["/C", "echo probe-ok"], 5_000, 1024);
+        // Disable Command Processor AutoRun so the success fixture remains a
+        // leaf command even on hosts with registry-configured startup hooks.
+        let success = run_probe(&program, &["/D", "/C", "echo probe-ok"], 5_000, 1024);
         assert_probe_success(&success, b"probe-ok", 1024);
         assert!(
             success.group_empty,

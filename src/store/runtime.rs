@@ -422,7 +422,16 @@ fn next_internal(
     let mut trusted_launch_dispatch_packet: Option<Value> = None;
     let guard = (|| -> Result<()> {
         let o = operations::get_operation(&tx, &op)?;
-        let caller = if opening_actor.is_some() {
+        let repair_context = if method == "agent.send"
+            && o["caller_id"] == crate::automation::authorization::AUTOMATION_TECHNICAL_REQUESTER_ID
+        {
+            let context = super::automation_repair::context_for_delivery_operation(&tx, &op)?;
+            context.require_current_for_effect(&tx, &op)?;
+            Some(context)
+        } else {
+            None
+        };
+        let caller = if opening_actor.is_some() || repair_context.is_some() {
             // The exact opening guard above validated the retained actor in
             // this transaction. A technical requester is not a registered
             // client or a Principal; no synthetic profile is created here.
@@ -503,7 +512,7 @@ fn next_internal(
                 "binding not ready before dispatch",
             ));
         }
-        if method != "agent.open" && caller["role"] != "operator" {
+        if method != "agent.open" && repair_context.is_none() && caller["role"] != "operator" {
             let owns:bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM attempts WHERE owner_id=?1 AND binding_id=?2 AND binding_generation=?3 AND released_at_ms IS NULL)",params![o["caller_id"].as_str(),id,generation],|r|r.get(0))?;
             if caller["role"] != "manager" || !owns {
                 return Err(Error::new(
@@ -2373,6 +2382,71 @@ pub(super) fn user_command(
     op: &str,
     config: &crate::config::Config,
 ) -> Result<Value> {
+    user_command_with_actor(tx, UserCommandActor::Direct(p), method, v, op, config)
+}
+
+enum UserCommandActor<'a> {
+    Direct(&'a Principal),
+    Repair(&'a crate::automation::repair::RepairDispatchContext),
+}
+
+impl UserCommandActor<'_> {
+    fn effective_client_id(&self) -> &str {
+        match self {
+            Self::Direct(principal) => &principal.client_id,
+            Self::Repair(context) => context.effective_manager_id(),
+        }
+    }
+
+    fn is_operator(&self) -> bool {
+        matches!(self, Self::Direct(principal) if principal.role == Role::Operator)
+    }
+
+    fn require_operator(&self) -> Result<()> {
+        match self {
+            Self::Direct(principal) => principal.require_operator(),
+            Self::Repair(_) => Err(Error::new(
+                "FORBIDDEN",
+                "repair authority cannot recover a binding",
+            )),
+        }
+    }
+}
+
+/// Derive the sole repair request from Store-validated immutable feedback.
+/// A technical requester receives no general Manager or Operator authority.
+pub(super) fn user_command_for_repair(
+    tx: &Connection,
+    context: &crate::automation::repair::RepairDispatchContext,
+    operation_id: &str,
+    config: &crate::config::Config,
+) -> Result<Value> {
+    context.require_current_for_admission(tx)?;
+    if meta(tx, "execution_mode")?.unwrap_or(Value::Null)["new_work"] != "enabled" {
+        return Err(Error::new(
+            "ADMISSION_DISABLED",
+            "new work is disabled before correction admission",
+        ));
+    }
+    let request = context.delivery_request()?.value();
+    user_command_with_actor(
+        tx,
+        UserCommandActor::Repair(context),
+        "agent.send",
+        &request,
+        operation_id,
+        config,
+    )
+}
+
+fn user_command_with_actor(
+    tx: &Connection,
+    actor: UserCommandActor<'_>,
+    method: &str,
+    v: &Value,
+    op: &str,
+    config: &crate::config::Config,
+) -> Result<Value> {
     // Envelope shape is validated before persistence by model::validate_mutation.
     let id = model::text(v, "binding_id")?;
     let generation = model::positive(v, "generation")?;
@@ -2386,14 +2460,14 @@ pub(super) fn user_command(
             "native session is not ready",
         ));
     }
-    if p.role != Role::Operator {
-        let owns:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM attempts WHERE owner_id=?1 AND binding_id=?2 AND binding_generation=?3 AND released_at_ms IS NULL)",params![p.client_id,id,generation],|r|r.get(0))?;
+    if !actor.is_operator() {
+        let owns:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM attempts WHERE owner_id=?1 AND binding_id=?2 AND binding_generation=?3 AND released_at_ms IS NULL)",params![actor.effective_client_id(),id,generation],|r|r.get(0))?;
         if !owns {
             return Err(Error::new("FORBIDDEN", "no assignment on this binding"));
         }
     }
     if method == "agent.recover" {
-        p.require_operator()?;
+        actor.require_operator()?;
         model::text(v, "reason")?;
         if v["expected_boot_id"] != b["observation"]["bridge_boot_id"]
             || b["observation"]["recovery_required"] != true
@@ -2569,6 +2643,17 @@ pub(super) fn user_command(
             "required_completion_condition":"native_configuration_applied",
             "required_contract_revision":prerequisite_contract_revision
         });
+    }
+    if let UserCommandActor::Repair(context) = &actor {
+        effective["automation_on_behalf"] = context.linkage_value();
+        tx.execute(
+            "UPDATE operations SET task_id=?2,attempt_id=?3 WHERE operation_id=?1",
+            params![
+                op,
+                context.identity().task_id,
+                context.identity().attempt_id
+            ],
+        )?;
     }
     tx.execute("UPDATE operations SET binding_id=?2,binding_generation=?3,prerequisite_operation_id=?4,effective_request_json=?5 WHERE operation_id=?1",params![op,id,generation,prerequisite_id,model::canonical(&effective)?])?;
     Ok(

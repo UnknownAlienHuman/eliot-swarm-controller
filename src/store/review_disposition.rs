@@ -10,6 +10,7 @@ use crate::{
         actions::AutomationStep,
         config::{self, AutomationEntry},
     },
+    config::Config,
     error::{Error, Result},
     model,
 };
@@ -138,10 +139,11 @@ pub(super) fn configure_activation(
     save_state(tx, &key, &state)
 }
 
-/// Run one fair, globally bounded page of enabled result-disposition entries.
+/// Run one fair, globally bounded page of enabled result-action entries.
 /// `fact_budget` applies independently to each selected entry.
 pub(super) fn reconcile(
     tx: &Transaction<'_>,
+    config: &Config,
     entry_budget: usize,
     fact_budget: usize,
     now_ms: i64,
@@ -167,7 +169,7 @@ pub(super) fn reconcile(
     let mut results = Vec::with_capacity(entries.len());
     let mut total_processed = 0usize;
     for entry in &entries {
-        let result = reconcile_entry(tx, entry, fact_budget, now_ms)?;
+        let result = reconcile_entry(tx, config, entry, fact_budget, now_ms)?;
         total_processed = total_processed.saturating_add(
             result["processed"]
                 .as_u64()
@@ -214,6 +216,7 @@ pub(super) fn disposition_state(db: &Connection, entry: &AutomationEntry) -> Res
 
 fn reconcile_entry(
     tx: &Transaction<'_>,
+    config: &Config,
     entry: &AutomationEntry,
     budget: usize,
     now_ms: i64,
@@ -258,6 +261,7 @@ fn reconcile_entry(
 
     let mut processed = recheck_pending(
         tx,
+        config,
         entry,
         &mut state,
         budget.min(MAX_PENDING_RECHECKS),
@@ -343,7 +347,14 @@ fn reconcile_entry(
             blocked_on_pending_capacity = true;
             break;
         }
-        let result = consume_isolated(tx, entry, &assignment_id, &result_operation_id, now_ms)?;
+        let result = consume_isolated(
+            tx,
+            config,
+            entry,
+            &assignment_id,
+            &result_operation_id,
+            now_ms,
+        )?;
         if is_unresolved(&result) {
             state.pending.push(PendingResult {
                 observation_id: event.observation_id,
@@ -396,6 +407,7 @@ fn remember_capacity_gap(state: &mut DispositionState, observation_id: Option<i6
 
 fn consume_isolated(
     tx: &Transaction<'_>,
+    config: &Config,
     entry: &AutomationEntry,
     assignment_id: &str,
     result_operation_id: &str,
@@ -404,6 +416,7 @@ fn consume_isolated(
     tx.execute_batch("SAVEPOINT review_disposition_consumer")?;
     match automation_disposition::consume_review_result_for_entry(
         tx,
+        config,
         entry,
         assignment_id,
         result_operation_id,
@@ -425,6 +438,7 @@ fn consume_isolated(
 
 fn recheck_pending(
     tx: &Transaction<'_>,
+    config: &Config,
     entry: &AutomationEntry,
     state: &mut DispositionState,
     budget: usize,
@@ -454,6 +468,7 @@ fn recheck_pending(
         event_identity(&event)?;
         let result = consume_isolated(
             tx,
+            config,
             entry,
             &pending.review_assignment_id,
             &pending.review_result_operation_id,
@@ -510,7 +525,14 @@ fn is_unresolved(result: &Value) -> bool {
     matches!(
         result["feedback"]["status"].as_str(),
         Some("pending" | "queued" | "sending" | "native_accepted" | "outcome_unknown")
-    )
+    ) || result["repair_dispatch"]["status"] == "pending"
+        || result["acceptance"]["code"] == "required_checks_incomplete"
+        || (result["acceptance"]["task_accepted"] != true
+            && (result["acceptance"]["acceptance_started"] == true
+                || matches!(
+                    result["acceptance"]["receipt"]["state"].as_str(),
+                    Some("queued" | "sending" | "native_accepted" | "outcome_unknown")
+                )))
 }
 
 fn retry_delay(retries: u32) -> i64 {
@@ -797,6 +819,7 @@ fn entry_has_result_action(entry: &AutomationEntry) -> bool {
 fn result_steps(entry: &AutomationEntry) -> impl Iterator<Item = AutomationStep> + '_ {
     [
         AutomationStep::ReviewDisposition,
+        AutomationStep::RepairDispatch,
         AutomationStep::Acceptance,
     ]
     .into_iter()

@@ -148,6 +148,8 @@ pub(crate) struct ReviewSubmitRequest {
     pub coverage: ReviewCoverage,
     pub findings: Vec<ReviewFinding>,
     pub evidence_refs: Vec<String>,
+    #[serde(default)]
+    pub requirement_reviews: Vec<crate::acceptance::RequirementReview>,
 }
 
 impl ReviewSubmitRequest {
@@ -202,6 +204,30 @@ impl ReviewSubmitRequest {
             }
             _ => {}
         }
+        let mut requirement_ids = BTreeSet::new();
+        if request.requirement_reviews.iter().any(|review| {
+            review.requirement_id.trim().is_empty()
+                || !requirement_ids.insert(review.requirement_id.as_str())
+                || review.rationale.trim().is_empty()
+                || review.evidence.is_empty()
+                || review
+                    .evidence
+                    .iter()
+                    .any(|reference| reference.trim().is_empty())
+        }) {
+            return Err(Error::invalid(
+                "requirement reviews need unique IDs, rationale, and evidence refs",
+            ));
+        }
+        if !request.requirement_reviews.is_empty()
+            && (request.verdict != ReviewVerdict::Pass
+                || request.coverage != ReviewCoverage::Complete
+                || !request.findings.is_empty())
+        {
+            return Err(Error::invalid(
+                "requirement reviews require a complete pass with no unresolved findings",
+            ));
+        }
         Ok(request)
     }
 
@@ -222,6 +248,36 @@ impl ReviewSubmitRequest {
                     "finding requirement IDs must be unique and belong to this Task revision",
                 ));
             }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_requirement_reviews(
+        &self,
+        requirement_ids: &BTreeSet<String>,
+    ) -> Result<()> {
+        if self.requirement_reviews.is_empty() {
+            return Ok(());
+        }
+        if self.verdict != ReviewVerdict::Pass
+            || self.coverage != ReviewCoverage::Complete
+            || !self.findings.is_empty()
+        {
+            return Err(Error::invalid(
+                "requirement reviews require a complete pass with no unresolved findings",
+            ));
+        }
+        let supplied: BTreeSet<_> = self
+            .requirement_reviews
+            .iter()
+            .map(|review| review.requirement_id.as_str())
+            .collect();
+        let expected: BTreeSet<_> = requirement_ids.iter().map(String::as_str).collect();
+        if supplied.len() != self.requirement_reviews.len() || supplied != expected {
+            return Err(Error::new(
+                "REVIEW_INCOMPLETE",
+                "structured review must address exactly the frozen Task requirements",
+            ));
         }
         Ok(())
     }

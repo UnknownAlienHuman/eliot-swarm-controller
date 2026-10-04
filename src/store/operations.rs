@@ -15,7 +15,7 @@ pub(super) fn get_operation(db: &Connection, id: &str) -> Result<Value> {
     })?)?)
 }
 pub(super) fn get_binding(db: &Connection, id: &str, generation: i64) -> Result<Value> {
-    let raw:Option<String>=db.query_row("SELECT json_object('binding_id',binding_id,'generation',generation,'lane_id',lane_id,'state',state,'native_scope_key',native_scope_key,'native_root_id',native_root_id,'released_at_ms',released_at_ms,'route',json(route_json),'observation',json(state_json)) FROM bindings WHERE binding_id=?1 AND generation=?2",params![id,generation],|r|r.get(0)).optional()?;
+    let raw:Option<String>=db.query_row("SELECT json_object('binding_id',binding_id,'generation',generation,'lane_id',lane_id,'module_instance_id',module_instance_id,'module_artifact_id',module_artifact_id,'state',state,'native_scope_key',native_scope_key,'native_root_id',native_root_id,'released_at_ms',released_at_ms,'route',json(route_json),'observation',json(state_json)) FROM bindings WHERE binding_id=?1 AND generation=?2",params![id,generation],|r|r.get(0)).optional()?;
     Ok(serde_json::from_str(&raw.ok_or_else(|| {
         Error::new("NOT_FOUND", format!("Binding {id}/{generation}"))
     })?)?)
@@ -285,6 +285,11 @@ fn public_observation(value: &Value) -> Value {
 /// native receipts, managed-owner data, and private configuration snapshots.
 pub(super) fn get_binding_public(db: &Connection, id: &str, generation: i64) -> Result<Value> {
     let mut binding = get_binding(db, id, generation)?;
+    // Persisted module identities are private inputs to the opening guard.
+    if let Some(object) = binding.as_object_mut() {
+        object.remove("module_instance_id");
+        object.remove("module_artifact_id");
+    }
     binding["native_scope_key"] = Value::Null;
     if public_token(&binding["native_root_id"]).is_none() {
         binding["native_root_id"] = Value::Null;

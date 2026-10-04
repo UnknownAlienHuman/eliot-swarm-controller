@@ -4,6 +4,7 @@ use super::{current_principal, operations, results, submissions, tasks};
 use crate::{
     acceptance::{AcceptRequest, InvalidateRequest},
     artifacts::ArtifactRecord,
+    automation::acceptance::AcceptanceContext,
     checks::{model::CheckProfile, worker},
     error::{Error, Result},
     model::{self, Dependency, Principal, TaskSpec},
@@ -215,15 +216,83 @@ fn validate_dependencies(db: &Connection, attempt: &Value, spec: &TaskSpec) -> R
 
 /// Materialize the precise evidence to be byte-verified off-thread. Every call
 /// rechecks anchors/policy; finish additionally compares this manifest to begin.
+enum AcceptActor<'a> {
+    Direct(&'a Principal),
+    OnBehalf(&'a AcceptanceContext),
+}
+
+impl AcceptActor<'_> {
+    fn require_current(&self, db: &Connection) -> Result<()> {
+        match self {
+            Self::Direct(principal) => super::gm::require_authority(db, principal),
+            Self::OnBehalf(context) => context.require_current_action(db),
+        }
+    }
+
+    fn require_exact_scope(
+        &self,
+        db: &Connection,
+        task_id: &str,
+        input: &AcceptRequest,
+    ) -> Result<()> {
+        match self {
+            Self::Direct(_) => Ok(()),
+            Self::OnBehalf(context) => context.require_action_object(
+                db,
+                "task.accept",
+                task_id,
+                input.expected_revision,
+                &input.attempt_id,
+                &input.submission_ref,
+                &input.candidate_ref,
+                input.expected_feedback_observation_id,
+                &input.check_ids,
+            ),
+        }
+    }
+
+    fn reviewer_id(&self) -> &str {
+        match self {
+            Self::Direct(principal) => &principal.client_id,
+            Self::OnBehalf(context) => context.effective_manager_id(),
+        }
+    }
+
+    fn automation_linkage(&self) -> Option<Value> {
+        match self {
+            Self::Direct(_) => None,
+            Self::OnBehalf(context) => Some(context.linkage_value()),
+        }
+    }
+
+    fn is_on_behalf(&self) -> bool {
+        match self {
+            Self::Direct(_) => false,
+            Self::OnBehalf(_) => true,
+        }
+    }
+}
+
+fn evidence_level(on_behalf: bool, has_checks: bool) -> &'static str {
+    match (on_behalf, has_checks) {
+        (false, false) => "operator_review",
+        (false, true) => "operator_review_with_checks",
+        (true, false) => "manager_review",
+        (true, true) => "manager_review_with_checks",
+    }
+}
+
 fn evidence(
     db: &Connection,
-    p: &Principal,
+    actor: &AcceptActor<'_>,
     input: &AcceptRequest,
 ) -> Result<(Value, Vec<ArtifactRecord>)> {
-    super::gm::require_authority(db, p)?;
+    actor.require_current(db)?;
     let doc = submissions::document(db, &input.submission_ref)?;
     let a = tasks::get_attempt(db, &input.attempt_id)?;
-    let t = tasks::get_task(db, model::text(&a, "task_id")?)?;
+    let task_id = model::text(&a, "task_id")?;
+    let t = tasks::get_task(db, task_id)?;
+    actor.require_exact_scope(db, task_id, input)?;
     if doc["attempt_id"] != input.attempt_id
         || doc["task_revision"] != input.expected_revision
         || doc["candidate_ref"] != input.candidate_ref
@@ -231,6 +300,7 @@ fn evidence(
         || a["candidate_ref"] != input.candidate_ref
         || a["task_revision"] != input.expected_revision
         || t["revision"] != input.expected_revision
+        || t["current_attempt_id"] != input.attempt_id
         || t["state"] != "open"
         || !a["released_at_ms"].is_null()
         || !matches!(a["state"].as_str(), Some("submitted" | "needs_correction"))
@@ -240,7 +310,7 @@ fn evidence(
             "acceptance no longer targets the current unreleased submission",
         ));
     }
-    if doc["owner_id"] == p.client_id || doc["submitted_by"] == p.client_id {
+    if doc["owner_id"] == actor.reviewer_id() || doc["submitted_by"] == actor.reviewer_id() {
         return Err(Error::new(
             "INDEPENDENT_REVIEW_REQUIRED",
             "the writer/submitter cannot accept its own proposal",
@@ -477,11 +547,18 @@ fn evidence(
     ))
 }
 
-pub(super) fn reserve(tx: &Transaction<'_>, p: &Principal, v: &Value, id: &str) -> Result<Value> {
-    super::gm::require_authority(tx, p)?;
+fn reserve_with_actor(
+    tx: &Transaction<'_>,
+    actor: &AcceptActor<'_>,
+    v: &Value,
+    id: &str,
+) -> Result<Value> {
     let input = AcceptRequest::parse(v)?;
     let a = tasks::get_attempt(tx, &input.attempt_id)?;
-    let t = tasks::get_task(tx, model::text(&a, "task_id")?)?;
+    let task_id = model::text(&a, "task_id")?;
+    let t = tasks::get_task(tx, task_id)?;
+    actor.require_current(tx)?;
+    actor.require_exact_scope(tx, task_id, &input)?;
     if let Some(prior) = t["accepted_operation_id"].as_str() {
         let d = decision(tx, prior)?;
         if d["attempt_id"] == input.attempt_id
@@ -490,6 +567,38 @@ pub(super) fn reserve(tx: &Transaction<'_>, p: &Principal, v: &Value, id: &str) 
             && d["candidate_ref"] == input.candidate_ref
             && !revoked(tx, prior)?
         {
+            if actor.is_on_behalf() {
+                if t["revision"] != input.expected_revision
+                    || t["current_attempt_id"] != input.attempt_id
+                {
+                    return Err(Error::new(
+                        "STALE_SUBMISSION",
+                        "coalesced acceptance no longer targets the exact current Task and Attempt",
+                    ));
+                }
+                let doc = submissions::document(tx, &input.submission_ref)?;
+                if doc["owner_id"] == actor.reviewer_id()
+                    || doc["submitted_by"] == actor.reviewer_id()
+                {
+                    return Err(Error::new(
+                        "INDEPENDENT_REVIEW_REQUIRED",
+                        "the writer/submitter cannot accept its own proposal",
+                    ));
+                }
+            }
+            if let Some(linkage) = actor.automation_linkage() {
+                tx.execute(
+                    "UPDATE operations SET task_id=?2,attempt_id=?3,effective_request_json=?4 WHERE operation_id=?1",
+                    params![
+                        id,
+                        task_id,
+                        input.attempt_id,
+                        model::canonical(&json!({
+                            "automation_on_behalf":linkage,
+                        }))?,
+                    ],
+                )?;
+            }
             return Ok(
                 json!({"operation_id":prior,"acceptance_operation_id":prior,"coalesced":true}),
             );
@@ -499,21 +608,55 @@ pub(super) fn reserve(tx: &Transaction<'_>, p: &Principal, v: &Value, id: &str) 
             "Task has a different current acceptance",
         ));
     }
-    let (manifest, _) = evidence(tx, p, &input)?;
-    tx.execute("UPDATE operations SET task_id=?2,attempt_id=?3,effective_request_json=?4 WHERE operation_id=?1",
-        params![id,a["task_id"].as_str(),input.attempt_id,model::canonical(&json!({"evidence":manifest}))?])?;
+    let (manifest, _) = evidence(tx, actor, &input)?;
+    let mut effective = json!({"evidence":manifest});
+    if let Some(linkage) = actor.automation_linkage() {
+        effective["automation_on_behalf"] = linkage;
+    }
+    tx.execute(
+        "UPDATE operations SET task_id=?2,attempt_id=?3,effective_request_json=?4 WHERE operation_id=?1",
+        params![id,task_id,input.attempt_id,model::canonical(&effective)?],
+    )?;
     Ok(
         json!({"operation_id":id,"attempt_id":input.attempt_id,"state":"queued","task_accepted":false}),
     )
 }
 
+pub(super) fn reserve(tx: &Transaction<'_>, p: &Principal, v: &Value, id: &str) -> Result<Value> {
+    super::gm::require_authority(tx, p)?;
+    reserve_with_actor(tx, &AcceptActor::Direct(p), v, id)
+}
+
+pub(super) fn reserve_on_behalf(
+    tx: &Transaction<'_>,
+    context: &AcceptanceContext,
+    v: &Value,
+    id: &str,
+) -> Result<Value> {
+    let operation = operations::get_operation(tx, id)?;
+    if operation["method"] != "task.accept"
+        || operation["caller_id"] != context.technical_requester_id()
+        || model::canonical(&original_request(tx, id)?)? != model::canonical(v)?
+    {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "acceptance Operation is not owned by the retained technical requester",
+        ));
+    }
+    reserve_with_actor(tx, &AcceptActor::OnBehalf(context), v, id)
+}
+
 fn request(db: &Connection, id: &str) -> Result<AcceptRequest> {
+    AcceptRequest::parse(&original_request(db, id)?)
+}
+
+fn original_request(db: &Connection, id: &str) -> Result<Value> {
     let raw: String = db.query_row(
         "SELECT original_request_json FROM operations WHERE operation_id=?1",
         [id],
         |r| r.get(0),
     )?;
-    AcceptRequest::parse(&serde_json::from_str(&raw)?)
+    Ok(serde_json::from_str(&raw)?)
 }
 fn manifest(db: &Connection, id: &str) -> Result<Value> {
     let raw: String = db.query_row(
@@ -522,6 +665,23 @@ fn manifest(db: &Connection, id: &str) -> Result<Value> {
         |r| r.get(0),
     )?;
     Ok(serde_json::from_str::<Value>(&raw)?["evidence"].clone())
+}
+
+fn on_behalf_context(db: &Connection, id: &str, caller_id: &str) -> Result<AcceptanceContext> {
+    if caller_id != crate::automation::authorization::AUTOMATION_TECHNICAL_REQUESTER_ID {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "acceptance Operation is not owned by the automation technical requester",
+        ));
+    }
+    let context = AcceptanceContext::from_committed_operation(db, id)?;
+    if context.technical_requester_id() != caller_id {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "acceptance linkage does not retain this technical requester",
+        ));
+    }
+    Ok(context)
 }
 
 pub(super) fn begin(
@@ -550,7 +710,7 @@ pub(super) fn begin(
     }
     let work = (|| -> Result<Vec<ArtifactRecord>> {
         let input = request(&tx, id)?;
-        let (current, files) = evidence(&tx, &p, &input)?;
+        let (current, files) = evidence(&tx, &AcceptActor::Direct(&p), &input)?;
         if current != manifest(&tx, id)? {
             return Err(Error::new(
                 "ACCEPTANCE_EVIDENCE_CHANGED",
@@ -560,6 +720,48 @@ pub(super) fn begin(
         Ok(files)
     })();
     tx.execute("UPDATE operations SET state='sending',sent_at_ms=?2,updated_at_ms=?2 WHERE operation_id=?1", params![id,model::now_ms()?])?;
+    tx.commit()?;
+    Ok(Some(work))
+}
+
+pub(super) fn begin_on_behalf(
+    db: &mut Connection,
+    id: &str,
+) -> Result<Option<Result<Vec<ArtifactRecord>>>> {
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let op = operations::get_operation(&tx, id)?;
+    if op["method"] != "task.accept" {
+        return Err(Error::invalid("not an acceptance operation"));
+    }
+    if op["state"] == "settled" {
+        return Ok(None);
+    }
+    let caller_id = model::text(&op, "caller_id")?;
+    if caller_id != crate::automation::authorization::AUTOMATION_TECHNICAL_REQUESTER_ID {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "acceptance Operation is not owned by the automation technical requester",
+        ));
+    }
+    if !matches!(op["state"].as_str(), Some("queued" | "outcome_unknown")) {
+        return Ok(None);
+    }
+    let work = (|| -> Result<Vec<ArtifactRecord>> {
+        let context = on_behalf_context(&tx, id, caller_id)?;
+        let input = request(&tx, id)?;
+        let (current, files) = evidence(&tx, &AcceptActor::OnBehalf(&context), &input)?;
+        if current != manifest(&tx, id)? {
+            return Err(Error::new(
+                "ACCEPTANCE_EVIDENCE_CHANGED",
+                "saved evidence no longer matches; candidate retained",
+            ));
+        }
+        Ok(files)
+    })();
+    tx.execute(
+        "UPDATE operations SET state='sending',sent_at_ms=?2,updated_at_ms=?2 WHERE operation_id=?1",
+        params![id, model::now_ms()?],
+    )?;
     tx.commit()?;
     Ok(Some(work))
 }
@@ -579,9 +781,10 @@ pub(super) fn finish(
     }
     let input = request(&tx, id)?;
     let now = model::now_ms()?;
+    let reviewer_id = p.client_id.clone();
     let result = verified.and_then(|()| {
         let p = current_principal(&tx, p)?;
-        let (current, _) = evidence(&tx, &p, &input)?;
+        let (current, _) = evidence(&tx, &AcceptActor::Direct(&p), &input)?;
         if current != manifest(&tx, id)? {
             return Err(Error::new(
                 "ACCEPTANCE_EVIDENCE_CHANGED",
@@ -590,8 +793,77 @@ pub(super) fn finish(
         }
         Ok(current)
     });
-    let result = match result {
+    settle_acceptance(
+        &tx,
+        id,
+        &input,
+        now,
+        result,
+        Some(&reviewer_id),
+        evidence_level(false, !input.check_ids.is_empty()),
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+pub(super) fn finish_on_behalf(db: &mut Connection, id: &str, verified: Result<()>) -> Result<()> {
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let op = operations::get_operation(&tx, id)?;
+    if op["method"] != "task.accept"
+        || op["caller_id"] != crate::automation::authorization::AUTOMATION_TECHNICAL_REQUESTER_ID
+        || op["state"] != "sending"
+    {
+        return Err(Error::conflict(
+            "acceptance operation is no longer in its verification phase",
+        ));
+    }
+    let input = request(&tx, id)?;
+    let caller_id = model::text(&op, "caller_id")?.to_owned();
+    let now = model::now_ms()?;
+    let mut reviewer_id = None;
+    let context = on_behalf_context(&tx, id, &caller_id);
+    let result = verified.and_then(|()| {
+        let context = context?;
+        let (current, _) = evidence(&tx, &AcceptActor::OnBehalf(&context), &input)?;
+        if current != manifest(&tx, id)? {
+            return Err(Error::new(
+                "ACCEPTANCE_EVIDENCE_CHANGED",
+                "evidence changed during byte verification",
+            ));
+        }
+        reviewer_id = Some(context.effective_manager_id().to_owned());
+        Ok(current)
+    });
+    settle_acceptance(
+        &tx,
+        id,
+        &input,
+        now,
+        result,
+        reviewer_id.as_deref(),
+        evidence_level(true, !input.check_ids.is_empty()),
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn settle_acceptance(
+    tx: &Transaction<'_>,
+    id: &str,
+    input: &AcceptRequest,
+    now: i64,
+    decision: Result<Value>,
+    reviewer_id: Option<&str>,
+    evidence_level: &str,
+) -> Result<()> {
+    let result = match decision {
         Ok(e) => {
+            let reviewer_id = reviewer_id.ok_or_else(|| {
+                Error::new(
+                    "ACCEPTANCE_ACTOR_MISSING",
+                    "verified acceptance has no retained reviewer identity",
+                )
+            })?;
             tx.execute("UPDATE tasks SET state='accepted',accepted_attempt_id=?2,accepted_operation_id=?3,accepted_revision=?4,accepted_phase=?5,accepted_candidate_ref=?6,updated_at_ms=?7 WHERE task_id=?1",
                 params![e["task_id"].as_str(),input.attempt_id,id,input.expected_revision,e["phase"].as_str(),input.candidate_ref,now])?;
             tx.execute(
@@ -600,9 +872,9 @@ pub(super) fn finish(
             )?;
             json!({"operation_id":id,"acceptance_operation_id":id,"outcome":"applied","task_id":e["task_id"],
                 "attempt_id":input.attempt_id,"task_revision":input.expected_revision,"phase":e["phase"],
-                "submission_ref":input.submission_ref,"candidate_ref":input.candidate_ref,"reviewer_id":op["caller_id"],
+                "submission_ref":input.submission_ref,"candidate_ref":input.candidate_ref,"reviewer_id":reviewer_id,
                 "reason":input.reason,"reviews":input.reviews,"check_ids":input.check_ids,
-                "feedback_observation_id":input.expected_feedback_observation_id,"evidence_level":if input.check_ids.is_empty(){"operator_review"}else{"operator_review_with_checks"},
+                "feedback_observation_id":input.expected_feedback_observation_id,"evidence_level":evidence_level,
                 "source_checkout_verified":!input.check_ids.is_empty(),"task_accepted":true,"ownership_released":false})
         }
         Err(error) => {
@@ -611,10 +883,9 @@ pub(super) fn finish(
     };
     tx.execute("UPDATE operations SET state='settled',result_json=?2,settled_at_ms=?3,updated_at_ms=?3 WHERE operation_id=?1",
         params![id,model::canonical(&result)?,now])?;
-    super::capacity::sync_attempt(&tx, &input.attempt_id, now)?;
+    super::capacity::sync_attempt(tx, &input.attempt_id, now)?;
     tx.execute("INSERT INTO observations(source_stream_id,source_event_key,operation_id,kind,payload_json,recorded_at_ms) VALUES('controller:acceptance',?1,?2,'task.acceptance',?3,?4)",
         params![format!("accept:{id}"),id,model::canonical(&result)?,now])?;
-    tx.commit()?;
     Ok(())
 }
 

@@ -5,6 +5,7 @@ use crate::{
     automation::{
         actions::AutomationStep, authorization, config, disposition::ReviewDispositionContext,
     },
+    config::Config,
     error::{Error, Result},
     model,
     review::ReviewSlotIdentity,
@@ -26,6 +27,7 @@ struct CommittedReviewResult {
 /// result cause.
 pub(super) fn consume_review_result_for_entry(
     tx: &Transaction<'_>,
+    config_value: &Config,
     entry: &config::AutomationEntry,
     review_assignment_id: &str,
     review_result_operation_id: &str,
@@ -45,6 +47,7 @@ pub(super) fn consume_review_result_for_entry(
     let result = &review.record["result"];
     if !entry.enabled
         || (!entry.steps.contains(&AutomationStep::ReviewDisposition)
+            && !entry.steps.contains(&AutomationStep::RepairDispatch)
             && !entry.steps.contains(&AutomationStep::Acceptance))
     {
         return Ok(skipped(
@@ -88,7 +91,16 @@ pub(super) fn consume_review_result_for_entry(
             "the review sponsor differs from this automation entry owner",
         ));
     }
-    let (task, attempt) = match current_subject(tx, &review.identity, manager_id)? {
+    // Acceptance is an independent GM decision over another owner's proposal.
+    // Owner-scoped correction keeps its original ownership guard; applying it
+    // to a passing acceptance first would make every valid decision unreachable.
+    let required_owner =
+        if result["verdict"] == "pass" && entry.steps.contains(&AutomationStep::Acceptance) {
+            None
+        } else {
+            Some(manager_id)
+        };
+    let (task, attempt) = match current_subject(tx, &review.identity, required_owner)? {
         Some(subject) => subject,
         None => {
             return Ok(skipped(
@@ -108,34 +120,87 @@ pub(super) fn consume_review_result_for_entry(
     }
     let acceptance_selected = entry.steps.contains(&AutomationStep::Acceptance);
     let disposition_selected = entry.steps.contains(&AutomationStep::ReviewDisposition);
+    let repair_selected = entry.steps.contains(&AutomationStep::RepairDispatch);
 
     match result["verdict"].as_str() {
         Some("pass") => {
-            if acceptance_selected {
-                return Ok(capability_gap(
+            let disposition = disposition_selected.then(|| {
+                skipped(
                     &review,
-                    "acceptance_consumer_unavailable",
-                    "a review pass is evidence, not Task acceptance; no guarded automated acceptance consumer is wired",
-                ));
-            }
-            return Ok(skipped(
+                    "review_pass_is_advisory",
+                    "a passing review does not request a return for correction",
+                )
+            });
+            let acceptance = if acceptance_selected {
+                Some(
+                    super::automation_acceptance::consume_review_result_for_entry(
+                        tx,
+                        entry,
+                        review_assignment_id,
+                        review_result_operation_id,
+                        now_ms,
+                    )?,
+                )
+            } else {
+                None
+            };
+            let repair = if repair_selected {
+                Some(super::automation_repair::consume_review_result_for_entry(
+                    tx,
+                    config_value,
+                    entry,
+                    review_assignment_id,
+                    review_result_operation_id,
+                    now_ms,
+                )?)
+            } else {
+                None
+            };
+            return Ok(compose_action_results(
                 &review,
-                "review_pass_is_advisory",
-                "review disposition does not accept or publish a Task",
+                disposition,
+                repair,
+                acceptance,
             ));
         }
         Some("inconclusive") => {
-            if acceptance_selected {
-                return Ok(capability_gap(
+            let disposition = disposition_selected.then(|| {
+                skipped(
                     &review,
-                    "acceptance_consumer_unavailable",
-                    "inconclusive review evidence cannot satisfy the selected acceptance path",
-                ));
-            }
-            return Ok(skipped(
+                    "inconclusive_review_result",
+                    "inconclusive evidence does not authorize a return for correction",
+                )
+            });
+            let acceptance = if acceptance_selected {
+                Some(
+                    super::automation_acceptance::consume_review_result_for_entry(
+                        tx,
+                        entry,
+                        review_assignment_id,
+                        review_result_operation_id,
+                        now_ms,
+                    )?,
+                )
+            } else {
+                None
+            };
+            let repair = if repair_selected {
+                Some(super::automation_repair::consume_review_result_for_entry(
+                    tx,
+                    config_value,
+                    entry,
+                    review_assignment_id,
+                    review_result_operation_id,
+                    now_ms,
+                )?)
+            } else {
+                None
+            };
+            return Ok(compose_action_results(
                 &review,
-                "inconclusive_review_result",
-                "inconclusive evidence does not authorize a return or acceptance",
+                disposition,
+                repair,
+                acceptance,
             ));
         }
         Some("changes_requested") => {}
@@ -147,16 +212,135 @@ pub(super) fn consume_review_result_for_entry(
         }
     }
 
-    if !disposition_selected {
-        return Ok(skipped(
+    let disposition = if disposition_selected {
+        consume_selected_disposition(
+            tx,
+            entry,
+            &review,
+            &attempt,
+            review_assignment_id,
+            review_result_operation_id,
+            now_ms,
+        )?
+    } else {
+        skipped(
             &review,
             "review_disposition_not_selected",
-            "no enabled manager automation selected review_disposition",
-        ));
+            "the current manager automation does not select review_disposition",
+        )
+    };
+    if !repair_selected {
+        if acceptance_selected {
+            let acceptance = super::automation_acceptance::consume_review_result_for_entry(
+                tx,
+                entry,
+                review_assignment_id,
+                review_result_operation_id,
+                now_ms,
+            )?;
+            return Ok(compose_action_results(
+                &review,
+                Some(disposition),
+                None,
+                Some(acceptance),
+            ));
+        }
+        return Ok(disposition);
     }
+
+    let repair = super::automation_repair::consume_review_result_for_entry(
+        tx,
+        config_value,
+        entry,
+        review_assignment_id,
+        review_result_operation_id,
+        now_ms,
+    )?;
+    let acceptance = if acceptance_selected {
+        Some(
+            super::automation_acceptance::consume_review_result_for_entry(
+                tx,
+                entry,
+                review_assignment_id,
+                review_result_operation_id,
+                now_ms,
+            )?,
+        )
+    } else {
+        None
+    };
+    Ok(compose_action_results(
+        &review,
+        Some(disposition),
+        Some(repair),
+        acceptance,
+    ))
+}
+
+fn compose_action_results(
+    review: &CommittedReviewResult,
+    disposition: Option<Value>,
+    repair: Option<Value>,
+    acceptance: Option<Value>,
+) -> Value {
+    if repair.is_none() && acceptance.is_none() {
+        return disposition.unwrap_or_else(|| {
+            json!({
+                "status":"skipped",
+                "review_assignment_id":review.assignment["review_assignment_id"],
+                "review_result_operation_id":review.record["operation_id"],
+                "disposition_applied":false
+            })
+        });
+    }
+    // Report the selected action's own outcome. In particular, mailbox
+    // feedback is retained as provenance and never promoted to a repair
+    // delivery receipt.
+    let status_source = acceptance
+        .as_ref()
+        .filter(|value| value["status"] != "skipped")
+        .or(repair.as_ref())
+        .or(disposition.as_ref());
+    let status = status_source
+        .map(|value| value["status"].clone())
+        .unwrap_or_else(|| json!("skipped"));
+    let feedback = disposition
+        .as_ref()
+        .and_then(|value| value.get("feedback"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let disposition_applied = disposition
+        .as_ref()
+        .is_some_and(|value| value["disposition_applied"] == true);
+    json!({
+        "status":status,
+        "code":status_source.and_then(|value| value.get("code")).cloned().unwrap_or(Value::Null),
+        "reason":status_source.and_then(|value| value.get("reason")).cloned().unwrap_or(Value::Null),
+        "operation_id":status_source.and_then(|value| value.get("operation_id")).cloned().unwrap_or(Value::Null),
+        "coalesced":status_source.and_then(|value| value.get("coalesced")).cloned().unwrap_or(json!(false)),
+        "review_assignment_id":review.assignment["review_assignment_id"],
+        "review_result_operation_id":review.record["operation_id"],
+        "disposition":disposition,
+        "feedback":feedback,
+        "repair_dispatch":repair,
+        "acceptance":acceptance,
+        "disposition_applied":disposition_applied
+    })
+}
+
+fn consume_selected_disposition(
+    tx: &Transaction<'_>,
+    entry: &config::AutomationEntry,
+    review: &CommittedReviewResult,
+    attempt: &Value,
+    review_assignment_id: &str,
+    review_result_operation_id: &str,
+    now_ms: i64,
+) -> Result<Value> {
+    let result = &review.record["result"];
     if !crate::policy::allows_scoped_manager_feedback(&attempt["task_snapshot"]) {
         return Ok(capability_gap(
-            &review,
+            review,
             "owner_policy_v2_required",
             "manager-owned review disposition is available only for a new Attempt explicitly bound to owner-policy-v2",
         ));
@@ -212,7 +396,7 @@ pub(super) fn consume_review_result_for_entry(
 
     if entry.scope.work_pool_id.is_some() {
         return Ok(capability_gap(
-            &review,
+            review,
             "work_pool_scope_unavailable",
             "the current Task source has no committed work-pool membership reader",
         ));
@@ -235,7 +419,7 @@ pub(super) fn consume_review_result_for_entry(
             ) =>
         {
             return Ok(capability_gap(
-                &review,
+                review,
                 "review_disposition_unavailable",
                 &error.message,
             ));
@@ -369,7 +553,7 @@ fn committed_review_result(
 fn current_subject(
     db: &Connection,
     identity: &ReviewSlotIdentity,
-    manager_id: &str,
+    required_owner: Option<&str>,
 ) -> Result<Option<(Value, Value)>> {
     let task = tasks::get_task(db, &identity.task_id)?;
     let attempt = tasks::get_attempt(db, &identity.attempt_id)?;
@@ -378,7 +562,7 @@ fn current_subject(
         && task["current_attempt_id"] == identity.attempt_id
         && attempt["task_id"] == identity.task_id
         && attempt["task_revision"] == identity.task_revision
-        && attempt["owner_id"] == manager_id
+        && required_owner.is_none_or(|owner| attempt["owner_id"] == owner)
         && attempt["released_at_ms"].is_null()
         && attempt["submission_ref"] == identity.submission_ref
         && attempt["candidate_ref"] == identity.candidate_ref

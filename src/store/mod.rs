@@ -2,9 +2,11 @@
 mod acceptance;
 mod assembly;
 mod automation;
+mod automation_acceptance;
 mod automation_dispatch;
 mod automation_disposition;
 mod automation_intake;
+pub(crate) mod automation_repair;
 pub(crate) mod automation_work_dispatch;
 pub(crate) mod capacity;
 mod checks;
@@ -451,13 +453,76 @@ impl Store {
     }
 
     pub(crate) async fn reconcile_review_dispositions_once(&self) -> Result<Value> {
-        self.run(move |db| {
-            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let result = review_disposition::reconcile(&tx, 16, 64, model::now_ms()?)?;
-            tx.commit()?;
-            Ok(result)
-        })
-        .await
+        let config = self.config.clone();
+        let result = self
+            .run(move |db| {
+                let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let result = review_disposition::reconcile(&tx, &config, 16, 64, model::now_ms()?)?;
+                tx.commit()?;
+                Ok(result)
+            })
+            .await?;
+        let decisions = self.verify_automation_acceptances_once().await?;
+        Ok(json!({"review_results":result,"acceptance_verifications":decisions}))
+    }
+
+    /// The normal artifact verifier runs off the DB thread. Only exact retained
+    /// task.accept Operations are resumed, including after host recovery has
+    /// marked an interrupted verification outcome_unknown.
+    async fn verify_automation_acceptances_once(&self) -> Result<Value> {
+        let operation_ids = self
+            .run(move |db| {
+                let mut statement = db.prepare(
+                    "SELECT operation_id FROM operations WHERE method='task.accept' \
+                 AND caller_id=?1 AND state IN ('queued','outcome_unknown') \
+                 AND json_type(effective_request_json,'$.automation_on_behalf')='object' \
+                 ORDER BY created_at_ms,operation_id LIMIT 8",
+                )?;
+                let ids = statement
+                    .query_map(
+                        [crate::automation::authorization::AUTOMATION_TECHNICAL_REQUESTER_ID],
+                        |row| row.get::<_, String>(0),
+                    )?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                Ok(ids)
+            })
+            .await?;
+        let mut decisions = Vec::with_capacity(operation_ids.len());
+        for id in operation_ids {
+            let start_id = id.clone();
+            let Some(work) = self
+                .run(move |db| acceptance::begin_on_behalf(db, &start_id))
+                .await?
+            else {
+                continue;
+            };
+            let outcome = match work {
+                Ok(records) => {
+                    self.file_io(move |files| {
+                        for record in &records {
+                            files.verify(record)?;
+                        }
+                        Ok(())
+                    })
+                    .await
+                }
+                Err(error) => Err(error),
+            };
+            let finish_id = id.clone();
+            self.run(move |db| acceptance::finish_on_behalf(db, &finish_id, outcome))
+                .await?;
+            let read_id = id.clone();
+            let operation = self
+                .run(move |db| operations::get_operation(db, &read_id))
+                .await?;
+            decisions.push(json!({
+                "operation_id":id,
+                "state":operation["state"],
+                "outcome":operation["result"]["outcome"],
+                "task_accepted":operation["result"]["task_accepted"]
+            }));
+        }
+        Ok(json!({"processed":decisions.len(),"decisions":decisions}))
     }
 
     /// Scoped watches share the host reconciler. Notification headers are
@@ -1276,6 +1341,7 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
     )
     OR (
         op.caller_id = 'eliot-internal-automation-v1'
+        AND op.method NOT IN ('task.accept','agent.send')
         AND EXISTS (
             SELECT 1 FROM meta AS link
             WHERE link.key = 'automation:v1:operation:' || op.operation_id
@@ -1283,6 +1349,32 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
               AND json_extract(link.value_json, '$.record.technical_requester_id') = op.caller_id
               AND json_extract(link.value_json, '$.record.effective_manager_id') = :client
               AND json_extract(op.effective_request_json, '$.automation_on_behalf.effective_manager_id') = :client
+        )
+    )
+    OR (
+        op.caller_id = 'eliot-internal-automation-v1'
+        AND op.method = 'task.accept'
+        AND EXISTS (
+            SELECT 1 FROM meta AS link JOIN tasks AS target ON target.task_id=op.task_id
+              JOIN meta AS manager ON manager.key='client:' || :client
+            WHERE link.key='automation:v1:operation:' || op.operation_id
+              AND json_extract(link.value_json,'$.record.operation_id')=op.operation_id
+              AND json_extract(link.value_json,'$.record.action')='task.accept'
+              AND json_extract(link.value_json,'$.record.technical_requester_id')=op.caller_id
+              AND json_extract(link.value_json,'$.record.effective_manager_id')=:client
+              AND json_extract(link.value_json,'$.record.project_id')=target.project_id
+              AND json_extract(link.value_json,'$.record.cause.kind')='review_result'
+              AND json_extract(link.value_json,'$.record.cause.identity.task_id')=op.task_id
+              AND json_extract(link.value_json,'$.record.cause.identity.attempt_id')=op.attempt_id
+              AND json_extract(op.original_request_json,'$.attempt_id')=op.attempt_id
+              AND json_extract(op.original_request_json,'$.expected_revision')=json_extract(link.value_json,'$.record.cause.identity.task_revision')
+              AND json_extract(op.original_request_json,'$.submission_ref')=json_extract(link.value_json,'$.record.cause.identity.submission_ref')
+              AND json_extract(op.original_request_json,'$.candidate_ref')=json_extract(link.value_json,'$.record.cause.identity.candidate_ref')
+              AND json_extract(op.effective_request_json,'$.automation_on_behalf.effective_manager_id')=:client
+              AND json_extract(manager.value_json,'$.role')='manager'
+              AND COALESCE(json_extract(manager.value_json,'$.disabled'),0)=0
+              AND (EXISTS (SELECT 1 FROM attempts AS owned WHERE owned.task_id=target.task_id AND owned.owner_id=:client AND owned.released_at_ms IS NULL)
+                   OR EXISTS (SELECT 1 FROM meta AS gm WHERE gm.key='gm' AND json_extract(gm.value_json,'$.client_id')=:client))
         )
     )
     OR (
@@ -1305,6 +1397,35 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
                     AND (EXISTS (SELECT 1 FROM attempts AS owned WHERE owned.task_id=target.task_id AND owned.owner_id=:client AND owned.released_at_ms IS NULL)
                          OR EXISTS (SELECT 1 FROM meta AS gm WHERE gm.key='gm' AND json_extract(gm.value_json,'$.client_id')=:client))
               )
+        )
+    )
+    OR (
+        op.caller_id = 'eliot-internal-automation-v1'
+        AND op.method = 'agent.send'
+        AND EXISTS (
+            SELECT 1 FROM meta AS link JOIN tasks AS target ON target.task_id=op.task_id
+              JOIN meta AS manager ON manager.key='client:' || :client
+            WHERE link.key='repair:v1:operation-link:' || op.operation_id
+              AND json_extract(link.value_json,'$.record.operation_id')=op.operation_id
+              AND json_extract(link.value_json,'$.record.action')='agent.send'
+              AND json_extract(link.value_json,'$.record.technical_requester_id')=op.caller_id
+              AND json_extract(link.value_json,'$.record.effective_manager_id')=:client
+              AND json_extract(link.value_json,'$.record.project_id')=target.project_id
+              AND json_extract(link.value_json,'$.record.task_id')=op.task_id
+              AND json_extract(link.value_json,'$.record.attempt_id')=op.attempt_id
+              AND json_extract(link.value_json,'$.record.binding_id')=op.binding_id
+              AND json_extract(link.value_json,'$.record.binding_generation')=op.binding_generation
+              AND json_extract(op.original_request_json,'$.binding_id')=op.binding_id
+              AND json_extract(op.original_request_json,'$.generation')=op.binding_generation
+              AND json_extract(op.original_request_json,'$.delivery')='next_turn'
+              AND json_extract(op.effective_request_json,'$.automation_on_behalf.effective_manager_id')=:client
+              AND json_extract(op.effective_request_json,'$.automation_on_behalf.semantic_slot_id')=json_extract(link.value_json,'$.record.semantic_slot_id')
+              AND json_extract(manager.value_json,'$.role')='manager'
+              AND COALESCE(json_extract(manager.value_json,'$.disabled'),0)=0
+              AND ((SELECT owned.owner_id FROM attempts AS owned
+                    WHERE owned.task_id=target.task_id AND owned.released_at_ms IS NULL
+                    ORDER BY owned.created_at_ms DESC,owned.attempt_id DESC LIMIT 1)=:client
+                   OR EXISTS (SELECT 1 FROM meta AS gm WHERE gm.key='gm' AND json_extract(gm.value_json,'$.client_id')=:client))
         )
     )
     OR (
@@ -2534,6 +2655,9 @@ fn mutate_in_transaction_with_authority(
     if let Some(receipt) = launch_alias_receipt(tx, caller_id, request_id, method, &original)? {
         return Ok(receipt_result(&receipt));
     }
+    if let Some(receipt) = repair_alias_receipt(tx, caller_id, request_id, method, &original)? {
+        return Ok(receipt_result(&receipt));
+    }
     let old:Option<(String,String,String)> = tx.query_row("SELECT method,original_request_json,effective_request_json FROM operations WHERE caller_id=?1 AND client_request_id=?2", params![caller_id,request_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
     if let Some((old_method, body, effective)) = old {
         if old_method != method || body != original {
@@ -2631,6 +2755,52 @@ fn mutate_in_transaction_with_authority(
             }
         }
     }
+    let direct_repair_slot = if method == "agent.send"
+        && let MutationAuthority::Direct(principal) = &authority
+    {
+        let slot = automation_repair::recognize_direct_correction_request(tx, principal, v)?;
+        if let Some(slot) = &slot {
+            match automation_repair::resolve_direct_slot(tx, slot)? {
+                automation_repair::RepairSlotResolution::Vacant => {}
+                automation_repair::RepairSlotResolution::Existing {
+                    operation_id,
+                    operation_state,
+                } => {
+                    let value = json!({
+                        "operation_id":operation_id,
+                        "operation_state_at_receipt":operation_state,
+                        "receipt_recorded_at_ms":now,
+                        "current_state_read_method":"operation.get",
+                        "semantic_reuse":true
+                    });
+                    save_repair_alias(
+                        tx,
+                        caller_id,
+                        request_id,
+                        &original,
+                        &operation_id,
+                        &value,
+                        now,
+                    )?;
+                    return Ok(Ok(value));
+                }
+                automation_repair::RepairSlotResolution::Conflict {
+                    operation_id,
+                    operation_state,
+                } => {
+                    return Err(Error::new(
+                        "REPAIR_SLOT_CONFLICT",
+                        format!(
+                            "correction slot is retained by Operation {operation_id} ({operation_state})"
+                        ),
+                    ));
+                }
+            }
+        }
+        slot
+    } else {
+        None
+    };
     let id = model::new_id();
     tx.execute("INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,effective_request_json,state,due_at_ms,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,?5,'{}','queued',?6,?6,?6)",params![id,caller_id,request_id,method,original,now])?;
     if let Some(launch_operation_id) = plan.launch_operation_id {
@@ -2664,6 +2834,20 @@ fn mutate_in_transaction_with_authority(
             },
         ),
     };
+    let result = result.and_then(|(value, queued)| {
+        if let Some(slot) = &direct_repair_slot
+            && let MutationAuthority::Direct(principal) = &authority
+        {
+            if !queued {
+                return Err(Error::new(
+                    "REPAIR_OPERATION_MISMATCH",
+                    "correction admission did not queue delivery",
+                ));
+            }
+            automation_repair::retain_direct_admission(tx, principal, slot, &id, now)?;
+        }
+        Ok((value, queued))
+    });
     let receipt = match &result {
         Ok((value, queued)) => {
             tx.execute_batch("RELEASE mutation_effect")?;
@@ -2695,6 +2879,84 @@ fn receipt_result(value: &Value) -> Result<Value> {
                 .unwrap_or("stored request has no valid receipt"),
         ))
     }
+}
+
+fn repair_alias_key(caller: &str, request_id: &str) -> Result<String> {
+    Ok(format!(
+        "repair:request-alias:v1:{}",
+        model::digest(model::canonical(&json!([caller, request_id]))?.as_bytes())
+    ))
+}
+
+fn repair_alias_receipt(
+    db: &Connection,
+    caller: &str,
+    request_id: &str,
+    method: &str,
+    original: &str,
+) -> Result<Option<Value>> {
+    let key = repair_alias_key(caller, request_id)?;
+    let Some(alias) = crate::automation::config::read_record(db, &key, "repair request alias")?
+    else {
+        return Ok(None);
+    };
+    if alias["schema_version"] != 1
+        || alias["caller_id"] != caller
+        || alias["client_request_id"] != request_id
+        || alias["method"] != "agent.send"
+    {
+        return Err(Error::new(
+            "INVALID_RECEIPT",
+            "repair request alias identity is invalid",
+        ));
+    }
+    if alias["method"] != method || alias["original_request_json"] != original {
+        return Err(Error::new(
+            "REQUEST_ID_CONFLICT",
+            "request ID was used with a different method or payload",
+        ));
+    }
+    let operation_id = model::text(&alias, "operation_id")?;
+    let operation = operations::get_operation(db, operation_id)?;
+    if operation["method"] != "agent.send"
+        || alias["receipt"]["ok"] != true
+        || alias["receipt"]["value"]["operation_id"] != operation_id
+    {
+        return Err(Error::new(
+            "INVALID_RECEIPT",
+            "repair request alias target is invalid",
+        ));
+    }
+    Ok(Some(alias["receipt"].clone()))
+}
+
+fn save_repair_alias(
+    tx: &Transaction<'_>,
+    caller: &str,
+    request_id: &str,
+    original: &str,
+    operation_id: &str,
+    value: &Value,
+    now: i64,
+) -> Result<()> {
+    let key = repair_alias_key(caller, request_id)?;
+    if value["operation_id"] != operation_id
+        || crate::automation::config::read_record(tx, &key, "repair request alias")?.is_some()
+    {
+        return Err(Error::new(
+            "INVALID_RECEIPT",
+            "repair request alias cannot replace a retained receipt",
+        ));
+    }
+    crate::automation::config::write_record(
+        tx,
+        &key,
+        &json!({
+            "schema_version":1,"caller_id":caller,"client_request_id":request_id,
+            "method":"agent.send","original_request_json":original,"operation_id":operation_id,
+            "receipt":{"ok":true,"value":value},"created_at_ms":now
+        }),
+    )
 }
 
 fn launch_alias_key(caller: &str, request_id: &str) -> Result<String> {
