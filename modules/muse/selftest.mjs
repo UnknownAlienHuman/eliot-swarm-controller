@@ -259,6 +259,8 @@ process.stdin.on('end',()=>process.exit(0));
   const endpoint=process.platform==='win32'?'\\\\.\\pipe\\muse-selftest-'+randomUUID():path.join(dir,'control.sock');
   const server=net.createServer();
   const sockets=new Set();
+  let teardownStarted=false;
+  const unexpectedSocketErrors=[];
   const commandIds={
     recover:'40000000-0000-4000-8000-000000000001',
     refresh:'40000000-0000-4000-8000-000000000002',
@@ -312,6 +314,12 @@ process.stdin.on('end',()=>process.exit(0));
   server.on('connection',socket=>{
     sockets.add(socket);socket.setEncoding('utf8');let buffer='';
     socket.on('close',()=>sockets.delete(socket));
+    socket.on('error',error=>{
+      if(teardownStarted&&error?.code==='ECONNRESET')return;
+      const diagnostic={code:error?.code??null,message:String(error?.message??error)};
+      unexpectedSocketErrors.push(diagnostic);
+      rejectFinished(new Error(`unexpected fixture host socket error: ${diagnostic.code??'unknown'}: ${diagnostic.message}`));
+    });
     socket.on('data',chunk=>{
       buffer+=chunk;let end;
       while((end=buffer.indexOf('\n'))>=0){const line=buffer.slice(0,end);buffer=buffer.slice(end+1);if(!line)continue;
@@ -394,11 +402,13 @@ process.stdin.on('end',()=>process.exit(0));
     assert.equal(audit.child_event_after_fresh,true,'the fixture native host emitted a child event after the stable read');
     console.log('PASS bridge B5 fixtures: restored-child freshness, retained stale evidence, unknown server request, exact-turn stale rejection');
   } finally {
+    teardownStarted=true;
     if(bridge&&bridge.exitCode===null)bridge.kill();
     if(bridge&&bridge.exitCode===null)await Promise.race([new Promise(resolve=>bridge.once('exit',resolve)),delay(3000)]);
     for(const socket of sockets)socket.destroy();
     if(server.listening)await new Promise(resolve=>server.close(resolve));
     await rm(dir,{recursive:true,force:true});
+    assert.deepEqual(unexpectedSocketErrors,[],`unexpected fixture socket errors: ${JSON.stringify(unexpectedSocketErrors)}`);
   }
 }
 

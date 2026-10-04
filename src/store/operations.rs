@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 const MAX_OWNED_SERVICE_START_FAILURE_BYTES: usize = 1024;
 const MAX_OWNED_SERVICE_DISPATCH_FAILURE_BYTES: usize = 1024;
 const MAX_MANAGER_ACTION_REQUIRED_ITEMS: i64 = 32;
+const MAX_PUBLIC_NATIVE_FAILURES: usize = 64;
 const START_FAILURE_V1_KEYS: [&str; 5] = [
     "schema_version",
     "status",
@@ -1163,9 +1164,27 @@ fn public_native_observation(value: &Value) -> Value {
     project_bools(value, &["enumeration_complete"], &mut native);
     project_numbers(
         value,
-        &["active_drain_count", "observed_at_ms"],
+        &["active_drain_count", "observed_at_ms", "gaps"],
         &mut native,
     );
+    if let Some(failures) = value.get("failures") {
+        let projected = match failures.as_array() {
+            Some(failures) => {
+                native.insert("failure_count".to_owned(), json!(failures.len()));
+                native.insert(
+                    "failures_truncated".to_owned(),
+                    json!(failures.len() > MAX_PUBLIC_NATIVE_FAILURES),
+                );
+                failures
+                    .iter()
+                    .take(MAX_PUBLIC_NATIVE_FAILURES)
+                    .map(public_native_failure)
+                    .collect::<Vec<_>>()
+            }
+            None => vec![json!({"code":"NATIVE_SNAPSHOT_DIAGNOSTIC_CORRUPT"})],
+        };
+        native.insert("failures".to_owned(), json!(projected));
+    }
     if let Some(session) = value.get("session") {
         let session = public_native_session(session);
         if session.as_object().is_some_and(|value| !value.is_empty()) {
@@ -1179,6 +1198,41 @@ fn public_native_observation(value: &Value) -> Value {
         }
     }
     Value::Object(native)
+}
+
+fn public_native_failure(value: &Value) -> Value {
+    let Some(code) = value["code"]
+        .as_str()
+        .filter(|code| safe_start_failure_error_code(code))
+    else {
+        return json!({"code":"NATIVE_SNAPSHOT_DIAGNOSTIC_CORRUPT"});
+    };
+    let mut failure = serde_json::Map::new();
+    failure.insert("code".to_owned(), json!(code));
+    if let Some(source) = value["source"].as_str().filter(|source| {
+        matches!(
+            *source,
+            "active_drains"
+                | "instruction_entries"
+                | "session_agent"
+                | "session_model"
+                | "session_goal"
+                | "form"
+                | "permission"
+                | "child_execution_log"
+                | "family_enumeration"
+                | "snapshot"
+        )
+    }) {
+        failure.insert("source".to_owned(), json!(source));
+    }
+    if let Some(session_id) = value["session_id"]
+        .as_str()
+        .filter(|id| crate::runtime::opencode_v2::valid_id(id, "ses").is_ok())
+    {
+        failure.insert("session_id".to_owned(), json!(session_id));
+    }
+    Value::Object(failure)
 }
 
 fn public_observation(value: &Value) -> Value {

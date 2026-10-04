@@ -155,6 +155,34 @@ fn attach(
     tx.commit()?;
     Ok(p)
 }
+
+fn write_connection_state(
+    db: &mut Connection,
+    principal: &Principal,
+    connected: bool,
+    detail: &Value,
+    failure_code: Option<&str>,
+) -> Result<()> {
+    let (id, generation, _) = runtime::scope(db, principal, true)?;
+    let connection = if connected {
+        "connected"
+    } else {
+        "native_unavailable"
+    };
+    let native_transport_error = model::canonical(detail)?;
+    if let Some(code) = failure_code.and_then(safe_runtime_error_code) {
+        let latest_native_failure = model::canonical(&json!({
+            "code":code,
+            "recorded_at_ms":model::now_ms()?
+        }))?;
+        db.execute("UPDATE bindings SET state=CASE WHEN NOT ?3 AND state='ready' THEN 'reconciling' ELSE state END,state_json=json_set(state_json,'$.connection',?4,'$.native_transport_error',json(?5),'$.latest_native_failure',json(?6)) WHERE binding_id=?1 AND generation=?2",
+            params![id,generation,connected,connection,native_transport_error,latest_native_failure])?;
+    } else {
+        db.execute("UPDATE bindings SET state=CASE WHEN NOT ?3 AND state='ready' THEN 'reconciling' ELSE state END,state_json=json_set(state_json,'$.connection',?4,'$.native_transport_error',json(?5)) WHERE binding_id=?1 AND generation=?2",
+            params![id,generation,connected,connection,native_transport_error])?;
+    }
+    Ok(())
+}
 fn original(db: &Connection, p: &Principal, id: &str) -> Result<RuntimeCommand> {
     let (binding, generation, b) = runtime::scope(db, p, true)?;
     let o = operations::get_operation(db, id)?;
@@ -227,85 +255,150 @@ impl Store {
         }
     }
 
-    pub async fn supervise_opencode(self, mut stopping: watch::Receiver<bool>) {
+    pub async fn supervise_opencode(self, mut stopping: watch::Receiver<bool>) -> Result<()> {
+        let (worker_stop, worker_stopping) = watch::channel(false);
         let mut workers: BTreeMap<String, JoinHandle<()>> = BTreeMap::new();
         let mut owned_workers: BTreeMap<(String, i64), JoinHandle<()>> = BTreeMap::new();
         let mut changed = self.changed.subscribe();
-        while !*stopping.borrow() {
-            let finished = workers
-                .iter()
-                .filter(|(_, task)| task.is_finished())
-                .map(|(key, _)| key.clone())
-                .collect::<Vec<_>>();
-            for key in finished {
-                if let Some(task) = workers.remove(&key) {
-                    let _ = task.await;
-                }
-            }
-            let finished_owned = owned_workers
-                .iter()
-                .filter(|(_, task)| task.is_finished())
-                .map(|(key, _)| key.clone())
-                .collect::<Vec<_>>();
-            for key in finished_owned {
-                if let Some(task) = owned_workers.remove(&key) {
-                    let _ = task.await;
-                }
-            }
-            match self.run(|db| bindings(db, None)).await {
-                Ok(bindings) => {
-                    for b in bindings {
-                        let Ok(options) = Options::parse(&b["route"]["native_options"]) else {
-                            continue;
-                        };
-                        if let std::collections::btree_map::Entry::Vacant(entry) =
-                            workers.entry(options.service_id.clone())
-                        {
-                            let store = self.clone();
-                            let stop = stopping.clone();
-                            entry.insert(tokio::spawn(async move {
-                                store.drive_opencode(&options.service_id, stop).await;
-                            }));
+        let result = async {
+            while !*stopping.borrow() {
+                let finished = workers
+                    .iter()
+                    .filter(|(_, task)| task.is_finished())
+                    .map(|(key, _)| key.clone())
+                    .collect::<Vec<_>>();
+                for key in finished {
+                    if let Some(task) = workers.remove(&key) {
+                        let result = task.await;
+                        if !*stopping.borrow() {
+                            self.recover_finished_shared_worker(&key, result).await?;
                         }
                     }
                 }
-                Err(e) => eprintln!("OpenCode supervisor: {}", e.code),
-            }
-            match self.run(|db| owned_bindings(db)).await {
-                Ok(bindings) => {
-                    for binding in bindings {
-                        let key = (
-                            binding["binding_id"]
-                                .as_str()
-                                .unwrap_or_default()
-                                .to_owned(),
-                            binding["generation"].as_i64().unwrap_or(0),
-                        );
-                        if let std::collections::btree_map::Entry::Vacant(entry) =
-                            owned_workers.entry(key.clone())
-                        {
-                            let store = self.clone();
-                            let stop = stopping.clone();
-                            entry.insert(tokio::spawn(async move {
-                                store.drive_owned_opencode(&key.0, key.1, stop).await;
-                            }));
+                let finished_owned = owned_workers
+                    .iter()
+                    .filter(|(_, task)| task.is_finished())
+                    .map(|(key, _)| key.clone())
+                    .collect::<Vec<_>>();
+                for key in finished_owned {
+                    if let Some(task) = owned_workers.remove(&key) {
+                        let result = task.await;
+                        if !*stopping.borrow() {
+                            self.recover_finished_owned_worker(&key.0, key.1, result)
+                                .await?;
                         }
                     }
                 }
-                Err(e) => eprintln!("OpenCode owned-service supervisor: {}", e.code),
+                let active_bindings = self.run(|db| bindings(db, None)).await?;
+                for b in active_bindings {
+                    let Ok(options) = Options::parse(&b["route"]["native_options"]) else {
+                        continue;
+                    };
+                    if let std::collections::btree_map::Entry::Vacant(entry) =
+                        workers.entry(options.service_id.clone())
+                    {
+                        let store = self.clone();
+                        let stop = worker_stopping.clone();
+                        entry.insert(tokio::spawn(async move {
+                            store.drive_opencode(&options.service_id, stop).await;
+                        }));
+                    }
+                }
+                let active_owned_bindings = self.run(|db| owned_bindings(db)).await?;
+                for binding in active_owned_bindings {
+                    let key = (
+                        binding["binding_id"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_owned(),
+                        binding["generation"].as_i64().unwrap_or(0),
+                    );
+                    if let std::collections::btree_map::Entry::Vacant(entry) =
+                        owned_workers.entry(key.clone())
+                    {
+                        let store = self.clone();
+                        let stop = worker_stopping.clone();
+                        entry.insert(tokio::spawn(async move {
+                            store.drive_owned_opencode(&key.0, key.1, stop).await;
+                        }));
+                    }
+                }
+                tokio::select! {
+                    _ = stopping.changed() => {},
+                    _ = changed.changed() => {},
+                    _ = tokio::time::sleep(Duration::from_secs(2)) => {},
+                }
             }
-            tokio::select! {
-                _ = stopping.changed() => {},
-                _ = changed.changed() => {},
-                _ = tokio::time::sleep(Duration::from_secs(2)) => {},
-            }
+            Ok(())
         }
-        for task in workers.into_values() {
-            let _ = task.await;
+        .await;
+        finish_opencode_supervisor(worker_stop, workers, owned_workers, result).await
+    }
+
+    async fn recover_finished_shared_worker(
+        &self,
+        service_id: &str,
+        result: std::result::Result<(), tokio::task::JoinError>,
+    ) -> Result<()> {
+        let code = worker_failure_code(&result);
+        let service_id = service_id.to_owned();
+        let boot = model::new_id();
+        let detail = oc::diagnostic(&Error::new(
+            code,
+            "builtin OpenCode worker terminated unexpectedly",
+        ));
+        let recovered = self
+            .run(move |db| {
+                // Re-resolve the exact live service scope in the same Store turn
+                // as reattachment and uncertainty recording. A release between
+                // worker exit and this point is an expected no-op.
+                let active = bindings(db, Some(&service_id))?;
+                let mut recovered = false;
+                for binding in active {
+                    let principal = attach(db, &binding, &boot, "external_shared_service")?;
+                    write_connection_state(db, &principal, false, &detail, Some(code))?;
+                    recovered = true;
+                }
+                Ok(recovered)
+            })
+            .await?;
+        if recovered {
+            self.changed
+                .send_modify(|revision| *revision = revision.wrapping_add(1));
         }
-        for task in owned_workers.into_values() {
-            let _ = task.await;
+        Ok(())
+    }
+
+    async fn recover_finished_owned_worker(
+        &self,
+        binding_id: &str,
+        generation: i64,
+        result: std::result::Result<(), tokio::task::JoinError>,
+    ) -> Result<()> {
+        let code = worker_failure_code(&result);
+        let binding_id = binding_id.to_owned();
+        let boot = model::new_id();
+        let detail = oc::diagnostic(&Error::new(
+            code,
+            "builtin OpenCode owned worker terminated unexpectedly",
+        ));
+        let recovered = self
+            .run(move |db| {
+                // The binding ID and generation are both part of this worker's
+                // retained identity; a replacement generation is never adopted.
+                let Some(binding) = active_owned_binding(db, &binding_id, generation)? else {
+                    return Ok(false);
+                };
+                let principal = attach(db, &binding, &boot, "owned_fresh_service")?;
+                write_connection_state(db, &principal, false, &detail, Some(code))?;
+                Ok(true)
+            })
+            .await?;
+        if recovered {
+            self.changed
+                .send_modify(|revision| *revision = revision.wrapping_add(1));
         }
+        Ok(())
     }
     async fn record_oc_outcome(&self, p: &Principal, outcome: RuntimeOutcome) -> Result<()> {
         let p = p.clone();
@@ -387,23 +480,10 @@ impl Store {
                 .unwrap_or("NATIVE_CONNECTION_FAILURE")
                 .to_owned()
         });
-        self.run(move|db|{
-            let (id,generation,_)=runtime::scope(db,&p,true)?;
-            let connection = if connected {"connected"} else {"native_unavailable"};
-            let native_transport_error = model::canonical(&detail)?;
-            if let Some(code) = failure_code {
-                let latest_native_failure = model::canonical(&json!({
-                    "code":code,
-                    "recorded_at_ms":model::now_ms()?
-                }))?;
-                db.execute("UPDATE bindings SET state=CASE WHEN NOT ?3 AND state='ready' THEN 'reconciling' ELSE state END,state_json=json_set(state_json,'$.connection',?4,'$.native_transport_error',json(?5),'$.latest_native_failure',json(?6)) WHERE binding_id=?1 AND generation=?2",
-                    params![id,generation,connected,connection,native_transport_error,latest_native_failure])?;
-            } else {
-                db.execute("UPDATE bindings SET state=CASE WHEN NOT ?3 AND state='ready' THEN 'reconciling' ELSE state END,state_json=json_set(state_json,'$.connection',?4,'$.native_transport_error',json(?5)) WHERE binding_id=?1 AND generation=?2",
-                    params![id,generation,connected,connection,native_transport_error])?;
-            }
-            Ok(())
-        }).await
+        self.run(move |db| {
+            write_connection_state(db, &p, connected, &detail, failure_code.as_deref())
+        })
+        .await
     }
     async fn oc_snapshot(
         &self,
@@ -426,8 +506,7 @@ impl Store {
         let principal = p.clone();
         let bound_children = self
             .run(move |db| bound_child_sessions(db, &principal))
-            .await
-            .unwrap_or_default();
+            .await?;
         let snapshot = tokio::time::timeout(
             Duration::from_secs(20),
             service.snapshot(root, &b["observation"]["native"], &bound_children),
@@ -448,7 +527,7 @@ impl Store {
             runtime::observe(db,&p,&json!({"event_id":event,"state":state}))?;
             // Finding a root cannot settle an unknown create. Exact ownership/location
             // readback must succeed and the original open must already be settled.
-            db.execute("UPDATE bindings SET state='ready' WHERE binding_id=?1 AND generation=?2 AND state='reconciling' AND EXISTS(SELECT 1 FROM operations WHERE binding_id=?1 AND binding_generation=?2 AND method='agent.open' AND state='settled')",params![id,generation])?;
+            db.execute("UPDATE bindings SET state='ready' WHERE binding_id=?1 AND generation=?2 AND state='reconciling' AND COALESCE(json_extract(state_json,'$.recovery_required'),0)=0 AND EXISTS(SELECT 1 FROM operations WHERE binding_id=?1 AND binding_generation=?2 AND method='agent.open' AND state='settled') AND NOT EXISTS(SELECT 1 FROM operations WHERE binding_id=?1 AND binding_generation=?2 AND state IN ('sending','native_accepted','outcome_unknown') AND method IN ('agent.open','task.dispatch','agent.send'))",params![id,generation])?;
             Ok(())
         }).await
     }
@@ -952,9 +1031,38 @@ fn safe_runtime_error_code(code: &str) -> Option<&str> {
     .then_some(code)
 }
 
+fn worker_failure_code(result: &std::result::Result<(), tokio::task::JoinError>) -> &'static str {
+    match result {
+        Ok(()) => "NATIVE_WORKER_EXITED",
+        Err(error) if error.is_panic() => "NATIVE_WORKER_PANICKED",
+        Err(error) if error.is_cancelled() => "NATIVE_WORKER_CANCELLED",
+        Err(_) => "NATIVE_WORKER_FAILED",
+    }
+}
+
+async fn finish_opencode_supervisor(
+    worker_stop: watch::Sender<bool>,
+    workers: BTreeMap<String, JoinHandle<()>>,
+    owned_workers: BTreeMap<(String, i64), JoinHandle<()>>,
+    result: Result<()>,
+) -> Result<()> {
+    let _ = worker_stop.send(true);
+    for worker in workers.into_values() {
+        let _ = worker.await;
+    }
+    for worker in owned_workers.into_values() {
+        let _ = worker.await;
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests;
 
 #[cfg(test)]
 #[path = "opencode/reconcile_failure_tests.rs"]
 mod reconcile_failure_tests;
+
+#[cfg(test)]
+#[path = "opencode/worker_failure_tests.rs"]
+mod worker_failure_tests;

@@ -28,4 +28,33 @@ Managers receive only the validated code and timestamp. Damaged optional history
 produces `NATIVE_FAILURE_DIAGNOSTIC_CORRUPT` without a fabricated timestamp and
 does not hide the rest of the binding state.
 
+An OpenCode snapshot requires a validated root-session read. Its independent
+optional read axes share a bounded deadline inside the existing whole-snapshot
+budget. A slow configuration, family, request or child-log read produces a
+partial observation with a safe axis failure; it does not erase completed axes.
+Pending forms and permissions are cleared only by a successful validated read of
+that session and request kind. Incomplete child-log reads retain prior terminal
+evidence. One instruction-entry read supplies both configuration and goal
+projections. A partial observation does not establish family completion or
+settle an unknown native input.
+
+Managers can inspect these current partial-read diagnoses at
+`agent.state.observation.native.failures` (also through `agent.list`). Each item
+contains a bounded safe `code`, an allowlisted `source` and a validated optional
+`session_id`; native bodies, paths, messages and credentials are omitted. At most
+64 entries are returned, with the full `failure_count` and `failures_truncated`
+flag when the stored list is valid. `gaps` remains the accumulated observation
+gap counter. Malformed diagnostic data produces
+`NATIVE_SNAPSHOT_DIAGNOSTIC_CORRUPT` without fabricated counts. These facts are
+current snapshot coverage; `latest_native_failure` is separate durable history.
+
+The OpenCode supervisor inspects completed worker handles. A panic, cancellation
+or unexpected return while the exact binding/service scope remains active
+records a fixed safe native worker failure and moves already sending or
+native-accepted work to unknown before a replacement worker can start. Released
+scopes and normal host shutdown do not produce false crash receipts. Failure to
+persist recovery is a supervisor error propagated to the host lifecycle. The
+existing per-scope supervisor recreation does not replay native input. Snapshot
+readiness restoration also retains recovery and unresolved-input guards.
+
 Implementation qualification is recorded in `docs/implementation-status.md`. These receipts do not introduce an automatic host restart, a model call or a new daemon.

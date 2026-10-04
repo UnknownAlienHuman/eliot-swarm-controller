@@ -2,6 +2,34 @@
 
 ## Current state
 
+The latest core reliability increment keeps mandatory root validation and moves
+independent optional snapshot reads under one bounded concurrent deadline. A
+slow catalog or child log no longer erases completed axes or starves the other
+pipeline. Configuration and goal share one instruction-entry response. Partial
+read failures are visible to Managers with bounded safe diagnostics; failed goal
+readback reports unknown presence rather than confirmed absence.
+
+Finished OpenCode workers now produce durable safe failure history for their
+exact active scope before replacement, retain unknown in-flight input, and
+preserve current-GM readback without tying it to a previous chat. Supervisor
+Store errors propagate to the host after all owned workers have been stopped and
+joined. Snapshot readiness restoration excludes recovery-required bindings and
+unresolved input; Store read errors no longer become empty child sets.
+
+On 2026-10-04, package formatting, strict production Clippy, eight focused
+snapshot/worker/Manager/recovery regressions and debug build passed with unchanged
+source. Three held-HTTP tests verify retained evidence and independent child-log
+and pending-question progress. The first test compilation exposed a test-only
+`Vec<Value>` formatting error, corrected before the successful gate; production
+Clippy was retained by exact source equivalence. Independent Luna review found
+and closed fatal worker-drain, diagnostic-null and unknown-goal concerns. The
+debug candidate SHA-256 is
+`BD576B1B29A28002F3BF015EDB6AA5DA6D17C487C86ACEC7E5854E0555AAEEEF`.
+Fresh C21 owned-service/native-MCP qualification is prepared but not yet run.
+Full CI for this latest source remains pending. The installed controller and
+the user's running Codex/OpenCodex remain unchanged. Local Linux, WSL and local
+models remain deferred. The project remains **PARTIAL_PROGRESS**.
+
 The runtime admission increment now retains a separate bounded
 `runtime_dispatch_action_required` diagnostic for the exact launch/open pair.
 Deterministic opening-actor validation failures settle the queued operation as
@@ -61,8 +89,19 @@ The initial fixture gates exposed a retained Store sender preventing test
 shutdown and a completed JoinHandle being polled twice; both were corrected in
 test code. Production stayed unchanged after the successful Clippy gate.
 Independent Luna review found no actionable issue in the failure-history
-projection. Fresh C20 native diagnostic qualification is pending; this source
-is not covered by the CI run above.
+projection. C20 run `cfd5dcc6-c0b9-42a8-a78b-88088fef0b5f` stopped at
+`native_snapshot_readback` with `NATIVE_SNAPSHOT_TIMEOUT`. Current-manager
+`agent.state` returned the exact binding's retained error and matching timestamp.
+This qualifies actual native failure delivery to the manager, while native MCP
+proof and model execution remain unqualified. No model call occurred. Preserve
+the consumed C20 run without replay.
+
+CI for source `094b0bbb24d6f0300c6a5cacd7880cd21e9af307`
+[37216299415](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37216299415)
+completed on 2026-10-04: Windows passed; the remote Ubuntu job passed its Rust
+and earlier checks, then failed on an unhandled `ECONNRESET` during Muse fixture
+teardown. The fixture correction is qualified on Windows; remote CI verification
+remains pending. No local Linux or WSL was used.
 
 The previous core increment is `3c1a93b476fc31a4d60345fcac627291e9fe4e54`.
 Full Windows and Ubuntu CI for that source

@@ -111,7 +111,7 @@ async fn shared_reader_receipts_survive_host_restart_without_replaying_native_wo
     .await
     .unwrap();
     stop.send(true).unwrap();
-    worker.await.unwrap();
+    worker.await.unwrap().unwrap();
     owner.close().await.unwrap();
     assert_eq!(
         f.world.lock().unwrap().sessions.len(),
@@ -166,7 +166,7 @@ async fn shared_reader_receipts_survive_host_restart_without_replaying_native_wo
         );
     }
     stop.send(true).unwrap();
-    worker.await.unwrap();
+    worker.await.unwrap().unwrap();
     owner.close().await.unwrap();
 }
 #[tokio::test]
@@ -265,7 +265,7 @@ async fn rejected_open_preflight_retains_diagnostic_without_partial_native_ident
     assert_eq!(f.posts("/api/session"), 0);
 
     stop.send(true).unwrap();
-    worker.await.unwrap();
+    worker.await.unwrap().unwrap();
     owner.close().await.unwrap();
 }
 
@@ -304,7 +304,7 @@ async fn goal_receipts_survive_host_restart_without_replaying_native_work() {
     .await
     .unwrap();
     stop.send(true).unwrap();
-    worker.await.unwrap();
+    worker.await.unwrap().unwrap();
     owner.close().await.unwrap();
     // Restart recovery must pick up agent.goal and reconcile by readback only:
     // the entry PUT and the (never sent) activation prompt are not replayed.
@@ -343,7 +343,7 @@ async fn goal_receipts_survive_host_restart_without_replaying_native_work() {
         );
     }
     stop.send(true).unwrap();
-    worker.await.unwrap();
+    worker.await.unwrap().unwrap();
     owner.close().await.unwrap();
 }
 
@@ -444,7 +444,7 @@ async fn configure_prerequisite_gates_goal_start() {
     .unwrap_err();
     assert_eq!(invalid.code, "INVALID_PREREQUISITE");
     stop.send(true).unwrap();
-    worker.await.unwrap();
+    worker.await.unwrap().unwrap();
     owner.close().await.unwrap();
 }
 
@@ -620,7 +620,7 @@ async fn setup_snapshot_binds_dependent_to_the_whole_setup() {
     .unwrap();
     assert_eq!(c["prerequisite_state"], "pending");
     stop.send(true).unwrap();
-    worker.await.unwrap();
+    worker.await.unwrap().unwrap();
     owner.close().await.unwrap();
 }
 
@@ -699,7 +699,7 @@ async fn goal_pause_cancels_queued_goal_set_on_same_binding() {
         pause["operation_id"]
     );
     stop.send(true).unwrap();
-    worker.await.unwrap();
+    worker.await.unwrap().unwrap();
     owner.close().await.unwrap();
 }
 
@@ -865,7 +865,7 @@ async fn bound_child_producers_close_only_from_their_own_logs() {
     .await;
     assert!(current["released_at_ms"].is_number());
     stop.send(true).unwrap();
-    worker.await.unwrap();
+    worker.await.unwrap().unwrap();
     owner.close().await.unwrap();
 }
 
@@ -931,6 +931,6 @@ async fn background_operation_settles_from_the_native_notice() {
     assert_eq!(f.posts(&format!("/api/session/{root}/background")), 1);
     assert_eq!(f.posts(&format!("/api/session/{root}/prompt")), 0);
     stop.send(true).unwrap();
-    worker.await.unwrap();
+    worker.await.unwrap().unwrap();
     owner.close().await.unwrap();
 }

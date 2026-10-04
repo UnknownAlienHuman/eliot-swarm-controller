@@ -674,14 +674,13 @@ impl Service {
         }
     }
 
-    pub(super) async fn goal_observation(&self, root: &str) -> Result<Value> {
-        let entries = self.instruction_entries(root).await?;
+    pub(super) fn goal_observation_from_entries(entries: &[Value]) -> Result<Value> {
         let record = entries
             .iter()
             .find(|entry| entry["key"] == GOAL_ENTRY_KEY)
             .map(|entry| GoalRecord::parse(&entry["value"]))
             .transpose()?;
-        let settings_revision = projection_revision(&owned_projection(&entries)?)?;
+        let settings_revision = projection_revision(&owned_projection(entries)?)?;
         let objective_digest = record
             .as_ref()
             .map(GoalRecord::objective_digest)

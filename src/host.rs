@@ -101,10 +101,7 @@ async fn run_until(
     supervisors.spawn(async move { ("scripts", store.supervise_scripts(stop).await) });
     let store = owner.store.clone();
     let stop = stopping.clone();
-    supervisors.spawn(async move {
-        store.supervise_opencode(stop).await;
-        ("opencode", Ok(()))
-    });
+    supervisors.spawn(async move { ("opencode", store.supervise_opencode(stop).await) });
     let store = owner.store.clone();
     let stop = stopping.clone();
     supervisors.spawn(async move {

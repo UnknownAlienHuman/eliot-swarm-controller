@@ -82,10 +82,10 @@ async fn read_binding(store: &Store, manager: &Principal, binding_id: &str) -> V
         .unwrap()
 }
 
-async fn stop_worker(stop: watch::Sender<bool>, mut worker: JoinHandle<()>) {
+async fn stop_worker(stop: watch::Sender<bool>, mut worker: JoinHandle<crate::error::Result<()>>) {
     let _ = stop.send(true);
     match tokio::time::timeout(Duration::from_secs(30), &mut worker).await {
-        Ok(result) => result.unwrap(),
+        Ok(result) => result.unwrap().unwrap(),
         Err(_) => {
             worker.abort();
             let _ = worker.await;
@@ -341,6 +341,27 @@ async fn manager_state_retains_safe_latest_connection_failure() {
         .unwrap();
     assert_eq!(changed, 1);
 
+    // A partial snapshot is successful readback with failed optional axes.
+    // Its manager projection must retain diagnoses without native payloads.
+    let mut failures = vec![
+        json!({"code":"NATIVE_SNAPSHOT_BUDGET_EXHAUSTED","source":"form","session_id":"ses_safe","message":secret_marker,"credential":secret_marker}),
+        json!({"code":secret_marker,"source":"permission","session_id":"ses_safe"}),
+        json!({"code":"NATIVE_READ_FAILURE","source":secret_marker,"session_id":"C:\\private\\session","body":secret_marker}),
+    ];
+    failures.extend((0..62).map(|_| json!({"code":"NATIVE_READ_FAILURE"})));
+    let native = json!({"failures":failures,"gaps":1,"family_completeness":"partial"});
+    let inject_binding = binding_id.clone();
+    store
+        .run(move |db| {
+            db.execute(
+                "UPDATE bindings SET state_json=json_set(state_json,'$.native',json(?3)) WHERE binding_id=?1 AND generation=?2",
+                params![inject_binding, 1, native.to_string()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
     store
         .oc_connection(&module_principal, true, None)
         .await
@@ -358,7 +379,46 @@ async fn manager_state_retains_safe_latest_connection_failure() {
     assert_eq!(latest.len(), 2);
     assert_eq!(latest["code"], "NATIVE_TEST_FAILURE");
     assert_eq!(latest["recorded_at_ms"], failure_time);
+    let native = &state["observation"]["native"];
+    assert_eq!(native["gaps"], 1);
+    assert_eq!(native["family_completeness"], "partial");
+    assert_eq!(native["failure_count"], 65);
+    assert_eq!(native["failures_truncated"], true);
+    let failures = native["failures"].as_array().unwrap();
+    assert_eq!(failures.len(), 64);
+    assert_eq!(
+        failures[0],
+        json!({"code":"NATIVE_SNAPSHOT_BUDGET_EXHAUSTED","source":"form","session_id":"ses_safe"})
+    );
+    assert_eq!(
+        failures[1],
+        json!({"code":"NATIVE_SNAPSHOT_DIAGNOSTIC_CORRUPT"})
+    );
+    assert_eq!(failures[2], json!({"code":"NATIVE_READ_FAILURE"}));
     assert!(!state.to_string().contains(secret_marker));
+    assert!(!state.to_string().contains("private"));
+    let corrupt_binding = binding_id.clone();
+    store
+        .run(move |db| {
+            db.execute(
+                "UPDATE bindings SET state_json=json_set(state_json,'$.native.failures',json('null')) WHERE binding_id=?1 AND generation=1",
+                [corrupt_binding],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let state = read_binding(&store, &manager, &binding_id).await;
+    let native = &state["observation"]["native"];
+    assert_eq!(
+        native["failures"],
+        json!([{"code":"NATIVE_SNAPSHOT_DIAGNOSTIC_CORRUPT"}])
+    );
+    assert!(native.get("failure_count").is_none());
+    assert_eq!(
+        state["observation"]["latest_native_failure"]["code"],
+        "NATIVE_TEST_FAILURE"
+    );
     drop(store);
     owner.close().await.unwrap();
 }

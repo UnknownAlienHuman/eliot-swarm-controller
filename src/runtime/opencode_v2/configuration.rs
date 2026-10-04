@@ -1538,9 +1538,8 @@ impl Service {
         }
     }
 
-    pub(super) async fn instruction_observation(&self, root: &str) -> Result<Value> {
-        let entries = self.instruction_entries(root).await?;
-        let projection = owned_projection(&entries)?;
+    pub(super) fn instruction_observation_from_entries(entries: &[Value]) -> Result<Value> {
+        let projection = owned_projection(entries)?;
         let complete = projection.len() <= MAX_OBSERVED_ENTRIES;
         let owned = projection
             .iter()
