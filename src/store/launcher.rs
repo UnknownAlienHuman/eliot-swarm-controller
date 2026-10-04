@@ -5343,7 +5343,11 @@ fn current_scope_overlaps(
     }))
 }
 
-fn manager_exceptions_page(db: &Connection, params_value: &Value) -> Result<Value> {
+fn manager_exceptions_page(
+    db: &Connection,
+    params_value: &Value,
+    include_current_gm_actions: bool,
+) -> Result<Value> {
     model::fields(params_value, &["after", "limit"])?;
     let page = PageRequest::parse(params_value)?;
     let raw = capacity::attention_report(db, ATTENTION_SCAN_LIMIT, page.after)?;
@@ -5390,13 +5394,19 @@ fn manager_exceptions_page(db: &Connection, params_value: &Value) -> Result<Valu
         limited.gap_count == 0 && raw["projection"]["coverage_complete"] == true,
         Vec::new(),
     )?;
-    Ok(json!({
+    let mut response = json!({
         "items":limited.items,
         "next_after":next_after,
         "pagination":"filtered_manager_actionable_attention; cursor is the raw attention offset",
         "source_attention":{"total_items":raw["total_items"],"next_after":raw_next,"has_more":source_has_more},
         "projection":frame,
-    }))
+    });
+    if include_current_gm_actions {
+        response["host_lifecycle"] = super::host_lifecycle::status(db)?;
+        response["manager_action_required"] =
+            super::operations::owned_service_start_failure_actions(db)?;
+    }
+    Ok(response)
 }
 
 fn sanitize_capacity_item(item: &Value) -> Value {
@@ -5472,7 +5482,12 @@ fn dashboard_summary(
     let queue_params = json!({"after":0,"limit":limit});
     let queue = queue_page(db, &queue_params, 4_096)?;
     let capacity = dashboard_capacity(db)?;
-    let exception = manager_exceptions_page(db, &json!({"after":0,"limit":limit}))?;
+    let include_current_gm_actions = super::gm::require_authority(db, p).is_ok();
+    let exception = manager_exceptions_page(
+        db,
+        &json!({"after":0,"limit":limit}),
+        include_current_gm_actions,
+    )?;
     let queue_partial = queue["projection"]["has_newer"] == true
         || queue["projection"]["gap_count"].as_i64().unwrap_or(0) > 0;
     let capacity_partial = capacity["projection"]["has_newer"] == true
@@ -5867,5 +5882,9 @@ pub(super) fn exceptions_get(
     params_value: &Value,
 ) -> Result<Value> {
     require_manager(db, p)?;
-    manager_exceptions_page(db, params_value)
+    manager_exceptions_page(
+        db,
+        params_value,
+        super::gm::require_authority(db, p).is_ok(),
+    )
 }

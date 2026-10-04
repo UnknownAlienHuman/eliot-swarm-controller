@@ -9,6 +9,7 @@ use crate::{
         config::{self, AutomationEntry},
         intake::{IntakeItem, IntakeStatus, LocalProducer},
     },
+    config::Config,
     error::{Error, Result},
     model,
     review::ReviewAssignRequest,
@@ -43,6 +44,12 @@ struct DispatchState {
     automation_id: String,
     step: String,
     cursor: i64,
+    #[serde(default)]
+    hook_cursor: i64,
+    #[serde(default)]
+    hook_activation_cut: i64,
+    #[serde(default)]
+    hook_include_existing: bool,
     activation_cut: i64,
     catch_up_until: Option<i64>,
     pending_after_observation_id: i64,
@@ -60,6 +67,18 @@ struct PendingSubject {
     first_seen_at_ms: i64,
     last_checked_at_ms: i64,
     held: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    awaiting_hook: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hook_fact: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hook_event_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hook_observation_id: Option<i64>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// One shared intake source snapshot, produced once per Store transaction and
@@ -70,6 +89,34 @@ pub(crate) struct IntakeSnapshot {
     pub(crate) high_water: i64,
     pub(crate) processed: usize,
     pub(crate) status: IntakeStatus,
+    pub(crate) hook_commit: Option<SourceIntakeSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub(crate) struct SourceIntakeSnapshot {
+    pub(crate) cursor: i64,
+    pub(crate) high_water: i64,
+    pub(crate) processed: usize,
+    pub(crate) status: IntakeStatus,
+}
+
+#[derive(Clone, Copy)]
+struct DispatchPassContext<'a> {
+    entry: &'a AutomationEntry,
+    app_config: &'a Config,
+    now_ms: i64,
+    hook: Option<HookCommitPassContext<'a>>,
+}
+
+#[derive(Clone, Copy)]
+struct HookCommitPassContext<'a> {
+    settings: &'a config::HookCommitSettings,
+    source_wait_reason: Option<&'a str>,
+}
+
+struct MatchedHookCommit {
+    receipt: crate::automation::intake::EventReceipt,
+    fact: crate::hooks::contract::HookCommitFact,
 }
 
 #[derive(Debug)]
@@ -93,14 +140,38 @@ enum SubjectResult {
 pub(crate) fn reconcile_source_intake(
     tx: &Transaction<'_>,
     limit: usize,
+    include_hook_commit: bool,
     now_ms: i64,
 ) -> Result<IntakeSnapshot> {
+    let submission =
+        reconcile_local_source_intake(tx, LocalProducer::TaskSubmission, limit, now_ms)?;
+    let hook_commit = include_hook_commit
+        .then(|| reconcile_local_source_intake(tx, LocalProducer::HookCommit, limit, now_ms))
+        .transpose()?;
+    Ok(IntakeSnapshot {
+        cursor: submission.cursor,
+        high_water: submission.high_water,
+        processed: submission.processed,
+        status: submission.status,
+        hook_commit,
+    })
+}
+
+fn reconcile_local_source_intake(
+    tx: &Transaction<'_>,
+    producer: LocalProducer,
+    limit: usize,
+    now_ms: i64,
+) -> Result<SourceIntakeSnapshot> {
     let (registration, cursor) =
-        automation_intake::register_local_source(tx, LocalProducer::TaskSubmission, true, now_ms)?;
+        automation_intake::register_local_source(tx, producer, true, now_ms)?;
     if !registration.include_existing && registration.initial_cursor > 0 {
         return Err(Error::new(
             "AUTOMATION_INTAKE_HISTORY_UNAVAILABLE",
-            "the registered submission source skipped history needed by per-entry activation cuts",
+            format!(
+                "the registered {:?} source skipped history needed by per-entry activation cuts",
+                producer
+            ),
         ));
     }
     let page = automation_intake::reconcile_source_page(
@@ -116,20 +187,20 @@ pub(crate) fn reconcile_source_intake(
     ) {
         return Err(Error::new(
             "AUTOMATION_INTAKE_RECONCILIATION_FAILED",
-            format!("shared submission intake returned {:?}", page.status),
+            format!("shared {:?} intake returned {:?}", producer, page.status),
         ));
     }
-    Ok(IntakeSnapshot {
+    Ok(SourceIntakeSnapshot {
         cursor: page.cursor.ok_or_else(|| {
             Error::new(
                 "AUTOMATION_INTAKE_CURSOR_MISSING",
-                "registered submission intake returned no cursor",
+                format!("registered {:?} source has no durable cursor", producer),
             )
         })?,
         high_water: page.high_water.ok_or_else(|| {
             Error::new(
                 "AUTOMATION_INTAKE_HIGH_WATER_MISSING",
-                "registered submission intake returned no high-water cut",
+                format!("registered {:?} source has no high-water cut", producer),
             )
         })?,
         processed: page.processed,
@@ -150,6 +221,16 @@ pub(super) fn configure_activation(
     });
     let has_review_coverage =
         after.enabled && after.steps.contains(&AutomationStep::ReviewDispatch);
+    let before_hook_source = before
+        .filter(|entry| entry.enabled && entry.steps.contains(&AutomationStep::ReviewDispatch))
+        .and_then(|entry| entry.hook_commit.as_ref())
+        .map(|hook| hook.source_id.as_str());
+    let after_hook_source = after
+        .hook_commit
+        .as_ref()
+        .filter(|_| has_review_coverage)
+        .map(|hook| hook.source_id.as_str());
+    let hook_selection_changed = before_hook_source != after_hook_source;
     let key = config::dispatch_state_key(
         &after.owner_manager_id,
         &after.project_id,
@@ -193,6 +274,46 @@ pub(super) fn configure_activation(
             pending.last_checked_at_ms = now_ms;
         }
     }
+
+    if let Some(source_id) = after_hook_source {
+        if hook_selection_changed || !had_review_coverage {
+            // HookCommit and TaskSubmission have separate retained journals.
+            // Rewind only this opted-in entry's submission cursor so exact
+            // applied submissions can join commits under the requested cut.
+            state.cursor = if include_existing { 0 } else { cut };
+            state.activation_cut = cut;
+            state.catch_up_until = include_existing.then_some(cut);
+            state.hook_cursor = if include_existing { 0 } else { cut };
+            state.hook_activation_cut = cut;
+            state.hook_include_existing = include_existing;
+            for pending in &mut state.pending {
+                let same_selected_source = pending
+                    .hook_fact
+                    .as_ref()
+                    .and_then(|fact| fact.get("source_id"))
+                    .and_then(Value::as_str)
+                    == Some(source_id);
+                if pending.hook_fact.is_some() && !same_selected_source {
+                    pending.held = true;
+                    pending.reason = "hook_source_selection_changed".to_owned();
+                    pending.last_checked_at_ms = now_ms;
+                } else if pending.awaiting_hook || same_selected_source {
+                    pending.held = false;
+                    if pending.awaiting_hook {
+                        pending.reason = "awaiting_verified_hook_commit".to_owned();
+                    }
+                }
+            }
+        }
+    } else if before_hook_source.is_some() {
+        for pending in &mut state.pending {
+            if pending.awaiting_hook || pending.hook_fact.is_some() {
+                pending.held = true;
+                pending.reason = "hook_trigger_removed".to_owned();
+                pending.last_checked_at_ms = now_ms;
+            }
+        }
+    }
     state.updated_at_ms = now_ms;
     save_state(tx, &key, &state)
 }
@@ -205,6 +326,7 @@ pub(super) fn reconcile_entry(
     entry: &AutomationEntry,
     budget: usize,
     intake: IntakeSnapshot,
+    config: &Config,
     now_ms: i64,
 ) -> Result<Value> {
     if !entry.enabled || !entry.steps.contains(&AutomationStep::ReviewDispatch) {
@@ -224,17 +346,104 @@ pub(super) fn reconcile_entry(
         )
     })?;
     let budget = budget.min(MAX_RECONCILE_FACTS);
+    let hook_source_wait_reason = if let Some(settings) = entry.hook_commit.as_ref() {
+        let reason = selected_hook_source_wait_reason(tx, config, entry, settings)?;
+        let mut rewind_hook_cursor = false;
+        for pending in &mut state.pending {
+            if !pending.awaiting_hook
+                || !(pending.reason == "awaiting_verified_hook_commit"
+                    || pending.reason.starts_with("hook_source_"))
+            {
+                continue;
+            }
+            if reason.is_none() && pending.reason.starts_with("hook_source_") {
+                // A fact already indexed while the source was unavailable may
+                // have passed this entry's HookCommit cursor. Revisit retained
+                // facts when the selected source becomes usable again.
+                rewind_hook_cursor = true;
+            }
+            let next_reason = reason
+                .clone()
+                .unwrap_or_else(|| "awaiting_verified_hook_commit".to_owned());
+            let unavailable = reason.is_some();
+            let next_wake_when = if unavailable {
+                vec!["selected_hook_source_available".to_owned()]
+            } else {
+                vec!["matching_hook_commit_observed".to_owned()]
+            };
+            if pending.reason != next_reason
+                || pending.held != unavailable
+                || pending.wake_when != next_wake_when
+            {
+                pending.reason = next_reason;
+                pending.held = unavailable;
+                pending.wake_when = next_wake_when;
+                pending.last_checked_at_ms = now_ms;
+            }
+        }
+        if rewind_hook_cursor {
+            state.hook_cursor = if state.hook_include_existing {
+                0
+            } else {
+                state.hook_activation_cut
+            };
+        }
+        reason
+    } else {
+        None
+    };
+    let pass = DispatchPassContext {
+        entry,
+        app_config: config,
+        now_ms,
+        hook: entry
+            .hook_commit
+            .as_ref()
+            .map(|settings| HookCommitPassContext {
+                settings,
+                source_wait_reason: hook_source_wait_reason.as_deref(),
+            }),
+    };
     if budget == 0 {
+        state.updated_at_ms = now_ms;
+        save_state(tx, &key, &state)?;
         return Ok(state_projection(&state));
     }
 
     let mut processed = 0usize;
     let pending_budget = budget.min(MAX_PENDING_RECHECKS);
-    processed += recheck_pending(tx, entry, &mut state, pending_budget, now_ms)?;
+    processed += recheck_pending(tx, entry, &mut state, pending_budget, config, now_ms)?;
     let remaining_budget = budget.saturating_sub(processed);
-    if remaining_budget > 0 && state.pending.len() < MAX_PENDING_SUBJECTS {
-        processed +=
-            consume_submission_page(tx, entry, &mut state, remaining_budget, intake, now_ms)?;
+    if remaining_budget > 0 {
+        if entry.hook_commit.is_some() {
+            let hook_intake = intake.hook_commit.ok_or_else(|| {
+                Error::new(
+                    "AUTOMATION_HOOK_INTAKE_MISSING",
+                    "selected HookCommit source was not reconciled",
+                )
+            })?;
+            let hook_processed =
+                consume_hook_commit_page(tx, &mut state, remaining_budget, hook_intake, &pass)?;
+            processed += hook_processed;
+            let remaining_budget = budget.saturating_sub(processed);
+            if remaining_budget > 0 && state.pending.len() < MAX_PENDING_SUBJECTS {
+                processed +=
+                    consume_submission_page(tx, &mut state, remaining_budget, intake, &pass)?;
+            }
+            let remaining_budget = budget.saturating_sub(processed);
+            if remaining_budget > 0 {
+                processed += recheck_pending(
+                    tx,
+                    entry,
+                    &mut state,
+                    remaining_budget.min(MAX_PENDING_RECHECKS),
+                    config,
+                    now_ms,
+                )?;
+            }
+        } else if state.pending.len() < MAX_PENDING_SUBJECTS {
+            processed += consume_submission_page(tx, &mut state, remaining_budget, intake, &pass)?;
+        }
     }
     state.updated_at_ms = now_ms;
     save_state(tx, &key, &state)?;
@@ -243,6 +452,7 @@ pub(super) fn reconcile_entry(
     projection["high_water"] = json!(intake.high_water);
     projection["intake_cursor"] = json!(intake.cursor);
     projection["intake_status"] = serde_json::to_value(intake.status)?;
+    projection["hook_intake"] = serde_json::to_value(intake.hook_commit)?;
     Ok(projection)
 }
 
@@ -262,17 +472,26 @@ pub(super) fn dispatch_state(db: &rusqlite::Connection, entry: &AutomationEntry)
 /// remain lossy hints only.
 pub(crate) fn reconcile(
     tx: &Transaction<'_>,
+    config: &Config,
     entry_budget: usize,
     fact_budget: usize,
     now_ms: i64,
 ) -> Result<Value> {
     let entry_budget = entry_budget.clamp(1, 32);
     let fact_budget = fact_budget.clamp(1, MAX_RECONCILE_FACTS);
-    let intake = reconcile_source_intake(tx, MAX_INTAKE_SOURCE_PAGE, now_ms)?;
     let (entries, last_entry_key) = enabled_entry_page(tx, entry_budget)?;
+    let include_hook_commit = entries.iter().any(|entry| entry.hook_commit.is_some());
+    let intake = reconcile_source_intake(tx, MAX_INTAKE_SOURCE_PAGE, include_hook_commit, now_ms)?;
     let mut results = Vec::with_capacity(entries.len());
     for entry in entries {
-        results.push(reconcile_entry(tx, &entry, fact_budget, intake, now_ms)?);
+        results.push(reconcile_entry(
+            tx,
+            &entry,
+            fact_budget,
+            intake,
+            config,
+            now_ms,
+        )?);
     }
     if let Some(last_entry_key) = last_entry_key {
         config::write_record(
@@ -400,11 +619,10 @@ fn select_enabled_entry_keys_before(
 
 fn consume_submission_page(
     tx: &Transaction<'_>,
-    entry: &AutomationEntry,
     state: &mut DispatchState,
     budget: usize,
     intake: IntakeSnapshot,
-    now_ms: i64,
+    pass: &DispatchPassContext<'_>,
 ) -> Result<usize> {
     let page_limit = budget.min(MAX_SUBMISSION_PAGE);
     let page = automation_intake::pending_page(
@@ -554,41 +772,121 @@ fn consume_submission_page(
                         );
                     }
                     Ok(Some(cause)) => {
-                        match attempt_review_assignment(tx, entry, &cause, now_ms)? {
-                            SubjectResult::Assigned {
-                                operation_id,
-                                value,
-                            } => remember_recent(
+                        if let Some(hook) = pass.hook {
+                            match matching_hook_commit(
+                                tx,
+                                pass.app_config,
+                                pass.entry,
+                                hook.settings,
                                 state,
-                                json!({
-                                    "observation_id":observation_id,
-                                    "submission_ref":cause.id(),
-                                    "source_event_key":receipt.source_event_key,
-                                    "disposition":"assigned",
-                                    "operation_id":operation_id,
-                                    "review_assignment_id":value["review_assignment_id"]
-                                }),
-                            ),
-                            SubjectResult::Pending { reason, wake_when } => {
-                                state.pending.push(PendingSubject {
-                                    cause: cause.as_json(),
-                                    reason,
-                                    wake_when,
-                                    first_seen_at_ms: now_ms,
-                                    last_checked_at_ms: now_ms,
-                                    held: false,
-                                });
+                                &cause,
+                                hook.source_wait_reason,
+                            )? {
+                                HookMatch::Matched(matched) => {
+                                    let MatchedHookCommit {
+                                        receipt: hook,
+                                        fact,
+                                    } = *matched;
+                                    state.pending.push(PendingSubject {
+                                        cause: cause.as_json(),
+                                        reason: "awaiting_review_assignment".to_owned(),
+                                        wake_when: vec![
+                                            "eligible_reviewer_or_review_slot_change".to_owned(),
+                                        ],
+                                        first_seen_at_ms: pass.now_ms,
+                                        last_checked_at_ms: pass.now_ms,
+                                        held: false,
+                                        awaiting_hook: false,
+                                        hook_fact: Some(serde_json::to_value(&fact)?),
+                                        hook_event_key: Some(hook.source_event_key.clone()),
+                                        hook_observation_id: Some(hook.observation_id),
+                                    });
+                                    remember_recent(
+                                        state,
+                                        json!({
+                                            "observation_id":observation_id,
+                                            "submission_ref":cause.id(),
+                                            "source_event_key":receipt.source_event_key,
+                                            "hook_observation_id":hook.observation_id,
+                                            "hook_event_key":hook.source_event_key,
+                                            "disposition":"hook_commit_matched"
+                                        }),
+                                    );
+                                }
+                                HookMatch::Waiting { source_reason } => {
+                                    let unavailable = source_reason.is_some();
+                                    state.pending.push(PendingSubject {
+                                        cause: cause.as_json(),
+                                        reason: source_reason.unwrap_or_else(|| {
+                                            "awaiting_verified_hook_commit".to_owned()
+                                        }),
+                                        wake_when: if unavailable {
+                                            vec!["selected_hook_source_available".to_owned()]
+                                        } else {
+                                            vec!["matching_hook_commit_observed".to_owned()]
+                                        },
+                                        first_seen_at_ms: pass.now_ms,
+                                        last_checked_at_ms: pass.now_ms,
+                                        held: unavailable,
+                                        awaiting_hook: true,
+                                        hook_fact: None,
+                                        hook_event_key: None,
+                                        hook_observation_id: None,
+                                    });
+                                }
+                                HookMatch::ReadbackOnly { reason } => remember_recent(
+                                    state,
+                                    json!({
+                                        "observation_id":observation_id,
+                                        "submission_ref":cause.id(),
+                                        "source_event_key":receipt.source_event_key,
+                                        "disposition":"readback_only",
+                                        "capability":"hook_commit_receipt",
+                                        "reason":reason
+                                    }),
+                                ),
                             }
-                            SubjectResult::Skipped { reason } => remember_recent(
-                                state,
-                                json!({
-                                    "observation_id":observation_id,
-                                    "submission_ref":cause.id(),
-                                    "source_event_key":receipt.source_event_key,
-                                    "disposition":"skipped",
-                                    "reason":reason
-                                }),
-                            ),
+                        } else {
+                            match attempt_review_assignment(tx, pass.entry, &cause, pass.now_ms)? {
+                                SubjectResult::Assigned {
+                                    operation_id,
+                                    value,
+                                } => remember_recent(
+                                    state,
+                                    json!({
+                                        "observation_id":observation_id,
+                                        "submission_ref":cause.id(),
+                                        "source_event_key":receipt.source_event_key,
+                                        "disposition":"assigned",
+                                        "operation_id":operation_id,
+                                        "review_assignment_id":value["review_assignment_id"]
+                                    }),
+                                ),
+                                SubjectResult::Pending { reason, wake_when } => {
+                                    state.pending.push(PendingSubject {
+                                        cause: cause.as_json(),
+                                        reason,
+                                        wake_when,
+                                        first_seen_at_ms: pass.now_ms,
+                                        last_checked_at_ms: pass.now_ms,
+                                        held: false,
+                                        awaiting_hook: false,
+                                        hook_fact: None,
+                                        hook_event_key: None,
+                                        hook_observation_id: None,
+                                    });
+                                }
+                                SubjectResult::Skipped { reason } => remember_recent(
+                                    state,
+                                    json!({
+                                        "observation_id":observation_id,
+                                        "submission_ref":cause.id(),
+                                        "source_event_key":receipt.source_event_key,
+                                        "disposition":"skipped",
+                                        "reason":reason
+                                    }),
+                                ),
+                            }
                         }
                     }
                 }
@@ -604,6 +902,472 @@ fn consume_submission_page(
         state.cursor = target;
     }
     finish_activation_catch_up(state, intake);
+    Ok(processed)
+}
+
+enum HookMatch {
+    Matched(Box<MatchedHookCommit>),
+    Waiting { source_reason: Option<String> },
+    ReadbackOnly { reason: String },
+}
+
+struct GitSnapshotIdentity {
+    project_id: String,
+    commit_oid: String,
+}
+
+fn matching_hook_commit(
+    tx: &Transaction<'_>,
+    app_config: &Config,
+    entry: &AutomationEntry,
+    settings: &config::HookCommitSettings,
+    state: &DispatchState,
+    cause: &AutomationCause,
+    source_wait_reason: Option<&str>,
+) -> Result<HookMatch> {
+    let Some(candidate) = submission_git_identity(tx, entry, cause)? else {
+        return Ok(HookMatch::ReadbackOnly {
+            reason: "submission_candidate_has_no_verified_source_snapshot_identity".to_owned(),
+        });
+    };
+    let indexed = match automation_intake::hook_commit_by_identity(
+        tx,
+        &settings.source_id,
+        &candidate.project_id,
+        &candidate.commit_oid,
+    ) {
+        Ok(indexed) => indexed,
+        Err(error) if safe_hook_index_readback_error(&error.code) => {
+            return Ok(HookMatch::ReadbackOnly {
+                reason: format!(
+                    "hook_receipt_readback_unavailable:{}",
+                    error.code.to_ascii_lowercase()
+                ),
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    let Some((receipt, fact)) = indexed else {
+        return Ok(HookMatch::Waiting {
+            source_reason: source_wait_reason.map(str::to_owned),
+        });
+    };
+    if !state.hook_include_existing && receipt.observation_id <= state.hook_activation_cut {
+        return Ok(HookMatch::ReadbackOnly {
+            reason: "matching_hook_commit_precedes_activation_cut".to_owned(),
+        });
+    }
+    if fact.commit_oid != candidate.commit_oid
+        || fact.project_id != candidate.project_id
+        || fact.project_id != entry.project_id
+    {
+        return Ok(HookMatch::ReadbackOnly {
+            reason: "hook_commit_project_or_candidate_identity_mismatch".to_owned(),
+        });
+    }
+    if let Some(reason) =
+        selected_hook_fact_readback_reason(tx, app_config, entry, settings, &fact)?
+    {
+        return Ok(HookMatch::ReadbackOnly { reason });
+    }
+    Ok(HookMatch::Matched(Box::new(MatchedHookCommit {
+        receipt,
+        fact,
+    })))
+}
+
+fn submission_git_identity(
+    db: &rusqlite::Connection,
+    entry: &AutomationEntry,
+    cause: &AutomationCause,
+) -> Result<Option<GitSnapshotIdentity>> {
+    let AutomationCause::AppliedSubmission {
+        operation_id,
+        submission_ref,
+        ..
+    } = cause
+    else {
+        return Ok(None);
+    };
+    let document = match submissions::document(db, submission_ref) {
+        Ok(document) => document,
+        Err(error) if safe_submission_candidate_readback_error(&error.code) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if document["operation_id"] != json!(operation_id) {
+        return Ok(None);
+    }
+    let Some(task_id) = document["task_id"].as_str() else {
+        return Ok(None);
+    };
+    let task = match tasks::get_task(db, task_id) {
+        Ok(task) => task,
+        Err(error) if safe_submission_candidate_readback_error(&error.code) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let Some(candidate_ref) = document["candidate_ref"].as_str() else {
+        return Ok(None);
+    };
+    let candidate = match super::results::get(db, candidate_ref) {
+        Ok(candidate) => candidate,
+        Err(error) if safe_submission_candidate_readback_error(&error.code) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let attempt_id = document["attempt_id"].as_str().unwrap_or_default();
+    let task_revision = document["task_revision"].as_i64();
+    let commit_oid = candidate.metadata["commit"].as_str().unwrap_or_default();
+    let tree_oid = candidate.metadata["tree"].as_str().unwrap_or_default();
+    if task["project_id"] != entry.project_id
+        || candidate.kind != "source_snapshot"
+        || candidate.metadata["coverage"] != "complete"
+        || candidate.metadata["task_id"] != task_id
+        || candidate.metadata["attempt_id"] != attempt_id
+        || task_revision.is_none()
+        || candidate.metadata["task_revision"] != json!(task_revision)
+        || !crate::forge::valid_object_id(commit_oid)
+        || !crate::forge::valid_object_id(tree_oid)
+    {
+        return Ok(None);
+    }
+    Ok(Some(GitSnapshotIdentity {
+        project_id: task["project_id"].as_str().unwrap_or_default().to_owned(),
+        commit_oid: commit_oid.to_ascii_lowercase(),
+    }))
+}
+
+fn safe_submission_candidate_readback_error(code: &str) -> bool {
+    matches!(
+        code,
+        "ARTIFACT_DAMAGED"
+            | "AUTOMATION_RECORD_CORRUPT"
+            | "AUTOMATION_RECORD_VERSION"
+            | "INVALID_PARAMS"
+            | "NOT_FOUND"
+            | "SUBMISSION_DAMAGED"
+    )
+}
+
+fn selected_hook_source_wait_reason(
+    db: &rusqlite::Connection,
+    app_config: &Config,
+    entry: &AutomationEntry,
+    settings: &config::HookCommitSettings,
+) -> Result<Option<String>> {
+    match super::hooks::source_status(db, app_config, &settings.source_id) {
+        Ok(super::hooks::HookSourceStatus::Current(source))
+            if source.project_id == entry.project_id =>
+        {
+            Ok(None)
+        }
+        Ok(super::hooks::HookSourceStatus::Current(_)) => {
+            Ok(Some("hook_source_project_mismatch".to_owned()))
+        }
+        Ok(super::hooks::HookSourceStatus::Revoked(_)) => {
+            Ok(Some("hook_source_revoked".to_owned()))
+        }
+        Ok(super::hooks::HookSourceStatus::Missing) => Ok(Some("hook_source_missing".to_owned())),
+        Ok(super::hooks::HookSourceStatus::Stale(_)) => Ok(Some("hook_source_stale".to_owned())),
+        Err(error) if optional_hook_source_record_error(&error.code) => Ok(Some(format!(
+            "hook_source_record_corrupt:{}",
+            error.code.to_ascii_lowercase()
+        ))),
+        Err(error) => Err(error),
+    }
+}
+
+fn optional_hook_source_record_error(code: &str) -> bool {
+    matches!(
+        code,
+        "AUTOMATION_RECORD_CORRUPT"
+            | "AUTOMATION_RECORD_VERSION"
+            | "HOOK_SETUP_REQUEST_RECORD_INVALID"
+            | "HOOK_SOURCE_RECORD_INVALID"
+    )
+}
+
+fn safe_hook_index_readback_error(code: &str) -> bool {
+    matches!(
+        code,
+        "AUTOMATION_HOOK_FACT_INVALID"
+            | "AUTOMATION_HOOK_INDEX_CORRUPT"
+            | "AUTOMATION_INTAKE_RECORD_INVALID"
+            | "AUTOMATION_RECORD_CORRUPT"
+            | "AUTOMATION_RECORD_VERSION"
+            | "HOOK_EVENT_RECORD_INVALID"
+    )
+}
+
+fn selected_hook_fact_readback_reason(
+    db: &rusqlite::Connection,
+    app_config: &Config,
+    entry: &AutomationEntry,
+    settings: &config::HookCommitSettings,
+    fact: &crate::hooks::contract::HookCommitFact,
+) -> Result<Option<String>> {
+    if fact.source_id != settings.source_id {
+        return Ok(Some("hook_source_does_not_match_selected_entry".to_owned()));
+    }
+    if fact.project_id != entry.project_id {
+        return Ok(Some("hook_project_outside_selected_entry".to_owned()));
+    }
+    match super::hooks::source_status(db, app_config, &settings.source_id) {
+        Ok(super::hooks::HookSourceStatus::Current(source)) => {
+            if source.source_id != fact.source_id
+                || source.project_id != fact.project_id
+                || source.project_id != entry.project_id
+                || source.canonical_repository != fact.canonical_repository
+                || source.registration_id != fact.registration_id
+                || source.registration_generation != fact.registration_generation
+                || source.event != fact.event
+            {
+                return Ok(Some("hook_source_readback_mismatch".to_owned()));
+            }
+            Ok(None)
+        }
+        Ok(super::hooks::HookSourceStatus::Revoked(_)) => {
+            Ok(Some("hook_source_revoked".to_owned()))
+        }
+        Ok(super::hooks::HookSourceStatus::Missing) => Ok(Some("hook_source_missing".to_owned())),
+        Ok(super::hooks::HookSourceStatus::Stale(_)) => Ok(Some("hook_source_stale".to_owned())),
+        Err(error) if optional_hook_source_record_error(&error.code) => Ok(Some(format!(
+            "hook_source_record_corrupt:{}",
+            error.code.to_ascii_lowercase()
+        ))),
+        Err(error) => Err(error),
+    }
+}
+
+fn consume_hook_commit_page(
+    tx: &Transaction<'_>,
+    state: &mut DispatchState,
+    budget: usize,
+    intake: SourceIntakeSnapshot,
+    pass: &DispatchPassContext<'_>,
+) -> Result<usize> {
+    let Some(hook) = pass.hook else {
+        return Err(Error::new(
+            "AUTOMATION_HOOK_CONTEXT_MISSING",
+            "HookCommit page consumption requires a selected hook trigger",
+        ));
+    };
+    let entry = pass.entry;
+    let settings = hook.settings;
+    let app_config = pass.app_config;
+    let now_ms = pass.now_ms;
+    let page_limit = budget.min(MAX_SUBMISSION_PAGE);
+    let page = automation_intake::pending_page(
+        tx,
+        LocalProducer::HookCommit.source_id(),
+        state.hook_cursor,
+        page_limit,
+    )?;
+    if page.status == IntakeStatus::UnknownSource {
+        return Err(Error::new(
+            "AUTOMATION_INTAKE_SOURCE_MISSING",
+            "selected HookCommit intake has not been registered",
+        ));
+    }
+    if page.status == IntakeStatus::StaleCursor {
+        return Ok(0);
+    }
+    let intake_cursor = page.cursor.ok_or_else(|| {
+        Error::new(
+            "AUTOMATION_INTAKE_CURSOR_MISSING",
+            "registered HookCommit source has no durable cursor",
+        )
+    })?;
+    if intake_cursor != intake.cursor {
+        return Err(Error::new(
+            "AUTOMATION_INTAKE_CURSOR_CHANGED",
+            "per-entry HookCommit journal differs from the shared intake snapshot",
+        ));
+    }
+    if state.hook_cursor >= intake_cursor {
+        return Ok(0);
+    }
+
+    let mut processed = 0usize;
+    for item in &page.items {
+        let observation_id = intake_item_observation_id(item);
+        if observation_id <= state.hook_cursor {
+            return Err(Error::new(
+                "AUTOMATION_INTAKE_JOURNAL_ORDER_INVALID",
+                "HookCommit journal returned an observation at or before the consumer cursor",
+            ));
+        }
+        processed += 1;
+        match item {
+            IntakeItem::Gap(gap) => {
+                if gap.source_id != LocalProducer::HookCommit.source_id()
+                    || gap.observation_id != observation_id
+                {
+                    return Err(Error::new(
+                        "AUTOMATION_INTAKE_JOURNAL_IDENTITY_INVALID",
+                        "pending gap does not match the registered HookCommit source",
+                    ));
+                }
+                remember_recent(
+                    state,
+                    json!({
+                        "hook_observation_id":observation_id,
+                        "hook_source_event_key":gap.source_event_key,
+                        "disposition":"readback_only",
+                        "capability":"hook_commit_receipt",
+                        "reason":gap.reason
+                    }),
+                );
+            }
+            IntakeItem::Receipt(receipt) => {
+                if receipt.source_id != LocalProducer::HookCommit.source_id()
+                    || receipt.event_kind != LocalProducer::HookCommit.event_kind()
+                {
+                    return Err(Error::new(
+                        "AUTOMATION_INTAKE_JOURNAL_IDENTITY_INVALID",
+                        "pending receipt is outside the registered HookCommit source",
+                    ));
+                }
+                let fact = match automation_intake::parse_hook_commit_fact(receipt) {
+                    Ok(fact) => fact,
+                    Err(error) => {
+                        remember_recent(
+                            state,
+                            json!({
+                                "hook_observation_id":observation_id,
+                                "hook_source_event_key":receipt.source_event_key,
+                                "disposition":"readback_only",
+                                "capability":"hook_commit_receipt",
+                                "reason":error.code.to_ascii_lowercase()
+                            }),
+                        );
+                        state.hook_cursor = observation_id;
+                        continue;
+                    }
+                };
+                if fact.source_id != settings.source_id {
+                    remember_recent(
+                        state,
+                        json!({
+                            "hook_observation_id":observation_id,
+                            "hook_source_event_key":receipt.source_event_key,
+                            "disposition":"unselected_source"
+                        }),
+                    );
+                    state.hook_cursor = observation_id;
+                    continue;
+                }
+                if !state.hook_include_existing && observation_id <= state.hook_activation_cut {
+                    remember_recent(
+                        state,
+                        json!({
+                            "hook_observation_id":observation_id,
+                            "hook_source_event_key":receipt.source_event_key,
+                            "disposition":"readback_only",
+                            "capability":"hook_commit_receipt",
+                            "reason":"hook_commit_precedes_activation_cut"
+                        }),
+                    );
+                    state.hook_cursor = observation_id;
+                    continue;
+                }
+                if let Some(reason) =
+                    selected_hook_fact_readback_reason(tx, app_config, entry, settings, &fact)?
+                {
+                    remember_recent(
+                        state,
+                        json!({
+                            "hook_observation_id":observation_id,
+                            "hook_source_event_key":receipt.source_event_key,
+                            "disposition":"readback_only",
+                            "capability":"hook_commit_receipt",
+                            "reason":reason
+                        }),
+                    );
+                    state.hook_cursor = observation_id;
+                    continue;
+                }
+
+                let mut matched = Vec::new();
+                let mut unmatchable = BTreeSet::new();
+                for pending in &mut state.pending {
+                    if pending.held || !pending.awaiting_hook {
+                        continue;
+                    }
+                    let cause = match cause_from_json(&pending.cause) {
+                        Ok(cause) => cause,
+                        Err(_) => {
+                            pending.reason = "retained_cause_corrupt".to_owned();
+                            pending.wake_when = vec!["operator_inspection".to_owned()];
+                            pending.last_checked_at_ms = now_ms;
+                            continue;
+                        }
+                    };
+                    match submission_git_identity(tx, entry, &cause)? {
+                        Some(candidate)
+                            if candidate.project_id == fact.project_id
+                                && candidate.commit_oid == fact.commit_oid.to_ascii_lowercase() =>
+                        {
+                            pending.awaiting_hook = false;
+                            pending.hook_fact = Some(serde_json::to_value(&fact)?);
+                            pending.hook_event_key = Some(receipt.source_event_key.clone());
+                            pending.hook_observation_id = Some(observation_id);
+                            pending.reason = "awaiting_review_assignment".to_owned();
+                            pending.wake_when =
+                                vec!["eligible_reviewer_or_review_slot_change".to_owned()];
+                            pending.last_checked_at_ms = now_ms;
+                            matched.push(cause.id().to_owned());
+                        }
+                        None => {
+                            unmatchable.insert(pending_cause_id(pending).to_owned());
+                        }
+                        _ => {}
+                    }
+                }
+                if !unmatchable.is_empty() {
+                    state.pending.retain(|pending| {
+                        !pending.awaiting_hook || !unmatchable.contains(pending_cause_id(pending))
+                    });
+                    for submission_ref in unmatchable {
+                        remember_recent(
+                            state,
+                            json!({
+                                "submission_ref":submission_ref,
+                                "hook_observation_id":observation_id,
+                                "disposition":"readback_only",
+                                "capability":"hook_commit_receipt",
+                                "reason":"submission_candidate_has_no_verified_source_snapshot_identity"
+                            }),
+                        );
+                    }
+                }
+                if matched.is_empty() {
+                    remember_recent(
+                        state,
+                        json!({
+                            "hook_observation_id":observation_id,
+                            "hook_source_event_key":receipt.source_event_key,
+                            "disposition":"retained_readback_only",
+                            "capability":"hook_commit_receipt",
+                            "reason":"no_exact_applied_submission_yet"
+                        }),
+                    );
+                } else {
+                    remember_recent(
+                        state,
+                        json!({
+                            "hook_observation_id":observation_id,
+                            "hook_source_event_key":receipt.source_event_key,
+                            "submission_refs":matched,
+                            "disposition":"hook_commit_matched"
+                        }),
+                    );
+                }
+            }
+        }
+        state.hook_cursor = observation_id;
+    }
+    if processed == page.items.len() && page.items.len() < page_limit {
+        state.hook_cursor = intake_cursor;
+    }
     Ok(processed)
 }
 
@@ -632,27 +1396,36 @@ fn recheck_pending(
     entry: &AutomationEntry,
     state: &mut DispatchState,
     budget: usize,
+    app_config: &Config,
     now_ms: i64,
 ) -> Result<usize> {
     if budget == 0 || state.pending.is_empty() || !entry.enabled {
         return Ok(0);
     }
     state.pending.sort_by_key(pending_observation_id);
-    let start = state
+    let eligible = state
         .pending
         .iter()
-        .position(|pending| pending_observation_id(pending) > state.pending_after_observation_id)
+        .enumerate()
+        .filter(|(_, pending)| !pending.held && !pending.awaiting_hook)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if eligible.is_empty() {
+        return Ok(0);
+    }
+    let start = eligible
+        .iter()
+        .position(|index| {
+            pending_observation_id(&state.pending[*index]) > state.pending_after_observation_id
+        })
         .unwrap_or(0);
-    let candidates = state.pending.len().min(budget);
+    let candidates = eligible.len().min(budget);
     let indices = (0..candidates)
-        .map(|offset| (start + offset) % state.pending.len())
+        .map(|offset| eligible[(start + offset) % eligible.len()])
         .collect::<Vec<_>>();
     let mut remove = BTreeSet::new();
     for index in indices {
         state.pending_after_observation_id = pending_observation_id(&state.pending[index]);
-        if state.pending[index].held {
-            continue;
-        }
         let cause = match cause_from_json(&state.pending[index].cause) {
             Ok(cause) => cause,
             Err(error) => {
@@ -663,6 +1436,33 @@ fn recheck_pending(
                 continue;
             }
         };
+        let hook_fact = state.pending[index].hook_fact.clone();
+        if let Some(hook_fact_value) = hook_fact.as_ref()
+            && let Some(reason) = pending_hook_readback_reason(
+                tx,
+                app_config,
+                entry,
+                &state.pending[index],
+                &cause,
+                hook_fact_value,
+            )?
+        {
+            remove.insert(cause.id().to_owned());
+            remember_recent(
+                state,
+                json!({
+                    "submission_ref":cause.id(),
+                    "hook_observation_id":state.pending[index].hook_observation_id,
+                    "hook_event_key":state.pending[index].hook_event_key,
+                    "disposition":"readback_only",
+                    "capability":"hook_commit_receipt",
+                    "reason":reason
+                }),
+            );
+            continue;
+        }
+        let hook_event_key = state.pending[index].hook_event_key.clone();
+        let hook_observation_id = state.pending[index].hook_observation_id;
         match attempt_review_assignment(tx, entry, &cause, now_ms)? {
             SubjectResult::Assigned {
                 operation_id,
@@ -675,7 +1475,9 @@ fn recheck_pending(
                         "submission_ref":cause.id(),
                         "disposition":"assigned",
                         "operation_id":operation_id,
-                        "review_assignment_id":value["review_assignment_id"]
+                        "review_assignment_id":value["review_assignment_id"],
+                        "hook_event_key":hook_event_key,
+                        "hook_observation_id":hook_observation_id
                     }),
                 );
             }
@@ -688,7 +1490,13 @@ fn recheck_pending(
                 remove.insert(cause.id().to_owned());
                 remember_recent(
                     state,
-                    json!({"submission_ref":cause.id(),"disposition":"skipped","reason":reason}),
+                    json!({
+                        "submission_ref":cause.id(),
+                        "disposition":"skipped",
+                        "reason":reason,
+                        "hook_event_key":hook_event_key,
+                        "hook_observation_id":hook_observation_id
+                    }),
                 );
             }
         }
@@ -697,6 +1505,65 @@ fn recheck_pending(
         .pending
         .retain(|pending| !remove.contains(pending_cause_id(pending)));
     Ok(candidates)
+}
+
+fn pending_hook_readback_reason(
+    db: &rusqlite::Connection,
+    app_config: &Config,
+    entry: &AutomationEntry,
+    pending: &PendingSubject,
+    cause: &AutomationCause,
+    value: &Value,
+) -> Result<Option<String>> {
+    let Some(settings) = entry.hook_commit.as_ref() else {
+        return Ok(Some("hook_trigger_removed".to_owned()));
+    };
+    let fact = match crate::hooks::contract::HookCommitFact::parse(value) {
+        Ok(fact) => fact,
+        Err(error) => return Ok(Some(error.code.to_ascii_lowercase())),
+    };
+    let event_key = pending.hook_event_key.as_deref().unwrap_or_default();
+    if pending.hook_observation_id.is_none_or(|id| id <= 0)
+        || event_key != format!("{}:{}", fact.source_id, fact.commit_oid)
+        || fact.source_id != settings.source_id
+        || fact.project_id != entry.project_id
+    {
+        return Ok(Some("hook_pending_identity_mismatch".to_owned()));
+    }
+    let Some(candidate) = submission_git_identity(db, entry, cause)? else {
+        return Ok(Some(
+            "submission_candidate_has_no_verified_source_snapshot_identity".to_owned(),
+        ));
+    };
+    if candidate.project_id != fact.project_id
+        || candidate.commit_oid != fact.commit_oid.to_ascii_lowercase()
+    {
+        return Ok(Some("hook_commit_candidate_identity_changed".to_owned()));
+    }
+    let retained = match automation_intake::hook_commit_by_identity(
+        db,
+        &fact.source_id,
+        &fact.project_id,
+        &fact.commit_oid,
+    ) {
+        Ok(Some(retained)) => retained,
+        Ok(None) => return Ok(Some("hook_commit_receipt_missing".to_owned())),
+        Err(error) if safe_hook_index_readback_error(&error.code) => {
+            return Ok(Some(format!(
+                "hook_commit_receipt_unavailable:{}",
+                error.code.to_ascii_lowercase()
+            )));
+        }
+        Err(error) => return Err(error),
+    };
+    let (receipt, retained_fact) = retained;
+    if receipt.observation_id != pending.hook_observation_id.unwrap_or_default()
+        || receipt.source_event_key != event_key
+        || retained_fact != fact
+    {
+        return Ok(Some("hook_pending_receipt_mismatch".to_owned()));
+    }
+    selected_hook_fact_readback_reason(db, app_config, entry, settings, &fact)
 }
 
 fn attempt_review_assignment(
@@ -1212,6 +2079,8 @@ fn validate_state(state: &DispatchState, entry: &AutomationEntry) -> Result<()> 
         || state.automation_id != entry.automation_id
         || state.step != AutomationStep::ReviewDispatch.as_str()
         || state.cursor < 0
+        || state.hook_cursor < 0
+        || state.hook_activation_cut < 0
         || state.pending.len() > MAX_PENDING_SUBJECTS
         || state.recent.len() > MAX_RECENT_DISPOSITIONS
     {
@@ -1236,6 +2105,9 @@ fn empty_state(entry: &AutomationEntry, cut: i64, now_ms: i64) -> DispatchState 
         automation_id: entry.automation_id.clone(),
         step: AutomationStep::ReviewDispatch.as_str().to_owned(),
         cursor: cut,
+        hook_cursor: cut,
+        hook_activation_cut: cut,
+        hook_include_existing: false,
         activation_cut: cut,
         catch_up_until: None,
         pending_after_observation_id: 0,
@@ -1250,6 +2122,9 @@ fn state_projection(state: &DispatchState) -> Value {
         "schema_version":state.schema_version,
         "step":state.step,
         "cursor":state.cursor,
+        "hook_cursor":state.hook_cursor,
+        "hook_activation_cut":state.hook_activation_cut,
+        "hook_include_existing":state.hook_include_existing,
         "activation_cut":state.activation_cut,
         "catch_up_until":state.catch_up_until,
         "pending":state.pending,

@@ -358,12 +358,20 @@ impl Service {
     pub(super) async fn post_no_body(&self, path: &str) -> Result<Value> {
         self.request(Method::POST, path, &[], None).await
     }
-    pub(super) async fn post_integration_key(&self, integration_id: &str, key: &str) -> Result<()> {
+    pub(super) async fn post_integration_key(
+        &self,
+        integration_id: &str,
+        key: &str,
+        directory: &str,
+    ) -> Result<()> {
         if integration_id != "opencode-go" {
             return Err(Error::invalid("unsupported provider integration"));
         }
         if key.is_empty() {
             return Err(Error::invalid("provider integration key is empty"));
+        }
+        if directory.is_empty() || directory.len() > 4096 {
+            return Err(Error::invalid("provider integration workspace is invalid"));
         }
         if self.owned_process.is_none() {
             return Err(Error::new(
@@ -371,14 +379,19 @@ impl Service {
                 "provider integration key requires a verified owned service",
             ));
         }
-        self.with_owned_process_check(self.post_integration_key_unchecked(key))
+        self.with_owned_process_check(self.post_integration_key_unchecked(key, directory))
             .await
     }
-    async fn post_integration_key_unchecked(&self, key: &str) -> Result<()> {
-        let url = self
+    async fn post_integration_key_unchecked(&self, key: &str, directory: &str) -> Result<()> {
+        let mut url = self
             .endpoint
             .join("/api/integration/opencode-go/connect/key")
             .map_err(|_| Error::new("NATIVE_ENDPOINT", "invalid provider integration route"))?;
+        // OpenCode 2.0.7's LocationMiddleware defaults an omitted directory to
+        // the server's process.cwd(). Bind this mutation to the same explicit
+        // workspace used by the surrounding integration readbacks.
+        url.query_pairs_mut()
+            .append_pair("location[directory]", directory);
         if url.origin() != self.endpoint.origin() {
             return Err(Error::new(
                 "NATIVE_ENDPOINT",

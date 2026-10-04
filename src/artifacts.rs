@@ -189,6 +189,9 @@ impl ArtifactFiles {
             "source_snapshot" => "source-",
             "check_result" => "check-",
             "check_output" => "checklog-",
+            "script_bundle" => "script-",
+            "script_result" => "scriptresult-",
+            "script_output" => "scriptlog-",
             _ => return Err(Error::new("ARTIFACT_KIND", "unsupported artifact kind")),
         };
         let hex = record.artifact_id.strip_prefix(prefix).unwrap_or("");
@@ -401,7 +404,13 @@ impl ArtifactFiles {
         }
         if matches!(
             record.kind.as_str(),
-            "task_submission" | "source_snapshot" | "check_result" | "check_output"
+            "task_submission"
+                | "source_snapshot"
+                | "check_result"
+                | "check_output"
+                | "script_bundle"
+                | "script_result"
+                | "script_output"
         ) {
             let bytes = self.verified_range(record, offset, length)?;
             let (encoding, content) = match std::str::from_utf8(&bytes) {

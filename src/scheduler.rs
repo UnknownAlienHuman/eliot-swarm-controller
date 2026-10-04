@@ -192,6 +192,9 @@ pub(crate) async fn run(store: Store, mut stopping: watch::Receiver<bool>) -> Re
         let mut next_due = store
             .reconcile_automation_cron_once(MAX_SCHEDULES, now)
             .await?;
+        if let Some(due) = store.reconcile_goals_once(now).await? {
+            next_due = Some(next_due.map_or(due, |old: i64| old.min(due)));
+        }
         for schedule in schedules {
             if let Some(due) = store.consider_scheduled(schedule.clone(), now).await? {
                 next_due = Some(next_due.map_or(due, |old: i64| old.min(due)));

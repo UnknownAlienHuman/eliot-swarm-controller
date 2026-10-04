@@ -606,7 +606,7 @@ pub(crate) fn valid_branch_ref(value: &str) -> bool {
 }
 
 /// Canonicalize only a credential-free `host/owner/repository` identity.
-pub(crate) fn canonical_repository(value: &str) -> Result<String> {
+pub fn canonical_repository(value: &str) -> Result<String> {
     let parts: Vec<_> = value.split('/').collect();
     if parts.len() < 3
         || !valid_host(parts[0])

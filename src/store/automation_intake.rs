@@ -18,6 +18,7 @@ const JOURNAL_SCHEMA_VERSION: u32 = 1;
 const MAX_SOURCE_EVENT_KEY_BYTES: usize = 512;
 const MAX_INTAKE_PAYLOAD_BYTES: i64 = 48 * 1024;
 const RECEIPT_STORAGE_PREFIX: &str = "automation:v1:intake:receipt:";
+const HOOK_COMMIT_INDEX_PREFIX: &str = "automation:v1:intake:hook_commit:";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -52,6 +53,98 @@ struct ObservationRow {
     payload_json: String,
     payload_oversized: bool,
     recorded_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HookCommitIndex {
+    schema_version: u32,
+    source_id: String,
+    project_id: String,
+    commit_oid: String,
+    canonical_repository: String,
+    receipt_key: String,
+    event_digest: String,
+}
+
+/// Find the immutable, readback-verified HookCommit receipt for one selected
+/// setup source and exact project/commit identity. The caller must still
+/// validate the current HookSource/workspace registration before admission.
+pub(crate) fn hook_commit_by_identity(
+    db: &Connection,
+    hook_source_id: &str,
+    project_id: &str,
+    commit_oid: &str,
+) -> Result<Option<(EventReceipt, crate::hooks::contract::HookCommitFact)>> {
+    let normalized_commit = commit_oid.to_ascii_lowercase();
+    let key = hook_commit_index_key(hook_source_id, project_id, &normalized_commit)?;
+    let Some(value) = config::read_record(db, &key, "HookCommit identity index")? else {
+        return Ok(None);
+    };
+    let index: HookCommitIndex = decode_record(value, "HookCommit identity index")?;
+    if index.schema_version != 1
+        || index.source_id != hook_source_id
+        || index.project_id != project_id
+        || !index.commit_oid.eq_ignore_ascii_case(&normalized_commit)
+        || !valid_receipt_storage_key(&index.receipt_key)
+        || !valid_event_digest(&index.event_digest)
+    {
+        return Err(Error::new(
+            "AUTOMATION_HOOK_INDEX_CORRUPT",
+            "HookCommit identity index is inconsistent",
+        ));
+    }
+    let Some(value) = readback_value(db, &index.receipt_key, "HookCommit event receipt")? else {
+        return Err(Error::new(
+            "AUTOMATION_HOOK_INDEX_CORRUPT",
+            "HookCommit identity index points to a missing receipt",
+        ));
+    };
+    let value = value.map_err(|reason| {
+        Error::new(
+            "AUTOMATION_HOOK_INDEX_CORRUPT",
+            format!("HookCommit receipt readback failed: {reason}"),
+        )
+    })?;
+    let receipt: EventReceipt = decode_record(value, "HookCommit event receipt")?;
+    let registration =
+        load_registration(db, LocalProducer::HookCommit.source_id())?.ok_or_else(|| {
+            Error::new(
+                "AUTOMATION_HOOK_INDEX_CORRUPT",
+                "HookCommit receipt has no registered intake source",
+            )
+        })?;
+    let fact = parse_hook_commit_fact(&receipt)?;
+    if !valid_receipt(
+        &receipt,
+        LocalProducer::HookCommit.source_id(),
+        &registration,
+        receipt.observation_id,
+    ) || receipt.event_digest != index.event_digest
+        || receipt_key(&receipt.source_id, &receipt.source_event_key)? != index.receipt_key
+        || fact.source_id != index.source_id
+        || fact.project_id != index.project_id
+        || !fact.commit_oid.eq_ignore_ascii_case(&index.commit_oid)
+        || fact.canonical_repository != index.canonical_repository
+        || receipt_digest(&receipt).as_deref() != Some(receipt.event_digest.as_str())
+    {
+        return Err(Error::new(
+            "AUTOMATION_HOOK_INDEX_CORRUPT",
+            "HookCommit indexed receipt does not match its retained identity",
+        ));
+    }
+    Ok(Some((receipt, fact)))
+}
+
+pub(crate) fn parse_hook_commit_fact(
+    receipt: &EventReceipt,
+) -> Result<crate::hooks::contract::HookCommitFact> {
+    validate_hook_commit_payload(
+        &receipt.source_id,
+        &receipt.event_kind,
+        &receipt.source_event_key,
+        &receipt.payload,
+    )
 }
 
 /// Admit a closed, existing local Store producer and initialize its cursor.
@@ -175,7 +268,29 @@ pub(crate) fn reconcile_source_page(
     let mut items = Vec::with_capacity(rows.len());
     let mut last_scanned = cursor.observation_id;
     for row in rows {
-        let item = process_observation(tx, source_id, &row)?;
+        let mut item = process_observation(tx, source_id, &row)?;
+        if let IntakeItem::Receipt(receipt) = &item
+            && registration.producer == LocalProducer::HookCommit
+        {
+            let event_key = receipt.source_event_key.clone();
+            let event_digest = receipt.event_digest.clone();
+            let index_error = match parse_hook_commit_fact(receipt)
+                .and_then(|fact| write_hook_commit_index(tx, receipt, &fact))
+            {
+                Ok(_) => None,
+                Err(error) if error.code == "STORE_ERROR" => return Err(error),
+                Err(error) => Some(error.code.to_ascii_lowercase()),
+            };
+            if let Some(reason_code) = index_error {
+                item = IntakeItem::Gap(gap(
+                    &row,
+                    source_id,
+                    Some(&event_key),
+                    Some(&event_digest),
+                    &format!("hook_commit_index_readback:{reason_code}"),
+                ));
+            }
+        }
         write_journal(tx, source_id, row.observation_id, &item)?;
         last_scanned = row.observation_id;
         items.push(item);
@@ -463,6 +578,17 @@ fn process_observation(
             )));
         }
     };
+    if source_id == LocalProducer::HookCommit.source_id()
+        && validate_hook_commit_payload(source_id, &row.event_kind, event_key, &payload).is_err()
+    {
+        return Ok(IntakeItem::Gap(gap(
+            row,
+            source_id,
+            Some(event_key),
+            None,
+            "hook_commit_contract_invalid",
+        )));
+    }
     let digest_input = json!({
         "schema_version":1,
         "source_id":source_id,
@@ -948,6 +1074,57 @@ fn receipt_key(source_id: &str, source_event_key: &str) -> Result<String> {
     let identity = json!([source_id, source_event_key]);
     Ok(format!(
         "automation:v1:intake:receipt:{}",
+        model::digest(model::canonical(&identity)?.as_bytes())
+    ))
+}
+
+fn validate_hook_commit_payload(
+    receipt_source_id: &str,
+    event_kind: &str,
+    source_event_key: &str,
+    payload: &Value,
+) -> Result<crate::hooks::contract::HookCommitFact> {
+    if receipt_source_id != LocalProducer::HookCommit.source_id()
+        || event_kind != LocalProducer::HookCommit.event_kind()
+    {
+        return Err(Error::new(
+            "AUTOMATION_HOOK_FACT_INVALID",
+            "HookCommit receipt is outside its registered source contract",
+        ));
+    }
+    let fact = crate::hooks::contract::HookCommitFact::parse(payload)?;
+    if source_event_key != format!("{}:{}", fact.source_id, fact.commit_oid) {
+        return Err(Error::new(
+            "AUTOMATION_HOOK_FACT_INVALID",
+            "HookCommit event key does not identify its source and exact commit",
+        ));
+    }
+    Ok(fact)
+}
+
+fn write_hook_commit_index(
+    tx: &Transaction<'_>,
+    receipt: &EventReceipt,
+    fact: &crate::hooks::contract::HookCommitFact,
+) -> Result<()> {
+    let record = HookCommitIndex {
+        schema_version: 1,
+        source_id: fact.source_id.clone(),
+        project_id: fact.project_id.clone(),
+        commit_oid: fact.commit_oid.to_ascii_lowercase(),
+        canonical_repository: fact.canonical_repository.clone(),
+        receipt_key: receipt_key(&receipt.source_id, &receipt.source_event_key)?,
+        event_digest: receipt.event_digest.clone(),
+    };
+    let key = hook_commit_index_key(&record.source_id, &record.project_id, &record.commit_oid)?;
+    write_immutable_record(tx, &key, &record, "HookCommit identity index")?;
+    Ok(())
+}
+
+fn hook_commit_index_key(source_id: &str, project_id: &str, commit_oid: &str) -> Result<String> {
+    let identity = json!([source_id, project_id, commit_oid.to_ascii_lowercase()]);
+    Ok(format!(
+        "{HOOK_COMMIT_INDEX_PREFIX}{}",
         model::digest(model::canonical(&identity)?.as_bytes())
     ))
 }

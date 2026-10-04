@@ -113,6 +113,65 @@ fn entry_state_keys(
     ])
 }
 
+fn cron_state_key(
+    origin: &str,
+    project: &str,
+    automation_id: &str,
+    generation: &str,
+) -> Result<(String, String)> {
+    let logical_id = model::digest(
+        model::canonical(&json!({
+            "cron_logical_entry_schema_version":1,
+            "origin_manager_id":origin,
+            "project_id":project,
+            "automation_id":automation_id,
+        }))?
+        .as_bytes(),
+    );
+    Ok((
+        logical_id.clone(),
+        format!("automation:v1:cron:state:{logical_id}:{generation}"),
+    ))
+}
+
+async fn read_cron_ledger(
+    store: &Store,
+    origin: &str,
+    project: &str,
+    automation_id: &str,
+    generation: String,
+) -> (Value, Value, i64) {
+    let (logical_id, state_key) =
+        cron_state_key(origin, project, automation_id, &generation).unwrap();
+    store
+        .run(move |db| {
+            let state_json: String = db.query_row(
+                "SELECT value_json FROM meta WHERE key=?1",
+                [state_key.as_str()],
+                |row| row.get(0),
+            )?;
+            let state: Value = serde_json::from_str(&state_json)?;
+            let wake_at_ms = state["indexed_due_at_ms"].as_i64().ok_or_else(|| {
+                Error::new("TEST_CRON_STATE_MISSING", "cron state has no indexed wake")
+            })?;
+            let due_key = format!("automation:v1:cron:due:{wake_at_ms:020}:{logical_id}");
+            let due_json: String = db.query_row(
+                "SELECT value_json FROM meta WHERE key=?1",
+                [due_key.as_str()],
+                |row| row.get(0),
+            )?;
+            let due: Value = serde_json::from_str(&due_json)?;
+            let due_count: i64 = db.query_row(
+                "SELECT COUNT(*) FROM meta WHERE key LIKE ?1",
+                [format!("automation:v1:cron:due:%:{logical_id}")],
+                |row| row.get(0),
+            )?;
+            Ok((state, due, due_count))
+        })
+        .await
+        .unwrap()
+}
+
 async fn seed_pending_journals(
     store: &Store,
     owner: &str,
@@ -277,6 +336,16 @@ async fn current_gm_transfer_preserves_all_entry_journals_and_retires_old_owner(
         "stop_conditions":[],
         "purpose":"implementation"
     });
+    // Keep a real enabled cron generation in this fixture. The four owner-
+    // scoped journals below are separate from cron's stable logical-entry
+    // state, which transfer relocates by updating its current-owner index.
+    let cron_anchor_ms = model::now_ms().unwrap().saturating_add(86_400_000);
+    let cron_calendar = crate::scheduler::calendar::CalendarDefinition {
+        expression: "0 0 0 * * *".to_owned(),
+        timezone: "UTC".to_owned(),
+        anchor_ms: cron_anchor_ms,
+    };
+    let cron_generation = crate::scheduler::calendar::generation_digest(&cron_calendar).unwrap();
     let changes = json!([{
         "automation_id":AUTOMATION_ID,
         "expected_revision":0,
@@ -284,13 +353,30 @@ async fn current_gm_transfer_preserves_all_entry_journals_and_retires_old_owner(
         "patch":{
             "enabled":true,
             "scope":{"work_pool_id":null},
-            "steps":["review_dispatch","review_disposition","work_dispatch","publication"],
+            "steps":[
+                "review_dispatch",
+                "review_disposition",
+                "work_dispatch",
+                "publication",
+                "check_run"
+            ],
             "review":{"profile":"transfer-auditor","required_reviewers":1},
             "work_dispatch":work_dispatch,
             "publication":{
                 "target_ref":"refs/heads/main",
                 "expected_old_ref":null,
                 "expected_create":true
+            },
+            "cron":{
+                "calendar":cron_calendar.clone(),
+                "action":{
+                    "kind":"check_run",
+                    "attempt_id":"00000000-0000-4000-8000-000000000001",
+                    "expected_task_revision":1,
+                    "candidate_ref":"transfer-cron-candidate",
+                    "profile_id":"strict",
+                    "profile_revision":"v1"
+                }
             }
         }
     }]);
@@ -324,6 +410,21 @@ async fn current_gm_transfer_preserves_all_entry_journals_and_retires_old_owner(
     let old_journals =
         seed_pending_journals(&owner.store, &former.client_id, PROJECT, AUTOMATION_ID).await;
     assert_eq!(old_journals.len(), 4);
+    let (old_cron_state, old_cron_due, old_cron_due_count) = read_cron_ledger(
+        &owner.store,
+        &former.client_id,
+        PROJECT,
+        AUTOMATION_ID,
+        cron_generation.clone(),
+    )
+    .await;
+    assert_eq!(old_cron_due_count, 1);
+    assert_eq!(old_cron_state["origin_manager_id"], former.client_id);
+    assert_eq!(
+        old_cron_state["indexed_due_at_ms"],
+        old_cron_due["wake_at_ms"]
+    );
+    assert_eq!(old_cron_due["current_owner_manager_id"], former.client_id);
 
     write(
         &owner.store,
@@ -402,7 +503,7 @@ async fn current_gm_transfer_preserves_all_entry_journals_and_retires_old_owner(
         .await
         .unwrap();
     assert_eq!(transfer["status"], "transferred");
-    assert_eq!(transfer["state_ledgers_relocated"], 4);
+    assert_eq!(transfer["state_ledgers_relocated"], 5);
     assert_eq!(transfer["new_owner_manager_id"], successor.client_id);
     let transfer_operation_id = transfer["transfer_operation_id"].as_str().unwrap();
 
@@ -424,6 +525,26 @@ async fn current_gm_transfer_preserves_all_entry_journals_and_retires_old_owner(
     let retired_journals =
         read_state_records(&owner.store, &former.client_id, PROJECT, AUTOMATION_ID).await;
     assert!(retired_journals.iter().all(|(_, value)| value.is_none()));
+
+    let (target_cron_state, target_cron_due, target_cron_due_count) = read_cron_ledger(
+        &owner.store,
+        &former.client_id,
+        PROJECT,
+        AUTOMATION_ID,
+        cron_generation,
+    )
+    .await;
+    assert_eq!(
+        target_cron_due_count, 1,
+        "cron due index was duplicated or lost"
+    );
+    let mut expected_cron_state = old_cron_state.clone();
+    expected_cron_state["updated_at_ms"] = target_cron_state["updated_at_ms"].clone();
+    assert_eq!(target_cron_state, expected_cron_state);
+    let mut expected_cron_due = old_cron_due.clone();
+    expected_cron_due["current_owner_manager_id"] = json!(successor.client_id);
+    assert_eq!(target_cron_due, expected_cron_due);
+    assert_eq!(target_cron_state["origin_manager_id"], former.client_id);
 
     let (source, target, lineage, successors) = {
         let former_id = former.client_id.clone();
@@ -468,6 +589,10 @@ async fn current_gm_transfer_preserves_all_entry_journals_and_retires_old_owner(
     assert_eq!(target["enabled"], true);
     assert_eq!(target["owner_manager_id"], successor.client_id);
     assert_eq!(target["revision"], 2);
+    assert_eq!(
+        target["cron"], source["cron"],
+        "transfer changed cron configuration"
+    );
     assert_eq!(lineage[0]["transfer_operation_id"], transfer_operation_id);
     assert_eq!(lineage[0]["former_owner_manager_id"], former.client_id);
     assert_eq!(lineage[0]["new_owner_manager_id"], successor.client_id);

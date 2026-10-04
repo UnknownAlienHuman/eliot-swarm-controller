@@ -187,7 +187,7 @@ pub(super) async fn bootstrap_once(
     }
 
     let post_result = service
-        .post_integration_key(PROVIDER_ID, credential.key.as_str()?)
+        .post_integration_key(PROVIDER_ID, credential.key.as_str()?, location)
         .await;
     let mut credential = credential;
     credential.key.clear();

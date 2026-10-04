@@ -16,7 +16,11 @@ mod checks;
 mod coordination;
 mod coordination_watch;
 mod forge;
+mod github;
 mod gm;
+mod goals;
+mod hooks;
+mod host_lifecycle;
 mod integration;
 mod launch_registration;
 pub(crate) mod launcher;
@@ -39,6 +43,7 @@ mod review_disposition;
 mod reviews;
 mod runtime;
 mod schedules;
+mod scripts;
 mod status_reader;
 mod submissions;
 mod tasks;
@@ -63,6 +68,8 @@ use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 const SCHEMA: &str = include_str!("../../migrations/001_core.sql");
 const WORKSPACE_SCHEMA: &str = include_str!("../../migrations/002_workspace.sql");
 const OWNED_SERVICE_SCHEMA: &str = include_str!("../../migrations/003_owned_services.sql");
+const SCRIPT_SCHEMA: &str = include_str!("../../migrations/004_scripts.sql");
+const GITHUB_SCHEMA: &str = include_str!("../../migrations/006_github.sql");
 const APPLICATION_ID: i64 = 0x45534331;
 const LOCAL_OPERATOR_CLIENT_ID_KEY: &str = "local_operator_client_id";
 type RunJob = Box<dyn FnOnce(&mut Connection) + Send>;
@@ -215,6 +222,35 @@ async fn join_store_thread(thread: JoinHandle<()>, name: &'static str) -> Result
         .map_err(|_| Error::new("STORE_PANIC", format!("{name} panicked")))
 }
 impl Store {
+    pub(crate) async fn record_host_start(&self) -> Result<()> {
+        self.run(move |db| {
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            host_lifecycle::start(&tx, model::now_ms()?)?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub(crate) async fn record_host_ready(&self) -> Result<()> {
+        self.run(move |db| {
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            host_lifecycle::ready(&tx, model::now_ms()?)?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub(crate) async fn record_host_exit(&self, error_code: Option<String>) -> Result<()> {
+        self.run(move |db| {
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            host_lifecycle::finish(&tx, error_code.as_deref(), model::now_ms()?)?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
     pub(crate) async fn reconcile_workspace_lifecycle_once(&self) -> Result<Value> {
         // Exact owned-process departure is observed outside the DB owner
         // transaction. Unknown or live starts remain a separate lease fence.
@@ -445,13 +481,25 @@ impl Store {
         self.run(move |db| {
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let now = model::now_ms()?;
-            let review_dispatch = automation_dispatch::reconcile(&tx, 16, 64, now)?;
+            let review_dispatch = automation_dispatch::reconcile(&tx, &config, 16, 64, now)?;
             let work_dispatch = automation_work_dispatch::reconcile(&tx, &config, 16, 64, now)?;
             let publication = automation_publication::reconcile(&tx, &config, 16, 64, now)?;
             // The cursor, pending reasons, semantic slot and Operation are
             // durable before the host can observe an admitted action.
             tx.commit()?;
             Ok(json!({"review_dispatch":review_dispatch,"work_dispatch":work_dispatch,"publication":publication}))
+        })
+        .await
+    }
+
+    /// Goal reminders use the same durable scheduler wake and transaction owner.
+    pub(crate) async fn reconcile_goals_once(&self, now: i64) -> Result<Option<i64>> {
+        self.run(move |db| {
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            goals::reconcile(&tx, now, 64)?;
+            let next_due = goals::next_due_at_ms(&tx)?;
+            tx.commit()?;
+            Ok(next_due)
         })
         .await
     }
@@ -602,6 +650,14 @@ impl Store {
         .await
     }
     pub async fn call(&self, principal: Principal, method: String, params: Value) -> Result<Value> {
+        if principal.role == Role::HookSource
+            && !matches!(method.as_str(), "hook.emit" | "hook.source.get")
+        {
+            return Err(Error::new(
+                "FORBIDDEN",
+                "hook credentials may emit and read only their source",
+            ));
+        }
         if principal.role == Role::Participant && !participant_method_allowed(&method) {
             return Err(Error::new(
                 "FORBIDDEN",
@@ -610,6 +666,18 @@ impl Store {
         }
         if method == "host.status" {
             return self.status_reader.host_status(principal, params).await;
+        }
+        if method.starts_with("script.") {
+            return self.script_call(principal, method, params).await;
+        }
+        if method.starts_with("github.") {
+            return self.github_call(principal, method, params).await;
+        }
+        if matches!(
+            method.as_str(),
+            "hook.source.setup" | "hook.emit" | "hook.source.get"
+        ) {
+            return self.hook_call(principal, method, params).await;
         }
         if matches!(method.as_str(), "message.send" | "coordination.send") {
             return self.message_send(principal, method, params).await;
@@ -735,6 +803,12 @@ impl Store {
                 | "review.assign"
                 | "review.submit"
                 | "task.request_changes"
+                | "goal.create"
+                | "goal.revise"
+                | "goal.enable"
+                | "goal.disable"
+                | "goal.readback"
+                | "hook.source.revoke"
         );
         let config = self.config.clone();
         let result = self
@@ -806,6 +880,92 @@ impl Store {
         }
         result
     }
+
+    /// Hook issuance/ingress has a fixed repository scope. Setup acknowledges
+    /// a credential already retained privately by the caller before dispatch.
+    async fn hook_call(
+        &self,
+        principal: Principal,
+        method: String,
+        params: Value,
+    ) -> Result<Value> {
+        let config = self.config.clone();
+        match method.as_str() {
+            "hook.source.setup" => {
+                let request = crate::hooks::contract::HookSetupRequest::parse(&params)?;
+                self.run(move |db| {
+                    let p = current_principal(db, principal)?;
+                    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                    let response =
+                        hooks::setup_source(&tx, &p, &config, &request, model::now_ms()?)?;
+                    tx.commit()?;
+                    Ok(json!({"source":response.public_value()}))
+                })
+                .await
+            }
+            "hook.emit" => {
+                model::fields(&params, &["source_id", "commit_oid", "client_request_id"])?;
+                let source_id = model::text(&params, "source_id")?.to_owned();
+                let commit_oid = model::text(&params, "commit_oid")?.to_owned();
+                let p = principal.clone();
+                let scope_config = config.clone();
+                let scope = self
+                    .run(move |db| {
+                        let p = current_principal(db, p)?;
+                        hooks::emit_scope(db, &p, &scope_config, &source_id)
+                    })
+                    .await?;
+                let verify_scope = scope.clone();
+                let snapshot = tokio::task::spawn_blocking(move || {
+                    crate::hooks::git::resolve_commit(&verify_scope, &commit_oid)
+                })
+                .await
+                .map_err(|_| {
+                    Error::new("HOOK_GIT_FAILED", "hook Git verification worker ended")
+                })??;
+                let result = self
+                    .run(move |db| {
+                        let p = current_principal(db, principal)?;
+                        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                        let result =
+                            hooks::emit(&tx, &p, &config, &scope, &snapshot, model::now_ms()?)?;
+                        tx.commit()?;
+                        Ok(result)
+                    })
+                    .await?;
+                if result["recorded"] == true {
+                    self.changed.send_modify(|n| *n = n.wrapping_add(1));
+                }
+                Ok(result)
+            }
+            "hook.source.get" => {
+                model::fields(&params, &["source_id", "after", "limit"])?;
+                let source_id = model::text(&params, "source_id")?.to_owned();
+                let after = match params.get("after") {
+                    None => 0,
+                    Some(value) => value
+                        .as_i64()
+                        .filter(|after| *after >= 0)
+                        .ok_or_else(|| Error::invalid("after must be a nonnegative integer"))?,
+                };
+                let limit = match params.get("limit") {
+                    None => 20,
+                    Some(value) => value
+                        .as_u64()
+                        .filter(|limit| (1..=64).contains(limit))
+                        .ok_or_else(|| Error::invalid("limit must be 1..64"))?
+                        as usize,
+                };
+                self.run(move |db| {
+                    let p = current_principal(db, principal)?;
+                    hooks::get(db, &p, &source_id, after, limit, &config)
+                })
+                .await
+            }
+            _ => Err(Error::new("METHOD_NOT_FOUND", method)),
+        }
+    }
+
     async fn file_io<T: Send + 'static>(
         &self,
         f: impl FnOnce(ArtifactFiles) -> Result<T> + Send + 'static,
@@ -1034,7 +1194,14 @@ impl Store {
                     ));
                 }
                 reviews::authorize_artifact_read(db, &p, &id)?;
-                results::get(db, &id)
+                let artifact = results::get(db, &id)?;
+                if matches!(
+                    artifact.kind.as_str(),
+                    "script_bundle" | "script_result" | "script_output"
+                ) {
+                    scripts::authorize_artifact_read(db, &p, &artifact)?;
+                }
+                Ok(artifact)
             })
             .await?;
         self.file_io(move |files| files.read(&record, offset, length as usize))
@@ -1209,6 +1376,24 @@ fn open_database(root: &Path, credential: &Credential) -> Result<Connection> {
             set_meta(&tx, "schema_extension:owned_services:v1", &owned_digest)?;
         }
     }
+    install_schema_extension(
+        &tx,
+        "schema_extension:scripts:v1",
+        SCRIPT_SCHEMA,
+        &["scripts", "script_revisions", "script_runs"],
+    )?;
+    install_schema_extension(
+        &tx,
+        "schema_extension:github:v1",
+        GITHUB_SCHEMA,
+        &[
+            "github_sources",
+            "github_issue_items",
+            "github_issue_facts",
+            "github_work_pool_members",
+            "github_poll_leases",
+        ],
+    )?;
     let scheduler_key = format!("client:{}", model::INTERNAL_SCHEDULER_CLIENT_ID);
     match meta(&tx, &scheduler_key)? {
         None => set_meta(
@@ -1255,6 +1440,10 @@ fn open_database(root: &Path, credential: &Credential) -> Result<Connection> {
         "UPDATE check_runs SET state='reconciling' WHERE state='running'",
         [],
     )?;
+    tx.execute(
+        "UPDATE script_runs SET state='reconciling' WHERE state='running'",
+        [],
+    )?;
     tx.commit()?;
     let fk: i64 = db.pragma_query_value(None, "foreign_keys", |r| r.get(0))?;
     let mode: String = db.pragma_query_value(None, "journal_mode", |r| r.get(0))?;
@@ -1280,10 +1469,50 @@ pub(super) fn set_meta(db: &Connection, key: &str, value: &Value) -> Result<()> 
     db.execute("INSERT INTO meta(key,value_json) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json", params![key,model::canonical(value)?])?;
     Ok(())
 }
+/// Add a known, source-pinned extension without adopting unrelated existing tables.
+fn install_schema_extension(
+    tx: &Transaction<'_>,
+    key: &str,
+    schema: &str,
+    tables: &[&str],
+) -> Result<()> {
+    let expected = json!(model::digest(schema.as_bytes()));
+    match meta(tx, key)? {
+        Some(digest) if digest == expected => Ok(()),
+        Some(_) => Err(Error::new(
+            "SCHEMA_MISMATCH",
+            format!("{key} extension content differs"),
+        )),
+        None => {
+            for table in tables {
+                let occupied: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name=?1)",
+                    [table],
+                    |row| row.get(0),
+                )?;
+                if occupied {
+                    return Err(Error::new(
+                        "SCHEMA_MISMATCH",
+                        format!("unregistered {key} table exists"),
+                    ));
+                }
+            }
+            tx.execute_batch(schema)?;
+            set_meta(tx, key, &expected)
+        }
+    }
+}
+
 fn is_read(method: &str) -> bool {
     matches!(
         method,
-        "check.get"
+        "goal.get"
+            | "goal.list"
+            | "script.get"
+            | "script.list"
+            | "script.validate"
+            | "hook.source.get"
+            | "check.get"
             | "mcp.authorization"
             | "swarm.context.get"
             | "coordination.participant.get"
@@ -1384,9 +1613,48 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
         AND op.method NOT LIKE 'coordination.%'
         AND op.method NOT LIKE 'review.%'
         AND op.method NOT LIKE 'automation.%'
+        AND op.method NOT LIKE 'script.%'
+        AND op.method NOT LIKE 'goal.%'
+        AND op.method NOT LIKE 'hook.%'
+        AND op.method NOT LIKE 'github.%'
         AND op.caller_id != 'eliot-internal-automation-v1'
     )
     OR op.caller_id = :client
+    OR (
+        ((op.method LIKE 'script.%' AND op.method != 'script.run') OR op.method LIKE 'goal.%'
+         OR op.method LIKE 'hook.%' OR op.method LIKE 'github.%')
+        AND EXISTS (
+            SELECT 1 FROM meta AS manager JOIN meta AS current_gm ON current_gm.key='gm'
+            WHERE manager.key='client:' || :client
+              AND json_extract(manager.value_json,'$.role')='manager'
+              AND COALESCE(json_extract(manager.value_json,'$.disabled'),0)=0
+              AND json_extract(current_gm.value_json,'$.client_id')=:client
+        )
+    )
+    OR (
+        op.method = 'script.run'
+        AND EXISTS (
+            SELECT 1 FROM script_runs AS run
+            JOIN attempts AS target_attempt ON target_attempt.attempt_id=run.attempt_id
+            JOIN tasks AS target ON target.task_id=run.task_id AND target.task_id=target_attempt.task_id
+            JOIN meta AS manager ON manager.key='client:' || :client
+            JOIN meta AS current_gm ON current_gm.key='gm'
+            WHERE run.operation_id=op.operation_id AND run.task_id=op.task_id AND run.attempt_id=op.attempt_id
+              AND json_extract(manager.value_json,'$.role')='manager'
+              AND COALESCE(json_extract(manager.value_json,'$.disabled'),0)=0
+              AND json_extract(current_gm.value_json,'$.client_id')=:client
+        )
+    )
+    OR (
+        op.method LIKE 'goal.%'
+        AND EXISTS (
+            SELECT 1 FROM attempts AS target JOIN meta AS manager ON manager.key='client:' || :client
+            WHERE target.attempt_id=op.attempt_id AND target.task_id=op.task_id
+              AND target.owner_id=:client
+              AND json_extract(manager.value_json,'$.role')='manager'
+              AND COALESCE(json_extract(manager.value_json,'$.disabled'),0)=0
+        )
+    )
     OR (
         op.method IN ('task.request_changes', 'check.run', 'check.cancel')
         AND EXISTS (
@@ -2398,6 +2666,8 @@ fn mcp_authorization(db: &Connection, p: &Principal, value: &Value) -> Result<Va
                 !participant_only_mutation(method)
                     && *method != "review.submit"
                     && (gm_authority
+                        || !(method.starts_with("script.") || method.starts_with("hook.")))
+                    && (gm_authority
                         || !matches!(
                             *method,
                             "client.register"
@@ -2428,8 +2698,12 @@ fn mcp_authorization(db: &Connection, p: &Principal, value: &Value) -> Result<Va
                         | "automation.config.explain"
                 )
                 && !method.starts_with("coordination.")
+                && !method.starts_with("script.")
+                && !method.starts_with("goal.")
+                && !method.starts_with("hook.")
+                && !method.starts_with("github.")
         })),
-        Role::Module | Role::Scheduler => {
+        Role::Module | Role::Scheduler | Role::HookSource => {
             return Err(Error::new(
                 "FORBIDDEN",
                 "this role has no MCP discovery surface",
@@ -2455,6 +2729,7 @@ fn mcp_authorization(db: &Connection, p: &Principal, value: &Value) -> Result<Va
 
 fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config) -> Result<Value> {
     match method {
+        "goal.get" | "goal.list" => goals::read(db, p, method, v),
         "mcp.authorization" => mcp_authorization(db, p, v),
         "swarm.context.get"
         | "coordination.participant.get"
@@ -2521,7 +2796,7 @@ fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config
                 |r| r.get(0),
             )?;
             Ok(
-                json!({"version":env!("CARGO_PKG_VERSION"),"controller_id":meta(db,"controller_id")?,"host_epoch":meta(db,"host_epoch")?,"gm":gm::record(db)?,"gm_wake_mode":gm::WAKE_MODE,"sqlite":rusqlite::version(),"tasks":tasks,"unreleased_attempts":owners,"queued_operations":queued,"execution_mode":meta(db,"execution_mode")?,"native_modules_connected":db.query_row("SELECT count(*) FROM bindings WHERE released_at_ms IS NULL AND json_extract(state_json, '$.connection')='connected'",[],|r|r.get::<_,i64>(0))?,"native_execution":"scoped_runtime_protocol","schedules":schedules::status(db,&config.schedules,model::now_ms()?)?}),
+                json!({"version":env!("CARGO_PKG_VERSION"),"controller_id":meta(db,"controller_id")?,"host_epoch":meta(db,"host_epoch")?,"host_lifecycle":host_lifecycle::status(db)?,"gm":gm::record(db)?,"gm_wake_mode":gm::WAKE_MODE,"sqlite":rusqlite::version(),"tasks":tasks,"unreleased_attempts":owners,"queued_operations":queued,"execution_mode":meta(db,"execution_mode")?,"native_modules_connected":db.query_row("SELECT count(*) FROM bindings WHERE released_at_ms IS NULL AND json_extract(state_json, '$.connection')='connected'",[],|r|r.get::<_,i64>(0))?,"native_execution":"scoped_runtime_protocol","schedules":schedules::status(db,&config.schedules,model::now_ms()?)?}),
             )
         }
         "agent.family" => producers::family(db, v),
@@ -2557,7 +2832,7 @@ fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config
             if !operation_visible_to(db, p, id)? {
                 return Err(Error::new("NOT_FOUND", format!("Operation {id}")));
             }
-            operations::get_operation(db, id)
+            operations::get_operation_for_current_manager(db, p, id)
         }
         "agent.state" => {
             model::fields(v, &["binding_id", "generation"])?;
@@ -2712,6 +2987,10 @@ fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config
                     || kind.starts_with("coordination.")
                     || kind.starts_with("review.")
                     || kind.starts_with("automation.")
+                    || kind.starts_with("script.")
+                    || kind.starts_with("goal.")
+                    || kind.starts_with("hook.")
+                    || kind.starts_with("github.")
                     || matches!(
                         kind.as_str(),
                         "task.request_changes"
@@ -2779,7 +3058,14 @@ fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config
                 limited.gap_count == 0,
                 Vec::new(),
             )?;
-            Ok(json!({"items":limited.items,"next_cursor":next,"projection":frame}))
+            let goal_reminders = if mailbox_only {
+                goals::notifications(db, p, limit)?
+            } else {
+                Value::Null
+            };
+            Ok(
+                json!({"items":limited.items,"next_cursor":next,"projection":frame,"goal_reminders":goal_reminders}),
+            )
         }
         _ => Err(Error::new("METHOD_NOT_FOUND", method)),
     }
@@ -3492,6 +3778,23 @@ fn apply(
         )?;
     }
     match method {
+        "goal.create" | "goal.revise" | "goal.enable" | "goal.disable" | "goal.readback" => {
+            goals::apply(tx, p, method, v, id, now)
+        }
+        "github.source.setup" | "github.source.poll" | "github.work_pool.apply" => {
+            github::apply(tx, p, method, v, config, id, now)
+        }
+        "hook.source.revoke" => hooks::revoke(
+            tx,
+            p,
+            model::text(v, "source_id")?,
+            model::positive(v, "expected_revision")?,
+            now,
+        )
+        .map(|mut value| {
+            value["operation_id"] = json!(id);
+            (value, false)
+        }),
         "coordination.sync_integration" => integration::apply(tx, p, method, v, config, id, now),
         "swarm.launch" => launcher::launch(tx, p, v, config, id, now),
         "coordination.watch.create" | "coordination.watch.cancel" => {
@@ -3592,6 +3895,12 @@ fn apply(
                 return Err(Error::new(
                     "FORBIDDEN",
                     "operator role is reserved for the bootstrap credential",
+                ));
+            }
+            if role == Role::HookSource {
+                return Err(Error::new(
+                    "FORBIDDEN",
+                    "hook credentials require repository-scoped source setup",
                 ));
             }
             if role == Role::Scheduler || client == model::INTERNAL_SCHEDULER_CLIENT_ID {
@@ -3760,6 +4069,8 @@ fn cancel_message(tx: &Transaction<'_>, p: &Principal, v: &Value, id: &str) -> R
 mod automation_transfer_tests;
 #[cfg(test)]
 mod capacity_tests;
+#[cfg(test)]
+mod core_failure_tests;
 #[cfg(test)]
 mod gm_automation_recovery_tests;
 #[cfg(test)]

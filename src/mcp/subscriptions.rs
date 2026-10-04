@@ -628,7 +628,12 @@ async fn deliver_tick(
     id: &str,
 ) -> Option<i64> {
     for _ in 0..MAX_PAGES_PER_TICK {
-        let page = source.delta_page(cursor).await.ok()?;
+        let page = match source.delta_page(cursor).await {
+            Ok(page) => page,
+            // A failed read is not a closed delivery queue. Keep the
+            // cursor at the last fully examined entry and retry next tick.
+            Err(_) => return Some(cursor),
+        };
         let frame = page["projection"].clone();
         let has_newer = frame["has_newer"] == json!(true);
         let items = page["items"].as_array().cloned().unwrap_or_default();

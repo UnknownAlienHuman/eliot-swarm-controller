@@ -1140,6 +1140,261 @@ static TOOLS: &[(bool, ToolSpec)] = &[
         &[f("delivery_id", S), f("payload_digest", S), f("reason", SN)],
         &["delivery_id", "payload_digest"],
     ),
+    read(
+        "hook.source.get",
+        "Read public metadata and bounded retained facts for one authenticated hook source; credentials are never returned.",
+        &[f("source_id", S), f("after", I), f("limit", I)],
+        &["source_id"],
+    ),
+    mutation(
+        "hook.source.revoke",
+        "Disable one exact setup-issued hook source using revision compare-and-swap.",
+        &[f("source_id", S), f("expected_revision", I)],
+        &["source_id", "expected_revision"],
+    ),
+    mutation(
+        "goal.create",
+        "Create a task-scoped tracking goal; it starts no Task, model, or native work.",
+        &[
+            f("project_id", S),
+            f("task_id", S),
+            f("task_revision", I),
+            f("attempt_id", S),
+            f("goal_id", S),
+            f("expected_revision", I),
+            f("objective", S),
+            f("completion_evidence", O),
+            f("reminder", O),
+            f("enabled", B),
+        ],
+        &[
+            "project_id",
+            "task_id",
+            "task_revision",
+            "attempt_id",
+            "goal_id",
+            "expected_revision",
+            "objective",
+            "completion_evidence",
+        ],
+    ),
+    mutation(
+        "goal.revise",
+        "Revise one task-scoped tracking goal with revision compare-and-swap; changing enabled state does not start work.",
+        &[
+            f("project_id", S),
+            f("task_id", S),
+            f("task_revision", I),
+            f("attempt_id", S),
+            f("goal_id", S),
+            f("expected_revision", I),
+            f("objective", S),
+            f("completion_evidence", O),
+            f("reminder", O),
+            f("enabled", B),
+        ],
+        &[
+            "project_id",
+            "task_id",
+            "task_revision",
+            "attempt_id",
+            "goal_id",
+            "expected_revision",
+        ],
+    ),
+    mutation(
+        "goal.enable",
+        "Enable one revision-checked Goal reminder entry; this never dispatches Task or model work.",
+        &[
+            f("project_id", S),
+            f("task_id", S),
+            f("task_revision", I),
+            f("attempt_id", S),
+            f("goal_id", S),
+            f("expected_revision", I),
+        ],
+        &[
+            "project_id",
+            "task_id",
+            "task_revision",
+            "attempt_id",
+            "goal_id",
+            "expected_revision",
+        ],
+    ),
+    mutation(
+        "goal.disable",
+        "Disable one revision-checked Goal reminder entry while retaining readback and history.",
+        &[
+            f("project_id", S),
+            f("task_id", S),
+            f("task_revision", I),
+            f("attempt_id", S),
+            f("goal_id", S),
+            f("expected_revision", I),
+        ],
+        &[
+            "project_id",
+            "task_id",
+            "task_revision",
+            "attempt_id",
+            "goal_id",
+            "expected_revision",
+        ],
+    ),
+    mutation(
+        "goal.readback",
+        "Persist a fresh evidence evaluation for one exact retained Goal scope under an Operation receipt.",
+        &[
+            f("project_id", S),
+            f("task_id", S),
+            f("task_revision", I),
+            f("attempt_id", S),
+            f("goal_id", S),
+        ],
+        &[
+            "project_id",
+            "task_id",
+            "task_revision",
+            "attempt_id",
+            "goal_id",
+        ],
+    ),
+    read(
+        "goal.get",
+        "Read one exact task-scoped Goal and its retained completion/reminder projection.",
+        &[
+            f("project_id", S),
+            f("task_id", S),
+            f("task_revision", I),
+            f("attempt_id", S),
+            f("goal_id", S),
+        ],
+        &[
+            "project_id",
+            "task_id",
+            "task_revision",
+            "attempt_id",
+            "goal_id",
+        ],
+    ),
+    read(
+        "goal.list",
+        "Page Goals only within one exact retained project, Task revision, and Attempt scope.",
+        &[
+            f("project_id", S),
+            f("task_id", S),
+            f("task_revision", I),
+            f("attempt_id", S),
+            f("after_goal_id", S),
+            f("limit", I),
+        ],
+        &["project_id", "task_id", "task_revision", "attempt_id"],
+    ),
+    mutation(
+        "script.register",
+        "Register one complete bounded trusted-local script bundle; no API capabilities or trigger are enabled.",
+        &[f("bundle", O)],
+        &["bundle"],
+    ),
+    mutation(
+        "script.revise",
+        "Publish a complete replacement script bundle under revision compare-and-swap.",
+        &[f("script_id", S), f("expected_revision", I), f("bundle", O)],
+        &["script_id", "expected_revision", "bundle"],
+    ),
+    read(
+        "script.validate",
+        "Validate one retained script revision and report metadata only; it does not execute the script.",
+        &[f("script_id", S), f("revision", I)],
+        &["script_id", "revision"],
+    ),
+    mutation(
+        "script.activate",
+        "Select one retained script revision for future authorized runs; activation does not execute it.",
+        &[f("script_id", S), f("revision", I)],
+        &["script_id", "revision"],
+    ),
+    mutation(
+        "script.run",
+        "Start exactly one authorized invocation of an activated script for one exact Attempt and Task revision.",
+        &[
+            f("script_id", S),
+            f("expected_script_revision", I),
+            f("attempt_id", S),
+            f("expected_task_revision", I),
+            f("input", "any"),
+        ],
+        &[
+            "script_id",
+            "expected_script_revision",
+            "attempt_id",
+            "expected_task_revision",
+            "input",
+        ],
+    ),
+    read(
+        "script.get",
+        "Read one script revision's metadata; bundle bytes are not returned.",
+        &[f("script_id", S), f("revision", IN)],
+        &["script_id"],
+    ),
+    read(
+        "script.list",
+        "Page authorized script registry metadata without bundle bytes.",
+        &[f("after", I), f("limit", I)],
+        &[],
+    ),
+    read(
+        "github.source.inspect",
+        "Inspect one GitHub repository through the installed gh account and return bounded public facts.",
+        &[f("host", S), f("owner", S), f("repo", S)],
+        &["host", "owner", "repo"],
+    ),
+    mutation(
+        "github.source.setup",
+        "Register one explicitly inspected GitHub repository for bounded issue intake.",
+        &[
+            f("source_id", S),
+            f("project_id", S),
+            f("host", S),
+            f("owner", S),
+            f("repo", S),
+            f("repository_id", I),
+        ],
+        &[
+            "source_id",
+            "project_id",
+            "host",
+            "owner",
+            "repo",
+            "repository_id",
+        ],
+    ),
+    read(
+        "github.source.get",
+        "Read public metadata and bounded coverage state for one registered GitHub source.",
+        &[f("source_id", S)],
+        &["source_id"],
+    ),
+    mutation(
+        "github.source.poll",
+        "Poll one registered source once, retaining bounded issue facts and exact coverage.",
+        &[f("source_id", S)],
+        &["source_id"],
+    ),
+    read(
+        "github.work_pool.preview",
+        "Preview bounded source-mapped Tasks eligible for explicit local work-pool admission.",
+        &[f("source_id", S), f("after", S), f("limit", I)],
+        &["source_id"],
+    ),
+    mutation(
+        "github.work_pool.apply",
+        "Apply an explicit bounded selection of source-mapped Tasks to the existing local work pool.",
+        &[f("source_id", S), f("task_ids", A)],
+        &["source_id", "task_ids"],
+    ),
 ];
 
 /// Canonical application methods advertised by MCP. The catalog search is a
@@ -1197,6 +1452,9 @@ fn input_schema(spec: &ToolSpec, read_only: bool, require_request_id: bool) -> A
 }
 
 fn refine_input_schema(method: &str, schema: &mut Value) {
+    if matches!(method, "script.register" | "script.revise") {
+        schema["$defs"] = json!({"ScriptValueSchema":script_value_schema_definition()});
+    }
     let properties = &mut schema["properties"];
     match method {
         "task.dispatch" => {
@@ -1356,6 +1614,138 @@ fn refine_input_schema(method: &str, schema: &mut Value) {
         "coordination.watch.cancel" => {
             properties["watch_id"] = json!({"type":"string","minLength":1,"maxLength":128});
         }
+        "hook.source.get" => {
+            properties["source_id"] =
+                json!({"type":"string","minLength":1,"maxLength":128,"pattern":"^\\S+$"});
+            properties["after"] =
+                json!({"type":"integer","minimum":0,"maximum":9223372036854775807_i64});
+            properties["limit"] = json!({"type":"integer","minimum":1,"maximum":64});
+        }
+        "hook.source.revoke" => {
+            properties["source_id"] =
+                json!({"type":"string","minLength":1,"maxLength":128,"pattern":"^\\S+$"});
+            properties["expected_revision"] =
+                json!({"type":"integer","minimum":1,"maximum":9223372036854775807_i64});
+        }
+        "goal.create" | "goal.revise" | "goal.enable" | "goal.disable" | "goal.readback"
+        | "goal.get" | "goal.list" => {
+            for name in ["project_id", "task_id", "attempt_id", "goal_id"] {
+                properties[name] =
+                    json!({"type":"string","minLength":1,"maxLength":128,"pattern":"^\\S+$"});
+            }
+            properties["task_revision"] =
+                json!({"type":"integer","minimum":1,"maximum":9223372036854775807_i64});
+            if method == "goal.create" {
+                properties["expected_revision"] = json!({"type":"integer","const":0});
+            } else if matches!(method, "goal.revise" | "goal.enable" | "goal.disable") {
+                properties["expected_revision"] =
+                    json!({"type":"integer","minimum":1,"maximum":9223372036854775807_i64});
+            }
+            if matches!(method, "goal.create" | "goal.revise") {
+                properties["objective"] = json!({"type":"string","minLength":1,"maxLength":32768});
+                properties["enabled"] = json!({"type":"boolean"});
+                properties["completion_evidence"] = json!({
+                    "type":"object",
+                    "properties":{"kind":{"const":"task_acceptance"}},
+                    "required":["kind"],
+                    "additionalProperties":false
+                });
+                properties["reminder"] = json!({
+                    "oneOf":[
+                        {"type":"null"},
+                        {
+                            "type":"object",
+                            "properties":{
+                                "due_at_ms":{"type":"integer","minimum":1,"maximum":9223372036854775807_i64},
+                                "cooldown_ms":{"type":"integer","minimum":0,"maximum":7776000000_i64}
+                            },
+                            "required":["due_at_ms","cooldown_ms"],
+                            "additionalProperties":false
+                        }
+                    ]
+                });
+            }
+            if method == "goal.list" {
+                properties["after_goal_id"] =
+                    json!({"type":"string","minLength":1,"maxLength":128,"pattern":"^\\S+$"});
+                properties["limit"] = json!({"type":"integer","minimum":1,"maximum":50});
+            }
+        }
+        "script.register" | "script.revise" => {
+            properties["bundle"] = script_bundle_request_schema();
+            if method == "script.revise" {
+                properties["script_id"] = script_id_schema();
+                properties["expected_revision"] =
+                    json!({"type":"integer","minimum":1,"maximum":9223372036854775807_i64});
+            }
+        }
+        "script.validate" | "script.activate" => {
+            properties["script_id"] = script_id_schema();
+            properties["revision"] =
+                json!({"type":"integer","minimum":1,"maximum":9223372036854775807_i64});
+        }
+        "script.run" => {
+            properties["script_id"] = script_id_schema();
+            properties["expected_script_revision"] =
+                json!({"type":"integer","minimum":1,"maximum":9223372036854775807_i64});
+            properties["attempt_id"] =
+                json!({"type":"string","minLength":1,"maxLength":128,"pattern":"^\\S+$"});
+            properties["expected_task_revision"] =
+                json!({"type":"integer","minimum":1,"maximum":9223372036854775807_i64});
+            properties["input"] = json!({});
+        }
+        "script.get" => {
+            properties["script_id"] = script_id_schema();
+            properties["revision"] =
+                json!({"type":["integer","null"],"minimum":1,"maximum":9223372036854775807_i64});
+        }
+        "script.list" => {
+            properties["after"] = json!({"type":"integer","minimum":0});
+            properties["limit"] = json!({"type":"integer","minimum":1,"maximum":100});
+        }
+        "github.source.inspect" => {
+            properties["host"] =
+                json!({"type":"string","minLength":1,"maxLength":253,"pattern":"^\\S+$"});
+            properties["owner"] =
+                json!({"type":"string","minLength":1,"maxLength":128,"pattern":"^\\S+$"});
+            properties["repo"] =
+                json!({"type":"string","minLength":1,"maxLength":128,"pattern":"^\\S+$"});
+        }
+        "github.source.setup" => {
+            properties["source_id"] =
+                json!({"type":"string","minLength":1,"maxLength":128,"pattern":"^\\S+$"});
+            properties["project_id"] =
+                json!({"type":"string","minLength":1,"maxLength":128,"pattern":"^\\S+$"});
+            properties["host"] =
+                json!({"type":"string","minLength":1,"maxLength":253,"pattern":"^\\S+$"});
+            properties["owner"] =
+                json!({"type":"string","minLength":1,"maxLength":128,"pattern":"^\\S+$"});
+            properties["repo"] =
+                json!({"type":"string","minLength":1,"maxLength":128,"pattern":"^\\S+$"});
+            properties["repository_id"] =
+                json!({"type":"integer","minimum":1,"maximum":9223372036854775807_i64});
+        }
+        "github.source.get" | "github.source.poll" => {
+            properties["source_id"] =
+                json!({"type":"string","minLength":1,"maxLength":128,"pattern":"^\\S+$"});
+        }
+        "github.work_pool.preview" => {
+            properties["source_id"] =
+                json!({"type":"string","minLength":1,"maxLength":128,"pattern":"^\\S+$"});
+            properties["after"] = json!({"type":"string","minLength":1,"maxLength":512});
+            properties["limit"] = json!({"type":"integer","minimum":1,"maximum":200});
+        }
+        "github.work_pool.apply" => {
+            properties["source_id"] =
+                json!({"type":"string","minLength":1,"maxLength":128,"pattern":"^\\S+$"});
+            properties["task_ids"] = json!({
+                "type":"array",
+                "minItems":1,
+                "maxItems":200,
+                "uniqueItems":true,
+                "items":{"type":"string","minLength":1,"maxLength":512,"pattern":"^\\S+$"}
+            });
+        }
         "swarm.launch.preview" | "swarm.launch" => {
             properties["task_id"] = json!({"type":"string","minLength":1,"maxLength":512});
             properties["expected_task_revision"] =
@@ -1393,6 +1783,60 @@ fn refine_input_schema(method: &str, schema: &mut Value) {
         }
         _ => {}
     }
+}
+
+fn script_bundle_request_schema() -> Value {
+    json!({
+        "type":"object",
+        "properties":{
+            "script_id":script_id_schema(),
+            "interpreter_kind":{"type":"string","enum":["python","powershell"]},
+            "interpreter_path":{"type":"string","minLength":1},
+            "entrypoint":{"type":"string","minLength":1,"maxLength":240},
+            "argv":{"type":"array","maxItems":32,"items":{"type":"string","maxLength":4096}},
+            "trust":{"const":"trusted_local"},
+            "inherit_environment":{"type":"array","maxItems":32,"items":{"type":"string","minLength":1,"maxLength":256}},
+            "input_schema":{"$ref":"#/$defs/ScriptValueSchema"},
+            "result_schema":{"$ref":"#/$defs/ScriptValueSchema"},
+            "files":{
+                "type":"array","minItems":1,"maxItems":64,
+                "items":{
+                    "type":"object",
+                    "properties":{
+                        "path":{"type":"string","minLength":1,"maxLength":240},
+                        "content_base64":{"type":"string","maxLength":349528}
+                    },
+                    "required":["path","content_base64"],
+                    "additionalProperties":false
+                }
+            }
+        },
+        "required":["script_id","interpreter_kind","interpreter_path","entrypoint","trust","input_schema","result_schema","files"],
+        "additionalProperties":false
+    })
+}
+
+fn script_value_schema_definition() -> Value {
+    json!({
+        "oneOf":[
+            {"type":"object","properties":{"type":{"const":"null"}},"required":["type"],"additionalProperties":false},
+            {"type":"object","properties":{"type":{"const":"boolean"}},"required":["type"],"additionalProperties":false},
+            {"type":"object","properties":{"type":{"const":"integer"}},"required":["type"],"additionalProperties":false},
+            {"type":"object","properties":{"type":{"const":"number"}},"required":["type"],"additionalProperties":false},
+            {"type":"object","properties":{"type":{"const":"string"},"max_bytes":{"type":"integer","minimum":0,"maximum":262144}},"required":["type","max_bytes"],"additionalProperties":false},
+            {"type":"object","properties":{"type":{"const":"array"},"items":{"$ref":"#/$defs/ScriptValueSchema"},"max_items":{"type":"integer","minimum":0,"maximum":4096}},"required":["type","items","max_items"],"additionalProperties":false},
+            {"type":"object","properties":{"type":{"const":"object"},"properties":{"type":"object","maxProperties":64,"additionalProperties":{"$ref":"#/$defs/ScriptValueSchema"}},"required":{"type":"array","maxItems":64,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":128}},"additional_properties":{"const":false}},"required":["type"],"additionalProperties":false}
+        ]
+    })
+}
+
+fn script_id_schema() -> Value {
+    json!({
+        "type":"string",
+        "minLength":1,
+        "maxLength":64,
+        "pattern":"^[a-z0-9_-]+$"
+    })
 }
 
 fn require_all_or_none_scope(schema: &mut Value) {
@@ -2906,15 +3350,37 @@ mod tests {
             "review.submit",
             "automation.config.apply",
             "automation.config.transfer",
+            "hook.source.get",
+            "hook.source.revoke",
+            "goal.create",
+            "goal.revise",
+            "goal.enable",
+            "goal.disable",
+            "goal.readback",
+            "goal.get",
+            "goal.list",
+            "script.register",
+            "script.revise",
+            "script.validate",
+            "script.activate",
+            "script.run",
+            "script.get",
+            "script.list",
+            "github.source.inspect",
+            "github.source.setup",
+            "github.source.get",
+            "github.source.poll",
+            "github.work_pool.preview",
+            "github.work_pool.apply",
         ]
         .into_iter()
         .collect();
         assert_eq!(methods, expected);
-        assert_eq!(TOOLS.len(), 93);
-        assert_eq!(TOOLS.iter().filter(|(read_only, _)| *read_only).count(), 45);
+        assert_eq!(TOOLS.len(), 115);
+        assert_eq!(TOOLS.iter().filter(|(read_only, _)| *read_only).count(), 54);
         assert_eq!(
             TOOLS.iter().filter(|(read_only, _)| !*read_only).count(),
-            48
+            61
         );
     }
 

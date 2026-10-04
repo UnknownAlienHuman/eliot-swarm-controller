@@ -24,6 +24,9 @@ pub enum ToolGroup {
     Administration,
     AssignmentRead,
     Core,
+    Goals,
+    GitHub,
+    Hooks,
     MailboxRaw,
     ManagerCore,
     Monitoring,
@@ -31,6 +34,7 @@ pub enum ToolGroup {
     RuntimeControl,
     RuntimeRecovery,
     Schedules,
+    Scripts,
     TaskManagement,
     GitRead,
     ParticipantCoordination,
@@ -43,6 +47,9 @@ impl ToolGroup {
             Self::Administration => "administration",
             Self::AssignmentRead => "assignment-read",
             Self::Core => "core",
+            Self::Goals => "goals",
+            Self::GitHub => "github",
+            Self::Hooks => "hooks",
             Self::MailboxRaw => "mailbox-raw",
             Self::ManagerCore => "manager-core",
             Self::Monitoring => "monitoring",
@@ -50,6 +57,7 @@ impl ToolGroup {
             Self::RuntimeControl => "runtime-control",
             Self::RuntimeRecovery => "runtime-recovery",
             Self::Schedules => "schedules",
+            Self::Scripts => "scripts",
             Self::TaskManagement => "task-management",
             Self::GitRead => "git-read",
             Self::ParticipantCoordination => "participant-coordination",
@@ -62,6 +70,9 @@ impl ToolGroup {
             "administration" => Self::Administration,
             "assignment-read" => Self::AssignmentRead,
             "core" => Self::Core,
+            "goals" => Self::Goals,
+            "github" => Self::GitHub,
+            "hooks" => Self::Hooks,
             "mailbox-raw" => Self::MailboxRaw,
             "manager-core" => Self::ManagerCore,
             "monitoring" => Self::Monitoring,
@@ -69,6 +80,7 @@ impl ToolGroup {
             "runtime-control" => Self::RuntimeControl,
             "runtime-recovery" => Self::RuntimeRecovery,
             "schedules" => Self::Schedules,
+            "scripts" => Self::Scripts,
             "task-management" => Self::TaskManagement,
             "git-read" => Self::GitRead,
             "participant-coordination" => Self::ParticipantCoordination,
@@ -220,6 +232,11 @@ const REVIEW_ASSIGNMENT_READ_AUDIENCES: &[ToolAudience] = &[
 const MANAGER_ONLY_AUDIENCES: &[ToolAudience] =
     &[ToolAudience::Manager, ToolAudience::FullCompatibility];
 const GM_AUDIENCES: &[ToolAudience] = &[ToolAudience::GmOperator, ToolAudience::FullCompatibility];
+const MANAGER_GM_AUDIENCES: &[ToolAudience] = &[
+    ToolAudience::Manager,
+    ToolAudience::GmOperator,
+    ToolAudience::FullCompatibility,
+];
 const FULL_AUDIENCE: &[ToolAudience] = &[ToolAudience::FullCompatibility];
 
 macro_rules! entry {
@@ -1573,6 +1590,308 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
         ],
         "One atomic ownership relocation with retained pending operations and original history."
     ),
+    entry!(
+        "hook.source.get",
+        Hooks,
+        MANAGER_GM_AUDIENCES,
+        ManualOnly,
+        "Read non-secret metadata and bounded retained facts for one setup-issued repository hook source.",
+        "Use to inspect one exact source before install readback or revocation; setup tokens are never returned.",
+        &["hook", "source", "repository", "commit", "readback"],
+        &["source_id", "optional after cursor", "optional limit"],
+        "One scoped public source record and bounded commit facts; no credentials or installation mutation."
+    ),
+    entry!(
+        "hook.source.revoke",
+        Hooks,
+        MANAGER_GM_AUDIENCES,
+        ManualOnly,
+        "Disable one setup-issued repository hook source with revision compare-and-swap.",
+        "Use after reading the source revision; local wrapper restoration is a separate CLI action.",
+        &["hook", "source", "revoke", "disable", "repository"],
+        &["source_id", "expected_revision", "client_request_id"],
+        "One retained source revocation receipt; never returns the source credential."
+    ),
+    entry!(
+        "goal.create",
+        Goals,
+        MANAGER_GM_AUDIENCES,
+        ManualOnly,
+        "Create a task-scoped Goal that tracks declared completion evidence and an optional one-shot reminder.",
+        "Use for one exact project, Task revision, and Attempt after reading the existing assignment.",
+        &["goal", "tracking", "objective", "completion", "reminder"],
+        &[
+            "project_id",
+            "task_id",
+            "task_revision",
+            "attempt_id",
+            "goal_id",
+            "objective",
+            "completion_evidence"
+        ],
+        "A revisioned tracking definition; creation starts no Task, model, or native work."
+    ),
+    entry!(
+        "goal.revise",
+        Goals,
+        MANAGER_GM_AUDIENCES,
+        ManualOnly,
+        "Revise one exact task-scoped Goal under revision compare-and-swap.",
+        "Use after reading the Goal; provide at least one explicitly selected definition field.",
+        &["goal", "tracking", "revise", "objective", "reminder"],
+        &[
+            "exact Goal scope",
+            "expected_revision",
+            "selected changed fields",
+            "client_request_id"
+        ],
+        "One revisioned definition update; evidence readback does not change the definition revision."
+    ),
+    entry!(
+        "goal.enable",
+        Goals,
+        MANAGER_GM_AUDIENCES,
+        ManualOnly,
+        "Enable a selected one-shot Goal reminder entry with compare-and-swap.",
+        "Use only for the exact retained Goal revision after confirming its task scope.",
+        &["goal", "enable", "reminder", "task-scoped"],
+        &["exact Goal scope", "expected_revision", "client_request_id"],
+        "Enables reminder eligibility only; it does not dispatch Task or model work."
+    ),
+    entry!(
+        "goal.disable",
+        Goals,
+        MANAGER_GM_AUDIENCES,
+        ManualOnly,
+        "Disable one task-scoped Goal reminder entry with compare-and-swap.",
+        "Use to stop new reminder notices while preserving Goal history and readback.",
+        &["goal", "disable", "reminder", "task-scoped"],
+        &["exact Goal scope", "expected_revision", "client_request_id"],
+        "Stops future reminder eligibility and retains earlier evidence and receipts."
+    ),
+    entry!(
+        "goal.readback",
+        Goals,
+        MANAGER_GM_AUDIENCES,
+        ManualOnly,
+        "Persist a fresh declared-evidence evaluation for one exact Goal scope.",
+        "Use when a fresh completion projection is needed; the request is receipt-backed and task-scoped.",
+        &["goal", "readback", "completion", "evidence", "accepted"],
+        &[
+            "project_id",
+            "task_id",
+            "task_revision",
+            "attempt_id",
+            "goal_id",
+            "client_request_id"
+        ],
+        "A retained pending/completed/unknown evidence projection; prose and notices never prove completion."
+    ),
+    entry!(
+        "goal.get",
+        Goals,
+        MANAGER_GM_AUDIENCES,
+        ManualOnly,
+        "Read one exact retained Goal and its current completion/reminder projection.",
+        "Use with the full project, Task revision, and Attempt scope.",
+        &["goal", "get", "tracking", "completion", "reminder"],
+        &[
+            "project_id",
+            "task_id",
+            "task_revision",
+            "attempt_id",
+            "goal_id"
+        ],
+        "One authorized retained Goal record; does not refresh evidence or start work."
+    ),
+    entry!(
+        "goal.list",
+        Goals,
+        MANAGER_GM_AUDIENCES,
+        ManualOnly,
+        "Page Goals within one exact project, Task revision, and Attempt.",
+        "Use to inspect the scoped retained Goal set with a bounded keyset page.",
+        &["goal", "list", "tracking", "task-scoped"],
+        &[
+            "project_id",
+            "task_id",
+            "task_revision",
+            "attempt_id",
+            "optional after_goal_id",
+            "optional limit"
+        ],
+        "Bounded scoped Goal metadata; does not read unrelated Tasks or activate work."
+    ),
+    entry!(
+        "script.register",
+        Scripts,
+        MANAGER_GM_AUDIENCES,
+        ManualOnly,
+        "Register a complete bounded trusted-local Python or PowerShell bundle.",
+        "Use after preparing all fixed files, interpreter identity, argv, environment, and closed input/result schemas.",
+        &["script", "bundle", "register", "python", "powershell"],
+        &["bundle", "client_request_id"],
+        "One immutable bundle revision; no API capabilities or recurring trigger are enabled."
+    ),
+    entry!(
+        "script.revise",
+        Scripts,
+        MANAGER_GM_AUDIENCES,
+        ManualOnly,
+        "Publish a complete replacement script bundle under revision compare-and-swap.",
+        "Use after reading the current script metadata and preparing the full replacement bundle.",
+        &[
+            "script",
+            "bundle",
+            "revise",
+            "revision",
+            "python",
+            "powershell"
+        ],
+        &[
+            "script_id",
+            "expected_revision",
+            "bundle",
+            "client_request_id"
+        ],
+        "One complete new immutable bundle revision; partial file edits are rejected."
+    ),
+    entry!(
+        "script.validate",
+        Scripts,
+        MANAGER_GM_AUDIENCES,
+        ManualOnly,
+        "Validate a retained script bundle revision without executing it.",
+        "Use to inspect captured bundle and interpreter metadata before activation.",
+        &["script", "validate", "bundle", "interpreter"],
+        &["script_id", "revision"],
+        "Validation metadata only; no process starts and no bundle content is returned."
+    ),
+    entry!(
+        "script.activate",
+        Scripts,
+        MANAGER_GM_AUDIENCES,
+        ManualOnly,
+        "Select a retained script revision for future authorized invocations.",
+        "Use after validation; activation does not execute the script or create a trigger.",
+        &["script", "activate", "revision", "bundle"],
+        &["script_id", "revision", "client_request_id"],
+        "One selected future content revision; no invocation is started."
+    ),
+    entry!(
+        "script.run",
+        Scripts,
+        MANAGER_GM_AUDIENCES,
+        ManualOnly,
+        "Start exactly one authorized script invocation for one exact Attempt and Task revision.",
+        "Use only with a validated activated revision and schema-valid input; repeat work needs a separately enabled trigger.",
+        &["script", "run", "invoke", "python", "powershell"],
+        &[
+            "script_id",
+            "expected_script_revision",
+            "attempt_id",
+            "expected_task_revision",
+            "input",
+            "client_request_id"
+        ],
+        "One queued invocation receipt; never accepts executable, argv, path, environment, API credential, or trigger overrides."
+    ),
+    entry!(
+        "script.get",
+        Scripts,
+        MANAGER_GM_AUDIENCES,
+        ManualOnly,
+        "Read one script registry item's metadata and optional revision.",
+        "Use to check activation and revision before a direct run or edit.",
+        &["script", "get", "registry", "revision"],
+        &["script_id", "optional revision"],
+        "Metadata only; no source bytes, credentials, process state, or execution effect."
+    ),
+    entry!(
+        "script.list",
+        Scripts,
+        MANAGER_GM_AUDIENCES,
+        ManualOnly,
+        "Page script registry metadata without exposing bundle contents.",
+        "Use for a bounded inventory of scripts visible to the current authorized Store scope.",
+        &["script", "list", "registry", "inventory"],
+        &["optional after offset", "optional limit"],
+        "Bounded script metadata only; never lists filesystem files or starts an invocation."
+    ),
+    entry!(
+        "github.source.inspect",
+        GitHub,
+        GM_AUDIENCES,
+        ManualOnly,
+        "Inspect one public GitHub repository using the already authenticated local gh account.",
+        "Use the exact host, owner and repository before registering an intake source.",
+        &["github", "repository", "inspect", "source", "issues"],
+        &["host", "owner", "repo"],
+        "Bounded public repository metadata; no credential or write effect."
+    ),
+    entry!(
+        "github.source.setup",
+        GitHub,
+        FULL_AUDIENCE,
+        ManualOnly,
+        "Register one inspected GitHub repository for bounded issue observation.",
+        "Use only from a local Full compatibility surface after confirming the exact repository ID.",
+        &["github", "source", "setup", "repository", "issue intake"],
+        &[
+            "source_id",
+            "project_id",
+            "host",
+            "owner",
+            "repo",
+            "repository_id",
+            "client_request_id"
+        ],
+        "One local source registration; creates no Task or external GitHub write."
+    ),
+    entry!(
+        "github.source.get",
+        GitHub,
+        GM_AUDIENCES,
+        ManualOnly,
+        "Read public status and bounded coverage for one registered GitHub source.",
+        "Use to confirm source scope and the last retained poll disposition.",
+        &["github", "source", "get", "coverage", "readback"],
+        &["source_id"],
+        "Source metadata and bounded coverage only; no raw token or comment body."
+    ),
+    entry!(
+        "github.source.poll",
+        GitHub,
+        FULL_AUDIENCE,
+        ManualOnly,
+        "Poll one registered GitHub source once and retain bounded issue observations.",
+        "Use only from a local Full compatibility surface with a setup-issued source ID.",
+        &["github", "source", "poll", "issues", "coverage"],
+        &["source_id", "client_request_id"],
+        "One durable poll receipt with explicit coverage; incomplete reads do not infer deletion."
+    ),
+    entry!(
+        "github.work_pool.preview",
+        GitHub,
+        GM_AUDIENCES,
+        ManualOnly,
+        "Preview source-mapped Tasks eligible for explicit local work-pool admission.",
+        "Inspect the bounded preview before selecting exact Task IDs for apply.",
+        &["github", "work pool", "preview", "task", "issue intake"],
+        &["source_id", "optional after cursor", "optional limit"],
+        "Bounded local preview; no Task dispatch, external write or model call."
+    ),
+    entry!(
+        "github.work_pool.apply",
+        GitHub,
+        GM_AUDIENCES,
+        ManualOnly,
+        "Apply an explicit selection of source-mapped Tasks to the existing local work pool.",
+        "Use after reviewing the exact preview and selecting bounded Task IDs.",
+        &["github", "work pool", "apply", "task", "issue intake"],
+        &["source_id", "task_ids", "client_request_id"],
+        "One local admission receipt; does not start Task execution or call a model."
+    ),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2397,6 +2716,10 @@ fn purpose_group_matches(group: ToolGroup, terms: &[String]) -> bool {
             )
         }
         "acceptance" | "publishing" => group == ToolGroup::AcceptanceEffects,
+        "github" | "github intake" | "work pool" => group == ToolGroup::GitHub,
+        "goal" | "goals" | "reminder" | "tracking" => group == ToolGroup::Goals,
+        "hook" | "hooks" | "git hooks" => group == ToolGroup::Hooks,
+        "script" | "scripts" => group == ToolGroup::Scripts,
         _ => false,
     }
 }

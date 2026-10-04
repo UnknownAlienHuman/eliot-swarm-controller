@@ -1,5 +1,5 @@
-//! OS process ownership shared by checks and independently launched modules.
-//! Only check groups use kill-on-close; module groups never kill on owner loss.
+//! OS process ownership shared by checks, scripts and independently launched modules.
+//! Checks and scripts use kill-on-close; module groups never kill on owner loss.
 use crate::{
     error::{Error, Result},
     model,
@@ -251,6 +251,13 @@ mod os {
     impl Group {
         pub fn enter(token: &str) -> Result<Self> {
             Self::enter_owned(token, false)
+        }
+        /// Scripts share the transient Check Job lifecycle and its named-token
+        /// recovery path; the purpose records the actual invocation owner.
+        pub fn enter_script(token: &str) -> Result<Self> {
+            let mut group = Self::enter(token)?;
+            group.identity["purpose"] = json!("script");
+            Ok(group)
         }
         pub fn enter_module(token: &str) -> Result<Self> {
             Self::enter_owned(token, true)
@@ -865,6 +872,11 @@ mod os {
         pub fn enter(token: &str) -> Result<Self> {
             Self::enter_owned(token, false)
         }
+        pub fn enter_script(token: &str) -> Result<Self> {
+            let mut group = Self::enter(token)?;
+            group.identity["purpose"] = json!("script");
+            Ok(group)
+        }
         pub fn enter_module(token: &str) -> Result<Self> {
             Self::enter_owned(token, true)
         }
@@ -1083,6 +1095,9 @@ mod os {
         pub identity: Value,
     }
     impl Group {
+        pub fn enter_script(token: &str) -> Result<Self> {
+            Self::enter(token)
+        }
         pub fn enter_module(token: &str) -> Result<Self> {
             Self::enter(token)
         }

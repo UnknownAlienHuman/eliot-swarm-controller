@@ -43,6 +43,28 @@ pub(crate) struct PublicationSettings {
     pub(crate) expected_create: bool,
 }
 
+/// Optional post-commit trigger for an existing ReviewDispatch action.
+/// Presence selects one setup-issued HookSource; `AutomationEntry.enabled`
+/// remains the sole enable switch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HookCommitSettings {
+    pub(crate) source_id: String,
+}
+
+impl HookCommitSettings {
+    fn validate(&self) -> Result<()> {
+        let parsed = uuid::Uuid::parse_str(&self.source_id)
+            .map_err(|_| Error::invalid("hook_commit.source_id must be a HookSource UUID"))?;
+        if parsed.to_string() != self.source_id {
+            return Err(Error::invalid(
+                "hook_commit.source_id must use the canonical HookSource UUID form",
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl PublicationSettings {
     fn validate(&self) -> Result<()> {
         if !crate::forge::valid_branch_ref(&self.target_ref)
@@ -80,6 +102,8 @@ pub(crate) struct AutomationEntry {
     pub(crate) publication: Option<PublicationSettings>,
     #[serde(default)]
     pub(crate) cron: Option<crate::scheduler::CronSettings>,
+    #[serde(default)]
+    pub(crate) hook_commit: Option<HookCommitSettings>,
     pub(crate) review: ReviewSettings,
     pub(crate) created_at_ms: i64,
     pub(crate) updated_at_ms: i64,
@@ -109,6 +133,7 @@ impl AutomationEntry {
             work_dispatch: None,
             publication: None,
             cron: None,
+            hook_commit: None,
             review: ReviewSettings {
                 profile: None,
                 required_reviewers: 1,
@@ -671,6 +696,7 @@ pub(crate) fn apply_patch(
             "work_dispatch" => patch_work_dispatch(&mut next.work_dispatch, value)?,
             "publication" => patch_publication(&mut next.publication, value)?,
             "cron" => patch_cron(&mut next.cron, value)?,
+            "hook_commit" => patch_hook_commit(&mut next.hook_commit, value)?,
             "review" => patch_review(&mut next.review, value)?,
             _ => return Err(Error::invalid(format!("unknown automation field: {field}"))),
         }
@@ -683,6 +709,18 @@ pub(crate) fn apply_patch(
         next.updated_at_ms = now_ms;
     }
     Ok(next)
+}
+
+fn patch_hook_commit(settings: &mut Option<HookCommitSettings>, patch: &Value) -> Result<()> {
+    if patch.is_null() {
+        *settings = None;
+        return Ok(());
+    }
+    let parsed: HookCommitSettings = serde_json::from_value(patch.clone())
+        .map_err(|_| Error::invalid("hook_commit requires exactly one source_id"))?;
+    parsed.validate()?;
+    *settings = Some(parsed);
+    Ok(())
 }
 
 fn patch_publication(settings: &mut Option<PublicationSettings>, patch: &Value) -> Result<()> {
@@ -942,6 +980,20 @@ pub(crate) fn validate_entry(entry: &AutomationEntry) -> Result<()> {
             Error::new(
                 "AUTOMATION_RECORD_INVALID",
                 "stored cron settings do not match the validated calendar and CheckRun contract",
+            )
+        })?;
+    }
+    if let Some(settings) = entry.hook_commit.as_ref() {
+        if !entry.steps.contains(&AutomationStep::ReviewDispatch) {
+            return Err(Error::new(
+                "AUTOMATION_RECORD_INVALID",
+                "hook_commit requires the existing review_dispatch action",
+            ));
+        }
+        settings.validate().map_err(|_| {
+            Error::new(
+                "AUTOMATION_RECORD_INVALID",
+                "stored HookCommit source identity is invalid",
             )
         })?;
     }

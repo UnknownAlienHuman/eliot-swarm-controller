@@ -156,6 +156,9 @@ pub fn validate_automation_config_read(method: &str, params: &Value) -> Result<(
 pub enum Role {
     Operator,
     Manager,
+    /// A setup-issued, repository-scoped hook credential. Store admits only
+    /// the hook ingress/readback methods for this identity.
+    HookSource,
     /// Assignment-bound coordination only; never a generic writer identity.
     Participant,
     Observer,
@@ -185,7 +188,10 @@ impl Principal {
         Ok(())
     }
     pub fn require_writer(&self) -> Result<()> {
-        if matches!(self.role, Role::Observer | Role::Participant) {
+        if matches!(
+            self.role,
+            Role::HookSource | Role::Observer | Role::Participant
+        ) {
             return Err(Error::new(
                 "FORBIDDEN",
                 "this role has no generic writer authority",
@@ -595,6 +601,35 @@ pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
             text(params, "client_request_id")?;
             return Ok(());
         }
+        "script.register" => {
+            crate::scripts::protocol::RegisterRequest::parse(params)?;
+            return Ok(());
+        }
+        "script.revise" => {
+            crate::scripts::protocol::ReviseRequest::parse(params)?;
+            return Ok(());
+        }
+        "script.activate" => {
+            crate::scripts::protocol::ActivateRequest::parse(params)?;
+            return Ok(());
+        }
+        "script.run" => {
+            crate::scripts::protocol::RunRequest::parse(params)?;
+            return Ok(());
+        }
+        "hook.source.setup" => {
+            crate::hooks::contract::HookSetupRequest::parse(params)?;
+            return Ok(());
+        }
+        "github.source.setup" | "github.source.poll" | "github.work_pool.apply" => {
+            crate::github::protocol::validate_mutation(method, params)?;
+            return Ok(());
+        }
+        "hook.source.revoke" => &["client_request_id", "source_id", "expected_revision"],
+        "goal.create" | "goal.revise" | "goal.enable" | "goal.disable" | "goal.readback" => {
+            crate::goals::validate_mutation(method, params)?;
+            return Ok(());
+        }
         "forge.publish_ref" => {
             crate::forge::PublishRefRequest::parse(params)?;
             return Ok(());
@@ -756,6 +791,15 @@ pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
             "binding_id",
             "binding_generation",
         ],
+        "hook.emit" => {
+            fields(params, &["source_id", "commit_oid"])?;
+            text(params, "source_id")?;
+            let commit_oid = text(params, "commit_oid")?;
+            if !crate::forge::valid_object_id(commit_oid) {
+                return Err(Error::invalid("commit_oid must be a full Git object ID"));
+            }
+            return Ok(());
+        }
         "message.send" => &[
             "client_request_id",
             "recipient",
@@ -776,6 +820,10 @@ pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
     };
     fields(params, allowed)?;
     match method {
+        "hook.source.revoke" => {
+            text(params, "source_id")?;
+            positive(params, "expected_revision")?;
+        }
         "task.accept" => {
             crate::acceptance::AcceptRequest::parse(params)?;
         }

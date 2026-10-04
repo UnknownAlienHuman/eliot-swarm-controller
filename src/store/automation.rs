@@ -191,6 +191,7 @@ pub(super) fn apply(
                     || (before.publication != change.after.publication)
                     || (before.check_run_ready() && !change.after.check_run_ready())
                     || (before.cron != change.after.cron)
+                    || (before.hook_commit != change.after.hook_commit)
                     || (before.review.profile != change.after.review.profile)
                     || (before.scope.work_pool_id != change.after.scope.work_pool_id)
             });
@@ -212,7 +213,15 @@ pub(super) fn apply(
             && change.after.steps.contains(&AutomationStep::ReviewDispatch)
     });
     if include_existing_review {
-        let intake = automation_dispatch::reconcile_source_intake(tx, 64, now_ms)?;
+        let include_hook_commit = planned.iter().any(|change| {
+            change.changed
+                && change.include_existing
+                && change.after.enabled
+                && change.after.steps.contains(&AutomationStep::ReviewDispatch)
+                && change.after.hook_commit.is_some()
+        });
+        let intake =
+            automation_dispatch::reconcile_source_intake(tx, 64, include_hook_commit, now_ms)?;
         for change in &planned {
             if change.changed
                 && change.include_existing
@@ -226,6 +235,7 @@ pub(super) fn apply(
                         &change.after,
                         budget,
                         intake,
+                        launcher_config,
                         now_ms,
                     )?);
                 }

@@ -57,17 +57,37 @@ async fn run_until(
     foreground_stop: impl std::future::Future<Output = Result<()>>,
 ) -> Result<()> {
     tokio::pin!(foreground_stop);
-    let root = DataRoot::acquire(&config.storage.data_dir)?;
-    let credential = bootstrap_credential(&root.path)?;
+    let root = DataRoot::acquire(&config.storage.data_dir)
+        .map_err(|error| startup_error("data_root", error))?;
+    let credential = bootstrap_credential(&root.path)
+        .map_err(|error| startup_error("credential_bootstrap", error))?;
     let root_path = root.path.clone();
     let config = Arc::new(config);
-    let owner = StoreOwner::start(root, config.clone(), credential).await?;
-    if let Err(error) = owner.store.initialize_workspace_authority().await {
-        owner.close().await?;
-        return Err(error);
-    }
+    let owner = StoreOwner::start(root, config.clone(), credential)
+        .await
+        .map_err(|error| startup_error("store_start", error))?;
     let ipc_config = Arc::new(config.ipc.clone());
-    let mut listener = ipc::Listener::bind(&root_path)?;
+    let startup: Result<ipc::Listener> = async {
+        owner.store.record_host_start().await?;
+        owner.store.initialize_workspace_authority().await?;
+        let listener = ipc::Listener::bind(&root_path)?;
+        owner.store.record_host_ready().await?;
+        Ok(listener)
+    }
+    .await;
+    let mut listener = match startup {
+        Ok(listener) => listener,
+        Err(error) => {
+            if let Err(receipt_error) = owner.store.record_host_exit(Some(error.code.clone())).await
+            {
+                eprintln!("host startup failure receipt: {}", receipt_error.code);
+            }
+            if let Err(close_error) = owner.close().await {
+                eprintln!("host startup Store close: {}", close_error.code);
+            }
+            return Err(error);
+        }
+    };
     let (shutdown, stopping) = watch::channel(false);
     let mut supervisors: JoinSet<(&'static str, Result<()>)> = JoinSet::new();
     let store = owner.store.clone();
@@ -76,6 +96,9 @@ async fn run_until(
         store.supervise_checks(stop).await;
         ("checks", Ok(()))
     });
+    let store = owner.store.clone();
+    let stop = stopping.clone();
+    supervisors.spawn(async move { ("scripts", store.supervise_scripts(stop).await) });
     let store = owner.store.clone();
     let stop = stopping.clone();
     supervisors.spawn(async move {
@@ -114,7 +137,7 @@ async fn run_until(
     let semaphore = Arc::new(Semaphore::new(config.ipc.max_connections));
     let mut connections = JoinSet::new();
     eprintln!("swarm host ready: {}", listener.endpoint());
-    let exit = loop {
+    let mut exit = loop {
         tokio::select! {
             signal=&mut foreground_stop=>break signal,
             Some(result)=supervisors.join_next()=>{
@@ -146,12 +169,44 @@ async fn run_until(
     while let Some(result) = supervisors.join_next().await {
         if let Ok((name, Err(error))) = result {
             eprintln!("{name} supervisor: {}", error.code);
+            if exit.is_ok() {
+                exit = Err(error);
+            }
         } else if let Err(error) = result {
-            eprintln!("supervisor join failed: {error}");
+            eprintln!("supervisor join failed");
+            if exit.is_ok() {
+                exit = Err(Error::new("SUPERVISOR_FAILED", error.to_string()));
+            }
         }
     }
-    owner.close().await?;
+    if let Err(error) = owner
+        .store
+        .record_host_exit(exit.as_ref().err().map(|error| error.code.clone()))
+        .await
+    {
+        eprintln!("host exit receipt: {}", error.code);
+        if exit.is_ok() {
+            exit = Err(error);
+        }
+    }
+    if let Err(error) = owner.close().await
+        && exit.is_ok()
+    {
+        exit = Err(error);
+    }
     exit
+}
+
+/// Before the Store is available, the foreground launcher receives a precise
+/// phase and controller code as the terminal startup result. No DB receipt can
+/// be promised when opening that database itself failed.
+fn startup_error(phase: &'static str, error: Error) -> Error {
+    Error::new(
+        error.code,
+        format!(
+            "host startup failed at {phase}; inspect that stage before starting the host again"
+        ),
+    )
 }
 
 /// One host-owned reconciler for enabled automation entries and passive scoped

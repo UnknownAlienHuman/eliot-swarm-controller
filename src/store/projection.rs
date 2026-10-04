@@ -261,6 +261,22 @@ mod tests {
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch(super::super::SCHEMA).unwrap();
         db.execute_batch(super::super::WORKSPACE_SCHEMA).unwrap();
+        db.execute_batch(super::super::OWNED_SERVICE_SCHEMA)
+            .unwrap();
+        db.execute_batch(super::super::SCRIPT_SCHEMA).unwrap();
+        db.execute_batch(super::super::GITHUB_SCHEMA).unwrap();
+        super::super::set_meta(
+            &db,
+            "client:op-1",
+            &json!({"role":"operator","disabled":false}),
+        )
+        .unwrap();
+        super::super::set_meta(
+            &db,
+            super::super::LOCAL_OPERATOR_CLIENT_ID_KEY,
+            &json!("op-1"),
+        )
+        .unwrap();
         db
     }
 

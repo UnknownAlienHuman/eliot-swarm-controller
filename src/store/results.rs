@@ -108,7 +108,7 @@ pub(super) fn record(
 
 pub(super) fn get(db: &Connection, id: &str) -> Result<ArtifactRecord> {
     let row: Option<(String,String,i64,String,String)> = db.query_row(
-        "SELECT kind,relative_path,byte_length,content_digest,metadata_json FROM artifacts WHERE artifact_id=?1 AND kind IN ('native_result_page','native_result','task_submission','source_snapshot','check_result','check_output')",
+        "SELECT kind,relative_path,byte_length,content_digest,metadata_json FROM artifacts WHERE artifact_id=?1 AND kind IN ('native_result_page','native_result','task_submission','source_snapshot','check_result','check_output','script_bundle','script_result','script_output')",
         [id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
     let (kind, relative_path, byte_length, content_digest, metadata) =
         row.ok_or_else(|| Error::new("NOT_FOUND", "result artifact is not registered"))?;
@@ -131,6 +131,12 @@ pub(super) fn describe(db: &Connection, p: &Principal, v: &Value) -> Result<Valu
     }
     model::fields(v, &["artifact_id"])?;
     let a = get(db, model::text(v, "artifact_id")?)?;
+    if matches!(
+        a.kind.as_str(),
+        "script_bundle" | "script_result" | "script_output"
+    ) {
+        super::scripts::authorize_artifact_read(db, p, &a)?;
+    }
     Ok(
         json!({"artifact_id":a.artifact_id,"kind":a.kind,"byte_length":a.byte_length,
         "content_digest":a.content_digest,"metadata":a.public_metadata()}),

@@ -158,10 +158,10 @@ pub(super) fn handover(tx: &Transaction<'_>, p: &Principal, v: &Value, id: &str)
         return Err(Error::new("UNAUTHORIZED", "GM client is disabled"));
     }
     let role: Role = serde_json::from_value(target["role"].clone())?;
-    if matches!(role, Role::Module | Role::Scheduler) {
+    if matches!(role, Role::Module | Role::Scheduler | Role::HookSource) {
         return Err(Error::new(
             "FORBIDDEN",
-            "module and internal scheduler principals cannot become GM",
+            "module, hook source and internal scheduler principals cannot become GM",
         ));
     }
     let (binding_id, binding_generation) = match (v.get("binding_id"), v.get("binding_generation"))

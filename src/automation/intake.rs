@@ -1,7 +1,7 @@
 //! Public-to-the-crate contracts for bounded durable automation intake.
 //!
-//! Only Store-backed producers named here are admissible. External hooks and
-//! forge providers need authenticated adapters before they can be registered.
+//! Only Store-backed producers named here are admissible. External producers
+//! become admissible only through an authenticated, bounded adapter.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -12,24 +12,29 @@ pub(crate) const MAX_INTAKE_PAGE: usize = 64;
 #[serde(rename_all = "snake_case")]
 pub(crate) enum LocalProducer {
     TaskSubmission,
+    /// Facts accepted from a setup-issued, repository-scoped HookSource.
+    HookCommit,
 }
 
 impl LocalProducer {
     pub(crate) const fn source_id(self) -> &'static str {
         match self {
             Self::TaskSubmission => "local:controller-task-submissions-v1",
+            Self::HookCommit => "local:controller-hook-commits-v1",
         }
     }
 
     pub(crate) const fn stream_id(self) -> &'static str {
         match self {
             Self::TaskSubmission => "controller",
+            Self::HookCommit => "controller:hooks",
         }
     }
 
     pub(crate) const fn event_kind(self) -> &'static str {
         match self {
             Self::TaskSubmission => "task.submission",
+            Self::HookCommit => "git.post_commit",
         }
     }
 }

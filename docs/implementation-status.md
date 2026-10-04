@@ -2,6 +2,37 @@
 
 ## Current state
 
+The 2026-10-04 implementation increment prioritizes the controller core, startup
+reliability and manager-visible failure readback. Local Linux, WSL and all local
+model/inference work remain deferred. The source adds durable host lifecycle
+and interruption receipts, typed pre-dispatch IPC failures, current-GM startup
+failure projections, optional HookCommit intake, recoverable private hook
+issuance, a trusted-local script registry/worker, task-scoped Goal reminders,
+and an optional GitHub Issue/work-pool source. Its final warnings-denied
+production Clippy, package formatting and debug build passed with unchanged
+source. The complete library run passed 245 of 246 tests; its remaining
+projection fixture lacked a registered local Operator. After correcting that
+test fixture, all six projection tests passed. The real-process host-recovery
+and Windows owned-probe integrations also passed. No assertion or timeout was
+weakened. These results establish the core qualification boundary; they do
+not qualify hosted-model execution or every new optional program.
+
+The new core checks cover malformed/mismatched IPC replies and authentication
+handshakes, writer failure with admitted work draining, safe recovery of a
+damaged lifecycle record, manager-visible owned-service startup errors,
+successor-GM readback, and a real host crash/restart preserving Task,
+Operation and logical-request deduplication. A later graceful exit retains
+the earlier interruption diagnosis. MCP subscription recovery now retries
+readback at its retained cursor after a shared-client cancellation; GM
+transfer preserves the legacy pending-ledger representation.
+
+The qualified debug candidate has SHA-256
+`D2C2979E1414871DB3D475580147C25CA473E2223A61C3B99DBF6CA2A8B39B68`.
+The installed binary below does not contain this increment. See
+[host recovery](host-recovery.md) for the
+failure/readback contract. Script controller API grants, Goal-driven
+progression and the remaining GitHub integrations are still outstanding.
+
 The previous delivered and installed source is
 `7061e455f04a76bfaa19699edba7f58c14a27748`.
 It implements successor-GM continuation of the retained work, including exact

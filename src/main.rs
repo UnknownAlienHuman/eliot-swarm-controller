@@ -7,7 +7,7 @@ use eliot_swarm_controller::{
     platform,
 };
 use serde_json::{Value, json};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
 #[command(
@@ -66,6 +66,12 @@ enum Command {
         #[arg(long)]
         file: PathBuf,
     },
+    /// Internal trusted-local script invocation worker; never opens the Store.
+    #[command(hide = true)]
+    ScriptWorker {
+        #[arg(long)]
+        file: PathBuf,
+    },
     Source {
         #[command(subcommand)]
         command: SourceCommand,
@@ -98,6 +104,22 @@ enum Command {
     Automation {
         #[command(subcommand)]
         command: AutomationCommand,
+    },
+    Script {
+        #[command(subcommand)]
+        command: ScriptCommand,
+    },
+    Hook {
+        #[command(subcommand)]
+        command: HookCommand,
+    },
+    Goal {
+        #[command(subcommand)]
+        command: GoalCommand,
+    },
+    GitHub {
+        #[command(subcommand)]
+        command: GitHubCommand,
     },
     Launcher {
         #[command(subcommand)]
@@ -468,6 +490,172 @@ enum AutomationConfigCommand {
     },
 }
 #[derive(Subcommand)]
+enum ScriptCommand {
+    Register {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    Revise {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    Validate {
+        script_id: String,
+        revision: i64,
+    },
+    Activate {
+        script_id: String,
+        revision: i64,
+    },
+    Run {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    Get {
+        script_id: String,
+        #[arg(long)]
+        revision: Option<i64>,
+    },
+    List {
+        #[arg(long, default_value_t = 0)]
+        after: i64,
+        #[arg(long, default_value_t = 50)]
+        limit: i64,
+    },
+}
+#[derive(Subcommand)]
+enum HookCommand {
+    /// Create and install the supported repository-local post-commit observer.
+    Setup { project_id: String },
+    /// Emit one bounded commit fact using the setup-issued HookSource credential.
+    Emit {
+        #[arg(long)]
+        source_id: String,
+        #[arg(long)]
+        commit_oid: String,
+    },
+    Source {
+        #[command(subcommand)]
+        command: HookSourceCommand,
+    },
+    Install {
+        #[command(subcommand)]
+        command: HookInstallCommand,
+    },
+}
+#[derive(Subcommand)]
+enum HookSourceCommand {
+    Get {
+        source_id: String,
+        #[arg(long, default_value_t = 0)]
+        after: i64,
+        #[arg(long, default_value_t = 50)]
+        limit: i64,
+    },
+    Revoke {
+        source_id: String,
+        #[arg(long)]
+        revision: i64,
+    },
+}
+#[derive(Subcommand)]
+enum HookInstallCommand {
+    Preview {
+        project_id: String,
+    },
+    Readback {
+        project_id: String,
+        source_id: String,
+    },
+    Revoke {
+        project_id: String,
+        source_id: String,
+        #[arg(long)]
+        revision: i64,
+    },
+}
+#[derive(Subcommand)]
+enum GoalCommand {
+    Create {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    Revise {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    Enable {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    Disable {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    Readback {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    Get {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    List {
+        #[arg(long)]
+        file: PathBuf,
+    },
+}
+#[derive(Subcommand)]
+enum GitHubCommand {
+    Source {
+        #[command(subcommand)]
+        command: GitHubSourceCommand,
+    },
+    WorkPool {
+        #[command(subcommand)]
+        command: GitHubWorkPoolCommand,
+    },
+}
+#[derive(Subcommand)]
+enum GitHubSourceCommand {
+    Inspect {
+        host: String,
+        owner: String,
+        repo: String,
+    },
+    Setup {
+        #[arg(long)]
+        source_id: String,
+        project_id: String,
+        host: String,
+        owner: String,
+        repo: String,
+        #[arg(long)]
+        repository_id: i64,
+    },
+    Get {
+        source_id: String,
+    },
+    Poll {
+        source_id: String,
+    },
+}
+#[derive(Subcommand)]
+enum GitHubWorkPoolCommand {
+    Preview {
+        source_id: String,
+        #[arg(long)]
+        after: Option<String>,
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    Apply {
+        source_id: String,
+        #[arg(long, num_args = 1..)]
+        task_ids: Vec<String>,
+    },
+}
+#[derive(Subcommand)]
 enum LauncherCommand {
     Dashboard {
         #[arg(long)]
@@ -540,6 +728,9 @@ fn execute(cli: Cli) -> Result<()> {
     if let Command::OwnedOpencodeService { file } = &cli.command {
         return eliot_swarm_controller::runtime::opencode_v2::run_owned_service_helper(file);
     }
+    if let Command::ScriptWorker { file } = &cli.command {
+        return eliot_swarm_controller::scripts::runner::run_worker(file);
+    }
     // The host and gateway are long-lived. CLI calls perform one local exchange
     // and must not create a CPU-sized pool for every status request.
     let mut builder = if matches!(&cli.command, Command::Host { .. } | Command::Gateway) {
@@ -597,6 +788,25 @@ async fn run(cli: Cli) -> Result<()> {
         return eliot_swarm_controller::mcp::run_profiled(config, credential, profile.as_deref())
             .await;
     }
+    if let Command::Call { method, .. } = &cli.command
+        && method == "hook.source.setup"
+    {
+        return Err(Error::invalid(
+            "use `swarm hook setup` so the one-time source credential is written privately and redacted from output",
+        ));
+    }
+    if let Command::Hook {
+        command: HookCommand::Setup { project_id },
+    } = &cli.command
+    {
+        return hook_setup(&config, &credential, &cli.request_id, project_id).await;
+    }
+    if let Command::Hook {
+        command: HookCommand::Install { command },
+    } = &cli.command
+    {
+        return hook_install(&config, &credential, &cli.request_id, command).await;
+    }
     if let Command::Artifact {
         command: ArtifactCommand::Export { artifact_id, out },
     } = &cli.command
@@ -619,6 +829,7 @@ async fn run(cli: Cli) -> Result<()> {
         | Command::Gateway
         | Command::CheckWorker { .. }
         | Command::OwnedOpencodeService { .. }
+        | Command::ScriptWorker { .. }
         | Command::ModuleRun { .. } => {
             unreachable!("executor returned above")
         }
@@ -875,6 +1086,130 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             },
         },
+        Command::Script { command } => match command {
+            ScriptCommand::Register { file } => ("script.register".into(), read_json(&file)?),
+            ScriptCommand::Revise { file } => ("script.revise".into(), read_json(&file)?),
+            ScriptCommand::Validate {
+                script_id,
+                revision,
+            } => (
+                "script.validate".into(),
+                json!({"script_id":script_id,"revision":revision}),
+            ),
+            ScriptCommand::Activate {
+                script_id,
+                revision,
+            } => (
+                "script.activate".into(),
+                json!({"script_id":script_id,"revision":revision}),
+            ),
+            ScriptCommand::Run { file } => ("script.run".into(), read_json(&file)?),
+            ScriptCommand::Get {
+                script_id,
+                revision,
+            } => {
+                let mut params = json!({"script_id":script_id});
+                if let Some(revision) = revision {
+                    params["revision"] = json!(revision);
+                }
+                ("script.get".into(), params)
+            }
+            ScriptCommand::List { after, limit } => {
+                ("script.list".into(), json!({"after":after,"limit":limit}))
+            }
+        },
+        Command::Hook { command } => match command {
+            HookCommand::Setup { .. } => unreachable!("setup returned above"),
+            HookCommand::Emit {
+                source_id,
+                commit_oid,
+            } => (
+                "hook.emit".into(),
+                json!({"source_id":source_id,"commit_oid":commit_oid}),
+            ),
+            HookCommand::Source { command } => match command {
+                HookSourceCommand::Get {
+                    source_id,
+                    after,
+                    limit,
+                } => (
+                    "hook.source.get".into(),
+                    json!({"source_id":source_id,"after":after,"limit":limit}),
+                ),
+                HookSourceCommand::Revoke {
+                    source_id,
+                    revision,
+                } => (
+                    "hook.source.revoke".into(),
+                    json!({"source_id":source_id,"expected_revision":revision}),
+                ),
+            },
+            HookCommand::Install { .. } => unreachable!("installer commands return above"),
+        },
+        Command::Goal { command } => match command {
+            GoalCommand::Create { file } => ("goal.create".into(), read_json(&file)?),
+            GoalCommand::Revise { file } => ("goal.revise".into(), read_json(&file)?),
+            GoalCommand::Enable { file } => ("goal.enable".into(), read_json(&file)?),
+            GoalCommand::Disable { file } => ("goal.disable".into(), read_json(&file)?),
+            GoalCommand::Readback { file } => ("goal.readback".into(), read_json(&file)?),
+            GoalCommand::Get { file } => ("goal.get".into(), read_json(&file)?),
+            GoalCommand::List { file } => ("goal.list".into(), read_json(&file)?),
+        },
+        Command::GitHub { command } => match command {
+            GitHubCommand::Source { command } => match command {
+                GitHubSourceCommand::Inspect { host, owner, repo } => (
+                    "github.source.inspect".into(),
+                    json!({"host":host,"owner":owner,"repo":repo}),
+                ),
+                GitHubSourceCommand::Setup {
+                    source_id,
+                    project_id,
+                    host,
+                    owner,
+                    repo,
+                    repository_id,
+                } => (
+                    "github.source.setup".into(),
+                    json!({
+                        "source_id":source_id,
+                        "project_id":project_id,
+                        "host":host,
+                        "owner":owner,
+                        "repo":repo,
+                        "repository_id":repository_id
+                    }),
+                ),
+                GitHubSourceCommand::Get { source_id } => {
+                    ("github.source.get".into(), json!({"source_id":source_id}))
+                }
+                GitHubSourceCommand::Poll { source_id } => {
+                    ("github.source.poll".into(), json!({"source_id":source_id}))
+                }
+            },
+            GitHubCommand::WorkPool { command } => match command {
+                GitHubWorkPoolCommand::Preview {
+                    source_id,
+                    after,
+                    limit,
+                } => {
+                    let mut params = json!({"source_id":source_id});
+                    if let Some(after) = after {
+                        params["after"] = json!(after);
+                    }
+                    if let Some(limit) = limit {
+                        params["limit"] = json!(limit);
+                    }
+                    ("github.work_pool.preview".into(), params)
+                }
+                GitHubWorkPoolCommand::Apply {
+                    source_id,
+                    task_ids,
+                } => (
+                    "github.work_pool.apply".into(),
+                    json!({"source_id":source_id,"task_ids":task_ids}),
+                ),
+            },
+        },
         Command::Launcher { command } => match command {
             LauncherCommand::Dashboard { file } => ("swarm.dashboard".into(), read_json(&file)?),
             LauncherCommand::Preview { file } => ("swarm.launch.preview".into(), read_json(&file)?),
@@ -988,8 +1323,21 @@ async fn run(cli: Cli) -> Result<()> {
             | "swarm.agent.inspect"
             | "swarm.exceptions.get"
             | "coordination.watch.list"
+            | "hook.source.get"
+            | "goal.get"
+            | "goal.list"
+            | "script.validate"
+            | "script.get"
+            | "script.list"
+            | "github.source.inspect"
+            | "github.source.get"
+            | "github.work_pool.preview"
     );
-    if !is_read {
+    let is_hook_emit = method == "hook.emit";
+    if is_hook_emit && cli.request_id.is_some() {
+        return Err(Error::invalid("--request-id is not accepted for hook emit"));
+    }
+    if !is_read && !is_hook_emit {
         if !params.is_object() {
             return Err(Error::invalid("params file must contain an object"));
         }
@@ -1028,6 +1376,397 @@ async fn run(cli: Cli) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(&result)?);
     if let Some(path) = pending_credential {
         eprintln!("credential saved: {}", path.display());
+    }
+    Ok(())
+}
+
+fn hook_install_context<'a>(config: &'a Config, project_id: &str) -> Result<(&'a Path, &'a Path)> {
+    let project = config.forge.projects.get(project_id).ok_or_else(|| {
+        Error::new(
+            "HOOK_PROJECT_UNAVAILABLE",
+            "project has no configured trusted repository",
+        )
+    })?;
+    let repository = project.repository_path.as_path();
+    let git = config.forge.git_executable.as_path();
+    if !repository.is_absolute() || !repository.is_dir() {
+        return Err(Error::new(
+            "HOOK_REPOSITORY_UNAVAILABLE",
+            "configured repository path must be an absolute existing directory",
+        ));
+    }
+    if !git.is_absolute() || !git.is_file() {
+        return Err(Error::new(
+            "HOOK_GIT_UNAVAILABLE",
+            "configured Git executable must be an absolute existing file",
+        ));
+    }
+    Ok((repository, git))
+}
+
+fn hook_source_public_projection(source: &Value) -> Result<Value> {
+    let object = source.as_object().ok_or_else(|| {
+        Error::new(
+            "HOOK_SETUP_RESPONSE_INVALID",
+            "hook setup public source is invalid",
+        )
+    })?;
+    let mut public = serde_json::Map::new();
+    for name in [
+        "source_id",
+        "project_id",
+        "event",
+        "phase",
+        "veto",
+        "canonical_repository",
+        "registration_id",
+        "registration_generation",
+        "revision",
+        "enabled",
+    ] {
+        let value = object.get(name).ok_or_else(|| {
+            Error::new(
+                "HOOK_SETUP_RESPONSE_INVALID",
+                "hook setup public source is incomplete",
+            )
+        })?;
+        public.insert(name.to_owned(), value.clone());
+    }
+    if public["source_id"].as_str().is_none_or(str::is_empty)
+        || public["project_id"].as_str().is_none_or(str::is_empty)
+        || public["canonical_repository"]
+            .as_str()
+            .is_none_or(str::is_empty)
+        || public["registration_id"].as_str().is_none_or(str::is_empty)
+        || public["registration_generation"]
+            .as_i64()
+            .is_none_or(|generation| generation <= 0)
+        || public["revision"]
+            .as_i64()
+            .is_none_or(|revision| revision <= 0)
+        || public["enabled"] != true
+    {
+        return Err(Error::new(
+            "HOOK_SETUP_RESPONSE_INVALID",
+            "hook setup public source fields are invalid",
+        ));
+    }
+    Ok(Value::Object(public))
+}
+
+async fn revoke_hook_source(
+    config: &Config,
+    operator: &Credential,
+    source_id: &str,
+    revision: i64,
+    request_id: Option<&str>,
+) -> Result<Value> {
+    let request_id = request_id.map(str::to_owned).unwrap_or_else(model::new_id);
+    ipc::call(
+        &config.storage.data_dir,
+        operator,
+        "hook.source.revoke",
+        json!({
+            "client_request_id":request_id,
+            "source_id":source_id,
+            "expected_revision":revision
+        }),
+        &config.ipc,
+    )
+    .await
+}
+
+fn sanitized_hook_install_error(code: &str) -> Error {
+    Error::new(
+        code.to_owned(),
+        "hook installation readback did not complete",
+    )
+}
+
+async fn rollback_hook_setup(
+    config: &Config,
+    operator: &Credential,
+    plan: &eliot_swarm_controller::hooks::git::HookInstallPlan,
+    prepared: &eliot_swarm_controller::hooks::git::PreparedHookSource,
+    revision: i64,
+) -> (bool, bool) {
+    let source_revoked = revoke_hook_source(config, operator, &prepared.source_id, revision, None)
+        .await
+        .is_ok();
+    if !source_revoked {
+        return (false, false);
+    }
+    let local_restored = eliot_swarm_controller::hooks::git::revoke_post_commit(
+        plan.repository_path(),
+        plan.git_executable(),
+        &prepared.source_id,
+    )
+    .is_ok_and(|readback| {
+        matches!(readback.state.as_str(), "restored" | "absent")
+            && !readback.credential_file_present
+    });
+    let pending_removed =
+        eliot_swarm_controller::hooks::git::discard_source_setup(plan, prepared).is_ok();
+    (source_revoked, local_restored && pending_removed)
+}
+
+async fn hook_setup(
+    config: &Config,
+    operator: &Credential,
+    request_id: &Option<String>,
+    project_id: &str,
+) -> Result<()> {
+    use eliot_swarm_controller::hooks::git;
+
+    let (repository, git_executable) = hook_install_context(config, project_id)?;
+    let plan = git::preview_post_commit(repository, git_executable)?;
+    let executable = std::env::current_exe().map_err(|_| {
+        Error::new(
+            "HOOK_EXECUTABLE_UNAVAILABLE",
+            "current Swarm executable path is unavailable",
+        )
+    })?;
+    let prepared = git::prepare_source_credential(&plan, project_id, request_id.as_deref())?;
+    eprintln!(
+        "hook_setup_request_id={} source_id={}",
+        serde_json::to_string(&prepared.client_request_id)?,
+        serde_json::to_string(&prepared.source_id)?
+    );
+    let issued = match ipc::call(
+        &config.storage.data_dir,
+        operator,
+        "hook.source.setup",
+        json!({
+            "client_request_id":&prepared.client_request_id,
+            "project_id":&prepared.project_id,
+            "source_id":&prepared.source_id,
+            "credential":serde_json::to_value(&prepared.credential)?
+        }),
+        &config.ipc,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            // A failure of this connection does not establish that an earlier
+            // attempt with the same pending identity failed to commit. Retain
+            // its credential until exact source readback/revocation resolves it.
+            return Err(Error::new(
+                error.code.clone(),
+                format!(
+                    "hook setup failed with {}; read back or retry the retained private source/request {}/{} before cleanup",
+                    error.code, prepared.source_id, prepared.client_request_id
+                ),
+            ));
+        }
+    };
+
+    let source = issued.get("source").ok_or_else(|| {
+        Error::new(
+            "HOOK_SETUP_RESPONSE_INVALID",
+            format!(
+                "hook setup returned no public source; retry retained source/request {}/{}",
+                prepared.source_id, prepared.client_request_id
+            ),
+        )
+    })?;
+    let raw_revision = source
+        .get("revision")
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    let public_source = match hook_source_public_projection(source) {
+        Ok(source) => source,
+        Err(error) => {
+            let revision = if raw_revision > 0 { raw_revision } else { 1 };
+            let (source_revoked, local_restored) =
+                rollback_hook_setup(config, operator, &plan, &prepared, revision).await;
+            if !source_revoked || !local_restored {
+                return Err(Error::new(
+                    "HOOK_SETUP_ROLLBACK_INCOMPLETE",
+                    format!(
+                        "invalid setup readback; inspect source/request {}/{}",
+                        prepared.source_id, prepared.client_request_id
+                    ),
+                ));
+            }
+            return Err(Error::new(
+                error.code,
+                "hook setup public readback was invalid",
+            ));
+        }
+    };
+    let source_id = public_source["source_id"].as_str().unwrap_or_default();
+    let revision = public_source["revision"].as_i64().unwrap_or_default();
+    let expected_repository = config.forge.projects.get(project_id).and_then(|project| {
+        eliot_swarm_controller::forge::canonical_repository(&project.canonical_repository).ok()
+    });
+    let source_matches = source_id == prepared.source_id.as_str()
+        && public_source["project_id"] == project_id
+        && public_source["event"] == "git.post_commit"
+        && public_source["phase"] == "post_commit"
+        && public_source["veto"] == "none_after_commit"
+        && expected_repository
+            .as_deref()
+            .is_some_and(|repository| public_source["canonical_repository"] == repository);
+    if !source_matches {
+        let rollback_revision = if revision > 0 { revision } else { 1 };
+        let (source_revoked, local_restored) =
+            rollback_hook_setup(config, operator, &plan, &prepared, rollback_revision).await;
+        if !source_revoked || !local_restored {
+            return Err(Error::new(
+                "HOOK_SETUP_ROLLBACK_INCOMPLETE",
+                format!(
+                    "source metadata did not match; inspect source/request {}/{}",
+                    prepared.source_id, prepared.client_request_id
+                ),
+            ));
+        }
+        return Err(Error::new(
+            "HOOK_SETUP_SCOPE_MISMATCH",
+            "issued hook source does not match the selected configured repository",
+        ));
+    }
+
+    let installation =
+        match git::apply_post_commit(&plan, source_id, &prepared.credential, &executable) {
+            Ok(readback) => readback,
+            Err(error) => {
+                let (source_revoked, local_restored) =
+                    rollback_hook_setup(config, operator, &plan, &prepared, revision).await;
+                if !source_revoked || !local_restored {
+                    return Err(Error::new(
+                        "HOOK_SETUP_ROLLBACK_INCOMPLETE",
+                        format!(
+                            "setup failed with {}; inspect source/request {}/{}",
+                            error.code, prepared.source_id, prepared.client_request_id
+                        ),
+                    ));
+                }
+                return Err(Error::new(
+                    error.code,
+                    "hook setup failed; its issued source and local installation were rolled back",
+                ));
+            }
+        };
+
+    let readback = match git::readback_post_commit(repository, git_executable, source_id) {
+        Ok(readback) if readback.state == "installed" && readback.wrapper_matches => readback,
+        result => {
+            let failure_code = result
+                .err()
+                .map(|error| error.code)
+                .unwrap_or_else(|| "HOOK_INSTALL_READBACK_FAILED".to_owned());
+            let (source_revoked, local_restored) =
+                rollback_hook_setup(config, operator, &plan, &prepared, revision).await;
+            if !source_revoked || !local_restored {
+                return Err(Error::new(
+                    "HOOK_SETUP_ROLLBACK_INCOMPLETE",
+                    format!(
+                        "readback failed with {failure_code}; inspect source/request {}/{}",
+                        prepared.source_id, prepared.client_request_id
+                    ),
+                ));
+            }
+            return Err(sanitized_hook_install_error(&failure_code));
+        }
+    };
+    if installation.state != "installed" || !installation.wrapper_matches {
+        let (source_revoked, local_restored) =
+            rollback_hook_setup(config, operator, &plan, &prepared, revision).await;
+        if !source_revoked || !local_restored {
+            return Err(Error::new(
+                "HOOK_SETUP_ROLLBACK_INCOMPLETE",
+                format!(
+                    "inspect source/request {}/{}",
+                    prepared.source_id, prepared.client_request_id
+                ),
+            ));
+        }
+        return Err(sanitized_hook_install_error("HOOK_INSTALL_READBACK_FAILED"));
+    }
+    if git::complete_source_setup(&plan, &prepared).is_err() {
+        return Err(Error::new(
+            "HOOK_SETUP_FINALIZATION_PENDING",
+            format!(
+                "installation is active; retry source/request {}/{} to complete readback",
+                prepared.source_id, prepared.client_request_id
+            ),
+        ));
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "source":public_source,
+            "credential_file_written":true,
+            "installation":readback
+        }))?
+    );
+    Ok(())
+}
+
+async fn hook_install(
+    config: &Config,
+    operator: &Credential,
+    request_id: &Option<String>,
+    command: &HookInstallCommand,
+) -> Result<()> {
+    use eliot_swarm_controller::hooks::git;
+
+    match command {
+        HookInstallCommand::Preview { project_id } => {
+            if request_id.is_some() {
+                return Err(Error::invalid(
+                    "--request-id is not used for local hook preview",
+                ));
+            }
+            let (repository, git_executable) = hook_install_context(config, project_id)?;
+            let plan = git::preview_post_commit(repository, git_executable)?;
+            println!("{}", serde_json::to_string_pretty(&plan.public_value())?);
+        }
+        HookInstallCommand::Readback {
+            project_id,
+            source_id,
+        } => {
+            if request_id.is_some() {
+                return Err(Error::invalid(
+                    "--request-id is not used for local hook readback",
+                ));
+            }
+            let (repository, git_executable) = hook_install_context(config, project_id)?;
+            let readback = git::readback_post_commit(repository, git_executable, source_id)?;
+            println!("{}", serde_json::to_string_pretty(&readback)?);
+        }
+        HookInstallCommand::Revoke {
+            project_id,
+            source_id,
+            revision,
+        } => {
+            let (repository, git_executable) = hook_install_context(config, project_id)?;
+            let source = revoke_hook_source(
+                config,
+                operator,
+                source_id,
+                *revision,
+                request_id.as_deref(),
+            )
+            .await?;
+            let installation = git::revoke_post_commit(repository, git_executable, source_id)
+                .map_err(|error| {
+                    Error::new(
+                        "HOOK_SOURCE_REVOKED_INSTALL_RESTORE_FAILED",
+                        format!(
+                            "source {source_id} is revoked; local hook restoration failed with {}",
+                            error.code
+                        ),
+                    )
+                })?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &json!({"source":source,"installation":installation})
+                )?
+            );
+        }
     }
     Ok(())
 }

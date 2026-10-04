@@ -8,12 +8,467 @@ use crate::{
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
 
+const MAX_OWNED_SERVICE_START_FAILURE_BYTES: usize = 1024;
+const MAX_MANAGER_ACTION_REQUIRED_ITEMS: i64 = 32;
+const START_FAILURE_V1_KEYS: [&str; 5] = [
+    "schema_version",
+    "status",
+    "stage",
+    "error_code",
+    "native_effect",
+];
+const START_FAILURE_V2_KEYS: [&str; 7] = [
+    "schema_version",
+    "status",
+    "stage",
+    "error_code",
+    "native_effect",
+    "request_phase",
+    "http_status",
+];
+
 pub(super) fn get_operation(db: &Connection, id: &str) -> Result<Value> {
     let raw:Option<String>=db.query_row("SELECT json_object('operation_id',operation_id,'caller_id',caller_id,'method',method,'state',state,'task_id',task_id,'attempt_id',attempt_id,'binding_id',binding_id,'binding_generation',binding_generation,'prerequisite_operation_id',prerequisite_operation_id,'operation_contract',json_extract(effective_request_json,'$.operation_contract'),'native_refs',json(native_refs_json),'result',json(result_json),'created_at_ms',created_at_ms,'updated_at_ms',updated_at_ms) FROM operations WHERE operation_id=?1",[id],|r|r.get(0)).optional()?;
     Ok(serde_json::from_str(&raw.ok_or_else(|| {
         Error::new("NOT_FOUND", format!("Operation {id}"))
     })?)?)
 }
+
+/// Current-manager readback adds only a safe action link for a retained
+/// owned-service startup failure. Other Operation readers keep the existing
+/// projection and visibility boundary.
+pub(super) fn get_operation_for_current_manager(
+    db: &Connection,
+    p: &Principal,
+    id: &str,
+) -> Result<Value> {
+    let mut operation = get_operation(db, id)?;
+    if matches!(p.role, Role::Manager | Role::Operator)
+        && super::gm::require_authority(db, p).is_ok()
+        && super::operation_visible_to(db, p, id)?
+        && let Some(action) = owned_service_start_action_for_operation(db, id)?
+    {
+        operation["manager_action_required"] = action;
+    }
+    Ok(operation)
+}
+
+/// A startup rejection remains an unknown native effect until exact readback.
+/// Project only the closed, bounded diagnostic attached to this exact
+/// launch/open pair; never return its raw payload or a process error message.
+fn owned_service_start_action_for_operation(
+    db: &Connection,
+    operation_id: &str,
+) -> Result<Option<Value>> {
+    match owned_service_start_action_for_operation_inner(db, operation_id) {
+        Err(error)
+            if matches!(
+                error.code.as_str(),
+                "OWNED_SERVICE_LINK_CORRUPT" | "OWNED_SERVICE_START_DIAGNOSTIC_CORRUPT"
+            ) =>
+        {
+            Ok(Some(owned_service_start_diagnostic_gap(
+                operation_id,
+                &error.code,
+            )))
+        }
+        result => result,
+    }
+}
+
+fn owned_service_start_action_for_operation_inner(
+    db: &Connection,
+    operation_id: &str,
+) -> Result<Option<Value>> {
+    let mut statement = db.prepare(
+        "SELECT launch_operation_id,open_operation_id,binding_id,binding_generation,
+                task_id,attempt_id,state,process_id,process_birth_token,executable_sha256,proof_json
+         FROM owned_service_starts
+         WHERE launch_operation_id=?1 OR open_operation_id=?1
+         ORDER BY launch_operation_id LIMIT 2",
+    )?;
+    let rows = statement
+        .query_map([operation_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<i64>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, String>(10)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if rows.len() > 1 {
+        return Err(owned_service_link_corrupt());
+    }
+    let Some((
+        launch_operation_id,
+        open_operation_id,
+        binding_id,
+        binding_generation,
+        task_id,
+        attempt_id,
+        state,
+        process_id,
+        process_birth_token,
+        executable_sha256,
+        proof_json,
+    )) = rows.into_iter().next()
+    else {
+        return Ok(None);
+    };
+    if state != "outcome_unknown" {
+        return Ok(None);
+    }
+    if process_id.is_some()
+        || process_birth_token.is_some()
+        || executable_sha256.is_some()
+        || proof_json != "{}"
+        || binding_generation <= 0
+        || [
+            launch_operation_id.as_str(),
+            open_operation_id.as_str(),
+            binding_id.as_str(),
+            task_id.as_str(),
+            attempt_id.as_str(),
+        ]
+        .iter()
+        .any(|value| !safe_store_identifier(value))
+    {
+        return Err(owned_service_start_diagnostic_corrupt());
+    }
+    let operation_link_valid: bool = db.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM operations AS launch
+             JOIN operations AS opened ON opened.operation_id=?2
+             WHERE launch.operation_id=?1
+               AND launch.method='swarm.launch'
+               AND launch.state IN ('queued','outcome_unknown')
+               AND opened.method='agent.open'
+               AND opened.state IN ('queued','outcome_unknown')
+               AND launch.caller_id=opened.caller_id
+               AND launch.task_id=?3
+               AND launch.attempt_id=?4
+               AND opened.prerequisite_operation_id=launch.operation_id
+               AND opened.task_id=?3
+               AND opened.attempt_id=?4
+               AND opened.binding_id=?5
+               AND opened.binding_generation=?6
+               AND json_extract(launch.effective_request_json,'$.launch_manifest.binding.operation_id')=opened.operation_id
+               AND json_extract(launch.effective_request_json,'$.launch_manifest.binding.binding_id')=?5
+               AND json_extract(launch.effective_request_json,'$.launch_manifest.binding.generation')=?6
+         )",
+        params![
+            launch_operation_id,
+            open_operation_id,
+            task_id,
+            attempt_id,
+            binding_id,
+            binding_generation
+        ],
+        |row| row.get(0),
+    )?;
+    if !operation_link_valid {
+        return Err(owned_service_link_corrupt());
+    }
+
+    let event_key = format!("owned-service-start-failure:{launch_operation_id}");
+    let mut statement = db.prepare(
+        "SELECT observation_id,source_stream_id,source_event_key,operation_id,binding_id,
+                binding_generation,kind,substr(CAST(payload_json AS BLOB),1,?1)
+         FROM observations
+         WHERE source_event_key=?2
+            OR (operation_id=?3 AND kind='owned_service.start_failure')
+         ORDER BY observation_id LIMIT 2",
+    )?;
+    let rows = statement
+        .query_map(
+            params![
+                (MAX_OWNED_SERVICE_START_FAILURE_BYTES + 1) as i64,
+                event_key,
+                launch_operation_id
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Vec<u8>>(7)?,
+                ))
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if rows.len() > 1 {
+        return Err(owned_service_start_diagnostic_corrupt());
+    }
+    let Some((
+        observation_id,
+        source_stream_id,
+        source_event_key,
+        diagnostic_operation_id,
+        diagnostic_binding_id,
+        diagnostic_binding_generation,
+        kind,
+        payload_bytes,
+    )) = rows.into_iter().next()
+    else {
+        // An outcome-unknown reservation may still be in flight or recovered
+        // without a terminal start-failure observation.
+        return Ok(None);
+    };
+    if observation_id <= 0
+        || source_stream_id != "controller:owned-service"
+        || source_event_key != event_key
+        || diagnostic_operation_id != launch_operation_id
+        || diagnostic_binding_id != binding_id
+        || diagnostic_binding_generation != binding_generation
+        || kind != "owned_service.start_failure"
+        || payload_bytes.len() > MAX_OWNED_SERVICE_START_FAILURE_BYTES
+    {
+        return Err(owned_service_start_diagnostic_corrupt());
+    }
+    let payload_text = std::str::from_utf8(&payload_bytes)
+        .map_err(|_| owned_service_start_diagnostic_corrupt())?;
+    let payload: Value =
+        serde_json::from_str(payload_text).map_err(|_| owned_service_start_diagnostic_corrupt())?;
+    let diagnostic = validate_owned_service_start_failure(&payload)?;
+
+    Ok(Some(json!({
+        "status":"required",
+        "kind":"owned_service_start_failure",
+        "manager_actionable":true,
+        "launch_operation_id":launch_operation_id,
+        "open_operation_id":open_operation_id,
+        "binding_id":binding_id,
+        "binding_generation":binding_generation,
+        "task_id":task_id,
+        "attempt_id":attempt_id,
+        "schema_version":diagnostic["schema_version"],
+        "failure_status":diagnostic["status"],
+        "stage":diagnostic["stage"],
+        "error_code":diagnostic["error_code"],
+        "native_effect":"unknown",
+        "request_phase":diagnostic["request_phase"],
+        "http_status":diagnostic["http_status"],
+        "source_observation":{
+            "observation_id":observation_id,
+            "source_stream_id":"controller:owned-service",
+            "kind":"owned_service.start_failure",
+        },
+        "retry_authorized":false,
+        "next_readback":{
+            "method":"operation.get",
+            "params":{"operation_id":launch_operation_id},
+        },
+        "actions":[
+            "Read the exact linked launch and owned-service state before any retry.",
+            "Keep the native effect unknown until process or no-effect readback resolves it.",
+        ],
+    })))
+}
+
+fn validate_owned_service_start_failure(payload: &Value) -> Result<Value> {
+    let object = payload
+        .as_object()
+        .ok_or_else(owned_service_start_diagnostic_corrupt)?;
+    let schema_version = payload["schema_version"]
+        .as_i64()
+        .ok_or_else(owned_service_start_diagnostic_corrupt)?;
+    let expected_keys: &[&str] = match schema_version {
+        1 => &START_FAILURE_V1_KEYS,
+        2 => &START_FAILURE_V2_KEYS,
+        _ => return Err(owned_service_start_diagnostic_corrupt()),
+    };
+    if object.len() != expected_keys.len()
+        || expected_keys.iter().any(|key| !object.contains_key(*key))
+        || payload["status"] != "startup_failed_unknown"
+        || payload["native_effect"] != "unknown"
+        || !safe_start_failure_stage(payload["stage"].as_str().unwrap_or_default())
+        || !safe_start_failure_error_code(payload["error_code"].as_str().unwrap_or_default())
+    {
+        return Err(owned_service_start_diagnostic_corrupt());
+    }
+    let (request_phase, http_status) = if schema_version == 2 {
+        let request_phase = if payload["request_phase"].is_null() {
+            None
+        } else {
+            Some(
+                payload["request_phase"]
+                    .as_str()
+                    .filter(|phase| *phase == "provider_key_post")
+                    .ok_or_else(owned_service_start_diagnostic_corrupt)?,
+            )
+        };
+        let http_status = if payload["http_status"].is_null() {
+            None
+        } else {
+            Some(
+                payload["http_status"]
+                    .as_i64()
+                    .filter(|status| safe_start_failure_http_status(*status))
+                    .ok_or_else(owned_service_start_diagnostic_corrupt)?,
+            )
+        };
+        let provider_post_failure =
+            payload["stage"] == "bootstrap" && payload["error_code"] == "NATIVE_REJECTED";
+        if (request_phase.is_none() && http_status.is_some())
+            || (provider_post_failure && request_phase != Some("provider_key_post"))
+            || (!provider_post_failure && request_phase.is_some())
+        {
+            return Err(owned_service_start_diagnostic_corrupt());
+        }
+        (request_phase, http_status)
+    } else {
+        (None, None)
+    };
+    Ok(json!({
+        "schema_version":schema_version,
+        "status":"startup_failed_unknown",
+        "stage":payload["stage"],
+        "error_code":payload["error_code"],
+        "request_phase":request_phase,
+        "http_status":http_status,
+    }))
+}
+
+fn safe_store_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
+fn safe_start_failure_stage(value: &str) -> bool {
+    matches!(
+        value,
+        "permit_validation"
+            | "pre_spawn"
+            | "helper_spawn"
+            | "helper_input"
+            | "ready_receipt"
+            | "from_route"
+            | "connect_owned"
+            | "route_verify"
+            | "provider_scope"
+            | "bootstrap"
+            | "provider_proof"
+    )
+}
+
+fn safe_start_failure_error_code(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value.as_bytes().first().is_some_and(u8::is_ascii_uppercase)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn safe_start_failure_http_status(value: i64) -> bool {
+    matches!(value, 400 | 401 | 403 | 404 | 405 | 409 | 413 | 422)
+}
+
+fn owned_service_start_diagnostic_corrupt() -> Error {
+    Error::new(
+        "OWNED_SERVICE_START_DIAGNOSTIC_CORRUPT",
+        "owned service startup failure diagnostic is invalid",
+    )
+}
+
+fn owned_service_start_diagnostic_gap(operation_id: &str, error_code: &str) -> Value {
+    json!({
+        "status":"readback_required",
+        "kind":"owned_service_start_diagnostic_gap",
+        "manager_actionable":true,
+        "source_operation_id":if safe_store_identifier(operation_id) {
+            Value::String(operation_id.to_owned())
+        } else {
+            Value::Null
+        },
+        "error_code":error_code,
+        "native_effect":"unknown",
+        "retry_authorized":false,
+        "next_readback":if safe_store_identifier(operation_id) {
+            json!({"method":"operation.get","params":{"operation_id":operation_id}})
+        } else {
+            Value::Null
+        },
+        "actions":[
+            "Have the local Operator inspect the exact owned-service record before any retry.",
+            "Keep the native effect unknown until process or no-effect readback resolves it.",
+        ],
+    })
+}
+/// Bounded current-attention projection for the exact current GM. The stored
+/// Operation result remains unchanged; this links unresolved startup failures
+/// to their retained, closed-schema evidence.
+pub(super) fn owned_service_start_failure_actions(db: &Connection) -> Result<Value> {
+    let total_items: i64 = db.query_row(
+        "SELECT count(*)
+         FROM owned_service_starts AS start
+         WHERE start.state='outcome_unknown'
+           AND EXISTS(
+             SELECT 1 FROM observations AS diagnostic
+             WHERE diagnostic.source_event_key='owned-service-start-failure:' || start.launch_operation_id
+                OR (diagnostic.operation_id=start.launch_operation_id
+                    AND diagnostic.kind='owned_service.start_failure')
+           )",
+        [],
+        |row| row.get(0),
+    )?;
+    let launch_ids = {
+        let mut statement = db.prepare(
+            "SELECT start.launch_operation_id
+             FROM owned_service_starts AS start
+             WHERE start.state='outcome_unknown'
+               AND EXISTS(
+                 SELECT 1 FROM observations AS diagnostic
+                 WHERE diagnostic.source_event_key='owned-service-start-failure:' || start.launch_operation_id
+                    OR (diagnostic.operation_id=start.launch_operation_id
+                        AND diagnostic.kind='owned_service.start_failure')
+               )
+             ORDER BY start.updated_at_ms DESC,start.launch_operation_id
+             LIMIT ?1",
+        )?;
+        let rows = statement.query_map([MAX_MANAGER_ACTION_REQUIRED_ITEMS], |row| {
+            row.get::<_, String>(0)
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut items = Vec::with_capacity(launch_ids.len());
+    for launch_operation_id in launch_ids {
+        if let Some(item) = owned_service_start_action_for_operation(db, &launch_operation_id)? {
+            items.push(item);
+        }
+    }
+    let returned_items = items.len();
+    Ok(json!({
+        "status":if total_items == 0 {"clear"} else {"required"},
+        "items":items,
+        "total_items":total_items,
+        "returned_items":returned_items,
+        "has_more":total_items > MAX_MANAGER_ACTION_REQUIRED_ITEMS,
+        "limit":MAX_MANAGER_ACTION_REQUIRED_ITEMS,
+        "coverage":if total_items > MAX_MANAGER_ACTION_REQUIRED_ITEMS {
+            "latest_unresolved_startup_failures_bounded"
+        } else {
+            "all_unresolved_startup_failures"
+        },
+    }))
+}
+
 pub(super) fn get_binding(db: &Connection, id: &str, generation: i64) -> Result<Value> {
     let raw:Option<String>=db.query_row("SELECT json_object('binding_id',binding_id,'generation',generation,'lane_id',lane_id,'module_instance_id',module_instance_id,'module_artifact_id',module_artifact_id,'state',state,'native_scope_key',native_scope_key,'native_root_id',native_root_id,'released_at_ms',released_at_ms,'route',json(route_json),'observation',json(state_json)) FROM bindings WHERE binding_id=?1 AND generation=?2",params![id,generation],|r|r.get(0)).optional()?;
     Ok(serde_json::from_str(&raw.ok_or_else(|| {
@@ -1143,6 +1598,12 @@ pub(super) fn cancel(
         return Err(Error::new(
             "NOT_QUEUED",
             "already-sent operations require native cancellation/reconciliation, not local deletion",
+        ));
+    }
+    if o["method"] == "github.source.poll" && o["state"] == "queued" {
+        return Err(Error::new(
+            "GITHUB_POLL_CANCELLATION_UNSUPPORTED",
+            "a queued GitHub poll retains its source-read lease; resume the exact poll request or inspect github.source.get",
         ));
     }
     if let Some(service_start) = owned_service_start_for_operation(tx, target)? {

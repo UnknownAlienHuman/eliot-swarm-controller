@@ -541,9 +541,18 @@ impl Store {
                 helper_stdin,
             }) => {
                 let error_code = safe_start_error_code(&error.code);
+                let request_diagnostic = safe_native_request_diagnostic(stage, &error);
                 let row = admission.row.clone();
                 let persist = self
-                    .run(move |db| persist_start_failure_diagnostic(db, &row, stage, error_code))
+                    .run(move |db| {
+                        persist_start_failure_diagnostic(
+                            db,
+                            &row,
+                            stage,
+                            error_code,
+                            request_diagnostic,
+                        )
+                    })
                     .await;
                 // This EOF is the existing graceful helper stop. Keep it behind
                 // the durable diagnostic so the next run can identify the
@@ -1240,11 +1249,57 @@ fn safe_start_error_code(code: &str) -> String {
     }
 }
 
+#[derive(Clone, Copy)]
+enum SafeNativeRequestPhase {
+    ProviderKeyPost,
+}
+
+impl SafeNativeRequestPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ProviderKeyPost => "provider_key_post",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SafeNativeRequestDiagnostic {
+    phase: SafeNativeRequestPhase,
+    http_status: Option<u16>,
+}
+
+fn safe_native_request_diagnostic(
+    stage: OwnedServiceStartStage,
+    error: &Error,
+) -> Option<SafeNativeRequestDiagnostic> {
+    // During bootstrap, NATIVE_REJECTED can only come from the one key POST:
+    // the surrounding integration reads classify HTTP failures as NATIVE_READ_FAILED.
+    if stage.as_str() != "bootstrap" || error.code != "NATIVE_REJECTED" {
+        return None;
+    }
+
+    // HTTP helpers deliberately retain only this fixed message for rejected
+    // statuses. Parse a narrow allowlist; never persist Error.message itself.
+    let http_status = error.message.strip_prefix("HTTP ").and_then(|value| {
+        if value.len() != 3 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        let status = value.parse::<u16>().ok()?;
+        matches!(status, 400 | 401 | 403 | 404 | 405 | 409 | 413 | 422).then_some(status)
+    });
+
+    Some(SafeNativeRequestDiagnostic {
+        phase: SafeNativeRequestPhase::ProviderKeyPost,
+        http_status,
+    })
+}
+
 fn persist_start_failure_diagnostic(
     db: &mut Connection,
     row: &OwnedStartRow,
     stage: OwnedServiceStartStage,
     error_code: String,
+    request_diagnostic: Option<SafeNativeRequestDiagnostic>,
 ) -> Result<()> {
     let stage = stage.as_str();
     if !matches!(
@@ -1265,11 +1320,13 @@ fn persist_start_failure_diagnostic(
         return Err(corrupt("owned service startup diagnostic is malformed"));
     }
     let diagnostic = json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "startup_failed_unknown",
         "stage": stage,
         "error_code": error_code,
         "native_effect": "unknown",
+        "request_phase": request_diagnostic.map(|detail| detail.phase.as_str()),
+        "http_status": request_diagnostic.and_then(|detail| detail.http_status),
     });
     let canonical = model::canonical(&diagnostic)?;
     if canonical.len() > MAX_START_FAILURE_DIAGNOSTIC_BYTES {
