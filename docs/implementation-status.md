@@ -2,7 +2,7 @@
 
 ## Current state
 
-**Published source checkpoint:** GM continuity and submission readback source ab8f7aed314b59bd64a05266c1124e3a9412b32c is saved in main. Production Clippy, debug build and all 13 focused GM/Store checks passed; the cross-platform CI for this latest increment is pending. The preceding GM continuity source f3eda2883474b28b8d3e8c6e587e696fad5477f6 completed full Windows and Ubuntu CI [37182521189](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37182521189). C13/C14 source 509715b34f2739fd1d71d2d62418ea0ff9cdf1cc also passed [37180875162](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37180875162), as did C12 source fa38ea3287dfba0bf9c7e3c7658c4f3aad9580d8 and C11 source 4ecc030e072be1b3fdf39e2b3ead122953e4de82. Live model and full O7 qualification remain separate.
+**Source checkpoint:** GM continuity and host-crash submission readback are saved in main. Their production Clippy, debug build and 13 focused GM/Store checks passed. The subsequent MCP table corrections and OpenCode Windows path fix passed full Windows and Ubuntu CI [37186030488](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37186030488) for source 8f3998ffb5da24deaac8445f883fe19780b02f3b, verified on 2026-10-04. Explicit automation transfer now passes production Clippy, its real-Store preservation regression, all 29 MCP checks, the Windows input-probe integration check and debug build. Its qualification boundary and candidate are recorded below. Successful live OpenCode startup, effective hosted-model identity and the full O7 cycle remain unqualified.
 
 C10 adds the optional exact `launch_operation_id` to the actual `task.dispatch` schema and Store contract for launch-owned Attempts. The Store checks the retained parent, exact Task/Attempt/binding/lease lineage, immutable prompt packet, and current C8 MCP capability proof before native input. The owned-provider path accepts one explicitly configured provider credential source and reports `stored_unverified` only for credential metadata; that does not prove key validity or provider/model consumption.
 
@@ -22,13 +22,26 @@ An earlier Command preflight stopped before host or model startup with RUN_ROOT_
 
 This single Command result does not establish Task completion, acceptance, OpenCode service/MCP readiness, model identity, or the full O7 cycle. Installed R6 is unchanged. All local model/inference work, including PR24/Kilo, remains deferred.
 
+### Fresh OpenCode diagnostic — 2026-10-04 07:25 UTC
+
+Run aa62853f-8722-48e8-b6ef-eec20c42cf6b admitted exactly one fresh launch after
+the private ACL readback was corrected. The actual child exited with code 1;
+the retained receipt reports process_gone/process_exit_race. Its complete,
+untruncated 62-byte diagnostic says `Refusing a redirected directory path`.
+The retained workspace uses a Windows extended-length DOS path; OpenCode's
+owner comparison treated that spelling as different from the ordinary realpath.
+The module source correction is saved in main 8f3998ffb5da24deaac8445f883fe19780b02f3b; syntax and four extracted path comparisons passed. A successful native restart is not yet qualified. This run has no ready
+or native MCP proof and no model turn. Its Operation remains unknown and is
+retained without replay. This new cause does not establish the cause of older
+unknown runs.
+
 ### C13/C14 saved implementation checkpoint — 2026-10-04 05:46 UTC
 
 C13 implements an explicit accepted-candidate publication consumer, typed current-GM authority, shared manual/automatic effect slots, no-effect slot release after handover, and scoped operation/history/explanation readback. C14 adds bounded private startup diagnostics: a closed process-identity failure class, the actual immediate child exit observation, and redacted stderr metadata. These are implemented source paths; live automatic publication and successful owned OpenCode startup are not qualified.
 
 Production formatting, warnings-denied Clippy (15.19 s) and debug build (37.78 s) passed. The candidate SHA-256 is 984B38A3567E572D14EE1D01BADBD343C1FE1575BB6ECEB75AD2A55598B6371B. The existing owner-sponsored acceptance/history check passed. The dedicated publication regression exposed an incomplete synthetic submission result, an outdated explain method name, and an incorrect successor-manager history-read expectation. All three are corrected; the final corrected regression and pending Forge endpoint check have not yet run. No production permission check was weakened.
 
-The later full CI for 509715b passed both publication and Forge endpoint regressions. The successor-manager denial in that historical publication test is being changed to the explicit continuity requirement below; its old passing result does not qualify the new behavior. The C14 fresh-start diagnostic harness is prepared and source-audited, but unexecuted; preserve all earlier unknown runs without replay. The full native O7 cycle remains incomplete.
+The later full CI for 509715b passed both publication and Forge endpoint regressions. Later GM continuity source replaces the historical successor-manager denial with the explicit continuity requirement below. The C14 fresh-start diagnostic has now run once; its failure and source correction are recorded above. Preserve all unknown runs without replay. The full native O7 cycle remains incomplete.
 
 ### GM continuity correction — 2026-10-04
 
@@ -61,14 +74,42 @@ on d6af378; source hashes prove that only the recovery test changed afterward.
 The new candidate SHA-256 is
 128DC8791F31E29ED18FB2FFC4DF411F896658C1591461116F9C3FC8FEBC022F.
 Cross-platform CI [37184545179](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37184545179)
-is still pending. The installed R6 binary and running native environments have
+failed solely on the outdated MCP table contract, repaired in 2f3e22a. The focused table guard passes; subsequent full Windows and Ubuntu CI37186030488 passed for source 8f3998f. The installed R6 binary and running native environments have
 not been replaced or restarted by these source gates.
 
-**Resume here:** inspect the latest CI and the exact-source Luna audit, then
-continue owned native startup diagnosis and full O7. Use the new candidate hash
-above for any fresh owned harness; preserve earlier unknown runs without replay.
-Automatic transfer of every former manager's automation entry remains separate;
-readback must not reset its cursors or replay its effects.
+**Resume here:** continue successor automatic review/correction from the saved
+transfer increment, then owned native startup qualification. Use the transfer
+candidate below when a fresh harness requires this code. Preserve earlier unknown
+runs without replay. Transferring every former manager's entry automatically
+remains separate from explicit per-entry transfer.
+
+### Automation transfer — qualified source increment, 2026-10-04
+
+The source adds explicit `automation.config.transfer` to the current GM,
+with revision checks, retired source identity, preserved typed journals,
+historical operation links and exact queued-operation continuation. The GM MCP
+profile exposes former-owner configuration reads and transfer. The real-Store
+regression passed, including all four cursors and nonempty pending journals,
+unchanged historical configuration Operation, denied unrelated/stale transfers,
+and blocked former-owner reenablement. All 29 MCP checks, the Windows input-probe
+integration check, warnings-denied production Clippy and debug build passed.
+The production source was unchanged after Clippy; only the test's protected-record
+reads were corrected before the successful test. The final source stayed unchanged
+during the remaining gates. Luna's bounded authority/effect audit found no further
+blocker in this slice. Candidate SHA-256 is
+`000B92BE2CDF4A0FE789A25CB021603607138F0CD35B9845D14462D1A3FD77C0`.
+This is a built candidate, not a newly installed or live-native-qualified binary.
+
+Transferred WorkDispatch workspace reconciliation has a distinct readback-only
+path for `workspace_effect_unknown`. It records an observed held lease and keeps
+the parent unknown; it cannot claim, open, start or replay. Other uncertain native
+start phases retain their existing recovery contracts.
+
+New autonomous ReviewDispatch and non-pass correction of an old-owner Attempt
+are still owner-scoped after entry transfer. Existing old-owner-sponsored passes
+can use the independent-GM acceptance path, and manual successor control remains
+implemented. A new automatic successor review/correction route is the next
+implementation gap; transfer does not establish full autonomous O7.
 
 ### Prior C7/C8 evidence
 

@@ -7,7 +7,7 @@
 //! on-behalf actor and recheck it at effect start.
 
 pub(crate) use super::authorization::AUTOMATION_TECHNICAL_REQUESTER_ID;
-use super::{actions::AutomationStep, config};
+use super::{actions::AutomationStep, authorization, config};
 use crate::{
     error::{Error, Result},
     launcher::{LaunchPreviewRequest, LaunchRequest},
@@ -242,6 +242,7 @@ impl WorkDispatchSource {
 /// a credential or Principal replacement.
 #[derive(Debug, Clone)]
 pub(crate) struct WorkDispatchContext {
+    operation_id: Option<String>,
     technical_requester_id: String,
     effective_manager_id: String,
     automation_id: String,
@@ -261,6 +262,7 @@ impl WorkDispatchContext {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_validated_operation_link(
         db: &Connection,
+        operation_id: &str,
         effective_manager_id: &str,
         automation_id: &str,
         automation_revision: i64,
@@ -315,6 +317,7 @@ impl WorkDispatchContext {
             ));
         }
         Ok(Self {
+            operation_id: Some(operation_id.to_owned()),
             technical_requester_id: AUTOMATION_TECHNICAL_REQUESTER_ID.to_owned(),
             effective_manager_id: effective_manager_id.to_owned(),
             automation_id: automation_id.to_owned(),
@@ -442,6 +445,7 @@ impl WorkDispatchContext {
             )
         })?;
         Ok(Self {
+            operation_id: None,
             technical_requester_id: AUTOMATION_TECHNICAL_REQUESTER_ID.to_owned(),
             effective_manager_id: entry.owner_manager_id.clone(),
             automation_id: entry.automation_id.clone(),
@@ -470,7 +474,7 @@ impl WorkDispatchContext {
                 "current automation revision predates the retained WorkDispatch admission",
             ));
         }
-        self.require_current_entry(db)?;
+        self.require_current_entry(db, self.operation_id.as_deref())?;
         let current = Self::from_current_assignment(
             db,
             &entry,
@@ -512,7 +516,81 @@ impl WorkDispatchContext {
                 "on-behalf launch is outside its retained Task assignment",
             ));
         }
+        if let Some(operation_id) = self.operation_id.as_deref()
+            && let Some(authority) = authorization::current_transfer_workspace_readback_authority(
+                db,
+                operation_id,
+                &self.subject.task_id,
+            )?
+        {
+            if !authority.matches_work_dispatch(
+                operation_id,
+                &self.project_id,
+                &self.subject.task_id,
+            ) {
+                return Err(Error::new(
+                    "FORBIDDEN",
+                    "workspace readback authority differs from the retained WorkDispatch launch",
+                ));
+            }
+            return Ok(());
+        }
         self.require_current(db)
+    }
+
+    pub(crate) fn require_workspace_readback_authority(
+        &self,
+        db: &Connection,
+        operation_id: &str,
+    ) -> Result<authorization::TransferReadbackAuthority> {
+        if self.operation_id.as_deref() != Some(operation_id) {
+            return Err(Error::new(
+                "FORBIDDEN",
+                "workspace readback is outside the retained WorkDispatch Operation",
+            ));
+        }
+        let authority = authorization::current_transfer_workspace_readback_authority(
+            db,
+            operation_id,
+            &self.subject.task_id,
+        )?
+        .ok_or_else(|| {
+            Error::new(
+                "FORBIDDEN",
+                "no current-GM readback authority exists for this unknown workspace effect",
+            )
+        })?;
+        if !authority.matches_work_dispatch(operation_id, &self.project_id, &self.subject.task_id) {
+            return Err(Error::new(
+                "FORBIDDEN",
+                "workspace readback authority differs from the retained WorkDispatch subject",
+            ));
+        }
+        Ok(authority)
+    }
+
+    /// Distinguish the exact transferred unknown-workspace readback from a
+    /// queued initial launch, which still requires the retained manager to be
+    /// the designated GM.
+    pub(crate) fn is_workspace_readback_authorized(&self, db: &Connection) -> Result<bool> {
+        let Some(operation_id) = self.operation_id.as_deref() else {
+            return Ok(false);
+        };
+        let Some(authority) = authorization::current_transfer_workspace_readback_authority(
+            db,
+            operation_id,
+            &self.subject.task_id,
+        )?
+        else {
+            return Ok(false);
+        };
+        if !authority.matches_work_dispatch(operation_id, &self.project_id, &self.subject.task_id) {
+            return Err(Error::new(
+                "FORBIDDEN",
+                "workspace readback authority differs from the retained WorkDispatch subject",
+            ));
+        }
+        Ok(true)
     }
 
     /// Revalidate the Task Attempt created by the existing launch flow after
@@ -540,7 +618,7 @@ impl WorkDispatchContext {
                 "launch Attempt is outside the retained WorkDispatch subject",
             ));
         }
-        self.require_current_entry(db)?;
+        self.require_current_entry(db, Some(operation_id))?;
 
         let operation: Option<(String, Option<String>, Option<String>)> = db
             .query_row(
@@ -643,7 +721,7 @@ impl WorkDispatchContext {
                 "opening launch Attempt is outside the retained WorkDispatch subject",
             ));
         }
-        self.require_current_entry(db)?;
+        self.require_current_entry(db, Some(operation_id))?;
 
         let link = crate::store::automation_work_dispatch::operation_link(db, operation_id)?
             .ok_or_else(|| Error::new("FORBIDDEN", "launch has no retained WorkDispatch link"))?;
@@ -1249,7 +1327,7 @@ impl WorkDispatchContext {
                 "bound launch Attempt is outside the retained WorkDispatch subject",
             ));
         }
-        self.require_current_entry(db)?;
+        self.require_current_entry(db, Some(operation_id))?;
 
         let link = crate::store::automation_work_dispatch::operation_link(db, operation_id)?
             .ok_or_else(|| Error::new("FORBIDDEN", "launch has no retained WorkDispatch link"))?;
@@ -1704,7 +1782,7 @@ impl WorkDispatchContext {
         Ok(())
     }
 
-    fn require_current_entry(&self, db: &Connection) -> Result<()> {
+    fn require_current_entry(&self, db: &Connection, operation_id: Option<&str>) -> Result<()> {
         let entry = config::load_entry(
             db,
             &self.effective_manager_id,
@@ -1713,6 +1791,40 @@ impl WorkDispatchContext {
         )?
         .ok_or_else(|| Error::new("FORBIDDEN", "owning automation was removed"))?;
         config::validate_entry(&entry)?;
+        if let Some(operation_id) = operation_id
+            && config::transfer_from_source(
+                db,
+                &self.effective_manager_id,
+                &self.project_id,
+                &self.automation_id,
+            )?
+            .is_some()
+        {
+            let grant = authorization::current_transfer_continuation(
+                db,
+                operation_id,
+                "swarm.launch",
+                AutomationStep::WorkDispatch,
+                &self.subject.task_id,
+            )?
+            .ok_or_else(|| {
+                Error::new(
+                    "FORBIDDEN",
+                    "transferred WorkDispatch Operation has no exact current-GM grant",
+                )
+            })?;
+            if grant.historical_owner_id() != self.effective_manager_id
+                || grant.historical_revision() != self.automation_revision
+                || grant.current_entry().work_dispatch.as_ref() != Some(&self.launch_settings)
+                || !grant.current_entry().work_dispatch_ready()
+            {
+                return Err(Error::new(
+                    "FORBIDDEN",
+                    "current GM WorkDispatch settings differ from the immutable launch request",
+                ));
+            }
+            return Ok(());
+        }
         if !entry.enabled
             || !entry.steps.contains(&AutomationStep::WorkDispatch)
             || entry.scope.work_pool_id.is_some()

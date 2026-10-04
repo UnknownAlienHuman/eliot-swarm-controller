@@ -288,11 +288,48 @@ impl RepairDispatchContext {
         delivery_operation_id: &str,
     ) -> Result<()> {
         validate_identity_text(delivery_operation_id, "delivery_operation_id")?;
-        self.require_current_action(db)?;
         self.require_current_subject(db)?;
         self.require_committed_lineage(db)?;
         self.require_delivery_operation(db, delivery_operation_id)?;
+        let continuation = authorization::current_transfer_continuation(
+            db,
+            delivery_operation_id,
+            "agent.send",
+            AutomationStep::RepairDispatch,
+            &self.identity.task_id,
+        )?;
+        if let Some(continuation) = continuation {
+            self.require_transfer_continuation_matches(&continuation)?;
+        } else {
+            self.require_current_action(db)?;
+        }
         self.require_no_unresolved_effect(db, Some(delivery_operation_id))
+    }
+
+    pub(crate) fn require_transfer_continuation_matches(
+        &self,
+        continuation: &authorization::TransferContinuation,
+    ) -> Result<()> {
+        let entry = continuation.current_entry();
+        if continuation.historical_owner_id() != self.effective_manager_id
+            || continuation.historical_revision() != self.automation_revision
+            || continuation.project_id() != self.project_id
+            || continuation.automation_id() != self.automation_id
+            || continuation.action() != "agent.send"
+            || continuation.task_id() != self.identity.task_id
+            || entry.owner_manager_id != continuation.current_owner_id()
+            || entry.project_id != self.project_id
+            || entry.automation_id != self.automation_id
+            || !entry.enabled
+            || !entry.steps.contains(&AutomationStep::RepairDispatch)
+            || entry.scope.work_pool_id.is_some()
+        {
+            return Err(Error::new(
+                "AUTOMATION_TRANSFER_SCOPE",
+                "current GM transfer does not preserve the exact retained RepairDispatch operation",
+            ));
+        }
+        Ok(())
     }
 
     fn require_current_action(&self, db: &Connection) -> Result<()> {
@@ -318,7 +355,6 @@ impl RepairDispatchContext {
     }
 
     fn require_current_subject(&self, db: &Connection) -> Result<()> {
-        authorization::require_registered_manager(db, &self.effective_manager_id)?;
         let subject = read_current_subject(db, &self.identity)?;
         if subject.project_id != self.project_id
             || subject.owner_id != self.effective_manager_id

@@ -590,6 +590,11 @@ pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
             text(params, "client_request_id")?;
             return Ok(());
         }
+        "automation.config.transfer" => {
+            crate::automation::config::TransferRequest::parse(params)?;
+            text(params, "client_request_id")?;
+            return Ok(());
+        }
         "forge.publish_ref" => {
             crate::forge::PublishRefRequest::parse(params)?;
             return Ok(());

@@ -1100,6 +1100,61 @@ fn load_state(db: &rusqlite::Connection, entry: &AutomationEntry) -> Result<Opti
             "automation dispatch state fields are invalid",
         )
     })?;
+    validate_state(&state, entry)?;
+    Ok(Some(state))
+}
+
+pub(super) fn relocate_state(
+    tx: &Transaction<'_>,
+    former: &AutomationEntry,
+    new: &AutomationEntry,
+) -> Result<()> {
+    config::validate_entry(former)?;
+    config::validate_entry(new)?;
+    if former.owner_manager_id == new.owner_manager_id
+        || former.project_id != new.project_id
+        || former.automation_id != new.automation_id
+    {
+        return Err(Error::invalid(
+            "automation dispatch relocation must preserve project and automation identity while changing owner",
+        ));
+    }
+
+    let source_key = config::dispatch_state_key(
+        &former.owner_manager_id,
+        &former.project_id,
+        &former.automation_id,
+    )?;
+    let target_key =
+        config::dispatch_state_key(&new.owner_manager_id, &new.project_id, &new.automation_id)?;
+    let target_exists: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM meta WHERE key=?1)",
+        [&target_key],
+        |row| row.get(0),
+    )?;
+    if target_exists {
+        return Err(Error::conflict(
+            "automation dispatch target state already exists",
+        ));
+    }
+
+    let Some(mut state) = load_state(tx, former)? else {
+        return Ok(());
+    };
+    state.owner_manager_id = new.owner_manager_id.clone();
+    validate_state(&state, new)?;
+    config::write_record(tx, &target_key, &serde_json::to_value(&state)?)?;
+    let deleted = tx.execute("DELETE FROM meta WHERE key=?1", [&source_key])?;
+    if deleted != 1 {
+        return Err(Error::new(
+            "AUTOMATION_CURSOR_MISSING",
+            "automation dispatch source state changed during relocation",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_state(state: &DispatchState, entry: &AutomationEntry) -> Result<()> {
     if state.schema_version != DISPATCH_SCHEMA_VERSION
         || state.owner_manager_id != entry.owner_manager_id
         || state.project_id != entry.project_id
@@ -1114,7 +1169,7 @@ fn load_state(db: &rusqlite::Connection, entry: &AutomationEntry) -> Result<Opti
             "automation dispatch cursor identity or bounds are invalid",
         ));
     }
-    Ok(Some(state))
+    Ok(())
 }
 
 fn save_state(db: &rusqlite::Connection, key: &str, state: &DispatchState) -> Result<()> {

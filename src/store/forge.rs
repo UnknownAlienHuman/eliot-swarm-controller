@@ -4,7 +4,7 @@
 use super::{current_principal, gm, meta, operations, results, submissions, tasks};
 use crate::{
     artifacts::ArtifactRecord,
-    automation::publication::PublicationContext,
+    automation::{authorization::TransferContinuation, publication::PublicationContext},
     checks::source,
     config::Config,
     error::{Error, Result},
@@ -53,6 +53,7 @@ struct ForgeWork {
     project: ForgeProject,
     candidate: Option<ArtifactRecord>,
     mode: WorkMode,
+    transfer_continuation: Option<TransferContinuation>,
 }
 
 #[derive(Debug, Clone)]
@@ -101,6 +102,30 @@ impl ForgeActor {
             Self::Direct { client_id } => require_direct_write_authority(db, client_id),
             Self::OnBehalf(context) => {
                 context.require_current(db)?;
+                Ok(context.gm_epoch())
+            }
+        }
+    }
+
+    fn transfer_continuation(&self, db: &Connection) -> Result<Option<TransferContinuation>> {
+        match self {
+            Self::Direct { .. } => Ok(None),
+            Self::OnBehalf(context) => context.transfer_continuation(db),
+        }
+    }
+
+    fn require_prepared_transfer_write_authority(
+        &self,
+        db: &Connection,
+        continuation: &TransferContinuation,
+    ) -> Result<i64> {
+        match self {
+            Self::Direct { .. } => Err(Error::new(
+                "AUTOMATION_TRANSFER_SCOPE",
+                "direct Forge actors cannot use an automation transfer grant",
+            )),
+            Self::OnBehalf(context) => {
+                context.require_prepared_transfer_continuation(db, continuation)?;
                 Ok(context.gm_epoch())
             }
         }
@@ -225,7 +250,20 @@ fn accepted_candidate(
     input: &PublishRefRequest,
     config: &ForgeConfig,
 ) -> Result<(PublicationIntent, ForgeProject, ArtifactRecord)> {
-    let admitted_gm_epoch = actor.require_current_write_authority(db)?;
+    accepted_candidate_with_transfer(db, actor, input, config, None)
+}
+
+fn accepted_candidate_with_transfer(
+    db: &Connection,
+    actor: &ForgeActor,
+    input: &PublishRefRequest,
+    config: &ForgeConfig,
+    transfer_continuation: Option<&TransferContinuation>,
+) -> Result<(PublicationIntent, ForgeProject, ArtifactRecord)> {
+    let admitted_gm_epoch = match transfer_continuation {
+        Some(continuation) => actor.require_prepared_transfer_write_authority(db, continuation)?,
+        None => actor.require_current_write_authority(db)?,
+    };
     actor.require_request_matches(input)?;
     let attempt = tasks::get_attempt(db, &input.attempt_id)?;
     let task_id = model::text(&attempt, "task_id")?;
@@ -717,6 +755,7 @@ fn work_from_saved(
         project,
         candidate,
         mode,
+        transfer_continuation: None,
     })
 }
 
@@ -740,8 +779,9 @@ fn begin(db: &mut Connection, id: &str, config: &Config) -> Result<Option<ForgeW
         Some("queued") => {
             let saved = saved_intent(&tx, id)?;
             actor.require_intent_matches(&saved)?;
+            let transfer_continuation = actor.transfer_continuation(&tx)?;
             let current_epoch = current_gm_epoch(&tx)?;
-            if saved.admitted_gm_epoch != current_epoch {
+            if saved.admitted_gm_epoch != current_epoch && transfer_continuation.is_none() {
                 settle_stale_gm_epoch(&tx, id, saved.admitted_gm_epoch, current_epoch)?;
                 tx.commit()?;
                 return Ok(None);
@@ -774,7 +814,8 @@ fn begin(db: &mut Connection, id: &str, config: &Config) -> Result<Option<ForgeW
                 work_from_saved(&tx, saved, &config.forge, WorkMode::PushOnce)
             })();
             match start {
-                Ok(work) => {
+                Ok(mut work) => {
+                    work.transfer_continuation = transfer_continuation;
                     let now = model::now_ms()?;
                     tx.execute(
                         "UPDATE operations SET state='sending',result_json=json_set(COALESCE(result_json,'{}'),'$.process_tree_unconfirmed',json('false'),'$.process_tree_status','in_flight','$.publication_may_have_started',json('false')),sent_at_ms=?2,updated_at_ms=?2 WHERE operation_id=?1 AND state='queued'",
@@ -925,14 +966,20 @@ fn dispatch_authorized(
     }
     let admitted_gm_epoch = saved.admitted_gm_epoch;
     let current_epoch = current_gm_epoch(db)?;
-    if admitted_gm_epoch != current_epoch {
+    if admitted_gm_epoch != current_epoch && work.transfer_continuation.is_none() {
         return Ok(DispatchAuthorization::StaleGmEpoch {
             admitted_gm_epoch,
             current_gm_epoch: current_epoch,
         });
     }
     let input = request(db, &work.intent.operation_id)?;
-    let (expected, project, candidate) = accepted_candidate(db, &actor, &input, &config.forge)?;
+    let (expected, project, candidate) = accepted_candidate_with_transfer(
+        db,
+        &actor,
+        &input,
+        &config.forge,
+        work.transfer_continuation.as_ref(),
+    )?;
     let mut expected = expected;
     expected.operation_id = work.intent.operation_id.clone();
     if expected != work.intent
@@ -943,6 +990,17 @@ fn dispatch_authorized(
             "FORGE_ACCEPTANCE_STALE",
             "accepted candidate or project mapping changed before publication",
         ));
+    }
+    if let Some(continuation) = work.transfer_continuation.as_ref() {
+        actor.require_prepared_transfer_write_authority(db, continuation)?;
+    } else {
+        let final_epoch = current_gm_epoch(db)?;
+        if admitted_gm_epoch != final_epoch {
+            return Ok(DispatchAuthorization::StaleGmEpoch {
+                admitted_gm_epoch,
+                current_gm_epoch: final_epoch,
+            });
+        }
     }
     let now = model::now_ms()?;
     let changed = db.execute(

@@ -133,6 +133,7 @@ pub(super) fn allows_method(profile: McpToolProfile, method: &str) -> bool {
                 | "automation.config.get"
                 | "automation.config.preview"
                 | "automation.config.apply"
+                | "automation.config.transfer"
                 | "automation.config.explain"
                 | "swarm.queue.get"
                 | "swarm.agent.inspect"
@@ -148,10 +149,7 @@ pub(super) fn allows_method(profile: McpToolProfile, method: &str) -> bool {
             (allows_method(McpToolProfile::Manager, method)
                 && !matches!(
                     method,
-                    "automation.config.get"
-                        | "automation.config.preview"
-                        | "automation.config.apply"
-                        | "automation.config.explain"
+                    "automation.config.preview" | "automation.config.apply"
                 ))
                 || matches!(
                     method,

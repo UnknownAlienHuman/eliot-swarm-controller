@@ -774,6 +774,52 @@ fn validate_state(state: &DispositionState, entry: &AutomationEntry) -> Result<(
     Ok(())
 }
 
+pub(super) fn relocate_state(
+    tx: &Transaction<'_>,
+    former: &AutomationEntry,
+    new: &AutomationEntry,
+) -> Result<()> {
+    config::validate_entry(former)?;
+    config::validate_entry(new)?;
+    if former.owner_manager_id == new.owner_manager_id
+        || former.project_id != new.project_id
+        || former.automation_id != new.automation_id
+    {
+        return Err(Error::invalid(
+            "review-disposition relocation must preserve project and automation identity while changing owner",
+        ));
+    }
+
+    let source_key = state_key(former)?;
+    let target_key = state_key(new)?;
+    let target_exists: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM meta WHERE key=?1)",
+        [&target_key],
+        |row| row.get(0),
+    )?;
+    if target_exists {
+        return Err(Error::conflict(
+            "review-disposition target state already exists",
+        ));
+    }
+
+    let Some(mut state) = load_state(tx, former)? else {
+        return Ok(());
+    };
+    state.owner_manager_id = new.owner_manager_id.clone();
+    state.configured_revision = new.revision;
+    validate_state(&state, new)?;
+    save_state(tx, &target_key, &state)?;
+    let deleted = tx.execute("DELETE FROM meta WHERE key=?1", [&source_key])?;
+    if deleted != 1 {
+        return Err(Error::new(
+            "AUTOMATION_REVIEW_DISPOSITION_STATE_MISSING",
+            "review-disposition source state changed during relocation",
+        ));
+    }
+    Ok(())
+}
+
 fn save_state(tx: &Transaction<'_>, key: &str, state: &DispositionState) -> Result<()> {
     config::write_record(tx, key, &serde_json::to_value(state)?)
 }

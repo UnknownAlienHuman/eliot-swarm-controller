@@ -56,9 +56,45 @@ For recovery, `automation.config.get` and `automation.config.explain` accept an
 optional `owner_manager_id` read selector. Omission selects the authenticated
 manager. The designated current GM may inspect another manager's retained entries,
 cursors and linked history in the requested project. This read preserves the
-original owner and does not enable, copy, transfer or reset an entry. Ordinary
-manager mutations remain scoped to their own entries. See
+original owner and does not enable, copy, transfer or reset an entry. The GM
+profile permits `automation.config.get`, `automation.config.explain` and the
+explicit transfer below; `automation.config.preview` and
+`automation.config.apply` remain Manager-only. See
 [GM session continuity](../gm-session-continuity.md).
+
+### 3.1 Explicit transfer to the current GM
+
+`gm.handover` changes the designated GM but does not transfer automation
+entries. After handover, the current GM or a local Operator may call
+`automation.config.transfer` for one entry. The destination is always the
+current GM; the request identifies only the project, former owner, automation
+and expected source revision:
+
+```json
+{
+  "client_request_id": "transfer-submission-audit",
+  "project_id": "project-a",
+  "former_owner_manager_id": "GM-previous",
+  "automation_id": "submission-audit",
+  "expected_revision": 3
+}
+```
+
+The call atomically retires the former-owner source and transfers that entry to
+the current GM. A stale `expected_revision` or an existing conflicting target
+entry is refused; transfer does not overwrite or merge the target. Cursors,
+pending slots and linked history are preserved. Existing authority and history
+actors remain unchanged: transfer does not grant a new action right, rewrite
+prior actors or replay pending work. Use the current source revision from
+`automation.config.get` and a stable `client_request_id` for the explicit
+mutation.
+
+The CLI form is `swarm automation config transfer --file <json>`, with
+`--request-id <stable-id>` supplying `client_request_id`. A GM may inspect the
+former owner's entry and transfer it, but the preview/apply configuration
+mutations remain available only through the Manager profile. If the transfer
+outcome is unknown, resolve it through readback only; do not issue another
+transfer mutation.
 
 Effective automatic authority is:
 
@@ -347,7 +383,7 @@ Saved enabled/disabled choices survive ordinary host restart and manager-client 
 
 Disable stops new starts and separate follow-ups, not running agents, native Goals or remote writes. Manual tools keep working and share the same reservations. Results/readback from already started work remain recordable; revocation never justifies forging new output or losing observed effect evidence.
 
-Revoked/deleted ownership blocks only new affected actions. Restored rights can make a still-enabled entry eligible; explicitly disabled entries stay disabled. Owner transfer is a future explicit authorized management action, not implemented in this slice. Before enabling it, compare-and-swap the owner epoch; it is never a side effect of editing, last-editor identity, session silence or queue balancing. Preserve old invocation attribution and reconcile old uncertain effects before replacing anything. GM handover does not automatically transfer every manager's automations or old epoch-fenced publication.
+Revoked/deleted ownership blocks only new affected actions. Restored rights can make a still-enabled entry eligible; explicitly disabled entries stay disabled. `automation.config.transfer` is the explicit, atomic compare-and-swap path for moving one entry from `former_owner_manager_id` to the current GM. It retires the source entry, preserves cursors, pending slots and linked history, refuses a conflicting target, and leaves authority and historical actors unchanged. It is never a side effect of editing, last-editor identity, session silence, queue balancing or `gm.handover`; a GM handover does not automatically transfer automations or old epoch-fenced publication. Resolve an unknown transfer outcome through readback only.
 
 ## 9. Dynamic runtime preferences
 
@@ -365,7 +401,7 @@ Script activation chooses future runnable content, not a trigger. An authorized 
 
 Goal tracking starts no work. Its selected progression uses one enabled manager entry and one actual continuation owner. Requested one-shot watches are available without recurring automation; a notice is not a task or approval-prompt answer.
 
-Keep #22's small eager cores. Config get/preview/apply/explain and detailed runtime, hook, script, schedule, Goal, review and forge methods are deferred groups. Schedule/rule/Goal editors update the same entry and enabled flag, not parallel records. Before exposing them, wire their real application handler and result reader.
+Keep #22's small eager cores. Config get/preview/apply/explain/transfer and detailed runtime, hook, script, schedule, Goal, review and forge methods are deferred groups. Schedule/rule/Goal editors update the same entry and enabled flag, not parallel records. Before exposing a new method, wire its real application handler and result reader.
 
 For review, the normal assigned-auditor result tool is `review.submit`; `task.request_changes` remains the guarded manager disposition. Scoped Manager feedback is available only when a TaskSpec explicitly selects [owner-policy-v2](../owner-policy-v2.md) for a new Attempt. Existing v1 Attempts and their feedback rights/evidence remain frozen and unchanged. Existing legacy MCP schemas do not silently acquire new rights. `automation.config.explain` and manual review/context reads must find on-behalf Operations through their owner linkage even though the service is their technical requester.
 

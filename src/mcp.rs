@@ -773,6 +773,22 @@ static TOOLS: &[(bool, ToolSpec)] = &[
         &["project_id", "changes"],
     ),
     mutation(
+        "automation.config.transfer",
+        "Transfer one former-manager automation to the current GM while preserving its cursors and pending operations. Requires current GM or local Operator authority and the exact source revision.",
+        &[
+            f("project_id", S),
+            f("former_owner_manager_id", S),
+            f("automation_id", S),
+            f("expected_revision", I),
+        ],
+        &[
+            "project_id",
+            "former_owner_manager_id",
+            "automation_id",
+            "expected_revision",
+        ],
+    ),
+    mutation(
         "host.mode",
         "Enable or disable admission of new work on the host: new_work is the string \"enabled\" or \"disabled\".",
         &[f("new_work", S)],
@@ -2889,15 +2905,16 @@ mod tests {
             "review.assign",
             "review.submit",
             "automation.config.apply",
+            "automation.config.transfer",
         ]
         .into_iter()
         .collect();
         assert_eq!(methods, expected);
-        assert_eq!(TOOLS.len(), 92);
+        assert_eq!(TOOLS.len(), 93);
         assert_eq!(TOOLS.iter().filter(|(read_only, _)| *read_only).count(), 45);
         assert_eq!(
             TOOLS.iter().filter(|(read_only, _)| !*read_only).count(),
-            47
+            48
         );
     }
 

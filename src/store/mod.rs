@@ -8,6 +8,7 @@ mod automation_disposition;
 mod automation_intake;
 mod automation_publication;
 pub(crate) mod automation_repair;
+mod automation_transfer;
 pub(crate) mod automation_work_dispatch;
 pub(crate) mod capacity;
 mod checks;
@@ -729,6 +730,7 @@ impl Store {
                 | "host.mode"
                 | "module.outcome"
                 | "automation.config.apply"
+                | "automation.config.transfer"
                 | "review.assign"
                 | "review.submit"
                 | "task.request_changes"
@@ -3402,6 +3404,9 @@ fn apply(
         "automation.config.apply" => {
             automation::apply(tx, p, v, id, config, now).map(|value| (value, false))
         }
+        "automation.config.transfer" => {
+            automation_transfer::apply(tx, p, v, id, now).map(|value| (value, false))
+        }
         "forge.publish_ref" => forge::reserve(tx, p, v, id, config).map(|value| {
             let queued = value.get("coalesced") != Some(&Value::Bool(true));
             (value, queued)
@@ -3638,6 +3643,8 @@ fn cancel_message(tx: &Transaction<'_>, p: &Principal, v: &Value, id: &str) -> R
     )
 }
 
+#[cfg(test)]
+mod automation_transfer_tests;
 #[cfg(test)]
 mod capacity_tests;
 #[cfg(test)]

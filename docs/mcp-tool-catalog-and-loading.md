@@ -400,6 +400,7 @@ client.list
 client.register
 host.mode
 gm.handover
+automation.config.transfer
 ```
 
 GM authorization does not make this group eager. It is explicit/manual-only.

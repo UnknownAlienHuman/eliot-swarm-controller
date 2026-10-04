@@ -64,7 +64,36 @@ Former-owner automation read parameters are explicit:
 
 Pass these to `automation.config.explain`; omit `automation_id` for
 `automation.config.get`. This read does not enable, transfer or duplicate an
-automation entry. Owner transfer remains a separate management operation.
+automation entry.
+
+After `gm.handover` designates the successor, the current GM can transfer one
+retained entry from its former owner. A local Operator can also perform this
+management action. First read the old owner's entry and use its current revision
+as `expected_revision`; the transfer target is always the current GM. The JSON
+file contains the exact transfer selectors and revision, while the global
+`--request-id` supplies the durable `client_request_id`:
+
+```json
+{
+  "project_id": "project-a",
+  "former_owner_manager_id": "GM-previous",
+  "automation_id": "submission-audit",
+  "expected_revision": 3
+}
+```
+
+Replace the example revision with the one returned by the read, then run the
+transfer using the successor's credential (or an authorized local Operator
+credential):
+
+```powershell
+swarm --data-dir C:\SwarmState --credential C:\SwarmState\GM-next.credential.json automation config get --file C:\SwarmState\former-owner-automation.json
+swarm --data-dir C:\SwarmState --credential C:\SwarmState\GM-next.credential.json --request-id transfer-submission-audit automation config transfer --file C:\SwarmState\automation-transfer.json
+```
+
+The same `--request-id` must be reused if the response is lost. Transfer is an
+explicit mutation for one entry; it preserves the retained automation state and
+does not replay a pending slot or reset its cursor.
 
 The source now implements this continuity requirement. Verification requires a
 real Store regression with an old GM, a successor using a different

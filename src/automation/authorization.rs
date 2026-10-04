@@ -1,7 +1,10 @@
 //! Internal manager-on-behalf identity. This is constructed from verified
 //! Store state and intentionally has no public deserializer or constructor.
 
-use super::{actions::AutomationCause, config};
+use super::{
+    actions::{AutomationCause, AutomationStep},
+    config,
+};
 use crate::{
     acceptance::AcceptRequest,
     error::{Error, Result},
@@ -272,6 +275,122 @@ pub(crate) enum AnyOnBehalfOperationLink {
     Publication(OnBehalfOperationLink),
     WorkDispatch(crate::store::automation_work_dispatch::WorkDispatchOperationLink),
     Repair(Box<crate::store::automation_repair::RepairDispatchOperationLink>),
+}
+
+/// Current execution authority derived from an immutable old operation and a
+/// committed automation ownership-transfer chain. The historical attribution
+/// stays on the operation; this value is only a separately checked grant for
+/// a still-queued effect that has not started.
+#[derive(Debug, Clone)]
+pub(crate) struct TransferContinuation {
+    historical_owner_id: String,
+    historical_revision: i64,
+    current_owner_id: String,
+    current_gm_epoch: i64,
+    project_id: String,
+    automation_id: String,
+    action: String,
+    task_id: String,
+    transfer_operation_ids: Vec<String>,
+    current_entry: config::AutomationEntry,
+}
+
+/// Read-only authority to reconcile one exact unknown WorkDispatch workspace
+/// effect after its automation has transferred. This is intentionally a
+/// different capability from `TransferContinuation`, which only admits a
+/// queued, unsent effect under the successor's current settings.
+#[derive(Debug, Clone)]
+pub(crate) struct TransferReadbackAuthority {
+    operation_id: String,
+    project_id: String,
+    task_id: String,
+}
+
+impl TransferReadbackAuthority {
+    pub(crate) fn matches_work_dispatch(
+        &self,
+        operation_id: &str,
+        project_id: &str,
+        task_id: &str,
+    ) -> bool {
+        self.operation_id == operation_id
+            && self.project_id == project_id
+            && self.task_id == task_id
+    }
+}
+
+impl TransferContinuation {
+    pub(crate) fn historical_owner_id(&self) -> &str {
+        &self.historical_owner_id
+    }
+
+    pub(crate) fn historical_revision(&self) -> i64 {
+        self.historical_revision
+    }
+
+    pub(crate) fn current_owner_id(&self) -> &str {
+        &self.current_owner_id
+    }
+
+    pub(crate) fn project_id(&self) -> &str {
+        &self.project_id
+    }
+
+    pub(crate) fn automation_id(&self) -> &str {
+        &self.automation_id
+    }
+
+    pub(crate) fn action(&self) -> &str {
+        &self.action
+    }
+
+    pub(crate) fn task_id(&self) -> &str {
+        &self.task_id
+    }
+
+    pub(crate) fn current_entry(&self) -> &config::AutomationEntry {
+        &self.current_entry
+    }
+
+    /// Revalidate this already-created queued grant at Forge's exact
+    /// pre-write boundary. This cannot construct a grant from a sending,
+    /// unknown, or otherwise unadmitted Operation.
+    pub(crate) fn revalidate_publication_prewrite(
+        &self,
+        db: &Connection,
+        operation_id: &str,
+    ) -> Result<Self> {
+        let current = current_transfer_continuation_at_phase(
+            db,
+            operation_id,
+            "forge.publish_ref",
+            AutomationStep::Publication,
+            &self.task_id,
+            TransferContinuationPhase::PublicationPreWrite,
+        )?
+        .ok_or_else(|| {
+            Error::new(
+                "FORBIDDEN",
+                "the queued transfer grant no longer has an active transfer lineage",
+            )
+        })?;
+        if current.historical_owner_id != self.historical_owner_id
+            || current.historical_revision != self.historical_revision
+            || current.current_owner_id != self.current_owner_id
+            || current.current_gm_epoch != self.current_gm_epoch
+            || current.project_id != self.project_id
+            || current.automation_id != self.automation_id
+            || current.action != self.action
+            || current.task_id != self.task_id
+            || current.transfer_operation_ids != self.transfer_operation_ids
+        {
+            return Err(Error::new(
+                "FORBIDDEN",
+                "GM epoch, transfer lineage, or exact Operation scope changed before publication",
+            ));
+        }
+        Ok(current)
+    }
 }
 
 impl AnyOnBehalfOperationLink {
@@ -1475,6 +1594,566 @@ pub(crate) fn any_on_behalf_operation_link(
             "Operation has multiple on-behalf attribution records",
         )),
     }
+}
+
+type TransferOperationRow = (Option<String>, String, String, Option<i64>, Option<String>);
+type TransferMutationRow = (String, String, String, Option<String>);
+
+/// Rehydrate a current-GM continuation grant for one exact, still-queued
+/// linked Operation. The stored caller/effective manager and action request
+/// are never rewritten. Callers must additionally compare their immutable
+/// action-specific request/intent with `current_entry()` before beginning an
+/// effect. Sent, unknown, or settled effects are intentionally excluded.
+pub(crate) fn current_transfer_continuation(
+    db: &Connection,
+    operation_id: &str,
+    expected_action: &str,
+    expected_step: AutomationStep,
+    expected_task_id: &str,
+) -> Result<Option<TransferContinuation>> {
+    current_transfer_continuation_at_phase(
+        db,
+        operation_id,
+        expected_action,
+        expected_step,
+        expected_task_id,
+        TransferContinuationPhase::QueuedUnsent,
+    )
+}
+
+/// Resolve a read-only continuation authority for the exact unknown
+/// workspace-preparation effect of a transferred WorkDispatch launch. Unlike
+/// `current_transfer_continuation`, this does not authorize new work and does
+/// not require the successor entry to remain enabled or keep old settings.
+pub(crate) fn current_transfer_workspace_readback_authority(
+    db: &Connection,
+    operation_id: &str,
+    expected_task_id: &str,
+) -> Result<Option<TransferReadbackAuthority>> {
+    let Some(AnyOnBehalfOperationLink::WorkDispatch(link)) =
+        any_on_behalf_operation_link(db, operation_id)?
+    else {
+        return Ok(None);
+    };
+    if link.operation_id != operation_id
+        || link.action != "swarm.launch"
+        || link.technical_requester_id != AUTOMATION_TECHNICAL_REQUESTER_ID
+        || link.task_id != expected_task_id
+    {
+        return Err(Error::new(
+            "AUTOMATION_LINK_CORRUPT",
+            "retained WorkDispatch link does not match the requested launch readback",
+        ));
+    }
+
+    type ReadbackOperationRow = (
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        String,
+    );
+    let operation: Option<ReadbackOperationRow> = db
+        .query_row(
+            "SELECT caller_id,method,state,task_id,attempt_id,result_json,effective_request_json \
+             FROM operations WHERE operation_id=?1",
+            [operation_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((caller, method, state, task_id, attempt_id, result_json, effective_json)) = operation
+    else {
+        return Err(Error::new(
+            "AUTOMATION_LINK_CORRUPT",
+            "retained WorkDispatch launch Operation is missing",
+        ));
+    };
+    if state != "outcome_unknown" {
+        return Ok(None);
+    }
+    let effective: Value = serde_json::from_str(&effective_json)?;
+    let manifest = &effective["launch_manifest"];
+    let result = result_json
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()?;
+    if manifest["failure"]["code"] != "workspace_effect_unknown"
+        && result
+            .as_ref()
+            .is_none_or(|value: &Value| value["failure"]["code"] != "workspace_effect_unknown")
+    {
+        return Ok(None);
+    }
+    let result = result.ok_or_else(|| {
+        Error::new(
+            "AUTOMATION_LINK_CORRUPT",
+            "unknown workspace launch has no retained result",
+        )
+    })?;
+    let expected_attempt = link
+        .attempt_id
+        .clone()
+        .map(Value::String)
+        .unwrap_or(Value::Null);
+    if caller != AUTOMATION_TECHNICAL_REQUESTER_ID
+        || method != "swarm.launch"
+        || task_id.as_deref() != Some(link.task_id.as_str())
+        || attempt_id != link.attempt_id
+        || manifest["state"] != "outcome_unknown"
+        || manifest["failure"]["code"] != "workspace_effect_unknown"
+        || manifest["actor"]["kind"] != "work_dispatch"
+        || manifest["actor"]["client_id"] != AUTOMATION_TECHNICAL_REQUESTER_ID
+        || manifest["actor"]["effective_manager_id"] != link.effective_manager_id
+        || manifest["actor"]["automation_id"] != link.automation_id
+        || manifest["actor"]["automation_revision"] != link.automation_revision
+        || manifest["actor"]["semantic_slot_id"] != link.semantic_slot_id
+        || manifest["task"]["task_id"] != link.task_id
+        || manifest["task"]["project_id"] != link.project_id
+        || manifest["task"]["observed_revision"] != link.task_revision
+        || manifest["task"]["attempt_id"] != expected_attempt
+        || result["operation_id"] != operation_id
+        || result["launch_state"] != "outcome_unknown"
+        || result["state"] != "outcome_unknown"
+        || result["failure"]["code"] != "workspace_effect_unknown"
+        || result["plan_digest"] != manifest["plan_digest"]
+        || result["task_id"] != link.task_id
+        || result["task_revision"] != link.task_revision
+        || result["attempt_id"] != expected_attempt
+    {
+        return Err(Error::new(
+            "AUTOMATION_LINK_CORRUPT",
+            "unknown launch does not retain the exact workspace readback scope",
+        ));
+    }
+
+    let lineage = config::transfer_successors(
+        db,
+        &link.effective_manager_id,
+        &link.project_id,
+        &link.automation_id,
+    )?;
+    if lineage.is_empty() {
+        return Ok(None);
+    }
+    let mut expected_former_owner = link.effective_manager_id.clone();
+    let mut previous_new_revision = link.automation_revision;
+    for (index, transfer) in lineage.iter().enumerate() {
+        if transfer.former_owner_manager_id != expected_former_owner
+            || transfer.project_id != link.project_id
+            || transfer.automation_id != link.automation_id
+            || transfer.former_owner_revision < previous_new_revision
+            || (index == 0 && link.automation_revision > transfer.former_owner_revision)
+        {
+            return Err(Error::new(
+                "AUTOMATION_TRANSFER_CORRUPT",
+                "workspace readback transfer chain does not match the retained launch owner",
+            ));
+        }
+        let former = config::load_entry(
+            db,
+            &transfer.former_owner_manager_id,
+            &link.project_id,
+            &link.automation_id,
+        )?
+        .ok_or_else(|| {
+            Error::new(
+                "AUTOMATION_TRANSFER_CORRUPT",
+                "workspace readback transfer chain has no former-owner snapshot",
+            )
+        })?;
+        if former.enabled || former.revision != transfer.former_owner_revision {
+            return Err(Error::new(
+                "AUTOMATION_TRANSFER_CORRUPT",
+                "workspace readback former-owner snapshot differs from its transfer edge",
+            ));
+        }
+        validate_transfer_operation(db, transfer)?;
+        expected_former_owner.clone_from(&transfer.new_owner_manager_id);
+        previous_new_revision = transfer.new_owner_revision;
+    }
+
+    let current_owner_id = lineage
+        .last()
+        .map(|transfer| transfer.new_owner_manager_id.clone())
+        .ok_or_else(|| Error::new("AUTOMATION_TRANSFER_CORRUPT", "transfer chain is empty"))?;
+    require_registered_manager(db, &current_owner_id)?;
+    let designated_gm: Option<(String, i64)> = db
+        .query_row(
+            "SELECT json_extract(value_json,'$.client_id'),json_extract(value_json,'$.epoch') \
+             FROM meta WHERE key='gm'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((designated_manager, epoch)) = designated_gm else {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "workspace readback requires a current GM designation",
+        ));
+    };
+    if designated_manager != current_owner_id || epoch <= 0 {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "workspace readback requires the current GM to own the transferred entry",
+        ));
+    }
+    let current_entry =
+        config::load_entry(db, &current_owner_id, &link.project_id, &link.automation_id)?
+            .ok_or_else(|| {
+                Error::new(
+                    "AUTOMATION_TRANSFER_CORRUPT",
+                    "workspace readback successor entry is missing",
+                )
+            })?;
+    config::validate_entry(&current_entry)?;
+    if current_entry.owner_manager_id != current_owner_id
+        || current_entry.project_id != link.project_id
+        || current_entry.automation_id != link.automation_id
+        || current_entry.revision < previous_new_revision
+    {
+        return Err(Error::new(
+            "AUTOMATION_TRANSFER_CORRUPT",
+            "workspace readback successor identity is inconsistent with transfer history",
+        ));
+    }
+    if !current_manager_id_has_task_scope(
+        db,
+        &current_owner_id,
+        expected_task_id,
+        &link.project_id,
+    )? {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "current GM no longer has scope for the exact Task and project",
+        ));
+    }
+    Ok(Some(TransferReadbackAuthority {
+        operation_id: operation_id.to_owned(),
+        project_id: link.project_id,
+        task_id: link.task_id,
+    }))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransferContinuationPhase {
+    QueuedUnsent,
+    PublicationPreWrite,
+}
+
+fn current_transfer_continuation_at_phase(
+    db: &Connection,
+    operation_id: &str,
+    expected_action: &str,
+    expected_step: AutomationStep,
+    expected_task_id: &str,
+    phase: TransferContinuationPhase,
+) -> Result<Option<TransferContinuation>> {
+    if !transfer_action_matches_step(expected_action, expected_step) {
+        return Err(Error::invalid(
+            "transfer continuation action does not match its selected step",
+        ));
+    }
+    let Some(link) = any_on_behalf_operation_link(db, operation_id)? else {
+        return Ok(None);
+    };
+    let (
+        linked_operation_id,
+        historical_owner_id,
+        historical_revision,
+        project_id,
+        automation_id,
+        action,
+    ) = match &link {
+        AnyOnBehalfOperationLink::Review(link)
+        | AnyOnBehalfOperationLink::Acceptance(link)
+        | AnyOnBehalfOperationLink::Publication(link) => (
+            link.operation_id.as_str(),
+            link.effective_manager_id.as_str(),
+            link.automation_revision,
+            link.project_id.as_str(),
+            link.automation_id.as_str(),
+            link.action.as_str(),
+        ),
+        AnyOnBehalfOperationLink::WorkDispatch(link) => (
+            link.operation_id.as_str(),
+            link.effective_manager_id.as_str(),
+            link.automation_revision,
+            link.project_id.as_str(),
+            link.automation_id.as_str(),
+            link.action.as_str(),
+        ),
+        AnyOnBehalfOperationLink::Repair(link) => (
+            link.operation_id.as_str(),
+            link.effective_manager_id.as_str(),
+            link.automation_revision,
+            link.project_id.as_str(),
+            link.automation_id.as_str(),
+            link.action.as_str(),
+        ),
+    };
+    if linked_operation_id != operation_id || action != expected_action {
+        return Err(Error::new(
+            "AUTOMATION_TRANSFER_SCOPE",
+            "retained Operation does not match the requested transfer action",
+        ));
+    }
+    let operation: Option<TransferOperationRow> = db
+        .query_row(
+            "SELECT task_id,method,state,sent_at_ms,result_json FROM operations WHERE operation_id=?1",
+            [operation_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((task_id, method, state, sent_at_ms, result_json)) = operation else {
+        return Err(Error::new(
+            "AUTOMATION_LINK_CORRUPT",
+            "linked Operation disappeared during transfer continuation",
+        ));
+    };
+    if method != expected_action || task_id.as_deref() != Some(expected_task_id) {
+        return Err(Error::new(
+            "AUTOMATION_LINK_CORRUPT",
+            "linked Operation Task or method does not match its retained attribution",
+        ));
+    }
+    let phase_is_current = match phase {
+        TransferContinuationPhase::QueuedUnsent => state == "queued" && sent_at_ms.is_none(),
+        TransferContinuationPhase::PublicationPreWrite => {
+            if expected_step != AutomationStep::Publication {
+                false
+            } else {
+                let result: Value = result_json
+                    .as_deref()
+                    .map(serde_json::from_str)
+                    .transpose()?
+                    .unwrap_or(Value::Null);
+                state == "sending"
+                    && sent_at_ms.is_some()
+                    && result["publication_may_have_started"] == false
+            }
+        }
+    };
+    if !phase_is_current {
+        return Err(Error::new(
+            "AUTOMATION_TRANSFER_EFFECT_NOT_QUEUED",
+            "Operation is not in the exact no-effect transfer-continuation phase",
+        ));
+    }
+    let lineage = config::transfer_successors(db, historical_owner_id, project_id, automation_id)?;
+    if lineage.is_empty() {
+        return Ok(None);
+    }
+
+    let mut expected_former_owner = historical_owner_id.to_owned();
+    let mut previous_new_revision = historical_revision;
+    for (index, transfer) in lineage.iter().enumerate() {
+        if transfer.former_owner_manager_id != expected_former_owner
+            || transfer.project_id != project_id
+            || transfer.automation_id != automation_id
+            || transfer.former_owner_revision < previous_new_revision
+            || (index == 0 && historical_revision > transfer.former_owner_revision)
+        {
+            return Err(Error::new(
+                "AUTOMATION_TRANSFER_CORRUPT",
+                "transfer chain does not continue from the retained Operation owner and revision",
+            ));
+        }
+        let former_entry = config::load_entry(
+            db,
+            &transfer.former_owner_manager_id,
+            project_id,
+            automation_id,
+        )?
+        .ok_or_else(|| {
+            Error::new(
+                "AUTOMATION_TRANSFER_CORRUPT",
+                "transfer chain has no retained former-owner entry snapshot",
+            )
+        })?;
+        if former_entry.enabled || former_entry.revision != transfer.former_owner_revision {
+            return Err(Error::new(
+                "AUTOMATION_TRANSFER_CORRUPT",
+                "former-owner snapshot does not match its committed transfer edge",
+            ));
+        }
+        validate_transfer_operation(db, transfer)?;
+        expected_former_owner.clone_from(&transfer.new_owner_manager_id);
+        previous_new_revision = transfer.new_owner_revision;
+    }
+
+    let current_owner_id = lineage
+        .last()
+        .map(|transfer| transfer.new_owner_manager_id.clone())
+        .ok_or_else(|| {
+            Error::new(
+                "AUTOMATION_TRANSFER_CORRUPT",
+                "validated transfer chain unexpectedly has no destination",
+            )
+        })?;
+    require_registered_manager(db, &current_owner_id)?;
+    let designated_gm: Option<(String, i64)> = db
+        .query_row(
+            "SELECT json_extract(value_json,'$.client_id'),json_extract(value_json,'$.epoch') FROM meta WHERE key='gm'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((designated_manager, current_gm_epoch)) = designated_gm else {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "transfer continuation requires a current GM designation",
+        ));
+    };
+    if designated_manager != current_owner_id || current_gm_epoch <= 0 {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "transfer continuation requires the current registered GM to own the destination entry",
+        ));
+    }
+    let current_entry = config::load_entry(db, &current_owner_id, project_id, automation_id)?
+        .ok_or_else(|| {
+            Error::new(
+                "AUTOMATION_TRANSFER_CORRUPT",
+                "transfer destination entry is missing",
+            )
+        })?;
+    if current_entry.revision < previous_new_revision
+        || !current_entry.enabled
+        || !current_entry.steps.contains(&expected_step)
+    {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "current transferred automation no longer enables this action",
+        ));
+    }
+    let ready = match expected_step {
+        AutomationStep::WorkDispatch => current_entry.work_dispatch_ready(),
+        AutomationStep::ReviewDispatch => current_entry.review_dispatch_ready(),
+        AutomationStep::Publication => current_entry.publication_ready(),
+        AutomationStep::ReviewDisposition
+        | AutomationStep::RepairDispatch
+        | AutomationStep::Acceptance => {
+            current_entry.enabled && current_entry.scope.work_pool_id.is_none()
+        }
+        AutomationStep::GithubProjection => false,
+    };
+    if !ready {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "current transferred automation settings do not permit this action",
+        ));
+    }
+    if !current_manager_id_has_task_scope(db, &current_owner_id, expected_task_id, project_id)? {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "current GM no longer has scope for the exact Task and project",
+        ));
+    }
+    Ok(Some(TransferContinuation {
+        historical_owner_id: historical_owner_id.to_owned(),
+        historical_revision,
+        current_owner_id,
+        current_gm_epoch,
+        project_id: project_id.to_owned(),
+        automation_id: automation_id.to_owned(),
+        action: action.to_owned(),
+        task_id: expected_task_id.to_owned(),
+        transfer_operation_ids: lineage
+            .into_iter()
+            .map(|transfer| transfer.transfer_operation_id)
+            .collect(),
+        current_entry,
+    }))
+}
+
+fn transfer_action_matches_step(action: &str, step: AutomationStep) -> bool {
+    matches!(
+        (action, step),
+        ("swarm.launch", AutomationStep::WorkDispatch)
+            | ("review.assign", AutomationStep::ReviewDispatch)
+            | ("task.request_changes", AutomationStep::ReviewDisposition)
+            | ("task.request_changes", AutomationStep::RepairDispatch)
+            | ("agent.send", AutomationStep::RepairDispatch)
+            | ("task.accept", AutomationStep::Acceptance)
+            | ("forge.publish_ref", AutomationStep::Publication)
+    )
+}
+
+fn validate_transfer_operation(
+    db: &Connection,
+    transfer: &config::TransferProvenance,
+) -> Result<()> {
+    let operation: Option<TransferMutationRow> = db
+        .query_row(
+            "SELECT method,state,original_request_json,result_json FROM operations WHERE operation_id=?1",
+            [&transfer.transfer_operation_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((method, state, original_json, result_json)) = operation else {
+        return Err(Error::new(
+            "AUTOMATION_TRANSFER_CORRUPT",
+            "transfer edge has no retained Operation",
+        ));
+    };
+    let request: Value = serde_json::from_str(&original_json).map_err(|_| {
+        Error::new(
+            "AUTOMATION_TRANSFER_CORRUPT",
+            "transfer Operation request is invalid",
+        )
+    })?;
+    let result_json = result_json.as_deref().ok_or_else(|| {
+        Error::new(
+            "AUTOMATION_TRANSFER_CORRUPT",
+            "transfer Operation has no retained result",
+        )
+    })?;
+    let result: Value = serde_json::from_str(result_json).map_err(|_| {
+        Error::new(
+            "AUTOMATION_TRANSFER_CORRUPT",
+            "transfer Operation result is invalid",
+        )
+    })?;
+    if method != "automation.config.transfer"
+        || state != "settled"
+        || request["project_id"] != transfer.project_id
+        || request["former_owner_manager_id"] != transfer.former_owner_manager_id
+        || request["automation_id"] != transfer.automation_id
+        || request["expected_revision"] != transfer.former_owner_revision
+        || result["transfer_operation_id"] != transfer.transfer_operation_id
+        || result["project_id"] != transfer.project_id
+        || result["former_owner_manager_id"] != transfer.former_owner_manager_id
+        || result["new_owner_manager_id"] != transfer.new_owner_manager_id
+        || result["automation_id"] != transfer.automation_id
+        || result["former_owner_revision"] != transfer.former_owner_revision
+        || result["new_owner_revision"] != transfer.new_owner_revision
+    {
+        return Err(Error::new(
+            "AUTOMATION_TRANSFER_CORRUPT",
+            "transfer record does not match its settled Operation request and result",
+        ));
+    }
+    Ok(())
 }
 
 fn current_work_dispatch_scope_visible_to(

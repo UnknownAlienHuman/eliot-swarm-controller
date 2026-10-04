@@ -461,6 +461,11 @@ enum AutomationConfigCommand {
         #[arg(long)]
         file: PathBuf,
     },
+    /// Transfer one retained automation entry to the current GM.
+    Transfer {
+        #[arg(long)]
+        file: PathBuf,
+    },
 }
 #[derive(Subcommand)]
 enum LauncherCommand {
@@ -864,6 +869,9 @@ async fn run(cli: Cli) -> Result<()> {
                 }
                 AutomationConfigCommand::Explain { file } => {
                     ("automation.config.explain".into(), read_json(&file)?)
+                }
+                AutomationConfigCommand::Transfer { file } => {
+                    ("automation.config.transfer".into(), read_json(&file)?)
                 }
             },
         },

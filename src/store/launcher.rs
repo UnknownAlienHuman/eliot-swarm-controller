@@ -129,6 +129,23 @@ impl LaunchActor {
         }
     }
 
+    /// Permit only exact unknown workspace readback under a separate
+    /// successor-GM capability. This never authorizes queued work or a new
+    /// native effect; direct actors retain their ordinary current check.
+    fn require_workspace_readback_authority(
+        &self,
+        db: &Connection,
+        operation_id: &str,
+    ) -> Result<()> {
+        match self {
+            Self::Direct(_) => self.require_current(db),
+            Self::OnBehalf(context) => {
+                let _authority = context.require_workspace_readback_authority(db, operation_id)?;
+                Ok(())
+            }
+        }
+    }
+
     pub(crate) fn require_action_object(
         &self,
         db: &Connection,
@@ -151,6 +168,7 @@ impl LaunchActor {
                         .as_ref()
                         .and_then(|record| record["client_id"].as_str())
                         != Some(context.effective_manager_id())
+                    && !context.is_workspace_readback_authorized(db)?
                 {
                     return Err(Error::new(
                         "WORK_DISPATCH_GM_REQUIRED",
@@ -2402,6 +2420,9 @@ pub(crate) fn resolve_launch_slot(
         .filter(|attempt| attempt.task_id == task.task_id && attempt.released_at_ms.is_none());
     let attempt_id = attempt.as_ref().map(|attempt| attempt.attempt_id.as_str());
     actor.require_action_object(db, "swarm.launch", &task.task_id, task.revision, attempt_id)?;
+    if let Some(previous) = transferred_launch_slot(db, actor, preview)? {
+        return Ok(previous);
+    }
     super::automation_work_dispatch::resolve_assignment_slot(
         db,
         actor.effective_manager_id(),
@@ -2429,6 +2450,30 @@ pub(crate) fn retain_launch_slot(
         .filter(|attempt| attempt.task_id == task.task_id && attempt.released_at_ms.is_none());
     let attempt_id = attempt.as_ref().map(|attempt| attempt.attempt_id.as_str());
     actor.require_action_object(tx, "swarm.launch", &task.task_id, task.revision, attempt_id)?;
+    if let Some(previous) = transferred_launch_slot(tx, actor, preview)? {
+        return Ok(match previous {
+            super::automation_work_dispatch::LaunchSlotResolution::Reuse {
+                operation_id,
+                operation_state,
+            } => super::automation_work_dispatch::LaunchSlotRetention::Reuse {
+                operation_id,
+                operation_state,
+            },
+            super::automation_work_dispatch::LaunchSlotResolution::Conflict {
+                operation_id,
+                operation_state,
+            } => super::automation_work_dispatch::LaunchSlotRetention::Conflict {
+                operation_id,
+                operation_state,
+            },
+            super::automation_work_dispatch::LaunchSlotResolution::Vacant => {
+                return Err(Error::new(
+                    "AUTOMATION_TRANSFER_SLOT_CORRUPT",
+                    "transfer alias lookup returned a vacant slot",
+                ));
+            }
+        });
+    }
     super::automation_work_dispatch::retain_assignment_slot(
         tx,
         actor.effective_manager_id(),
@@ -2439,6 +2484,48 @@ pub(crate) fn retain_launch_slot(
         operation_id,
         now_ms,
     )
+}
+
+/// A transferred WorkDispatch journal keeps its old manager-keyed semantic
+/// slot. Before reserving a successor-owned slot, consult every exact former
+/// owner in the sealed transfer chain; an existing prior slot is reused or
+/// blocks a changed request, never shadowed by a new owner-keyed effect.
+fn transferred_launch_slot(
+    db: &Connection,
+    actor: &LaunchActor,
+    preview: &launcher::LaunchPreviewRequest,
+) -> Result<Option<WorkDispatchLaunchSlotOutcome>> {
+    let Some(context) = actor.work_dispatch_context() else {
+        return Ok(None);
+    };
+    let lineage = crate::automation::config::transfer_lineage(
+        db,
+        context.effective_manager_id(),
+        context.project_id(),
+        context.automation_id(),
+    )?;
+    let mut existing = Vec::new();
+    for transfer in lineage {
+        match super::automation_work_dispatch::resolve_assignment_slot(
+            db,
+            &transfer.former_owner_manager_id,
+            &preview.task_id,
+            preview.expected_task_revision,
+            context.subject().attempt_id(),
+            preview,
+        )? {
+            super::automation_work_dispatch::LaunchSlotResolution::Vacant => {}
+            resolution => existing.push(resolution),
+        }
+    }
+    match existing.len() {
+        0 => Ok(None),
+        1 => Ok(existing.pop()),
+        _ => Err(Error::new(
+            "AUTOMATION_TRANSFER_SLOT_AMBIGUOUS",
+            "multiple former-owner launch slots exist for one transferred WorkDispatch subject",
+        )),
+    }
 }
 
 fn launch_operation_projection(
@@ -3551,7 +3638,7 @@ pub(super) fn launch_workspace_plan(
     operation_id: &str,
     config: &Config,
 ) -> Result<crate::workspace::WorkspaceLeasePlan> {
-    launch_workspace_plan_inner(db, actor, operation_id, config, false)
+    launch_workspace_plan_inner(db, actor, operation_id, config)
 }
 
 fn launch_workspace_plan_inner(
@@ -3559,19 +3646,14 @@ fn launch_workspace_plan_inner(
     actor: &LaunchActor,
     operation_id: &str,
     config: &Config,
-    allow_exact_unknown_readback: bool,
 ) -> Result<crate::workspace::WorkspaceLeasePlan> {
     actor.require_current(db)?;
     let operation = super::operations::get_operation(db, operation_id)?;
     let pending = operation["state"] == "queued"
         && operation["result"]["launch_state"] == "pending_workspace";
-    let unknown_readback = allow_exact_unknown_readback
-        && operation["state"] == "outcome_unknown"
-        && operation["result"]["launch_state"] == "outcome_unknown"
-        && retained_launch_manifest(db, operation_id)?["state"] == "outcome_unknown";
     if operation["method"] != "swarm.launch"
         || operation["caller_id"] != actor.technical_requester_id()
-        || !(pending || unknown_readback)
+        || !pending
     {
         return Err(Error::new(
             "STALE_LAUNCH",
@@ -3898,6 +3980,138 @@ fn final_workspace_manifest_digest(
     ))
 }
 
+fn retain_unknown_workspace_readback(
+    tx: &Transaction<'_>,
+    actor: &LaunchActor,
+    operation: &Value,
+    mut manifest: Value,
+    operation_id: &str,
+    lease: &crate::workspace::LeaseAuthorityRef,
+    now: i64,
+) -> Result<Value> {
+    actor.require_workspace_readback_authority(tx, operation_id)?;
+    let result = &operation["result"];
+    let task_id = model::text(&manifest["task"], "task_id")?.to_owned();
+    let task_revision = model::positive(&manifest["task"], "observed_revision")?;
+    let project_id = model::text(&manifest["task"], "project_id")?;
+    let expected_attempt = manifest["task"]["attempt_id"].as_str().map(str::to_owned);
+    if operation["method"] != "swarm.launch"
+        || operation["state"] != "outcome_unknown"
+        || operation["caller_id"] != actor.technical_requester_id()
+        || result["launch_state"] != "outcome_unknown"
+        || result["state"] != "outcome_unknown"
+        || result["failure"]["code"] != "workspace_effect_unknown"
+        || manifest["state"] != "outcome_unknown"
+        || manifest["failure"]["code"] != "workspace_effect_unknown"
+        || result["operation_id"] != operation_id
+        || result["plan_digest"] != manifest["plan_digest"]
+        || result["task_id"] != task_id
+        || result["task_revision"] != task_revision
+        || result["attempt_id"] != manifest["task"]["attempt_id"]
+        || lease.state != "held"
+        || lease.operation_id != operation_id
+        || lease.plan_digest != manifest["plan_digest"]
+        || lease.project_id != project_id
+        || lease.task_id != task_id
+        || lease.task_revision != task_revision
+        || lease.owner_client_id != actor.effective_manager_id()
+        || lease.attempt_id != expected_attempt
+        || lease.generation <= 0
+        || lease.registration_generation <= 0
+        || lease.binding_digest.is_empty()
+        || super::workspace::held_lease_for_operation(tx, operation_id)?.as_ref() != Some(lease)
+    {
+        return Err(Error::new(
+            "WORKSPACE_LEASE_STALE",
+            "unknown workspace readback does not match the exact retained launch and lease",
+        ));
+    }
+
+    let original_request: String = tx.query_row(
+        "SELECT original_request_json FROM operations WHERE operation_id=?1 AND method='swarm.launch'",
+        [operation_id],
+        |row| row.get(0),
+    )?;
+    let request =
+        launcher::LaunchRequest::parse(&serde_json::from_str::<Value>(&original_request)?)?;
+    let client_request_id: String = tx.query_row(
+        "SELECT client_request_id FROM operations WHERE operation_id=?1",
+        [operation_id],
+        |row| row.get(0),
+    )?;
+    if request.client_request_id != client_request_id
+        || request.plan_digest != manifest["plan_digest"]
+        || request.preview.task_id != task_id
+        || request.preview.expected_task_revision != manifest["task"]["expected_revision"]
+    {
+        return Err(Error::new(
+            "LAUNCH_MANIFEST_CORRUPT",
+            "unknown workspace readback request differs from its original plan identity",
+        ));
+    }
+
+    let lease_view = super::workspace::get_lease_view(tx, lease)?;
+    let digest = final_workspace_manifest_digest(&request.plan_digest, lease, &lease_view)?;
+    if manifest["workspace"]["readback_status"] == "verified" {
+        let saved_lease: crate::workspace::LeaseAuthorityRef = serde_json::from_value(
+            manifest["workspace"]["lease_authority"].clone(),
+        )
+        .map_err(|_| {
+            Error::new(
+                "INVALID_LAUNCH_MANIFEST",
+                "readback workspace authority reference is invalid",
+            )
+        })?;
+        if saved_lease != *lease
+            || result["workspace_lease"] != "held_verified_by_exact_readback"
+            || model::canonical(&lease_view)? != model::canonical(&manifest["workspace"]["lease"])?
+            || manifest["workspace"]["manifest_digest"] != digest
+        {
+            return Err(Error::new(
+                "WORKSPACE_LEASE_STALE",
+                "persisted readback does not match the exact held workspace lease",
+            ));
+        }
+        return Ok(result.clone());
+    }
+
+    manifest["workspace"]["lease_state"] = json!("held");
+    manifest["workspace"]["dirty_state"] = lease_view["clean_state"].clone();
+    manifest["workspace"]["filesystem_inspected"] = json!(true);
+    manifest["workspace"]["readback_status"] = json!("verified");
+    manifest["workspace"]["lease"] = lease_view;
+    manifest["workspace"]["lease_authority"] = serde_json::to_value(lease)?;
+    manifest["workspace"]["manifest_digest"] = json!(digest);
+    manifest["progress"]["workspace_lease"] = json!("verified_by_exact_readback");
+    manifest["effects"] = json!("workspace_effect_reconciled_readonly; no_native_effect_admitted");
+    let readback = json!({
+        "operation_id":operation_id,
+        "launch_state":"outcome_unknown",
+        "state":"outcome_unknown",
+        "plan_digest":request.plan_digest,
+        "task_id":task_id,
+        "task_revision":task_revision,
+        "attempt_id":expected_attempt,
+        "workspace_lease":"held_verified_by_exact_readback",
+        "native_effect":"unknown",
+        "failure":{"code":"workspace_effect_unknown"},
+        "gaps":["workspace_effect_reconciled_readonly","unknown_effect_remains_readback_only"],
+    });
+    persist_launch_progress(
+        tx,
+        operation_id,
+        LaunchProgress {
+            manifest,
+            result: &readback,
+            operation_state: "outcome_unknown",
+            attempt_id: expected_attempt.as_deref(),
+            binding: None,
+            now,
+        },
+    )?;
+    Ok(readback)
+}
+
 /// Claim/reuse the exact Attempt and reserve its first workspace-bound native
 /// binding after Host evidence has moved the precise lease to held.
 pub(super) fn launch_after_workspace_held(
@@ -3908,8 +4122,25 @@ pub(super) fn launch_after_workspace_held(
     lease: &crate::workspace::LeaseAuthorityRef,
     now: i64,
 ) -> Result<Value> {
-    actor.require_current(tx)?;
     let operation = super::operations::get_operation(tx, operation_id)?;
+    let mut manifest = retained_launch_manifest(tx, operation_id)?;
+    let recovering_unknown_workspace = operation["state"] == "outcome_unknown"
+        && operation["result"]["launch_state"] == "outcome_unknown"
+        && operation["result"]["failure"]["code"] == "workspace_effect_unknown"
+        && manifest["state"] == "outcome_unknown"
+        && manifest["failure"]["code"] == "workspace_effect_unknown";
+    if recovering_unknown_workspace {
+        return retain_unknown_workspace_readback(
+            tx,
+            actor,
+            &operation,
+            manifest,
+            operation_id,
+            lease,
+            now,
+        );
+    }
+    actor.require_current(tx)?;
     if operation["method"] != "swarm.launch"
         || operation["caller_id"] != actor.technical_requester_id()
     {
@@ -3918,10 +4149,7 @@ pub(super) fn launch_after_workspace_held(
             "launch is not owned by this manager",
         ));
     }
-    let mut manifest = retained_launch_manifest(tx, operation_id)?;
-    let recovering_unknown_workspace =
-        operation["state"] == "outcome_unknown" && manifest["state"] == "outcome_unknown";
-    if manifest["state"] != "pending_workspace" && !recovering_unknown_workspace {
+    if manifest["state"] != "pending_workspace" {
         if matches!(
             manifest["state"].as_str(),
             Some("awaiting_binding" | "awaiting_capability" | "awaiting_participant_credential")
@@ -3933,19 +4161,13 @@ pub(super) fn launch_after_workspace_held(
             "launch is not awaiting its first verified workspace lease",
         ));
     }
-    if operation["state"] != "queued" && !recovering_unknown_workspace {
+    if operation["state"] != "queued" {
         return Err(Error::new(
             "STALE_LAUNCH",
             "launch Operation is no longer queued",
         ));
     }
-    let plan = launch_workspace_plan_inner(
-        tx,
-        actor,
-        operation_id,
-        config,
-        recovering_unknown_workspace,
-    )?;
+    let plan = launch_workspace_plan_inner(tx, actor, operation_id, config)?;
     if lease.state != "held"
         || lease.operation_id != operation_id
         || lease.plan_digest != plan.plan_digest
@@ -3961,37 +4183,6 @@ pub(super) fn launch_after_workspace_held(
     }
     super::workspace::assert_held_for_claim(tx, lease, &plan)?;
     let verified_lease_view = super::workspace::get_lease_view(tx, lease)?;
-    if recovering_unknown_workspace {
-        manifest["state"] = json!("pending_workspace");
-        if let Some(object) = manifest.as_object_mut() {
-            object.remove("failure");
-        }
-        let resumed = json!({
-            "operation_id":operation_id,
-            "launch_state":"pending_workspace",
-            "state":"queued",
-            "plan_digest":plan.plan_digest,
-            "task_id":plan.task_id,
-            "task_revision":plan.task_revision,
-            "attempt_id":lease.attempt_id,
-            "workspace_lease":"held_verified_by_exact_readback",
-            "native_effect":"not_attempted",
-            "next_phase":"claim_or_reuse_exact_attempt_and_open_binding",
-            "gaps":["workspace_effect_reconciled_by_exact_lease_readback"],
-        });
-        persist_launch_progress(
-            tx,
-            operation_id,
-            LaunchProgress {
-                manifest: manifest.clone(),
-                result: &resumed,
-                operation_state: "queued",
-                attempt_id: lease.attempt_id.as_deref(),
-                binding: None,
-                now,
-            },
-        )?;
-    }
     let request_raw: String = tx.query_row(
         "SELECT original_request_json FROM operations WHERE operation_id=?1",
         [operation_id],

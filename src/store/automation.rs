@@ -16,6 +16,7 @@ use crate::{
 };
 use rusqlite::{Connection, Transaction, params};
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 
 const MAX_IMPACT_OPERATIONS: i64 = 100;
 
@@ -43,7 +44,7 @@ pub(super) fn get(db: &Connection, p: &Principal, value: &Value) -> Result<Value
     let end = entries.len().min(start.saturating_add(limit as usize));
     let items = entries[start..end]
         .iter()
-        .map(entry_projection)
+        .map(|entry| entry_read_projection(db, &owner_manager_id, entry))
         .collect::<Result<Vec<_>>>()?;
     Ok(json!({
         "project_id":project,
@@ -279,9 +280,13 @@ pub(super) fn explain(db: &Connection, p: &Principal, value: &Value) -> Result<V
     let work = operation_impacts(db, &owner_manager_id, project, automation_id)?;
     let operation_history =
         linked_operation_history(db, &owner_manager_id, project, automation_id)?;
+    let transfer_lineage = config::transfer_lineage(db, &owner_manager_id, project, automation_id)?;
+    let retired_to = config::transfer_from_source(db, &owner_manager_id, project, automation_id)?;
     Ok(json!({
         "owner_manager_id":owner_manager_id,
         "entry":entry_projection(&entry)?,
+        "transfer_lineage":transfer_lineage.iter().rev().collect::<Vec<_>>(),
+        "retired_to":retired_to,
         "dispatch":state,
         "work_dispatch":work_dispatch,
         "review_disposition":disposition,
@@ -297,22 +302,55 @@ fn linked_operation_history(
     project: &str,
     automation_id: &str,
 ) -> Result<Value> {
-    let mut links = authorization::entry_operation_links(
-        db,
-        owner,
-        project,
-        automation_id,
-        "",
-        MAX_IMPACT_OPERATIONS as usize + 1,
-    )?;
-    let truncated = links.len() > MAX_IMPACT_OPERATIONS as usize;
+    let lineage = config::transfer_lineage(db, owner, project, automation_id)?;
+    let mut owners = vec![owner.to_owned()];
+    owners.extend(
+        lineage
+            .iter()
+            .map(|transfer| transfer.former_owner_manager_id.clone()),
+    );
+    let mut seen_owners = BTreeSet::new();
+    let mut seen_operations = BTreeSet::new();
+    let mut links = Vec::new();
+    let mut truncated = false;
+    for source_owner in owners {
+        if !seen_owners.insert(source_owner.clone()) {
+            continue;
+        }
+        let mut source_links = authorization::entry_operation_links(
+            db,
+            &source_owner,
+            project,
+            automation_id,
+            "",
+            MAX_IMPACT_OPERATIONS as usize + 1,
+        )?;
+        if source_links.len() > MAX_IMPACT_OPERATIONS as usize {
+            truncated = true;
+        }
+        for link in source_links.drain(..) {
+            if seen_operations.insert(link.operation_id.clone()) {
+                links.push((source_owner.clone(), link));
+            }
+        }
+    }
+    links.sort_by(|(left_owner, left), (right_owner, right)| {
+        left.linked_at_ms
+            .cmp(&right.linked_at_ms)
+            .then_with(|| left.operation_id.cmp(&right.operation_id))
+            .then_with(|| left_owner.cmp(right_owner))
+    });
+    if links.len() > MAX_IMPACT_OPERATIONS as usize {
+        truncated = true;
+    }
     links.truncate(MAX_IMPACT_OPERATIONS as usize);
     let items = links
         .iter()
-        .map(|link| {
+        .map(|(source_owner, link)| {
             let operation = operations::get_operation(db, &link.operation_id)?;
             Ok(json!({
                 "operation_id":link.operation_id,
+                "historical_owner_manager_id":source_owner,
                 "action":link.action,
                 "state":operation["state"],
                 "automation_revision":link.automation_revision,
@@ -321,6 +359,16 @@ fn linked_operation_history(
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(json!({"items":items,"truncated":truncated}))
+}
+
+fn entry_read_projection(db: &Connection, owner: &str, entry: &AutomationEntry) -> Result<Value> {
+    let mut value = entry_projection(entry)?;
+    let lineage = config::transfer_lineage(db, owner, &entry.project_id, &entry.automation_id)?;
+    let retired_to =
+        config::transfer_from_source(db, owner, &entry.project_id, &entry.automation_id)?;
+    value["transfer_lineage"] = json!(lineage.iter().rev().collect::<Vec<_>>());
+    value["retired_to"] = json!(retired_to);
+    Ok(value)
 }
 
 fn require_manager(p: &Principal) -> Result<()> {
@@ -443,6 +491,12 @@ fn build_plan(
     let mut planned = Vec::with_capacity(request.changes.len());
     let mut scoped_count = scoped_entries(db, &p.client_id, &request.project_id)?.len();
     for change in &request.changes {
+        config::require_not_transferred(
+            db,
+            &p.client_id,
+            &request.project_id,
+            &change.automation_id,
+        )?;
         let before =
             config::load_entry(db, &p.client_id, &request.project_id, &change.automation_id)?;
         let creating = before.is_none();

@@ -13,6 +13,9 @@ pub(crate) const MAX_AUTOMATIONS_PER_SCOPE: usize = 64;
 pub(crate) const MAX_CHANGES_PER_APPLY: usize = 32;
 pub(crate) const MAX_AUTOMATION_ID_BYTES: usize = 64;
 pub(crate) const MAX_META_RECORD_BYTES: usize = 64 * 1024;
+const TRANSFER_RECORD_PREFIX: &str = "automation:v1:transfer:record:";
+const TRANSFER_SOURCE_PREFIX: &str = "automation:v1:transfer:source:";
+const TRANSFER_TARGET_PREFIX: &str = "automation:v1:transfer:target:";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -215,6 +218,302 @@ pub(crate) struct ConfigRequest {
     pub(crate) project_id: String,
     pub(crate) preview_digest: Option<String>,
     pub(crate) changes: Vec<ConfigChange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TransferRequest {
+    pub(crate) project_id: String,
+    pub(crate) former_owner_manager_id: String,
+    pub(crate) automation_id: String,
+    pub(crate) expected_revision: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TransferProvenance {
+    pub(crate) schema_version: u32,
+    pub(crate) transfer_operation_id: String,
+    pub(crate) project_id: String,
+    pub(crate) automation_id: String,
+    pub(crate) former_owner_manager_id: String,
+    pub(crate) new_owner_manager_id: String,
+    pub(crate) former_owner_revision: i64,
+    pub(crate) new_owner_revision: i64,
+    pub(crate) created_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TransferPointer {
+    schema_version: u32,
+    transfer_operation_id: String,
+}
+
+impl TransferRequest {
+    pub(crate) fn parse(value: &Value) -> Result<Self> {
+        crate::model::fields(
+            value,
+            &[
+                "client_request_id",
+                "project_id",
+                "former_owner_manager_id",
+                "automation_id",
+                "expected_revision",
+            ],
+        )?;
+        let project_id = crate::model::text(value, "project_id")?.to_owned();
+        let former_owner_manager_id =
+            crate::model::text(value, "former_owner_manager_id")?.to_owned();
+        let automation_id = crate::model::text(value, "automation_id")?.to_owned();
+        let expected_revision = value
+            .get("expected_revision")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| Error::invalid("expected_revision must be an integer"))?;
+        if project_id.len() > 128 || project_id.chars().any(char::is_control) {
+            return Err(Error::invalid("project_id is invalid"));
+        }
+        validate_name(&former_owner_manager_id, "former_owner_manager_id", 128)?;
+        validate_automation_id(&automation_id)?;
+        if expected_revision <= 0 {
+            return Err(Error::invalid("expected_revision must be positive"));
+        }
+        Ok(Self {
+            project_id,
+            former_owner_manager_id,
+            automation_id,
+            expected_revision,
+        })
+    }
+}
+
+pub(crate) fn transfer_record_key(operation_id: &str) -> Result<String> {
+    validate_name(operation_id, "transfer_operation_id", 128)?;
+    Ok(format!("{TRANSFER_RECORD_PREFIX}{operation_id}"))
+}
+
+pub(crate) fn transfer_source_key(
+    owner: &str,
+    project: &str,
+    automation_id: &str,
+) -> Result<String> {
+    validate_automation_id(automation_id)?;
+    Ok(format!(
+        "{TRANSFER_SOURCE_PREFIX}{}:{automation_id}",
+        scope_digest(owner, project)?
+    ))
+}
+
+pub(crate) fn transfer_target_key(
+    owner: &str,
+    project: &str,
+    automation_id: &str,
+) -> Result<String> {
+    validate_automation_id(automation_id)?;
+    Ok(format!(
+        "{TRANSFER_TARGET_PREFIX}{}:{automation_id}",
+        scope_digest(owner, project)?
+    ))
+}
+
+pub(crate) fn transfer_pointer_value(operation_id: &str) -> Result<Value> {
+    validate_name(operation_id, "transfer_operation_id", 128)?;
+    Ok(serde_json::to_value(TransferPointer {
+        schema_version: 1,
+        transfer_operation_id: operation_id.to_owned(),
+    })?)
+}
+
+pub(crate) fn transfer_record(
+    db: &Connection,
+    operation_id: &str,
+) -> Result<Option<TransferProvenance>> {
+    let Some(value) = read_record(
+        db,
+        &transfer_record_key(operation_id)?,
+        "automation ownership transfer",
+    )?
+    else {
+        return Ok(None);
+    };
+    let record: TransferProvenance = serde_json::from_value(value).map_err(|_| {
+        Error::new(
+            "AUTOMATION_TRANSFER_CORRUPT",
+            "automation ownership transfer fields are invalid",
+        )
+    })?;
+    validate_transfer_record(&record, operation_id)?;
+    Ok(Some(record))
+}
+
+pub(crate) fn transfer_from_source(
+    db: &Connection,
+    owner: &str,
+    project: &str,
+    automation_id: &str,
+) -> Result<Option<TransferProvenance>> {
+    let Some(operation_id) =
+        transfer_pointer(db, &transfer_source_key(owner, project, automation_id)?)?
+    else {
+        return Ok(None);
+    };
+    let record = transfer_record(db, &operation_id)?.ok_or_else(|| {
+        Error::new(
+            "AUTOMATION_TRANSFER_CORRUPT",
+            "automation retirement pointer has no transfer record",
+        )
+    })?;
+    if record.former_owner_manager_id != owner
+        || record.project_id != project
+        || record.automation_id != automation_id
+    {
+        return Err(Error::new(
+            "AUTOMATION_TRANSFER_CORRUPT",
+            "automation retirement pointer crosses its source scope",
+        ));
+    }
+    Ok(Some(record))
+}
+
+pub(crate) fn transfer_into_target(
+    db: &Connection,
+    owner: &str,
+    project: &str,
+    automation_id: &str,
+) -> Result<Option<TransferProvenance>> {
+    let Some(operation_id) =
+        transfer_pointer(db, &transfer_target_key(owner, project, automation_id)?)?
+    else {
+        return Ok(None);
+    };
+    let record = transfer_record(db, &operation_id)?.ok_or_else(|| {
+        Error::new(
+            "AUTOMATION_TRANSFER_CORRUPT",
+            "automation incoming pointer has no transfer record",
+        )
+    })?;
+    if record.new_owner_manager_id != owner
+        || record.project_id != project
+        || record.automation_id != automation_id
+    {
+        return Err(Error::new(
+            "AUTOMATION_TRANSFER_CORRUPT",
+            "automation incoming pointer crosses its destination scope",
+        ));
+    }
+    Ok(Some(record))
+}
+
+/// Return newest-to-oldest transfer provenance for the current entry. Each
+/// edge is read through the sealed destination index and its single record.
+pub(crate) fn transfer_lineage(
+    db: &Connection,
+    owner: &str,
+    project: &str,
+    automation_id: &str,
+) -> Result<Vec<TransferProvenance>> {
+    let mut current_owner = owner.to_owned();
+    let mut seen = BTreeSet::from([current_owner.clone()]);
+    let mut lineage = Vec::new();
+    while let Some(record) = transfer_into_target(db, &current_owner, project, automation_id)? {
+        if !seen.insert(record.former_owner_manager_id.clone()) {
+            return Err(Error::new(
+                "AUTOMATION_TRANSFER_CORRUPT",
+                "automation ownership transfer lineage contains a cycle",
+            ));
+        }
+        current_owner.clone_from(&record.former_owner_manager_id);
+        lineage.push(record);
+    }
+    Ok(lineage)
+}
+
+/// Resolve the terminal owner of an old entry through explicit transfer
+/// records. This is lineage only; callers must still revalidate current GM,
+/// entry, Task and Operation scope before continuing an effect.
+pub(crate) fn transfer_successors(
+    db: &Connection,
+    owner: &str,
+    project: &str,
+    automation_id: &str,
+) -> Result<Vec<TransferProvenance>> {
+    let mut current_owner = owner.to_owned();
+    let mut seen = BTreeSet::from([current_owner.clone()]);
+    let mut lineage = Vec::new();
+    while let Some(record) = transfer_from_source(db, &current_owner, project, automation_id)? {
+        if !seen.insert(record.new_owner_manager_id.clone()) {
+            return Err(Error::new(
+                "AUTOMATION_TRANSFER_CORRUPT",
+                "automation ownership transfer lineage contains a cycle",
+            ));
+        }
+        current_owner.clone_from(&record.new_owner_manager_id);
+        lineage.push(record);
+    }
+    Ok(lineage)
+}
+
+pub(crate) fn require_not_transferred(
+    db: &Connection,
+    owner: &str,
+    project: &str,
+    automation_id: &str,
+) -> Result<()> {
+    if transfer_from_source(db, owner, project, automation_id)?.is_some() {
+        return Err(Error::new(
+            "AUTOMATION_TRANSFER_RETIRED",
+            "a transferred former-owner snapshot cannot be edited or re-enabled",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_transfer_record(
+    record: &TransferProvenance,
+    operation_id: &str,
+) -> Result<()> {
+    if record.schema_version != 1
+        || record.transfer_operation_id != operation_id
+        || record.former_owner_manager_id == record.new_owner_manager_id
+        || record.former_owner_revision <= 0
+        || record.new_owner_revision != record.former_owner_revision.saturating_add(1)
+        || record.created_at_ms < 0
+        || validate_name(
+            &record.former_owner_manager_id,
+            "former_owner_manager_id",
+            128,
+        )
+        .is_err()
+        || validate_name(&record.new_owner_manager_id, "new_owner_manager_id", 128).is_err()
+        || validate_name(&record.project_id, "project_id", 128).is_err()
+        || validate_automation_id(&record.automation_id).is_err()
+    {
+        return Err(Error::new(
+            "AUTOMATION_TRANSFER_CORRUPT",
+            "automation ownership transfer identity or revision is invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn transfer_pointer(db: &Connection, key: &str) -> Result<Option<String>> {
+    let Some(value) = read_record(db, key, "automation transfer index")? else {
+        return Ok(None);
+    };
+    let pointer: TransferPointer = serde_json::from_value(value).map_err(|_| {
+        Error::new(
+            "AUTOMATION_TRANSFER_CORRUPT",
+            "automation transfer index fields are invalid",
+        )
+    })?;
+    if pointer.schema_version != 1
+        || validate_name(&pointer.transfer_operation_id, "transfer_operation_id", 128).is_err()
+    {
+        return Err(Error::new(
+            "AUTOMATION_TRANSFER_CORRUPT",
+            "automation transfer index identity is invalid",
+        ));
+    }
+    Ok(Some(pointer.transfer_operation_id))
 }
 
 pub(crate) fn parse_request(value: &Value, applying: bool) -> Result<ConfigRequest> {

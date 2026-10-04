@@ -102,9 +102,21 @@ fn profile_tables_are_closed_and_keep_gm_authority_separate() {
         "host.mode"
     ));
     assert!(profiles::allows_method(McpToolProfile::Gm, "gm.handover"));
-    assert!(!profiles::allows_method(
+    assert!(profiles::allows_method(
         McpToolProfile::Gm,
         "automation.config.get"
+    ));
+    assert!(profiles::allows_method(
+        McpToolProfile::Gm,
+        "automation.config.explain"
+    ));
+    assert!(profiles::allows_method(
+        McpToolProfile::Gm,
+        "automation.config.transfer"
+    ));
+    assert!(!profiles::allows_method(
+        McpToolProfile::Gm,
+        "automation.config.apply"
     ));
     assert!(profiles::allows_method(
         McpToolProfile::Participant,

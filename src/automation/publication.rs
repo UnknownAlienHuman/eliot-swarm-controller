@@ -43,6 +43,7 @@ pub(crate) struct PublicationContext {
     expected_create: bool,
     activation_cut: i64,
     historical_replay_authorized: bool,
+    committed_operation_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -223,6 +224,7 @@ impl PublicationContext {
             expected_create: settings.expected_create,
             activation_cut,
             historical_replay_authorized,
+            committed_operation_id: None,
         };
         if candidate.project_id != context.project_id {
             return Err(Error::new(
@@ -302,7 +304,8 @@ impl PublicationContext {
                 )
             })?;
         let cause = attribution.cause.clone();
-        let context = Self::from_attribution(attribution)?;
+        let mut context = Self::from_attribution(attribution)?;
+        context.committed_operation_id = Some(operation_id.to_owned());
         let link_key = config::operation_link_key(operation_id)?;
         let link = config::read_record(db, &link_key, "publication on-behalf Operation link")?
             .ok_or_else(|| {
@@ -528,12 +531,53 @@ impl PublicationContext {
             expected_create: cause.expected_create,
             activation_cut: cause.activation_cut,
             historical_replay_authorized: cause.historical_replay_authorized,
+            committed_operation_id: None,
         })
     }
 
     /// Check all current write prerequisites. Forge calls this only before a
     /// new push; it must not gate readback of an already uncertain effect.
     pub(crate) fn require_current(&self, db: &Connection) -> Result<()> {
+        if let Some(continuation) = self.transfer_continuation(db)? {
+            let candidate = accepted_candidate_from_observation(
+                db,
+                self.acceptance_observation_id,
+                &self.accepted_operation_id,
+            )?;
+            if candidate.task_id != self.task_id
+                || candidate.project_id != self.project_id
+                || candidate.task_revision != self.task_revision
+                || candidate.attempt_id != self.attempt_id
+                || candidate.submission_ref != self.submission_ref
+                || candidate.candidate_ref != self.candidate_ref
+            {
+                return Err(Error::new(
+                    "FORGE_ACCEPTANCE_STALE",
+                    "retained acceptance no longer identifies the exact publication candidate",
+                ));
+            }
+            validate_current_accepted_candidate(
+                db,
+                &candidate,
+                &self.project_id,
+                &self.policy_revision,
+            )?;
+            if continuation.historical_owner_id() != self.effective_manager_id
+                || continuation.historical_revision() != self.automation_revision
+                || continuation.project_id() != self.project_id
+                || continuation.automation_id() != self.automation_id
+                || continuation.action() != ACTION
+                || continuation.task_id() != self.task_id
+                || continuation.current_entry().owner_manager_id != continuation.current_owner_id()
+                || !entry_matches_publication_settings(continuation.current_entry(), self)
+            {
+                return Err(Error::new(
+                    "AUTOMATION_TRANSFER_SCOPE",
+                    "current GM transfer does not preserve the exact retained publication action",
+                ));
+            }
+            return Ok(());
+        }
         authorization::require_registered_manager(db, &self.effective_manager_id)?;
         let entry = config::load_entry(
             db,
@@ -588,6 +632,99 @@ impl PublicationContext {
             return Err(Error::new(
                 "FORBIDDEN",
                 "current manager no longer has Task/project scope for publication",
+            ));
+        }
+        validate_current_accepted_candidate(
+            db,
+            &candidate,
+            &self.project_id,
+            &self.policy_revision,
+        )?;
+        Ok(())
+    }
+
+    /// A transfer grant can only be rehydrated while this exact retained
+    /// publication Operation remains queued and unsent. Forge carries the
+    /// returned typed grant across its atomic begin transition and rechecks
+    /// that same grant before crossing the write boundary.
+    pub(crate) fn transfer_continuation(
+        &self,
+        db: &Connection,
+    ) -> Result<Option<authorization::TransferContinuation>> {
+        let Some(operation_id) = self.committed_operation_id.as_deref() else {
+            return Ok(None);
+        };
+        let continuation = authorization::current_transfer_continuation(
+            db,
+            operation_id,
+            ACTION,
+            super::actions::AutomationStep::Publication,
+            &self.task_id,
+        )?;
+        let Some(continuation) = continuation else {
+            return Ok(None);
+        };
+        if continuation.historical_owner_id() != self.effective_manager_id
+            || continuation.historical_revision() != self.automation_revision
+            || continuation.project_id() != self.project_id
+            || continuation.automation_id() != self.automation_id
+            || continuation.action() != ACTION
+            || continuation.task_id() != self.task_id
+            || continuation.current_entry().owner_manager_id != continuation.current_owner_id()
+            || !entry_matches_publication_settings(continuation.current_entry(), self)
+        {
+            return Err(Error::new(
+                "AUTOMATION_TRANSFER_SCOPE",
+                "current GM transfer does not preserve the exact retained publication action",
+            ));
+        }
+        Ok(Some(continuation))
+    }
+
+    /// Verify a grant captured before `begin` moved the Operation from queued
+    /// to sending. This does not create a grant from a sending or uncertain
+    /// Operation; the store boundary validates the typed pre-begin grant.
+    pub(crate) fn require_prepared_transfer_continuation(
+        &self,
+        db: &Connection,
+        continuation: &authorization::TransferContinuation,
+    ) -> Result<()> {
+        let operation_id = self.committed_operation_id.as_deref().ok_or_else(|| {
+            Error::new(
+                "AUTOMATION_TRANSFER_SCOPE",
+                "publication transfer grant has no retained Operation identity",
+            )
+        })?;
+        let current = continuation.revalidate_publication_prewrite(db, operation_id)?;
+        if current.historical_owner_id() != self.effective_manager_id
+            || current.historical_revision() != self.automation_revision
+            || current.project_id() != self.project_id
+            || current.automation_id() != self.automation_id
+            || current.action() != ACTION
+            || current.task_id() != self.task_id
+            || current.current_entry().owner_manager_id != current.current_owner_id()
+            || !entry_matches_publication_settings(current.current_entry(), self)
+        {
+            return Err(Error::new(
+                "AUTOMATION_TRANSFER_SCOPE",
+                "prepared current GM transfer no longer preserves the exact publication action",
+            ));
+        }
+        let candidate = accepted_candidate_from_observation(
+            db,
+            self.acceptance_observation_id,
+            &self.accepted_operation_id,
+        )?;
+        if candidate.task_id != self.task_id
+            || candidate.project_id != self.project_id
+            || candidate.task_revision != self.task_revision
+            || candidate.attempt_id != self.attempt_id
+            || candidate.submission_ref != self.submission_ref
+            || candidate.candidate_ref != self.candidate_ref
+        {
+            return Err(Error::new(
+                "FORGE_ACCEPTANCE_STALE",
+                "retained acceptance no longer identifies the exact publication candidate",
             ));
         }
         validate_current_accepted_candidate(
@@ -810,6 +947,20 @@ impl PublicationContext {
     pub(crate) fn expected_create(&self) -> bool {
         self.expected_create
     }
+}
+
+fn entry_matches_publication_settings(
+    entry: &config::AutomationEntry,
+    context: &PublicationContext,
+) -> bool {
+    entry.project_id == context.project_id
+        && entry.automation_id == context.automation_id
+        && entry.publication_ready()
+        && entry.publication.as_ref().is_some_and(|settings| {
+            settings.target_ref == context.target_ref
+                && settings.expected_old_ref == context.expected_old_ref
+                && settings.expected_create == context.expected_create
+        })
 }
 
 fn validate_entry_authority(db: &Connection, entry: &config::AutomationEntry) -> Result<()> {

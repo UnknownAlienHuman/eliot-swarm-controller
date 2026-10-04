@@ -1024,6 +1024,52 @@ fn load_state(db: &Connection, entry: &AutomationEntry) -> Result<Option<WorkDis
     Ok(Some(state))
 }
 
+/// Move only the typed per-entry journal during an explicit ownership
+/// transfer. Global intake cursors, semantic slots, and operation history are
+/// independent records and remain untouched.
+pub(super) fn relocate_state(
+    tx: &Transaction<'_>,
+    former: &AutomationEntry,
+    successor: &AutomationEntry,
+) -> Result<()> {
+    if former.owner_manager_id == successor.owner_manager_id
+        || former.project_id != successor.project_id
+        || former.automation_id != successor.automation_id
+    {
+        return Err(Error::new(
+            "AUTOMATION_TRANSFER_SCOPE",
+            "WorkDispatch state relocation requires the exact former and successor entry pair",
+        ));
+    }
+    let old_key = state_key(former)?;
+    let new_key = state_key(successor)?;
+    let target_exists: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM meta WHERE key=?1)",
+        [&new_key],
+        |row| row.get(0),
+    )?;
+    if target_exists {
+        return Err(Error::new(
+            "AUTOMATION_TRANSFER_CONFLICT",
+            "successor already has WorkDispatch state for this automation",
+        ));
+    }
+    let Some(mut state) = load_state(tx, former)? else {
+        return Ok(());
+    };
+    state.owner_manager_id = successor.owner_manager_id.clone();
+    validate_state(&state, successor)?;
+    save_state(tx, &new_key, &state)?;
+    let deleted = tx.execute("DELETE FROM meta WHERE key=?1", [&old_key])?;
+    if deleted != 1 {
+        return Err(Error::new(
+            "AUTOMATION_TRANSFER_STATE_CORRUPT",
+            "former WorkDispatch state changed while transfer was being applied",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_state(state: &WorkDispatchState, entry: &AutomationEntry) -> Result<()> {
     if state.schema_version != STATE_SCHEMA_VERSION
         || state.owner_manager_id != entry.owner_manager_id
@@ -1783,6 +1829,7 @@ pub(crate) fn context_for_operation(
     let launch_settings = retained_launch_settings(db, operation_id)?;
     let context = WorkDispatchContext::from_validated_operation_link(
         db,
+        &link.operation_id,
         &link.effective_manager_id,
         &link.automation_id,
         link.automation_revision,
@@ -1895,6 +1942,7 @@ fn validate_work_dispatch_link(db: &Connection, link: &WorkDispatchOperationLink
     }
     let expected_slot = WorkDispatchContext::from_validated_operation_link(
         db,
+        &link.operation_id,
         &link.effective_manager_id,
         &link.automation_id,
         link.automation_revision,

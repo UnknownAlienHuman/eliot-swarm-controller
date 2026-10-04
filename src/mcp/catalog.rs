@@ -1256,10 +1256,10 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
     entry!(
         "automation.config.get",
         Schedules,
-        MANAGER_ONLY_AUDIENCES,
+        MANAGER_AUDIENCES,
         Searchable,
-        "Page the authenticated Manager's revisioned automation definitions for one project.",
-        "Use to inspect existing definitions before previewing an exact change.",
+        "Page revisioned automation definitions for one project; current GM can select a former owner for continuity.",
+        "Use to inspect retained definitions and their exact revision before a change or transfer.",
         &[
             "automation",
             "configuration",
@@ -1267,7 +1267,11 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
             "project",
             "revision"
         ],
-        &["project_id", "optional after/limit"],
+        &[
+            "project_id",
+            "optional owner_manager_id",
+            "optional after/limit"
+        ],
         "Bounded owner-and-project-scoped page."
     ),
     entry!(
@@ -1284,10 +1288,10 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
     entry!(
         "automation.config.explain",
         Schedules,
-        MANAGER_ONLY_AUDIENCES,
+        MANAGER_AUDIENCES,
         Searchable,
         "Explain dispatch state and linked operations for one owned automation.",
-        "Use with exact project and automation IDs to diagnose retained dispatch state.",
+        "Use with exact project and automation IDs; current GM can select owner_manager_id to inspect former-owner state.",
         &[
             "automation",
             "explain",
@@ -1295,7 +1299,7 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
             "linked operations",
             "state"
         ],
-        &["project_id", "automation_id"],
+        &["project_id", "automation_id", "optional owner_manager_id"],
         "One scoped entry explanation and bounded linked-work projection."
     ),
     entry!(
@@ -1544,6 +1548,30 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
             "client_request_id"
         ],
         "One guarded configuration update; enabling dispatch does not start a model turn."
+    ),
+    entry!(
+        "automation.config.transfer",
+        Administration,
+        MANAGER_AUDIENCES,
+        ManualOnly,
+        "Transfer one retained automation to the current designated GM without resetting cursors or replaying effects.",
+        "Use after GM handover and reading the former owner's exact automation revision; requires current GM or local Operator authority.",
+        &[
+            "automation",
+            "transfer",
+            "handover",
+            "GM",
+            "continuity",
+            "ownership"
+        ],
+        &[
+            "project_id",
+            "former_owner_manager_id",
+            "automation_id",
+            "expected_revision",
+            "client_request_id"
+        ],
+        "One atomic ownership relocation with retained pending operations and original history."
     ),
 ];
 
