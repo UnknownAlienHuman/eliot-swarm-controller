@@ -605,6 +605,7 @@ pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
         "check.cancel" => &["client_request_id", "check_id", "reason"],
 
         "artifact.assemble" => &["client_request_id", "page_refs", "expected_sha256"],
+        "task.submit.recover" => &["client_request_id", "operation_id"],
         "task.submit" => &[
             "client_request_id",
             "attempt_id",
@@ -778,6 +779,9 @@ pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
         }
         "task.submit" => {
             crate::submission::SubmitRequest::parse(params)?;
+        }
+        "task.submit.recover" => {
+            text(params, "operation_id")?;
         }
         "task.request_changes" => {
             crate::submission::ChangeRequest::parse(params)?;

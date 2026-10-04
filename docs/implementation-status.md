@@ -47,10 +47,19 @@ Cross-platform CI [37182521189](https://github.com/UnknownAlienHuman/eliot-swarm
 completed successfully on Windows and Ubuntu, verified at 06:37 UTC. The requirement is saved in ac6691c and
 described in [GM session continuity](gm-session-continuity.md).
 
-**Resume here:** run the saved native-command continuation regression with the
-deterministic submission readback increment. Continue owned native startup diagnosis and full
-O7 afterwards. Deterministic
-file readback for a submission left unknown by a host crash remains separate.
+The next source increment implements `task.submit.recover` and
+`swarm task recover-submission <operation_id>` for an exact prior submission
+left unknown by a host crash. It verifies the existing deterministic artifact
+without publishing or native replay, keeps original caller/submitted-by, checks
+the actual current GM again at finalization, and retains stale submission history
+without changing the Attempt. A missing file keeps the original target unknown.
+An already-settled target returns its stored result without duplicate artifacts.
+The real-Store continuation and readback regressions are saved with this source;
+their focused gate is pending.
+
+**Resume here:** run the saved native-command continuation and deterministic
+submission readback gate. Continue owned native startup diagnosis and full
+O7 afterwards.
 Automatic transfer of every former manager's automation entry remains separate;
 readback must not reset its cursors or replay its effects.
 

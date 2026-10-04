@@ -100,6 +100,7 @@ pub(super) fn allows_method(profile: McpToolProfile, method: &str) -> bool {
                 | "task.claim"
                 | "task.dispatch"
                 | "task.submit"
+                | "task.submit.recover"
                 | "attempt.release"
                 | "attempt.bind_producer"
                 | "operation.cancel"

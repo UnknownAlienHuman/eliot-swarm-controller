@@ -879,6 +879,12 @@ static TOOLS: &[(bool, ToolSpec)] = &[
         ],
     ),
     mutation(
+        "task.submit.recover",
+        "Recover an unknown submission from its exact existing artifact as the current GM or operator; does not publish files or replay native work.",
+        &[f("operation_id", S)],
+        &["operation_id"],
+    ),
+    mutation(
         "task.request_changes",
         "Return one anchored finding about the exact current submission/candidate.",
         &[

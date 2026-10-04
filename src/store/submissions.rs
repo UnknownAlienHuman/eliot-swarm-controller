@@ -1,7 +1,7 @@
 //! Anchored submission and review transitions. No native input or file I/O in transactions.
 use super::{current_principal, operations, results, tasks};
 use crate::{
-    artifacts::ArtifactRecord,
+    artifacts::{ArtifactFiles, ArtifactRecord},
     automation::disposition::ReviewDispositionContext,
     error::{Error, Result},
     model::{self, Principal, Role, TaskSpec},
@@ -92,6 +92,152 @@ fn candidate(db: &Connection, a: &Value, input: &SubmitRequest) -> Result<Artifa
     Ok(record)
 }
 
+struct RetainedSubmission {
+    input: SubmitRequest,
+    attempt: Value,
+    task: Value,
+    artifact: ArtifactRecord,
+}
+
+struct ValidatedSubmission {
+    artifact: ArtifactRecord,
+    still_current: bool,
+}
+
+/// The recovery actor must be the currently designated GM or local Operator.
+/// Unlike submission admission, historical recovery deliberately does not
+/// require control of the current Attempt: a released or superseded Attempt's
+/// already-published artifact still needs an exact readback decision.
+fn require_recovery_authority(db: &Connection, p: &Principal, task_id: &str) -> Result<()> {
+    let p = current_principal(db, p.clone())?;
+    if !matches!(p.role, Role::Operator | Role::Manager) {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "submission recovery requires the current GM or operator",
+        ));
+    }
+    super::gm::require_authority(db, &p)?;
+    if p.role == Role::Manager {
+        let task = tasks::get_task(db, task_id)?;
+        let project_id = model::text(&task, "project_id")?;
+        if !crate::automation::authorization::current_manager_has_task_scope(
+            db, &p, task_id, project_id,
+        )? {
+            return Err(Error::new(
+                "FORBIDDEN",
+                "current GM lacks scope for this Task and project",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Rebuild the immutable expected document from the original request and the
+/// retained Attempt/candidate. This keeps recovery anchored to the original
+/// submitter and never lets the recovering GM replace any admission fact.
+fn retained_submission(db: &Connection, id: &str, op: &Value) -> Result<RetainedSubmission> {
+    if op["operation_id"] != id || op["method"] != "task.submit" {
+        return Err(Error::new(
+            "SUBMISSION_RECOVERY_TARGET",
+            "recovery target is not the exact task.submit Operation",
+        ));
+    }
+    let (original_raw, effective_raw, client_request_id): (String, String, String) = db.query_row(
+        "SELECT original_request_json,effective_request_json,client_request_id FROM operations WHERE operation_id=?1",
+        [id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    let original: Value = serde_json::from_str(&original_raw)?;
+    let input = SubmitRequest::parse(&original)?;
+    let attempt = tasks::get_attempt(db, &input.attempt_id)?;
+    let task = tasks::get_task(db, model::text(&attempt, "task_id")?)?;
+    let candidate = candidate(db, &attempt, &input)?;
+    let spec: TaskSpec = serde_json::from_value(attempt["task_snapshot"]["spec"].clone())?;
+    let claims = input.normalized_claims(&spec)?;
+    let counts = claim_counts(&claims);
+    let expected_document = json!({
+        "schema_version":1,
+        "operation_id":id,
+        "task_id":attempt["task_id"],
+        "attempt_id":input.attempt_id,
+        "task_revision":input.expected_revision,
+        "phase":spec.phase,
+        "owner_id":attempt["owner_id"],
+        "submitted_by":op["caller_id"],
+        "previous_submission_ref":input.expected_submission_ref,
+        "candidate_ref":candidate.artifact_id,
+        "candidate_sha256":candidate.content_digest,
+        "candidate_kind":candidate.kind,
+        "candidate_byte_length":candidate.byte_length,
+        "summary":input.summary,
+        "claims":claims,
+        "claim_counts":counts,
+        "evidence_level":"submitter_report",
+        "source_checkout_verified":false
+    });
+    let effective: Value = serde_json::from_str(&effective_raw)?;
+    let document = effective["submission_document"].clone();
+    if op["task_id"] != expected_document["task_id"]
+        || op["attempt_id"] != expected_document["attempt_id"]
+        || original["client_request_id"] != client_request_id
+        || expected_document["submitted_by"] != op["caller_id"]
+        || model::canonical(&document)? != model::canonical(&expected_document)?
+    {
+        return Err(Error::new(
+            "SUBMISSION_RECOVERY_TARGET",
+            "retained submission differs from its original request, Attempt, or candidate",
+        ));
+    }
+    let (artifact, _) = ArtifactFiles::submission(id, &document)?;
+    Ok(RetainedSubmission {
+        input,
+        attempt,
+        task,
+        artifact,
+    })
+}
+
+fn still_current(retained: &RetainedSubmission) -> bool {
+    let input = &retained.input;
+    let attempt = &retained.attempt;
+    let task = &retained.task;
+    task["state"] == "open"
+        && task["revision"] == input.expected_revision
+        && task["current_attempt_id"] == input.attempt_id
+        && attempt["task_revision"] == input.expected_revision
+        && attempt["released_at_ms"].is_null()
+        && attempt["submission_ref"] == json!(input.expected_submission_ref)
+        && matches!(
+            attempt["state"].as_str(),
+            Some("reserved" | "running" | "submitted" | "needs_correction" | "recovery_pending")
+        )
+}
+
+fn validate_published_submission(
+    db: &Connection,
+    id: &str,
+    op: &Value,
+    published: ArtifactRecord,
+) -> Result<ValidatedSubmission> {
+    let retained = retained_submission(db, id, op)?;
+    let expected = &retained.artifact;
+    if published.kind != expected.kind
+        || published.artifact_id != expected.artifact_id
+        || published.relative_path != expected.relative_path
+        || published.byte_length != expected.byte_length
+        || published.content_digest != expected.content_digest
+        || published.metadata != expected.metadata
+    {
+        return Err(Error::conflict(
+            "published submission differs from its retained operation, Attempt, or candidate",
+        ));
+    }
+    Ok(ValidatedSubmission {
+        artifact: published,
+        still_current: still_current(&retained),
+    })
+}
+
 pub(super) fn reserve(tx: &Transaction<'_>, p: &Principal, v: &Value, id: &str) -> Result<Value> {
     let input = SubmitRequest::parse(v)?;
     let a = current(tx, p, &input)?;
@@ -114,6 +260,408 @@ pub(super) fn reserve(tx: &Transaction<'_>, p: &Principal, v: &Value, id: &str) 
     )
 }
 
+pub(super) fn reserve_recovery(
+    tx: &Transaction<'_>,
+    p: &Principal,
+    v: &Value,
+    recovery_id: &str,
+    now: i64,
+) -> Result<(Value, bool)> {
+    let p = current_principal(tx, p.clone())?;
+    let target_id = model::text(v, "operation_id")?;
+    let target = operations::get_operation(tx, target_id)?;
+    if target["method"] != "task.submit"
+        || !matches!(
+            target["state"].as_str(),
+            Some("outcome_unknown" | "settled")
+        )
+    {
+        return Err(Error::new(
+            "SUBMISSION_NOT_RECOVERABLE",
+            "recovery requires the exact task.submit Operation in outcome_unknown or settled",
+        ));
+    }
+    require_recovery_authority(tx, &p, model::text(&target, "task_id")?)?;
+    // Validate the complete immutable target now; begin/finalize repeat this
+    // against the same Operation so no client-supplied identity is trusted.
+    retained_submission(tx, target_id, &target)?;
+    if target["state"] == "settled" {
+        settled_target_result(target_id, &target)?;
+    }
+    let linkage = json!({
+        "target_operation_id":target_id,
+        "original_caller_id":target["caller_id"],
+        "task_id":target["task_id"],
+        "attempt_id":target["attempt_id"]
+    });
+    let changed = tx.execute(
+        "UPDATE operations SET task_id=?2,attempt_id=?3,effective_request_json=?4,updated_at_ms=?5 \
+         WHERE operation_id=?1 AND method='task.submit.recover' AND caller_id=?6 AND state='queued'",
+        params![
+            recovery_id,
+            target["task_id"].as_str(),
+            target["attempt_id"].as_str(),
+            model::canonical(&linkage)?,
+            now,
+            p.client_id
+        ],
+    )?;
+    if changed != 1 {
+        return Err(Error::conflict(
+            "submission recovery Operation is no longer queued",
+        ));
+    }
+    Ok((
+        json!({
+            "operation_id":recovery_id,
+            "target_operation_id":target_id,
+            "state":"queued",
+            "outcome":"recovery_pending",
+            "artifact_readback":"required"
+        }),
+        true,
+    ))
+}
+
+pub(super) enum SubmissionRecoveryStart {
+    Verify {
+        target_operation_id: String,
+        expected_artifact: ArtifactRecord,
+    },
+    Complete(Value),
+}
+
+fn settle_recovery(tx: &Transaction<'_>, recovery_id: &str, value: &Value, now: i64) -> Result<()> {
+    let changed = tx.execute(
+        "UPDATE operations SET state='settled',result_json=?2,settled_at_ms=?3,updated_at_ms=?3 \
+         WHERE operation_id=?1 AND method='task.submit.recover' AND state='queued'",
+        params![recovery_id, model::canonical(value)?, now],
+    )?;
+    if changed != 1 {
+        return Err(Error::conflict(
+            "submission recovery Operation is no longer queued",
+        ));
+    }
+    super::capacity::sync_operation(tx, recovery_id, now)?;
+    tx.execute(
+        "INSERT OR IGNORE INTO observations(source_stream_id,source_event_key,operation_id,kind,payload_json,recorded_at_ms) \
+         VALUES('controller',?1,?2,'task.submit.recover',?3,?4)",
+        params![
+            format!("submission-recovery:{recovery_id}"),
+            recovery_id,
+            model::canonical(value)?,
+            now
+        ],
+    )?;
+    Ok(())
+}
+
+fn recovery_linkage(db: &Connection, recovery_id: &str, op: &Value) -> Result<(String, Value)> {
+    if op["operation_id"] != recovery_id || op["method"] != "task.submit.recover" {
+        return Err(Error::new(
+            "SUBMISSION_RECOVERY_OPERATION",
+            "Operation is not the exact task.submit.recover request",
+        ));
+    }
+    let (original_raw, effective_raw, client_request_id): (String, String, String) = db.query_row(
+        "SELECT original_request_json,effective_request_json,client_request_id FROM operations WHERE operation_id=?1",
+        [recovery_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    let original: Value = serde_json::from_str(&original_raw)?;
+    let effective: Value = serde_json::from_str(&effective_raw)?;
+    let target_id = model::text(&original, "operation_id")?.to_owned();
+    if effective["target_operation_id"] != target_id
+        || op["task_id"] != effective["task_id"]
+        || op["attempt_id"] != effective["attempt_id"]
+        || original["client_request_id"] != client_request_id
+        || effective["receipt"]["ok"] != true
+        || effective["receipt"]["value"]["operation_id"] != recovery_id
+        || effective["receipt"]["value"]["target_operation_id"] != target_id
+    {
+        return Err(Error::new(
+            "SUBMISSION_RECOVERY_OPERATION",
+            "recovery request differs from its retained target linkage",
+        ));
+    }
+    Ok((target_id, effective))
+}
+
+fn settled_target_result(target_id: &str, target: &Value) -> Result<Value> {
+    let result = &target["result"];
+    if target["method"] != "task.submit"
+        || target["operation_id"] != target_id
+        || target["state"] != "settled"
+        || result["operation_id"] != target_id
+        || !matches!(
+            result["outcome"].as_str(),
+            Some("applied" | "stale_submission_scope" | "failed")
+        )
+    {
+        return Err(Error::new(
+            "SUBMISSION_RECOVERY_TARGET",
+            "settled target does not have a valid retained submission result",
+        ));
+    }
+    Ok(result.clone())
+}
+
+pub(super) fn begin_recovery(
+    db: &mut Connection,
+    p: Principal,
+    recovery_id: &str,
+) -> Result<SubmissionRecoveryStart> {
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let p = current_principal(&tx, p)?;
+    let recovery = operations::get_operation(&tx, recovery_id)?;
+    if recovery["caller_id"] != p.client_id || recovery["method"] != "task.submit.recover" {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "recovery Operation belongs to another caller or method",
+        ));
+    }
+    if recovery["state"] == "settled" {
+        let value = recovery["result"].clone();
+        tx.commit()?;
+        return Ok(SubmissionRecoveryStart::Complete(value));
+    }
+    if recovery["state"] != "queued" {
+        return Err(Error::conflict(
+            "submission recovery Operation is not queued",
+        ));
+    }
+    let (target_id, linkage) = recovery_linkage(&tx, recovery_id, &recovery)?;
+    let target = operations::get_operation(&tx, &target_id)?;
+    if target["method"] != "task.submit"
+        || target["task_id"] != linkage["task_id"]
+        || target["attempt_id"] != linkage["attempt_id"]
+        || target["caller_id"] != linkage["original_caller_id"]
+    {
+        return Err(Error::new(
+            "SUBMISSION_RECOVERY_TARGET",
+            "target Operation no longer matches the retained recovery linkage",
+        ));
+    }
+    require_recovery_authority(&tx, &p, model::text(&target, "task_id")?)?;
+    let retained = retained_submission(&tx, &target_id, &target)?;
+    if target["state"] == "settled" {
+        let target_result = settled_target_result(&target_id, &target)?;
+        let value = json!({
+            "operation_id":recovery_id,
+            "target_operation_id":target_id,
+            "outcome":"already_settled",
+            "target_result":target_result
+        });
+        settle_recovery(&tx, recovery_id, &value, model::now_ms()?)?;
+        tx.commit()?;
+        return Ok(SubmissionRecoveryStart::Complete(value));
+    }
+    if target["state"] != "outcome_unknown" {
+        return Err(Error::new(
+            "SUBMISSION_NOT_RECOVERABLE",
+            "target is no longer an unknown submission",
+        ));
+    }
+    let expected_artifact = retained.artifact;
+    tx.commit()?;
+    Ok(SubmissionRecoveryStart::Verify {
+        target_operation_id: target_id,
+        expected_artifact,
+    })
+}
+
+fn insert_artifact_once(tx: &Transaction<'_>, artifact: &ArtifactRecord, now: i64) -> Result<()> {
+    let existing: Option<(String, String, i64, String, String)> = tx
+        .query_row(
+            "SELECT kind,relative_path,byte_length,content_digest,metadata_json FROM artifacts WHERE artifact_id=?1",
+            [&artifact.artifact_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .optional()?;
+    if let Some((kind, path, byte_length, digest, metadata_raw)) = existing {
+        let metadata: Value = serde_json::from_str(&metadata_raw)?;
+        if kind != artifact.kind
+            || path != artifact.relative_path
+            || u64::try_from(byte_length).ok() != Some(artifact.byte_length)
+            || digest != artifact.content_digest
+            || metadata != artifact.metadata
+        {
+            return Err(Error::new(
+                "ARTIFACT_COLLISION",
+                "submission artifact ID is already registered with different content",
+            ));
+        }
+        return Ok(());
+    }
+    tx.execute(
+        "INSERT INTO artifacts(artifact_id,relative_path,kind,byte_length,content_digest,created_at_ms,metadata_json) \
+         VALUES(?1,?2,'task_submission',?3,?4,?5,?6)",
+        params![
+            artifact.artifact_id,
+            artifact.relative_path,
+            i64::try_from(artifact.byte_length)
+                .map_err(|_| Error::invalid("submission too large"))?,
+            artifact.content_digest,
+            now,
+            model::canonical(&artifact.metadata)?
+        ],
+    )?;
+    Ok(())
+}
+
+pub(super) fn finish_recovery(
+    db: &mut Connection,
+    p: Principal,
+    recovery_id: &str,
+    expected_target_id: &str,
+    verified: bool,
+) -> Result<Value> {
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let p = current_principal(&tx, p)?;
+    let recovery = operations::get_operation(&tx, recovery_id)?;
+    if recovery["caller_id"] != p.client_id || recovery["method"] != "task.submit.recover" {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "recovery Operation belongs to another caller or method",
+        ));
+    }
+    if recovery["state"] == "settled" {
+        let result = recovery["result"].clone();
+        tx.commit()?;
+        return Ok(result);
+    }
+    if recovery["state"] != "queued" {
+        return Err(Error::conflict(
+            "submission recovery Operation is not queued",
+        ));
+    }
+    let (target_id, linkage) = recovery_linkage(&tx, recovery_id, &recovery)?;
+    if target_id != expected_target_id {
+        return Err(Error::new(
+            "SUBMISSION_RECOVERY_TARGET",
+            "verified artifact target differs from the retained recovery request",
+        ));
+    }
+    let target = operations::get_operation(&tx, &target_id)?;
+    if target["method"] != "task.submit"
+        || target["task_id"] != linkage["task_id"]
+        || target["attempt_id"] != linkage["attempt_id"]
+        || target["caller_id"] != linkage["original_caller_id"]
+    {
+        return Err(Error::new(
+            "SUBMISSION_RECOVERY_TARGET",
+            "target Operation no longer matches the retained recovery linkage",
+        ));
+    }
+    require_recovery_authority(&tx, &p, model::text(&target, "task_id")?)?;
+    let retained = retained_submission(&tx, &target_id, &target)?;
+    let now = model::now_ms()?;
+    if target["state"] == "settled" {
+        let target_result = settled_target_result(&target_id, &target)?;
+        let value = json!({
+            "operation_id":recovery_id,
+            "target_operation_id":target_id,
+            "outcome":"already_settled",
+            "target_result":target_result
+        });
+        settle_recovery(&tx, recovery_id, &value, now)?;
+        tx.commit()?;
+        return Ok(value);
+    }
+    if target["state"] != "outcome_unknown" {
+        return Err(Error::new(
+            "SUBMISSION_NOT_RECOVERABLE",
+            "target is no longer an unknown submission",
+        ));
+    }
+    if !verified {
+        let value = json!({
+            "operation_id":recovery_id,
+            "target_operation_id":target_id,
+            "outcome":"held_unknown",
+            "reason":"submission_artifact_missing",
+            "target_state":"outcome_unknown"
+        });
+        settle_recovery(&tx, recovery_id, &value, now)?;
+        tx.commit()?;
+        return Ok(value);
+    }
+
+    insert_artifact_once(&tx, &retained.artifact, now)?;
+    let target_value = if still_current(&retained) {
+        let changed = tx.execute(
+            "UPDATE attempts SET state='submitted',submission_ref=?2,candidate_ref=?3,updated_at_ms=?4 \
+             WHERE attempt_id=?1 AND released_at_ms IS NULL AND task_revision=?5 \
+             AND submission_ref IS ?6 AND state IN ('reserved','running','submitted','needs_correction','recovery_pending')",
+            params![
+                retained.input.attempt_id,
+                retained.artifact.artifact_id,
+                retained.input.candidate_ref,
+                now,
+                retained.input.expected_revision,
+                retained.input.expected_submission_ref
+            ],
+        )?;
+        if changed != 1 {
+            return Err(Error::conflict(
+                "Attempt changed before the recovered submission was recorded",
+            ));
+        }
+        json!({
+            "operation_id":target_id,
+            "outcome":"applied",
+            "attempt_id":retained.input.attempt_id,
+            "submission_ref":retained.artifact.artifact_id,
+            "candidate_ref":retained.input.candidate_ref,
+            "claim_counts":retained.artifact.metadata["claim_counts"],
+            "state":"submitted",
+            "task_accepted":false
+        })
+    } else {
+        json!({
+            "operation_id":target_id,
+            "outcome":"stale_submission_scope",
+            "attempt_id":retained.input.attempt_id,
+            "submission_artifact_ref":retained.artifact.artifact_id,
+            "candidate_ref":retained.input.candidate_ref,
+            "task_accepted":false,
+            "applied_to_attempt":false
+        })
+    };
+    let target_changed = tx.execute(
+        "UPDATE operations SET state='settled',result_json=?2,settled_at_ms=?3,updated_at_ms=?3 \
+         WHERE operation_id=?1 AND method='task.submit' AND state='outcome_unknown'",
+        params![target_id, model::canonical(&target_value)?, now],
+    )?;
+    if target_changed != 1 {
+        return Err(Error::conflict(
+            "submission target changed before recovery finalization",
+        ));
+    }
+    tx.execute(
+        "INSERT OR IGNORE INTO observations(source_stream_id,source_event_key,operation_id,kind,payload_json,recorded_at_ms) \
+         VALUES('controller',?1,?2,'task.submission',?3,?4)",
+        params![
+            format!("submission:{target_id}"),
+            target_id,
+            model::canonical(&target_value)?,
+            now
+        ],
+    )?;
+    super::capacity::sync_attempt(&tx, &retained.input.attempt_id, now)?;
+    super::capacity::sync_operation(&tx, &target_id, now)?;
+    let value = json!({
+        "operation_id":recovery_id,
+        "target_operation_id":target_id,
+        "outcome":"recovered",
+        "target_outcome":target_value["outcome"],
+        "submission_ref":retained.artifact.artifact_id
+    });
+    settle_recovery(&tx, recovery_id, &value, now)?;
+    tx.commit()?;
+    Ok(value)
+}
+
 pub(super) fn begin(
     db: &mut Connection,
     p: Principal,
@@ -134,7 +682,7 @@ pub(super) fn begin(
             "submission belongs to another caller or method",
         ));
     }
-    if !matches!(op["state"].as_str(), Some("queued" | "outcome_unknown")) {
+    if op["state"] != "queued" {
         return Ok(None);
     }
     let original_raw: String = tx.query_row(
@@ -156,8 +704,9 @@ pub(super) fn begin(
     let now = model::now_ms()?;
     tx.execute("UPDATE operations SET state='sending',sent_at_ms=?2,updated_at_ms=?2 WHERE operation_id=?1", params![id,now])?;
     tx.commit()?;
-    // This local immutable publication may resume after a host restart. It never
-    // resumes/replays native work. A final CAS still guards every Task transition.
+    // Only a first, admitted queued submit reaches publication here. Unknown
+    // outcomes use the explicit GM recovery readback path below; they never
+    // replay publish from this begin helper.
     Ok(Some((record, document)))
 }
 
@@ -181,65 +730,10 @@ pub(super) fn finish(
     )?;
     let input = SubmitRequest::parse(&serde_json::from_str(&raw)?)?;
     let checked = outcome.and_then(|record| {
-        // Publication is an already-crossed filesystem boundary. Do not let
-        // a GM handover turn a verified immutable artifact into an orphan;
-        // validate the retained submitter/candidate/Attempt provenance here,
-        // while begin() remains the current-actor authorization boundary.
-        let a = tasks::get_attempt(&tx, &input.attempt_id)?;
-        let task = tasks::get_task(&tx, model::text(&a, "task_id")?)?;
-        let candidate = candidate(&tx, &a, &input)?;
-        let effective_raw: String = tx.query_row(
-            "SELECT effective_request_json FROM operations WHERE operation_id=?1",
-            [id],
-            |row| row.get(0),
-        )?;
-        let effective: Value = serde_json::from_str(&effective_raw)?;
-        let document = &effective["submission_document"];
-        let mut expected_metadata = document.clone();
-        if let Some(fields) = expected_metadata.as_object_mut() {
-            fields.remove("claims");
-            fields.remove("summary");
-        }
-        let bytes = model::canonical(document)?.into_bytes();
-        let expected_artifact_id = format!("submission-{}", model::digest(id.as_bytes()));
-        if document["schema_version"] != 1
-            || document["operation_id"] != id
-            || document["task_id"] != a["task_id"]
-            || op["task_id"] != document["task_id"]
-            || document["attempt_id"] != input.attempt_id
-            || op["attempt_id"] != document["attempt_id"]
-            || document["task_revision"] != input.expected_revision
-            || document["owner_id"] != a["owner_id"]
-            || document["submitted_by"] != op["caller_id"]
-            || document["candidate_ref"] != candidate.artifact_id
-            || document["candidate_sha256"] != candidate.content_digest
-            || document["candidate_kind"] != candidate.kind
-            || document["candidate_byte_length"] != candidate.byte_length
-            || document["previous_submission_ref"] != json!(input.expected_submission_ref)
-            || record.kind != "task_submission"
-            || record.artifact_id != expected_artifact_id
-            || record.relative_path != format!("artifacts/{expected_artifact_id}.bin")
-            || record.byte_length != bytes.len() as u64
-            || record.content_digest != model::digest(&bytes)
-            || record.metadata != expected_metadata
-        {
-            return Err(Error::conflict(
-                "published submission differs from its retained operation, Attempt, or candidate",
-            ));
-        }
-        let still_current = task["state"] == "open"
-            && task["revision"] == input.expected_revision
-            && task["current_attempt_id"] == input.attempt_id
-            && a["task_revision"] == input.expected_revision
-            && a["released_at_ms"].is_null()
-            && a["submission_ref"] == json!(input.expected_submission_ref)
-            && matches!(
-                a["state"].as_str(),
-                Some(
-                    "reserved" | "running" | "submitted" | "needs_correction" | "recovery_pending"
-                )
-            );
-        Ok((record, still_current))
+        // Validate only immutable retained provenance after the file boundary;
+        // GM handover cannot orphan bytes already published by the submitter.
+        validate_published_submission(&tx, id, &op, record)
+            .map(|checked| (checked.artifact, checked.still_current))
     });
     let now = model::now_ms()?;
     let value = match checked {

@@ -236,6 +236,11 @@ enum TaskCommand {
         #[arg(long)]
         file: PathBuf,
     },
+    /// Recover the exact result of an unknown prior submission.
+    /// Records a Store recovery Operation; does not replay native work or create a file.
+    RecoverSubmission {
+        operation_id: String,
+    },
     /// Read a specific immutable submission, with paged requirement claims.
     Submission {
         submission_ref: String,
@@ -696,6 +701,10 @@ async fn run(cli: Cli) -> Result<()> {
                 ("task.invalidate_acceptance".into(), read_json(&file)?)
             }
             TaskCommand::Submit { file } => ("task.submit".into(), read_json(&file)?),
+            TaskCommand::RecoverSubmission { operation_id } => (
+                "task.submit.recover".into(),
+                json!({"operation_id":operation_id}),
+            ),
             TaskCommand::RequestChanges { file } => {
                 ("task.request_changes".into(), read_json(&file)?)
             }

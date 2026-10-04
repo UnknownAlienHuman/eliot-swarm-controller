@@ -656,6 +656,9 @@ impl Store {
         if method == "task.submit" {
             return self.submit_task(principal, params).await;
         }
+        if method == "task.submit.recover" {
+            return self.recover_task_submission(principal, params).await;
+        }
         if method == "module.result" {
             return self.persist_result(principal, params).await;
         }
@@ -884,6 +887,47 @@ impl Store {
                 .await;
             self.run(move |db| submissions::finish(db, principal, &id, outcome))
                 .await?;
+        }
+        Ok(receipt)
+    }
+    async fn recover_task_submission(&self, principal: Principal, params: Value) -> Result<Value> {
+        let p = principal.clone();
+        let config = self.config.clone();
+        let receipt = self
+            .run(move |db| {
+                let p = current_principal(db, p)?;
+                if !matches!(p.role, Role::Operator | Role::Manager) {
+                    return Err(Error::new(
+                        "FORBIDDEN",
+                        "submission recovery requires the current GM or operator",
+                    ));
+                }
+                mutate(db, &p, "task.submit.recover", &params, &config)
+            })
+            .await?;
+        let recovery_id = model::text(&receipt, "operation_id")?.to_owned();
+        let p = principal.clone();
+        let start_id = recovery_id.clone();
+        let start = self
+            .run(move |db| submissions::begin_recovery(db, p, &start_id))
+            .await?;
+        if let submissions::SubmissionRecoveryStart::Verify {
+            target_operation_id,
+            expected_artifact,
+        } = start
+        {
+            let artifact = expected_artifact;
+            let verified = self
+                .file_io(move |files| files.verify_existing(&artifact))
+                .await?;
+            let p = principal;
+            let finish_id = recovery_id.clone();
+            let finish_target = target_operation_id;
+            self.run(move |db| {
+                submissions::finish_recovery(db, p, &finish_id, &finish_target, verified)
+            })
+            .await?;
+            self.changed.send_modify(|n| *n = n.wrapping_add(1));
         }
         Ok(receipt)
     }
@@ -3362,6 +3406,7 @@ fn apply(
 
         "artifact.assemble" => assembly::reserve(tx, p, v, id).map(|v| (v, true)),
         "task.submit" => submissions::reserve(tx, p, v, id).map(|v| (v, true)),
+        "task.submit.recover" => submissions::reserve_recovery(tx, p, v, id, now),
         "task.accept" => acceptance::reserve(tx, p, v, id).map(|v| {
             let queued = v.get("coalesced") != Some(&Value::Bool(true));
             (v, queued)
@@ -3593,6 +3638,8 @@ mod capacity_tests;
 mod gm_automation_recovery_tests;
 #[cfg(test)]
 mod gm_continuation_tests;
+#[cfg(test)]
+mod gm_submission_recovery_tests;
 #[cfg(test)]
 mod mailbox_tests;
 #[cfg(test)]

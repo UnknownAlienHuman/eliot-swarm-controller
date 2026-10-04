@@ -75,7 +75,9 @@ recorded separately in [implementation status](implementation-status.md).
 The local submission writer also separates admission from completion: a GM
 change during immutable artifact publication cannot discard the verified file.
 Completion retains the original submitting actor; a changed Task scope keeps
-the artifact as history without applying it to the current Attempt. Successor
-readback of a submission left `outcome_unknown` by a controller host crash still
-needs its separate deterministic-file recovery path. This is distinct from
+the artifact as history without applying it to the current Attempt. A submission
+left `outcome_unknown` by a controller host crash has an explicit
+[`task.submit.recover` readback path](gm-submission-recovery.md). The current GM
+or local Operator verifies the exact already-existing file; recovery preserves
+the original submitter and cannot publish a missing file. This is distinct from
 losing the GM chat while the controller host remains running.

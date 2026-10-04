@@ -617,6 +617,17 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
         "One immutable submission."
     ),
     entry!(
+        "task.submit.recover",
+        TaskManagement,
+        MANAGER_AUDIENCES,
+        Searchable,
+        "Recover an unknown submission from its exact existing artifact.",
+        "Use as the current GM after a controller restart. Name the prior submission Operation; no file is created and no native work is replayed.",
+        &["task", "submission", "recover", "restart", "unknown"],
+        &["operation_id"],
+        "One durable recovery receipt preserving the original submitting actor."
+    ),
+    entry!(
         "task.request_changes",
         Review,
         REVIEW_DISPOSITION_AUDIENCES,
