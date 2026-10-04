@@ -369,7 +369,51 @@ fn next_internal(
             return Ok(json!({"command":null}));
         };
         let opening_actor = if method == "agent.open" {
-            super::launcher::opening_actor_for_open(&tx, &op, &id, generation)?
+            match super::launcher::opening_actor_for_open(&tx, &op, &id, generation) {
+                Ok(actor) => actor,
+                Err(error)
+                    if matches!(
+                        error.code.as_str(),
+                        "STORE_ERROR" | "STORE_CLOSED" | "IO_ERROR" | "CLOCK_ERROR"
+                    ) =>
+                {
+                    return Err(error);
+                }
+                Err(error) => {
+                    // This validation precedes the ordinary dispatch guard.
+                    // Retain a deterministic rejection instead of rolling back
+                    // to queued work that the executor silently retries forever.
+                    let now = model::now_ms()?;
+                    let safe_error = Error::new(
+                        error.code,
+                        "opening launch validation failed before dispatch",
+                    );
+                    let changed = tx.execute(
+                        "UPDATE operations SET state='rejected',result_json=?2,settled_at_ms=?3,updated_at_ms=?3 WHERE operation_id=?1 AND state='queued'",
+                        params![op, model::canonical(&json!(safe_error))?, now],
+                    )?;
+                    if changed != 1 {
+                        return Err(Error::conflict(
+                            "opening operation changed before validation rejection",
+                        ));
+                    }
+                    operations::record_owned_open_dispatch_failure(
+                        &tx,
+                        &id,
+                        generation,
+                        "opening_actor_validate",
+                        "rejected_before_dispatch",
+                        &safe_error.code,
+                        "rejected",
+                    )?;
+                    tx.commit()?;
+                    return Ok(json!({
+                        "command":null,
+                        "rejected_operation_id":op,
+                        "error":safe_error
+                    }));
+                }
+            }
         } else {
             None
         };

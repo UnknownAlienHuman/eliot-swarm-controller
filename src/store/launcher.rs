@@ -5405,6 +5405,8 @@ fn manager_exceptions_page(
         response["host_lifecycle"] = super::host_lifecycle::status(db)?;
         response["manager_action_required"] =
             super::operations::owned_service_start_failure_actions(db)?;
+        response["runtime_dispatch_action_required"] =
+            super::operations::owned_service_dispatch_failure_actions(db)?;
     }
     Ok(response)
 }

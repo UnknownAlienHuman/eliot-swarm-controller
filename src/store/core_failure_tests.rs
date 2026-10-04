@@ -11,6 +11,7 @@ const BINDING_ID: &str = "binding-owned-service-failure";
 const LAUNCH_OPERATION_ID: &str = "launch-owned-service-failure";
 const OPEN_OPERATION_ID: &str = "open-owned-service-failure";
 const DIAGNOSTIC_MARKER: &str = "DO_NOT_EXPOSE_CORRUPT_DIAGNOSTIC_MARKER";
+const PRIVATE_SERVICE_PROOF_MARKER: &str = "DO_NOT_EXPOSE_OWNED_SERVICE_PROOF_MARKER";
 
 struct Fixture {
     db: Connection,
@@ -254,6 +255,7 @@ fn assert_failure_visible_through_store_reads(fixture: &Fixture, caller: Princip
         json!({"operation_id":LAUNCH_OPERATION_ID}),
     );
     assert_eq!(operation["result"], fixture.admission_result);
+    assert!(operation.get("runtime_dispatch_action_required").is_none());
     let operation_action = &operation["manager_action_required"];
     assert_failure_action(operation_action, fixture.observation_id);
 
@@ -276,6 +278,11 @@ fn assert_failure_visible_through_store_reads(fixture: &Fixture, caller: Princip
     assert_eq!(feed_items.len(), 1);
     assert_failure_action(&feed_items[0], fixture.observation_id);
     assert_eq!(&feed_items[0], operation_action);
+    let dispatch_feed = &exceptions["runtime_dispatch_action_required"];
+    assert_eq!(dispatch_feed["status"], "clear");
+    assert_eq!(dispatch_feed["total_items"], 0);
+    assert_eq!(dispatch_feed["returned_items"], 0);
+    assert!(dispatch_feed["items"].as_array().unwrap().is_empty());
 }
 
 fn stored_admission_result(db: &Connection) -> String {
@@ -338,6 +345,385 @@ fn successor_gm_keeps_failure_readback_while_former_gm_loses_action_authority() 
     );
     assert!(former_exceptions.get("manager_action_required").is_none());
     assert!(former_exceptions.get("host_lifecycle").is_none());
+    assert_eq!(stored_admission_result(&fixture.db), original_receipt);
+}
+
+fn prepare_queued_owned_open_dispatch_failure(fixture: &mut Fixture) {
+    let manifest = json!({
+        "launch_manifest":{
+            "state":"awaiting_capability",
+            "binding":{
+                "operation_id":OPEN_OPERATION_ID,
+                "binding_id":BINDING_ID,
+                "generation":1,
+            },
+            "task":{
+                "task_id":TASK_ID,
+                "observed_revision":1,
+                "attempt_id":ATTEMPT_ID,
+                "attempt_action":"use_existing",
+            },
+        }
+    });
+    let route = json!({
+        "alias":"failure-opencode",
+        "runtime":"opencode_v2",
+        "native_options":{"service_id":"opencode","model":{"id":"hosted/model","providerID":"opencode-go"}},
+        "owned_service":{"service_id":"opencode","service_version":"2.0.7"},
+    });
+    let birth_token = "b".repeat(64);
+    let executable_sha256 = "d".repeat(64);
+    let proof = json!({
+        "schema_version":1,
+        "status":"ready",
+        "process":{
+            "pid":43210,
+            "birth_token":birth_token,
+            "binary_sha256":executable_sha256,
+        },
+        "private_marker":PRIVATE_SERVICE_PROOF_MARKER,
+    });
+    fixture
+        .db
+        .execute(
+            "UPDATE owned_service_starts
+             SET state='service_observed',process_id=43210,process_birth_token=?1,
+                 executable_sha256=?2,proof_json=?3,updated_at_ms=3
+             WHERE launch_operation_id=?4",
+            params![
+                birth_token,
+                executable_sha256,
+                model::canonical(&proof).unwrap(),
+                LAUNCH_OPERATION_ID,
+            ],
+        )
+        .unwrap();
+    fixture
+        .db
+        .execute(
+            "UPDATE bindings SET state='opening',route_json=?1,state_json='{}',
+                 native_root_id=NULL,native_scope_key=NULL,released_at_ms=NULL
+             WHERE binding_id=?2 AND generation=1",
+            params![model::canonical(&route).unwrap(), BINDING_ID],
+        )
+        .unwrap();
+    fixture
+        .db
+        .execute(
+            "UPDATE operations SET state='queued',effective_request_json=?1,due_at_ms=1,updated_at_ms=3
+             WHERE operation_id=?2",
+            params![model::canonical(&manifest).unwrap(), LAUNCH_OPERATION_ID],
+        )
+        .unwrap();
+    fixture
+        .db
+        .execute(
+            "UPDATE operations SET state='queued',due_at_ms=1,updated_at_ms=3
+             WHERE operation_id=?1",
+            [OPEN_OPERATION_ID],
+        )
+        .unwrap();
+}
+
+fn assert_dispatch_failure_action(action: &Value, observation_id: i64) {
+    assert_eq!(action["status"], "required");
+    assert_eq!(action["kind"], "owned_service_dispatch_failure");
+    assert_eq!(action["manager_actionable"], true);
+    assert_eq!(action["launch_operation_id"], LAUNCH_OPERATION_ID);
+    assert_eq!(action["open_operation_id"], OPEN_OPERATION_ID);
+    assert_eq!(action["binding_id"], BINDING_ID);
+    assert_eq!(action["binding_generation"], 1);
+    assert_eq!(action["task_id"], TASK_ID);
+    assert_eq!(action["attempt_id"], ATTEMPT_ID);
+    assert_eq!(action["failure_status"], "selection_error");
+    assert_eq!(action["stage"], "runtime_command_select");
+    assert_eq!(action["error_code"], "INVALID_PARAMS");
+    assert_eq!(action["dispatch_state"], "queued");
+    assert_eq!(action["native_effect"], "not_dispatched");
+    assert_eq!(action["retry_authorized"], false);
+    assert_eq!(
+        action["source_observation"]["observation_id"],
+        observation_id
+    );
+    assert_eq!(
+        action["source_observation"]["source_stream_id"],
+        "controller:owned-service"
+    );
+    assert_eq!(
+        action["source_observation"]["kind"],
+        "owned_service.dispatch_failure"
+    );
+}
+
+#[test]
+fn queued_open_selection_failure_is_deduplicated_and_survives_handover_and_departure() {
+    let mut fixture = fixture();
+    prepare_queued_owned_open_dispatch_failure(&mut fixture);
+    let original_receipt = stored_admission_result(&fixture.db);
+    assert_eq!(original_receipt, fixture.admission_result_json);
+
+    assert!(
+        super::operations::record_owned_open_dispatch_failure(
+            &fixture.db,
+            BINDING_ID,
+            1,
+            "runtime_command_select",
+            "selection_error",
+            "INVALID_PARAMS",
+            "queued",
+        )
+        .unwrap()
+    );
+    assert!(
+        !super::operations::record_owned_open_dispatch_failure(
+            &fixture.db,
+            BINDING_ID,
+            1,
+            "runtime_command_select",
+            "selection_error",
+            "INVALID_PARAMS",
+            "queued",
+        )
+        .unwrap()
+    );
+
+    let event_key = format!("owned-service-dispatch-failure:{LAUNCH_OPERATION_ID}");
+    let (source_stream, operation_id, binding_id, generation, kind, payload_json): (
+        String,
+        String,
+        String,
+        i64,
+        String,
+        String,
+    ) = fixture
+        .db
+        .query_row(
+            "SELECT source_stream_id,operation_id,binding_id,binding_generation,kind,payload_json
+             FROM observations WHERE source_event_key=?1",
+            [&event_key],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(source_stream, "controller:owned-service");
+    assert_eq!(operation_id, LAUNCH_OPERATION_ID);
+    assert_eq!(binding_id, BINDING_ID);
+    assert_eq!(generation, 1);
+    assert_eq!(kind, "owned_service.dispatch_failure");
+    let payload: Value = serde_json::from_str(&payload_json).unwrap();
+    assert_eq!(payload.as_object().unwrap().len(), 6);
+    assert_eq!(payload["schema_version"], 1);
+    assert_eq!(payload["status"], "selection_error");
+    assert_eq!(payload["stage"], "runtime_command_select");
+    assert_eq!(payload["error_code"], "INVALID_PARAMS");
+    assert_eq!(payload["native_effect"], "not_dispatched");
+    assert_eq!(payload["retry_authorized"], false);
+    let observation_id: i64 = fixture
+        .db
+        .query_row(
+            "SELECT observation_id FROM observations WHERE source_event_key=?1",
+            [&event_key],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let observation_count: i64 = fixture
+        .db
+        .query_row(
+            "SELECT count(*) FROM observations WHERE source_event_key=?1",
+            [&event_key],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(observation_count, 1);
+
+    let manager = principal(ORIGINAL_GM, Role::Manager);
+    let operation = store_read(
+        &fixture.db,
+        manager.clone(),
+        "operation.get",
+        json!({"operation_id":LAUNCH_OPERATION_ID}),
+    );
+    assert_eq!(operation["result"], fixture.admission_result);
+    let operation_action = &operation["runtime_dispatch_action_required"];
+    assert_dispatch_failure_action(operation_action, observation_id);
+    let exceptions = store_read(
+        &fixture.db,
+        manager,
+        "swarm.exceptions.get",
+        json!({"after":0,"limit":32}),
+    );
+    let exception_feed = &exceptions["runtime_dispatch_action_required"];
+    assert_eq!(exception_feed["status"], "required");
+    assert_eq!(exception_feed["total_items"], 1);
+    assert_eq!(exception_feed["returned_items"], 1);
+    assert_eq!(exception_feed["items"].as_array().unwrap().len(), 1);
+    let exception_action = &exception_feed["items"][0];
+    assert_dispatch_failure_action(exception_action, observation_id);
+    assert_eq!(exception_action, operation_action);
+    assert!(
+        !serde_json::to_string(&(&operation, &exceptions))
+            .unwrap()
+            .contains(PRIVATE_SERVICE_PROOF_MARKER)
+    );
+
+    handover_to_successor(&mut fixture);
+    let successor = principal(SUCCESSOR_GM, Role::Manager);
+    let successor_operation = store_read(
+        &fixture.db,
+        successor.clone(),
+        "operation.get",
+        json!({"operation_id":LAUNCH_OPERATION_ID}),
+    );
+    assert_eq!(successor_operation["result"], fixture.admission_result);
+    let successor_action = &successor_operation["runtime_dispatch_action_required"];
+    assert_dispatch_failure_action(successor_action, observation_id);
+    assert_eq!(successor_action, operation_action);
+    let former_operation = store_read(
+        &fixture.db,
+        principal(ORIGINAL_GM, Role::Manager),
+        "operation.get",
+        json!({"operation_id":LAUNCH_OPERATION_ID}),
+    );
+    assert_eq!(former_operation["result"], fixture.admission_result);
+    assert!(
+        former_operation
+            .get("runtime_dispatch_action_required")
+            .is_none()
+    );
+    let former_exceptions = store_read(
+        &fixture.db,
+        principal(ORIGINAL_GM, Role::Manager),
+        "swarm.exceptions.get",
+        json!({"after":0,"limit":32}),
+    );
+    assert!(
+        former_exceptions
+            .get("runtime_dispatch_action_required")
+            .is_none()
+    );
+
+    fixture
+        .db
+        .execute(
+            "UPDATE owned_service_starts SET state='service_departed',updated_at_ms=4
+             WHERE launch_operation_id=?1",
+            [LAUNCH_OPERATION_ID],
+        )
+        .unwrap();
+    fixture
+        .db
+        .execute(
+            "UPDATE operations SET state='rejected',settled_at_ms=4,updated_at_ms=4 WHERE operation_id=?1",
+            [LAUNCH_OPERATION_ID],
+        )
+        .unwrap();
+    let departed_operation = store_read(
+        &fixture.db,
+        successor.clone(),
+        "operation.get",
+        json!({"operation_id":LAUNCH_OPERATION_ID}),
+    );
+    assert_eq!(departed_operation["result"], fixture.admission_result);
+    assert_eq!(departed_operation["state"], "rejected");
+    let departed_action = &departed_operation["runtime_dispatch_action_required"];
+    assert_dispatch_failure_action(departed_action, observation_id);
+    let departed_exceptions = store_read(
+        &fixture.db,
+        successor,
+        "swarm.exceptions.get",
+        json!({"after":0,"limit":32}),
+    );
+    let departed_feed = &departed_exceptions["runtime_dispatch_action_required"];
+    assert_eq!(departed_feed["total_items"], 1);
+    assert_eq!(&departed_feed["items"][0], departed_action);
+    assert!(
+        !serde_json::to_string(&(&departed_operation, &departed_exceptions))
+            .unwrap()
+            .contains(PRIVATE_SERVICE_PROOF_MARKER)
+    );
+
+    let rejected_result = json!({"code":"INVALID_PARAMS","message":"safe selector rejection"});
+    fixture
+        .db
+        .execute(
+            "UPDATE operations SET state='rejected',sent_at_ms=5,settled_at_ms=5,result_json=?1,updated_at_ms=5
+             WHERE operation_id=?2",
+            params![
+                model::canonical(&rejected_result).unwrap(),
+                OPEN_OPERATION_ID,
+            ],
+        )
+        .unwrap();
+    let sent_rejection = store_read(
+        &fixture.db,
+        principal(SUCCESSOR_GM, Role::Manager),
+        "operation.get",
+        json!({"operation_id":LAUNCH_OPERATION_ID}),
+    );
+    let uncertain_action = &sent_rejection["runtime_dispatch_action_required"];
+    assert_eq!(uncertain_action["dispatch_state"], "rejected");
+    assert_eq!(uncertain_action["error_code"], "INVALID_PARAMS");
+    assert_eq!(uncertain_action["native_effect"], "unknown");
+    assert_eq!(uncertain_action["retry_authorized"], false);
+    let uncertain_exceptions = store_read(
+        &fixture.db,
+        principal(SUCCESSOR_GM, Role::Manager),
+        "swarm.exceptions.get",
+        json!({"after":0,"limit":32}),
+    );
+    assert_eq!(
+        &uncertain_exceptions["runtime_dispatch_action_required"]["items"][0],
+        uncertain_action
+    );
+
+    fixture
+        .db
+        .execute(
+            "UPDATE operations SET state='settled',settled_at_ms=6,updated_at_ms=6
+             WHERE operation_id=?1",
+            [OPEN_OPERATION_ID],
+        )
+        .unwrap();
+    let settled = store_read(
+        &fixture.db,
+        principal(SUCCESSOR_GM, Role::Manager),
+        "operation.get",
+        json!({"operation_id":LAUNCH_OPERATION_ID}),
+    );
+    assert!(settled.get("runtime_dispatch_action_required").is_none());
+    let settled_exceptions = store_read(
+        &fixture.db,
+        principal(SUCCESSOR_GM, Role::Manager),
+        "swarm.exceptions.get",
+        json!({"after":0,"limit":32}),
+    );
+    assert_eq!(
+        settled_exceptions["runtime_dispatch_action_required"]["total_items"],
+        0
+    );
+    assert!(
+        settled_exceptions["runtime_dispatch_action_required"]["items"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let retained_event_count: i64 = fixture
+        .db
+        .query_row(
+            "SELECT count(*) FROM observations WHERE source_event_key=?1",
+            [&event_key],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(retained_event_count, 1);
     assert_eq!(stored_admission_result(&fixture.db), original_receipt);
 }
 

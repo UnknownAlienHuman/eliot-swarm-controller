@@ -9,6 +9,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
 
 const MAX_OWNED_SERVICE_START_FAILURE_BYTES: usize = 1024;
+const MAX_OWNED_SERVICE_DISPATCH_FAILURE_BYTES: usize = 1024;
 const MAX_MANAGER_ACTION_REQUIRED_ITEMS: i64 = 32;
 const START_FAILURE_V1_KEYS: [&str; 5] = [
     "schema_version",
@@ -25,6 +26,14 @@ const START_FAILURE_V2_KEYS: [&str; 7] = [
     "native_effect",
     "request_phase",
     "http_status",
+];
+const DISPATCH_FAILURE_KEYS: [&str; 6] = [
+    "schema_version",
+    "status",
+    "stage",
+    "error_code",
+    "native_effect",
+    "retry_authorized",
 ];
 
 pub(super) fn get_operation(db: &Connection, id: &str) -> Result<Value> {
@@ -50,7 +59,123 @@ pub(super) fn get_operation_for_current_manager(
     {
         operation["manager_action_required"] = action;
     }
+    if matches!(p.role, Role::Manager | Role::Operator)
+        && super::gm::require_authority(db, p).is_ok()
+        && super::operation_visible_to(db, p, id)?
+        && let Some(action) = owned_service_dispatch_action_for_operation(db, id)?
+    {
+        operation["runtime_dispatch_action_required"] = action;
+    }
     Ok(operation)
+}
+
+/// Retain only the safe code and closed stage for a failure selecting an
+/// already-observed owned service's exact queued `agent.open`. The INSERT is
+/// one statement so the binding, start proof, launch manifest and Operation
+/// tuple are checked atomically with the durable observation.
+pub(super) fn record_owned_open_dispatch_failure(
+    db: &Connection,
+    binding_id: &str,
+    generation: i64,
+    stage: &str,
+    status: &str,
+    error_code: &str,
+    expected_open_state: &str,
+) -> Result<bool> {
+    let valid_case = matches!(
+        (stage, status, expected_open_state),
+        ("runtime_command_select", "selection_error", "queued")
+            | (
+                "opening_actor_validate",
+                "rejected_before_dispatch",
+                "rejected"
+            )
+    );
+    if !valid_case || !safe_start_failure_error_code(error_code) {
+        return Ok(false);
+    }
+    let payload = model::canonical(&json!({
+        "schema_version":1,
+        "status":status,
+        "stage":stage,
+        "error_code":error_code,
+        "native_effect":"not_dispatched",
+        "retry_authorized":false,
+    }))?;
+    if payload.len() > MAX_OWNED_SERVICE_DISPATCH_FAILURE_BYTES {
+        return Ok(false);
+    }
+    let now = model::now_ms()?;
+    let inserted = db.execute(
+        "INSERT OR IGNORE INTO observations(
+             source_stream_id,source_event_key,binding_id,binding_generation,
+             operation_id,kind,payload_json,recorded_at_ms
+         )
+         SELECT 'controller:owned-service',
+                'owned-service-dispatch-failure:' || start.launch_operation_id,
+                start.binding_id,start.binding_generation,start.launch_operation_id,
+                'owned_service.dispatch_failure',?4,?5
+         FROM owned_service_starts AS start
+         JOIN operations AS launch ON launch.operation_id=start.launch_operation_id
+         JOIN operations AS opened ON opened.operation_id=start.open_operation_id
+         JOIN bindings AS binding
+           ON binding.binding_id=start.binding_id
+          AND binding.generation=start.binding_generation
+         WHERE start.binding_id=?1 AND start.binding_generation=?2
+           AND start.state IN ('service_observed','service_departed')
+           AND start.process_id IS NOT NULL
+           AND start.process_birth_token IS NOT NULL
+           AND length(start.process_birth_token)>0
+           AND start.executable_sha256 IS NOT NULL
+           AND length(start.executable_sha256)=64
+           AND start.proof_json<>'{}' AND length(start.proof_json)<=8192
+           AND launch.method='swarm.launch'
+           AND opened.method='agent.open'
+           AND opened.state=?3
+           AND opened.due_at_ms<=?5
+           AND opened.sent_at_ms IS NULL
+           AND opened.binding_id=start.binding_id
+           AND opened.binding_generation=start.binding_generation
+           AND opened.prerequisite_operation_id=launch.operation_id
+           AND opened.caller_id=launch.caller_id
+           AND opened.task_id=start.task_id AND launch.task_id=start.task_id
+           AND opened.attempt_id=start.attempt_id AND launch.attempt_id=start.attempt_id
+           AND json_extract(launch.effective_request_json,'$.launch_manifest.binding.operation_id')=opened.operation_id
+           AND json_extract(launch.effective_request_json,'$.launch_manifest.binding.binding_id')=start.binding_id
+           AND json_extract(launch.effective_request_json,'$.launch_manifest.binding.generation')=start.binding_generation
+           AND json_extract(launch.effective_request_json,'$.launch_manifest.task.task_id')=start.task_id
+           AND json_extract(launch.effective_request_json,'$.launch_manifest.task.attempt_id')=start.attempt_id
+           AND binding.released_at_ms IS NULL
+           AND binding.state='opening'
+           AND binding.native_root_id IS NULL
+           AND binding.native_scope_key IS NULL
+           AND json_extract(binding.route_json,'$.runtime')='opencode_v2'
+           AND json_type(binding.route_json,'$.owned_service')='object'
+           AND json_extract((SELECT value_json FROM meta WHERE key='execution_mode'),'$.new_work')='enabled'
+           AND (?3<>'rejected' OR json_extract(opened.result_json,'$.code')=?6)
+           AND (?3<>'queued' OR (
+               COALESCE(json_extract(binding.state_json,'$.recovery_required'),0)=0
+               AND (SELECT count(*) FROM operations AS candidate
+                    WHERE candidate.binding_id=start.binding_id
+                      AND candidate.binding_generation=start.binding_generation
+                      AND candidate.state='queued' AND candidate.due_at_ms<=?5
+                      AND (COALESCE(json_extract(binding.state_json,'$.recovery_required'),0)=0
+                           OR candidate.method IN ('agent.recover','agent.reconcile'))
+                      AND candidate.method IN ('agent.open','task.dispatch','agent.send','agent.reply','agent.configure','agent.goal','agent.background','agent.refresh','agent.reconcile','agent.result','agent.recover')
+                      AND (candidate.method IN ('agent.reply','agent.background','agent.refresh','agent.reconcile','agent.result','agent.recover')
+                           OR (candidate.method='agent.send' AND json_extract(candidate.original_request_json,'$.delivery')='steer')
+                           OR (candidate.method='agent.goal' AND json_extract(candidate.original_request_json,'$.action') IN ('pause','clear'))
+                           OR NOT EXISTS (
+                               SELECT 1 FROM operations AS pending
+                               WHERE pending.binding_id=candidate.binding_id
+                                 AND pending.binding_generation=candidate.binding_generation
+                                 AND pending.state IN ('sending','native_accepted','outcome_unknown')
+                                 AND pending.method IN ('agent.open','task.dispatch','agent.send','agent.configure','agent.goal','agent.recover')
+                           )))=1
+           ))",
+        params![binding_id, generation, expected_open_state, payload, now, error_code],
+    )?;
+    Ok(inserted == 1)
 }
 
 /// A startup rejection remains an unknown native effect until exact readback.
@@ -84,7 +209,7 @@ fn owned_service_start_action_for_operation_inner(
         "SELECT launch_operation_id,open_operation_id,binding_id,binding_generation,
                 task_id,attempt_id,state,process_id,process_birth_token,executable_sha256,proof_json
          FROM owned_service_starts
-         WHERE launch_operation_id=?1 OR open_operation_id=?1
+         WHERE (launch_operation_id=?1 OR open_operation_id=?1)
          ORDER BY launch_operation_id LIMIT 2",
     )?;
     let rows = statement
@@ -410,6 +535,394 @@ fn owned_service_start_diagnostic_gap(operation_id: &str, error_code: &str) -> V
             "Keep the native effect unknown until process or no-effect readback resolves it.",
         ],
     })
+}
+
+/// Current-manager readback for an exact owned-service open that failed before
+/// `agent.open` crossed the durable dispatch boundary. The original Operation
+/// receipt is never rewritten by this diagnostic.
+fn owned_service_dispatch_action_for_operation(
+    db: &Connection,
+    operation_id: &str,
+) -> Result<Option<Value>> {
+    match owned_service_dispatch_action_for_operation_inner(db, operation_id) {
+        Err(error)
+            if matches!(
+                error.code.as_str(),
+                "OWNED_SERVICE_LINK_CORRUPT" | "OWNED_SERVICE_DISPATCH_DIAGNOSTIC_CORRUPT"
+            ) =>
+        {
+            Ok(Some(owned_service_dispatch_diagnostic_gap(
+                operation_id,
+                &error.code,
+            )))
+        }
+        result => result,
+    }
+}
+
+fn owned_service_dispatch_action_for_operation_inner(
+    db: &Connection,
+    operation_id: &str,
+) -> Result<Option<Value>> {
+    let mut statement = db.prepare(
+        "SELECT launch_operation_id,open_operation_id,binding_id,binding_generation,
+                task_id,attempt_id,state,process_id,process_birth_token,executable_sha256,
+                length(proof_json)
+         FROM owned_service_starts
+         WHERE (launch_operation_id=?1 OR open_operation_id=?1)
+           AND EXISTS(
+               SELECT 1 FROM observations AS diagnostic
+               WHERE diagnostic.source_event_key='owned-service-dispatch-failure:' || launch_operation_id
+                  OR (diagnostic.operation_id=launch_operation_id
+                      AND diagnostic.kind='owned_service.dispatch_failure')
+           )
+         ORDER BY launch_operation_id LIMIT 2",
+    )?;
+    let rows = statement
+        .query_map([operation_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<i64>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, i64>(10)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if rows.len() > 1 {
+        return Err(owned_service_link_corrupt());
+    }
+    let Some((
+        launch_operation_id,
+        open_operation_id,
+        binding_id,
+        binding_generation,
+        task_id,
+        attempt_id,
+        start_state,
+        process_id,
+        process_birth_token,
+        executable_sha256,
+        proof_bytes,
+    )) = rows.into_iter().next()
+    else {
+        return Ok(None);
+    };
+    if !matches!(
+        start_state.as_str(),
+        "service_observed" | "service_departed"
+    ) || process_id.is_none_or(|pid| pid <= 0)
+        || process_birth_token
+            .as_deref()
+            .is_none_or(|token| token.is_empty() || token.len() > 256)
+        || executable_sha256
+            .as_deref()
+            .is_none_or(|digest| !safe_sha256(digest))
+        || !(3..=8192).contains(&proof_bytes)
+        || binding_generation <= 0
+        || [
+            launch_operation_id.as_str(),
+            open_operation_id.as_str(),
+            binding_id.as_str(),
+            task_id.as_str(),
+            attempt_id.as_str(),
+        ]
+        .iter()
+        .any(|value| !safe_store_identifier(value))
+    {
+        return Err(owned_service_dispatch_diagnostic_corrupt());
+    }
+
+    let link_valid: bool = db.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM operations AS launch
+             JOIN operations AS opened ON opened.operation_id=?2
+             JOIN bindings AS binding
+               ON binding.binding_id=?5 AND binding.generation=?6
+             WHERE launch.operation_id=?1
+               AND launch.method='swarm.launch'
+               AND opened.method='agent.open'
+               AND opened.state IN ('queued','rejected','sending','native_accepted','outcome_unknown','settled','cancelled')
+               AND launch.task_id=?3 AND launch.attempt_id=?4
+               AND opened.task_id=?3 AND opened.attempt_id=?4
+               AND opened.caller_id=launch.caller_id
+               AND opened.binding_id=?5 AND opened.binding_generation=?6
+               AND opened.prerequisite_operation_id=launch.operation_id
+               AND json_extract(launch.effective_request_json,'$.launch_manifest.binding.operation_id')=opened.operation_id
+               AND json_extract(launch.effective_request_json,'$.launch_manifest.binding.binding_id')=?5
+               AND json_extract(launch.effective_request_json,'$.launch_manifest.binding.generation')=?6
+               AND json_extract(launch.effective_request_json,'$.launch_manifest.task.task_id')=?3
+               AND json_extract(launch.effective_request_json,'$.launch_manifest.task.attempt_id')=?4
+         )",
+        params![
+            launch_operation_id,
+            open_operation_id,
+            task_id,
+            attempt_id,
+            binding_id,
+            binding_generation
+        ],
+        |row| row.get(0),
+    )?;
+    if !link_valid {
+        return Err(owned_service_link_corrupt());
+    }
+
+    let event_key = format!("owned-service-dispatch-failure:{launch_operation_id}");
+    let mut statement = db.prepare(
+        "SELECT observation_id,source_stream_id,source_event_key,operation_id,binding_id,
+                binding_generation,kind,
+                substr(CAST(payload_json AS BLOB),1,?1)
+         FROM observations
+         WHERE source_event_key=?2
+            OR (operation_id=?3 AND kind='owned_service.dispatch_failure')
+         ORDER BY observation_id LIMIT 2",
+    )?;
+    let rows = statement
+        .query_map(
+            params![
+                (MAX_OWNED_SERVICE_DISPATCH_FAILURE_BYTES + 1) as i64,
+                event_key,
+                launch_operation_id
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Vec<u8>>(7)?,
+                ))
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if rows.len() > 1 {
+        return Err(owned_service_dispatch_diagnostic_corrupt());
+    }
+    let Some((
+        observation_id,
+        source_stream_id,
+        source_event_key,
+        diagnostic_operation_id,
+        diagnostic_binding_id,
+        diagnostic_binding_generation,
+        kind,
+        payload_bytes,
+    )) = rows.into_iter().next()
+    else {
+        return Ok(None);
+    };
+    if observation_id <= 0
+        || source_stream_id != "controller:owned-service"
+        || source_event_key != event_key
+        || diagnostic_operation_id != launch_operation_id
+        || diagnostic_binding_id != binding_id
+        || diagnostic_binding_generation != binding_generation
+        || kind != "owned_service.dispatch_failure"
+        || payload_bytes.len() > MAX_OWNED_SERVICE_DISPATCH_FAILURE_BYTES
+    {
+        return Err(owned_service_dispatch_diagnostic_corrupt());
+    }
+    let payload_text = std::str::from_utf8(&payload_bytes)
+        .map_err(|_| owned_service_dispatch_diagnostic_corrupt())?;
+    let payload: Value = serde_json::from_str(payload_text)
+        .map_err(|_| owned_service_dispatch_diagnostic_corrupt())?;
+    let diagnostic = validate_owned_service_dispatch_failure(&payload)?;
+
+    let (current_state, current_error_code, sent_at_ms): (String, Option<String>, Option<i64>) = db
+        .query_row(
+            "SELECT state,json_extract(result_json,'$.code'),sent_at_ms
+         FROM operations WHERE operation_id=?1 AND method='agent.open'",
+            [&open_operation_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+    if matches!(current_state.as_str(), "settled" | "cancelled") {
+        return Ok(None);
+    }
+    let rejected_before_dispatch = current_state == "rejected"
+        && diagnostic["status"] == "rejected_before_dispatch"
+        && current_error_code.as_deref() == diagnostic["error_code"].as_str();
+    let native_effect =
+        if sent_at_ms.is_none() && (current_state == "queued" || rejected_before_dispatch) {
+            "not_dispatched"
+        } else if matches!(
+            current_state.as_str(),
+            "queued" | "rejected" | "sending" | "native_accepted" | "outcome_unknown"
+        ) {
+            "unknown"
+        } else {
+            return Err(owned_service_link_corrupt());
+        };
+
+    Ok(Some(json!({
+        "status":"required",
+        "kind":"owned_service_dispatch_failure",
+        "manager_actionable":true,
+        "launch_operation_id":launch_operation_id,
+        "open_operation_id":open_operation_id,
+        "binding_id":binding_id,
+        "binding_generation":binding_generation,
+        "task_id":task_id,
+        "attempt_id":attempt_id,
+        "failure_status":diagnostic["status"],
+        "stage":diagnostic["stage"],
+        "error_code":diagnostic["error_code"],
+        "dispatch_state":current_state,
+        "native_effect":native_effect,
+        "retry_authorized":false,
+        "source_observation":{
+            "observation_id":observation_id,
+            "source_stream_id":"controller:owned-service",
+            "kind":"owned_service.dispatch_failure",
+        },
+        "next_readback":{
+            "method":"operation.get",
+            "params":{"operation_id":launch_operation_id},
+        },
+        "actions":[
+            "Read the exact linked launch, open Operation, and binding state before any retry.",
+            "Do not retry while dispatch state is sending or its native effect remains unknown.",
+        ],
+    })))
+}
+
+fn validate_owned_service_dispatch_failure(payload: &Value) -> Result<Value> {
+    let object = payload
+        .as_object()
+        .ok_or_else(owned_service_dispatch_diagnostic_corrupt)?;
+    if object.len() != DISPATCH_FAILURE_KEYS.len()
+        || DISPATCH_FAILURE_KEYS
+            .iter()
+            .any(|key| !object.contains_key(*key))
+        || payload["schema_version"].as_i64() != Some(1)
+        || payload["native_effect"] != "not_dispatched"
+        || payload["retry_authorized"] != false
+    {
+        return Err(owned_service_dispatch_diagnostic_corrupt());
+    }
+    let status = payload["status"].as_str().unwrap_or_default();
+    let stage = payload["stage"].as_str().unwrap_or_default();
+    let valid_pair = matches!(
+        (status, stage),
+        ("selection_error", "runtime_command_select")
+            | ("rejected_before_dispatch", "opening_actor_validate")
+    );
+    let error_code = payload["error_code"].as_str().unwrap_or_default();
+    if !valid_pair || !safe_start_failure_error_code(error_code) {
+        return Err(owned_service_dispatch_diagnostic_corrupt());
+    }
+    Ok(json!({
+        "status":status,
+        "stage":stage,
+        "error_code":error_code,
+    }))
+}
+
+fn safe_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn owned_service_dispatch_diagnostic_corrupt() -> Error {
+    Error::new(
+        "OWNED_SERVICE_DISPATCH_DIAGNOSTIC_CORRUPT",
+        "owned service dispatch diagnostic is invalid",
+    )
+}
+
+fn owned_service_dispatch_diagnostic_gap(operation_id: &str, error_code: &str) -> Value {
+    json!({
+        "status":"readback_required",
+        "kind":"owned_service_dispatch_diagnostic_gap",
+        "manager_actionable":true,
+        "source_operation_id":if safe_store_identifier(operation_id) {
+            Value::String(operation_id.to_owned())
+        } else {
+            Value::Null
+        },
+        "error_code":error_code,
+        "native_effect":"unknown",
+        "retry_authorized":false,
+        "next_readback":if safe_store_identifier(operation_id) {
+            json!({"method":"operation.get","params":{"operation_id":operation_id}})
+        } else {
+            Value::Null
+        },
+        "actions":[
+            "Have the local Operator inspect the exact owned-service record before any retry.",
+            "Keep the native effect unknown until exact Operation and process readback resolves it.",
+        ],
+    })
+}
+
+/// Bounded current-manager attention feed for linked owned-service dispatch
+/// failures. It remains available after the parent launch settles or the
+/// observed helper process departs, while a queued/rejected/unknown open still
+/// needs readback.
+pub(super) fn owned_service_dispatch_failure_actions(db: &Connection) -> Result<Value> {
+    let total_items: i64 = db.query_row(
+        "SELECT count(*)
+         FROM owned_service_starts AS start
+         JOIN operations AS opened ON opened.operation_id=start.open_operation_id
+         WHERE opened.state IN ('queued','rejected','sending','native_accepted','outcome_unknown')
+           AND EXISTS(
+             SELECT 1 FROM observations AS diagnostic
+             WHERE diagnostic.source_event_key='owned-service-dispatch-failure:' || start.launch_operation_id
+                OR (diagnostic.operation_id=start.launch_operation_id
+                    AND diagnostic.kind='owned_service.dispatch_failure')
+           )",
+        [],
+        |row| row.get(0),
+    )?;
+    let launch_ids = {
+        let mut statement = db.prepare(
+            "SELECT start.launch_operation_id
+             FROM owned_service_starts AS start
+             JOIN operations AS opened ON opened.operation_id=start.open_operation_id
+             WHERE opened.state IN ('queued','rejected','sending','native_accepted','outcome_unknown')
+               AND EXISTS(
+                 SELECT 1 FROM observations AS diagnostic
+                 WHERE diagnostic.source_event_key='owned-service-dispatch-failure:' || start.launch_operation_id
+                    OR (diagnostic.operation_id=start.launch_operation_id
+                        AND diagnostic.kind='owned_service.dispatch_failure')
+               )
+             ORDER BY start.updated_at_ms DESC,start.launch_operation_id
+             LIMIT ?1",
+        )?;
+        let rows = statement.query_map([MAX_MANAGER_ACTION_REQUIRED_ITEMS], |row| {
+            row.get::<_, String>(0)
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut items = Vec::with_capacity(launch_ids.len());
+    for launch_operation_id in launch_ids {
+        if let Some(item) = owned_service_dispatch_action_for_operation(db, &launch_operation_id)? {
+            items.push(item);
+        }
+    }
+    let returned_items = items.len();
+    Ok(json!({
+        "status":if total_items == 0 {"clear"} else {"required"},
+        "items":items,
+        "total_items":total_items,
+        "returned_items":returned_items,
+        "has_more":total_items > MAX_MANAGER_ACTION_REQUIRED_ITEMS,
+        "limit":MAX_MANAGER_ACTION_REQUIRED_ITEMS,
+        "coverage":if total_items > MAX_MANAGER_ACTION_REQUIRED_ITEMS {
+            "latest_unresolved_owned_service_dispatch_failures_bounded"
+        } else {
+            "all_unresolved_owned_service_dispatch_failures"
+        },
+    }))
 }
 /// Bounded current-attention projection for the exact current GM. The stored
 /// Operation result remains unchanged; this links unresolved startup failures

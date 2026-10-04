@@ -2,36 +2,50 @@
 
 ## Current state
 
-The 2026-10-04 implementation increment prioritizes the controller core, startup
-reliability and manager-visible failure readback. Local Linux, WSL and all local
-model/inference work remain deferred. The source adds durable host lifecycle
-and interruption receipts, typed pre-dispatch IPC failures, current-GM startup
-failure projections, optional HookCommit intake, recoverable private hook
-issuance, a trusted-local script registry/worker, task-scoped Goal reminders,
-and an optional GitHub Issue/work-pool source. Its final warnings-denied
-production Clippy, package formatting and debug build passed with unchanged
-source. The complete library run passed 245 of 246 tests; its remaining
-projection fixture lacked a registered local Operator. After correcting that
-test fixture, all six projection tests passed. The real-process host-recovery
-and Windows owned-probe integrations also passed. No assertion or timeout was
-weakened. These results establish the core qualification boundary; they do
-not qualify hosted-model execution or every new optional program.
+The runtime admission increment now retains a separate bounded
+`runtime_dispatch_action_required` diagnostic for the exact launch/open pair.
+Deterministic opening-actor validation failures settle the queued operation as
+rejected before dispatch; infrastructure errors remain errors. Current-GM
+readback survives handover, parent rejection and service departure, preserves
+the launch admission receipt, and keeps post-send outcomes unknown.
 
-The new core checks cover malformed/mismatched IPC replies and authentication
-handshakes, writer failure with admitted work draining, safe recovery of a
-damaged lifecycle record, manager-visible owned-service startup errors,
-successor-GM readback, and a real host crash/restart preserving Task,
-Operation and logical-request deduplication. A later graceful exit retains
-the earlier interruption diagnosis. MCP subscription recovery now retries
-readback at its retained cursor after a shared-client cancellation; GM
-transfer preserves the legacy pending-ledger representation.
+Windows production Clippy with warnings denied, two runtime admission tests,
+four public Store failure/readback tests, formatting and debug build passed on
+2026-10-04. Production stayed unchanged after Clippy; the final test/build gate
+retained unchanged source. The qualified debug candidate SHA-256 is
+`74B869D818794AEF3242C74863744212996C67A20E3846BBDADEA7B9FC928F9E`.
+Fresh C18 startup qualification remains pending; hosted-model execution and the
+full native delivery cycle remain unqualified.
 
-The qualified debug candidate has SHA-256
-`D2C2979E1414871DB3D475580147C25CA473E2223A61C3B99DBF6CA2A8B39B68`.
-The installed binary below does not contain this increment. See
-[host recovery](host-recovery.md) for the
-failure/readback contract. Script controller API grants, Goal-driven
-progression and the remaining GitHub integrations are still outstanding.
+The previous core increment is `3c1a93b476fc31a4d60345fcac627291e9fe4e54`.
+Full Windows and Ubuntu CI for that source
+[37208920531](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37208920531)
+completed successfully, verified on 2026-10-04. The Windows debug candidate
+used by C17 has SHA-256
+`D2C2979E1414871DB3D475580147C25CA473E2223A61C3B99DBF6CA2A8B39B68` and was
+qualified from source `be2054f`. The installed controller remains
+`7061e455f04a76bfaa19699edba7f58c14a27748`; it does not contain this source
+increment.
+
+C17 run `e126db26-c70d-4a93-9f37-15aca367ff29` ended with
+`OWNED_SERVICE_OR_NATIVE_PROOF_TIMEOUT` at `service_start`. Service observation
+and proof were recorded and binding opening was reached, but `agent.open`
+remained queued and was never admitted. No model call occurred. The exact
+underlying failure reason is unproven; the new admission diagnostic replaces
+silently discarded selector errors. Preserve this run without replay. Local Linux, WSL and all local
+model/inference work remain deferred.
+
+The source includes durable host lifecycle and interruption receipts, typed
+pre-dispatch IPC failures, current-GM startup failure projections, bounded
+HookCommit intake and private hook issuance, an immutable script bundle
+registry and owned-process runner, task-scoped Goal reminders, and GitHub
+Issue intake/work-pool handling. The script registry and direct run/readback
+path exist; scoped script controller API grants/triggers and full native
+qualification remain incomplete. Goal-driven progression and broader GitHub
+effect integrations also remain incomplete. See [host recovery](host-recovery.md)
+for the failure/readback contract. Earlier checkpoints below are retained as
+dated historical evidence; this current summary supersedes their older source,
+gate and native-run state.
 
 The previous delivered and installed source is
 `7061e455f04a76bfaa19699edba7f58c14a27748`.
@@ -258,8 +272,9 @@ controller never retained a ready/native MCP proof and the harness timed out at
 `service_start`. The Operation remains unknown and is retained without replay.
 The source review found that parent-side startup errors lost their stage before
 normal helper EOF cleanup. The next increment retains a bounded stage/code
-observation before that cleanup; C16 will check its actual native result. The
-historical C15 cause remains unknown. No model request was made. All six protected
+observation before that cleanup. At this historical checkpoint, C16 was expected
+to check the change; the subsequent C17 result is summarized in Current State.
+The historical C15 cause remains unknown. No model request was made. All six protected
 Codex processes retained their birth identities.
 
 ### Prior C7/C8 evidence
@@ -299,23 +314,27 @@ and qualification follow it.
    metadata only, not key validity or model consumption. Earlier failed runs produced no new credential observation. Native plugin loading, callable tools and provider/model capability remain unqualified; current native evidence is in Current State above.
 6. **O4 Git/GitHub intake, work pools and distribution — Partial.** Local
    non-force Git ref publication exists as a first slice, with live Git/remote
-   qualification pending. GitHub reconciliation, source-to-Task mapping, pool
-   distribution, PR/check effects and shared bounded Git-scope inspection
+   qualification pending. GitHub Issue GET intake/reconciliation and work-pool
+   handling exist. Broader GitHub write effects, PR/check effects and shared
+   bounded Git-scope inspection remain.
+
+7. **O5 Rust hook observation — Partial.** Authenticated bounded HookCommit
+   intake and private hook issuance/install/readback exist in source. Runtime
+   integration and end-to-end native qualification remain.
+
+8. **O6 optional script bundles and runner — Partial.** Immutable bundle
+   registration/revision, interpreter capture, activation, direct authorized
+   run, owned-process handling, bounded output and durable readback exist.
+   Scoped script-controller API grants/triggers and full native qualification
    remain.
-
-7. **O5 Rust hook observation — Unimplemented.** Authenticated bounded hook
-   intake and safe install/readback need a specific runtime/plugin contract.
-
-8. **O6 optional script bundles and runner — Unimplemented.** A scoped bundle
-   registry, immutable environment capture, runner ownership, bounded output
-   and durable result readback are not present.
 
 9. **O8 cron/typed rules and O9 shared Goal progression — Partial.**
    Manager-owned calendar CheckRuns now share the legacy scheduler, entry
    enablement, durable occurrence identities, normal CheckRunner and explicit
    transfer/restart paths. The current source gates are recorded above.
    Typed event rules, the manual run-now editor and shared Goal progression
-   remain. OpenCode has a controller-recorded Goal with one activation;
+    remain. Task-scoped Goal reminders exist. OpenCode has a controller-recorded
+    Goal with one activation;
    native Goal APIs and shared manager-enabled progression remain incomplete.
 
 10. **O10 cross-contract parity and O11 integrated qualification — Partial /

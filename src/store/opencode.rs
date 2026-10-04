@@ -480,9 +480,65 @@ impl Store {
             let next = self
                 .run(move |db| runtime::next_with_config(db, &principal, &config))
                 .await;
-            let command = next.ok().and_then(|value| {
-                serde_json::from_value::<RuntimeCommand>(value["command"].clone()).ok()
-            });
+            let next = match next {
+                Ok(value) => value,
+                Err(error) => {
+                    let safe_code = safe_runtime_error_code(&error.code).map(str::to_owned);
+                    if owned_options.is_some()
+                        && let Some(error_code) = safe_code.clone()
+                    {
+                        let binding_id = key.0.clone();
+                        let generation = key.1;
+                        match self
+                            .run(move |db| {
+                                operations::record_owned_open_dispatch_failure(
+                                    db,
+                                    &binding_id,
+                                    generation,
+                                    "runtime_command_select",
+                                    "selection_error",
+                                    &error_code,
+                                    "queued",
+                                )
+                            })
+                            .await
+                        {
+                            Ok(_) => {}
+                            Err(persist_error) => eprintln!(
+                                "OpenCode owned dispatch diagnostic: {}",
+                                safe_runtime_error_code(&persist_error.code)
+                                    .unwrap_or("STORE_ERROR")
+                            ),
+                        }
+                    }
+                    eprintln!(
+                        "OpenCode command selection: {}",
+                        safe_code.as_deref().unwrap_or("RUNTIME_SELECTOR_ERROR")
+                    );
+                    // Do not turn selector infrastructure or authority errors
+                    // into an idle readback pass. A later pass may retry only
+                    // the same durable queued Operation.
+                    continue;
+                }
+            };
+            let Some(raw_command) = next.get("command") else {
+                eprintln!("OpenCode command selection: RUNTIME_COMMAND_RESPONSE_INVALID");
+                continue;
+            };
+            let command = if raw_command.is_null() {
+                None
+            } else {
+                match serde_json::from_value::<RuntimeCommand>(raw_command.clone()) {
+                    Ok(command) => Some(command),
+                    Err(_) => {
+                        // runtime::next commits the sending boundary before it
+                        // returns a command. Keep that Operation unresolved;
+                        // never misreport it as not dispatched or retry it.
+                        eprintln!("OpenCode command decode: RUNTIME_COMMAND_INVALID");
+                        continue;
+                    }
+                }
+            };
             let command = if let Some(command) = command {
                 command
             } else {
@@ -836,6 +892,16 @@ impl Store {
             let _ = self.oc_connection(p, false, None).await;
         }
     }
+}
+
+fn safe_runtime_error_code(code: &str) -> Option<&str> {
+    (!code.is_empty()
+        && code.len() <= 64
+        && code.as_bytes().first().is_some_and(u8::is_ascii_uppercase)
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_'))
+    .then_some(code)
 }
 
 #[cfg(test)]
