@@ -1116,7 +1116,7 @@ fn read_optional_regular_file(path: &Path) -> Result<Option<PreviousHook>> {
 fn is_executable_hook(path: &Path, bytes: &[u8], mode: Option<u32>) -> bool {
     #[cfg(unix)]
     {
-        let _ = path;
+        let _ = (path, bytes);
         mode.is_some_and(|mode| mode & 0o111 != 0)
     }
     #[cfg(windows)]
