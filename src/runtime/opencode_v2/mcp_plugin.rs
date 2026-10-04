@@ -198,10 +198,8 @@ pub(crate) fn prepare_plugin_config(
     let package_dir = module_path
         .parent()
         .ok_or_else(|| source_error("plugin directory is missing"))?;
-    let package_text = package_dir
-        .to_str()
-        .ok_or_else(|| source_error("plugin path is not valid Unicode"))?;
-    if plugin_descriptor["package"] != package_text
+    let package_text = mcp_tools::plugin_config_package_path(package_dir)?;
+    if plugin_descriptor["package"].as_str() != Some(package_text.as_str())
         || plugin_descriptor["options"]["serviceId"] != intent.service_id
         || plugin_descriptor["options"]["serviceVersion"] != PINNED_VERSION
         || plugin_descriptor["options"]["moduleSha256"] != module_sha256
@@ -248,9 +246,7 @@ pub(crate) fn verify_plugin_config_value(
     let package_dir = module_path
         .parent()
         .ok_or_else(|| source_error("plugin directory is missing"))?;
-    let package_text = package_dir
-        .to_str()
-        .ok_or_else(|| source_error("plugin path is not valid Unicode"))?;
+    let package_text = mcp_tools::plugin_config_package_path(package_dir)?;
     let entries = value["plugin"].as_array();
     let descriptor = entries
         .and_then(|items| items.first())
@@ -262,7 +258,7 @@ pub(crate) fn verify_plugin_config_value(
         || descriptor
             .and_then(|parts| parts.first())
             .and_then(Value::as_str)
-            != Some(package_text)
+            != Some(package_text.as_str())
         || options
             .and_then(Value::as_object)
             .is_none_or(|object| object.len() != 3)

@@ -117,21 +117,13 @@ pub(crate) fn plugin_config_value(options: &Options) -> Result<Value> {
     }
     let (module_path, module_sha256) = module_source()?;
     let entry = plugin_entry_path(&module_path)?;
-    let package = entry
-        .parent()
-        .ok_or_else(|| {
-            source_error_code(
-                "NATIVE_MCP_PROOF_PLUGIN_CONFIG_INVALID",
-                "native MCP plugin directory is missing",
-            )
-        })?
-        .to_str()
-        .ok_or_else(|| {
-            source_error_code(
-                "NATIVE_MCP_PROOF_PLUGIN_CONFIG_INVALID",
-                "native MCP observer path is not valid Unicode",
-            )
-        })?;
+    let package_dir = entry.parent().ok_or_else(|| {
+        source_error_code(
+            "NATIVE_MCP_PROOF_PLUGIN_CONFIG_INVALID",
+            "native MCP plugin directory is missing",
+        )
+    })?;
+    let package = plugin_config_package_path(package_dir)?;
     Ok(json!({
         "package": package,
         "options": {
@@ -140,6 +132,62 @@ pub(crate) fn plugin_config_value(options: &Options) -> Result<Value> {
             "moduleSha256": module_sha256,
         },
     }))
+}
+
+/// Return the path spelling the pinned Bun resolver accepts at the OpenCode
+/// config boundary. Source identity and filesystem checks continue to use the
+/// canonical `Path`; only Windows verbatim namespace prefixes are projected.
+pub(crate) fn plugin_config_package_path(path: &Path) -> Result<String> {
+    let value = path.to_str().ok_or_else(|| {
+        source_error_code(
+            "NATIVE_MCP_PROOF_PLUGIN_CONFIG_INVALID",
+            "native MCP observer path is not valid Unicode",
+        )
+    })?;
+    plugin_config_package_path_text(value)
+}
+
+fn plugin_config_package_path_text(value: &str) -> Result<String> {
+    const VERBATIM_PREFIX: &str = "\\\\?\\";
+    const VERBATIM_UNC_PREFIX: &str = "\\\\?\\UNC\\";
+
+    if value
+        .get(..VERBATIM_UNC_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(VERBATIM_UNC_PREFIX))
+    {
+        let ordinary = &value[VERBATIM_UNC_PREFIX.len()..];
+        let mut components = ordinary.split(['\\', '/']);
+        if components
+            .next()
+            .is_none_or(|component| component.is_empty())
+            || components
+                .next()
+                .is_none_or(|component| component.is_empty())
+        {
+            return Err(source_error_code(
+                "NATIVE_MCP_PROOF_PLUGIN_CONFIG_INVALID",
+                "native MCP observer UNC path is invalid",
+            ));
+        }
+        return Ok(format!("\\\\{ordinary}"));
+    }
+
+    if let Some(ordinary) = value.strip_prefix(VERBATIM_PREFIX) {
+        let bytes = ordinary.as_bytes();
+        if bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'\\' | b'/')
+        {
+            return Ok(ordinary.to_owned());
+        }
+        return Err(source_error_code(
+            "NATIVE_MCP_PROOF_PLUGIN_CONFIG_INVALID",
+            "native MCP observer Windows path namespace is unsupported",
+        ));
+    }
+
+    Ok(value.to_owned())
 }
 
 /// Recreate a challenge from exact private Store metadata after a lost HTTP
@@ -323,22 +371,13 @@ pub(crate) async fn arm_prepared(
 fn expected_plugin_config(options: &Options, challenge: &NativeMcpChallenge) -> Result<Value> {
     let config = plugin_config_value(options)?;
     plugin_entry_path(&challenge.module_path)?;
-    let package_path = challenge
-        .module_path
-        .parent()
-        .ok_or_else(|| {
-            source_error_code(
-                "NATIVE_MCP_PROOF_PLUGIN_CONFIG_INVALID",
-                "native MCP plugin directory is missing",
-            )
-        })?
-        .to_str()
-        .ok_or_else(|| {
-            source_error_code(
-                "NATIVE_MCP_PROOF_PLUGIN_CONFIG_INVALID",
-                "native MCP observer path is not valid Unicode",
-            )
-        })?;
+    let package_dir = challenge.module_path.parent().ok_or_else(|| {
+        source_error_code(
+            "NATIVE_MCP_PROOF_PLUGIN_CONFIG_INVALID",
+            "native MCP plugin directory is missing",
+        )
+    })?;
+    let package_path = plugin_config_package_path(package_dir)?;
     if config["package"] != package_path {
         return Err(source_error_code(
             "NATIVE_MCP_PROOF_PLUGIN_CONFIG_MISMATCH",
@@ -1157,4 +1196,71 @@ fn rotated_module() -> Error {
 
 fn schema_error(message: &str) -> Error {
     Error::new("NATIVE_MCP_PROOF_SCHEMA", message)
+}
+
+#[cfg(test)]
+mod plugin_package_path_tests {
+    use super::{
+        module_source, plugin_config_package_path, plugin_config_package_path_text,
+        plugin_config_value,
+    };
+    use crate::runtime::opencode_v2::{ModelRef, Options, mcp_plugin};
+    use std::path::PathBuf;
+
+    #[test]
+    fn plugin_package_path_projects_verbatim_drive_and_unc_paths() {
+        assert_eq!(
+            plugin_config_package_path_text(r"\\?\C:\repo\modules\opencode").unwrap(),
+            r"C:\repo\modules\opencode",
+        );
+        assert_eq!(
+            plugin_config_package_path_text(r"\\?\UNC\server\share\repo\plugin").unwrap(),
+            r"\\server\share\repo\plugin",
+        );
+        assert_eq!(
+            plugin_config_package_path_text(r"\\?\unc\server\share\repo\plugin").unwrap(),
+            r"\\server\share\repo\plugin",
+        );
+        assert_eq!(
+            plugin_config_package_path_text(r"C:\repo\modules\opencode").unwrap(),
+            r"C:\repo\modules\opencode",
+        );
+        assert_eq!(
+            plugin_config_package_path_text("/repo/modules/opencode").unwrap(),
+            "/repo/modules/opencode",
+        );
+        assert!(plugin_config_package_path_text(r"\\?\Volume{abc}\repo\plugin").is_err());
+        assert!(plugin_config_package_path_text(r"\\?\UNC\server").is_err());
+    }
+
+    #[test]
+    fn plugin_package_path_config_roundtrips_through_source_validation() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let options = Options {
+            service_id: "plugin_path_fixture".to_owned(),
+            connection_file: root.join("unused-connection.json"),
+            expected_version: "2.0.7".to_owned(),
+            directory: root.clone(),
+            model: ModelRef {
+                id: "fixture-model".to_owned(),
+                provider_id: "fixture-provider".to_owned(),
+                variant: "fixture-variant".to_owned(),
+            },
+        };
+
+        let config = plugin_config_value(&options).unwrap();
+        let (module_path, _) = module_source().unwrap();
+        let package_dir = module_path.parent().unwrap();
+        let expected_package = plugin_config_package_path(package_dir).unwrap();
+        assert_eq!(config["package"].as_str(), Some(expected_package.as_str()));
+        if cfg!(windows) {
+            assert!(!expected_package.starts_with(r"\\?\"));
+        }
+
+        let serialized_config = serde_json::json!({
+            "plugin": [[config["package"].clone(), config["options"].clone()]]
+        });
+        mcp_plugin::verify_plugin_config_value(&serialized_config, &options.service_id).unwrap();
+        assert!(package_dir.is_absolute());
+    }
 }

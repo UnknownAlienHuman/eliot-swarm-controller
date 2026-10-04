@@ -2,6 +2,31 @@
 
 ## Current state
 
+### Windows plugin configuration path correction — 2026-10-04
+
+The pinned OpenCode 2.0.7 loader failed to resolve the server entrypoint for the
+canonical Windows verbatim package path. An offline comparison resolved and
+loaded the expected plugin from an ordinary absolute spelling of the same
+canonical directory. The correction projects Windows drive and UNC prefixes
+only at the configuration boundary. The producer and every exact configuration
+comparison use the same helper; canonical filesystem, source digest, wrapper
+digest and scope checks retain their previous validation.
+
+Final source gate `3afdc876-1786-4e55-960a-1807e37ebf29` passed formatting, both
+focused path/config regressions and debug build with unchanged source. Strict
+production Clippy passed in `68b94ca2-fe9c-49a6-8995-98cdd2a7c52b`; the final
+change corrected only the regression fixture's serialized input shape, with
+production source equivalence independently checked. Independent Luna review
+passed at the final file hashes. The new candidate SHA-256 is
+`867E9FF4107DDB558612C38D3210486963783E39490328479FC24517421DB5AE`.
+
+C28 is prepared for a fresh native startup qualification with this candidate.
+The offline probe and source gate do not prove plugin activation, callable MCP
+tools or model execution. Hosted Bunny qualification follows successful native
+MCP qualification. The installed controller and current Codex/OpenCodex are
+unchanged. Local Linux, WSL and local models remain deferred. The project remains
+**PARTIAL_PROGRESS**.
+
 ### Latest qualified source and C27 terminal outcome — 2026-10-04
 
 Source `60398688823c07c9d796bc1df6dd5b7c3e2abf6a` is published on main.
@@ -32,8 +57,15 @@ readbacks (2 valid, 0 failed), and six runtime snapshots (zero failures or
 gaps). It produced no corruption or private-read error. This closes live error
 delivery for this exact C8 failure, but native MCP proof and model execution
 remain unqualified. C15 and C8 are auditing the plugin registration/loader
-cause; no production root cause or fix is claimed. Preserve the consumed C27
-claim without replay.
+cause at this historical checkpoint. The subsequent bounded, offline probe of
+the pinned OpenCode 2.0.7 loader proved that the exact Windows verbatim package
+path (`\\?\` prefix) resolves no server entrypoint, while an ordinary absolute
+path to the same canonical directory loads the expected plugin. This probe did
+not activate the plugin or start a service. The source correction projects only
+the serialized configuration path and shares that projection with all exact
+config consumers; canonical source, digest and scope checks remain unchanged.
+Its fresh source gate and native qualification are recorded in the next
+checkpoint. Preserve the consumed C27 claim without replay.
 
 C26's earlier projection mismatch was a harness alias-collision defect, not a
 product diagnosis: aliases generated from `assignment_type`,

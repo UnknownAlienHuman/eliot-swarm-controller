@@ -94,8 +94,14 @@ at `1791143831520`, after open at `1791143730468` and first-ready at
 validated the exact current-Manager C8 readback (1 valid, 0 failed), C7
 readbacks (2 valid, 0 failed), and six successful runtime snapshots (zero
 failures or gaps). This proves current-Manager error delivery for this exact
-failure, but not native MCP proof or model execution. C15 and C8 are auditing
-the plugin registration/loader cause; no production cause or fix is claimed.
+failure, but not native MCP proof or model execution. A subsequent bounded
+offline probe of the pinned loader proved that the Windows verbatim package
+path resolves no server entrypoint, while an ordinary absolute spelling of the
+same canonical directory loads the expected plugin. The correction changes
+only the serialized configuration path and its exact comparison consumers;
+canonical file, digest and scope validation remain intact. Offline loading does
+not establish service activation or native MCP proof; the fresh source gate
+and native run are recorded in `implementation-status.md`.
 Preserve the consumed C27 claim without replay. C24 hosted Bunny remains private
 preparation until full native MCP proof exists.
 
