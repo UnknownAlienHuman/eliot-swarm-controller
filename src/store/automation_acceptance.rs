@@ -9,7 +9,7 @@ use super::{capacity, operations, results, submissions, tasks};
 use crate::{
     acceptance::{AcceptRequest, AcceptancePolicy, RequirementReview},
     automation::{
-        acceptance::AcceptanceContext,
+        acceptance::{AcceptanceContext, AcceptanceReviewEvidence},
         actions::AutomationStep,
         authorization,
         config::{self, AutomationEntry},
@@ -149,16 +149,17 @@ pub(super) fn consume_review_result_for_entry(
         )
     })?;
 
-    let manager_id = model::text(&review.assignment, "sponsor_client_id")?;
-    if manager_id != entry.owner_manager_id
-        || result["sponsor_client_id"] != manager_id
+    let assignment_sponsor_id = model::text(&review.assignment, "sponsor_client_id")?;
+    let reviewer_id = model::text(result, "reviewer_client_id")?;
+    if result["sponsor_client_id"] != assignment_sponsor_id
         || result["reviewer_client_id"] != review.assignment["reviewer_client_id"]
-        || result["reviewer_client_id"] == manager_id
+        || reviewer_id == assignment_sponsor_id
+        || reviewer_id == entry.owner_manager_id
     {
         return Ok(skipped(
             &review,
             "acceptance_manager_or_reviewer_mismatch",
-            "the assigned independent reviewer or manager sponsor differs from this entry",
+            "the retained assignment sponsor differs from its result or the reviewer is not independent of the sponsor and current GM",
         ));
     }
     if entry.steps.contains(&AutomationStep::ReviewDispatch)
@@ -241,9 +242,12 @@ pub(super) fn consume_review_result_for_entry(
     let reviewer_id = model::text(result, "reviewer_client_id")?;
     let submitted_by = model::text(&document, "submitted_by")?;
     let owner_id = model::text(&document, "owner_id")?;
+    let attempt_owner_id = model::text(&attempt, "owner_id")?;
     if document["attempt_id"] != review.identity.attempt_id
         || document["task_revision"] != review.identity.task_revision
         || document["candidate_ref"] != review.identity.candidate_ref
+        || owner_id != attempt_owner_id
+        || review.assignment["sponsor_client_id"] != attempt_owner_id
         || submitted_by == entry.owner_manager_id.as_str()
         || owner_id == entry.owner_manager_id.as_str()
         || reviewer_id == submitted_by
@@ -251,8 +255,8 @@ pub(super) fn consume_review_result_for_entry(
     {
         return Ok(skipped(
             &review,
-            "acceptance_subject_or_independence_mismatch",
-            "the submission does not match the exact review candidate or the reviewer is not independent of the manager, writer, and submitter",
+            "acceptance_subject_or_owner_sponsor_mismatch",
+            "automatic acceptance requires the exact current Attempt, an owner-consistent submission, an Attempt-owner-sponsored review assignment, and an independent reviewer",
         ));
     }
     let candidate = results::get(tx, &review.identity.candidate_ref)?;
@@ -305,9 +309,12 @@ pub(super) fn consume_review_result_for_entry(
     let context = match AcceptanceContext::from_committed_entry(
         tx,
         entry,
-        review.identity.clone(),
-        review_assignment_id,
-        review_result_operation_id,
+        AcceptanceReviewEvidence {
+            identity: review.identity.clone(),
+            assignment_id: review_assignment_id.to_owned(),
+            result_operation_id: review_result_operation_id.to_owned(),
+            assignment_sponsor_id: assignment_sponsor_id.to_owned(),
+        },
         expected_feedback_observation_id,
         check_ids.clone(),
     ) {
@@ -392,6 +399,7 @@ pub(super) fn consume_review_result_for_entry(
         "coalesced":coalesced,
         "review_assignment_id":context.review_assignment_id(),
         "review_result_operation_id":context.review_result_operation_id(),
+        "review_assignment_sponsor_id":context.review_assignment_sponsor_id(),
         "task_id":context.identity().task_id,
         "task_revision":context.identity().task_revision,
         "attempt_id":context.identity().attempt_id,

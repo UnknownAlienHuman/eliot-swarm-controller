@@ -40,6 +40,14 @@ struct CurrentReviewSubject {
     current_task_revision: i64,
 }
 
+struct RetainedAcceptanceAttempt {
+    owner_id: String,
+    task_id: String,
+    task_revision: i64,
+    submission_ref: Option<String>,
+    candidate_ref: Option<String>,
+}
+
 type AcceptanceOperationRow = (
     String,
     String,
@@ -48,7 +56,7 @@ type AcceptanceOperationRow = (
     String,
     String,
 );
-type AcceptanceAssignmentOperationRow = (String, String, String, Option<String>);
+type AcceptanceAssignmentOperationRow = (String, String, String, Option<String>, String);
 type AcceptanceResultOperationRow = (
     String,
     String,
@@ -360,6 +368,10 @@ fn validate_acceptance_link(db: &Connection, link: &OnBehalfOperationLink) -> Re
         .as_str()
         .filter(|value| !value.is_empty())
         .ok_or_else(corrupt)?;
+    let review_assignment_sponsor_id = link.cause["review_assignment_sponsor_id"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(corrupt)?;
     let identity: ReviewSlotIdentity =
         serde_json::from_value(link.cause["identity"].clone()).map_err(|_| corrupt())?;
     if identity.task_revision <= 0
@@ -412,6 +424,7 @@ fn validate_acceptance_link(db: &Connection, link: &OnBehalfOperationLink) -> Re
         "kind":"review_result",
         "review_assignment_id":assignment_id,
         "review_result_operation_id":result_operation_id,
+        "review_assignment_sponsor_id":review_assignment_sponsor_id,
         "identity":identity_value,
         "check_ids":request.check_ids
     });
@@ -421,6 +434,7 @@ fn validate_acceptance_link(db: &Connection, link: &OnBehalfOperationLink) -> Re
     sorted_check_ids.sort();
     let semantic_input = model::canonical(&json!([
         link.effective_manager_id,
+        review_assignment_sponsor_id,
         identity.task_id,
         identity.task_revision,
         identity.attempt_id,
@@ -498,6 +512,10 @@ fn validate_acceptance_review_pass(
             "acceptance link does not match its retained request and assigned review pass",
         )
     };
+    let sponsor_id = link.cause["review_assignment_sponsor_id"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(corrupt)?;
     let assignment_key = format!("assignment:{assignment_id}");
     let assignment_row: Option<(String, String)> = db
         .query_row(
@@ -516,34 +534,113 @@ fn validate_acceptance_review_pass(
         || assignment["review_assignment_id"] != assignment_id
         || assignment["operation_id"] != assignment_operation_id
         || assignment["identity"] != serde_json::to_value(identity).map_err(|_| corrupt())?
-        || assignment["sponsor_client_id"] != link.effective_manager_id
+        || assignment["sponsor_client_id"] != sponsor_id
         || assignment["reviewer_client_id"]
             .as_str()
             .is_none_or(str::is_empty)
     {
         return Err(corrupt());
     }
+    let reviewer_id = assignment["reviewer_client_id"]
+        .as_str()
+        .ok_or_else(corrupt)?;
+    if reviewer_id == sponsor_id || reviewer_id == link.effective_manager_id {
+        return Err(corrupt());
+    }
+
+    let retained_attempt: Option<RetainedAcceptanceAttempt> = db
+        .query_row(
+            "SELECT owner_id,task_id,task_revision,submission_ref,candidate_ref \
+             FROM attempts WHERE attempt_id=?1",
+            [&identity.attempt_id],
+            |row| {
+                Ok(RetainedAcceptanceAttempt {
+                    owner_id: row.get(0)?,
+                    task_id: row.get(1)?,
+                    task_revision: row.get(2)?,
+                    submission_ref: row.get(3)?,
+                    candidate_ref: row.get(4)?,
+                })
+            },
+        )
+        .optional()?;
+    let Some(retained_attempt) = retained_attempt else {
+        return Err(corrupt());
+    };
+    if retained_attempt.owner_id != sponsor_id
+        || retained_attempt.task_id != identity.task_id
+        || retained_attempt.task_revision != identity.task_revision
+        || retained_attempt.submission_ref.as_deref() != Some(identity.submission_ref.as_str())
+        || retained_attempt.candidate_ref.as_deref() != Some(identity.candidate_ref.as_str())
+    {
+        return Err(corrupt());
+    }
 
     let assignment_operation: Option<AcceptanceAssignmentOperationRow> = db
         .query_row(
-            "SELECT caller_id,method,state,result_json FROM operations WHERE operation_id=?1",
+            "SELECT caller_id,method,state,result_json,effective_request_json \
+             FROM operations WHERE operation_id=?1",
             [&assignment_operation_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
         .optional()?;
-    let Some((assignment_caller, method, state, result_raw)) = assignment_operation else {
+    let Some((assignment_caller, method, state, result_raw, assignment_effective_raw)) =
+        assignment_operation
+    else {
         return Err(corrupt());
     };
     let assignment_result: Value =
         serde_json::from_str(&result_raw.ok_or_else(corrupt)?).map_err(|_| corrupt())?;
+    let assignment_effective: Value =
+        serde_json::from_str(&assignment_effective_raw).map_err(|_| corrupt())?;
+    let operation_sponsor_id = match assignment_effective.get("on_behalf") {
+        None | Some(Value::Null) => {
+            if operation_link(db, &assignment_operation_id)?.is_some() {
+                return Err(corrupt());
+            }
+            assignment_caller.clone()
+        }
+        Some(saved) if saved.is_object() => {
+            let Some(operation_link) = operation_link(db, &assignment_operation_id)? else {
+                return Err(corrupt());
+            };
+            if operation_link.action != "review.assign"
+                || saved["technical_requester_id"] != operation_link.technical_requester_id
+                || saved["effective_manager_id"] != operation_link.effective_manager_id
+                || saved["automation_id"] != operation_link.automation_id
+                || saved["automation_revision"] != operation_link.automation_revision
+                || saved["project_id"] != operation_link.project_id
+                || saved["action"] != operation_link.action
+                || operation_link.project_id != link.project_id
+                || saved["semantic_cause_kind"] != operation_link.cause["kind"]
+                || saved["semantic_cause_id"] != operation_link.cause["id"]
+                || saved["cause"] != operation_link.cause
+                || operation_link.cause["id"] != identity.submission_ref
+            {
+                return Err(corrupt());
+            }
+            operation_link.effective_manager_id
+        }
+        Some(_) => return Err(corrupt()),
+    };
     if method != "review.assign"
         || state != "settled"
         || assignment["technical_requester_id"] != assignment_caller
         || assignment_result != assignment["result"]
         || assignment_result["review_assignment_id"] != assignment_id
         || assignment_result["identity"] != assignment["identity"]
-        || assignment_result["sponsor_client_id"] != link.effective_manager_id
+        || assignment_result["technical_requester_id"] != assignment_caller
+        || assignment_result["sponsor_client_id"] != sponsor_id
         || assignment_result["reviewer_client_id"] != assignment["reviewer_client_id"]
+        || operation_sponsor_id != sponsor_id
     {
         return Err(corrupt());
     }
@@ -624,7 +721,7 @@ fn validate_acceptance_review_pass(
         || result != record["result"]
         || result["review_assignment_id"] != assignment_id
         || result["reviewer_client_id"] != assignment["reviewer_client_id"]
-        || result["sponsor_client_id"] != link.effective_manager_id
+        || result["sponsor_client_id"] != sponsor_id
         || result["task_id"] != identity.task_id
         || result["attempt_id"] != identity.attempt_id
         || result["task_revision"] != identity.task_revision

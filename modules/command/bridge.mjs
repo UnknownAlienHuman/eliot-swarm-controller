@@ -71,6 +71,14 @@ if (argv.length !== 2 || argv[0] !== "--config") {
   process.exit(2);
 }
 const config = JSON.parse(await readFile(argv[1], "utf8"));
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+const runTimeoutMs = config.runTimeoutMs;
+if (runTimeoutMs !== undefined
+    && (!Number.isSafeInteger(runTimeoutMs)
+      || runTimeoutMs <= 0
+      || runTimeoutMs > MAX_TIMER_DELAY_MS)) {
+  throw codedError("INVALID_RUN_TIMEOUT_MS");
+}
 const credentialFile = required(config, "credentialFile");
 const endpoint = required(config, "endpoint");
 const credential = JSON.parse(await readFile(credentialFile, "utf8"));
@@ -293,6 +301,7 @@ async function dispatchTask(command) {
     coreBinding,
     controlDir,
     cwd,
+    ...(runTimeoutMs === undefined ? {} : { timeoutMs: runTimeoutMs }),
   });
   if (record.evidence_validation?.valid !== true) {
     return unknownTaskOutcome(null,

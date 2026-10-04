@@ -4,6 +4,7 @@ use rusqlite::params;
 use serde_json::{Value, json};
 use std::{path::PathBuf, sync::Arc};
 
+#[derive(Clone)]
 struct ReviewSubject {
     task_id: String,
     attempt_id: String,
@@ -205,6 +206,7 @@ async fn seed_subject(
                     )?;
                 }
             }
+
             Ok(ReviewSubject {
                 task_id,
                 attempt_id,
@@ -214,6 +216,70 @@ async fn seed_subject(
         })
         .await
         .unwrap()
+}
+
+async fn configure_acceptance_fixture(store: &Store, manager_id: &str, subjects: &[ReviewSubject]) {
+    let manager_id = manager_id.to_owned();
+    let subjects = subjects
+        .iter()
+        .map(|subject| (subject.task_id.clone(), subject.attempt_id.clone()))
+        .collect::<Vec<_>>();
+    store
+        .run(move |db| {
+            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            for (task_id, attempt_id) in &subjects {
+                let task_spec_raw: String = tx.query_row(
+                    "SELECT spec_json FROM tasks WHERE task_id=?1",
+                    [task_id],
+                    |row| row.get(0),
+                )?;
+                let mut spec: Value = serde_json::from_str(&task_spec_raw)?;
+                spec["acceptance"] = json!({"required_check_profiles":[]});
+                let validated: crate::model::TaskSpec = serde_json::from_value(spec.clone())?;
+                validated.validate()?;
+                tx.execute(
+                    "UPDATE tasks SET spec_json=?2 WHERE task_id=?1",
+                    params![task_id, model::canonical(&spec)?],
+                )?;
+
+                let snapshot_raw: String = tx.query_row(
+                    "SELECT task_snapshot_json FROM attempts WHERE attempt_id=?1",
+                    [attempt_id],
+                    |row| row.get(0),
+                )?;
+                let mut snapshot: Value = serde_json::from_str(&snapshot_raw)?;
+                snapshot["spec"] = spec;
+                tx.execute(
+                    "UPDATE attempts SET task_snapshot_json=?2 WHERE attempt_id=?1",
+                    params![attempt_id, model::canonical(&snapshot)?],
+                )?;
+            }
+
+            let mut entry = crate::automation::config::AutomationEntry::new(
+                &manager_id,
+                "fixture",
+                "cross-owner-acceptance",
+                10,
+            );
+            entry.enabled = true;
+            entry.steps = vec![crate::automation::actions::AutomationStep::Acceptance];
+            crate::automation::config::validate_entry(&entry)?;
+            let entry_key =
+                crate::automation::config::entry_key(&manager_id, "fixture", &entry.automation_id)?;
+            crate::automation::config::write_record(&tx, &entry_key, &entry.value()?)?;
+            let cut: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(observation_id),0) FROM observations",
+                [],
+                |row| row.get(0),
+            )?;
+            crate::store::review_disposition::configure_activation(
+                &tx, None, &entry, false, cut, 10,
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .unwrap();
 }
 
 async fn assign_sponsored_reviewer(
@@ -293,6 +359,255 @@ fn review_result_request(subject: &ReviewSubject, assignment_id: &str, request_i
         }],
         "evidence_refs":["evidence://review/r1"],
     })
+}
+
+fn passing_review_result_request(
+    subject: &ReviewSubject,
+    assignment_id: &str,
+    request_id: &str,
+) -> Value {
+    json!({
+        "client_request_id":request_id,
+        "review_assignment_id":assignment_id,
+        "submission_ref":subject.submission_ref,
+        "candidate_ref":subject.candidate_ref,
+        "verdict":"pass",
+        "coverage":"complete",
+        "findings":[],
+        "evidence_refs":[subject.candidate_ref],
+        "requirement_reviews":[{
+            "requirement_id":"R1",
+            "rationale":"The retained candidate evidence satisfies the frozen requirement.",
+            "evidence":[subject.candidate_ref]
+        }]
+    })
+}
+
+#[tokio::test]
+async fn current_gm_acceptance_consumes_owner_sponsored_review_without_owner_self_acceptance() {
+    let (owner, directory, bootstrap_credential) = start_store("cross-owner-acceptance").await;
+    let local_operator = owner
+        .store
+        .authenticate(bootstrap_credential)
+        .await
+        .unwrap();
+    assert_eq!(local_operator.role, Role::Operator);
+    seed_clients(&owner.store).await;
+    let owner_subject = seed_subject(
+        &owner.store,
+        "cross-owner",
+        "review-owner-v2",
+        crate::policy::OWNER_POLICY_V2_ID,
+        false,
+    )
+    .await;
+    let gm_owned_subject = seed_subject(
+        &owner.store,
+        "gm-owned",
+        "review-gm",
+        crate::policy::OWNER_POLICY_V2_ID,
+        false,
+    )
+    .await;
+    let operator_sponsored_subject = seed_subject(
+        &owner.store,
+        "operator-sponsored",
+        "review-owner-v2",
+        crate::policy::OWNER_POLICY_V2_ID,
+        false,
+    )
+    .await;
+    configure_acceptance_fixture(
+        &owner.store,
+        "review-gm",
+        &[
+            owner_subject.clone(),
+            gm_owned_subject.clone(),
+            operator_sponsored_subject.clone(),
+        ],
+    )
+    .await;
+
+    let owner_manager = principal("review-owner-v2", Role::Manager);
+    let (owner_reviewer, owner_assignment_id) = assign_sponsored_reviewer(
+        &owner.store,
+        owner_manager.clone(),
+        &owner_subject,
+        "cross-owner-reviewer",
+        "cross-owner-reviewer-token",
+    )
+    .await;
+    let gm = principal("review-gm", Role::Manager);
+    let (gm_subject_reviewer, gm_assignment_id) = assign_sponsored_reviewer(
+        &owner.store,
+        gm.clone(),
+        &gm_owned_subject,
+        "gm-owned-reviewer",
+        "gm-owned-reviewer-token",
+    )
+    .await;
+
+    let operator_pending_scope = json!({
+        "review_assignment_id":null,
+        "task_id":operator_sponsored_subject.task_id.clone(),
+        "attempt_id":operator_sponsored_subject.attempt_id.clone(),
+        "task_revision":1,
+        "submission_ref":operator_sponsored_subject.submission_ref.clone(),
+        "candidate_ref":operator_sponsored_subject.candidate_ref.clone(),
+    });
+    owner
+        .store
+        .call(
+            local_operator.clone(),
+            "coordination.participant.register".into(),
+            json!({
+                "client_request_id":"register-operator-sponsored-reviewer",
+                "client_id":"operator-sponsored-reviewer",
+                "token_hash":model::digest(b"operator-sponsored-reviewer-token"),
+                "task_id":operator_sponsored_subject.task_id.clone(),
+                "task_revision":1,
+                "attempt_id":operator_sponsored_subject.attempt_id.clone(),
+                "participation_basis":{"kind":"sponsored_reviewer","review_scope":operator_pending_scope},
+            }),
+        )
+        .await
+        .unwrap();
+    let operator_assignment = owner
+        .store
+        .call(
+            local_operator.clone(),
+            "review.assign".into(),
+            json!({
+                "client_request_id":"assign-operator-sponsored-reviewer",
+                "attempt_id":operator_sponsored_subject.attempt_id.clone(),
+                "expected_revision":1,
+                "submission_ref":operator_sponsored_subject.submission_ref.clone(),
+                "candidate_ref":operator_sponsored_subject.candidate_ref.clone(),
+                "reviewer_client_id":"operator-sponsored-reviewer",
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        operator_assignment["sponsor_client_id"].as_str(),
+        Some(local_operator.client_id.as_str())
+    );
+    let operator_assignment_id = operator_assignment["review_assignment_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let operator_reviewer = owner
+        .store
+        .authenticate(Credential {
+            client_id: "operator-sponsored-reviewer".into(),
+            token: "operator-sponsored-reviewer-token".into(),
+        })
+        .await
+        .unwrap();
+
+    owner
+        .store
+        .call(
+            owner_reviewer,
+            "review.submit".into(),
+            passing_review_result_request(&owner_subject, &owner_assignment_id, "cross-owner-pass"),
+        )
+        .await
+        .unwrap();
+    owner
+        .store
+        .call(
+            gm_subject_reviewer,
+            "review.submit".into(),
+            passing_review_result_request(&gm_owned_subject, &gm_assignment_id, "gm-owned-pass"),
+        )
+        .await
+        .unwrap();
+    owner
+        .store
+        .call(
+            operator_reviewer,
+            "review.submit".into(),
+            passing_review_result_request(
+                &operator_sponsored_subject,
+                &operator_assignment_id,
+                "operator-sponsored-pass",
+            ),
+        )
+        .await
+        .unwrap();
+
+    let config = Config::default();
+    owner
+        .store
+        .run(move |db| {
+            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let projection = review_disposition::reconcile(&tx, &config, 16, 64, model::now_ms()?)?;
+            tx.commit()?;
+            Ok(projection)
+        })
+        .await
+        .unwrap();
+
+    let owner_task_id = owner_subject.task_id.clone();
+    let gm_task_id = gm_owned_subject.task_id.clone();
+    let operator_task_id = operator_sponsored_subject.task_id.clone();
+    let (owner_acceptance, gm_acceptance_count, operator_acceptance_count): (
+        Vec<(String, String)>,
+        i64,
+        i64,
+    ) = owner
+        .store
+        .run(move |db| {
+            let mut statement = db.prepare(
+                "SELECT operation_id,effective_request_json FROM operations \
+                 WHERE method='task.accept' AND task_id=?1 ORDER BY operation_id",
+            )?;
+            let rows = statement
+                .query_map([owner_task_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let rejected_count: i64 = db.query_row(
+                "SELECT count(*) FROM operations WHERE method='task.accept' AND task_id=?1",
+                [gm_task_id],
+                |row| row.get(0),
+            )?;
+            let operator_rejected_count: i64 = db.query_row(
+                "SELECT count(*) FROM operations WHERE method='task.accept' AND task_id=?1",
+                [operator_task_id],
+                |row| row.get(0),
+            )?;
+            Ok((rows, rejected_count, operator_rejected_count))
+        })
+        .await
+        .unwrap();
+    assert_eq!(owner_acceptance.len(), 1);
+    assert_eq!(gm_acceptance_count, 0);
+    assert_eq!(operator_acceptance_count, 0);
+    let operation_id = owner_acceptance[0].0.clone();
+    let effective: Value = serde_json::from_str(&owner_acceptance[0].1).unwrap();
+    assert_eq!(
+        effective["automation_on_behalf"]["effective_manager_id"],
+        "review-gm"
+    );
+    assert_eq!(
+        effective["automation_on_behalf"]["cause"]["review_assignment_sponsor_id"],
+        "review-owner-v2"
+    );
+    let context = owner
+        .store
+        .run(move |db| {
+            crate::automation::acceptance::AcceptanceContext::from_committed_operation(
+                db,
+                &operation_id,
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(context.effective_manager_id(), "review-gm");
+    assert_eq!(context.review_assignment_sponsor_id(), "review-owner-v2");
+
+    owner.close().await.unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[tokio::test]

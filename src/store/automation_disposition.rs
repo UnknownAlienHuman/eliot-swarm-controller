@@ -84,7 +84,9 @@ pub(super) fn consume_review_result_for_entry(
     }
 
     let manager_id = model::text(&review.assignment, "sponsor_client_id")?;
-    if manager_id != entry.owner_manager_id {
+    let independent_acceptance =
+        result["verdict"] == "pass" && entry.steps.contains(&AutomationStep::Acceptance);
+    if manager_id != entry.owner_manager_id && !independent_acceptance {
         return Ok(skipped(
             &review,
             "automation_owner_mismatch",
@@ -94,12 +96,11 @@ pub(super) fn consume_review_result_for_entry(
     // Acceptance is an independent GM decision over another owner's proposal.
     // Owner-scoped correction keeps its original ownership guard; applying it
     // to a passing acceptance first would make every valid decision unreachable.
-    let required_owner =
-        if result["verdict"] == "pass" && entry.steps.contains(&AutomationStep::Acceptance) {
-            None
-        } else {
-            Some(manager_id)
-        };
+    let required_owner = if independent_acceptance {
+        None
+    } else {
+        Some(manager_id)
+    };
     let (task, attempt) = match current_subject(tx, &review.identity, required_owner)? {
         Some(subject) => subject,
         None => {

@@ -26,7 +26,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
-    io::{AsyncBufReadExt, BufReader as AsyncBufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, BufReader as AsyncBufReader},
     process::{Child, ChildStdin, Command as AsyncCommand},
     time::timeout,
 };
@@ -769,7 +769,8 @@ async fn complete_foreground_start(
         .stdout
         .take()
         .ok_or_else(|| readback_error("owned service helper output is unavailable"))?;
-    let mut reader = AsyncBufReader::new(stdout);
+    let bounded_stdout = stdout.take((MAX_HANDSHAKE_BYTES + 1) as u64);
+    let mut reader = AsyncBufReader::new(bounded_stdout);
     let mut line = Vec::with_capacity(MAX_HANDSHAKE_BYTES);
     let read_result = timeout(START_TIMEOUT, reader.read_until(b'\n', &mut line)).await;
     let count = match read_result {
@@ -909,6 +910,11 @@ pub(crate) async fn readback_existing(
         )?)
     };
     let Some(readback) = read_owned_files(route)? else {
+        if let Some(phase) = read_helper_start_failure(route, intent)?
+            && let Some((code, message)) = phase.safe_failure()
+        {
+            return Err(Error::new(code, message));
+        }
         return Ok(None);
     };
     let mut checked = OwnedServiceReadback::from_private_value(
@@ -1155,19 +1161,94 @@ pub(crate) fn run_owned_service_helper(plan_path: &Path) -> Result<()> {
     write_private_new(&consumed, plan.owner_nonce.as_bytes())?;
     let _group = Group::enter_module(&plan.owner_nonce)?;
     let helper_observation = write_helper_observation(&plan)?;
-    let mut command = bun_command(&plan);
-    let mut bun = command.spawn().map_err(|_| {
-        Error::new(
-            "OWNED_SERVICE_START",
-            "pinned OpenCode owner process could not start",
-        )
-    })?;
-    let observation = ProcessObservation::for_spawned_process(&plan, bun.id())?;
-    write_private_new(
-        &plan.state_root.join("process-observation.json"),
-        model::canonical(&serde_json::to_value(&observation)?)?.as_bytes(),
+    write_helper_start_receipt(
+        &plan,
+        &helper_observation,
+        HelperStartPhase::SpawnAttempted,
+        None,
+        None,
+        None,
     )?;
-    let ready = wait_for_ready(&plan, &mut bun)?;
+    let mut command = bun_command(&plan);
+    let mut bun = match command.spawn() {
+        Ok(bun) => bun,
+        Err(error) => {
+            if write_helper_start_receipt(
+                &plan,
+                &helper_observation,
+                HelperStartPhase::SpawnFailed,
+                None,
+                Some(&error),
+                None,
+            )
+            .is_err()
+            {
+                return Err(readback_error(
+                    "owned helper could not retain its private spawn failure stage",
+                ));
+            }
+            return Err(Error::new(
+                "OWNED_SERVICE_START",
+                "pinned OpenCode owner process could not start",
+            ));
+        }
+    };
+    let spawned_pid = bun.id();
+    if write_helper_start_receipt(
+        &plan,
+        &helper_observation,
+        HelperStartPhase::Spawned,
+        Some(spawned_pid),
+        None,
+        None,
+    )
+    .is_err()
+    {
+        let _ = write_helper_start_receipt(
+            &plan,
+            &helper_observation,
+            HelperStartPhase::SpawnReceiptWriteFailed,
+            Some(spawned_pid),
+            None,
+            None,
+        );
+    }
+    let observation = match ProcessObservation::for_spawned_process(&plan, spawned_pid) {
+        Ok(observation) => observation,
+        Err(_) => {
+            let _ = write_helper_start_receipt(
+                &plan,
+                &helper_observation,
+                HelperStartPhase::ProcessIdentityFailed,
+                Some(spawned_pid),
+                None,
+                None,
+            );
+            return Err(readback_error(
+                "spawned owner process identity could not be validated",
+            ));
+        }
+    };
+    let process_observation_json = model::canonical(&serde_json::to_value(&observation)?)?;
+    if write_private_new(
+        &plan.state_root.join("process-observation.json"),
+        process_observation_json.as_bytes(),
+    )
+    .is_err()
+    {
+        let _ = write_helper_start_receipt(
+            &plan,
+            &helper_observation,
+            HelperStartPhase::ProcessObservationWriteFailed,
+            Some(spawned_pid),
+            None,
+            None,
+        );
+        return Err(readback_error(
+            "spawned owner process observation could not be retained",
+        ));
+    }
+    let ready = wait_for_ready(&plan, &mut bun, &helper_observation, spawned_pid)?;
     if ready.pid != observation.pid {
         return Err(readback_error(
             "ready owner PID differs from the spawned process",
@@ -1254,16 +1335,46 @@ fn bun_command(plan: &HelperPlan) -> Command {
     command
 }
 
-fn wait_for_ready(plan: &HelperPlan, bun: &mut std::process::Child) -> Result<ReadyRecord> {
+fn wait_for_ready(
+    plan: &HelperPlan,
+    bun: &mut std::process::Child,
+    helper_observation: &HelperObservation,
+    spawned_pid: u32,
+) -> Result<ReadyRecord> {
     let owner_path = plan.state_root.join("owner.json");
     let connection_path = &plan.connection_file;
     let deadline = Instant::now() + START_TIMEOUT;
     loop {
-        if let Some(status) = bun.try_wait()? {
-            return Err(Error::new(
-                "OWNED_SERVICE_START",
-                format!("pinned OpenCode owner exited before readiness ({status})"),
-            ));
+        match bun.try_wait() {
+            Ok(Some(status)) => {
+                let _ = write_helper_start_receipt(
+                    plan,
+                    helper_observation,
+                    HelperStartPhase::BunExitedBeforeReady,
+                    Some(spawned_pid),
+                    None,
+                    status.code(),
+                );
+                return Err(Error::new(
+                    "OWNED_SERVICE_EXITED_BEFORE_READY",
+                    "pinned OpenCode owner exited before publishing matching readiness receipts",
+                ));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let _ = write_helper_start_receipt(
+                    plan,
+                    helper_observation,
+                    HelperStartPhase::BunWaitFailed,
+                    Some(spawned_pid),
+                    Some(&error),
+                    None,
+                );
+                return Err(Error::new(
+                    "OWNED_SERVICE_PROCESS_WAIT_FAILED",
+                    "the helper could not safely observe the spawned OpenCode process",
+                ));
+            }
         }
         if regular_file(&owner_path, MAX_OWNER_BYTES).is_ok()
             && regular_file(connection_path, MAX_OWNER_BYTES).is_ok()
@@ -1285,6 +1396,14 @@ fn wait_for_ready(plan: &HelperPlan, bun: &mut std::process::Child) -> Result<Re
             });
         }
         if Instant::now() >= deadline {
+            let _ = write_helper_start_receipt(
+                plan,
+                helper_observation,
+                HelperStartPhase::ReadinessTimedOut,
+                Some(spawned_pid),
+                None,
+                None,
+            );
             return Err(Error::new(
                 "OWNED_SERVICE_START_UNKNOWN",
                 "pinned service did not publish matching owner and connection receipts",
@@ -1353,6 +1472,254 @@ struct HelperObservation {
     helper_birth_token: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum HelperStartPhase {
+    SpawnAttempted,
+    SpawnFailed,
+    Spawned,
+    SpawnReceiptWriteFailed,
+    ProcessIdentityFailed,
+    ProcessObservationWriteFailed,
+    BunExitedBeforeReady,
+    BunWaitFailed,
+    ReadinessTimedOut,
+}
+
+impl HelperStartPhase {
+    const ALL: [Self; 9] = [
+        Self::SpawnAttempted,
+        Self::SpawnFailed,
+        Self::Spawned,
+        Self::SpawnReceiptWriteFailed,
+        Self::ProcessIdentityFailed,
+        Self::ProcessObservationWriteFailed,
+        Self::BunExitedBeforeReady,
+        Self::BunWaitFailed,
+        Self::ReadinessTimedOut,
+    ];
+
+    fn file_name(self) -> &'static str {
+        match self {
+            Self::SpawnAttempted => "helper-start-spawn-attempted.json",
+            Self::SpawnFailed => "helper-start-spawn-failed.json",
+            Self::Spawned => "helper-start-spawned.json",
+            Self::SpawnReceiptWriteFailed => "helper-start-spawn-receipt-write-failed.json",
+            Self::ProcessIdentityFailed => "helper-start-process-identity-failed.json",
+            Self::ProcessObservationWriteFailed => {
+                "helper-start-process-observation-write-failed.json"
+            }
+            Self::BunExitedBeforeReady => "helper-start-bun-exited-before-ready.json",
+            Self::BunWaitFailed => "helper-start-bun-wait-failed.json",
+            Self::ReadinessTimedOut => "helper-start-readiness-timed-out.json",
+        }
+    }
+
+    fn safe_failure(self) -> Option<(&'static str, &'static str)> {
+        match self {
+            Self::SpawnFailed => Some((
+                "OWNED_SERVICE_HELPER_SPAWN_FAILED",
+                "the exact owned-service helper recorded a Bun spawn failure; start remains uncertain",
+            )),
+            Self::SpawnReceiptWriteFailed => Some((
+                "OWNED_SERVICE_START_STAGE_WRITE_FAILED",
+                "the helper could not retain its private spawn-success stage; start remains uncertain",
+            )),
+            Self::ProcessIdentityFailed => Some((
+                "OWNED_SERVICE_PROCESS_IDENTITY_UNAVAILABLE",
+                "Bun spawn succeeded but its process identity could not be validated; start remains uncertain",
+            )),
+            Self::ProcessObservationWriteFailed => Some((
+                "OWNED_SERVICE_PROCESS_OBSERVATION_WRITE_FAILED",
+                "Bun spawn succeeded but its private process observation could not be retained; start remains uncertain",
+            )),
+            Self::BunExitedBeforeReady => Some((
+                "OWNED_SERVICE_EXITED_BEFORE_READY",
+                "Bun exited before matching owner readiness was observed; start remains uncertain",
+            )),
+            Self::BunWaitFailed => Some((
+                "OWNED_SERVICE_PROCESS_WAIT_FAILED",
+                "the helper could not safely observe the spawned OpenCode process; start remains uncertain",
+            )),
+            Self::ReadinessTimedOut => Some((
+                "OWNED_SERVICE_START_UNKNOWN",
+                "matching owner readiness was not observed before the bounded startup deadline",
+            )),
+            Self::SpawnAttempted | Self::Spawned => None,
+        }
+    }
+}
+
+/// Reads only the bounded, private diagnostic journal. It is deliberately not
+/// a process/readiness proof and never authorizes a retry or state transition.
+fn read_helper_start_failure(
+    route: &OwnedServiceRoute,
+    intent: &OwnedServiceIntent,
+) -> Result<Option<HelperStartPhase>> {
+    let route_digest = route.route_digest()?;
+    if intent.owner_nonce() != route.owner_nonce() || intent.route_digest() != route_digest {
+        return Err(readback_error(
+            "retained intent does not match the exact owned route",
+        ));
+    }
+
+    let mut recorded = Vec::new();
+    for phase in HelperStartPhase::ALL {
+        let path = route.state_root.join(phase.file_name());
+        let Some(bytes) = read_optional_regular(&path, MAX_OBSERVATION_BYTES)? else {
+            continue;
+        };
+        let receipt: HelperStartStageReceipt = serde_json::from_slice(&bytes)
+            .map_err(|_| readback_error("private helper start stage is invalid"))?;
+        if receipt.phase != phase {
+            return Err(readback_error(
+                "private helper start stage filename differs from its phase",
+            ));
+        }
+        recorded.push(receipt);
+    }
+    if recorded.is_empty() {
+        return Ok(None);
+    }
+
+    let plan_path = route.state_root.join(".owned-launch-plan.json");
+    let plan = read_plan(&plan_path)?;
+    validate_plan(&plan, &plan_path)?;
+    if plan.owner_nonce != intent.owner_nonce()
+        || plan.route_digest != route_digest
+        || route_digest_for_plan(&plan)? != intent.route_digest()
+    {
+        return Err(readback_error(
+            "private helper start stage is not bound to the retained launch plan",
+        ));
+    }
+
+    let helper_path = route.state_root.join("helper-observation.json");
+    let helper_bytes = read_optional_regular(&helper_path, MAX_OBSERVATION_BYTES)?
+        .ok_or_else(|| readback_error("helper stage has no exact helper observation"))?;
+    let helper: HelperObservation = serde_json::from_slice(&helper_bytes)
+        .map_err(|_| readback_error("private helper observation is invalid"))?;
+    helper.validate(&plan.owner_nonce, &plan.route_digest)?;
+
+    let mut saw_attempt = false;
+    let mut spawn_failed = false;
+    let mut spawn_stage_pid = None;
+    let mut terminal_count = 0_u8;
+    let mut process_failure_count = 0_u8;
+    let mut failure = None;
+    for receipt in &recorded {
+        receipt.validate(&plan, &helper)?;
+        match receipt.phase {
+            HelperStartPhase::SpawnAttempted => saw_attempt = true,
+            HelperStartPhase::SpawnFailed => {
+                spawn_failed = true;
+                failure = Some(HelperStartPhase::SpawnFailed);
+            }
+            HelperStartPhase::Spawned => {
+                retain_spawn_pid(&mut spawn_stage_pid, receipt.spawned_pid)?;
+            }
+            HelperStartPhase::SpawnReceiptWriteFailed => {
+                retain_spawn_pid(&mut spawn_stage_pid, receipt.spawned_pid)?;
+                failure = Some(HelperStartPhase::SpawnReceiptWriteFailed);
+            }
+            HelperStartPhase::ProcessIdentityFailed
+            | HelperStartPhase::ProcessObservationWriteFailed => {
+                retain_spawn_pid(&mut spawn_stage_pid, receipt.spawned_pid)?;
+                process_failure_count += 1;
+                failure = Some(receipt.phase);
+            }
+            HelperStartPhase::BunExitedBeforeReady
+            | HelperStartPhase::BunWaitFailed
+            | HelperStartPhase::ReadinessTimedOut => {
+                retain_spawn_pid(&mut spawn_stage_pid, receipt.spawned_pid)?;
+                terminal_count += 1;
+                failure = Some(receipt.phase);
+            }
+        }
+    }
+    if !saw_attempt
+        || (spawn_failed && spawn_stage_pid.is_some())
+        || (process_failure_count > 1)
+        || (terminal_count > 1)
+        || (terminal_count > 0 && process_failure_count > 0)
+    {
+        return Err(readback_error(
+            "private helper start stages do not form one exact launch sequence",
+        ));
+    }
+    Ok(failure)
+}
+
+fn retain_spawn_pid(current: &mut Option<u32>, observed: Option<u32>) -> Result<()> {
+    let Some(observed) = observed else {
+        return Err(readback_error(
+            "private post-spawn stage has no spawned process identifier",
+        ));
+    };
+    if current.is_some_and(|current| current != observed) {
+        return Err(readback_error(
+            "private helper stages disagree on the spawned process identifier",
+        ));
+    }
+    *current = Some(observed);
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SafeSpawnErrorKind {
+    NotFound,
+    PermissionDenied,
+    AlreadyExists,
+    InvalidInput,
+    InvalidData,
+    Interrupted,
+    TimedOut,
+    WouldBlock,
+    BrokenPipe,
+    UnexpectedEof,
+    WriteZero,
+    Other,
+}
+
+impl From<std::io::ErrorKind> for SafeSpawnErrorKind {
+    fn from(value: std::io::ErrorKind) -> Self {
+        match value {
+            std::io::ErrorKind::NotFound => Self::NotFound,
+            std::io::ErrorKind::PermissionDenied => Self::PermissionDenied,
+            std::io::ErrorKind::AlreadyExists => Self::AlreadyExists,
+            std::io::ErrorKind::InvalidInput => Self::InvalidInput,
+            std::io::ErrorKind::InvalidData => Self::InvalidData,
+            std::io::ErrorKind::Interrupted => Self::Interrupted,
+            std::io::ErrorKind::TimedOut => Self::TimedOut,
+            std::io::ErrorKind::WouldBlock => Self::WouldBlock,
+            std::io::ErrorKind::BrokenPipe => Self::BrokenPipe,
+            std::io::ErrorKind::UnexpectedEof => Self::UnexpectedEof,
+            std::io::ErrorKind::WriteZero => Self::WriteZero,
+            _ => Self::Other,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HelperStartStageReceipt {
+    schema_version: u32,
+    owner_nonce: String,
+    route_digest: String,
+    helper_pid: u32,
+    helper_birth_token: String,
+    phase: HelperStartPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    spawned_pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    os_error_kind: Option<SafeSpawnErrorKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    os_error_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    process_exit_code: Option<i32>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HelperFamilyStopReceipt {
@@ -1391,6 +1758,85 @@ impl HelperObservation {
         }
         Ok(())
     }
+}
+
+impl HelperStartStageReceipt {
+    fn validate(&self, plan: &HelperPlan, helper: &HelperObservation) -> Result<()> {
+        helper.validate(&plan.owner_nonce, &plan.route_digest)?;
+        let has_no_error = self.os_error_kind.is_none() && self.os_error_code.is_none();
+        let has_no_exit = self.process_exit_code.is_none();
+        let valid_stage_fields = match self.phase {
+            HelperStartPhase::SpawnAttempted => {
+                self.spawned_pid.is_none() && has_no_error && has_no_exit
+            }
+            HelperStartPhase::SpawnFailed => {
+                self.spawned_pid.is_none() && self.os_error_kind.is_some() && has_no_exit
+            }
+            HelperStartPhase::Spawned
+            | HelperStartPhase::SpawnReceiptWriteFailed
+            | HelperStartPhase::ProcessIdentityFailed
+            | HelperStartPhase::ProcessObservationWriteFailed
+            | HelperStartPhase::ReadinessTimedOut => {
+                self.spawned_pid.is_some() && has_no_error && has_no_exit
+            }
+            HelperStartPhase::BunExitedBeforeReady => self.spawned_pid.is_some() && has_no_error,
+            HelperStartPhase::BunWaitFailed => {
+                self.spawned_pid.is_some() && self.os_error_kind.is_some() && has_no_exit
+            }
+        };
+        if self.schema_version != 1
+            || self.owner_nonce != plan.owner_nonce
+            || self.route_digest != plan.route_digest
+            || self.helper_pid != helper.helper_pid
+            || self.helper_birth_token != helper.helper_birth_token
+            || !valid_stage_fields
+            || self
+                .spawned_pid
+                .is_some_and(|pid| pid == 0 || pid == helper.helper_pid)
+            || (self.os_error_code.is_some()
+                && !matches!(
+                    self.phase,
+                    HelperStartPhase::SpawnFailed | HelperStartPhase::BunWaitFailed
+                ))
+        {
+            return Err(readback_error(
+                "private helper start stage differs from its exact launch",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn write_helper_start_receipt(
+    plan: &HelperPlan,
+    helper: &HelperObservation,
+    phase: HelperStartPhase,
+    spawned_pid: Option<u32>,
+    spawn_error: Option<&std::io::Error>,
+    process_exit_code: Option<i32>,
+) -> Result<()> {
+    helper.validate(&plan.owner_nonce, &plan.route_digest)?;
+    if helper.helper_pid != std::process::id() {
+        return Err(readback_error(
+            "helper start stage was written by a different process",
+        ));
+    }
+    let receipt = HelperStartStageReceipt {
+        schema_version: 1,
+        owner_nonce: plan.owner_nonce.clone(),
+        route_digest: plan.route_digest.clone(),
+        helper_pid: helper.helper_pid,
+        helper_birth_token: helper.helper_birth_token.clone(),
+        phase,
+        spawned_pid,
+        os_error_kind: spawn_error.map(|error| SafeSpawnErrorKind::from(error.kind())),
+        os_error_code: spawn_error.and_then(std::io::Error::raw_os_error),
+        process_exit_code,
+    };
+    receipt.validate(plan, helper)?;
+    let path = plan.state_root.join(phase.file_name());
+    let body = model::canonical(&serde_json::to_value(receipt)?)?;
+    write_private_new(&path, body.as_bytes())
 }
 
 fn write_helper_observation(plan: &HelperPlan) -> Result<HelperObservation> {

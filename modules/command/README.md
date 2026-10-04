@@ -4,6 +4,8 @@ This module launches Command Code’s documented headless `cmd -p --output-forma
 
 `modules/command/bridge.mjs` uses the existing host JSON-RPC transport in `modules/claude/control.mjs` and the local driver in `glue.mjs`. Configure the installed Node executable in `command` and an absolute `commandArgs` array containing the trusted native CLI entrypoint (no shell wrapper), plus host endpoint/credential and an isolated `controlRoot`, in a private copy of `module.example.json`. The CLI arguments follow that fixed prefix. The controller route must carry `native_options.modelId = 'stealth/space-bunny-alpha'`; this is the selected FREE Command catalog entry and is not asserted equivalent to OpenCode’s `opencode/space-bunny-free`. `workspaceRoot` must be an absolute route option.
 
+The private module config may set `runTimeoutMs` to a positive safe integer from 1 through 2,147,483,647. It sets the deadline for the existing `task.dispatch` child termination path; an absent field preserves the existing no-timeout behavior. On expiry, glue requests child termination, uses its existing two-second escalation, and records the result as `Unknown`; native input is never resent. A timeout is not proof that every descendant has exited, so the owning process supervisor must verify the exact process family before declaring cleanup complete.
+
 ## Operation boundary
 
 | Host operation | Behavior |

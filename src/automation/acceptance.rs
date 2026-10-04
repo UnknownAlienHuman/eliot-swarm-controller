@@ -18,6 +18,7 @@ use std::collections::BTreeSet;
 pub(crate) struct AcceptanceContext {
     technical_requester_id: String,
     effective_manager_id: String,
+    review_assignment_sponsor_id: String,
     automation_id: String,
     automation_revision: i64,
     project_id: String,
@@ -29,6 +30,13 @@ pub(crate) struct AcceptanceContext {
     check_ids: Vec<String>,
 }
 
+pub(crate) struct AcceptanceReviewEvidence {
+    pub(crate) identity: ReviewSlotIdentity,
+    pub(crate) assignment_id: String,
+    pub(crate) result_operation_id: String,
+    pub(crate) assignment_sponsor_id: String,
+}
+
 struct StoredAcceptanceOperation {
     caller_id: String,
     method: String,
@@ -38,19 +46,34 @@ struct StoredAcceptanceOperation {
     effective_request_json: String,
 }
 
+struct RetainedAssignmentOperation {
+    caller_id: String,
+    method: String,
+    state: String,
+    result_json: String,
+}
+
 impl AcceptanceContext {
     pub(crate) fn from_committed_entry(
         db: &Connection,
         entry: &config::AutomationEntry,
-        identity: ReviewSlotIdentity,
-        review_assignment_id: &str,
-        review_result_operation_id: &str,
+        review: AcceptanceReviewEvidence,
         expected_feedback_observation_id: i64,
         check_ids: Vec<String>,
     ) -> Result<Self> {
+        let AcceptanceReviewEvidence {
+            identity,
+            assignment_id: review_assignment_id,
+            result_operation_id: review_result_operation_id,
+            assignment_sponsor_id: review_assignment_sponsor_id,
+        } = review;
         config::validate_entry(entry)?;
-        validate_identity_text(review_assignment_id, "review_assignment_id")?;
-        validate_identity_text(review_result_operation_id, "review_result_operation_id")?;
+        validate_identity_text(&review_assignment_id, "review_assignment_id")?;
+        validate_identity_text(&review_result_operation_id, "review_result_operation_id")?;
+        validate_identity_text(
+            &review_assignment_sponsor_id,
+            "review_assignment_sponsor_id",
+        )?;
         validate_check_ids(&check_ids)?;
         if !entry.enabled
             || !entry.steps.contains(&AutomationStep::Acceptance)
@@ -68,6 +91,15 @@ impl AcceptanceContext {
             return Err(Error::new(
                 "REVIEW_RESULT_DAMAGED",
                 "acceptance requires a valid current primary review slot",
+            ));
+        }
+
+        let retained_sponsor =
+            retained_review_assignment_sponsor(db, &review_assignment_id, &identity)?;
+        if retained_sponsor != review_assignment_sponsor_id {
+            return Err(Error::new(
+                "REVIEW_ASSIGNMENT_DAMAGED",
+                "retained assignment sponsor differs from the review evidence",
             ));
         }
 
@@ -106,13 +138,14 @@ impl AcceptanceContext {
         Ok(Self {
             technical_requester_id: authorization::AUTOMATION_TECHNICAL_REQUESTER_ID.to_owned(),
             effective_manager_id: entry.owner_manager_id.clone(),
+            review_assignment_sponsor_id,
             automation_id: entry.automation_id.clone(),
             automation_revision: entry.revision,
             project_id: entry.project_id.clone(),
             gm_epoch: gm.epoch,
             expected_feedback_observation_id,
-            review_assignment_id: review_assignment_id.to_owned(),
-            review_result_operation_id: review_result_operation_id.to_owned(),
+            review_assignment_id,
+            review_result_operation_id,
             identity,
             check_ids: sorted_check_ids(check_ids),
         })
@@ -173,6 +206,8 @@ impl AcceptanceContext {
         let automation_id = model::text(saved_link, "automation_id")?;
         let assignment_id = model::text(&saved_link["cause"], "review_assignment_id")?;
         let result_operation_id = model::text(&saved_link["cause"], "review_result_operation_id")?;
+        let review_assignment_sponsor_id =
+            model::text(&saved_link["cause"], "review_assignment_sponsor_id")?.to_owned();
         let identity: ReviewSlotIdentity =
             serde_json::from_value(saved_link["cause"]["identity"].clone()).map_err(|_| {
                 Error::new(
@@ -212,9 +247,12 @@ impl AcceptanceContext {
         let context = Self::from_committed_entry(
             db,
             &entry,
-            identity,
-            assignment_id,
-            result_operation_id,
+            AcceptanceReviewEvidence {
+                identity,
+                assignment_id: assignment_id.to_owned(),
+                result_operation_id: result_operation_id.to_owned(),
+                assignment_sponsor_id: review_assignment_sponsor_id,
+            },
             request.expected_feedback_observation_id,
             check_ids,
         )?;
@@ -347,6 +385,10 @@ impl AcceptanceContext {
         &self.review_result_operation_id
     }
 
+    pub(crate) fn review_assignment_sponsor_id(&self) -> &str {
+        &self.review_assignment_sponsor_id
+    }
+
     pub(crate) fn identity(&self) -> &ReviewSlotIdentity {
         &self.identity
     }
@@ -360,6 +402,7 @@ impl AcceptanceContext {
             "kind":"review_result",
             "review_assignment_id":self.review_assignment_id,
             "review_result_operation_id":self.review_result_operation_id,
+            "review_assignment_sponsor_id":self.review_assignment_sponsor_id,
             "identity":self.identity,
             "check_ids":self.check_ids,
         })
@@ -390,6 +433,7 @@ impl AcceptanceContext {
     pub(crate) fn semantic_request_id(&self) -> Result<String> {
         let identity = model::canonical(&json!([
             self.effective_manager_id,
+            self.review_assignment_sponsor_id,
             self.identity.task_id,
             self.identity.task_revision,
             self.identity.attempt_id,
@@ -401,6 +445,86 @@ impl AcceptanceContext {
         ]))?;
         Ok(model::digest(identity.as_bytes()))
     }
+}
+
+const REVIEW_STREAM: &str = "controller:review";
+
+fn retained_review_assignment_sponsor(
+    db: &Connection,
+    review_assignment_id: &str,
+    identity: &ReviewSlotIdentity,
+) -> Result<String> {
+    let assignment_key = format!("assignment:{review_assignment_id}");
+    let row: Option<(String, String)> = db
+        .query_row(
+            "SELECT payload_json,operation_id FROM observations \
+             WHERE source_stream_id=?1 AND source_event_key=?2 AND kind='review.assignment'",
+            rusqlite::params![REVIEW_STREAM, assignment_key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let (payload, operation_id) = row.ok_or_else(|| {
+        Error::new(
+            "REVIEW_ASSIGNMENT_DAMAGED",
+            "acceptance linkage has no retained review assignment",
+        )
+    })?;
+    let assignment: Value = serde_json::from_str(&payload).map_err(|_| {
+        Error::new(
+            "REVIEW_ASSIGNMENT_DAMAGED",
+            "retained review assignment is invalid",
+        )
+    })?;
+    let expected_identity = serde_json::to_value(identity)?;
+    let sponsor_id = model::text(&assignment, "sponsor_client_id")?.to_owned();
+    if assignment["review_assignment_id"] != review_assignment_id
+        || assignment["operation_id"] != operation_id
+        || assignment["identity"] != expected_identity
+    {
+        return Err(Error::new(
+            "REVIEW_ASSIGNMENT_DAMAGED",
+            "retained review assignment differs from its exact acceptance scope",
+        ));
+    }
+
+    let operation: Option<RetainedAssignmentOperation> = db
+        .query_row(
+            "SELECT caller_id,method,state,result_json FROM operations WHERE operation_id=?1",
+            [&operation_id],
+            |row| {
+                Ok(RetainedAssignmentOperation {
+                    caller_id: row.get(0)?,
+                    method: row.get(1)?,
+                    state: row.get(2)?,
+                    result_json: row.get(3)?,
+                })
+            },
+        )
+        .optional()?;
+    let Some(operation) = operation else {
+        return Err(Error::new(
+            "REVIEW_ASSIGNMENT_DAMAGED",
+            "retained review assignment has no settled Operation",
+        ));
+    };
+    let result: Value = serde_json::from_str(&operation.result_json).map_err(|_| {
+        Error::new(
+            "REVIEW_ASSIGNMENT_DAMAGED",
+            "retained review assignment Operation result is invalid",
+        )
+    })?;
+    if operation.method != "review.assign"
+        || operation.state != "settled"
+        || operation.caller_id != sponsor_id
+        || result["review_assignment_id"] != review_assignment_id
+        || result["identity"] != expected_identity
+    {
+        return Err(Error::new(
+            "REVIEW_ASSIGNMENT_DAMAGED",
+            "review assignment sponsor does not match its settled assigning Operation",
+        ));
+    }
+    Ok(sponsor_id)
 }
 
 struct CurrentGm {

@@ -722,19 +722,47 @@ export async function openRun(config, options) {
   let timedOut = false;
   const exit = await new Promise((resolveExit) => {
     let timer = null;
+    let escalationTimer = null;
+    let runSettled = false;
+    let childExited = false;
+    let childClosed = false;
+    const clearTimers = () => {
+      if (timer) clearTimeout(timer);
+      if (escalationTimer) clearTimeout(escalationTimer);
+      timer = null;
+      escalationTimer = null;
+    };
+    const settle = (result) => {
+      if (runSettled) return;
+      runSettled = true;
+      clearTimers();
+      resolveExit(result);
+    };
     if (timeoutMs > 0) {
       timer = setTimeout(() => {
+        if (runSettled || childExited || childClosed) return;
         timedOut = true;
         child.kill("SIGTERM");
-        setTimeout(() => child.kill("SIGKILL"), 2000).unref();
+        if (!runSettled && !childExited && !childClosed) {
+          escalationTimer = setTimeout(() => {
+            if (!runSettled && !childExited && !childClosed) {
+              child.kill("SIGKILL");
+            }
+          }, 2000);
+          escalationTimer.unref();
+        }
       }, timeoutMs);
     }
-    child.on("error", (error) =>
-      resolveExit({ code: null, signal: null, spawnError: error.message }),
-    );
-    child.on("close", (code, signal) => {
-      if (timer) clearTimeout(timer);
-      resolveExit({ code, signal, spawnError: null });
+    child.once("error", (error) => {
+      settle({ code: null, signal: null, spawnError: error.message });
+    });
+    child.once("exit", () => {
+      childExited = true;
+      clearTimers();
+    });
+    child.once("close", (code, signal) => {
+      childClosed = true;
+      settle({ code, signal, spawnError: null });
     });
   });
   // The child is gone; wait until the line reader flushed the final line.
