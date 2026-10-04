@@ -487,18 +487,20 @@ pub fn prepare_lease(
             branch_short.into(),
         ],
     )?;
+    let disabled_hooks_git_path = git_path_argument(&disabled_hooks)?;
+    let workspace_git_path = git_path_argument(workspace_path)?;
     git_text(
         forge_config,
         forge_project,
         &[
             "-c".into(),
-            format!("core.hooksPath={}", disabled_hooks.to_string_lossy()),
+            format!("core.hooksPath={disabled_hooks_git_path}"),
             "worktree".into(),
             "add".into(),
             "-b".into(),
             branch_short.into(),
             "--".into(),
-            workspace_path.to_string_lossy().into_owned(),
+            workspace_git_path,
             baseline_commit.clone(),
         ],
     )?;
@@ -930,11 +932,10 @@ fn verify_worktree(
         ));
     }
     validate_directory_security(workspace_path)?;
+    let workspace_git_path = git_path_argument(workspace_path)?;
+    let expected_worktree_path_key = path_key(Path::new(&workspace_git_path));
     let args = |tail: &[&str]| {
-        let mut result = vec![
-            "-C".to_owned(),
-            workspace_path.to_string_lossy().into_owned(),
-        ];
+        let mut result = vec!["-C".to_owned(), workspace_git_path.clone()];
         result.extend(tail.iter().map(|value| (*value).to_owned()));
         result
     };
@@ -988,7 +989,8 @@ fn verify_worktree(
     let exact_record = worktrees.split("\n\n").any(|record| {
         record.lines().any(|line| {
             line.strip_prefix("worktree ")
-                .is_some_and(|path| path_key(Path::new(path)) == path_key(workspace_path))
+                .and_then(|path| git_path_argument(Path::new(path)).ok())
+                .is_some_and(|path| path_key(Path::new(&path)) == expected_worktree_path_key)
         }) && record.lines().any(|line| line == expected_branch)
     });
     if !exact_record {
@@ -1066,6 +1068,91 @@ fn path_string(path: &Path) -> Result<String> {
         ));
     }
     Ok(value.to_owned())
+}
+
+/// Convert only Windows extended-length disk and UNC paths for Git argv.
+/// Filesystem checks and persisted lease paths keep their canonical form.
+#[cfg(windows)]
+fn git_path_argument(path: &Path) -> Result<String> {
+    use std::path::Prefix;
+
+    let original = path_string(path)?;
+    if !path.is_absolute() {
+        return Err(Error::new(
+            "WORKSPACE_PATH",
+            "Git path arguments must be absolute",
+        ));
+    }
+    let mut components = path.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return Ok(original);
+    };
+    let mut converted = match prefix.kind() {
+        Prefix::Disk(_) | Prefix::UNC(_, _) => return Ok(original),
+        Prefix::VerbatimDisk(drive) => format!("{}:\\", char::from(drive)),
+        Prefix::VerbatimUNC(server, share) => {
+            let server = server
+                .to_str()
+                .ok_or_else(|| Error::new("WORKSPACE_PATH", "Git path prefix is not UTF-8"))?;
+            let share = share
+                .to_str()
+                .ok_or_else(|| Error::new("WORKSPACE_PATH", "Git path prefix is not UTF-8"))?;
+            format!("\\\\{server}\\{share}\\")
+        }
+        Prefix::Verbatim(_) | Prefix::DeviceNS(_) => {
+            return Err(Error::new(
+                "WORKSPACE_PATH",
+                "unsupported Windows device or volume path for Git",
+            ));
+        }
+    };
+    let mut saw_root = false;
+    for component in components {
+        match component {
+            Component::RootDir if !saw_root => saw_root = true,
+            Component::Normal(part) if saw_root => {
+                let part = part.to_str().ok_or_else(|| {
+                    Error::new("WORKSPACE_PATH", "Git path component is not UTF-8")
+                })?;
+                if !converted.ends_with('\\') {
+                    converted.push('\\');
+                }
+                converted.push_str(part);
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(Error::new(
+                    "WORKSPACE_PATH",
+                    "Git paths cannot traverse parent components",
+                ));
+            }
+            _ => {
+                return Err(Error::new(
+                    "WORKSPACE_PATH",
+                    "Windows Git path could not be normalized safely",
+                ));
+            }
+        }
+    }
+    if !saw_root {
+        return Err(Error::new(
+            "WORKSPACE_PATH",
+            "Windows Git path root is missing",
+        ));
+    }
+    Ok(converted)
+}
+
+#[cfg(not(windows))]
+fn git_path_argument(path: &Path) -> Result<String> {
+    let value = path_string(path)?;
+    if !path.is_absolute() {
+        return Err(Error::new(
+            "WORKSPACE_PATH",
+            "Git path arguments must be absolute",
+        ));
+    }
+    Ok(value)
 }
 
 fn path_key(path: &Path) -> String {
@@ -1180,6 +1267,28 @@ mod tests {
         let error =
             reject_reparse_components(&traversing).expect_err("parent traversal remains forbidden");
         assert_eq!(error.code, "WORKSPACE_PATH");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn git_path_arguments_normalize_only_supported_verbatim_roots() {
+        assert_eq!(
+            git_path_argument(Path::new(r"\\?\C:\workspace\worktrees\wt-a"))
+                .expect("verbatim disk path is a supported Git argument"),
+            r"C:\workspace\worktrees\wt-a"
+        );
+        assert_eq!(
+            git_path_argument(Path::new(r"\\?\UNC\server\share\workspace\wt-a"))
+                .expect("verbatim UNC path is a supported Git argument"),
+            r"\\server\share\workspace\wt-a"
+        );
+        assert!(
+            git_path_argument(Path::new(
+                r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\workspace"
+            ))
+            .is_err()
+        );
+        assert!(git_path_argument(Path::new(r"\\.\PhysicalDrive0")).is_err());
     }
 }
 
