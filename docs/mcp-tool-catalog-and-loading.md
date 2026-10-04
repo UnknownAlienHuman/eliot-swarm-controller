@@ -1,14 +1,14 @@
 # ELIOT MCP Tool Catalog and Deferred Loading
 ## Small role-specific core, searchable domain groups, hard authorization and verified runtime capability
 
-**Current C10 status:** Published source `cea63dde1d923f821c436c61f2561bcfb6a4bb0d` passed owned-source formatting, warnings-denied Clippy and debug build; four bounded source audits passed. CI run [37170376636](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37170376636) completed successfully on Windows and Ubuntu. The actual `task.dispatch` schema now carries the optional exact `launch_operation_id` for launch-owned Attempts. The Store packet/current-capability gate and provider-auth path are source-present. The prior native run `bb070791-ba7c-4c71-9cc7-660fbb531418` failed before an owned-service row, MCP proof or Bun call because manifest `runtime.route` metadata was compared as an object against an alias string. The three-file follow-up repair passed independent source audit, formatting, production Clippy (14.67 s) and debug build (35.37 s; candidate SHA-256 `DEDBF403020780A35ED0141A31EF8A43654073B9B2A96CC4BF88AC77B462B528`), but has no final commit SHA or CI yet. New native run `46cef212-aa65-418a-a911-b54502fe9fd7` is active at `awaiting_binding` with held lease and no owned-service row or MCP proof; opening-fence diagnosis is active. Native tool loading and productive dispatch remain unqualified. See [Implementation Status](implementation-status.md).
+**Current qualification status:** See [Implementation Status](implementation-status.md) for current source, gate, and native evidence; this document owns catalog grouping and deferred-loading behavior.
 
 ### Historical C7/C8 catalog qualification snapshot
 **Revision:** 11 — 2026-10-03
 **Source baseline:** C10 `cea63dde1d923f821c436c61f2561bcfb6a4bb0d`; prior C9 CI baseline `2e609ecf7d826da7019fe5e5f2ed397a992bc45a`.
 **Applies to:** [Communication Program](agent-communication-program.md), [Fleet-Scale Freedom](agent-communication-fleet-scale-freedom.md), [MCP Profiles](mcp-profiles.md)
 **Historical C7/C8 CI:** Exact runs and source commits are recorded in [Implementation Status](implementation-status.md).
-All local model/inference remains deferred by owner. C10's provider credential state `stored_unverified` is metadata evidence only, not proof the key is valid or consumed. The prior native run made zero Bun calls and produced no new auth observation or native MCP proof. The current run is active at `awaiting_binding` with no owned-service row or MCP proof; diagnosis continues. The route-shape follow-up passed source audit and build gates, but has no final commit SHA, CI or native qualification yet.
+All local model/inference remains deferred by owner. C10 credential state `stored_unverified` is metadata only, not proof of key validity or consumption. Current native and gate evidence is tracked in [Implementation Status](implementation-status.md).
 
 **Precedence:** this file governs MCP grouping, eager/deferred loading, catalog metadata and launcher-facing tool UX. Existing application authorization and Task/Attempt authority remain unchanged.
 
@@ -76,24 +76,18 @@ fixtures for that exact source. Native run `f368339d-1247-4118-bdac-a5441d29b8be
 timed out before an owned-service row, MCP proof or model after repeated
 `OWNED_SERVICE_SCOPE_STALE`; earlier runs remain unknown with no replay.
 
-C10 source `cea63dde1d923f821c436c61f2561bcfb6a4bb0d` adds the actual
-`task.dispatch` schema field `launch_operation_id`, Store validation of exact
-launch ancestry, an immutable prompt packet, a current C8 capability-proof gate,
-and explicit single-provider credential bootstrap. Owned-source formatting,
-warnings-denied Clippy, debug build and four bounded source audits passed; CI
-37170376636 passed on Windows and Ubuntu. Native run `bb070791-ba7c-4c71-9cc7-660fbb531418`
-ended in `service_start` before an owned-service row, MCP proof or Bun call.
-The cause was a manifest-route object/alias-string comparison before start
-reservation. The three-file follow-up passed independent audit, formatting,
-production Clippy and debug build, but has no final commit SHA or CI yet. Native
-run `46cef212-aa65-418a-a911-b54502fe9fd7` is active at `awaiting_binding`
-with held lease and no owned-service row or MCP proof; diagnosis remains active.
-Native plugin loading, actual harness consumption, callable tools, productive
-dispatch and provider/model execution remain unqualified. `stored_unverified`
-means metadata only, and the failed run made no new credential observation.
+Published C11 source `4ecc030e072be1b3fdf39e2b3ead122953e4de82` retains C10's
+exact `task.dispatch` `launch_operation_id`, launch-ancestry validation,
+immutable prompt packet, current C8 capability-proof gate and explicit
+single-provider credential bootstrap. It adds RepairDispatch and acceptance
+consumers on typed ledgers/cursors, exact same-slot reuse, GM epoch and
+off-database-byte checks, structured requirement reviews, and manager
+history/visibility. Reviewer independence, GM-ownership precondition and
+reviewer-equals-writer checks are fixed. Current source gates and retained native evidence are maintained in [Implementation Status](implementation-status.md).
+Current native capability evidence is maintained in [Implementation Status](implementation-status.md).
 Workspace leases remain database-backed, not an OS-level lock.
 
-The [Canonical MCP Surfaces](mcp-canonical-surfaces-and-topologies.md) document owns exact public names. This document owns group metadata and deferred-loading design. Remaining end-to-end gaps include actual native harness consumption/qualification, productive dispatch after `agent.open`, watched predicates without authoritative sources, broader integration/scope-Git, Concilium, cron, Goal and native-Rust program paths. Do not replace the application authorization layer with catalog metadata.
+The [Canonical MCP Surfaces](mcp-canonical-surfaces-and-topologies.md) document owns exact public names. This document owns group metadata and deferred-loading design. The remaining end-to-end delivery blocks are tracked in [Implementation Status](implementation-status.md). Do not replace the application authorization layer with catalog metadata.
 
 ## 2. Evidence-based design constraints
 

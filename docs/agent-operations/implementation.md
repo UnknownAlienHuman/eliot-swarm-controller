@@ -1,9 +1,9 @@
 # Implementation Plan — Rust Operations on Behalf of the Manager
 
-**Current C10 status:** Published source `cea63dde1d923f821c436c61f2561bcfb6a4bb0d` passed owned-source formatting, warnings-denied Clippy (12.16 s) and debug build (34.84 s); four bounded source audits passed. CI run [37170376636](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37170376636) completed successfully on Windows and Ubuntu. A three-file follow-up repair for the prior native route-shape failure passed independent audit, formatting, production Clippy and debug build; it has no final commit SHA or CI yet. New native run `46cef212-aa65-418a-a911-b54502fe9fd7` is active at `awaiting_binding` with held lease and no owned-service row or MCP proof yet. See [Implementation Status](../implementation-status.md).
+**Current implementation status:** See [Implementation Status](../implementation-status.md) for current source, gate, native qualification, and remaining-work facts. This plan owns the O1–O11 implementation blocks.
 
 ### Historical C7/C8 qualification snapshots
-Revision 19 · 2026-10-03 · current source `cea63dde1d923f821c436c61f2561bcfb6a4bb0d`; C9 CI baseline `2e609ecf7d826da7019fe5e5f2ed397a992bc45a`.
+Revision 20 · 2026-10-04 · current source 4ecc030e072be1b3fdf39e2b3ead122953e4de82; prior C9 CI baseline 2e609ecf7d826da7019fe5e5f2ed397a992bc45a.
 
 Read [README](README.md), then the relevant [Configuration](configuration.md), [Architecture](architecture.md), [Delivery](delivery.md) and [Donor map](donor-map.md). The program remains partial. C4's 221 Rust tests apply only to `2607c8858e573ae40459c27d76d8ae9e1ca9f8fc`.
 
@@ -135,33 +135,41 @@ dispatch to retained Task/Attempt/binding/lease ancestry. Store retains and
 rechecks an immutable prompt packet and current C8 MCP capability proof before
 native input. Its provider-auth path accepts one explicit host-side credential
 source; `stored_unverified` means metadata was observed, not that the key works
-or was consumed by a model. Formatting, warnings-denied Clippy and debug build
-passed, and four bounded source audits passed exact current pins. CI 37170376636
-passed on Windows and Ubuntu. A follow-up three-file route-shape repair also
-passed independent audit, formatting, production Clippy (14.67 s) and debug
-build (35.37 s; candidate SHA-256
-`DEDBF403020780A35ED0141A31EF8A43654073B9B2A96CC4BF88AC77B462B528`); it has
-no final commit SHA or CI yet.
+or was consumed by a model. That source passed CI 37170376636 on Windows and
+Ubuntu. The route-shape repair is published as `e637d45` and passed independent
+source audit (report SHA-256
+`A4089D435AC3DE11D1DFE1A12DED3FEC147FAE21520068697B02ABE98E734BB1`),
+formatting, production Clippy (14.67 s) and debug build (35.37 s; candidate
+SHA-256 `DEDBF403020780A35ED0141A31EF8A43654073B9B2A96CC4BF88AC77B462B528`).
+CI 37172541315 failed the Windows `check_probe` lifetime step after Ubuntu and
+Windows unit tests passed; the focused fixture uses /D to disable ambient CMD AutoRun; the historical cause remains unproven.
 
 Native run `bb070791-ba7c-4c71-9cc7-660fbb531418` ended
 `OWNED_SERVICE_OR_NATIVE_PROOF_TIMEOUT` at `service_start`, after repeated
 `OWNED_SERVICE_SCOPE_STALE` and before any owned-service row, MCP proof, Bun
 call or model call. Its cause was a manifest-route object/alias-string
-comparison before start reservation. The three-file follow-up repair passed
-independent source audit (report SHA-256
+comparison before start reservation. The three-file follow-up repair is
+published as `e637d45` and passed independent source audit (report SHA-256
 `A4089D435AC3DE11D1DFE1A12DED3FEC147FAE21520068697B02ABE98E734BB1`),
-formatting, Clippy and debug build, but has no final commit SHA or CI yet.
-The prior host exited by normal EOF; no replay occurred.
+formatting, Clippy and debug build. CI 37172541315 failed Windows
+`check_probe` lifetime after Ubuntu and Windows unit tests passed; the
+the focused fixture uses /D to disable ambient CMD AutoRun; the historical cause remains unproven. That prior host exited by normal EOF; no
+replay occurred.
 
-New native run `46cef212-aa65-418a-a911-b54502fe9fd7` is active at
-`awaiting_binding` with held lease and no owned-service row or MCP proof yet;
-diagnosis of the remaining opening fences is active. Do not classify it as a
-failure or success. Neither run produced a new credential observation. C11
-repair/acceptance work is being authored and wired across shared tracked files
-plus four new modules, but remains uncompiled and unpublished. Native tool
-loading, productive dispatch, provider/model use and the complete
-manager-owned cycle remain unqualified. All local model/inference execution,
-including PR24/Kilo, remains deferred.
+Native run `46cef212-aa65-418a-a911-b54502fe9fd7` ended at `service_start` after
+240 `BINDING_NOT_READY` observations, before an owned-service row, MCP proof,
+native tool call, or model call. Normal stdin EOF closed the host; the run is
+retained without replay. The opening-fence audit found that database module
+IDs matched the child but `get_binding` omitted instance and artifact IDs. The
+published C11 projection correction advances module IDs past reservation.
+Current retained-run evidence and native qualification are maintained in [Implementation Status](../implementation-status.md). C11 now wires
+RepairDispatch and acceptance consumers to typed ledgers/cursors, exact
+same-slot reuse, GM epoch checks, off-database-bytes verification, structured
+requirement reviews, and manager history/visibility. The reviewer-equals-writer
+consumer defect is patched (snapshot `4E903...`); both bounded exact-source
+audits passed. C11 source is published, while native tool loading, productive dispatch,
+provider/model use and the complete manager-owned cycle remain unqualified.
+All local model/inference execution, including PR24/Kilo, remains deferred.
 - Port owned transport/translation to Rust through documented protocols or maintained libraries; preserve vendor loops externally. Do not silently retain a mandatory internal JS/Python service.
 - Qualify installed protocol/capabilities, not exact release equality. Preserve unknown consequential values and safe additive data.
 - Maintain native binding/generation/session/turn/family and actual process ownership. Never restart/adopt by heuristic merely to activate a new adapter.

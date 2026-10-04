@@ -2,13 +2,25 @@
 
 ## Current state
 
-**C10 source status:** Published main commit `cea63dde1d923f821c436c61f2561bcfb6a4bb0d`. Owned-source formatting passed; warnings-denied production Clippy passed in 12.16 s; the debug build passed in 34.84 s (candidate SHA-256 `CBED6FD418BBE389E136E5716FB6E8394253481A81A3707E7B2F4730DC641ACE`). Four bounded independent source audits for the provider path, typed actor, getter, and consumer passed against their exact current pins. Full CI run [37170376636](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37170376636) completed successfully on Windows and Ubuntu. C9 run 37168223030 remains green only for its exact source `2e609ecf7d826da7019fe5e5f2ed397a992bc45a`.
+**Current source status:** C12 source fa38ea3287dfba0bf9c7e3c7658c4f3aad9580d8 is published. Formatting, JavaScript syntax, production Clippy (14.39 s), debug build (39.04 s), the corrected real-Store regression (1/1, 0.10 s; owner-positive, GM-self and Operator-negative cases), and exact-source audit SHA-256 5A28B4C381492C70D86F7ACE68DEF82EA9DA2202261B26F03FA7C6C4B5CA389D passed. CI run [37176386371](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37176386371) completed successfully on Windows and Ubuntu, verified on 2026-10-04 at 04:28 UTC. The earlier C11 run [37174102156](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37174102156) remains green for exact source 4ecc030e072be1b3fdf39e2b3ead122953e4de82.
 
 C10 adds the optional exact `launch_operation_id` to the actual `task.dispatch` schema and Store contract for launch-owned Attempts. The Store checks the retained parent, exact Task/Attempt/binding/lease lineage, immutable prompt packet, and current C8 MCP capability proof before native input. The owned-provider path accepts one explicitly configured provider credential source and reports `stored_unverified` only for credential metadata; that does not prove key validity or provider/model consumption.
 
-The prior native run `bb070791-ba7c-4c71-9cc7-660fbb531418` ended `OWNED_SERVICE_OR_NATIVE_PROOF_TIMEOUT` at `service_start`, after repeated `OWNED_SERVICE_SCOPE_STALE` and before an owned-service row, MCP proof, Bun call, or model call. Its failure was traced to comparing manifest `runtime.route` metadata as an object against an alias string before start reservation. A three-file follow-up source repair has since passed independent exact-source audit (`.local/pr-implementation/c10-route-shape-audit.md`, report SHA-256 `A4089D435AC3DE11D1DFE1A12DED3FEC147FAE21520068697B02ABE98E734BB1`), package formatting, production Clippy (14.67 s), and debug build (35.37 s; candidate SHA-256 `DEDBF403020780A35ED0141A31EF8A43654073B9B2A96CC4BF88AC77B462B528`). The repair does not yet have a final commit SHA or CI run.
+The prior native run `bb070791-ba7c-4c71-9cc7-660fbb531418` ended `OWNED_SERVICE_OR_NATIVE_PROOF_TIMEOUT` at `service_start`, after repeated `OWNED_SERVICE_SCOPE_STALE` and before an owned-service row, MCP proof, Bun call, or model call. Its failure was traced to comparing manifest `runtime.route` metadata as an object against an alias string before start reservation; the route repair is published in `e637d45`. Historical CI 37172541315 failed the Windows `check_probe` lifetime step; the focused regression now passes with `/D` disabling ambient CMD AutoRun startup hooks in the fixture, but the precise historical cause is unproven.
 
-New native run `46cef212-aa65-418a-a911-b54502fe9fd7` is active. Its current observation is `awaiting_binding` with a held lease and no owned-service row or MCP proof yet; diagnosis of the remaining opening fences is active. Do not classify this run as a final failure or success. The prior `bb070...` run exited by normal EOF; no replay occurred. Earlier runs `f368339d-1247-4118-bdac-a5441d29b8be` and `114d4ca7` remain retained as unknown. No listed run produced a new provider credential observation or model call. Installed R6 is unchanged. C11 repair/acceptance work is being authored and wired across shared tracked files plus four new modules; it remains uncompiled and unpublished. All local model/inference work, including PR24/Kilo, remains deferred.
+Native run 46cef212-aa65-418a-a911-b54502fe9fd7 timed out at service_start after 240 BINDING_NOT_READY observations; normal stdin EOF closed the host, and the run remains retained without replay. Its opening-fence audit found that database module IDs matched the child while get_binding omitted instance and artifact IDs.
+
+Earlier native run e16291b7-0913-43b0-bf72-35fa409ab4da ended with OWNED_SERVICE_OR_NATIVE_PROOF_TIMEOUT at service_start. The start outcome remains unknown; final private-audit SHA-256 is 1CA31BA6A1BD6A093BC32FB5CCA5A06C9D1AC4647A4C4717FB35EC45274ADD42. No MCP proof, owner-ready receipt, connection receipt, or family-stop receipt exists. It remains retained without replay, and process=NULL does not establish whether Bun exists.
+
+C11 wires RepairDispatch and acceptance consumers to typed ledgers/cursors, exact same-slot reuse, GM epoch and byte-verification checks, structured requirement reviews, and manager history/visibility. Reviewer independence, GM-ownership precondition, and reviewer-equals-writer checks are fixed; C11 full CI is recorded above.
+
+C12 publishes the owner-sponsored acceptance route to an independent GM; the real-Store regression covered owner-positive, GM-self, and Operator-negative cases. Source and CI gates are listed above.
+
+OpenCode owned-startup diagnostic e2814fe9-ac32-42be-90b5-7ea4173ee2c2 admitted one launch and reached the helper. Its journal recorded process_identity_failed / OWNED_SERVICE_PROCESS_IDENTITY_UNAVAILABLE with a spawnedPID field. The outcome remains unknown, with no ready or native-proof receipt, and the launch is retained without replay. Host EOF completed normally; departure and helper-family stop proof are not yet known. Do not infer a Bun-exit cause.
+
+An earlier Command preflight stopped before host or model startup with RUN_ROOT_ACL_FAILED while autoloading Get-Acl; an ACL-only private probe passed. Later Command run f413bd5d-149d-4344-972b-125b6b3bf23a passed one bounded Bunny task.dispatch: marker 50 bytes, exit 0, no timeout. Requested route was stealth/space-bunny-alpha; effective model was null/unknown, and the native result exposed no upstream provider/model identity. Proof summary SHA-256 is 1C71DAB9592AE72752032556251A602BD5D268F9BEE42ED06BFCB944196453D2. Module owner family was empty and owner exit was 0; host 50688 exited on EOF with code 0, current owned PIDs were absent, and four Codex processes retained their same birth identities.
+
+This single Command result does not establish Task completion, acceptance, OpenCode service/MCP readiness, model identity, or the full O7 cycle. C13 publication work is active across four writers and remains unbuilt. Its integration exposed a mismatch between the acceptance producer envelope and the historical linkage reader; a producer correction is prepared and unbuilt. Installed R6 is unchanged. All local model/inference work, including PR24/Kilo, remains deferred.
 
 ### Prior C7/C8 evidence
 
@@ -36,43 +48,15 @@ and qualification follow it.
    negotiated contracts, unsupported watch predicates and durable Concilium
    rounds remain.
 
-2. **O1 manager-owned automation actions — Partial.** Owner-scoped configuration
-   get/preview/apply/explain, WorkDispatch, ReviewDispatch, bounded
-   ReviewDisposition, typed manager authority, and shared manual/automatic
-   semantic slots are wired. C10 publishes the launch-parent dispatch schema
-   and Store gate. The prior native failure led to the audited three-file route
-   repair; its new native run is active before owned-service startup. In the
-   published C10 source, RepairDispatch, automated acceptance/publication, and
-   GitHub projection still have no registered consumers. C11 work to add/wire
-   repair and acceptance is in progress but uncompiled and unpublished.
-3. **O2 durable intake and shared monitoring — Partial.** The dispatcher
-   consumes bounded shared intake and journal readback for committed local
-   controller/task.submission observations. Participant credential issuance,
-   authenticated configured/connect readback, and C9 fresh-owned service
-   lifecycle/readback are in the source path. Other source adapters are not
-   admitted. C10's actual MCP schema and provider-auth gate are source-verified.
-   A route-shape follow-up repair passed source audit, formatting, Clippy and
-   build, but has no final commit SHA or CI yet. The new native run is active at
-   `awaiting_binding`, before any owned-service row or MCP proof; native
-   capability and provider/model use remain unqualified.
-4. **Productive launcher, workspace ownership and complete local O7 cycle —
-   Partial.** Queue/context/overlap projections, launch preview, async lease,
-   exact Task claim, `agent.open`, Participant context and WorkDispatch
-   admission exist. C10 adds a launch-linked `task.dispatch` parent/packet and
-   current MCP-proof gate; the prior native attempt stopped before an
-   owned-service row, and the route-shape repair is awaiting final commit/CI.
-   The new native attempt is active at `awaiting_binding` with held lease and no
-   owned-service row or MCP proof yet. Workspace enforcement remains
-   database-backed, with a separate retained-proof service-departure fence.
-   Productive dispatch and the full candidate/review/return/correction/fresh-
-   review/acceptance path remain unqualified.
+2. **O1 manager-owned automation actions — Partial.** Owner-scoped configuration get/preview/apply/explain, WorkDispatch, ReviewDispatch, bounded ReviewDisposition, typed manager authority, and shared manual/automatic semantic slots are wired. C10 publishes the launch-parent dispatch schema and Store gate. C11 adds RepairDispatch and acceptance consumers on typed ledgers/cursors, with same-slot reuse, GM epoch and byte-verification checks, structured reviews, and manager history/visibility. C12 publishes the owner-sponsored acceptance route to an independent GM. Automated publication and GitHub projection remain gaps.
+
+3. **O2 durable intake and shared monitoring — Partial.** The dispatcher consumes bounded shared intake and journal readback for committed local controller/task.submission observations. Participant credential issuance, authenticated configured/connect readback, and C9 fresh-owned service lifecycle/readback are in the source path. Other source adapters are not admitted. C10 actual MCP schema and provider-auth gate are source-verified. Native OpenCode and end-to-end qualification remain partial; see Current State above for the latest evidence.
+
+4. **Productive launcher, workspace ownership and complete local O7 cycle — Partial.** Queue/context/overlap projections, launch preview, async lease, exact Task claim, agent.open, Participant context, WorkDispatch admission and C10 launch-linked task.dispatch gate are implemented. Native service capability remains unqualified. Workspace enforcement remains database-backed, with a separate retained-proof service-departure fence. Productive dispatch and the full candidate/review/return/correction/fresh-review/acceptance path remain unqualified.
 5. **O3 Rust adapters and provider lifecycle — Partial.** Rust OpenCode V2 and
    Zed paths exist alongside JavaScript/Python module bridges. C10 publishes the
    exact provider credential gate; `stored_unverified` denotes credential
-   metadata only, not key validity or model consumption. Neither the prior
-   failed run nor the active run has produced a new credential observation.
-   Native plugin loading, callable tools and provider/model capability remain
-   unqualified.
+   metadata only, not key validity or model consumption. Earlier failed runs produced no new credential observation. Native plugin loading, callable tools and provider/model capability remain unqualified; current native evidence is in Current State above.
 6. **O4 Git/GitHub intake, work pools and distribution — Partial.** Local
    non-force Git ref publication exists as a first slice, with live Git/remote
    qualification pending. GitHub reconciliation, source-to-Task mapping, pool
@@ -92,16 +76,9 @@ and qualification follow it.
    shared manager-enabled progression remain incomplete.
 
 10. **O10 cross-contract parity and O11 integrated qualification — Partial /
-    qualification pending.** C10 formatting, warnings-denied Clippy, debug
-    build and four bounded source audits passed for the published source
-    `cea63dde1d923f821c436c61f2561bcfb6a4bb0d`; CI 37170376636 passed Windows
-    and Ubuntu. The prior native failure was traced to a manifest-route
-    object/alias-string comparison. Its three-file follow-up repair passed
-    source audit, formatter, Clippy and debug build but lacks a final commit SHA
-    and CI. A new native run is active at `awaiting_binding`, with held lease
-    and no owned-service row/MCP proof yet. C9 CI 37168223030 is green for exact
-    source 2e609ec only. Neither CI run proves live MCP/model capability or the
-    complete manager-owned workflow.
+    qualification pending.** Current source gates and retained native evidence are
+    recorded in Current State above. No listed CI run proves live MCP/model
+    capability or the complete manager-owned workflow.
 The status separates implemented slices from authored work and from runtime
 qualification. A registry entry, configuration, or successful unrelated gate
 does not establish productive launch or completion of the local delivery path.

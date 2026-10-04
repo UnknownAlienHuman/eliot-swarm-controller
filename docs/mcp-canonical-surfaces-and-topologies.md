@@ -1,13 +1,13 @@
 # ELIOT MCP Canonical Surfaces and Client Topologies
 
-**Current C10 status:** Published source `cea63dde1d923f821c436c61f2561bcfb6a4bb0d` passed owned-source formatting, warnings-denied Clippy and debug build; four bounded source audits passed. CI run [37170376636](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37170376636) completed successfully on Windows and Ubuntu. C10 adds `launch_operation_id` to the actual `task.dispatch` schema and requires exact retained launch ancestry plus a current MCP capability proof before native input. The prior native run `bb070791-ba7c-4c71-9cc7-660fbb531418` failed before an owned-service row or MCP proof because manifest `runtime.route` metadata was compared as an object against an alias string. The three-file follow-up source repair passed independent audit, package formatting, production Clippy (14.67 s) and debug build (35.37 s; candidate SHA-256 `DEDBF403020780A35ED0141A31EF8A43654073B9B2A96CC4BF88AC77B462B528`); it has no final commit SHA or CI yet. New native run `46cef212-aa65-418a-a911-b54502fe9fd7` is active at `awaiting_binding`, with a held lease and no owned-service row or MCP proof; opening-fence diagnosis is active. See [Implementation Status](implementation-status.md).
+**Current qualification status:** See [Implementation Status](implementation-status.md) for the current source and native qualification; this document remains authoritative for canonical MCP names and authorization contracts.
 
 ### Historical C7/C8 status snapshot
 **Revision:** 11 — 2026-10-03
 **Integration review:** published C5 snapshot `a0a931e` and [Agent Operations PR #23](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/23).
 **Historical C7/C8 CI:** Exact runs and source commits are recorded in [Implementation Status](implementation-status.md).
 
-All local model/inference execution remains deferred by owner. C10 provider authentication is scoped to an explicit credential reference; `stored_unverified` indicates metadata observation only, not key validity or consumption. The prior native run made zero Bun calls and produced no new auth observation, native tool proof, or model call. The current native run is active at `awaiting_binding`; it has not produced an owned-service row or MCP proof, and opening-fence diagnosis is ongoing. The route-shape follow-up source repair passed independent audit and build gates, but has no final commit SHA, CI or native qualification yet.
+All local model/inference execution remains deferred by owner. C10 provider authentication uses an explicit credential reference; `stored_unverified` is metadata only, not proof of key validity or consumption. Current native evidence is maintained in [Implementation Status](implementation-status.md).
 
 This is the canonical convenience-tool list for the [Communication Program](agent-communication-program.md). [Catalog and Loading](mcp-tool-catalog-and-loading.md) owns registry metadata; [Launcher](swarm-launcher-assignment-context.md) owns work context. Older aliases and reviewer examples are corrected here rather than exposed as competing APIs.
 
@@ -97,8 +97,8 @@ All reads are scoped and bounded. GM/operator uses the manager core, with rare a
 | `swarm.agent.steer` | Manager-owned exact `agent.send` semantics, not peer mail. |
 | `swarm.agent.inspect` | One current scoped work/runtime/capability projection. |
 | `swarm.launch` | Linked existing Task/workspace/binding/Participant/runtime admissions, not an MCP-only macro. |
-| `agent.open` | Manager-admitted asynchronous open tied to an exact Task claim and held workspace lease; C10 adds a parent-linked dispatch path, but the latest native attempt stopped before owned-service startup and MCP proof. |
-| `task.dispatch` | Launch-owned Attempts require the exact `launch_operation_id`; Store binds the immutable prompt packet to retained Task/Attempt/binding/lease ancestry and rechecks the current MCP capability proof before native input. The legacy unlinked direct-dispatch contract remains separate; live dispatch is unqualified. |
+| `agent.open` | Manager-admitted asynchronous open tied to an exact Task claim and held workspace lease; C10 adds a parent-linked dispatch path. Current live-service qualification is tracked in [Implementation Status](implementation-status.md). |
+| `task.dispatch` | Launch-owned Attempts require the exact `launch_operation_id`; Store binds the immutable prompt packet to retained Task/Attempt/binding/lease ancestry and rechecks the current MCP capability proof before native input. The legacy unlinked direct-dispatch contract remains separate; current qualification is tracked in [Implementation Status](implementation-status.md). |
 | `swarm.tools.search` | Authorized catalog lookup and loading guidance, not a generic execute-method endpoint. |
 
 Put prompt vocabulary synonyms in search metadata, not additional eager public aliases. Slash notation denotes separate typed methods.
