@@ -205,6 +205,28 @@ fn fixture() -> Fixture {
     }
 }
 
+fn set_native_mcp_manifest(fixture: &Fixture, marker: Value, latest_failure: Value) {
+    let effective = json!({
+        "launch_manifest":{
+            "state":"awaiting_native_mcp",
+            "binding":{
+                "operation_id":OPEN_OPERATION_ID,
+                "binding_id":BINDING_ID,
+                "generation":1,
+            },
+            "native_mcp_readback":marker,
+            "native_mcp_latest_failure":latest_failure,
+        }
+    });
+    fixture
+        .db
+        .execute(
+            "UPDATE operations SET effective_request_json=?1 WHERE operation_id=?2",
+            params![model::canonical(&effective).unwrap(), LAUNCH_OPERATION_ID],
+        )
+        .unwrap();
+}
+
 fn store_read(db: &Connection, caller: Principal, method: &str, params: Value) -> Value {
     let current = super::current_principal(db, caller).unwrap();
     super::read(db, &current, method, &params, &Config::default()).unwrap()
@@ -798,4 +820,165 @@ fn corrupt_optional_startup_diagnostic_returns_a_safe_gap_without_breaking_reads
             .contains(DIAGNOSTIC_MARKER)
     );
     assert_eq!(stored_admission_result(&fixture.db), original_receipt);
+}
+
+#[test]
+fn native_mcp_failure_survives_successful_readback_and_successor_gm_handover() {
+    const RAW_MESSAGE: &str = "RAW_NATIVE_MCP_MESSAGE_private_9137";
+    const RAW_AUTH: &str = "RAW_NATIVE_MCP_AUTH_private_2841";
+    const RAW_PATH: &str = "C:/private/native-mcp/credential-file";
+
+    let mut fixture = fixture();
+    let original_result = stored_admission_result(&fixture.db);
+    let latest_failure = json!({
+        "schema_version":1,
+        "code":"NATIVE_MCP_READBACK_TIMEOUT",
+        "stage":"native_capability_readback",
+        "recorded_at_ms":7,
+        "category":"native_service_unavailable",
+        "message":RAW_MESSAGE,
+        "authorization":RAW_AUTH,
+        "path":RAW_PATH,
+    });
+    let retry_marker = json!({
+        "state":"retry_wait",
+        "attempts":2,
+        "last_attempt_at_ms":7,
+        "next_retry_at_ms":60_007,
+        "last_failure_category":"native_service_unavailable",
+        "last_error_code":"NATIVE_MCP_READBACK_TIMEOUT",
+        "last_error_stage":"native_capability_readback",
+        "dispatch_permitted":false,
+    });
+    set_native_mcp_manifest(&fixture, retry_marker, latest_failure.clone());
+
+    let original_before_readback = store_read(
+        &fixture.db,
+        principal(ORIGINAL_GM, Role::Manager),
+        "operation.get",
+        json!({"operation_id":LAUNCH_OPERATION_ID}),
+    );
+    assert_eq!(original_before_readback["result"], fixture.admission_result);
+    assert_eq!(
+        original_before_readback["native_mcp_readback"]["state"],
+        "retry_wait"
+    );
+    assert_eq!(
+        original_before_readback["native_mcp_readback"]["latest_failure"],
+        json!({
+            "schema_version":1,
+            "code":"NATIVE_MCP_READBACK_TIMEOUT",
+            "stage":"native_capability_readback",
+            "recorded_at_ms":7,
+            "category":"native_service_unavailable",
+        })
+    );
+
+    // A successful partial MCP list read replaces the retry marker while the
+    // producer's sibling latest-failure fact remains durable.
+    let observed_marker = json!({
+        "state":"observed_partial",
+        "attempts":2,
+        "first_observed_at_ms":7,
+        "last_observed_at_ms":12,
+        "next_retry_at_ms":60_012,
+        "observation_id":42,
+        "semantic_digest":format!("sha256:{}", "a".repeat(64)),
+        "dispatch_permitted":false,
+    });
+    set_native_mcp_manifest(&fixture, observed_marker, latest_failure);
+    let original_after_readback = store_read(
+        &fixture.db,
+        principal(ORIGINAL_GM, Role::Manager),
+        "operation.get",
+        json!({"operation_id":LAUNCH_OPERATION_ID}),
+    );
+    assert_eq!(original_after_readback["result"], fixture.admission_result);
+    assert_eq!(
+        original_after_readback["native_mcp_readback"]["state"],
+        "observed_partial"
+    );
+    assert_eq!(
+        original_after_readback["native_mcp_readback"]["latest_failure"],
+        original_before_readback["native_mcp_readback"]["latest_failure"]
+    );
+
+    handover_to_successor(&mut fixture);
+    let successor_operation = store_read(
+        &fixture.db,
+        principal(SUCCESSOR_GM, Role::Manager),
+        "operation.get",
+        json!({"operation_id":LAUNCH_OPERATION_ID}),
+    );
+    assert_eq!(successor_operation["result"], fixture.admission_result);
+    assert_eq!(
+        successor_operation["native_mcp_readback"],
+        original_after_readback["native_mcp_readback"]
+    );
+    let former_operation = store_read(
+        &fixture.db,
+        principal(ORIGINAL_GM, Role::Manager),
+        "operation.get",
+        json!({"operation_id":LAUNCH_OPERATION_ID}),
+    );
+    assert_eq!(former_operation["result"], fixture.admission_result);
+    assert!(former_operation.get("native_mcp_readback").is_none());
+    assert!(former_operation.get("manager_action_required").is_none());
+    assert!(
+        former_operation
+            .get("runtime_dispatch_action_required")
+            .is_none()
+    );
+
+    for public in [
+        &original_before_readback,
+        &original_after_readback,
+        &successor_operation,
+        &former_operation,
+    ] {
+        let encoded = serde_json::to_string(public).unwrap();
+        assert!(!encoded.contains(RAW_MESSAGE));
+        assert!(!encoded.contains(RAW_AUTH));
+        assert!(!encoded.contains(RAW_PATH));
+    }
+
+    // Malformed optional failure data is a bounded diagnostic, not a failed
+    // Operation read and not a channel for private native details.
+    let malformed_failure = json!({
+        "schema_version":9,
+        "code":"private malformed code",
+        "stage":"unknown private stage",
+        "recorded_at_ms":-1,
+        "category":"unknown private category",
+        "message":RAW_MESSAGE,
+        "authorization":RAW_AUTH,
+        "path":RAW_PATH,
+    });
+    let observed_marker = json!({
+        "state":"observed_partial",
+        "attempts":2,
+        "next_retry_at_ms":60_012,
+        "dispatch_permitted":false,
+    });
+    set_native_mcp_manifest(&fixture, observed_marker, malformed_failure);
+    let corrupted = store_read(
+        &fixture.db,
+        principal(SUCCESSOR_GM, Role::Manager),
+        "operation.get",
+        json!({"operation_id":LAUNCH_OPERATION_ID}),
+    );
+    assert_eq!(corrupted["result"], fixture.admission_result);
+    assert_eq!(
+        corrupted["native_mcp_readback"]["state"],
+        "observed_partial"
+    );
+    assert_eq!(
+        corrupted["native_mcp_readback"]["latest_failure"],
+        json!({"schema_version":1,"code":"NATIVE_MCP_DIAGNOSTIC_CORRUPT"})
+    );
+    let encoded = serde_json::to_string(&corrupted).unwrap();
+    assert!(!encoded.contains(RAW_MESSAGE));
+    assert!(!encoded.contains(RAW_AUTH));
+    assert!(!encoded.contains(RAW_PATH));
+    assert_eq!(stored_admission_result(&fixture.db), original_result);
 }

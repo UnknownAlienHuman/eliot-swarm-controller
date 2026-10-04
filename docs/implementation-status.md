@@ -2,6 +2,40 @@
 
 ## Current state
 
+### Latest verified source and C21 evidence — 2026-10-04
+
+Source `4aa85e52d8dfef82431ac9b85537a29bf628341c` passed full Windows and
+remote Ubuntu CI in [37219293550](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37219293550),
+verified on 2026-10-04. Its production Clippy, focused regressions and debug
+build also passed; the qualified debug candidate SHA-256 is
+`BD576B1B29A28002F3BF015EDB6AA5DA6D17C487C86ACEC7E5854E0555AAEEEF`.
+
+C21 run `d88bf29c-b6e5-49a0-9b0f-01ec73a065af` ended with
+`OWNED_SERVICE_OR_NATIVE_PROOF_TIMEOUT` at `service_start`. `agent.open` had
+settled as `native_session_created`; the live binding was ready and connected,
+and 22 actual snapshots completed without axis failures. Native MCP proof was
+never confirmed and no Bunny prompt or inference ran. The fifth C7 marker
+attempt reported `assignment_scope_unavailable`; its exact cause remains
+unknown. The later `native_unavailable`/`reconciling` state came from scoped
+harness cleanup and is not evidence of the startup cause. Preserve the consumed
+run without replay.
+
+The following core increment adds a sibling `native_mcp_latest_failure` record
+with safe exact error code, closed stage, timestamp and category, plus
+current-GM `operation.get` readback at `native_mcp_readback.latest_failure`
+after handover. Package formatting, strict production Clippy, six focused
+producer/Manager startup regressions and debug build passed with unchanged source.
+The producer test passed after correcting an initial filter that selected zero
+tests. Independent Luna source review passed. The new debug candidate SHA-256 is
+`44AC5642E861DA1C3E5CA9DFC94DC83BC2713895C257310CFC2F5447CF5D2750`.
+Full CI and fresh C22 qualification for this follow-on source are pending. Failure
+readback is not input-retry authority and does not authorize replaying a
+`task.dispatch`. The project remains **PARTIAL_PROGRESS**. The installed
+controller and running Codex/OpenCodex remain unchanged; local Linux, WSL and
+local models remain deferred.
+
+### Earlier source and qualification checkpoints
+
 The latest core reliability increment keeps mandatory root validation and moves
 independent optional snapshot reads under one bounded concurrent deadline. A
 slow catalog or child log no longer erases completed axes or starves the other
@@ -25,10 +59,10 @@ Clippy was retained by exact source equivalence. Independent Luna review found
 and closed fatal worker-drain, diagnostic-null and unknown-goal concerns. The
 debug candidate SHA-256 is
 `BD576B1B29A28002F3BF015EDB6AA5DA6D17C487C86ACEC7E5854E0555AAEEEF`.
-Fresh C21 owned-service/native-MCP qualification is prepared but not yet run.
-Full CI for this latest source remains pending. The installed controller and
-the user's running Codex/OpenCodex remain unchanged. Local Linux, WSL and local
-models remain deferred. The project remains **PARTIAL_PROGRESS**.
+At this earlier checkpoint, C21 and full CI were still pending; both have since
+completed as recorded above. The installed controller and the user's running
+Codex/OpenCodex remain unchanged. Local Linux, WSL and local models remain
+deferred. The project remains **PARTIAL_PROGRESS**.
 
 The runtime admission increment now retains a separate bounded
 `runtime_dispatch_action_required` diagnostic for the exact launch/open pair.

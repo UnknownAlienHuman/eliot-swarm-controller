@@ -175,6 +175,37 @@ struct ReadbackClaim {
     first_observed_at_ms: Option<i64>,
 }
 
+#[derive(Clone, Copy)]
+enum ReadbackFailureStage {
+    LaunchSnapshotValidate,
+    NativeCapabilityReadback,
+}
+
+impl ReadbackFailureStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::LaunchSnapshotValidate => "launch_snapshot_validate",
+            Self::NativeCapabilityReadback => "native_capability_readback",
+        }
+    }
+}
+
+struct ReadbackFailure {
+    category: &'static str,
+    code: String,
+    stage: ReadbackFailureStage,
+}
+
+impl ReadbackFailure {
+    fn new(code: &str, stage: ReadbackFailureStage) -> Self {
+        Self {
+            category: failure_category(code),
+            code: safe_error_code(code),
+            stage,
+        }
+    }
+}
+
 struct LoadedArtifacts {
     credential: Credential,
     profile_config: McpConfig,
@@ -525,12 +556,13 @@ impl Store {
             previous_semantic_digest: claim.previous_semantic_digest.clone(),
             first_observed_at_ms: claim.first_observed_at_ms,
         };
-        let failure_category = failure_category(&error.code);
+        let failure =
+            ReadbackFailure::new(&error.code, ReadbackFailureStage::NativeCapabilityReadback);
         let now = model::now_ms()?;
         let result = self
             .run(move |db| {
                 let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                let outcome = record_retry(&tx, &claim, now, failure_category)?;
+                let outcome = record_retry(&tx, &claim, now, &failure)?;
                 tx.commit()?;
                 Ok(outcome)
             })
@@ -615,10 +647,12 @@ fn claim_next_readback(tx: &Transaction<'_>, now: i64, config: &Config) -> Resul
                 return Ok(ClaimOutcome::Claimed(Box::new(claim)));
             }
             Err(error) => {
+                let failure =
+                    ReadbackFailure::new(&error.code, ReadbackFailureStage::LaunchSnapshotValidate);
                 let marker = retry_marker(
                     attempt,
                     now,
-                    failure_category(&error.code),
+                    &failure,
                     previous.and_then(|old| old["first_observed_at_ms"].as_i64()),
                     previous.and_then(|old| old["observation_id"].as_i64()),
                     previous
@@ -627,6 +661,7 @@ fn claim_next_readback(tx: &Transaction<'_>, now: i64, config: &Config) -> Resul
                 );
                 let mut next_manifest = manifest;
                 next_manifest["native_mcp_readback"] = marker;
+                next_manifest["native_mcp_latest_failure"] = latest_failure(&failure, now);
                 let next_retry_at_ms =
                     next_manifest["native_mcp_readback"]["next_retry_at_ms"].as_i64();
                 persist_manifest(tx, &row, &next_manifest, now)?;
@@ -634,7 +669,9 @@ fn claim_next_readback(tx: &Transaction<'_>, now: i64, config: &Config) -> Resul
                     "operation_id":operation_id,
                     "state":"retry_wait",
                     "attempt":attempt,
-                    "failure_category":failure_category(&error.code),
+                    "failure_category":failure.category,
+                    "last_error_code":failure.code,
+                    "last_error_stage":failure.stage.as_str(),
                     "next_retry_at_ms":next_retry_at_ms,
                     "capability_state":"unknown",
                     "dispatch_permitted":false,
@@ -1164,7 +1201,7 @@ fn record_retry(
     tx: &Transaction<'_>,
     claim: &ReadbackClaim,
     now: i64,
-    category: &'static str,
+    failure: &ReadbackFailure,
 ) -> Result<Value> {
     let operation_id = &claim.snapshot.operation_id;
     let (row, manifest) = match load_launch_manifest(tx, operation_id) {
@@ -1177,7 +1214,7 @@ fn record_retry(
     let marker = retry_marker(
         claim.attempt,
         now,
-        category,
+        failure,
         claim.first_observed_at_ms,
         claim.previous_observation_id,
         claim.previous_semantic_digest.clone(),
@@ -1185,6 +1222,7 @@ fn record_retry(
     let next_retry_at_ms = marker["next_retry_at_ms"].as_i64();
     let mut next_manifest = manifest;
     next_manifest["native_mcp_readback"] = marker;
+    next_manifest["native_mcp_latest_failure"] = latest_failure(failure, now);
     persist_manifest(tx, &row, &next_manifest, now)?;
     Ok(retry_summary(claim, now, next_retry_at_ms, "retry_wait"))
 }
@@ -1208,7 +1246,7 @@ fn retry_summary(
 fn retry_marker(
     attempts: i64,
     now: i64,
-    category: &'static str,
+    failure: &ReadbackFailure,
     first_observed_at_ms: Option<i64>,
     observation_id: Option<i64>,
     semantic_digest: Option<String>,
@@ -1219,7 +1257,9 @@ fn retry_marker(
         "attempts":attempts,
         "last_attempt_at_ms":now,
         "next_retry_at_ms":next_retry_at_ms,
-        "last_failure_category":category,
+        "last_failure_category":failure.category,
+        "last_error_code":failure.code,
+        "last_error_stage":failure.stage.as_str(),
         "first_observed_at_ms":first_observed_at_ms,
         "last_observation_id":observation_id,
         "semantic_digest":semantic_digest,
@@ -1333,6 +1373,32 @@ fn failure_category(code: &str) -> &'static str {
     }
 }
 
+fn safe_error_code(code: &str) -> String {
+    if !code.is_empty()
+        && code.len() <= 64
+        && code.as_bytes().first().is_some_and(u8::is_ascii_uppercase)
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        // Error codes are bounded identifiers. Do not persist Error::message,
+        // native response content, or any private request detail.
+        code.to_owned()
+    } else {
+        "NATIVE_MCP_READBACK_ERROR".to_owned()
+    }
+}
+
+fn latest_failure(failure: &ReadbackFailure, recorded_at_ms: i64) -> Value {
+    json!({
+        "schema_version":1,
+        "code":failure.code,
+        "stage":failure.stage.as_str(),
+        "recorded_at_ms":recorded_at_ms,
+        "category":failure.category,
+    })
+}
+
 fn valid_opaque_ref(value: &str, prefix: &str) -> bool {
     let Some((actual_prefix, id)) = value.split_once(':') else {
         return false;
@@ -1431,3 +1497,7 @@ fn clone_claim(claim: &ReadbackClaim) -> ReadbackClaim {
         first_observed_at_ms: claim.first_observed_at_ms,
     }
 }
+
+#[cfg(test)]
+#[path = "launcher_native_mcp_failure_tests.rs"]
+mod failure_tests;

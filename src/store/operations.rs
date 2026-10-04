@@ -44,30 +44,122 @@ pub(super) fn get_operation(db: &Connection, id: &str) -> Result<Value> {
     })?)?)
 }
 
-/// Current-manager readback adds only a safe action link for a retained
-/// owned-service startup failure. Other Operation readers keep the existing
-/// projection and visibility boundary.
+/// Current-manager readback adds bounded startup and native-MCP diagnostics.
+/// Other Operation readers keep the existing projection and visibility boundary.
 pub(super) fn get_operation_for_current_manager(
     db: &Connection,
     p: &Principal,
     id: &str,
 ) -> Result<Value> {
     let mut operation = get_operation(db, id)?;
-    if matches!(p.role, Role::Manager | Role::Operator)
+    let current_manager = matches!(p.role, Role::Manager | Role::Operator)
         && super::gm::require_authority(db, p).is_ok()
-        && super::operation_visible_to(db, p, id)?
-        && let Some(action) = owned_service_start_action_for_operation(db, id)?
-    {
+        && super::operation_visible_to(db, p, id)?;
+    if current_manager && let Some(action) = owned_service_start_action_for_operation(db, id)? {
         operation["manager_action_required"] = action;
     }
-    if matches!(p.role, Role::Manager | Role::Operator)
-        && super::gm::require_authority(db, p).is_ok()
-        && super::operation_visible_to(db, p, id)?
-        && let Some(action) = owned_service_dispatch_action_for_operation(db, id)?
-    {
+    if current_manager && let Some(action) = owned_service_dispatch_action_for_operation(db, id)? {
         operation["runtime_dispatch_action_required"] = action;
     }
+    if current_manager && let Some(readback) = native_mcp_readback_for_operation(db, id)? {
+        operation["native_mcp_readback"] = readback;
+    }
     Ok(operation)
+}
+
+fn native_mcp_readback_for_operation(db: &Connection, id: &str) -> Result<Option<Value>> {
+    let raw: Option<String> = db
+        .query_row(
+            "SELECT json_object(
+                'marker',json_extract(effective_request_json,'$.launch_manifest.native_mcp_readback'),
+                'has_marker',json_type(effective_request_json,'$.launch_manifest.native_mcp_readback') IS NOT NULL,
+                'latest_failure',json_extract(effective_request_json,'$.launch_manifest.native_mcp_latest_failure'),
+                'has_failure',json_type(effective_request_json,'$.launch_manifest.native_mcp_latest_failure') IS NOT NULL
+             ) FROM operations WHERE operation_id=?1 AND method='swarm.launch'",
+            [id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(raw) = raw else { return Ok(None) };
+    // A damaged optional diagnostic must not hide the retained Operation.
+    if raw.len() > 4096 {
+        return Ok(Some(native_mcp_diagnostic_corrupt()));
+    }
+    let retained: Value = match serde_json::from_str(&raw) {
+        Ok(value) => value,
+        _ => return Ok(Some(native_mcp_diagnostic_corrupt())),
+    };
+    let has_marker = retained["has_marker"].as_i64() == Some(1);
+    let has_failure = retained["has_failure"].as_i64() == Some(1);
+    if !has_marker && !has_failure {
+        return Ok(None);
+    }
+    let mut public = json!({"schema_version":1});
+    if has_marker {
+        let marker = &retained["marker"];
+        match marker["state"].as_str() {
+            Some(state @ ("reading" | "retry_wait" | "observed_partial")) => {
+                public["state"] = json!(state);
+            }
+            _ => public = native_mcp_diagnostic_corrupt(),
+        }
+        for key in ["attempts", "next_retry_at_ms"] {
+            if let Some(value) = marker[key].as_i64().filter(|value| *value >= 0) {
+                public[key] = json!(value);
+            }
+        }
+        if let Some(category) = marker["last_failure_category"]
+            .as_str()
+            .filter(|category| safe_native_mcp_failure_category(category))
+        {
+            public["last_failure_category"] = json!(category);
+        }
+    }
+    if has_failure {
+        let failure = &retained["latest_failure"];
+        let valid = failure["schema_version"].as_u64() == Some(1)
+            && failure["code"]
+                .as_str()
+                .is_some_and(safe_start_failure_error_code)
+            && failure["stage"].as_str().is_some_and(|stage| {
+                matches!(
+                    stage,
+                    "launch_snapshot_validate" | "native_capability_readback"
+                )
+            })
+            && failure["recorded_at_ms"]
+                .as_i64()
+                .is_some_and(|time| time >= 0)
+            && failure["category"]
+                .as_str()
+                .is_some_and(safe_native_mcp_failure_category);
+        public["latest_failure"] = if valid {
+            json!({
+                "schema_version":1,
+                "code":failure["code"],
+                "stage":failure["stage"],
+                "recorded_at_ms":failure["recorded_at_ms"],
+                "category":failure["category"],
+            })
+        } else {
+            json!({"schema_version":1,"code":"NATIVE_MCP_DIAGNOSTIC_CORRUPT"})
+        };
+    }
+    Ok(Some(public))
+}
+
+fn safe_native_mcp_failure_category(category: &str) -> bool {
+    matches!(
+        category,
+        "native_service_unavailable"
+            | "scoped_artifact_or_credential_unavailable"
+            | "assignment_scope_unavailable"
+            | "native_readback_incomplete"
+    )
+}
+
+fn native_mcp_diagnostic_corrupt() -> Value {
+    json!({"schema_version":1,"state":"unknown","code":"NATIVE_MCP_DIAGNOSTIC_CORRUPT"})
 }
 
 /// Retain only the safe code and closed stage for a failure selecting an

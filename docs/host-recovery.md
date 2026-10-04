@@ -28,6 +28,16 @@ Managers receive only the validated code and timestamp. Damaged optional history
 produces `NATIVE_FAILURE_DIAGNOSTIC_CORRUPT` without a fabricated timestamp and
 does not hide the rest of the binding state.
 
+The current source also retains native MCP readback failures in the launch
+manifest's sibling `native_mcp_latest_failure` record. It exposes only the safe
+error code, closed stage, timestamp and category; current-GM
+`operation.get` includes `native_mcp_readback.latest_failure` after handover.
+The producer and current-manager readback have passed the focused source gate,
+as recorded in `implementation-status.md`; fresh native qualification is pending.
+The receipt is failure history, not native MCP
+proof, dispatch authority or retry permission. Reading it does not authorize
+replaying a `task.dispatch` or repeating an uncertain input.
+
 An OpenCode snapshot requires a validated root-session read. Its independent
 optional read axes share a bounded deadline inside the existing whole-snapshot
 budget. A slow configuration, family, request or child-log read produces a
