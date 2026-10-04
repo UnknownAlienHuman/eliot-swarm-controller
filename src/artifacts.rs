@@ -290,13 +290,31 @@ impl ArtifactFiles {
     pub fn verify(&self, record: &ArtifactRecord) -> Result<()> {
         self.verified_range(record, 0, 0).map(|_| ())
     }
+    /// Read back an existing immutable artifact. Absence is distinct from a
+    /// damaged body or any other I/O failure; this method never creates files.
+    pub fn verify_existing(&self, record: &ArtifactRecord) -> Result<bool> {
+        let Some(file) = self.open_regular_existing(record)? else {
+            return Ok(false);
+        };
+        self.verified_range_from_file(record, file, 0, 0)?;
+        Ok(true)
+    }
     fn verified_range(
         &self,
         record: &ArtifactRecord,
         offset: u64,
         length: usize,
     ) -> Result<Vec<u8>> {
-        let mut file = self.open_regular(record)?;
+        let file = self.open_regular(record)?;
+        self.verified_range_from_file(record, file, offset, length)
+    }
+    fn verified_range_from_file(
+        &self,
+        record: &ArtifactRecord,
+        mut file: File,
+        offset: u64,
+        length: usize,
+    ) -> Result<Vec<u8>> {
         let mut hash = Sha256::new();
         let mut buffer = [0u8; MAX_PAGE_BYTES];
         let mut position = 0u64;

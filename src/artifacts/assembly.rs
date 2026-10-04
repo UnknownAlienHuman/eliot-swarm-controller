@@ -215,22 +215,34 @@ impl ArtifactFiles {
         result
     }
     pub(super) fn open_regular(&self, record: &ArtifactRecord) -> Result<File> {
+        self.open_regular_existing(record)?
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound).into())
+    }
+    pub(super) fn open_regular_existing(&self, record: &ArtifactRecord) -> Result<Option<File>> {
         let path = self.path(record)?;
-        let m = fs::symlink_metadata(&path)?;
+        let m = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
         if !m.is_file() || m.file_type().is_symlink() || m.len() != record.byte_length {
             return Err(Error::new(
                 "ARTIFACT_DAMAGED",
                 "assembled artifact file or length changed",
             ));
         }
-        let file = File::open(path)?;
+        let file = match File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
         if file.metadata()?.len() != record.byte_length {
             return Err(Error::new(
                 "ARTIFACT_DAMAGED",
                 "artifact changed during open",
             ));
         }
-        Ok(file)
+        Ok(Some(file))
     }
     pub(super) fn read_assembled(
         &self,
