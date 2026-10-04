@@ -20,12 +20,20 @@ production source equivalence independently checked. Independent Luna review
 passed at the final file hashes. The new candidate SHA-256 is
 `867E9FF4107DDB558612C38D3210486963783E39490328479FC24517421DB5AE`.
 
-C28 is prepared for a fresh native startup qualification with this candidate.
+C28 run `b7b1f673-03c0-400b-9f2e-a954fdbdb22f` used this candidate and ended with
+`NATIVE_MCP_PROOF_PLUGIN_STATE_MISMATCH` at `challenge_preflight` (`exec24279`,
+exit 1). The expected plugin ID passed the missing/nonunique guards, but active
+server state did not pass. The current-Manager error projection validated once
+with zero failures or corruption; C7 readbacks validated twice with zero failures.
+The challenge remained prepared and no effect was reserved. Plugin activation
+is under a bounded source audit; the exact native error body was not retained.
+Preserve the consumed C28 claim without replay. C29 is fresh preparation only.
+
 The offline probe and source gate do not prove plugin activation, callable MCP
 tools or model execution. Hosted Bunny qualification follows successful native
-MCP qualification. The installed controller and current Codex/OpenCodex are
-unchanged. Local Linux, WSL and local models remain deferred. The project remains
-**PARTIAL_PROGRESS**.
+MCP qualification. The installed controller and all protected Codex processes
+were unchanged after C28 cleanup. Local Linux, WSL and local models remain
+deferred. The project remains **PARTIAL_PROGRESS**.
 
 ### Latest qualified source and C27 terminal outcome — 2026-10-04
 

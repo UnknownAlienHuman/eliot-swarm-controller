@@ -105,6 +105,15 @@ and native run are recorded in `implementation-status.md`.
 Preserve the consumed C27 claim without replay. C24 hosted Bunny remains private
 preparation until full native MCP proof exists.
 
+C28 used the qualified Windows configuration-path correction and ended with
+`NATIVE_MCP_PROOF_PLUGIN_STATE_MISMATCH` at `challenge_preflight`. The current
+Manager again read the exact persisted code, stage and timestamp successfully
+(one validated C8 readback, zero failed or corrupt readbacks). The expected
+plugin ID existed and passed uniqueness validation; its active server state
+failed validation. No challenge effect was reserved. This error delivery is
+qualified for that exact failure and does not prove plugin activation, callable
+tools or model execution. Preserve the consumed C28 claim without replay.
+
 An OpenCode snapshot requires a validated root-session read. Its independent
 optional read axes share a bounded deadline inside the existing whole-snapshot
 budget. A slow configuration, family, request or child-log read produces a
