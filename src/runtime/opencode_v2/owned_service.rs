@@ -6,7 +6,7 @@
 //! A process effect is one-shot; recovery reads exact owner evidence and never
 //! starts a replacement.
 
-use super::{ModelRef, Options, Service, mcp_plugin};
+use super::{ModelRef, Options, Service, mcp_plugin, provider_auth};
 use crate::{
     config::OwnedOpenCodeServiceConfig,
     error::{Error, Result},
@@ -53,6 +53,7 @@ pub(crate) struct OwnedServiceRoute {
     service_id: String,
     model: ModelRef,
     model_catalog: String,
+    credential_ref: Option<String>,
     bun_executable: PathBuf,
     bun_sha256: String,
     server_program: PathBuf,
@@ -72,6 +73,13 @@ impl OwnedServiceRoute {
         if config.origin != "fresh_owned_service"
             || config.model_catalog != "offline" && config.model_catalog != "refresh"
             || !config.model.valid()
+            || config
+                .credential_ref
+                .as_deref()
+                .is_some_and(|credential_ref| {
+                    provider_auth::validate_ref(credential_ref).is_err()
+                        || config.model.provider_id != "opencode-go"
+                })
         {
             return Err(config_error("invalid fresh-owned OpenCode declaration"));
         }
@@ -105,6 +113,7 @@ impl OwnedServiceRoute {
             service_id: config.service_id.clone(),
             model: config.model.clone(),
             model_catalog: config.model_catalog.clone(),
+            credential_ref: config.credential_ref.clone(),
             bun_executable,
             bun_sha256,
             server_program,
@@ -150,6 +159,12 @@ impl OwnedServiceRoute {
 
     pub(crate) fn service_id(&self) -> &str {
         &self.service_id
+    }
+    pub(crate) fn credential_ref(&self) -> Option<&str> {
+        self.credential_ref.as_deref()
+    }
+    pub(crate) fn model_ref(&self) -> &ModelRef {
+        &self.model
     }
     pub(crate) fn version(&self) -> &str {
         VERSION
@@ -197,6 +212,10 @@ impl OwnedServiceRoute {
             "password_file":path_text(&self.password_file)?,
             "connection_file":path_text(&self.connection_file)?, "config_file":path_text(&self.config_file)?,
         });
+        let mut value = value;
+        if let Some(credential_ref) = &self.credential_ref {
+            value["credential_ref"] = json!(credential_ref);
+        }
         Ok(model::digest(model::canonical(&value)?.as_bytes()))
     }
 
@@ -227,6 +246,7 @@ pub(crate) struct PreparedOwnedService {
     plugin: mcp_plugin::PreparedPluginConfig,
     config_digest: String,
     intent: OwnedServiceIntent,
+    provider_credential: Option<provider_auth::PreparedProviderCredential>,
 }
 
 impl PreparedOwnedService {
@@ -239,6 +259,29 @@ pub(crate) fn prepare_owned_service(
     route: &OwnedServiceRoute,
     intent: &OwnedServiceIntent,
 ) -> Result<PreparedOwnedService> {
+    prepare_owned_service_with_provider_auth(route, intent, None)
+}
+
+/// Prepare one owned route with its explicitly authorized host credential.
+/// The path is consumed only here and is never copied into route, plan or Store.
+pub(crate) fn prepare_owned_service_with_provider_auth(
+    route: &OwnedServiceRoute,
+    intent: &OwnedServiceIntent,
+    auth_source: Option<&Path>,
+) -> Result<PreparedOwnedService> {
+    match (route.credential_ref(), auth_source) {
+        (Some(_), Some(_)) | (None, None) => {}
+        (Some(_), None) => {
+            return Err(config_error(
+                "owned route credential reference has no authorized host source",
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(config_error(
+                "provider credentials cannot be supplied to a route without a reference",
+            ));
+        }
+    }
     route.verify_files()?;
     validate_directory_components(&route.state_root)?;
     match fs::symlink_metadata(&route.state_root) {
@@ -257,11 +300,28 @@ pub(crate) fn prepare_owned_service(
     }
     let plugin = mcp_plugin::prepare_plugin_config(route, intent)?;
     let config_digest = plugin.config_digest().to_owned();
+    let provider_credential = match (route.credential_ref(), auth_source) {
+        (Some(credential_ref), Some(path)) => Some(provider_auth::prepare_credential(
+            credential_ref,
+            &route.model,
+            path,
+            intent.owner_nonce(),
+            &route.route_digest()?,
+            intent.scope_digest(),
+        )?),
+        (None, None) => None,
+        _ => {
+            return Err(scope_error(
+                "provider credential source changed during preparation",
+            ));
+        }
+    };
     Ok(PreparedOwnedService {
         route: route.clone(),
         plugin,
         config_digest,
         intent: intent.clone(),
+        provider_credential,
     })
 }
 
@@ -273,6 +333,7 @@ pub(crate) struct OwnedServiceStartPermit {
     route_digest: String,
     config_digest: String,
     scope_digest: String,
+    provider_auth: Option<provider_auth::ProviderAuthPermit>,
     consumed: bool,
 }
 
@@ -294,11 +355,29 @@ impl OwnedServiceStartPermit {
                 "start permit does not match the exact Store-owned route",
             ));
         }
+        let provider_auth = prepared
+            .provider_credential
+            .as_ref()
+            .map(|credential| {
+                provider_auth::ProviderAuthPermit::from_start_scope(
+                    credential,
+                    intent.owner_nonce(),
+                    &route_digest,
+                    intent.scope_digest(),
+                )
+            })
+            .transpose()?;
+        if prepared.route.credential_ref().is_some() != provider_auth.is_some() {
+            return Err(scope_error(
+                "provider authorization permit does not match the owned route",
+            ));
+        }
         Ok(Self {
             owner_nonce: intent.owner_nonce().to_owned(),
             route_digest,
             config_digest: prepared.config_digest.clone(),
             scope_digest: intent.scope_digest().to_owned(),
+            provider_auth,
             consumed: false,
         })
     }
@@ -391,13 +470,26 @@ impl OwnedServiceReadback {
         route: &OwnedServiceRoute,
         intent: &OwnedServiceIntent,
     ) -> Result<Self> {
-        Self::from_route_value(value, route, intent.owner_nonce())
+        Self::from_route_value(value, route, intent.owner_nonce(), true)
+    }
+
+    pub(crate) fn from_retained_value(value: &Value, route: &OwnedServiceRoute) -> Result<Self> {
+        Self::from_route_value(value, route, route.owner_nonce(), true)
+    }
+
+    fn from_private_value(
+        value: &Value,
+        route: &OwnedServiceRoute,
+        owner_nonce: &str,
+    ) -> Result<Self> {
+        Self::from_route_value(value, route, owner_nonce, false)
     }
 
     fn from_route_value(
         value: &Value,
         route: &OwnedServiceRoute,
         owner_nonce: &str,
+        require_provider_auth: bool,
     ) -> Result<Self> {
         let object = value
             .as_object()
@@ -421,8 +513,11 @@ impl OwnedServiceReadback {
             "plugin_loaded",
             "dispatch_permitted",
         ];
-        if object.len() != expected.len()
-            || object.keys().any(|key| !expected.contains(&key.as_str()))
+        let has_provider_auth = object.contains_key("provider_auth");
+        if object.len() != expected.len() + usize::from(has_provider_auth)
+            || object
+                .keys()
+                .any(|key| !expected.contains(&key.as_str()) && key != "provider_auth")
             || value["schema_version"] != 1
             || value["status"] != "ready"
             || value["service_id"] != route.service_id
@@ -474,10 +569,70 @@ impl OwnedServiceReadback {
         {
             return Err(readback_error("process proof is malformed"));
         }
+        match (route.credential_ref(), value.get("provider_auth")) {
+            (Some(credential_ref), Some(provider_proof)) => {
+                provider_auth::validate_proof(provider_proof, provider_auth_scope(route, value)?)?;
+                if provider_proof["credential_ref"] != credential_ref {
+                    return Err(readback_error(
+                        "provider proof differs from the route credential reference",
+                    ));
+                }
+            }
+            (Some(_), None) if require_provider_auth => {
+                return Err(readback_error(
+                    "owned service provider credential is not observed",
+                ));
+            }
+            (Some(_), None) => {}
+            (None, Some(_)) => {
+                return Err(readback_error(
+                    "provider proof is present for a route without a credential reference",
+                ));
+            }
+            (None, None) => {}
+        }
         Ok(Self {
             proof: value.clone(),
         })
     }
+
+    fn with_provider_auth(mut self, route: &OwnedServiceRoute, proof: Value) -> Result<Self> {
+        provider_auth::validate_proof(&proof, provider_auth_scope(route, &self.proof)?)?;
+        let object = self
+            .proof
+            .as_object_mut()
+            .ok_or_else(|| readback_error("owned service proof is malformed"))?;
+        object.insert("provider_auth".into(), proof);
+        Ok(self)
+    }
+}
+
+fn provider_auth_scope<'a>(
+    route: &'a OwnedServiceRoute,
+    proof: &'a Value,
+) -> Result<provider_auth::OwnedServiceAuthScope<'a>> {
+    let credential_ref = route
+        .credential_ref()
+        .ok_or_else(|| readback_error("owned route has no provider credential reference"))?;
+    let pid = proof["process"]["pid"]
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value != 0)
+        .ok_or_else(|| readback_error("owned service process proof is malformed"))?;
+    let birth_token = proof["process"]["birth_token"]
+        .as_str()
+        .filter(|value| is_sha256(value))
+        .ok_or_else(|| readback_error("owned service process proof is malformed"))?;
+    Ok(provider_auth::OwnedServiceAuthScope {
+        credential_ref,
+        model_ref: &route.model,
+        service_id: &route.service_id,
+        service_version: VERSION,
+        owner_nonce: &route.owner_nonce,
+        pid,
+        birth_token,
+        directory: &route.workspace_directory,
+    })
 }
 
 /// Positive no-kill evidence that one exact owner process incarnation has
@@ -555,6 +710,11 @@ pub(crate) async fn start_foreground(
             "owned-service start permit is stale or mismatched",
         )));
     }
+    if prepared.provider_credential.is_some() != permit.provider_auth.is_some() {
+        return Err(OwnedServiceStartFailure::Unknown(scope_error(
+            "provider authorization permit differs from the prepared route",
+        )));
+    }
     permit.consumed = true;
     if prepared.route.verify_files().is_err() {
         return Err(pre_spawn_failure(&prepared.route, &permit, false));
@@ -591,7 +751,7 @@ pub(crate) async fn start_foreground(
             // have started even when the parent could not observe its handle.
             OwnedServiceStartFailure::Unknown(error.into())
         })?;
-    complete_foreground_start(prepared, child)
+    complete_foreground_start(prepared, child, permit.provider_auth.take())
         .await
         .map_err(OwnedServiceStartFailure::Unknown)
 }
@@ -599,6 +759,7 @@ pub(crate) async fn start_foreground(
 async fn complete_foreground_start(
     prepared: PreparedOwnedService,
     mut child: Child,
+    provider_auth_permit: Option<provider_auth::ProviderAuthPermit>,
 ) -> Result<OwnedServiceHandle> {
     let stdin = child
         .stdin
@@ -628,8 +789,12 @@ async fn complete_foreground_start(
     }
     let value: Value = serde_json::from_slice(&line[..count - 1])
         .map_err(|_| readback_error("owned service helper receipt is invalid"))?;
-    let readback =
-        OwnedServiceReadback::from_store_value(&value, &prepared.route, &prepared.intent)?;
+    let mut readback = OwnedServiceReadback::from_route_value(
+        &value,
+        &prepared.route,
+        prepared.intent.owner_nonce(),
+        false,
+    )?;
     let options = prepared.route.options();
     if readback.config_digest() != prepared.config_digest
         || value["plugin_module_sha256"].as_str() != Some(prepared.plugin.module_sha256())
@@ -655,6 +820,20 @@ async fn complete_foreground_start(
         }
     };
     prepared.route.verify_files()?;
+    match (prepared.provider_credential, provider_auth_permit) {
+        (Some(credential), Some(permit)) => {
+            let provider_scope = provider_auth_scope(&prepared.route, &readback.proof)?;
+            let provider_proof =
+                provider_auth::bootstrap_once(&service, credential, permit, provider_scope).await?;
+            readback = readback.with_provider_auth(&prepared.route, provider_proof)?;
+        }
+        (None, None) => {}
+        _ => {
+            return Err(scope_error(
+                "provider credential and one-shot permission do not match",
+            ));
+        }
+    }
     Ok(OwnedServiceHandle {
         route: prepared.route,
         options,
@@ -732,12 +911,11 @@ pub(crate) async fn readback_existing(
     let Some(readback) = read_owned_files(route)? else {
         return Ok(None);
     };
-    let checked = OwnedServiceReadback::from_store_value(&readback.store_proof(), route, intent)?;
-    if let Some(expected) = expected
-        && model::canonical(&checked.store_proof())? != model::canonical(&expected.store_proof())?
-    {
-        return Ok(None);
-    }
+    let mut checked = OwnedServiceReadback::from_private_value(
+        &readback.store_proof(),
+        route,
+        intent.owner_nonce(),
+    )?;
     let pid = checked.pid();
     let identity = process_image_identity(pid)?;
     verify_process_identity(
@@ -763,11 +941,24 @@ pub(crate) async fn readback_existing(
         checked.binary_sha256(),
         checked.birth_token(),
     )?;
+    if route.credential_ref().is_some() {
+        let auth_proof = provider_auth::verify_retained_connection(
+            &service,
+            provider_auth_scope(route, &checked.proof)?,
+        )
+        .await?;
+        checked = checked.with_provider_auth(route, auth_proof)?;
+    }
+    if let Some(expected) = expected
+        && model::canonical(&checked.store_proof())? != model::canonical(&expected.store_proof())?
+    {
+        return Ok(None);
+    }
     Ok(Some(OwnedServiceHandle {
         route: route.clone(),
         options,
         service,
-        readback,
+        readback: checked,
         helper: None,
         helper_stdin: None,
     }))
@@ -781,12 +972,19 @@ pub(crate) async fn readback_retained(
 ) -> Result<OwnedServiceHandle> {
     route.verify_files()?;
     let owner_nonce = route.owner_nonce();
-    let expected = OwnedServiceReadback::from_route_value(stored_proof, route, owner_nonce)?;
-    let readback = read_owned_files(route)?
+    let expected = OwnedServiceReadback::from_route_value(stored_proof, route, owner_nonce, true)?;
+    let private_readback = read_owned_files(route)?
         .ok_or_else(|| readback_error("retained owned service owner is unavailable"))?;
-    let checked =
-        OwnedServiceReadback::from_route_value(&readback.store_proof(), route, owner_nonce)?;
-    if model::canonical(&checked.store_proof())? != model::canonical(&expected.store_proof())? {
+    let mut checked = OwnedServiceReadback::from_private_value(
+        &private_readback.store_proof(),
+        route,
+        owner_nonce,
+    )?;
+    let mut expected_base = expected.store_proof();
+    if let Some(object) = expected_base.as_object_mut() {
+        object.remove("provider_auth");
+    }
+    if model::canonical(&checked.store_proof())? != model::canonical(&expected_base)? {
         return Err(readback_error(
             "live owned service differs from its retained startup proof",
         ));
@@ -808,6 +1006,20 @@ pub(crate) async fn readback_retained(
         checked.binary_sha256(),
     )
     .await?;
+    if route.credential_ref().is_some() {
+        let observed_auth = provider_auth::verify_retained_connection(
+            &service,
+            provider_auth_scope(route, &checked.proof)?,
+        )
+        .await?;
+        if model::canonical(&observed_auth)? != model::canonical(&expected.proof["provider_auth"])?
+        {
+            return Err(readback_error(
+                "live provider connection metadata differs from its retained proof",
+            ));
+        }
+        checked = checked.with_provider_auth(route, observed_auth)?;
+    }
     let identity = process_image_identity(pid)?;
     verify_process_identity(
         route,
@@ -820,7 +1032,7 @@ pub(crate) async fn readback_retained(
         route: route.clone(),
         options,
         service,
-        readback,
+        readback: checked,
         helper: None,
         helper_stdin: None,
     })
@@ -837,6 +1049,8 @@ struct HelperPlan {
     version: String,
     model: ModelRef,
     model_catalog: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    credential_ref: Option<String>,
     bun_executable: PathBuf,
     bun_sha256: String,
     server_program: PathBuf,
@@ -906,6 +1120,7 @@ fn materialize_launch(
             version: VERSION.into(),
             model: route.model.clone(),
             model_catalog: route.model_catalog.clone(),
+            credential_ref: route.credential_ref.clone(),
             bun_executable: route.bun_executable.clone(),
             bun_sha256: route.bun_sha256.clone(),
             server_program: route.server_program.clone(),
@@ -1521,6 +1736,7 @@ pub(crate) fn observe_departure(
             stored_proof,
             route,
             route.owner_nonce(),
+            false,
         )?)
     };
     let Some(observation) = read_process_observation(
@@ -1624,6 +1840,7 @@ fn read_owned_files(route: &OwnedServiceRoute) -> Result<Option<OwnedServiceRead
         version: VERSION.into(),
         model: route.model.clone(),
         model_catalog: route.model_catalog.clone(),
+        credential_ref: route.credential_ref.clone(),
         bun_executable: route.bun_executable.clone(),
         bun_sha256: route.bun_sha256.clone(),
         server_program: route.server_program.clone(),
@@ -1706,6 +1923,13 @@ fn validate_plan(plan: &HelperPlan, plan_path: &Path) -> Result<()> {
         || plan.service_id.len() > 128
         || plan.model_catalog != "offline" && plan.model_catalog != "refresh"
         || !plan.model.valid()
+        || plan
+            .credential_ref
+            .as_deref()
+            .is_some_and(|credential_ref| {
+                provider_auth::validate_ref(credential_ref).is_err()
+                    || plan.model.provider_id != "opencode-go"
+            })
         || !is_sha256(&plan.route_digest)
         || !is_sha256(&plan.config_digest)
         || !is_sha256(&plan.module_sha256)
@@ -1785,12 +2009,17 @@ fn verify_plan_config(plan: &HelperPlan) -> Result<(Value, String, String, Strin
 fn route_digest_for_plan(plan: &HelperPlan) -> Result<String> {
     let value = json!({
         "origin":"fresh_owned_service","service_id":plan.service_id,"version":VERSION,"model":plan.model,
-        "model_catalog":plan.model_catalog,"bun_executable":path_text(&plan.bun_executable)?,"bun_sha256":plan.bun_sha256,
+        "model_catalog":plan.model_catalog,
+        "bun_executable":path_text(&plan.bun_executable)?,"bun_sha256":plan.bun_sha256,
         "server_program":path_text(&plan.server_program)?,"server_program_sha256":plan.server_program_sha256,
         "state_root":path_text(&plan.state_root)?,"base_state_root":path_text(plan.state_root.parent().and_then(Path::parent).ok_or_else(||config_error("state root parent missing"))?)?,
         "port":plan.port,"owner_nonce":plan.owner_nonce,"workspace_directory":path_text(&plan.workspace_directory)?,
         "password_file":path_text(&plan.password_file)?,"connection_file":path_text(&plan.connection_file)?,"config_file":path_text(&plan.config_file)?,
     });
+    let mut value = value;
+    if let Some(credential_ref) = &plan.credential_ref {
+        value["credential_ref"] = json!(credential_ref);
+    }
     Ok(model::digest(model::canonical(&value)?.as_bytes()))
 }
 

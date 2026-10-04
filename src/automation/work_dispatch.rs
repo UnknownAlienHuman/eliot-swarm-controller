@@ -1147,6 +1147,89 @@ impl WorkDispatchContext {
         binding_id: &str,
         binding_generation: i64,
     ) -> Result<()> {
+        self.require_bound_launch_attempt_at_dispatch_stage(
+            db,
+            operation_id,
+            task_id,
+            task_revision,
+            attempt_id,
+            binding_id,
+            binding_generation,
+            None,
+        )
+    }
+
+    /// Revalidate a bound WorkDispatch launch for initial delivery. `None`
+    /// requires the exact Attempt to remain unstarted; `Some` admits only the
+    /// exact queued dispatch Operation already stored as its start pointer.
+    // Each argument is an independent identity in the retained launch chain.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn require_dispatch_launch_attempt(
+        &self,
+        db: &Connection,
+        operation_id: &str,
+        task_id: &str,
+        task_revision: i64,
+        attempt_id: &str,
+        binding_id: &str,
+        binding_generation: i64,
+        dispatch_operation_id: Option<&str>,
+    ) -> Result<()> {
+        require_new_work_enabled(db)?;
+        let current_attempt_id: Option<String> = db
+            .query_row(
+                "SELECT current_attempt_id FROM tasks WHERE task_id=?1",
+                [task_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        if current_attempt_id.as_deref() != Some(attempt_id) {
+            return Err(Error::new(
+                "AUTOMATION_WORK_ASSIGNMENT_STALE",
+                "Task no longer points to this exact dispatch Attempt",
+            ));
+        }
+        let entry = config::load_entry(
+            db,
+            &self.effective_manager_id,
+            &self.project_id,
+            &self.automation_id,
+        )?
+        .ok_or_else(|| Error::new("FORBIDDEN", "owning automation was removed"))?;
+        if entry.revision < self.automation_revision {
+            return Err(Error::new(
+                "AUTOMATION_ACTION_CHANGED",
+                "current automation revision predates the retained WorkDispatch admission",
+            ));
+        }
+        self.require_bound_launch_attempt_at_dispatch_stage(
+            db,
+            operation_id,
+            task_id,
+            task_revision,
+            attempt_id,
+            binding_id,
+            binding_generation,
+            dispatch_operation_id,
+        )
+    }
+
+    // Preserve the strict bound/unstarted contract above for the older
+    // credential/readiness stages; only the explicit dispatch path may pass a
+    // queued task.dispatch Operation through this helper.
+    #[allow(clippy::too_many_arguments)]
+    fn require_bound_launch_attempt_at_dispatch_stage(
+        &self,
+        db: &Connection,
+        operation_id: &str,
+        task_id: &str,
+        task_revision: i64,
+        attempt_id: &str,
+        binding_id: &str,
+        binding_generation: i64,
+        dispatch_operation_id: Option<&str>,
+    ) -> Result<()> {
         if task_id != self.subject.task_id
             || task_revision != self.subject.task_revision
             || self
@@ -1157,6 +1240,9 @@ impl WorkDispatchContext {
             || operation_id.is_empty()
             || binding_id.is_empty()
             || binding_generation <= 0
+            || dispatch_operation_id.is_some_and(|id| {
+                id.is_empty() || id.len() > 256 || id.chars().any(char::is_control)
+            })
         {
             return Err(Error::new(
                 "FORBIDDEN",
@@ -1294,6 +1380,30 @@ impl WorkDispatchContext {
                 "launch manifest does not retain the exact ready binding",
             ));
         }
+        match dispatch_operation_id {
+            None if manifest["progress"]["task_dispatch"] != "not_started"
+                || !manifest["progress"]["task_dispatch_operation_id"].is_null()
+                || !manifest["progress"]["task_dispatch_packet_digest"].is_null() =>
+            {
+                return Err(Error::new(
+                    "AUTOMATION_WORK_ASSIGNMENT_STALE",
+                    "launch is no longer at its unstarted dispatch stage",
+                ));
+            }
+            Some(dispatch_id)
+                if manifest["progress"]["task_dispatch"] != "queued"
+                    || manifest["progress"]["task_dispatch_operation_id"] != dispatch_id
+                    || manifest["progress"]["task_dispatch_packet_digest"]
+                        .as_str()
+                        .is_none_or(str::is_empty) =>
+            {
+                return Err(Error::new(
+                    "AUTOMATION_WORK_ASSIGNMENT_STALE",
+                    "launch does not retain this exact queued dispatch stage",
+                ));
+            }
+            _ => {}
+        }
 
         self.require_launch_open_child(
             db,
@@ -1335,7 +1445,8 @@ impl WorkDispatchContext {
         let bound_attempt_is_current: bool = db.query_row(
             "SELECT EXISTS(SELECT 1 FROM attempts WHERE attempt_id=?1 AND task_id=?2 \
              AND task_revision=?3 AND owner_id=?4 AND state='reserved' \
-             AND released_at_ms IS NULL AND start_operation_id IS NULL \
+             AND start_owner='controller' AND released_at_ms IS NULL \
+             AND ((?7 IS NULL AND start_operation_id IS NULL) OR start_operation_id=?7) \
              AND binding_id=?5 AND binding_generation=?6)",
             params![
                 attempt_id,
@@ -1343,15 +1454,34 @@ impl WorkDispatchContext {
                 task_revision,
                 self.effective_manager_id,
                 binding_id,
-                binding_generation
+                binding_generation,
+                dispatch_operation_id,
             ],
             |row| row.get(0),
         )?;
         if active_attempts != 1 || !bound_attempt_is_current {
             return Err(Error::new(
                 "AUTOMATION_WORK_ASSIGNMENT_STALE",
-                "launch Attempt is not the sole current bound unstarted assignment",
+                "launch Attempt is not the sole current bound assignment at this dispatch stage",
             ));
+        }
+        if let Some(dispatch_id) = dispatch_operation_id {
+            require_work_dispatch_start_operation(
+                db,
+                dispatch_id,
+                operation_id,
+                task_id,
+                task_revision,
+                attempt_id,
+                binding_id,
+                binding_generation,
+                &self.effective_manager_id,
+                &effective["launch_manifest"]["plan_digest"],
+                model::text(
+                    &effective["launch_manifest"]["progress"],
+                    "task_dispatch_packet_digest",
+                )?,
+            )?;
         }
         let binding: Option<(String, Option<i64>)> = db
             .query_row(
@@ -1796,6 +1926,132 @@ fn require_registered_manager(db: &Connection, manager_id: &str) -> Result<()> {
         return Err(Error::new(
             "FORBIDDEN",
             "work dispatch requires the current enabled manager identity",
+        ));
+    }
+    Ok(())
+}
+
+fn require_new_work_enabled(db: &Connection) -> Result<()> {
+    let raw: Option<String> = db
+        .query_row(
+            "SELECT value_json FROM meta WHERE key='execution_mode'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let mode = raw
+        .map(|raw| serde_json::from_str::<Value>(&raw))
+        .transpose()?
+        .unwrap_or(Value::Null);
+    if mode["new_work"] != "enabled" {
+        return Err(Error::new("ADMISSION_DISABLED", "new work is disabled"));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn require_work_dispatch_start_operation(
+    db: &Connection,
+    dispatch_operation_id: &str,
+    parent_operation_id: &str,
+    task_id: &str,
+    task_revision: i64,
+    attempt_id: &str,
+    binding_id: &str,
+    binding_generation: i64,
+    expected_caller_id: &str,
+    plan_digest: &Value,
+    expected_packet_digest: &str,
+) -> Result<()> {
+    type DispatchRow = (
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        String,
+        String,
+    );
+    let dispatch: Option<DispatchRow> = db
+        .query_row(
+            "SELECT caller_id,method,state,task_id,attempt_id,binding_id,binding_generation,\
+             original_request_json,effective_request_json FROM operations WHERE operation_id=?1",
+            [dispatch_operation_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        caller,
+        method,
+        state,
+        operation_task,
+        operation_attempt,
+        operation_binding,
+        operation_generation,
+        original_json,
+        effective_json,
+    )) = dispatch
+    else {
+        return Err(Error::new(
+            "AUTOMATION_WORK_ASSIGNMENT_STALE",
+            "queued dispatch Operation was not found",
+        ));
+    };
+    if caller != expected_caller_id
+        || method != "task.dispatch"
+        || state != "queued"
+        || operation_task.as_deref() != Some(task_id)
+        || operation_attempt.as_deref() != Some(attempt_id)
+        || operation_binding.as_deref() != Some(binding_id)
+        || operation_generation != Some(binding_generation)
+    {
+        return Err(Error::new(
+            "AUTOMATION_WORK_ASSIGNMENT_STALE",
+            "dispatch Operation is not the exact queued Task, Attempt, and binding child",
+        ));
+    }
+    let original: Value = serde_json::from_str(&original_json)
+        .map_err(|_| Error::new("INVALID_RECEIPT", "dispatch request is invalid"))?;
+    if original["attempt_id"] != attempt_id
+        || original["launch_operation_id"] != parent_operation_id
+    {
+        return Err(Error::new(
+            "AUTOMATION_WORK_ASSIGNMENT_STALE",
+            "dispatch request does not name the exact parent launch and Attempt",
+        ));
+    }
+    let effective: Value = serde_json::from_str(&effective_json)
+        .map_err(|_| Error::new("INVALID_RECEIPT", "dispatch packet is invalid"))?;
+    let packet = &effective["launch_dispatch_packet"];
+    let packet_digest = format!(
+        "sha256:{}",
+        model::digest(model::canonical(packet)?.as_bytes())
+    );
+    if packet["schema_version"] != 1
+        || packet["launch_operation_id"] != parent_operation_id
+        || packet["plan_digest"] != *plan_digest
+        || packet["task"]["task_id"] != task_id
+        || packet["task"]["revision"] != task_revision
+        || packet["task"]["attempt_id"] != attempt_id
+        || packet_digest != expected_packet_digest
+    {
+        return Err(Error::new(
+            "AUTOMATION_WORK_ASSIGNMENT_STALE",
+            "dispatch packet does not retain the exact parent launch and Task assignment",
         ));
     }
     Ok(())

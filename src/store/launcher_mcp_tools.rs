@@ -1649,6 +1649,384 @@ fn validate_current_scope(
     Ok(())
 }
 
+/// Return the exact acknowledged C8 native tool proof for a current launch
+/// dispatch stage. This path is read-only: it never contacts OpenCode,
+/// upgrades a receipt, or claims that a model consumed the schemas.
+pub(crate) fn require_current_connection(
+    db: &Connection,
+    config: &Config,
+    launch_operation_id: &str,
+    dispatch_operation_id: Option<&str>,
+) -> Result<Value> {
+    let snapshot = launcher_native_mcp::current_mcp_launch_snapshot_for_dispatch(
+        db,
+        config,
+        launch_operation_id,
+        dispatch_operation_id,
+    )?;
+    let identity_digest = snapshot.identity_digest()?;
+    let assignment = snapshot.assignment_context()?;
+    let facts = LaunchFacts {
+        operation_id: snapshot.launch_operation_id().to_owned(),
+        identity_digest: identity_digest.clone(),
+        participant_id: snapshot.participant_id().to_owned(),
+        credential_ref: snapshot.credential_ref().to_owned(),
+        profile_config_ref: snapshot.profile_config_ref().to_owned(),
+        options: snapshot.options().clone(),
+        owned_service: snapshot.owned_service_expectation(),
+        config: Arc::new(config.clone()),
+    };
+    let owned_service = facts.owned_service.as_ref().ok_or_else(|| {
+        Error::new(
+            "NATIVE_MCP_CAPABILITY_UNAVAILABLE",
+            "dispatch requires the retained owned-service process identity",
+        )
+    })?;
+    let record = meta(db, &record_key(launch_operation_id))?.ok_or_else(|| {
+        Error::new(
+            "NATIVE_MCP_CAPABILITY_UNAVAILABLE",
+            "exact acknowledged native MCP proof is not retained",
+        )
+    })?;
+    validate_record(&record, &facts, &assignment)?;
+    if record["install"]["state"] != "registered"
+        || record["install"]["readback"]["runtime_status"] != "connected"
+        || record["challenge"]["state"] != "observed"
+        || !record["tools_readback"].is_object()
+    {
+        return Err(Error::new(
+            "NATIVE_MCP_CAPABILITY_UNAVAILABLE",
+            "native MCP install acknowledgement or scoped tool proof is incomplete",
+        ));
+    }
+
+    let install_intent = &record["install"]["intent"];
+    if install_intent["schema_version"] != 1
+        || install_intent["kind"] != "opencode_v2_mcp_install_intent"
+        || install_intent["registration"] != "location_scoped_in_memory"
+        || install_intent["expected_version"] != OPENCODE_VERSION
+        || install_intent["assignment"] != record["assignment"]
+        || install_intent["native_tool_set"] != "unknown"
+        || install_intent["provider_request_context"] != "unknown"
+        || install_intent["model_consumption"] != "unknown"
+        || install_intent["dispatch_permitted"] != false
+    {
+        return Err(record_error("native MCP install intent is invalid"));
+    }
+    validate_install_readback(
+        &record["install"]["readback"],
+        install_intent,
+        install_intent,
+        record["service"]["pid"]
+            .as_u64()
+            .and_then(|pid| u32::try_from(pid).ok())
+            .filter(|pid| *pid > 0)
+            .ok_or_else(|| record_error("native MCP service PID is invalid"))?,
+        record["service"]["version"]
+            .as_str()
+            .filter(|version| !version.is_empty())
+            .ok_or_else(|| record_error("native MCP service version is missing"))?,
+    )?;
+    let server_name = install_intent["server_name"]
+        .as_str()
+        .filter(|name| {
+            !name.is_empty()
+                && name.len() <= 96
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"_-.:".contains(&byte))
+        })
+        .ok_or_else(|| record_error("native MCP server name is missing"))?;
+    let command_sha256 = install_intent["command_sha256"]
+        .as_str()
+        .filter(|digest| valid_prefixed_sha256(digest))
+        .ok_or_else(|| record_error("native MCP command digest is invalid"))?;
+    let location_sha256 = install_intent["location_sha256"]
+        .as_str()
+        .filter(|digest| valid_prefixed_sha256(digest))
+        .ok_or_else(|| record_error("native MCP location digest is invalid"))?;
+    let tools = &record["tools_readback"];
+    if model::canonical(tools)?.len() > MAX_PRIVATE_READBACK_BYTES
+        || record["install"]["readback"]["runtime_config_readback"] != "not_exposed_by_pinned_api"
+        || tools["contract"] != "opencode-v2-native-mcp-proof-v1"
+        || tools["dispatch_permitted"] != false
+        || tools["model_consumed"] != "unknown"
+        || model::canonical(&tools["assignment"])? != model::canonical(&assignment.as_value())?
+        || tools["service"]["id"] != record["service"]["id"]
+        || tools["service"]["pid"] != record["service"]["pid"]
+        || tools["service"]["version"] != record["service"]["version"]
+        || tools["session"]["id"] != assignment.native_session_id()
+        || model::canonical(&tools["session"]["model"])?
+            != model::canonical(&serde_json::to_value(&facts.options.model)?)?
+        || tools["challenge"]["id"] != record["challenge"]["metadata"]["challenge_id"]
+        || tools["challenge"]["issued_at_ms"] != record["challenge"]["metadata"]["issued_at_ms"]
+        || tools["challenge"]["expires_at_ms"] != record["challenge"]["metadata"]["expires_at_ms"]
+        || model::canonical(&record["challenge"]["metadata"]["assignment"])?
+            != model::canonical(&assignment.as_value())?
+        || model::canonical(&record["challenge"]["metadata"]["model"])?
+            != model::canonical(&serde_json::to_value(&facts.options.model)?)?
+    {
+        return Err(Error::new(
+            "NATIVE_MCP_CAPABILITY_UNAVAILABLE",
+            "native MCP tool evidence does not match the acknowledged launch scope",
+        ));
+    }
+
+    let directory = tools["service"]["directory"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| record_error("native MCP evidence location is missing"))?;
+    let directory_digest = format!("sha256:{}", model::digest(directory.as_bytes()));
+    let observer = &tools["observer"];
+    let plugin_id = observer["plugin_id"]
+        .as_str()
+        .filter(|plugin| *plugin == "eliot.native-mcp-proof.v1")
+        .ok_or_else(|| record_error("native MCP observer identity is invalid"))?;
+    let module_sha256 = observer["module_sha256"]
+        .as_str()
+        .filter(|digest| valid_prefixed_sha256(digest))
+        .ok_or_else(|| record_error("native MCP observer module digest is invalid"))?;
+    let metadata = &record["challenge"]["metadata"];
+    let metadata_directory = metadata["directory"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| record_error("native MCP challenge location is missing"))?;
+    let metadata_directory_digest =
+        format!("sha256:{}", model::digest(metadata_directory.as_bytes()));
+    if metadata["schema"] != "opencode-v2-native-mcp-challenge-v1"
+        || metadata["service_id"] != record["service"]["id"]
+        || metadata["service_pid"] != record["service"]["pid"]
+        || metadata["service_version"] != record["service"]["version"]
+        || metadata["module_sha256"].as_str() != module_sha256.strip_prefix("sha256:")
+        || observer["module_path"] != metadata["module_path"]
+        || directory != metadata_directory
+        || !valid_prefixed_sha256(&directory_digest)
+        || directory_digest.as_str() != location_sha256
+        || metadata_directory_digest.as_str() != location_sha256
+    {
+        return Err(Error::new(
+            "NATIVE_MCP_CAPABILITY_UNAVAILABLE",
+            "native MCP observer evidence does not match the acknowledged install location",
+        ));
+    }
+
+    let native_discovered = &tools["native_discovered"];
+    let observed_at_ms = native_discovered["observed_at_ms"]
+        .as_i64()
+        .filter(|time| *time > 0)
+        .ok_or_else(|| record_error("native MCP inventory observation time is invalid"))?;
+    let inventory = native_discovered["tools"]
+        .as_array()
+        .filter(|tools| !tools.is_empty() && tools.len() <= 512)
+        .ok_or_else(|| {
+            Error::new(
+                "NATIVE_MCP_CAPABILITY_UNAVAILABLE",
+                "native MCP tool inventory is absent or exceeds its bound",
+            )
+        })?;
+    if native_discovered["status"] != "observed"
+        || observed_at_ms < metadata["issued_at_ms"].as_i64().unwrap_or(i64::MAX)
+        || observed_at_ms > metadata["expires_at_ms"].as_i64().unwrap_or(0)
+        || observed_at_ms > model::now_ms()?
+    {
+        return Err(Error::new(
+            "NATIVE_MCP_CAPABILITY_UNAVAILABLE",
+            "native MCP tool inventory was not observed",
+        ));
+    }
+    let native_tools_digest = digest_json(&native_discovered["tools"])?;
+    if native_discovered["digest"].as_str() != Some(native_tools_digest.as_str()) {
+        return Err(record_error(
+            "native MCP tool inventory digest does not match its observed tools",
+        ));
+    }
+    let mut scoped_tools = Vec::new();
+    for tool in inventory {
+        if tool["server"] != server_name {
+            continue;
+        }
+        let name = tool["name"]
+            .as_str()
+            .filter(|name| !name.is_empty() && name.len() <= 256)
+            .ok_or_else(|| record_error("native MCP tool name is invalid"))?;
+        if !tool["input_schema"].is_object() {
+            return Err(record_error("native MCP tool schema is invalid"));
+        }
+        scoped_tools.push(json!({
+            "server":server_name,
+            "name":name,
+            "input_schema":tool["input_schema"],
+        }));
+    }
+    if scoped_tools.is_empty() {
+        return Err(Error::new(
+            "NATIVE_MCP_CAPABILITY_UNAVAILABLE",
+            "the acknowledged server has no observed tools",
+        ));
+    }
+
+    let assignment_value = assignment.as_value();
+    let assignment_digest = digest_json(&assignment_value)?;
+    let mut evidence_without_digest = (*tools).clone();
+    let evidence_digest = evidence_without_digest
+        .as_object_mut()
+        .and_then(|evidence| evidence.remove("evidence_digest"))
+        .and_then(|digest| digest.as_str().map(str::to_owned))
+        .filter(|digest| valid_prefixed_sha256(digest))
+        .ok_or_else(|| record_error("native MCP evidence digest is missing or invalid"))?;
+    if digest_json(&evidence_without_digest)? != evidence_digest {
+        return Err(record_error(
+            "native MCP evidence digest does not match its observer readback",
+        ));
+    }
+    let native_discovered_digest = digest_json(native_discovered)?;
+    let service_id = record["service"]["id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| record_error("native MCP service identity is missing"))?;
+    let service_version = record["service"]["version"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| record_error("native MCP service version is missing"))?;
+    let service_pid = record["service"]["pid"]
+        .as_u64()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| record_error("native MCP service PID is invalid"))?;
+    if service_pid != u64::from(owned_service.process_id()) {
+        return Err(Error::new(
+            "NATIVE_MCP_CAPABILITY_UNAVAILABLE",
+            "native MCP proof does not match the current owned-service process",
+        ));
+    }
+    let provider_auth = validated_provider_auth_projection(db, &snapshot, owned_service)?;
+    let service_process_identity_digest = digest_json(&json!({
+        "process_id":owned_service.process_id(),
+        "process_birth_token":owned_service.process_birth_token(),
+        "executable_sha256":owned_service.executable_sha256(),
+    }))?;
+    let model = json!({
+        "id":facts.options.model.id,
+        "provider_id":facts.options.model.provider_id,
+        "variant":facts.options.model.variant,
+    });
+    let mut projection = json!({
+        "schema_version":1,
+        "kind":"launcher_native_mcp_dispatch_capability",
+        "launch_operation_id":facts.operation_id,
+        "dispatch_operation_id":dispatch_operation_id,
+        "launch_identity_digest":identity_digest,
+        "assignment_digest":assignment_digest,
+        "evidence_digest":evidence_digest,
+        "native_discovered_digest":native_discovered_digest,
+        "assignment":{
+            "task_id":assignment_value["task_id"],
+            "task_revision":assignment_value["task_revision"],
+            "attempt_id":assignment_value["attempt_id"],
+            "binding_id":assignment_value["binding_id"],
+            "binding_generation":assignment_value["binding_generation"],
+            "participant_id":assignment_value["participant_id"],
+            "grant_revision":assignment_value["grant_revision"],
+            "native_session_id":assignment_value["native_session_id"],
+        },
+        "service":{
+            "id":service_id,
+            "pid":service_pid,
+            "version":service_version,
+            "process_identity_digest":service_process_identity_digest,
+        },
+        "model":model,
+        "install":{
+            "server_name":server_name,
+            "command_sha256":command_sha256,
+            "location_sha256":location_sha256,
+            "state":"registered",
+            "runtime_config_readback":"not_exposed_by_pinned_api",
+            "matches_prepared_command":"unknown",
+        },
+        "capability":{
+            "identity_digest":identity_digest,
+            "evidence_digest":evidence_digest,
+            "native_discovered_digest":native_discovered_digest,
+            "service_id":service_id,
+            "service_version":service_version,
+            "plugin_id":plugin_id,
+            "module_sha256":module_sha256,
+        },
+        "native_discovered":{
+            "status":"observed",
+            "observed_at_ms":observed_at_ms,
+            "tools":scoped_tools,
+        },
+        "dispatch_permitted":false,
+        "model_consumed":"unknown",
+    });
+    if let Some(provider_auth) = provider_auth {
+        projection["provider_auth"] = provider_auth;
+    }
+    Ok(projection)
+}
+
+fn validated_provider_auth_projection(
+    db: &Connection,
+    snapshot: &launcher_native_mcp::NativeMcpLaunchSnapshot,
+    owned_service: &launcher_native_mcp::OwnedServiceExpectation,
+) -> Result<Option<Value>> {
+    let (launch_operation_id, state, proof_json): (String, String, String) = db.query_row(
+        "SELECT launch_operation_id,state,proof_json FROM owned_service_starts \
+         WHERE binding_id=?1 AND binding_generation=?2",
+        params![snapshot.binding_id(), snapshot.binding_generation()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    if launch_operation_id != snapshot.launch_operation_id() || state != "service_observed" {
+        return Err(Error::new(
+            "NATIVE_MCP_CAPABILITY_UNAVAILABLE",
+            "current owned-service receipt changed during capability validation",
+        ));
+    }
+    let proof: Value = serde_json::from_str(&proof_json)
+        .map_err(|_| record_error("retained owned-service proof is invalid JSON"))?;
+    let proof_digest = model::digest(model::canonical(&proof)?.as_bytes());
+    if proof_digest != owned_service.proof_digest() {
+        return Err(Error::new(
+            "NATIVE_MCP_CAPABILITY_UNAVAILABLE",
+            "current owned-service receipt differs from its validated binding proof",
+        ));
+    }
+    match (
+        owned_service.provider_auth_required(),
+        proof.get("provider_auth"),
+    ) {
+        (true, Some(provider_auth)) if provider_auth.is_object() => {
+            if provider_auth["status"] != "stored_unverified" {
+                return Err(Error::new(
+                    "NATIVE_MCP_CAPABILITY_UNAVAILABLE",
+                    "owned-service provider-auth proof is not in its validated state",
+                ));
+            }
+            Ok(Some(json!({
+                "status":"stored_unverified",
+                "proof_digest":digest_json(provider_auth)?,
+            })))
+        }
+        (true, _) => Err(Error::new(
+            "NATIVE_MCP_CAPABILITY_UNAVAILABLE",
+            "current owned route requires retained provider-auth proof",
+        )),
+        (false, None) => Ok(None),
+        (false, Some(_)) => Err(Error::new(
+            "NATIVE_MCP_CAPABILITY_UNAVAILABLE",
+            "retained provider-auth proof is not permitted by the current owned route",
+        )),
+    }
+}
+
+fn digest_json(value: &Value) -> Result<String> {
+    Ok(format!(
+        "sha256:{}",
+        model::digest(model::canonical(value)?.as_bytes())
+    ))
+}
+
 fn validate_record(
     record: &Value,
     facts: &LaunchFacts,

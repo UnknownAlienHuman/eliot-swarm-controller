@@ -14,7 +14,7 @@ use crate::{
         owned_service::{
             OwnedServiceHandle, OwnedServiceIntent, OwnedServiceOrigin, OwnedServiceReadback,
             OwnedServiceRoute, OwnedServiceSeed, OwnedServiceStartFailure, OwnedServiceStartPermit,
-            prepare_owned_service, start_foreground,
+            prepare_owned_service, prepare_owned_service_with_provider_auth, start_foreground,
         },
     },
     workspace::LeaseAuthorityRef,
@@ -407,7 +407,19 @@ impl Store {
 
         // Preparation is effect-free. It may read pinned source files but does
         // not create files, contact OpenCode, or admit native work.
-        let prepared = prepare_owned_service(&admission.route, &admission.intent)?;
+        let prepared = match admission.route.credential_ref() {
+            Some(credential_ref) => {
+                let auth_source = self
+                    .config
+                    .opencode_provider_auth_source(credential_ref, admission.route.model_ref())?;
+                prepare_owned_service_with_provider_auth(
+                    &admission.route,
+                    &admission.intent,
+                    auth_source.as_deref(),
+                )?
+            }
+            None => prepare_owned_service(&admission.route, &admission.intent)?,
+        };
         if *stopping.borrow() {
             return Err(shutdown_error());
         }
@@ -735,12 +747,9 @@ pub(crate) fn validate_owned_open_dispatch(
     verify_scope_for_admission(&scope, &scope.actor, &row, &scope.workspace_directory)?;
     let proof: Value = serde_json::from_str(&row.proof_json)
         .map_err(|_| corrupt("owned service readback proof is invalid JSON"))?;
-    validate_readback_proof_fields(
-        &proof,
-        &row,
-        &normalize_digest(&scope.service_config.bun_sha256)?,
-        &normalize_digest(&scope.service_config.server_program_sha256)?,
-    )?;
+    let route = OwnedServiceRoute::from_config(&scope.service_config)?
+        .for_launch(&row.owner_nonce, &scope.workspace_directory)?;
+    validate_readback_proof_fields(&proof, &row, &route)?;
     Ok(())
 }
 
@@ -1486,12 +1495,7 @@ fn verify_readback_value(
     route: &OwnedServiceRoute,
     row: &OwnedStartRow,
 ) -> Result<VerifiedOwnedServiceBinding> {
-    validate_readback_proof_fields(
-        proof,
-        row,
-        route.bun_sha256(),
-        route.server_program_sha256(),
-    )?;
+    validate_readback_proof_fields(proof, row, route)?;
     let canonical = model::canonical(proof)?;
     if route.service_id() != row.service_id
         || route.version() != row.service_version
@@ -1573,9 +1577,11 @@ fn verify_readback_value(
 fn validate_readback_proof_fields(
     proof: &Value,
     row: &OwnedStartRow,
-    bun_sha256: &str,
-    server_program_sha256: &str,
+    route: &OwnedServiceRoute,
 ) -> Result<()> {
+    // Runtime validation also binds an optional provider proof to this exact
+    // route, model and process. Its presence is mandatory only for auth routes.
+    OwnedServiceReadback::from_retained_value(proof, route)?;
     let canonical = model::canonical(proof)?;
     let fields = proof
         .as_object()
@@ -1600,7 +1606,10 @@ fn validate_readback_proof_fields(
         "dispatch_permitted",
     ];
     if canonical.len() > MAX_PROOF_BYTES
-        || fields.len() != expected_fields.len()
+        || fields.len() != expected_fields.len() + usize::from(fields.contains_key("provider_auth"))
+        || fields
+            .keys()
+            .any(|key| !expected_fields.contains(&key.as_str()) && key != "provider_auth")
         || expected_fields.iter().any(|key| !fields.contains_key(*key))
         || proof["schema_version"] != 1
         || proof["status"] != "ready"
@@ -1618,8 +1627,8 @@ fn validate_readback_proof_fields(
         || !is_sha256_value(&proof["plugin_entrypoint_sha256"])
         || !is_sha256_value(&proof["server_program_sha256"])
         || !is_sha256_value(&proof["bun_sha256"])
-        || proof["bun_sha256"] != bun_sha256
-        || proof["server_program_sha256"] != server_program_sha256
+        || proof["bun_sha256"] != route.bun_sha256()
+        || proof["server_program_sha256"] != route.server_program_sha256()
     {
         return Err(corrupt(
             "owned service readback does not match its pinned route and schema",
@@ -2411,12 +2420,4 @@ fn is_sha256(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-fn normalize_digest(value: &str) -> Result<String> {
-    let digest = value.strip_prefix("sha256:").unwrap_or(value);
-    if !is_sha256(&digest.to_ascii_lowercase()) {
-        return Err(corrupt("owned service configured digest is invalid"));
-    }
-    Ok(digest.to_ascii_lowercase())
 }

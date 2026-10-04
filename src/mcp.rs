@@ -840,9 +840,10 @@ static TOOLS: &[(bool, ToolSpec)] = &[
     ),
     mutation(
         "task.dispatch",
-        "Start a claimed controller-start attempt, or reuse its existing start operation.",
+        "Start a claimed controller-start attempt or reuse its existing start operation. Supply the exact launch_operation_id for launch-owned Attempts; prerequisite_operation_id remains a runtime configuration prerequisite.",
         &[
             f("attempt_id", S),
+            f("launch_operation_id", S),
             f("text", S),
             f("prerequisite_operation_id", S),
         ],
@@ -1166,6 +1167,15 @@ fn input_schema(spec: &ToolSpec, read_only: bool, require_request_id: bool) -> A
 fn refine_input_schema(method: &str, schema: &mut Value) {
     let properties = &mut schema["properties"];
     match method {
+        "task.dispatch" => {
+            properties["launch_operation_id"] = json!({
+                "type":"string",
+                "minLength":1,
+                "maxLength":128,
+                "pattern":"^\\S+$",
+                "description":"Exact parent swarm.launch Operation for a launch-owned Attempt. Omit only for a legacy unlinked Attempt; prerequisite_operation_id remains a runtime configuration prerequisite."
+            });
+        }
         "coordination.sync_integration" => {
             properties["client_request_id"]["minLength"] = json!(1);
             properties["client_request_id"]["maxLength"] = json!(128);
@@ -2377,9 +2387,33 @@ pub(crate) fn profiled_facade(
     Ok(ProfiledFacade::with_surface(facade, profile, surface))
 }
 
-/// Validate a launch-preview target MCP presentation using the same rules as
-/// the configured facade. This describes server-side configuration only; it
-/// does not establish that a native harness loaded or acknowledged the tools.
+/// Canonical restricted Participant core schemas for comparison with an
+/// independently observed native inventory. This grants no method authority.
+pub(crate) fn participant_core_tool_contracts() -> Result<Vec<Value>> {
+    catalog::validate_registry_metadata().map_err(|error| Error::invalid(error.to_string()))?;
+    catalog::role_core(catalog::CoreRole::Participant)
+        .methods
+        .iter()
+        .map(|method| {
+            let (read_only, spec) = TOOLS
+                .iter()
+                .find(|(_, spec)| spec.method == *method)
+                .ok_or_else(|| Error::invalid("Participant core has no canonical tool contract"))?;
+            if !profiles::allows_method(McpToolProfile::Participant, method) {
+                return Err(Error::invalid(
+                    "Participant core tool is outside its hard profile",
+                ));
+            }
+            Ok(json!({
+                "method": method,
+                "name": tool_name(method),
+                "input_schema": input_schema(spec, *read_only, true).as_ref(),
+            }))
+        })
+        .collect()
+}
+
+/// Describe the configured facade without claiming native tool loading.
 pub(crate) fn launch_profile_surface(
     profile: McpToolProfile,
     surface_name: &str,

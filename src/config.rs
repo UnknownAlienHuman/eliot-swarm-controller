@@ -15,6 +15,11 @@ pub struct Config {
     pub storage: Storage,
     pub ipc: Ipc,
     pub routes: Vec<Route>,
+    /// Explicit operator-authorized OpenCode auth.json sources. References
+    /// are usable by owned routes but this private source map is never emitted
+    /// by Config serialization or copied into Store state.
+    #[serde(default, skip_serializing)]
+    pub opencode_provider_auth_sources: BTreeMap<String, OwnedProviderAuthSourceConfig>,
     pub checks: crate::checks::model::CheckConfig,
     pub mcp: McpConfig,
     pub gateway: GatewayConfig,
@@ -115,12 +120,36 @@ pub struct OwnedOpenCodeServiceConfig {
     pub model: crate::runtime::opencode_v2::ModelRef,
     /// Explicit choice; offline qualification does not enable a live catalog.
     pub model_catalog: String,
+    /// Opaque reference into `Config::opencode_provider_auth_sources`.
+    /// Absent means no provider credential is resolved or bootstrapped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<String>,
     pub bun_executable: PathBuf,
     pub bun_sha256: String,
     pub server_program: PathBuf,
     pub server_program_sha256: String,
     pub state_root: PathBuf,
     pub port: u16,
+}
+
+/// Host-only mapping from an opaque reference to one explicitly authorized
+/// source file. The source path never leaves local Config resolution.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnedProviderAuthSourceConfig {
+    pub provider_id: String,
+    #[serde(skip_serializing)]
+    pub auth_file: PathBuf,
+}
+
+impl std::fmt::Debug for OwnedProviderAuthSourceConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OwnedProviderAuthSourceConfig")
+            .field("provider_id", &self.provider_id)
+            .field("auth_file", &"<redacted>")
+            .finish()
+    }
 }
 
 impl Route {
@@ -141,6 +170,81 @@ impl Route {
         crate::runtime::opencode_v2::owned_service::OwnedServiceRoute::from_config(definition)
             .map(Some)
     }
+}
+
+impl Config {
+    /// Resolve an exact route reference to its locally configured auth source.
+    /// This returns a host-only path for the credential reader; callers must
+    /// never persist or serialize it.
+    pub(crate) fn opencode_provider_auth_source(
+        &self,
+        credential_ref: &str,
+        model: &crate::runtime::opencode_v2::ModelRef,
+    ) -> Result<Option<PathBuf>> {
+        validate_provider_credential_ref(credential_ref)?;
+        if model.provider_id != "opencode-go" {
+            return Err(Error::new(
+                "CONFIG_ERROR",
+                "owned provider credentials are restricted to opencode-go",
+            ));
+        }
+        let source = self
+            .opencode_provider_auth_sources
+            .get(credential_ref)
+            .ok_or_else(|| {
+                Error::new(
+                    "CONFIG_ERROR",
+                    "owned provider credential reference is not configured",
+                )
+            })?;
+        validate_provider_auth_source(credential_ref, source)?;
+        Ok(Some(source.auth_file.clone()))
+    }
+
+    fn validate_opencode_provider_auth_sources(&self) -> Result<()> {
+        for (credential_ref, source) in &self.opencode_provider_auth_sources {
+            validate_provider_auth_source(credential_ref, source)?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_provider_auth_source(
+    credential_ref: &str,
+    source: &OwnedProviderAuthSourceConfig,
+) -> Result<()> {
+    validate_provider_credential_ref(credential_ref)?;
+    if source.provider_id != "opencode-go"
+        || !source.auth_file.is_absolute()
+        || source.auth_file.file_name().and_then(|name| name.to_str()) != Some("auth.json")
+        || source.auth_file.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+    {
+        return Err(Error::new(
+            "CONFIG_ERROR",
+            "owned provider auth source must be an absolute opencode-go auth.json path",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_provider_credential_ref(credential_ref: &str) -> Result<()> {
+    if credential_ref.is_empty()
+        || credential_ref.len() > 128
+        || !credential_ref
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    {
+        return Err(Error::new(
+            "CONFIG_ERROR",
+            "owned provider credential reference is malformed",
+        ));
+    }
+    Ok(())
 }
 impl Default for Storage {
     fn default() -> Self {
@@ -167,6 +271,7 @@ impl Default for Config {
             storage: Storage::default(),
             ipc: Ipc::default(),
             routes: Vec::new(),
+            opencode_provider_auth_sources: BTreeMap::new(),
             checks: crate::checks::model::CheckConfig::default(),
             mcp: McpConfig::default(),
             gateway: GatewayConfig::default(),
@@ -426,6 +531,7 @@ impl Config {
                 "unsupported version or invalid IPC/queue capacity",
             ));
         }
+        cfg.validate_opencode_provider_auth_sources()?;
         cfg.mcp.validate()?;
         let config_dir =
             std::env::current_dir()?.join(path.and_then(Path::parent).unwrap_or(Path::new(".")));
@@ -438,8 +544,11 @@ impl Config {
         crate::scheduler::validate_schedules(&cfg.schedules)?;
         let mut aliases = std::collections::BTreeSet::new();
         for r in &cfg.routes {
-            if r.owned_service.is_some() {
+            if let Some(owned) = &r.owned_service {
                 r.owned_opencode_service()?;
+                if let Some(credential_ref) = owned.credential_ref.as_deref() {
+                    cfg.opencode_provider_auth_source(credential_ref, &owned.model)?;
+                }
             }
             if r.alias.trim().is_empty()
                 || r.runtime.trim().is_empty()

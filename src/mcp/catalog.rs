@@ -594,9 +594,9 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
         TaskManagement,
         MANAGER_AUDIENCES,
         Core,
-        "Start a claimed controller-start attempt or reuse its start operation.",
-        "Use after a valid claim when the manager explicitly dispatches work.",
-        &["task", "dispatch", "start", "attempt"],
+        "Start a claimed controller-start attempt or reuse its start operation; launch-owned Attempts require their exact launch Operation ID.",
+        "Use after a valid claim. Supply launch_operation_id for a launch-owned Attempt; omit it only for a legacy unlinked Attempt. prerequisite_operation_id remains a runtime configuration prerequisite.",
+        &["task", "dispatch", "start", "attempt", "launch"],
         &["attempt_id"],
         "One start operation or its existing durable handle."
     ),

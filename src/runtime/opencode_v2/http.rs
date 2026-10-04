@@ -4,7 +4,7 @@ use crate::error::{Error, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use reqwest::{Client, Method, Url, header};
 use serde::{Deserialize, de::DeserializeOwned};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::{
     future::Future,
     io::Read,
@@ -357,6 +357,55 @@ impl Service {
     /// (e.g. `session.background`): never invent a body shape.
     pub(super) async fn post_no_body(&self, path: &str) -> Result<Value> {
         self.request(Method::POST, path, &[], None).await
+    }
+    pub(super) async fn post_integration_key(&self, integration_id: &str, key: &str) -> Result<()> {
+        if integration_id != "opencode-go" {
+            return Err(Error::invalid("unsupported provider integration"));
+        }
+        if key.is_empty() {
+            return Err(Error::invalid("provider integration key is empty"));
+        }
+        if self.owned_process.is_none() {
+            return Err(Error::new(
+                "NATIVE_OWNED_PROCESS_MISMATCH",
+                "provider integration key requires a verified owned service",
+            ));
+        }
+        self.with_owned_process_check(self.post_integration_key_unchecked(key))
+            .await
+    }
+    async fn post_integration_key_unchecked(&self, key: &str) -> Result<()> {
+        let url = self
+            .endpoint
+            .join("/api/integration/opencode-go/connect/key")
+            .map_err(|_| Error::new("NATIVE_ENDPOINT", "invalid provider integration route"))?;
+        if url.origin() != self.endpoint.origin() {
+            return Err(Error::new(
+                "NATIVE_ENDPOINT",
+                "cross-origin native request refused",
+            ));
+        }
+        let response = self
+            .client
+            .post(url)
+            .timeout(REQUEST_TIMEOUT)
+            .json(&json!({"key": key}))
+            .send()
+            .await
+            .map_err(|_| transport_error(true))?;
+        let status = response.status();
+        if status != reqwest::StatusCode::NO_CONTENT {
+            let code = if matches!(
+                status.as_u16(),
+                400 | 401 | 403 | 404 | 405 | 409 | 413 | 422
+            ) {
+                "NATIVE_REJECTED"
+            } else {
+                "NATIVE_OUTCOME_UNKNOWN"
+            };
+            return Err(Error::new(code, format!("HTTP {}", status.as_u16())));
+        }
+        Ok(())
     }
     pub(super) async fn put(&self, path: &str, body: Value) -> Result<Value> {
         self.request(Method::PUT, path, &[], Some(body)).await

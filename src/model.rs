@@ -627,6 +627,7 @@ pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
         "task.dispatch" => &[
             "client_request_id",
             "attempt_id",
+            "launch_operation_id",
             "text",
             "prerequisite_operation_id",
         ],
@@ -782,15 +783,17 @@ pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
             text(params, "reason")?;
         }
     }
-    if params.get("prerequisite_operation_id").is_some() {
-        let operation_id = text(params, "prerequisite_operation_id")?;
-        if operation_id.is_empty()
-            || operation_id.len() > 128
-            || operation_id
-                .bytes()
-                .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
-        {
-            return Err(Error::invalid("invalid prerequisite_operation_id"));
+    for field in ["prerequisite_operation_id", "launch_operation_id"] {
+        if params.get(field).is_some() {
+            let operation_id = text(params, field)?;
+            if operation_id.is_empty()
+                || operation_id.len() > 128
+                || operation_id
+                    .chars()
+                    .any(|character| character.is_control() || character.is_whitespace())
+            {
+                return Err(Error::invalid(format!("invalid {field}")));
+            }
         }
     }
     if matches!(method, "task.create" | "task.revise") {

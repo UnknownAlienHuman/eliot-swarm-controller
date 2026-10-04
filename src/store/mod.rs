@@ -15,6 +15,7 @@ mod gm;
 mod integration;
 mod launch_registration;
 pub(crate) mod launcher;
+mod launcher_dispatch;
 mod launcher_issuance;
 mod launcher_mcp_tools;
 mod launcher_native_mcp;
@@ -2886,7 +2887,7 @@ fn apply(
         "task.claim" => tasks::claim(tx, p, v, id, now).map(|v| (v, false)),
         "attempt.bind_producer" => producers::bind(tx, p, v, id, now).map(|v| (v, false)),
         "attempt.release" => tasks::release(tx, p, v, id, now).map(|v| (v, false)),
-        "task.dispatch" => operations::dispatch(tx, p, v, id, now),
+        "task.dispatch" => operations::dispatch(tx, p, v, id, now, config),
         "agent.send" | "agent.reply" | "agent.configure" | "agent.goal" | "agent.background"
         | "agent.refresh" | "agent.reconcile" | "agent.result" | "agent.recover" => {
             runtime::user_command(tx, p, method, v, id, config).map(|v| (v, true))

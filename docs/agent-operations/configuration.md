@@ -347,6 +347,33 @@ The owned service uses repository-pinned @opencode/server 2.0.7. This differs fr
 
 model_catalog accepts offline or refresh. offline disables the bundled snapshot and fetching. refresh uses the bundled snapshot and fetches public Models.dev metadata. Neither choice authenticates a provider or executes a model call. Historical provider receipts remain historical and separately scoped; they are not proof for this new service. All local model/inference execution remains deferred, including PR24/Kilo.
 
+### Explicit hosted-provider credential source
+
+An owned `opencode-go` route can name a host-only credential source. Add
+`credential_ref = "hosted-bunny"` inside its `routes.owned_service` table and
+configure the matching source in the original controller configuration:
+
+~~~toml
+[opencode_provider_auth_sources.hosted-bunny]
+provider_id = "opencode-go"
+auth_file = "C:/approved/user-data/opencode/auth.json"
+~~~
+
+The model's `providerID` must be `opencode-go`; keep its exact approved model
+ID and variant. The source must be an absolute `auth.json` file containing the
+selected provider's `type = "api"` entry. The host reads that entry before the
+startup boundary and sends the key once to the newly owned service's native
+integration endpoint. It does not copy another profile or use an ambient auth
+source. The source registry is omitted from serialized Config and generated
+participant configurations; the original host configuration remains the source
+of that mapping.
+
+The retained proof says `stored_unverified`: native credential metadata was
+observed for the exact service process and model. It does not establish key
+validity or model execution. Uncertain startup is read back without another
+credential POST. A route without `credential_ref` keeps the existing startup
+behavior and receives no provider credential.
+
 Each admitted launch receives its own retained owner nonce and private state directory under state_root/launches/<owner_nonce>. Do not copy global OpenCode state into it or manually reuse a nonce directory. The controller embeds a dedicated helper child and keeps its stdin open while the service is owned. Closing that stdin sends EOF as the graceful-stop signal; the helper must exit successfully and produce exact owner/stop receipts. Do not substitute a kill or launch retry.
 
 Before spawn, Store reserves one durable start. A proven pre-helper-spawn NoEffect is recorded only after an exact empty-unknown compare-and-swap. If spawn was attempted or the result is uncertain, the disposition remains outcome_unknown and must not be replayed; recovery is readback-only. Operation readers accept only the two exact negative-proof shapes with NULL process fields, and reserved cancellation writes a canonical bounded negative proof. A retained service that cannot be proved stays fenced.

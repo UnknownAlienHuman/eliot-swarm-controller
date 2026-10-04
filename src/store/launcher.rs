@@ -774,6 +774,103 @@ impl LaunchActor {
         }
     }
 
+    /// Revalidate only the bound, ready initial-dispatch stage. An absent child
+    /// Operation means admission before the Attempt start-pointer CAS; a child
+    /// means pre-effect validation of that exact queued dispatch Operation.
+    // Each argument identifies one independently checked retained launch fact.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn require_dispatch_launch_attempt(
+        &self,
+        db: &Connection,
+        operation_id: &str,
+        task_id: &str,
+        task_revision: i64,
+        attempt_id: &str,
+        binding_id: &str,
+        binding_generation: i64,
+        dispatch_operation_id: Option<&str>,
+    ) -> Result<()> {
+        if operation_id.is_empty()
+            || task_id.is_empty()
+            || task_revision <= 0
+            || attempt_id.is_empty()
+            || binding_id.is_empty()
+            || binding_generation <= 0
+            || dispatch_operation_id.is_some_and(|id| {
+                id.is_empty() || id.len() > 256 || id.chars().any(char::is_control)
+            })
+        {
+            return Err(Error::new("FORBIDDEN", "dispatch launch scope is invalid"));
+        }
+        if new_work_state(db)?["new_work"] != "enabled" {
+            return Err(Error::new(
+                "ADMISSION_DISABLED",
+                "new work is disabled before launch dispatch",
+            ));
+        }
+        let (request, manifest) = require_dispatch_launch_parent_stage(
+            db,
+            self,
+            operation_id,
+            task_id,
+            task_revision,
+            attempt_id,
+            binding_id,
+            binding_generation,
+            dispatch_operation_id,
+        )?;
+        match self {
+            Self::Direct(_) => {
+                self.require_current(db)?;
+                self.require_action_object(
+                    db,
+                    "swarm.launch",
+                    task_id,
+                    task_revision,
+                    Some(attempt_id),
+                )?;
+            }
+            Self::OnBehalf(context) => context.require_dispatch_launch_attempt(
+                db,
+                operation_id,
+                task_id,
+                task_revision,
+                attempt_id,
+                binding_id,
+                binding_generation,
+                dispatch_operation_id,
+            )?,
+        }
+        require_current_dispatch_launch_chain(
+            db,
+            self,
+            operation_id,
+            task_id,
+            task_revision,
+            attempt_id,
+            binding_id,
+            binding_generation,
+            dispatch_operation_id,
+            &request,
+            &manifest,
+        )?;
+        if let Some(dispatch_operation_id) = dispatch_operation_id {
+            require_dispatch_child_link(
+                db,
+                self,
+                operation_id,
+                task_id,
+                task_revision,
+                attempt_id,
+                binding_id,
+                binding_generation,
+                dispatch_operation_id,
+                &manifest,
+            )?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn same_authority_identity(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Direct(left), Self::Direct(right)) => {
@@ -788,6 +885,571 @@ impl LaunchActor {
             _ => false,
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn require_dispatch_launch_parent_stage(
+    db: &Connection,
+    actor: &LaunchActor,
+    operation_id: &str,
+    task_id: &str,
+    task_revision: i64,
+    attempt_id: &str,
+    binding_id: &str,
+    binding_generation: i64,
+    dispatch_operation_id: Option<&str>,
+) -> Result<(launcher::LaunchRequest, Value)> {
+    type ParentRow = (
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        String,
+        String,
+    );
+    let row: Option<ParentRow> = db
+        .query_row(
+            "SELECT caller_id,method,state,task_id,attempt_id,binding_id,binding_generation,\
+             original_request_json,effective_request_json FROM operations WHERE operation_id=?1",
+            [operation_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        caller,
+        method,
+        state,
+        operation_task,
+        operation_attempt,
+        operation_binding,
+        operation_generation,
+        original_json,
+        effective_json,
+    )) = row
+    else {
+        return Err(Error::new("NOT_FOUND", "launch Operation was not found"));
+    };
+    if caller != actor.technical_requester_id()
+        || method != "swarm.launch"
+        || state != "queued"
+        || operation_task.as_deref() != Some(task_id)
+        || operation_attempt.as_deref() != Some(attempt_id)
+        || operation_binding.as_deref() != Some(binding_id)
+        || operation_generation != Some(binding_generation)
+    {
+        return Err(Error::new(
+            "STALE_LAUNCH",
+            "launch Operation is not bound to the exact current dispatch tuple",
+        ));
+    }
+    let original: Value = serde_json::from_str(&original_json)
+        .map_err(|_| Error::new("INVALID_LAUNCH_MANIFEST", "launch request is invalid"))?;
+    let request = launcher::LaunchRequest::parse(&original)?;
+    let effective: Value = serde_json::from_str(&effective_json)
+        .map_err(|_| Error::new("INVALID_LAUNCH_MANIFEST", "launch manifest is invalid"))?;
+    let manifest = effective
+        .get("launch_manifest")
+        .ok_or_else(|| Error::new("INVALID_LAUNCH_MANIFEST", "launch manifest is missing"))?
+        .clone();
+    let expected_contract = json!({
+        "effect_scope":"one_exact_launch_plan",
+        "completion_condition":"workspace_binding_dispatch_and_capability_readback",
+        "replay_policy":"same_request_id_returns_retained_launch_receipt; unknown_effects_require_readback",
+        "contract_revision":"swarm-launch-v1",
+    });
+    if effective["operation_contract"] != expected_contract
+        || manifest["manifest_version"] != "eliot-launch-manifest-v1"
+        || manifest["actor"] != launch_actor_manifest(actor)
+        || manifest["plan_digest"] != request.plan_digest
+        || manifest["request"] != launch_preview_value(&request.preview)
+        || request.preview.task_id != task_id
+        || request.preview.expected_task_revision != task_revision
+        || manifest["task"]["task_id"] != task_id
+        || manifest["task"]["expected_revision"] != task_revision
+        || manifest["task"]["observed_revision"] != task_revision
+        || manifest["task"]["attempt_id"] != attempt_id
+        || manifest["attempt"]["start_owner"] != "controller"
+        || manifest["binding"]["binding_id"] != binding_id
+        || manifest["binding"]["generation"] != binding_generation
+        || manifest["binding"]["state"] != "ready"
+        || manifest["runtime"]["route"] != request.preview.route
+    {
+        return Err(Error::new(
+            "LAUNCH_MANIFEST_CORRUPT",
+            "retained launch does not match the exact dispatch actor and tuple",
+        ));
+    }
+    match dispatch_operation_id {
+        None if manifest["progress"]["task_dispatch"] != "not_started"
+            || !manifest["progress"]["task_dispatch_operation_id"].is_null()
+            || !manifest["progress"]["task_dispatch_packet_digest"].is_null() =>
+        {
+            return Err(Error::new(
+                "STALE_LAUNCH",
+                "launch has already left the unstarted dispatch stage",
+            ));
+        }
+        Some(dispatch_id)
+            if manifest["progress"]["task_dispatch"] != "queued"
+                || manifest["progress"]["task_dispatch_operation_id"] != dispatch_id
+                || manifest["progress"]["task_dispatch_packet_digest"]
+                    .as_str()
+                    .is_none_or(str::is_empty) =>
+        {
+            return Err(Error::new(
+                "STALE_LAUNCH",
+                "launch manifest does not retain this queued dispatch child",
+            ));
+        }
+        _ => {}
+    }
+    Ok((request, manifest))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn require_current_dispatch_launch_chain(
+    db: &Connection,
+    actor: &LaunchActor,
+    operation_id: &str,
+    task_id: &str,
+    task_revision: i64,
+    attempt_id: &str,
+    binding_id: &str,
+    binding_generation: i64,
+    dispatch_operation_id: Option<&str>,
+    request: &launcher::LaunchRequest,
+    manifest: &Value,
+) -> Result<()> {
+    let task = super::tasks::get_task(db, task_id)?;
+    if task["project_id"] != manifest["task"]["project_id"]
+        || task["revision"] != task_revision
+        || task["state"] != "open"
+        || task["current_attempt_id"] != attempt_id
+    {
+        return Err(Error::new(
+            "STALE_LAUNCH",
+            "Task is no longer current at the exact launch revision and Attempt",
+        ));
+    }
+    let active_attempts: i64 = db.query_row(
+        "SELECT count(*) FROM attempts WHERE task_id=?1 AND released_at_ms IS NULL",
+        [task_id],
+        |row| row.get(0),
+    )?;
+    type AttemptStage = (
+        String,
+        i64,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+    );
+    let attempt: Option<AttemptStage> = db
+        .query_row(
+            "SELECT task_id,task_revision,owner_id,state,start_owner,start_operation_id,binding_id,\
+             binding_generation,released_at_ms FROM attempts WHERE attempt_id=?1",
+            [attempt_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ))
+            },
+        )
+        .optional()?;
+    let exact_attempt = attempt.is_some_and(
+        |(
+            attempt_task,
+            revision,
+            owner_id,
+            state,
+            start_owner,
+            start_operation,
+            attempt_binding,
+            generation,
+            released,
+        )| {
+            attempt_task == task_id
+                && revision == task_revision
+                && owner_id == actor.effective_manager_id()
+                && state == "reserved"
+                && start_owner == "controller"
+                && start_operation.as_deref() == dispatch_operation_id
+                && attempt_binding.as_deref() == Some(binding_id)
+                && generation == Some(binding_generation)
+                && released.is_none()
+        },
+    );
+    if active_attempts != 1 || !exact_attempt {
+        return Err(Error::new(
+            "STALE_LAUNCH",
+            "Attempt is not the sole current bound controller assignment at this dispatch stage",
+        ));
+    }
+    let binding = super::operations::get_binding(db, binding_id, binding_generation)?;
+    if binding["state"] != "ready" || !binding["released_at_ms"].is_null() {
+        return Err(Error::new(
+            "BINDING_NOT_READY",
+            "dispatch requires the exact ready, unreleased native binding",
+        ));
+    }
+
+    let lease: crate::workspace::LeaseAuthorityRef =
+        serde_json::from_value(manifest["workspace"]["lease_authority"].clone()).map_err(|_| {
+            Error::new(
+                "LAUNCH_MANIFEST_CORRUPT",
+                "launch held-lease authority reference is invalid",
+            )
+        })?;
+    if lease.state != "held"
+        || lease.operation_id != operation_id
+        || lease.project_id != task["project_id"]
+        || lease.task_id != task_id
+        || lease.task_revision != task_revision
+        || lease.plan_digest != request.plan_digest
+        || lease.owner_client_id != actor.effective_manager_id()
+        || lease.attempt_id.as_deref() != Some(attempt_id)
+        || lease.generation <= 0
+        || lease.registration_generation <= 0
+        || lease.binding_digest.is_empty()
+        || super::workspace::held_lease_for_operation(db, operation_id)?.as_ref() != Some(&lease)
+    {
+        return Err(Error::new(
+            "WORKSPACE_LEASE_STALE",
+            "dispatch parent does not retain its exact held workspace lease",
+        ));
+    }
+    let lease_view = super::workspace::get_lease_view(db, &lease)?;
+    let manifest_digest =
+        final_workspace_manifest_digest(&request.plan_digest, &lease, &lease_view)?;
+    if model::canonical(&lease_view)? != model::canonical(&manifest["workspace"]["lease"])?
+        || manifest["workspace"]["manifest_digest"] != manifest_digest
+    {
+        return Err(Error::new(
+            "WORKSPACE_LEASE_STALE",
+            "dispatch parent workspace snapshot differs from current lease authority",
+        ));
+    }
+
+    let open_operation_id = model::text(&manifest["binding"], "operation_id")?;
+    type OpenRow = (
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        String,
+        Option<String>,
+        String,
+        String,
+    );
+    let open: Option<OpenRow> = db
+        .query_row(
+            "SELECT caller_id,method,client_request_id,prerequisite_operation_id,task_id,\
+             attempt_id,binding_id,binding_generation,state,result_json,original_request_json,\
+             effective_request_json FROM operations WHERE operation_id=?1",
+            [open_operation_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        caller,
+        method,
+        client_request_id,
+        prerequisite,
+        open_task,
+        open_attempt,
+        open_binding,
+        open_generation,
+        state,
+        open_result_json,
+        open_original_json,
+        open_effective_json,
+    )) = open
+    else {
+        return Err(Error::new(
+            "LAUNCH_OPEN_MISSING",
+            "launch open child was not found",
+        ));
+    };
+    let expected_open_request_id = format!("launch:{operation_id}:open");
+    if caller != actor.technical_requester_id()
+        || method != "agent.open"
+        || client_request_id != expected_open_request_id
+        || prerequisite.as_deref() != Some(operation_id)
+        || open_task.as_deref() != Some(task_id)
+        || open_attempt.as_deref() != Some(attempt_id)
+        || open_binding.as_deref() != Some(binding_id)
+        || open_generation != Some(binding_generation)
+        || state != "settled"
+    {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "agent.open is not the exact settled child of this launch binding",
+        ));
+    }
+    let open_original: Value = serde_json::from_str(&open_original_json)
+        .map_err(|_| Error::new("LAUNCH_OPEN_CORRUPT", "agent.open request is invalid"))?;
+    model::fields(&open_original, &["client_request_id", "lane_id", "route"])?;
+    if open_original["client_request_id"] != expected_open_request_id
+        || open_original["lane_id"] != format!("launch-{}", lease.lease_id)
+        || open_original["route"] != request.preview.route
+    {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "agent.open request differs from the exact launch route and lease",
+        ));
+    }
+    let open_effective: Value = serde_json::from_str(&open_effective_json)
+        .map_err(|_| Error::new("LAUNCH_OPEN_CORRUPT", "agent.open receipt is invalid"))?;
+    if open_effective["receipt"]["ok"] != true
+        || open_effective["receipt"]["value"]["operation_id"] != open_operation_id
+        || open_effective["receipt"]["value"]["binding_id"] != binding_id
+        || open_effective["receipt"]["value"]["generation"] != binding_generation
+        || open_effective["receipt"]["value"]["state"] != "queued"
+        || open_effective["operation_contract"]["parent_launch_operation_id"] != operation_id
+        || open_effective["workspace_lease"]["lease_id"] != lease.lease_id
+        || open_effective["workspace_lease"]["generation"] != lease.generation
+        || open_effective["workspace_lease"]["binding_digest"] != lease.binding_digest
+    {
+        return Err(Error::new(
+            "LAUNCH_OPEN_CORRUPT",
+            "agent.open receipt does not prove the exact parent lease and binding",
+        ));
+    }
+    let result_raw = open_result_json.ok_or_else(|| {
+        Error::new(
+            "LAUNCH_OPEN_CORRUPT",
+            "settled agent.open has no result receipt",
+        )
+    })?;
+    let result: crate::runtime::RuntimeOutcome =
+        serde_json::from_str(&result_raw).map_err(|_| {
+            Error::new(
+                "LAUNCH_OPEN_CORRUPT",
+                "settled agent.open result is not a runtime outcome",
+            )
+        })?;
+    let expected_root = model::text(&binding, "native_root_id")?;
+    let expected_scope = model::text(&binding, "native_scope_key")?;
+    if result.operation_id != open_operation_id
+        || !matches!(result.outcome, crate::runtime::EffectOutcome::Applied)
+        || result.native_root_id.as_deref() != Some(expected_root)
+        || result.native_scope_key.as_deref() != Some(expected_scope)
+    {
+        return Err(Error::new(
+            "LAUNCH_OPEN_CORRUPT",
+            "settled agent.open result differs from the exact ready native binding",
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)] // Exact retained authority tuple.
+fn require_dispatch_child_link(
+    db: &Connection,
+    actor: &LaunchActor,
+    parent_operation_id: &str,
+    task_id: &str,
+    task_revision: i64,
+    attempt_id: &str,
+    binding_id: &str,
+    binding_generation: i64,
+    dispatch_operation_id: &str,
+    manifest: &Value,
+) -> Result<()> {
+    type DispatchRow = (
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        String,
+        String,
+    );
+    let row: Option<DispatchRow> = db
+        .query_row(
+            "SELECT caller_id,method,state,task_id,attempt_id,binding_id,binding_generation,\
+             original_request_json,effective_request_json FROM operations WHERE operation_id=?1",
+            [dispatch_operation_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        caller,
+        method,
+        state,
+        operation_task,
+        operation_attempt,
+        operation_binding,
+        operation_generation,
+        original_json,
+        effective_json,
+    )) = row
+    else {
+        return Err(Error::new(
+            "STALE_LAUNCH",
+            "queued dispatch child was not found",
+        ));
+    };
+    let expected_caller = match actor {
+        LaunchActor::Direct(_) => actor.technical_requester_id(),
+        LaunchActor::OnBehalf(_) => actor.effective_manager_id(),
+    };
+    if caller != expected_caller
+        || method != "task.dispatch"
+        || state != "queued"
+        || operation_task.as_deref() != Some(task_id)
+        || operation_attempt.as_deref() != Some(attempt_id)
+        || operation_binding.as_deref() != Some(binding_id)
+        || operation_generation != Some(binding_generation)
+    {
+        return Err(Error::new(
+            "STALE_LAUNCH",
+            "dispatch child is not the exact queued Task, Attempt, and binding Operation",
+        ));
+    }
+    let original: Value = serde_json::from_str(&original_json)
+        .map_err(|_| Error::new("INVALID_RECEIPT", "dispatch request is invalid"))?;
+    if original["attempt_id"] != attempt_id
+        || original["launch_operation_id"] != parent_operation_id
+    {
+        return Err(Error::new(
+            "STALE_LAUNCH",
+            "dispatch request does not name this exact launch and Attempt",
+        ));
+    }
+    let effective: Value = serde_json::from_str(&effective_json)
+        .map_err(|_| Error::new("INVALID_RECEIPT", "dispatch packet is invalid"))?;
+    let packet = &effective["launch_dispatch_packet"];
+    if packet["schema_version"] != 1
+        || packet["launch_operation_id"] != parent_operation_id
+        || packet["plan_digest"] != manifest["plan_digest"]
+        || packet["task"]["task_id"] != task_id
+        || packet["task"]["revision"] != task_revision
+        || packet["task"]["attempt_id"] != attempt_id
+    {
+        return Err(Error::new(
+            "STALE_LAUNCH",
+            "dispatch packet does not retain the exact parent and Task tuple",
+        ));
+    }
+    let packet_digest = format!(
+        "sha256:{}",
+        model::digest(model::canonical(packet)?.as_bytes())
+    );
+    if manifest["progress"]["task_dispatch_packet_digest"] != packet_digest {
+        return Err(Error::new(
+            "STALE_LAUNCH",
+            "launch manifest dispatch packet digest differs from the queued child",
+        ));
+    }
+    let identity_digest = model::text(&packet["capability"], "identity_digest")?;
+    let key = format!(
+        "launcher:task_dispatch:v1:{}",
+        model::digest(dispatch_operation_id.as_bytes())
+    );
+    let record = meta(db, &key)?
+        .ok_or_else(|| Error::new("LAUNCH_DISPATCH_LINK_MISSING", "dispatch link is missing"))?;
+    model::fields(
+        &record,
+        &[
+            "schema_version",
+            "kind",
+            "launch_operation_id",
+            "dispatch_operation_id",
+            "plan_digest",
+            "task_id",
+            "task_revision",
+            "attempt_id",
+            "binding_id",
+            "binding_generation",
+            "packet_digest",
+            "capability_identity_digest",
+            "created_at_ms",
+        ],
+    )?;
+    if record["schema_version"] != 1
+        || record["kind"] != "launcher_task_dispatch"
+        || record["launch_operation_id"] != parent_operation_id
+        || record["dispatch_operation_id"] != dispatch_operation_id
+        || record["plan_digest"] != manifest["plan_digest"]
+        || record["task_id"] != task_id
+        || record["task_revision"] != task_revision
+        || record["attempt_id"] != attempt_id
+        || record["binding_id"] != binding_id
+        || record["binding_generation"] != binding_generation
+        || record["packet_digest"] != packet_digest
+        || record["capability_identity_digest"] != identity_digest
+        || record["created_at_ms"]
+            .as_i64()
+            .is_none_or(|time| time <= 0)
+        || manifest["progress"]["task_dispatch"] != "queued"
+        || manifest["progress"]["task_dispatch_operation_id"] != dispatch_operation_id
+    {
+        return Err(Error::new(
+            "LAUNCH_DISPATCH_LINK_INVALID",
+            "retained dispatch link does not match the exact queued child and packet",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -2605,7 +3267,10 @@ fn persist_launch_progress(
 
 /// Reconstruct an admitted actor from the immutable launch manifest and,
 /// for WorkDispatch, its integrity-checked private Operation link.
-pub(crate) fn launch_actor(db: &Connection, operation_id: &str) -> Result<LaunchActor> {
+fn retained_launch_actor(
+    db: &Connection,
+    operation_id: &str,
+) -> Result<(Value, Value, LaunchActor)> {
     let operation = super::operations::get_operation(db, operation_id)?;
     if operation["method"] != "swarm.launch" {
         return Err(Error::new("FORBIDDEN", "Operation is not a launch"));
@@ -2632,7 +3297,11 @@ pub(crate) fn launch_actor(db: &Connection, operation_id: &str) -> Result<Launch
                 "on-behalf launch manifest differs from its retained Store link",
             ));
         }
-        return Ok(LaunchActor::OnBehalf(Box::new(context)));
+        return Ok((
+            operation,
+            manifest,
+            LaunchActor::OnBehalf(Box::new(context)),
+        ));
     }
 
     if retained_client_id != caller_id
@@ -2671,10 +3340,41 @@ pub(crate) fn launch_actor(db: &Connection, operation_id: &str) -> Result<Launch
     };
     let actor = LaunchActor::Direct(principal);
     actor.require_current(db)?;
+    Ok((operation, manifest, actor))
+}
+
+pub(crate) fn launch_actor(db: &Connection, operation_id: &str) -> Result<LaunchActor> {
+    let (_operation, manifest, actor) = retained_launch_actor(db, operation_id)?;
     let task_id = model::text(&manifest["task"], "task_id")?;
     let task_revision = model::positive(&manifest["task"], "observed_revision")?;
     let attempt_id = manifest["task"]["attempt_id"].as_str();
     actor.require_action_object(db, "swarm.launch", task_id, task_revision, attempt_id)?;
+    Ok(actor)
+}
+
+/// Rehydrate an actor only for the bound, ready dispatch stage. The ordinary
+/// launch actor constructor remains restricted to its original unstarted path.
+pub(crate) fn dispatch_launch_actor(
+    db: &Connection,
+    operation_id: &str,
+    dispatch_operation_id: Option<&str>,
+) -> Result<LaunchActor> {
+    let (_operation, manifest, actor) = retained_launch_actor(db, operation_id)?;
+    let task_id = model::text(&manifest["task"], "task_id")?;
+    let task_revision = model::positive(&manifest["task"], "observed_revision")?;
+    let attempt_id = model::text(&manifest["task"], "attempt_id")?;
+    let binding_id = model::text(&manifest["binding"], "binding_id")?;
+    let binding_generation = model::positive(&manifest["binding"], "generation")?;
+    actor.require_dispatch_launch_attempt(
+        db,
+        operation_id,
+        task_id,
+        task_revision,
+        attempt_id,
+        binding_id,
+        binding_generation,
+        dispatch_operation_id,
+    )?;
     Ok(actor)
 }
 

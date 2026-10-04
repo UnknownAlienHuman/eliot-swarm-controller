@@ -419,6 +419,7 @@ fn next_internal(
         }
     };
     let mut input: Value = serde_json::from_str(&raw)?;
+    let mut trusted_launch_dispatch_packet: Option<Value> = None;
     let guard = (|| -> Result<()> {
         let o = operations::get_operation(&tx, &op)?;
         let caller = if opening_actor.is_some() {
@@ -536,6 +537,8 @@ fn next_internal(
                     "original caller no longer owns this task",
                 ));
             }
+            trusted_launch_dispatch_packet =
+                super::launcher_dispatch::validate_before_effect(&tx, config, &op, &input, &b)?;
         }
         Ok(())
     })();
@@ -544,6 +547,9 @@ fn next_internal(
         tx.execute("UPDATE operations SET state='rejected',result_json=?2,settled_at_ms=?3,updated_at_ms=?3 WHERE operation_id=?1 AND state='queued'",params![op,model::canonical(&json!(e))?,now])?;
         tx.commit()?;
         return Ok(json!({"command":null,"rejected_operation_id":op,"error":e}));
+    }
+    if let Some(packet) = trusted_launch_dispatch_packet {
+        input["launch_dispatch_packet"] = packet;
     }
     let mut command_route = b["route"].clone();
     if command_route

@@ -12,6 +12,7 @@ pub(crate) mod mcp_plugin;
 pub(crate) mod mcp_tools;
 pub(crate) mod owned_service;
 mod prerequisites;
+mod provider_auth;
 mod results;
 mod snapshot;
 #[cfg(test)]

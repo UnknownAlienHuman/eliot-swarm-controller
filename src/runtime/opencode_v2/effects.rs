@@ -53,13 +53,101 @@ pub(super) fn prompt(command: &RuntimeCommand) -> Result<String> {
         if !command.input["task_snapshot"].is_object() {
             return Err(Error::invalid("immutable task snapshot is required"));
         }
+        let task_snapshot = model::canonical(&command.input["task_snapshot"])?;
+        let base = format!("{text}\n\nELIOT immutable task snapshot:\n{task_snapshot}");
+        let Some(packet) = command.input.get("launch_dispatch_packet") else {
+            return Ok(base);
+        };
+        validate_launch_dispatch_packet(packet)?;
+        let packet = model::canonical(packet)?;
         Ok(format!(
-            "{text}\n\nELIOT immutable task snapshot:\n{}",
-            model::canonical(&command.input["task_snapshot"])?
+            "{base}\n\nELIOT immutable launch dispatch packet v1:\n\
+             <<<ELIOT-LAUNCH-DISPATCH-PACKET-V1-BEGIN>>>\n{packet}\n\
+             <<<ELIOT-LAUNCH-DISPATCH-PACKET-V1-END>>>"
         ))
     } else {
         Ok(text.to_owned())
     }
+}
+
+fn validate_launch_dispatch_packet(packet: &Value) -> Result<()> {
+    model::fields(
+        packet,
+        &[
+            "schema_version",
+            "launch_operation_id",
+            "plan_digest",
+            "task",
+            "selection",
+            "purpose",
+            "capability",
+        ],
+    )?;
+    if packet["schema_version"] != 1 {
+        return Err(Error::new(
+            "INVALID_LAUNCH_DISPATCH_PACKET",
+            "launch dispatch packet must use schema version 1",
+        ));
+    }
+    model::text(packet, "launch_operation_id")?;
+    model::text(packet, "plan_digest")?;
+    model::text(packet, "purpose")?;
+
+    let task = &packet["task"];
+    model::fields(
+        task,
+        &["task_id", "revision", "attempt_id", "snapshot_digest"],
+    )?;
+    model::text(task, "task_id")?;
+    model::positive(task, "revision")?;
+    model::text(task, "attempt_id")?;
+    model::text(task, "snapshot_digest")?;
+
+    let selection = &packet["selection"];
+    model::fields(selection, &["route", "provider", "model", "variant"])?;
+    model::text(selection, "route")?;
+    model::text(selection, "provider")?;
+    model::text(selection, "model")?;
+    model::text(selection, "variant")?;
+
+    let capability = &packet["capability"];
+    model::fields(
+        capability,
+        &[
+            "identity_digest",
+            "evidence_digest",
+            "native_discovered_digest",
+            "service_id",
+            "service_version",
+            "plugin_id",
+            "module_sha256",
+            "required_core_schemas",
+        ],
+    )?;
+    for field in [
+        "identity_digest",
+        "evidence_digest",
+        "native_discovered_digest",
+        "service_id",
+        "service_version",
+        "plugin_id",
+        "module_sha256",
+    ] {
+        model::text(capability, field)?;
+    }
+    let schemas = capability["required_core_schemas"]
+        .as_array()
+        .filter(|schemas| !schemas.is_empty())
+        .ok_or_else(|| Error::invalid("required core schemas must be a nonempty string array"))?;
+    if schemas
+        .iter()
+        .any(|schema| schema.as_str().is_none_or(|name| name.trim().is_empty()))
+    {
+        return Err(Error::invalid(
+            "required core schemas must be a nonempty string array",
+        ));
+    }
+    Ok(())
 }
 /// A server fallback to its default workspace must not redirect an assignment.
 /// Native canonicalization (case, separators, symlinks) is allowed only when the

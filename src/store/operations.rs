@@ -1,4 +1,4 @@
-use super::{meta, prerequisites, tasks};
+use super::{launcher_dispatch, meta, prerequisites, tasks};
 use crate::{
     automation::authorization::{on_behalf_visible_to, operation_link},
     config::Config,
@@ -507,6 +507,7 @@ pub(super) fn dispatch(
     v: &Value,
     id: &str,
     now: i64,
+    config: &Config,
 ) -> Result<(Value, bool)> {
     model::fields(
         v,
@@ -515,6 +516,7 @@ pub(super) fn dispatch(
             "attempt_id",
             "text",
             "prerequisite_operation_id",
+            "launch_operation_id",
         ],
     )?;
     let attempt = model::text(v, "attempt_id")?;
@@ -528,14 +530,22 @@ pub(super) fn dispatch(
         ));
     }
     if let Some(start) = a["start_operation_id"].as_str() {
-        let prior: String = tx.query_row(
-            "SELECT original_request_json FROM operations WHERE operation_id=?1",
+        let (prior_method, prior_raw): (String, String) = tx.query_row(
+            "SELECT method,original_request_json FROM operations WHERE operation_id=?1",
             [start],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
-        let prior: Value = serde_json::from_str(&prior)?;
+        if prior_method != "task.dispatch" {
+            return Err(Error::new(
+                "ATTEMPT_START_CORRUPT",
+                "Attempt start pointer is not a task.dispatch Operation",
+            ));
+        }
+        launcher_dispatch::validate_coalesced_dispatch(tx, start, v, &a)?;
+        let prior: Value = serde_json::from_str(&prior_raw)?;
         if prior["text"] != body
             || prior.get("prerequisite_operation_id") != v.get("prerequisite_operation_id")
+            || prior.get("launch_operation_id") != v.get("launch_operation_id")
         {
             return Err(Error::conflict(
                 "initial delivery already exists with different input or setup prerequisite; use correction, not dispatch",
@@ -570,6 +580,7 @@ pub(super) fn dispatch(
         ));
     }
     let prerequisite = prerequisites::validate_request(tx, &b, v, id)?;
+    let launch_dispatch = launcher_dispatch::prepare_admission(tx, config, p, v, &a, &task, &b)?;
     let prerequisite_id = prerequisite.operation_id().map(str::to_owned);
     let prerequisite_contract_revision = prerequisite.contract_revision().map(str::to_owned);
     let mut effective = json!({
@@ -587,6 +598,16 @@ pub(super) fn dispatch(
             "contract_revision":"opencode-input-v1"
         });
     }
+    if let Some(admission) = &launch_dispatch {
+        effective["launch_dispatch_packet"] = admission.packet.clone();
+        effective["operation_contract"]["launch_dispatch"] = json!({
+            "contract_revision":"launch-dispatch-v1",
+            "launch_operation_id":admission.launch_operation_id,
+            "packet_digest":admission.packet_digest,
+            "completion_condition":"native_input_admitted",
+            "replay_policy":"same_parent_and_packet_only_no_mutation_replay",
+        });
+    }
     if let Some(prerequisite_id) = &prerequisite_id {
         effective["prerequisite"] = json!({
             "operation_id":prerequisite_id,
@@ -594,10 +615,56 @@ pub(super) fn dispatch(
             "required_contract_revision":prerequisite_contract_revision
         });
     }
-    tx.execute("UPDATE operations SET task_id=?2,attempt_id=?3,binding_id=?4,binding_generation=?5,prerequisite_operation_id=?6,effective_request_json=?7 WHERE operation_id=?1",params![id,a["task_id"].as_str(),attempt,binding,generation,prerequisite_id,model::canonical(&effective)?])?;
-    tx.execute("UPDATE attempts SET start_operation_id=?2,updated_at_ms=?3 WHERE attempt_id=?1 AND start_operation_id IS NULL",params![attempt,id,now])?;
+    let operation_changed = tx.execute(
+        "UPDATE operations SET task_id=?2,attempt_id=?3,binding_id=?4,binding_generation=?5,prerequisite_operation_id=?6,effective_request_json=?7 \
+         WHERE operation_id=?1 AND method='task.dispatch' AND state='queued'",
+        params![
+            id,
+            a["task_id"].as_str(),
+            attempt,
+            binding,
+            generation,
+            prerequisite_id,
+            model::canonical(&effective)?
+        ],
+    )?;
+    if operation_changed != 1 {
+        return Err(Error::conflict(
+            "dispatch Operation changed before admission completed",
+        ));
+    }
+    if let Some(admission) = &launch_dispatch {
+        launcher_dispatch::retain_admission(tx, id, &a, admission, now)?;
+    }
+    let attempt_changed = tx.execute(
+        "UPDATE attempts SET start_operation_id=?2,updated_at_ms=?3 \
+         WHERE attempt_id=?1 AND start_operation_id IS NULL AND state='reserved' \
+           AND released_at_ms IS NULL AND owner_id=?4 AND task_id=?5 \
+           AND task_revision=?6 AND binding_id=?7 AND binding_generation=?8",
+        params![
+            attempt,
+            id,
+            now,
+            a["owner_id"].as_str(),
+            a["task_id"].as_str(),
+            a["task_revision"].as_i64(),
+            binding,
+            generation,
+        ],
+    )?;
+    if attempt_changed != 1 {
+        return Err(Error::conflict(
+            "Attempt changed before its initial dispatch was admitted",
+        ));
+    }
+    let launch_receipt = launch_dispatch.as_ref().map(|admission| {
+        json!({
+            "launch_operation_id":admission.launch_operation_id,
+            "packet_digest":admission.packet_digest,
+        })
+    });
     Ok((
-        json!({"operation_id":id,"attempt_id":attempt,"state":"queued","admission":"durable_local","native_admission":"not_observed","prerequisite_operation_id":prerequisite_id,"prerequisite_state":prerequisite.receipt_state()}),
+        json!({"operation_id":id,"attempt_id":attempt,"state":"queued","admission":"durable_local","native_admission":"not_observed","prerequisite_operation_id":prerequisite_id,"prerequisite_state":prerequisite.receipt_state(),"launch_dispatch":launch_receipt}),
         true,
     ))
 }

@@ -56,6 +56,8 @@ pub(crate) struct OwnedServiceExpectation {
     process_birth_token: String,
     executable_sha256: String,
     identity_digest: String,
+    proof_digest: String,
+    provider_auth_required: bool,
 }
 
 impl OwnedServiceExpectation {
@@ -69,6 +71,14 @@ impl OwnedServiceExpectation {
 
     pub(crate) fn executable_sha256(&self) -> &str {
         &self.executable_sha256
+    }
+
+    pub(crate) fn proof_digest(&self) -> &str {
+        &self.proof_digest
+    }
+
+    pub(crate) fn provider_auth_required(&self) -> bool {
+        self.provider_auth_required
     }
 
     fn identity_digest(&self) -> &str {
@@ -93,6 +103,14 @@ impl NativeMcpLaunchSnapshot {
         &self.snapshot.client_id
     }
 
+    pub(crate) fn binding_id(&self) -> &str {
+        &self.snapshot.binding_id
+    }
+
+    pub(crate) fn binding_generation(&self) -> i64 {
+        self.snapshot.binding_generation
+    }
+
     pub(crate) fn credential_ref(&self) -> &str {
         &self.snapshot.credential_ref
     }
@@ -112,6 +130,40 @@ impl NativeMcpLaunchSnapshot {
     pub(crate) fn identity_digest(&self) -> Result<String> {
         Ok(self.identity_digest.clone())
     }
+
+    /// Reconstruct the typed attempt-owner scope from this freshly validated
+    /// Store snapshot. This uses the current ready binding root and grant
+    /// facts already checked by `validate_launch_snapshot`; it is not a
+    /// Participant Principal constructor or an external request decoder.
+    pub(crate) fn assignment_context(&self) -> Result<crate::native_mcp::AssignmentContext> {
+        let snapshot = &self.snapshot;
+        let native_session_id = snapshot.current_authority_facts["binding"]["native_root_id"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(stale_readback)?
+            .to_owned();
+        crate::native_mcp::AssignmentContext::new(crate::native_mcp::AssignmentSeed {
+            task_id: snapshot.task_id.clone(),
+            task_revision: snapshot.task_revision,
+            attempt_id: snapshot.attempt_id.clone(),
+            binding_id: snapshot.binding_id.clone(),
+            binding_generation: snapshot.binding_generation,
+            native_session_id,
+            participant_id: snapshot.client_id.clone(),
+            profile: McpToolProfile::Participant,
+            grant_revision: snapshot.grant_revision,
+            basis_kind: "attempt_owner".to_owned(),
+            assignment_id: None,
+            review_assignment_id: None,
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum LaunchSnapshotPhase<'a> {
+    PreDispatch,
+    DispatchNotStarted,
+    DispatchQueued(&'a str),
 }
 
 struct ReadbackClaim {
@@ -215,7 +267,13 @@ impl Store {
                 let _actor = launcher::launch_actor(db, &operation_id)?;
                 let (row, manifest) = load_launch_manifest(db, &operation_id)?;
                 verify_claim(&row, &manifest, &context_claim)?;
-                let current = validate_launch_snapshot(db, &row, &manifest, &config)?;
+                let current = validate_launch_snapshot(
+                    db,
+                    &row,
+                    &manifest,
+                    &config,
+                    LaunchSnapshotPhase::PreDispatch,
+                )?;
                 if snapshot_identity(&current) != expected_snapshot {
                     return Err(stale_readback());
                 }
@@ -274,7 +332,9 @@ impl Store {
                 let _actor = launcher::launch_actor(&tx, &operation_id)?;
                 let (row, manifest) = load_launch_manifest(&tx, &operation_id)?;
                 verify_claim(&row, &manifest, &record_claim)?;
-                let current = validate_launch_snapshot(&tx, &row, &manifest, &config)?;
+                let current = validate_launch_snapshot(
+                    &tx, &row, &manifest, &config, LaunchSnapshotPhase::PreDispatch,
+                )?;
                 if snapshot_identity(&current) != snapshot_identity(&record_claim.snapshot) {
                     return Err(stale_readback());
                 }
@@ -519,7 +579,13 @@ fn claim_next_readback(tx: &Transaction<'_>, now: i64, config: &Config) -> Resul
         let (row, manifest) = load_launch_manifest(tx, &operation_id)?;
         let previous = readback_marker(&manifest);
         let attempt = marker_attempts(previous).saturating_add(1);
-        match validate_launch_snapshot(tx, &row, &manifest, config) {
+        match validate_launch_snapshot(
+            tx,
+            &row,
+            &manifest,
+            config,
+            LaunchSnapshotPhase::PreDispatch,
+        ) {
             Ok(snapshot) => {
                 let claim = ReadbackClaim {
                     snapshot,
@@ -585,16 +651,29 @@ fn validate_launch_snapshot(
     row: &LaunchRow,
     manifest: &Value,
     config: &Config,
+    phase: LaunchSnapshotPhase<'_>,
 ) -> Result<LaunchSnapshot> {
+    let expected_progress = match phase {
+        LaunchSnapshotPhase::PreDispatch | LaunchSnapshotPhase::DispatchNotStarted => "not_started",
+        LaunchSnapshotPhase::DispatchQueued(_) => "queued",
+    };
     if row.method != "swarm.launch"
         || row.state != "queued"
         || manifest["state"] != "awaiting_native_mcp"
         || manifest["runtime"]["dispatch_permitted"] != false
-        || manifest["progress"]["task_dispatch"] != "not_started"
+        || manifest["progress"]["task_dispatch"] != expected_progress
     {
         return Err(stale_readback());
     }
-    let actor = launcher::launch_actor(db, &row.operation_id)?;
+    let actor = match phase {
+        LaunchSnapshotPhase::PreDispatch => launcher::launch_actor(db, &row.operation_id)?,
+        LaunchSnapshotPhase::DispatchNotStarted => {
+            launcher::dispatch_launch_actor(db, &row.operation_id, None)?
+        }
+        LaunchSnapshotPhase::DispatchQueued(dispatch_operation_id) => {
+            launcher::dispatch_launch_actor(db, &row.operation_id, Some(dispatch_operation_id))?
+        }
+    };
     let current_gm = meta(db, "gm")?.unwrap_or(Value::Null);
     let local_operator = meta(db, "local_operator_client_id")?.unwrap_or(Value::Null);
     let task_id = text_at(&manifest["task"], "task_id")?;
@@ -605,15 +684,17 @@ fn validate_launch_snapshot(
     let binding_id = text_at(&manifest["binding"], "binding_id")?;
     let binding_generation = positive_at(&manifest["binding"], "generation")?;
     let owner_id = text_at(&attempt, "owner_id")?;
-    actor.require_bound_launch_attempt(
-        db,
-        &row.operation_id,
-        task_id,
-        task_revision,
-        attempt_id,
-        binding_id,
-        binding_generation,
-    )?;
+    if matches!(phase, LaunchSnapshotPhase::PreDispatch) {
+        actor.require_bound_launch_attempt(
+            db,
+            &row.operation_id,
+            task_id,
+            task_revision,
+            attempt_id,
+            binding_id,
+            binding_generation,
+        )?;
+    }
     if task["state"] != "open"
         || task["revision"] != task_revision
         || task["current_attempt_id"].as_str() != Some(attempt_id)
@@ -623,6 +704,14 @@ fn validate_launch_snapshot(
         || attempt["released_at_ms"].is_number()
         || attempt["binding_id"].as_str() != Some(binding_id)
         || attempt["binding_generation"] != binding_generation
+        || match phase {
+            LaunchSnapshotPhase::PreDispatch | LaunchSnapshotPhase::DispatchNotStarted => {
+                !attempt["start_operation_id"].is_null()
+            }
+            LaunchSnapshotPhase::DispatchQueued(dispatch_operation_id) => {
+                attempt["start_operation_id"].as_str() != Some(dispatch_operation_id)
+            }
+        }
         || row.task_id.as_deref() != Some(task_id)
         || row.attempt_id.as_deref() != Some(attempt_id)
         || row.binding_id.as_deref() != Some(binding_id)
@@ -832,6 +921,8 @@ fn validate_launch_snapshot(
                 process_birth_token,
                 executable_sha256,
                 identity_digest,
+                proof_digest: binding.proof_digest().to_owned(),
+                provider_auth_required: binding.route().credential_ref().is_some(),
             };
             (options, Some(expected))
         }
@@ -916,7 +1007,48 @@ pub(crate) fn current_mcp_launch_snapshot(
         return Err(Error::invalid("launch Operation ID is invalid"));
     }
     let (row, manifest) = load_launch_manifest(db, operation_id)?;
-    let snapshot = validate_launch_snapshot(db, &row, &manifest, config)?;
+    let snapshot = validate_launch_snapshot(
+        db,
+        &row,
+        &manifest,
+        config,
+        LaunchSnapshotPhase::PreDispatch,
+    )?;
+    let identity_digest = launch_identity_digest(&snapshot)?;
+    Ok(NativeMcpLaunchSnapshot {
+        snapshot,
+        identity_digest,
+    })
+}
+
+/// Capture the launch scope at the C10 admission or pre-effect stage. `None`
+/// accepts only the unstarted bound Attempt; `Some` accepts only the exact
+/// queued launch-owned task.dispatch child. The legacy pre-dispatch snapshot
+/// remains unchanged for C7/C8 callers.
+pub(crate) fn current_mcp_launch_snapshot_for_dispatch(
+    db: &Connection,
+    config: &Config,
+    launch_operation_id: &str,
+    dispatch_operation_id: Option<&str>,
+) -> Result<NativeMcpLaunchSnapshot> {
+    if launch_operation_id.is_empty()
+        || launch_operation_id.len() > 256
+        || launch_operation_id
+            .bytes()
+            .any(|byte| byte.is_ascii_control())
+        || dispatch_operation_id.is_some_and(|operation_id| {
+            operation_id.is_empty()
+                || operation_id.len() > 256
+                || operation_id.bytes().any(|byte| byte.is_ascii_control())
+        })
+    {
+        return Err(Error::invalid("launch or dispatch Operation ID is invalid"));
+    }
+    let (row, manifest) = load_launch_manifest(db, launch_operation_id)?;
+    let phase = dispatch_operation_id
+        .map(LaunchSnapshotPhase::DispatchQueued)
+        .unwrap_or(LaunchSnapshotPhase::DispatchNotStarted);
+    let snapshot = validate_launch_snapshot(db, &row, &manifest, config, phase)?;
     let identity_digest = launch_identity_digest(&snapshot)?;
     Ok(NativeMcpLaunchSnapshot {
         snapshot,
