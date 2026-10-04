@@ -28,8 +28,9 @@ fixtures/contracts, with exact production equivalence checked. Final gate
 contract and build with unchanged source, retaining the two Store checks and
 33 other MCP passes. The new debug candidate SHA-256 is
 `A26E038B93A766E55FFA708B21F56213B4BD4A68678F6C3EE8A25825A6F205A0`.
-Full CI for this new Rust increment is pending publication; the activation-fix
-CI linked below proves its historical source only.
+Full CI for source `836c938123714392d75b57158c777973aa6d8c07` is running at
+[37237925409](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37237925409);
+its results remain pending. The activation-fix CI below proves historical source.
 These scenarios do not establish native correction delivery, checker execution
 or publication. Typed event rules and shared Goal progression remain incomplete.
 
