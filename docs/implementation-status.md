@@ -2,7 +2,7 @@
 
 ## Current state
 
-**C9 source status:** C9 source 4218e7a4c67f5de244081d6e9dd37e2ee2e30544 is committed. The previous source 56bb19b9fbb5e3665fd567251d48a5c6e70e089b passed owned-crate formatting and production warnings-denied Clippy (11.95 s); the SQL-only 4218e7a delta passed formatting, and the debug candidate build passed (35.85 s). The SQL repair fixes escaped continuation whitespace in launcher::pending_launches; the exact extracted query also passed read-only preparation against the retained database. The earlier native host passed workspace configuration but failed at the first Store tick before Manager, Task or service. Independent bounded exact-source audits of 4218e7a passed: Store authority artifact .local/pr-implementation/c9-store-authority-audit.md (SHA-256 A7297B523C0964458778E0F25D3F39462E83CC497BA3ADF8A63EC060D9FC4EC0); owned runtime artifact .local/pr-implementation/c9-owned-runtime-audit.md (SHA-256 B67736D6AF04822E36C5DC8E657F9C05D31858B0973452678D169FF6964166B6). Corrected staged native acceptance remains pending. Hosted CI for 4218e7a4c67f5de244081d6e9dd37e2ee2e30544 is pending. Native MCP loading, callable tools, productive dispatch, model execution and the complete manager-owned cycle remain unqualified. Installed R6 is unchanged; all local model/inference work, including PR24/Kilo, remains deferred.
+**C9 source status:** Main/remote commit 2e609ecf7d826da7019fe5e5f2ed397a992bc45a contains the held-workspace overlay fix reviewed against source SHA prefix 0A905. Full Windows/Linux CI passed all steps on this exact source: formatting, Clippy, tests, build and native offline fixtures ([run 37168223030](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37168223030)). The native-derived path has not been locally rebuilt or retested. Prior Git-argv fix dd4a965571c8f846be8465309acebcb97bfb3f0c also passed full Windows/Linux CI run 37166867596; its local formatting/Clippy passed in 15.42 s and candidate build in 37.37 s. Staged run f368339d-1247-4118-bdac-a5441d29b8be ended OWNED_SERVICE_OR_NATIVE_PROOF_TIMEOUT/service_start: workspace hold and binding link succeeded, but the host repeatedly reported OWNED_SERVICE_SCOPE_STALE before an owned_service row, native MCP or model. The issue was comparing the whole route against an intentional native_options.directory lease overlay. Commit 2e609ec permits only that exact held directory and requires equality for every other route field; native retest remains pending. Runs f368339d and 114d4ca7 remain retained as unknown; no replay occurred and the host exited through normal EOF. Installed R6 is unchanged. C10 API/immutable-prompt/parent-dispatch, typed bound-ready authority, current C8 proof gate and a single opencode-go credential resolver are active WIP, not published, built or native-qualified. All local models/inference, including PR24, remain deferred.
 
 ### Prior C7/C8 evidence
 
@@ -74,13 +74,12 @@ and qualification follow it.
    shared manager-enabled progression remain incomplete.
 
 10. **O10 cross-contract parity and O11 integrated qualification — Partial /
-    qualification pending.** Catalog entries, handler wiring and individual CI
-    runs do not prove native harness loading or a recovered end-to-end
-    workflow. Historical C7/C8 CI evidence is recorded above. Source
-    56bb19b9fbb5e3665fd567251d48a5c6e70e089b passed formatting and
-    warnings-denied Clippy; hosted CI and corrected native acceptance remain
-    pending, while productive dispatch and the full manager-owned cycle remain
-    unqualified.
+    qualification pending.** CI 37168223030 passed all Windows/Linux steps for
+    source 2e609ec, including formatting, Clippy, tests, build and offline
+    native fixtures. The live native run still timed out before an
+    owned_service row; the overlay fix needs a local rebuild and native retest.
+    Hosted green does not qualify native MCP/model capability or the complete
+    manager-owned workflow.
 The status separates implemented slices from authored work and from runtime
 qualification. A registry entry, configuration, or successful unrelated gate
 does not establish productive launch or completion of the local delivery path.

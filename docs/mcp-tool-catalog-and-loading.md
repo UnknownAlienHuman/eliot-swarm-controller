@@ -1,11 +1,11 @@
 # ELIOT MCP Tool Catalog and Deferred Loading
 ## Small role-specific core, searchable domain groups, hard authorization and verified runtime capability
 
-**Current C9 status:** Source 4218e7a4c67f5de244081d6e9dd37e2ee2e30544 is committed. Fresh-owned startup and pinned plugin-index preparation still do not prove native loading. The previous source passed formatting/Clippy, and the SQL-only repair passed formatting and a debug candidate build. Bounded exact-source Store-authority and runtime audits passed for 4218e7a; corrected native acceptance and hosted CI remain pending. See [Implementation Status](implementation-status.md) for audit digests; callable tool/model capability and productive dispatch remain unqualified.
+**Current C9 status:** Source 2e609ecf7d826da7019fe5e5f2ed397a992bc45a passed full Windows/Linux CI ([run 37168223030](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37168223030)), including native offline fixtures; this does not prove a live owned service, MCP loading or model call. The committed held-workspace overlay fix still needs local rebuild and native retest. Run f368339d-1247-4118-bdac-a5441d29b8be timed out before an owned_service row. See [Implementation Status](implementation-status.md).
 
 ### Historical C7/C8 catalog qualification snapshot
 **Revision:** 10 — 2026-10-03
-**Source baseline:** C9 4218e7a4c67f5de244081d6e9dd37e2ee2e30544. Historical C7/C8 CI evidence is summarized below.
+**Source baseline:** latest 2e609ecf7d826da7019fe5e5f2ed397a992bc45a; prior Git-argv CI fix dd4a965571c8f846be8465309acebcb97bfb3f0c.
 **Applies to:** [Communication Program](agent-communication-program.md), [Fleet-Scale Freedom](agent-communication-fleet-scale-freedom.md), [MCP Profiles](mcp-profiles.md)
 **Historical C7/C8 CI:** Exact runs and source commits are recorded in [Implementation Status](implementation-status.md).
 All local model/inference remains deferred by owner. C9 readiness and plugin-index preparation do not prove native loading or model-visible capability.
@@ -68,16 +68,15 @@ manual/automatic launch slot, and MCP install/proof handlers and readback.
 Historical full-CI evidence for C7 and the repaired C8 source is summarized
 above.
 
-C9 source 4218e7a4c67f5de244081d6e9dd37e2ee2e30544 wires per-binding
-fresh-owned startup/readback, a plugin-directory index and pinned 2.0.7 syntax
-preparation. Native plugin loading, actual harness consumption, callable tool
-capability, productive dispatch and model execution remain unqualified. The
-workspace lease is database-backed; the separate C9 managed-service departure
-fence requires retained process and stop evidence but does not establish an
-OS-level workspace lock. Scoped credentials and readback do not prove secret
-confidentiality or model-visible capability. A registry entry,
-configured/connect readback, plugin-directory index, or tools/list response
-alone does not prove that a model loaded or used a schema.
+C9 source 2e609ecf7d826da7019fe5e5f2ed397a992bc45a wires per-binding
+fresh-owned startup/readback, plugin-directory index and pinned 2.0.7 syntax
+preparation. Its held-workspace overlay fix is reviewed against source SHA prefix 0A905. Full Windows/Linux CI passed run 37168223030, including formatting, Clippy, tests, build and native offline fixtures. The native-derived integration has not been locally rebuilt or retested; prior Git-argv commit dd4a965571c8f846be8465309acebcb97bfb3f0c also passed full Windows/Linux CI. Native run f368339d-1247-4118-bdac-a5441d29b8be
+timed out before an owned_service row, native MCP or model after repeated
+OWNED_SERVICE_SCOPE_STALE. Native plugin loading, actual harness consumption,
+callable tool capability, productive dispatch and model execution remain
+unqualified. Workspace leases remain database-backed; departure evidence does
+not establish an OS-level workspace lock. Scoped credentials and readback do
+not prove secret confidentiality or model-visible capability.
 
 The [Canonical MCP Surfaces](mcp-canonical-surfaces-and-topologies.md) document owns exact public names. This document owns group metadata and deferred-loading design. Remaining end-to-end gaps include actual native harness consumption/qualification, productive dispatch beyond the lease/claim/`agent.open` admission, watch predicates without authoritative sources, broader integration/scope-Git, Concilium, cron, Goal and native-Rust program paths. Do not replace the application authorization layer with catalog metadata.
 

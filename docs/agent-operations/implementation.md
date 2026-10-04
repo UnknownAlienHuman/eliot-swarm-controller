@@ -1,9 +1,9 @@
 # Implementation Plan — Rust Operations on Behalf of the Manager
 
-**Current C9 status:** Source 4218e7a4c67f5de244081d6e9dd37e2ee2e30544 is committed. The previous source passed formatting and production Clippy (11.95 s); the SQL-only repair passed formatting and the debug candidate build passed (35.85 s). Bounded exact-source Store-authority and runtime audits passed for 4218e7a. A prior native host passed workspace configuration but failed at its first Store tick; corrected acceptance and hosted CI remain pending. Native MCP loading, productive dispatch, model execution and the full manager-owned cycle remain unqualified. See [Implementation Status](../implementation-status.md) for audit digests.
+**Current C9 status:** Main/remote source 2e609ecf7d826da7019fe5e5f2ed397a992bc45a passed full Windows/Linux CI ([run 37168223030](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37168223030)). The held-workspace overlay fix is not yet locally rebuilt or native-retested. Run f368339d-1247-4118-bdac-a5441d29b8be timed out at service_start before an owned_service row, native MCP or model. See [Implementation Status](implementation-status.md).
 
 ### Historical C7/C8 qualification snapshots
-Revision 16 · 2026-10-03 · C9 source 4218e7a4c67f5de244081d6e9dd37e2ee2e30544. Historical C7/C8 CI: [Implementation Status](../implementation-status.md).
+Revision 18 · 2026-10-03 · current source 2e609ecf7d826da7019fe5e5f2ed397a992bc45a; prior Git-argv CI fix dd4a965571c8f846be8465309acebcb97bfb3f0c.
 
 Read [README](README.md), then the relevant [Configuration](configuration.md), [Architecture](architecture.md), [Delivery](delivery.md) and [Donor map](donor-map.md). The program remains partial. C4's 221 Rust tests apply only to `2607c8858e573ae40459c27d76d8ae9e1ca9f8fc`.
 
@@ -120,7 +120,19 @@ configured/connect readback, and bounded review-disposition handling. C8 added
 manager-authorized WorkDispatch, the shared launch slot, and MCP install/proof
 handlers. C7 and repaired C8 full-CI evidence is summarized above.
 
-C9 source 4218e7a4c67f5de244081d6e9dd37e2ee2e30544 adds fresh-owned OpenCode startup/readback, plugin-directory index and pinned 2.0.7 syntax preparation, plus bounded service-departure reconciliation. Workspace leases remain database-backed; departure proof is a separate service-specific fence, not an OS-level workspace lock. The managed-service NoEffect path requires an exact empty-unknown CAS; spawn-attempt/post-spawn ambiguity remains unknown. The 4218e7a SQL-only repair fixes escaped continuation whitespace in launcher::pending_launches; bounded exact-source Store-authority and runtime audits passed for 4218e7a; hosted CI and the corrected staged native run are pending. Native plugin/tool loading, productive dispatch, model capability and the full manager-owned cycle remain unqualified.
+C9 source 2e609ecf7d826da7019fe5e5f2ed397a992bc45a includes fresh-owned
+OpenCode startup/readback, plugin-directory index and pinned 2.0.7 syntax
+preparation, plus bounded service-departure reconciliation. Workspace leases
+remain database-backed; departure proof is a separate service-specific fence,
+not an OS-level workspace lock. The held-workspace overlay fix permits only
+the exact native_options.directory lease overlay and requires all remaining
+route fields to match; its native-derived integration has not been locally
+built or retested. Git-argv commit dd4a965571c8f846be8465309acebcb97bfb3f0c
+passed full Windows/Linux CI run 37166867596. CI 37168223030 passed all Windows/Linux steps for source 2e609ec, including formatting, Clippy, tests, build and native offline fixtures.
+Native run f368339d-1247-4118-bdac-a5441d29b8be timed out before owned_service
+after repeated OWNED_SERVICE_SCOPE_STALE; no replay occurred. Native tool/model
+loading, productive dispatch and the full manager-owned cycle remain
+unqualified.
 - Port owned transport/translation to Rust through documented protocols or maintained libraries; preserve vendor loops externally. Do not silently retain a mandatory internal JS/Python service.
 - Qualify installed protocol/capabilities, not exact release equality. Preserve unknown consequential values and safe additive data.
 - Maintain native binding/generation/session/turn/family and actual process ownership. Never restart/adopt by heuristic merely to activate a new adapter.

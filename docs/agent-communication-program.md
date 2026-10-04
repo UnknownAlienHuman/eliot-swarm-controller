@@ -1,12 +1,12 @@
 # ELIOT Agent Communication, Launcher and MCP Program
 ## Start here
 
-**Current C9 status:** Source 4218e7a4c67f5de244081d6e9dd37e2ee2e30544 is committed. C9 source 56bb19b passed formatting and warnings-denied Clippy (11.95 s); the SQL-only repair passed formatting and the debug candidate build passed (35.85 s). Bounded exact-source Store-authority and runtime audits passed for 4218e7a. The prior native host failed at the first Store tick after workspace configuration; corrected acceptance and hosted CI remain pending. Native MCP/tool/model capability and productive dispatch remain unqualified; all local inference is deferred. See [Implementation Status](implementation-status.md) for audit digests.
+**Current C9 status:** Main/remote source 2e609ecf7d826da7019fe5e5f2ed397a992bc45a passed full Windows/Linux CI ([run 37168223030](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37168223030)). The held-workspace overlay fix is not yet locally rebuilt or native-retested. Run f368339d-1247-4118-bdac-a5441d29b8be timed out at service_start before an owned_service row, native MCP or model. See [Implementation Status](implementation-status.md).
 
 The C7/C8 paragraph below preserves prior qualification only; use the current C9 status above.
 
 **Revision:** 17 — 2026-10-03
-**Latest committed source:** C9 4218e7a4c67f5de244081d6e9dd37e2ee2e30544. Historical C8 CI: [Implementation Status](implementation-status.md).
+**Latest committed source:** 2e609ecf7d826da7019fe5e5f2ed397a992bc45a. Prior Windows Git-argv CI fix dd4a965571c8f846be8465309acebcb97bfb3f0c passed CI 37166867596.
 **Historical C7/C8 CI:** Exact runs and source commits are recorded in [Implementation Status](implementation-status.md).
 
 For the public list of remaining implementation blocks and their critical path, see [Implementation Status](implementation-status.md).

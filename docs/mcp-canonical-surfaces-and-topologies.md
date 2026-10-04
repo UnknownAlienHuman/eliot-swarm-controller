@@ -1,6 +1,6 @@
 # ELIOT MCP Canonical Surfaces and Client Topologies
 
-**Current C9 status:** Source 4218e7a4c67f5de244081d6e9dd37e2ee2e30544 is committed. Formatting and production Clippy passed on the immediately previous source; the SQL repair passed formatting and a debug candidate build. Bounded exact-source Store-authority and runtime audits passed for 4218e7a. A prior native host failed at the first Store tick after workspace configuration; the corrected staged run and hosted CI remain pending. Native MCP loading, callable tools, productive dispatch and model execution remain unqualified. See [Implementation Status](implementation-status.md) for audit digests; all local inference is deferred.
+**Current C9 status:** Source 2e609ecf7d826da7019fe5e5f2ed397a992bc45a passed full Windows/Linux CI ([run 37168223030](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37168223030)), including native offline fixtures; this does not prove a live owned service, MCP loading or model call. The committed held-workspace overlay fix still needs local rebuild and native retest. Run f368339d-1247-4118-bdac-a5441d29b8be timed out before an owned_service row. See [Implementation Status](implementation-status.md).
 
 ### Historical C7/C8 status snapshot
 **Revision:** 10 — 2026-10-03
