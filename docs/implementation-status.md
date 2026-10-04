@@ -2,6 +2,32 @@
 
 ## Current state
 
+### Plugin activation context correction — 2026-10-04
+
+The pinned plugin supervisor activates effects with Scope and logging services;
+it does not provide the internal MCP service tag. The observer looked up that
+tag before registering hooks or RPC handlers. A controlled offline invocation
+of the actual effect failed before any registration; providing only the MCP tag
+made the same effect register all three hooks and both RPC methods. This proves
+the activation-time dependency defect. C28's raw native error was not retained.
+
+The observer now resolves MCP inside the `arm` RPC handler, after the existing
+challenge, replay, session and capacity guards. The request location supplies
+that service in OpenCode 2.0.7. The native tools snapshot, source identity,
+schemas and all input bounds remain unchanged. Independent Luna review passed.
+One offline behavioral regression passed (19 assertions): bare activation,
+scoped native tool readback, invalid-scope rejection before MCP reads, and
+duplicate-arm deduplication. It preserves unknown context/provider/model state.
+CI now runs this regression with its existing pinned Bun runtime.
+
+All 188 other source pins from the previous gate and the debug binary are
+unchanged, retaining the Rust Clippy, tests and build results. Windows and remote
+Ubuntu CI [37233398047](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37233398047)
+passed for source `df61ae7010c71777deca5155a975c6e28eeeef3b`; that historical CI
+does not prove this new JavaScript increment. Fresh C29 native qualification is
+prepared, with no claim or run yet. Model execution remains unqualified and the
+project remains **PARTIAL_PROGRESS**.
+
 ### Windows plugin configuration path correction — 2026-10-04
 
 The pinned OpenCode 2.0.7 loader failed to resolve the server entrypoint for the

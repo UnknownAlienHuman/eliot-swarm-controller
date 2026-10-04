@@ -114,6 +114,13 @@ failed validation. No challenge effect was reserved. This error delivery is
 qualified for that exact failure and does not prove plugin activation, callable
 tools or model execution. Preserve the consumed C28 claim without replay.
 
+The activation correction resolves the internal MCP service only inside the
+guarded `arm` RPC handler, where the pinned request location provides it, rather
+than during plugin activation. A controlled offline regression verifies bare
+activation, scoped native readback and rejection/deduplication before extra MCP
+reads. It does not establish live registration or model consumption; fresh C29
+qualification is still required.
+
 An OpenCode snapshot requires a validated root-session read. Its independent
 optional read axes share a bounded deadline inside the existing whole-snapshot
 budget. A slow configuration, family, request or child-log read produces a

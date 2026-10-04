@@ -464,8 +464,6 @@ export default Plugin.define({
   effect(context) {
     const states = new Map();
     return Effect.gen(function* () {
-      const mcp = yield* McpService;
-
       yield* context.session.hook("context", (event) =>
         Effect.sync(() => captureContext(states, event)));
 
@@ -558,6 +556,8 @@ export default Plugin.define({
           }
           if (states.size >= MAX_ACTIVE_CHALLENGES) throw new Error("challenge_capacity");
 
+          // RPC handlers run in the request location context, which provides MCP.Service.
+          const mcp = yield* McpService;
           const nativeTools = normalizeNativeTools(yield* mcp.tools());
           const state = {
             challenge,

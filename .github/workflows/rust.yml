@@ -86,6 +86,7 @@ jobs:
         run: |
           cd modules/opencode
           npm ci --ignore-scripts --no-audit --no-fund
+          bun test native-mcp-proof.test.mjs
           node selftest.mjs
       - name: Build
         run: cargo build --locked --release --bin swarm
