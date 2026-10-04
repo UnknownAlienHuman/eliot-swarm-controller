@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { readFileSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { Effect, Exit } from "effect";
+import { Effect, Exit, JsonSchema, Schema, SchemaRepresentation } from "effect";
 import { Service as McpService } from "@opencode/core/mcp/index";
 import plugin from "./native-mcp-proof.mjs";
 
@@ -80,6 +80,21 @@ test("native MCP proof activation and scoped RPC receipt", async () => {
     issued_at_ms: issuedAtMs,
     expires_at_ms: issuedAtMs + 60_000,
   };
+  const compilePinnedRpcInput = (schema) => Schema.make(
+    SchemaRepresentation.fromJsonSchemaDocument(JsonSchema.fromSchemaDraft2020_12(schema)).ast,
+  );
+  const armInputDecoder = compilePinnedRpcInput(registeredDefinition.methods.arm.input);
+  const readInputDecoder = compilePinnedRpcInput(registeredDefinition.methods.read.input);
+  const decodedArmInput = await Effect.runPromise(
+    Schema.decodeUnknownEffect(armInputDecoder)(input),
+  );
+  expect(decodedArmInput).toEqual(input);
+  const readRequest = { challenge_id: input.challenge_id, nonce: input.nonce };
+  const decodedReadInput = await Effect.runPromise(
+    Schema.decodeUnknownEffect(readInputDecoder)(readRequest),
+  );
+  expect(decodedReadInput).toEqual(readRequest);
+
   const discoveredTools = [{
     server: "fixture_server",
     name: "fixture_tool",
@@ -101,6 +116,33 @@ test("native MCP proof activation and scoped RPC receipt", async () => {
   const invokeArm = (value) => Effect.runPromiseExit(
     Effect.provideService(registeredHandlers.arm(value), McpService, controlledMcp),
   );
+
+  const invalidUuidInput = { ...input, challenge_id: "x".repeat(36) };
+  expect(Exit.isSuccess(await Effect.runPromiseExit(
+    Schema.decodeUnknownEffect(armInputDecoder)(invalidUuidInput),
+  ))).toBe(true);
+  expect(Exit.isFailure(await invokeArm(invalidUuidInput))).toBe(true);
+  expect(mcpReadCount).toBe(0);
+
+  const invalidShaInput = { ...input, module_sha256: "g".repeat(64) };
+  expect(Exit.isSuccess(await Effect.runPromiseExit(
+    Schema.decodeUnknownEffect(armInputDecoder)(invalidShaInput),
+  ))).toBe(true);
+  expect(Exit.isFailure(await invokeArm(invalidShaInput))).toBe(true);
+  expect(mcpReadCount).toBe(0);
+
+  for (const invalidSessionID of ["ses_fixture.invalid", "ses_fixture\u2028", "ses_fixture\u2029"]) {
+    const invalidSessionInput = {
+      ...input,
+      session_id: invalidSessionID,
+      assignment: { ...input.assignment, native_session_id: invalidSessionID },
+    };
+    expect(Exit.isSuccess(await Effect.runPromiseExit(
+      Schema.decodeUnknownEffect(armInputDecoder)(invalidSessionInput),
+    ))).toBe(true);
+    expect(Exit.isFailure(await invokeArm(invalidSessionInput))).toBe(true);
+    expect(mcpReadCount).toBe(0);
+  }
 
   const invalidScope = await invokeArm({
     ...input,

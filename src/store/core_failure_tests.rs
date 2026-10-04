@@ -1096,6 +1096,62 @@ fn native_mcp_tools_preflight_failure_is_bounded_and_visible_to_successor_gm() {
         assert!(!successor_json.contains(marker));
     }
 
+    // A successor Manager receives the optional closed RPC class without
+    // losing the unchanged admission receipt or leaking legacy private detail.
+    for (code, class) in [
+        ("NATIVE_REJECTED", "invalid_input"),
+        ("NATIVE_OUTCOME_UNKNOWN", "internal"),
+    ] {
+        let mut rpc_record = record.clone();
+        rpc_record["last_error"]["stage"] = json!("challenge");
+        rpc_record["last_error"]["code"] = json!(code);
+        rpc_record["last_error"]["rejection_class"] = json!(class);
+        let mut rpc_schedule = schedule.clone();
+        rpc_schedule["last_error_code"] = json!(code);
+        set_meta(&fixture.db, &record_key, &rpc_record).unwrap();
+        set_meta(&fixture.db, &schedule_key, &rpc_schedule).unwrap();
+        let rpc_operation = store_read(
+            &fixture.db,
+            principal(SUCCESSOR_GM, Role::Manager),
+            "operation.get",
+            json!({"operation_id":LAUNCH_OPERATION_ID}),
+        );
+        let failure = &rpc_operation["native_mcp_tools_readback"]["latest_failure"];
+        assert_eq!(rpc_operation["result"], fixture.admission_result);
+        assert_eq!(failure["code"], code);
+        assert_eq!(failure["stage"], "challenge");
+        assert_eq!(failure["rejection_class"], class);
+        assert_eq!(failure.as_object().unwrap().len(), 5);
+        let encoded = serde_json::to_string(&rpc_operation).unwrap();
+        for marker in [RAW_MESSAGE, RAW_AUTH, RAW_CONFIG, RAW_ENDPOINT, RAW_SCHEMA] {
+            assert!(!encoded.contains(marker));
+        }
+    }
+    for (code, class) in [
+        ("NATIVE_REJECTED", Value::Null),
+        ("NATIVE_REJECTED", json!("plugin_guard_detail")),
+        ("NATIVE_REJECTED", json!("internal")),
+    ] {
+        let mut rpc_record = record.clone();
+        rpc_record["last_error"]["stage"] = json!("challenge");
+        rpc_record["last_error"]["code"] = json!(code);
+        rpc_record["last_error"]["rejection_class"] = class;
+        set_meta(&fixture.db, &record_key, &rpc_record).unwrap();
+        let corrupt = store_read(
+            &fixture.db,
+            principal(SUCCESSOR_GM, Role::Manager),
+            "operation.get",
+            json!({"operation_id":LAUNCH_OPERATION_ID}),
+        );
+        assert_eq!(corrupt["result"], fixture.admission_result);
+        assert_eq!(
+            corrupt["native_mcp_tools_readback"]["latest_failure"]["code"],
+            "NATIVE_MCP_TOOLS_DIAGNOSTIC_CORRUPT"
+        );
+    }
+    set_meta(&fixture.db, &record_key, &record).unwrap();
+    set_meta(&fixture.db, &schedule_key, &schedule).unwrap();
+
     // Invalid optional record shape and schedule fields must leave Operation
     // readback available while returning only the closed corruption marker.
     let invalid_record = model::canonical(&json!({

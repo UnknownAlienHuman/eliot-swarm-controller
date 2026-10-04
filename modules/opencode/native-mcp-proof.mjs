@@ -17,6 +17,8 @@ const MAX_JSON_BYTES = 512 * 1024;
 const MAX_DESCRIPTION_BYTES = 16 * 1024;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const SHA256_RE = /^[0-9a-f]{64}$/;
+// A negative end assertion also rejects final Unicode line terminators.
+const SESSION_ID_RE = /^ses_[A-Za-z0-9_-]{1,252}(?![\s\S])/;
 
 const MODULE_PATH = realpathSync(fileURLToPath(import.meta.url));
 const MODULE_SHA256 = createHash("sha256").update(readFileSync(MODULE_PATH)).digest("hex");
@@ -32,14 +34,14 @@ const ArmInput = {
   ],
   additionalProperties: false,
   properties: {
-    challenge_id: { type: "string", pattern: UUID_RE.source },
-    nonce: { type: "string", pattern: UUID_RE.source },
+    challenge_id: { type: "string", minLength: 36, maxLength: 36 },
+    nonce: { type: "string", minLength: 36, maxLength: 36 },
     service_id: Text,
     service_pid: PositiveInteger,
     service_version: { type: "string", const: SERVICE_VERSION },
-    module_sha256: { type: "string", pattern: SHA256_RE.source },
+    module_sha256: { type: "string", minLength: 64, maxLength: 64 },
     directory: Text,
-    session_id: { type: "string", pattern: "^ses_[A-Za-z0-9_-]{1,252}$" },
+    session_id: { type: "string", minLength: 5, maxLength: 256 },
     model: JsonObject,
     assignment: JsonObject,
     issued_at_ms: PositiveInteger,
@@ -51,8 +53,8 @@ const ReadInput = {
   required: ["challenge_id", "nonce"],
   additionalProperties: false,
   properties: {
-    challenge_id: { type: "string", pattern: UUID_RE.source },
-    nonce: { type: "string", pattern: UUID_RE.source },
+    challenge_id: { type: "string", minLength: 36, maxLength: 36 },
+    nonce: { type: "string", minLength: 36, maxLength: 36 },
   },
 };
 const AnyObject = { type: "object", additionalProperties: true };
@@ -159,6 +161,7 @@ function validateArmInput(input, pluginOptions, location) {
         ? path.resolve(input.directory).toLowerCase() !== normalizedLocation.toLowerCase()
         : path.resolve(input.directory) !== normalizedLocation)
       || !boundedText(input.session_id, 256)
+      || !SESSION_ID_RE.test(input.session_id)
       || !isRecord(input.model)
       || !onlyKeys(input.model, ["id", "providerID", "variant"])
       || !["id", "providerID", "variant"].every((key) => boundedText(input.model[key], 256))

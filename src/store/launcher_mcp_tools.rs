@@ -12,7 +12,7 @@
 use super::{Store, meta, set_meta};
 use crate::{
     config::Config,
-    error::{Error, Result},
+    error::{Error, NativeRpcRejectionClass, Result},
     model::{self, Credential, Principal, Role},
     participant_credentials, platform,
     runtime::opencode_v2::{Options, Service},
@@ -534,12 +534,12 @@ impl Store {
                                 .await?;
                         }
                         Ok(Err(error)) => {
-                            self.record_safe_error(
+                            self.record_safe_rpc_error(
                                 &facts,
                                 &credential,
                                 &assignment,
                                 "challenge",
-                                &error.code,
+                                &error,
                             )
                             .await?;
                         }
@@ -612,12 +612,12 @@ impl Store {
                             .await?;
                     }
                     Ok(Err(error)) => {
-                        self.record_safe_error(
+                        self.record_safe_rpc_error(
                             &facts,
                             &credential,
                             &assignment,
                             "tools_readback",
-                            &error.code,
+                            &error,
                         )
                         .await?;
                     }
@@ -1503,10 +1503,46 @@ impl Store {
         stage: &str,
         code: &str,
     ) -> Result<()> {
+        self.record_safe_error_with_class(facts, credential, assignment, stage, code, None)
+            .await
+    }
+
+    async fn record_safe_rpc_error(
+        &self,
+        facts: &LaunchFacts,
+        credential: &Credential,
+        assignment: &crate::native_mcp::AssignmentContext,
+        stage: &str,
+        error: &Error,
+    ) -> Result<()> {
+        self.record_safe_error_with_class(
+            facts,
+            credential,
+            assignment,
+            stage,
+            &error.code,
+            error.rejection_class,
+        )
+        .await
+    }
+
+    async fn record_safe_error_with_class(
+        &self,
+        facts: &LaunchFacts,
+        credential: &Credential,
+        assignment: &crate::native_mcp::AssignmentContext,
+        stage: &str,
+        code: &str,
+        rejection_class: Option<NativeRpcRejectionClass>,
+    ) -> Result<()> {
         let stage = safe_label(stage)?;
         let code = safe_label(code)?;
         self.transition(facts, credential, assignment, move |record, now| {
-            record["last_error"] = json!({"stage":stage,"code":code,"recorded_at_ms":now});
+            let mut failure = json!({"stage":stage,"code":code,"recorded_at_ms":now});
+            if let Some(rejection_class) = rejection_class {
+                failure["rejection_class"] = json!(rejection_class.as_str());
+            }
+            record["last_error"] = failure;
             Ok(())
         })
         .await?;
@@ -2496,12 +2532,22 @@ pub(super) fn diagnostic_for_operation(
 
     let latest_failure = match record.as_ref().map(|record| &record["last_error"]) {
         None | Some(Value::Null) => Value::Null,
-        Some(failure) if valid_public_c8_failure(failure) => json!({
-            "schema_version":1,
-            "code":failure["code"],
-            "stage":failure["stage"],
-            "recorded_at_ms":failure["recorded_at_ms"],
-        }),
+        Some(failure) if valid_public_c8_failure(failure) => {
+            let mut public = json!({
+                "schema_version":1,
+                "code":failure["code"],
+                "stage":failure["stage"],
+                "recorded_at_ms":failure["recorded_at_ms"],
+            });
+            if let Some(class) = failure
+                .get("rejection_class")
+                .and_then(Value::as_str)
+                .and_then(NativeRpcRejectionClass::parse)
+            {
+                public["rejection_class"] = json!(class.as_str());
+            }
+            public
+        }
         Some(_) => return Ok(corrupt()),
     };
 
@@ -2627,21 +2673,47 @@ fn public_c8_schedule<'a>(schedule: &'a Value, operation_id: &str) -> Option<Pub
 }
 
 fn valid_public_c8_failure(failure: &Value) -> bool {
-    failure.is_object()
-        && valid_public_c8_code(failure["code"].as_str().unwrap_or_default())
+    if !failure.is_object() {
+        return false;
+    }
+    let stage = failure["stage"].as_str().unwrap_or_default();
+    let code = failure["code"].as_str().unwrap_or_default();
+    let class_valid = match failure.get("rejection_class") {
+        None => true,
+        Some(Value::String(value)) => valid_public_c8_rejection_class(value, stage, code),
+        Some(_) => false,
+    };
+    // Legacy records may contain private detail. Project only the validated
+    // scalar fields rather than rejecting their otherwise usable failure.
+    valid_public_c8_code(code)
         && matches!(
-            failure["stage"].as_str(),
-            Some(
-                "install"
-                    | "install_readback"
-                    | "challenge_preflight"
-                    | "challenge"
-                    | "tools_readback"
-            )
+            stage,
+            "install" | "install_readback" | "challenge_preflight" | "challenge" | "tools_readback"
         )
         && failure["recorded_at_ms"]
             .as_i64()
             .is_some_and(|value| value >= 0)
+        && class_valid
+}
+
+fn valid_public_c8_rejection_class(class: &str, stage: &str, code: &str) -> bool {
+    if !matches!(stage, "challenge" | "tools_readback") {
+        return false;
+    }
+    match NativeRpcRejectionClass::parse(class) {
+        Some(
+            NativeRpcRejectionClass::InvalidInput
+            | NativeRpcRejectionClass::MethodNotFound
+            | NativeRpcRejectionClass::Unavailable,
+        ) => code == "NATIVE_REJECTED",
+        Some(NativeRpcRejectionClass::InvalidOutput | NativeRpcRejectionClass::Internal) => {
+            code == "NATIVE_OUTCOME_UNKNOWN"
+        }
+        Some(NativeRpcRejectionClass::Unclassified) => {
+            matches!(code, "NATIVE_REJECTED" | "NATIVE_OUTCOME_UNKNOWN")
+        }
+        None => false,
+    }
 }
 
 fn valid_public_c8_code(code: &str) -> bool {

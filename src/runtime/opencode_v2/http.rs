@@ -1,9 +1,12 @@
 mod execution_log;
 use super::{Options, valid_id};
-use crate::error::{Error, Result};
+use crate::error::{Error, NativeRpcRejectionClass, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use reqwest::{Client, Method, Url, header};
-use serde::{Deserialize, de::DeserializeOwned};
+use serde::{
+    Deserialize,
+    de::{DeserializeOwned, IgnoredAny},
+};
 use serde_json::{Value, json};
 use std::{
     future::Future,
@@ -14,7 +17,21 @@ use std::{
 };
 
 const MAX_BODY: usize = 4 * 1024 * 1024;
+const MAX_RPC_ERROR_BODY: usize = 8 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeRpcErrorEnvelope {
+    #[serde(rename = "_tag")]
+    tag: String,
+    #[serde(rename = "type")]
+    error_type: String,
+    #[serde(rename = "message")]
+    _message: String,
+    #[serde(default, rename = "data")]
+    _data: Option<IgnoredAny>,
+}
 
 // This is an ELIOT connection record, not a guessed version of service.json.
 // An operator may update it when the externally owned service changes address.
@@ -569,6 +586,7 @@ impl Service {
             url.query_pairs_mut()
                 .extend_pairs(query.iter().map(|(k, v)| (*k, v.as_str())));
         }
+        let native_mcp_rpc_route = is_native_mcp_rpc_route(&method, &url);
         let mut request = self.client.request(method, url).timeout(REQUEST_TIMEOUT);
         if let Some(body) = body {
             request = request.json(&body);
@@ -577,6 +595,11 @@ impl Service {
         let status = response.status();
         if !status.is_success() {
             // Never save a reflected error body or follow a redirect with credentials.
+            let rejection_class = if native_mcp_rpc_route && matches!(status.as_u16(), 400 | 500) {
+                Some(read_native_rpc_rejection_class(&mut response, status).await)
+            } else {
+                None
+            };
             let code = if effect
                 && matches!(
                     status.as_u16(),
@@ -588,7 +611,11 @@ impl Service {
             } else {
                 "NATIVE_READ_FAILED"
             };
-            return Err(Error::new(code, format!("HTTP {}", status.as_u16())));
+            let error = Error::new(code, format!("HTTP {}", status.as_u16()));
+            return Err(match rejection_class {
+                Some(class) => error.with_rejection_class(class),
+                None => error,
+            });
         }
         if response
             .content_length()
@@ -626,6 +653,68 @@ impl Service {
         Ok(response.data)
     }
 }
+
+fn is_native_mcp_rpc_route(method: &Method, url: &Url) -> bool {
+    if method != Method::POST {
+        return false;
+    }
+    let Some(mut segments) = url.path_segments() else {
+        return false;
+    };
+    matches!(segments.next(), Some("api"))
+        && matches!(segments.next(), Some("rpc"))
+        && segments.next() == Some(super::mcp_tools::RPC_ID)
+        && matches!(segments.next(), Some("arm" | "read"))
+        && segments.next().is_none()
+}
+
+async fn read_native_rpc_rejection_class(
+    response: &mut reqwest::Response,
+    status: reqwest::StatusCode,
+) -> NativeRpcRejectionClass {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_RPC_ERROR_BODY as u64)
+    {
+        return NativeRpcRejectionClass::Unclassified;
+    }
+    let mut bytes = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) if bytes.len().saturating_add(chunk.len()) <= MAX_RPC_ERROR_BODY => {
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok(Some(_)) | Err(_) => return NativeRpcRejectionClass::Unclassified,
+            Ok(None) => break,
+        }
+    }
+    decode_native_rpc_rejection_class(status, &bytes)
+}
+
+fn decode_native_rpc_rejection_class(
+    status: reqwest::StatusCode,
+    bytes: &[u8],
+) -> NativeRpcRejectionClass {
+    if bytes.len() > MAX_RPC_ERROR_BODY {
+        return NativeRpcRejectionClass::Unclassified;
+    }
+    let Ok(envelope) = serde_json::from_slice::<NativeRpcErrorEnvelope>(bytes) else {
+        return NativeRpcRejectionClass::Unclassified;
+    };
+    match (
+        status.as_u16(),
+        envelope.tag.as_str(),
+        envelope.error_type.as_str(),
+    ) {
+        (400, "RpcError", "rpc.invalid_input") => NativeRpcRejectionClass::InvalidInput,
+        (400, "RpcError", "rpc.method_not_found") => NativeRpcRejectionClass::MethodNotFound,
+        (400, "RpcError", "rpc.unavailable") => NativeRpcRejectionClass::Unavailable,
+        (500, "RpcInternalError", "rpc.invalid_output") => NativeRpcRejectionClass::InvalidOutput,
+        (500, "RpcInternalError", "rpc.internal") => NativeRpcRejectionClass::Internal,
+        _ => NativeRpcRejectionClass::Unclassified,
+    }
+}
+
 fn transport_error(effect: bool) -> Error {
     Error::new(
         if effect {
@@ -635,6 +724,64 @@ fn transport_error(effect: bool) -> Error {
         },
         "native transport failed; no automatic mutation replay",
     )
+}
+
+#[cfg(test)]
+mod rpc_error_tests {
+    use super::{MAX_RPC_ERROR_BODY, decode_native_rpc_rejection_class};
+    use crate::error::{Error, NativeRpcRejectionClass};
+    use reqwest::StatusCode;
+    use serde_json::json;
+
+    #[test]
+    fn bounded_pinned_rpc_envelope_yields_only_a_closed_class() {
+        let input_error = br#"{"_tag":"RpcError","type":"rpc.invalid_input","message":"private detail","data":{"nonce":"must not be retained"}}"#;
+        let class = decode_native_rpc_rejection_class(StatusCode::BAD_REQUEST, input_error);
+        assert_eq!(class, NativeRpcRejectionClass::InvalidInput);
+        let retained = serde_json::to_value(
+            Error::new("NATIVE_REJECTED", "HTTP 400").with_rejection_class(class),
+        )
+        .expect("safe typed error serializes");
+        assert_eq!(
+            retained,
+            json!({
+                "code":"NATIVE_REJECTED",
+                "message":"HTTP 400",
+                "rejection_class":"invalid_input",
+            }),
+        );
+        assert!(
+            !serde_json::to_string(&retained)
+                .expect("serialized error")
+                .contains("must not be retained")
+        );
+        assert_eq!(
+            serde_json::to_value(Error::new("NATIVE_REJECTED", "HTTP 400"))
+                .expect("legacy error serializes"),
+            json!({"code":"NATIVE_REJECTED","message":"HTTP 400"}),
+        );
+
+        let internal_error =
+            br#"{"_tag":"RpcInternalError","type":"rpc.internal","message":"private detail"}"#;
+        assert_eq!(
+            decode_native_rpc_rejection_class(StatusCode::INTERNAL_SERVER_ERROR, internal_error),
+            NativeRpcRejectionClass::Internal,
+        );
+        assert_eq!(
+            decode_native_rpc_rejection_class(
+                StatusCode::BAD_REQUEST,
+                br#"{"_tag":"RpcError","type":"plugin.scope_rejected","message":"private detail"}"#,
+            ),
+            NativeRpcRejectionClass::Unclassified,
+        );
+        assert_eq!(
+            decode_native_rpc_rejection_class(
+                StatusCode::BAD_REQUEST,
+                &vec![b'x'; MAX_RPC_ERROR_BODY + 1],
+            ),
+            NativeRpcRejectionClass::Unclassified,
+        );
+    }
 }
 
 /// One invalidation stream per service client, not per native binding. The donor

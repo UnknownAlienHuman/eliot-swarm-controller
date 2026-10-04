@@ -17,7 +17,7 @@ use std::{
 };
 
 const PLUGIN_ID: &str = "eliot.native-mcp-proof.v1";
-const RPC_ID: &str = PLUGIN_ID;
+pub(super) const RPC_ID: &str = PLUGIN_ID;
 const PINNED_VERSION: &str = "2.0.7";
 const CHALLENGE_TTL_MS: i64 = 120_000;
 const MAX_PLUGIN_SOURCE_BYTES: u64 = 512 * 1024;

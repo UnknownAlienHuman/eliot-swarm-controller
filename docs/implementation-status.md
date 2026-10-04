@@ -2,6 +2,47 @@
 
 ## Current state
 
+### Native RPC schema compatibility and actionable errors — 2026-10-04
+
+The pinned OpenCode 2.0.7 RPC decoder cannot compile the JSON Schema
+`pattern` keywords used by the observer's arm/read inputs. An offline decode
+of the retained C29 request failed before the handler; its envelope, field
+types and registered RPC identity matched. C29's original HTTP body was not
+retained, so this establishes the schema defect without inventing its response.
+
+The wire schema now uses exact UUID/SHA lengths and bounded session lengths.
+The handler enforces UUID, lowercase SHA-256 and strict full-string `ses_`
+validation before MCP access. Session IDs with a trailing Unicode line
+terminator are rejected. Existing assignment, process, module, scope, replay,
+capacity and TTL checks remain in place. The actual pinned decoder and plugin
+fixture passed once on the final source, with 36 assertions covering activation,
+valid arm/read, malformed inputs before MCP reads and duplicate-arm deduplication.
+
+Native arm/read HTTP errors now retain an optional closed `rejection_class`:
+`invalid_input`, `method_not_found`, `unavailable`, `invalid_output`, `internal`
+or `unclassified`. Only those exact RPC POST routes and bounded 400/500
+envelopes are classified; raw message/data/credentials are not retained.
+Existing status-derived error codes and unknown effect handling are unchanged.
+C8 persists the class and current-Manager `operation.get` projects it alongside
+the safe stage/code/time. Legacy records still project with their extra private
+fields stripped. Invalid classes produce a nested corruption diagnostic while
+preserving the original Operation receipt. The real Store successor-Manager
+fixture passed for both valid classes and malformed-class cases.
+
+Root gate `b7957556-d613-48cf-9ec7-e2c6523737b0` passed formatting, strict
+production Clippy, both focused Rust fixtures and build with unchanged source.
+The final JS-only correction passed gate
+`final-cbcca750-95ce-49b0-b643-9f9368736ae1`; every other source pin and the
+candidate remained identical. Candidate SHA-256:
+`5D79C31E552CB4E6FF4DCD1E97E05D8A1E3FA9EBC869CED68DC346C04DC68EAA`.
+Fresh C30 native qualification remains pending; hosted Bunny execution is not
+qualified by these offline checks. The installed launcher has not been replaced.
+
+Luna implementation workers are preparing GitHub write effects (O4), hook
+runtime intake (O5), invocation-scoped script effects (O6), typed event rules
+(O8) and shared Goal progression (O9). Their private overlays are not part of
+the published build until root integrates and qualifies them.
+
 ### Manual automation invocation and correction cycle — 2026-10-04
 
 `schedule.run_now` is implemented for the authenticated Manager's saved
@@ -28,9 +69,10 @@ fixtures/contracts, with exact production equivalence checked. Final gate
 contract and build with unchanged source, retaining the two Store checks and
 33 other MCP passes. The new debug candidate SHA-256 is
 `A26E038B93A766E55FFA708B21F56213B4BD4A68678F6C3EE8A25825A6F205A0`.
-Full CI for source `836c938123714392d75b57158c777973aa6d8c07` is running at
+Full CI for source `836c938123714392d75b57158c777973aa6d8c07` passed on Windows
+and remote Ubuntu at
 [37237925409](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37237925409);
-its results remain pending. The activation-fix CI below proves historical source.
+verified 2026-10-04. The RPC correction above requires its own full CI.
 These scenarios do not establish native correction delivery, checker execution
 or publication. Typed event rules and shared Goal progression remain incomplete.
 
