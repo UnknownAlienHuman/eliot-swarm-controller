@@ -3592,6 +3592,8 @@ mod capacity_tests;
 #[cfg(test)]
 mod gm_automation_recovery_tests;
 #[cfg(test)]
+mod gm_continuation_tests;
+#[cfg(test)]
 mod mailbox_tests;
 #[cfg(test)]
 mod program_tests;

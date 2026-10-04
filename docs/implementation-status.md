@@ -44,11 +44,11 @@ Production Clippy (16.10 s), debug build (35.66 s), and 11 focused GM/Store
 regressions passed on 2026-10-04 at 06:23 UTC. The source remained unchanged during
 these gates; candidate SHA-256 is 6AC53A11511AF1C3A34A7571D5B3A505E66CA50AC471E70E7A3EC9D748FECDBA.
 Cross-platform CI [37182521189](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37182521189)
-is still pending. The requirement is saved in ac6691c and
+completed successfully on Windows and Ubuntu, verified at 06:37 UTC. The requirement is saved in ac6691c and
 described in [GM session continuity](gm-session-continuity.md).
 
-**Resume here:** finish the separate native-command continuation regression and
-inspect CI for the saved source. Continue owned native startup diagnosis and full
+**Resume here:** run the saved native-command continuation regression with the
+deterministic submission readback increment. Continue owned native startup diagnosis and full
 O7 afterwards. Deterministic
 file readback for a submission left unknown by a host crash remains separate.
 Automatic transfer of every former manager's automation entry remains separate;
