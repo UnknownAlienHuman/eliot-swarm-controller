@@ -243,19 +243,24 @@ fn manager_may_assign(
             ))
         }
         ReviewActor::OnBehalf(manager_context) => {
-            manager_context.require_action_object(
+            let inherited_authority = manager_context.require_action_object_with_transfer(
                 tx,
                 "review.assign",
                 task_id,
+                submission.identity.task_revision,
                 attempt_id,
                 project_id,
                 &submission.identity.submission_ref,
             )?;
             let sponsor = manager_context.effective_manager_id();
-            if sponsor != owner_id {
+            let inherited_owner = inherited_authority.as_ref().is_some_and(|authority| {
+                authority.source_attempt_owner_id() == owner_id
+                    && authority.successor_manager_id() == sponsor
+            });
+            if sponsor != owner_id && !inherited_owner {
                 return Err(Error::new(
                     "FORBIDDEN",
-                    "automation sponsor does not own the current Attempt",
+                    "automation sponsor does not own or inherit authority for the current Attempt",
                 ));
             }
             Ok((
@@ -355,15 +360,18 @@ pub(crate) fn reserve_assign(
             ));
         }
         let resolved_target = match (&request.reviewer_client_id, &request.review_profile) {
-            (Some(client), None) => Some(client.as_str()),
+            (Some(client), None) => Some(client.clone()),
             (None, Some(profile)) if previous["review_profile"] == *profile => {
-                previous["reviewer_client_id"].as_str()
+                if previous["sponsor_client_id"] == sponsor_id {
+                    previous["reviewer_client_id"].as_str().map(str::to_owned)
+                } else {
+                    resolve_reviewer_profile(tx, &sponsor_id, profile, &context.identity)?
+                }
             }
             (None, Some(_)) => None,
             _ => None,
         };
-        let same_target =
-            resolved_target.is_some_and(|reviewer| reviewer == previous["reviewer_client_id"]);
+        let same_target = resolved_target.as_deref() == previous["reviewer_client_id"].as_str();
         let replacing = request.replaces_review_assignment_id.as_deref() == Some(existing_id);
         if !replacing {
             if request.replaces_review_assignment_id.is_some() {

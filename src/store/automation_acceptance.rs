@@ -9,7 +9,7 @@ use super::{capacity, operations, results, submissions, tasks};
 use crate::{
     acceptance::{AcceptRequest, AcceptancePolicy, RequirementReview},
     automation::{
-        acceptance::{AcceptanceContext, AcceptanceReviewEvidence},
+        acceptance::{AcceptanceContext, AcceptanceReviewEvidence, assignment_sponsor_authorized},
         actions::AutomationStep,
         authorization,
         config::{self, AutomationEntry},
@@ -243,11 +243,24 @@ pub(super) fn consume_review_result_for_entry(
     let submitted_by = model::text(&document, "submitted_by")?;
     let owner_id = model::text(&document, "owner_id")?;
     let attempt_owner_id = model::text(&attempt, "owner_id")?;
+    if !assignment_sponsor_authorized(
+        tx,
+        entry,
+        &review.identity,
+        assignment_sponsor_id,
+        attempt_owner_id,
+        gm_epoch,
+    )? {
+        return Ok(skipped(
+            &review,
+            "acceptance_owner_sponsor_or_transfer_required",
+            "the pass must be sponsored by the Attempt owner or a manager in the exact transfer lineage ending at the current GM",
+        ));
+    }
     if document["attempt_id"] != review.identity.attempt_id
         || document["task_revision"] != review.identity.task_revision
         || document["candidate_ref"] != review.identity.candidate_ref
         || owner_id != attempt_owner_id
-        || review.assignment["sponsor_client_id"] != attempt_owner_id
         || submitted_by == entry.owner_manager_id.as_str()
         || owner_id == entry.owner_manager_id.as_str()
         || reviewer_id == submitted_by
@@ -256,7 +269,7 @@ pub(super) fn consume_review_result_for_entry(
         return Ok(skipped(
             &review,
             "acceptance_subject_or_owner_sponsor_mismatch",
-            "automatic acceptance requires the exact current Attempt, an owner-consistent submission, an Attempt-owner-sponsored review assignment, and an independent reviewer",
+            "automatic acceptance requires the exact current Attempt, an owner-consistent submission, a valid review sponsor, and an independent reviewer",
         ));
     }
     let candidate = results::get(tx, &review.identity.candidate_ref)?;

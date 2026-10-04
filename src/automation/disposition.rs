@@ -16,6 +16,9 @@ use serde_json::{Value, json};
 pub(crate) struct ReviewDispositionContext {
     technical_requester_id: String,
     effective_manager_id: String,
+    review_assignment_sponsor_id: String,
+    attempt_owner_id: String,
+    transfer_authority: Option<authorization::TransferredAttemptAuthority>,
     automation_id: String,
     automation_revision: i64,
     project_id: String,
@@ -31,10 +34,12 @@ impl ReviewDispositionContext {
         identity: ReviewSlotIdentity,
         review_assignment_id: &str,
         review_result_operation_id: &str,
+        review_assignment_sponsor_id: &str,
     ) -> Result<Self> {
         config::validate_entry(entry)?;
         validate_identity_text(review_assignment_id, "review_assignment_id")?;
         validate_identity_text(review_result_operation_id, "review_result_operation_id")?;
+        validate_identity_text(review_assignment_sponsor_id, "review_assignment_sponsor_id")?;
         if !entry.enabled || !entry.steps.contains(&AutomationStep::ReviewDisposition) {
             return Err(Error::new(
                 "AUTOMATION_ACTION_UNAVAILABLE",
@@ -78,9 +83,46 @@ impl ReviewDispositionContext {
             ));
         }
 
+        let transfer_authority = authorization::current_transferred_attempt_authority(
+            db,
+            entry,
+            AutomationStep::ReviewDisposition,
+            &identity.task_id,
+            identity.task_revision,
+            &identity.attempt_id,
+            &identity.submission_ref,
+            &identity.candidate_ref,
+        )?;
+        let attempt_owner_id = match transfer_authority.as_ref() {
+            Some(proof)
+                if proof.successor_manager_id() == entry.owner_manager_id
+                    && proof.contains_manager_id(review_assignment_sponsor_id) =>
+            {
+                proof.source_attempt_owner_id().to_owned()
+            }
+            Some(_) => {
+                return Err(Error::new(
+                    "FORBIDDEN",
+                    "review sponsor is outside the validated manager transfer lineage",
+                ));
+            }
+            None if review_assignment_sponsor_id == entry.owner_manager_id => {
+                entry.owner_manager_id.clone()
+            }
+            None => {
+                return Err(Error::new(
+                    "FORBIDDEN",
+                    "review sponsor does not own the exact Attempt or current automation entry",
+                ));
+            }
+        };
+
         Ok(Self {
             technical_requester_id: authorization::AUTOMATION_TECHNICAL_REQUESTER_ID.to_owned(),
             effective_manager_id: entry.owner_manager_id.clone(),
+            review_assignment_sponsor_id: review_assignment_sponsor_id.to_owned(),
+            attempt_owner_id,
+            transfer_authority,
             automation_id: entry.automation_id.clone(),
             automation_revision: entry.revision,
             project_id: entry.project_id.clone(),
@@ -112,6 +154,35 @@ impl ReviewDispositionContext {
                 "current automation settings no longer permit review disposition",
             ));
         }
+        let current_transfer = authorization::current_transferred_attempt_authority(
+            db,
+            &current,
+            AutomationStep::ReviewDisposition,
+            &self.identity.task_id,
+            self.identity.task_revision,
+            &self.identity.attempt_id,
+            &self.identity.submission_ref,
+            &self.identity.candidate_ref,
+        )?;
+        match (&self.transfer_authority, current_transfer.as_ref()) {
+            (Some(previous), Some(current))
+                if current.source_attempt_owner_id() == self.attempt_owner_id
+                    && current.successor_manager_id() == self.effective_manager_id
+                    && current.contains_manager_id(&self.review_assignment_sponsor_id)
+                    && current.source_attempt_owner_id() == previous.source_attempt_owner_id()
+                    && current.successor_manager_id() == previous.successor_manager_id()
+                    && current.current_gm_epoch() == previous.current_gm_epoch()
+                    && current.transfer_operation_ids() == previous.transfer_operation_ids() => {}
+            (None, None)
+                if self.attempt_owner_id == self.effective_manager_id
+                    && self.review_assignment_sponsor_id == self.effective_manager_id => {}
+            _ => {
+                return Err(Error::new(
+                    "FORBIDDEN",
+                    "exact Attempt ownership or transfer authority changed before feedback",
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -121,6 +192,14 @@ impl ReviewDispositionContext {
 
     pub(crate) fn effective_manager_id(&self) -> &str {
         &self.effective_manager_id
+    }
+
+    pub(crate) fn review_assignment_sponsor_id(&self) -> &str {
+        &self.review_assignment_sponsor_id
+    }
+
+    pub(crate) fn attempt_owner_id(&self) -> &str {
+        &self.attempt_owner_id
     }
 
     pub(crate) fn automation_id(&self) -> &str {
@@ -152,6 +231,7 @@ impl ReviewDispositionContext {
             "kind":"review_result",
             "id":self.review_assignment_id,
             "review_assignment_id":self.review_assignment_id,
+            "review_assignment_sponsor_id":self.review_assignment_sponsor_id,
             "operation_id":self.review_result_operation_id,
             "identity":self.identity,
         })
@@ -163,6 +243,7 @@ impl ReviewDispositionContext {
         json!({
             "technical_requester_id":self.technical_requester_id,
             "effective_manager_id":self.effective_manager_id,
+            "review_assignment_sponsor_id":self.review_assignment_sponsor_id,
             "automation_id":self.automation_id,
             "automation_revision":self.automation_revision,
             "project_id":self.project_id,

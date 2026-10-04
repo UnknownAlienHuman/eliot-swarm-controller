@@ -899,13 +899,30 @@ pub(super) fn request_changes_on_behalf(
             "on-behalf feedback Operation has no retained manager link",
         )
     })?;
-    let cause = json!({
-        "kind":"review_result",
-        "id":context.review_assignment_id(),
-        "review_assignment_id":context.review_assignment_id(),
-        "operation_id":context.review_result_operation_id(),
-        "identity":context.identity(),
-    });
+    let mut expected_cause = context.cause_value();
+    expected_cause
+        .as_object_mut()
+        .ok_or_else(|| {
+            Error::new(
+                "AUTOMATION_LINK_CORRUPT",
+                "typed disposition cause is not an object",
+            )
+        })?
+        .remove("review_assignment_sponsor_id");
+    let mut retained_cause = link["cause"].clone();
+    let retained_cause_object = retained_cause.as_object_mut();
+    let cause_sponsor_matches = match retained_cause_object
+        .and_then(|cause| cause.remove("review_assignment_sponsor_id"))
+    {
+        None => true,
+        Some(Value::String(sponsor)) => sponsor == context.review_assignment_sponsor_id(),
+        Some(_) => false,
+    };
+    let top_level_sponsor_matches = match link.get("review_assignment_sponsor_id") {
+        None => true,
+        Some(Value::String(sponsor)) => sponsor == context.review_assignment_sponsor_id(),
+        Some(_) => false,
+    };
     if link["schema_version"] != 1
         || link["operation_id"] != id
         || link["technical_requester_id"]
@@ -915,7 +932,9 @@ pub(super) fn request_changes_on_behalf(
         || link["automation_revision"] != context.automation_revision()
         || link["project_id"] != context.project_id()
         || link["action"] != "task.request_changes"
-        || link["cause"] != cause
+        || !cause_sponsor_matches
+        || !top_level_sponsor_matches
+        || retained_cause != expected_cause
     {
         return Err(Error::new(
             "AUTOMATION_LINK_CORRUPT",
@@ -979,12 +998,12 @@ fn request_changes_core(
             scoped_manager
         }
         FeedbackActor::Automation(context) => {
-            if a["owner_id"] != context.effective_manager_id()
+            if a["owner_id"] != context.attempt_owner_id()
                 || !crate::policy::allows_scoped_manager_feedback(&a["task_snapshot"])
             {
                 return Err(Error::new(
                     "FORBIDDEN",
-                    "manager-owned automation requires the current owner-policy-v2 Attempt owner",
+                    "manager-owned automation requires the exact transferred owner-policy-v2 Attempt",
                 ));
             }
             true
@@ -1295,7 +1314,7 @@ fn require_automation_review_provenance(
     if assignment["review_assignment_id"] != context.review_assignment_id()
         || assignment["operation_id"] != assignment_operation_id
         || assignment["identity"] != json!(identity)
-        || assignment["sponsor_client_id"] != context.effective_manager_id()
+        || assignment["sponsor_client_id"] != context.review_assignment_sponsor_id()
         || assignment["reviewer_client_id"] != provenance["reviewer_client_id"]
     {
         return Err(damaged());
@@ -1316,7 +1335,8 @@ fn require_automation_review_provenance(
         || state != "settled"
         || assignment_operation_result["review_assignment_id"] != context.review_assignment_id()
         || assignment_operation_result["identity"] != json!(identity)
-        || assignment_operation_result["sponsor_client_id"] != context.effective_manager_id()
+        || assignment_operation_result["sponsor_client_id"]
+            != context.review_assignment_sponsor_id()
     {
         return Err(damaged());
     }
@@ -1356,7 +1376,7 @@ fn require_automation_review_provenance(
         || method != "review.submit"
         || result["review_assignment_id"] != context.review_assignment_id()
         || result["reviewer_client_id"] != assignment["reviewer_client_id"]
-        || result["sponsor_client_id"] != context.effective_manager_id()
+        || result["sponsor_client_id"] != context.review_assignment_sponsor_id()
         || result["task_id"] != identity.task_id
         || result["attempt_id"] != identity.attempt_id
         || result["task_revision"] != identity.task_revision

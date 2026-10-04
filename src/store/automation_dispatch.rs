@@ -803,14 +803,14 @@ fn attempt_review_assignment(
     }
     if task["state"] != "open"
         || task["revision"] != json!(task_revision)
+        || task["current_attempt_id"] != json!(attempt_id)
         || attempt["state"] != "submitted"
         || attempt["task_revision"] != json!(task_revision)
         || attempt["task_id"] != json!(task_id)
-        || attempt["owner_id"] != json!(entry.owner_manager_id)
         || !attempt["released_at_ms"].is_null()
     {
         return Ok(SubjectResult::Skipped {
-            reason: "submission_is_not_current_manager_work".to_owned(),
+            reason: "submission_is_not_current_attempt_work".to_owned(),
         });
     }
     if attempt["submission_ref"] != json!(submission_ref)
@@ -820,6 +820,45 @@ fn attempt_review_assignment(
             reason: "submission_is_not_current_attempt_candidate".to_owned(),
         });
     }
+    let transferred_authority = if attempt["owner_id"] == json!(entry.owner_manager_id) {
+        None
+    } else {
+        match authorization::current_transferred_attempt_authority(
+            tx,
+            entry,
+            AutomationStep::ReviewDispatch,
+            task_id,
+            task_revision,
+            attempt_id,
+            submission_ref,
+            candidate_ref,
+        ) {
+            Ok(Some(authority)) => Some(authority),
+            Ok(None) => {
+                return Ok(SubjectResult::Skipped {
+                    reason: "attempt_owner_is_not_in_current_transfer_lineage".to_owned(),
+                });
+            }
+            Err(error) if error.code == "FORBIDDEN" => {
+                return Ok(SubjectResult::Pending {
+                    reason: "successor_manager_authority_unavailable".to_owned(),
+                    wake_when: vec!["current_gm_or_task_scope_changed".to_owned()],
+                });
+            }
+            Err(error) if error.code == "AUTOMATION_ACTION_CHANGED" => {
+                return Ok(SubjectResult::Pending {
+                    reason: "automation_configuration_changed".to_owned(),
+                    wake_when: vec!["automation_config_changed".to_owned()],
+                });
+            }
+            Err(error) if error.code == "AUTOMATION_ATTEMPT_STALE" => {
+                return Ok(SubjectResult::Skipped {
+                    reason: "submission_is_not_current_attempt_work".to_owned(),
+                });
+            }
+            Err(error) => return Err(error),
+        }
+    };
     let context = match ManagerExecutionContext::from_committed_entry(tx, entry, cause.clone()) {
         Ok(context) => context,
         Err(error) if error.code == "FORBIDDEN" || error.code == "UNAUTHORIZED" => {
@@ -843,6 +882,7 @@ fn attempt_review_assignment(
         task_revision,
         submission_ref,
         candidate_ref,
+        transferred_authority.as_ref(),
     )?;
     let request = ReviewAssignRequest::for_automation(
         client_request_id.clone(),
@@ -1006,8 +1046,9 @@ fn automatic_request_id(
     task_revision: i64,
     submission_ref: &str,
     candidate_ref: &str,
+    transferred_authority: Option<&authorization::TransferredAttemptAuthority>,
 ) -> Result<String> {
-    let identity = json!({
+    let mut identity = json!({
         "automation_id":context.automation_id(),
         "task_id":task_id,
         "task_revision":task_revision,
@@ -1017,6 +1058,13 @@ fn automatic_request_id(
         "action":"review.assign",
         "slot":"primary"
     });
+    if let Some(authority) = transferred_authority {
+        identity["transferred_attempt_authority"] = json!({
+            "source_attempt_owner_id":authority.source_attempt_owner_id(),
+            "successor_manager_id":authority.successor_manager_id(),
+            "transfer_operation_ids":authority.transfer_operation_ids(),
+        });
+    }
     Ok(model::digest(model::canonical(&identity)?.as_bytes()))
 }
 

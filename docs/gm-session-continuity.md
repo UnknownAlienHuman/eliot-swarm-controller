@@ -95,6 +95,18 @@ The same `--request-id` must be reused if the response is lost. Transfer is an
 explicit mutation for one entry; it preserves the retained automation state and
 does not replay a pending slot or reset its cursor.
 
+After transfer, the successor can use only the enabled review steps on the
+exact current, unreleased Attempt while the transfer lineage, entry and current
+GM scope still match. A new assigned review can be sponsored by the successor;
+the original Attempt owner and submission author remain unchanged, and the
+assigned reviewer remains the source of review evidence. A configured review
+disposition or acceptance records the successor as decision manager. Feedback
+is still addressed to the original Attempt owner. Transfer does not grant
+authority over other Attempts or rewrite historical review assignments.
+If the entry is transferred again, a retained assignment sponsor is not
+rewritten; the next successor can consume that result only through the exact
+recorded transfer lineage.
+
 The source now implements this continuity requirement. Verification requires a
 real Store regression with an old GM, a successor using a different
 client identity, preserved Attempt ownership and dispatch identity, positive

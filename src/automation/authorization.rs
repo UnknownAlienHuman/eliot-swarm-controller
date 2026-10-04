@@ -36,11 +36,13 @@ struct CurrentReviewSubject {
     task_id: String,
     task_revision: i64,
     submission_ref: Option<String>,
+    candidate_ref: Option<String>,
     released_at_ms: Option<i64>,
     attempt_state: String,
     project_id: String,
     task_state: String,
     current_task_revision: i64,
+    current_attempt_id: Option<String>,
 }
 
 struct RetainedAcceptanceAttempt {
@@ -49,6 +51,7 @@ struct RetainedAcceptanceAttempt {
     task_revision: i64,
     submission_ref: Option<String>,
     candidate_ref: Option<String>,
+    project_id: String,
 }
 
 type AcceptanceOperationRow = (
@@ -172,15 +175,17 @@ impl ManagerExecutionContext {
 
     /// Rechecks current config, manager registration and the exact live
     /// attempt/submission scope immediately before a new review assignment.
-    pub(crate) fn require_action_object(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn require_action_object_with_transfer(
         &self,
         db: &Connection,
         action: &str,
         task_id: &str,
+        task_revision: i64,
         attempt_id: &str,
         project_id: &str,
         submission_ref: &str,
-    ) -> Result<()> {
+    ) -> Result<Option<TransferredAttemptAuthority>> {
         if action != "review.assign"
             || project_id != self.project_id
             || submission_ref != self.semantic_cause_id()
@@ -213,40 +218,82 @@ impl ManagerExecutionContext {
         }
         let row: Option<CurrentReviewSubject> = db
             .query_row(
-                "SELECT a.owner_id,a.task_id,a.task_revision,a.submission_ref,a.released_at_ms,a.state,t.project_id,t.state,t.revision \
+                "SELECT a.owner_id,a.task_id,a.task_revision,a.submission_ref,a.candidate_ref,\
+                        a.released_at_ms,a.state,t.project_id,t.state,t.revision, \
+                        (SELECT active.attempt_id FROM attempts AS active \
+                         WHERE active.task_id=t.task_id AND active.released_at_ms IS NULL) \
                  FROM attempts AS a JOIN tasks AS t ON t.task_id=a.task_id WHERE a.attempt_id=?1",
                 [attempt_id],
-                |r| Ok(CurrentReviewSubject {
-                    owner_id: r.get(0)?,
-                    task_id: r.get(1)?,
-                    task_revision: r.get(2)?,
-                    submission_ref: r.get(3)?,
-                    released_at_ms: r.get(4)?,
-                    attempt_state: r.get(5)?,
-                    project_id: r.get(6)?,
-                    task_state: r.get(7)?,
-                    current_task_revision: r.get(8)?,
-                }),
+                |r| {
+                    Ok(CurrentReviewSubject {
+                        owner_id: r.get(0)?,
+                        task_id: r.get(1)?,
+                        task_revision: r.get(2)?,
+                        submission_ref: r.get(3)?,
+                        candidate_ref: r.get(4)?,
+                        released_at_ms: r.get(5)?,
+                        attempt_state: r.get(6)?,
+                        project_id: r.get(7)?,
+                        task_state: r.get(8)?,
+                        current_task_revision: r.get(9)?,
+                        current_attempt_id: r.get(10)?,
+                    })
+                },
             )
             .optional()?;
         let Some(subject) = row else {
             return Err(Error::new("NOT_FOUND", "review attempt was not found"));
         };
-        if subject.owner_id != self.effective_manager_id
-            || subject.task_id != task_id
+        if subject.task_id != task_id
+            || subject.task_revision != task_revision
             || subject.project_id != project_id
             || subject.released_at_ms.is_some()
             || subject.attempt_state != "submitted"
             || subject.task_state != "open"
             || subject.current_task_revision != subject.task_revision
+            || subject.current_attempt_id.as_deref() != Some(attempt_id)
             || subject.submission_ref.as_deref() != Some(submission_ref)
+            || subject.candidate_ref.as_deref().is_none_or(str::is_empty)
         {
             return Err(Error::new(
                 "FORBIDDEN",
-                "manager no longer owns this current review subject",
+                "manager action no longer targets this exact current review subject",
             ));
         }
-        Ok(())
+        if subject.owner_id == self.effective_manager_id {
+            return Ok(None);
+        }
+        let candidate_ref = subject.candidate_ref.as_deref().ok_or_else(|| {
+            Error::new(
+                "AUTOMATION_ATTEMPT_STALE",
+                "current review Attempt has no retained candidate",
+            )
+        })?;
+        let authority = current_transferred_attempt_authority(
+            db,
+            &current,
+            AutomationStep::ReviewDispatch,
+            task_id,
+            subject.task_revision,
+            attempt_id,
+            submission_ref,
+            candidate_ref,
+        )?
+        .ok_or_else(|| {
+            Error::new(
+                "FORBIDDEN",
+                "automation sponsor does not own or inherit authority for this review Attempt",
+            )
+        })?;
+        if authority.source_attempt_owner_id() != subject.owner_id
+            || authority.successor_manager_id() != self.effective_manager_id
+        {
+            return Err(Error::new(
+                "FORBIDDEN",
+                "transferred review authority differs from the exact Attempt owner and sponsor",
+            ));
+        }
+        Ok(Some(authority))
     }
 }
 
@@ -306,6 +353,17 @@ pub(crate) struct TransferReadbackAuthority {
     task_id: String,
 }
 
+/// Current-GM authority for one exact live Attempt whose owner is in the
+/// committed transfer lineage of the current automation entry.
+#[derive(Debug, Clone)]
+pub(crate) struct TransferredAttemptAuthority {
+    source_attempt_owner_id: String,
+    successor_manager_id: String,
+    current_gm_epoch: i64,
+    owner_lineage: Vec<String>,
+    transfer_operation_ids: Vec<String>,
+}
+
 impl TransferReadbackAuthority {
     pub(crate) fn matches_work_dispatch(
         &self,
@@ -316,6 +374,28 @@ impl TransferReadbackAuthority {
         self.operation_id == operation_id
             && self.project_id == project_id
             && self.task_id == task_id
+    }
+}
+
+impl TransferredAttemptAuthority {
+    pub(crate) fn source_attempt_owner_id(&self) -> &str {
+        &self.source_attempt_owner_id
+    }
+
+    pub(crate) fn successor_manager_id(&self) -> &str {
+        &self.successor_manager_id
+    }
+
+    pub(crate) fn current_gm_epoch(&self) -> i64 {
+        self.current_gm_epoch
+    }
+
+    pub(crate) fn transfer_operation_ids(&self) -> &[String] {
+        &self.transfer_operation_ids
+    }
+
+    pub(crate) fn contains_manager_id(&self, manager_id: &str) -> bool {
+        self.owner_lineage.iter().any(|owner| owner == manager_id)
     }
 }
 
@@ -675,8 +755,8 @@ fn validate_acceptance_review_pass(
 
     let retained_attempt: Option<RetainedAcceptanceAttempt> = db
         .query_row(
-            "SELECT owner_id,task_id,task_revision,submission_ref,candidate_ref \
-             FROM attempts WHERE attempt_id=?1",
+            "SELECT a.owner_id,a.task_id,a.task_revision,a.submission_ref,a.candidate_ref,t.project_id \
+             FROM attempts AS a JOIN tasks AS t ON t.task_id=a.task_id WHERE a.attempt_id=?1",
             [&identity.attempt_id],
             |row| {
                 Ok(RetainedAcceptanceAttempt {
@@ -685,6 +765,7 @@ fn validate_acceptance_review_pass(
                     task_revision: row.get(2)?,
                     submission_ref: row.get(3)?,
                     candidate_ref: row.get(4)?,
+                    project_id: row.get(5)?,
                 })
             },
         )
@@ -692,11 +773,11 @@ fn validate_acceptance_review_pass(
     let Some(retained_attempt) = retained_attempt else {
         return Err(corrupt());
     };
-    if retained_attempt.owner_id != sponsor_id
-        || retained_attempt.task_id != identity.task_id
+    if retained_attempt.task_id != identity.task_id
         || retained_attempt.task_revision != identity.task_revision
         || retained_attempt.submission_ref.as_deref() != Some(identity.submission_ref.as_str())
         || retained_attempt.candidate_ref.as_deref() != Some(identity.candidate_ref.as_str())
+        || retained_attempt.project_id != link.project_id
     {
         return Err(corrupt());
     }
@@ -726,12 +807,13 @@ fn validate_acceptance_review_pass(
         serde_json::from_str(&result_raw.ok_or_else(corrupt)?).map_err(|_| corrupt())?;
     let assignment_effective: Value =
         serde_json::from_str(&assignment_effective_raw).map_err(|_| corrupt())?;
-    let operation_sponsor_id = match assignment_effective.get("on_behalf") {
+    let (operation_sponsor_id, assignment_manager_id) = match assignment_effective.get("on_behalf")
+    {
         None | Some(Value::Null) => {
             if operation_link(db, &assignment_operation_id)?.is_some() {
                 return Err(corrupt());
             }
-            assignment_caller.clone()
+            (assignment_caller.clone(), None)
         }
         Some(saved) if saved.is_object() => {
             let Some(operation_link) = operation_link(db, &assignment_operation_id)? else {
@@ -745,6 +827,7 @@ fn validate_acceptance_review_pass(
                 || saved["project_id"] != operation_link.project_id
                 || saved["action"] != operation_link.action
                 || operation_link.project_id != link.project_id
+                || operation_link.automation_id != link.automation_id
                 || saved["semantic_cause_kind"] != operation_link.cause["kind"]
                 || saved["semantic_cause_id"] != operation_link.cause["id"]
                 || saved["cause"] != operation_link.cause
@@ -752,7 +835,10 @@ fn validate_acceptance_review_pass(
             {
                 return Err(corrupt());
             }
-            operation_link.effective_manager_id
+            (
+                operation_link.effective_manager_id.clone(),
+                Some(operation_link.effective_manager_id),
+            )
         }
         Some(_) => return Err(corrupt()),
     };
@@ -768,6 +854,28 @@ fn validate_acceptance_review_pass(
         || operation_sponsor_id != sponsor_id
     {
         return Err(corrupt());
+    }
+
+    // A retained acceptance can outlive another transfer (B -> C). Validate
+    // the immutable owner chain and historical sponsor/decision manager
+    // against its sealed edges without requiring either actor to remain
+    // today's GM or the accepted Task to stay open.
+    if sponsor_id != retained_attempt.owner_id {
+        let lineage = validated_transfer_owner_lineage(
+            db,
+            &retained_attempt.owner_id,
+            &retained_attempt.project_id,
+            &link.automation_id,
+        )?;
+        if !lineage.iter().any(|owner| owner == sponsor_id)
+            || !lineage
+                .iter()
+                .any(|owner| owner == &link.effective_manager_id)
+            || (sponsor_id != retained_attempt.owner_id
+                && assignment_manager_id.as_deref() != Some(sponsor_id))
+        {
+            return Err(corrupt());
+        }
     }
 
     let result_key = format!("result:{assignment_id}");
@@ -1598,6 +1706,247 @@ pub(crate) fn any_on_behalf_operation_link(
 
 type TransferOperationRow = (Option<String>, String, String, Option<i64>, Option<String>);
 type TransferMutationRow = (String, String, String, Option<String>);
+type CurrentTransferredAttemptRow = (
+    String,
+    String,
+    i64,
+    String,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+    i64,
+    Option<String>,
+);
+
+/// Validate the narrow successor-GM path for one exact current Attempt.
+/// The ordinary same-owner path returns `None`; a different owner is admitted
+/// only through the complete retained automation transfer chain.
+// Keeping this exact subject tuple explicit prevents callers from substituting
+// a Task, revision, Attempt, submission, or candidate independently.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn current_transferred_attempt_authority(
+    db: &Connection,
+    entry: &config::AutomationEntry,
+    step: AutomationStep,
+    task_id: &str,
+    task_revision: i64,
+    attempt_id: &str,
+    submission_ref: &str,
+    candidate_ref: &str,
+) -> Result<Option<TransferredAttemptAuthority>> {
+    if !matches!(
+        step,
+        AutomationStep::ReviewDispatch
+            | AutomationStep::ReviewDisposition
+            | AutomationStep::Acceptance
+    ) {
+        return Err(Error::invalid(
+            "transferred Attempt authority is limited to review and acceptance steps",
+        ));
+    }
+    config::validate_entry(entry)?;
+    let current_entry = config::load_entry(
+        db,
+        &entry.owner_manager_id,
+        &entry.project_id,
+        &entry.automation_id,
+    )?
+    .ok_or_else(|| {
+        Error::new(
+            "AUTOMATION_ACTION_CHANGED",
+            "current transferred automation entry is missing",
+        )
+    })?;
+    let step_ready = match step {
+        AutomationStep::ReviewDispatch => current_entry.review_dispatch_ready(),
+        AutomationStep::ReviewDisposition | AutomationStep::Acceptance => {
+            current_entry.enabled
+                && current_entry.steps.contains(&step)
+                && current_entry.scope.work_pool_id.is_none()
+        }
+        _ => false,
+    };
+    if current_entry != *entry || !step_ready {
+        return Err(Error::new(
+            "AUTOMATION_ACTION_CHANGED",
+            "current entry no longer enables the exact transferred action",
+        ));
+    }
+
+    let subject: Option<CurrentTransferredAttemptRow> = db
+        .query_row(
+            "SELECT a.owner_id,a.task_id,a.task_revision,a.state,a.released_at_ms,\
+                    a.submission_ref,a.candidate_ref,t.project_id,t.state,t.revision,\
+                    (SELECT active.attempt_id FROM attempts AS active \
+                     WHERE active.task_id=t.task_id AND active.released_at_ms IS NULL) \
+             FROM attempts AS a JOIN tasks AS t ON t.task_id=a.task_id \
+             WHERE a.attempt_id=?1",
+            [attempt_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        attempt_owner_id,
+        attempt_task_id,
+        attempt_revision,
+        attempt_state,
+        released_at_ms,
+        attempt_submission_ref,
+        attempt_candidate_ref,
+        task_project_id,
+        task_state,
+        current_task_revision,
+        current_attempt_id,
+    )) = subject
+    else {
+        return Err(Error::new(
+            "AUTOMATION_ATTEMPT_STALE",
+            "transferred review subject Attempt was not found",
+        ));
+    };
+    let allowed_attempt_state = match step {
+        AutomationStep::ReviewDisposition => {
+            matches!(attempt_state.as_str(), "submitted" | "needs_correction")
+        }
+        AutomationStep::ReviewDispatch => attempt_state == "submitted",
+        AutomationStep::Acceptance => {
+            matches!(attempt_state.as_str(), "submitted" | "needs_correction")
+        }
+        _ => false,
+    };
+    if attempt_task_id != task_id
+        || attempt_revision != task_revision
+        || current_task_revision != task_revision
+        || current_attempt_id.as_deref() != Some(attempt_id)
+        || task_project_id != entry.project_id
+        || task_state != "open"
+        || !allowed_attempt_state
+        || released_at_ms.is_some()
+        || attempt_submission_ref.as_deref() != Some(submission_ref)
+        || attempt_candidate_ref.as_deref() != Some(candidate_ref)
+    {
+        return Err(Error::new(
+            "AUTOMATION_ATTEMPT_STALE",
+            "Task, Attempt, submission, or candidate is no longer the exact live subject",
+        ));
+    }
+    if attempt_owner_id == entry.owner_manager_id {
+        return Ok(None);
+    }
+
+    require_registered_manager(db, &entry.owner_manager_id)?;
+    let gm: Option<(String, i64)> = db
+        .query_row(
+            "SELECT json_extract(value_json,'$.client_id'),json_extract(value_json,'$.epoch') \
+             FROM meta WHERE key='gm'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((gm_client_id, current_gm_epoch)) = gm else {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "transferred Attempt action requires a current GM designation",
+        ));
+    };
+    if gm_client_id != entry.owner_manager_id || current_gm_epoch <= 0 {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "the current registered GM must own the transferred automation entry",
+        ));
+    }
+
+    let lineage = config::transfer_successors(
+        db,
+        &attempt_owner_id,
+        &entry.project_id,
+        &entry.automation_id,
+    )?;
+    if lineage.is_empty() {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "Attempt owner is not in the current automation transfer lineage",
+        ));
+    }
+    let mut expected_former_owner = attempt_owner_id.clone();
+    let mut prior_new_revision = None;
+    let mut owner_lineage = vec![attempt_owner_id.clone()];
+    let mut transfer_operation_ids = Vec::with_capacity(lineage.len());
+    for transfer in &lineage {
+        if transfer.former_owner_manager_id != expected_former_owner
+            || transfer.project_id != entry.project_id
+            || transfer.automation_id != entry.automation_id
+            || prior_new_revision.is_some_and(|revision| transfer.former_owner_revision < revision)
+            || transfer.former_owner_revision.checked_add(1) != Some(transfer.new_owner_revision)
+        {
+            return Err(Error::new(
+                "AUTOMATION_TRANSFER_CORRUPT",
+                "Attempt transfer chain has an inconsistent owner or revision edge",
+            ));
+        }
+        let former_entry = config::load_entry(
+            db,
+            &transfer.former_owner_manager_id,
+            &entry.project_id,
+            &entry.automation_id,
+        )?
+        .ok_or_else(|| {
+            Error::new(
+                "AUTOMATION_TRANSFER_CORRUPT",
+                "Attempt transfer chain has no retained former-owner snapshot",
+            )
+        })?;
+        if former_entry.enabled || former_entry.revision != transfer.former_owner_revision {
+            return Err(Error::new(
+                "AUTOMATION_TRANSFER_CORRUPT",
+                "Attempt transfer former-owner snapshot differs from its committed edge",
+            ));
+        }
+        validate_transfer_operation(db, transfer)?;
+        expected_former_owner.clone_from(&transfer.new_owner_manager_id);
+        prior_new_revision = Some(transfer.new_owner_revision);
+        owner_lineage.push(transfer.new_owner_manager_id.clone());
+        transfer_operation_ids.push(transfer.transfer_operation_id.clone());
+    }
+    if expected_former_owner != entry.owner_manager_id
+        || prior_new_revision.is_none_or(|revision| current_entry.revision < revision)
+    {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "current automation entry is not the terminal destination of the Attempt owner transfer",
+        ));
+    }
+    if !current_manager_id_has_task_scope(db, &entry.owner_manager_id, task_id, &entry.project_id)?
+    {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "current GM no longer has scope for the exact Task and project",
+        ));
+    }
+    Ok(Some(TransferredAttemptAuthority {
+        source_attempt_owner_id: attempt_owner_id,
+        successor_manager_id: entry.owner_manager_id.clone(),
+        current_gm_epoch,
+        owner_lineage,
+        transfer_operation_ids,
+    }))
+}
 
 /// Rehydrate a current-GM continuation grant for one exact, still-queued
 /// linked Operation. The stored caller/effective manager and action request
@@ -2097,6 +2446,67 @@ fn transfer_action_matches_step(action: &str, step: AutomationStep) -> bool {
             | ("task.accept", AutomationStep::Acceptance)
             | ("forge.publish_ref", AutomationStep::Publication)
     )
+}
+
+fn validated_transfer_owner_lineage(
+    db: &Connection,
+    source_owner_id: &str,
+    project_id: &str,
+    automation_id: &str,
+) -> Result<Vec<String>> {
+    let transfers = config::transfer_successors(db, source_owner_id, project_id, automation_id)?;
+    let mut expected_former_owner = source_owner_id.to_owned();
+    let mut prior_new_revision = None;
+    let mut owners = vec![source_owner_id.to_owned()];
+    for transfer in &transfers {
+        if transfer.former_owner_manager_id != expected_former_owner
+            || transfer.project_id != project_id
+            || transfer.automation_id != automation_id
+            || prior_new_revision.is_some_and(|revision| transfer.former_owner_revision < revision)
+            || transfer.former_owner_revision.checked_add(1) != Some(transfer.new_owner_revision)
+        {
+            return Err(Error::new(
+                "AUTOMATION_TRANSFER_CORRUPT",
+                "retained acceptance transfer lineage has an inconsistent owner or revision edge",
+            ));
+        }
+        let former_entry = config::load_entry(
+            db,
+            &transfer.former_owner_manager_id,
+            project_id,
+            automation_id,
+        )?
+        .ok_or_else(|| {
+            Error::new(
+                "AUTOMATION_TRANSFER_CORRUPT",
+                "retained acceptance transfer has no former-owner snapshot",
+            )
+        })?;
+        if former_entry.enabled || former_entry.revision != transfer.former_owner_revision {
+            return Err(Error::new(
+                "AUTOMATION_TRANSFER_CORRUPT",
+                "retained acceptance transfer differs from its former-owner snapshot",
+            ));
+        }
+        validate_transfer_operation(db, transfer)?;
+        expected_former_owner.clone_from(&transfer.new_owner_manager_id);
+        prior_new_revision = Some(transfer.new_owner_revision);
+        owners.push(transfer.new_owner_manager_id.clone());
+    }
+    let terminal_entry = config::load_entry(db, &expected_former_owner, project_id, automation_id)?
+        .ok_or_else(|| {
+            Error::new(
+                "AUTOMATION_TRANSFER_CORRUPT",
+                "retained acceptance transfer has no terminal-owner entry",
+            )
+        })?;
+    if prior_new_revision.is_some_and(|revision| terminal_entry.revision < revision) {
+        return Err(Error::new(
+            "AUTOMATION_TRANSFER_CORRUPT",
+            "retained acceptance terminal entry predates its transfer edge",
+        ));
+    }
+    Ok(owners)
 }
 
 fn validate_transfer_operation(

@@ -83,9 +83,17 @@ and expected source revision:
 The call atomically retires the former-owner source and transfers that entry to
 the current GM. A stale `expected_revision` or an existing conflicting target
 entry is refused; transfer does not overwrite or merge the target. Cursors,
-pending slots and linked history are preserved. Existing authority and history
-actors remain unchanged: transfer does not grant a new action right, rewrite
-prior actors or replay pending work. Use the current source revision from
+pending slots and linked history are preserved. Transfer does not grant
+unrelated action rights, rewrite prior actors or replay pending work. While the
+successor remains the current GM and the transferred entry and exact Task and
+Attempt scope remain current, its explicitly selected `review_dispatch`,
+`review_disposition` and `acceptance` steps may continue that Attempt. The
+Attempt owner and submission author remain unchanged; new review assignments
+use the successor as sponsor, while the assigned reviewer supplies the review
+evidence. A resulting correction is attributed to the successor and addressed
+to the original Attempt owner. A later transfer does not rewrite an existing
+assignment sponsor; its result remains usable only when that sponsor is in the
+validated transfer lineage. Use the current source revision from
 `automation.config.get` and a stable `client_request_id` for the explicit
 mutation.
 

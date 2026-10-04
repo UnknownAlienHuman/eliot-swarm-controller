@@ -86,22 +86,7 @@ pub(super) fn consume_review_result_for_entry(
     let manager_id = model::text(&review.assignment, "sponsor_client_id")?;
     let independent_acceptance =
         result["verdict"] == "pass" && entry.steps.contains(&AutomationStep::Acceptance);
-    if manager_id != entry.owner_manager_id && !independent_acceptance {
-        return Ok(skipped(
-            &review,
-            "automation_owner_mismatch",
-            "the review sponsor differs from this automation entry owner",
-        ));
-    }
-    // Acceptance is an independent GM decision over another owner's proposal.
-    // Owner-scoped correction keeps its original ownership guard; applying it
-    // to a passing acceptance first would make every valid decision unreachable.
-    let required_owner = if independent_acceptance {
-        None
-    } else {
-        Some(manager_id)
-    };
-    let (task, attempt) = match current_subject(tx, &review.identity, required_owner)? {
+    let (task, attempt) = match current_subject(tx, &review.identity)? {
         Some(subject) => subject,
         None => {
             return Ok(skipped(
@@ -122,6 +107,45 @@ pub(super) fn consume_review_result_for_entry(
     let acceptance_selected = entry.steps.contains(&AutomationStep::Acceptance);
     let disposition_selected = entry.steps.contains(&AutomationStep::ReviewDisposition);
     let repair_selected = entry.steps.contains(&AutomationStep::RepairDispatch);
+    let attempt_owner_id = model::text(&attempt, "owner_id")?;
+    let ordinary_owner_scope =
+        attempt_owner_id == entry.owner_manager_id && manager_id == entry.owner_manager_id;
+    let transferred_disposition = result["verdict"] == "changes_requested"
+        && disposition_selected
+        && attempt_owner_id != entry.owner_manager_id;
+    let transferred_sponsor_scope = if transferred_disposition {
+        match authorization::current_transferred_attempt_authority(
+            tx,
+            entry,
+            AutomationStep::ReviewDisposition,
+            &review.identity.task_id,
+            review.identity.task_revision,
+            &review.identity.attempt_id,
+            &review.identity.submission_ref,
+            &review.identity.candidate_ref,
+        ) {
+            Ok(Some(proof)) => {
+                proof.source_attempt_owner_id() == attempt_owner_id
+                    && proof.successor_manager_id() == entry.owner_manager_id
+                    && proof.contains_manager_id(manager_id)
+            }
+            Ok(None) => false,
+            Err(error) if error.code == "FORBIDDEN" => false,
+            Err(error) => return Err(error),
+        }
+    } else {
+        false
+    };
+    // A passing acceptance remains an independent current-GM path. Successor
+    // authority here is only for this exact non-pass disposition and does not
+    // widen repair, acceptance, or other Task actions.
+    if !independent_acceptance && !ordinary_owner_scope && !transferred_sponsor_scope {
+        return Ok(skipped(
+            &review,
+            "automation_owner_mismatch",
+            "the retained sponsor is not the current owner or a manager in the exact transferred Attempt lineage",
+        ));
+    }
 
     match result["verdict"].as_str() {
         Some("pass") => {
@@ -221,6 +245,7 @@ pub(super) fn consume_review_result_for_entry(
             &attempt,
             review_assignment_id,
             review_result_operation_id,
+            manager_id,
             now_ms,
         )?
     } else {
@@ -329,6 +354,7 @@ fn compose_action_results(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn consume_selected_disposition(
     tx: &Transaction<'_>,
     entry: &config::AutomationEntry,
@@ -336,6 +362,7 @@ fn consume_selected_disposition(
     attempt: &Value,
     review_assignment_id: &str,
     review_result_operation_id: &str,
+    review_assignment_sponsor_id: &str,
     now_ms: i64,
 ) -> Result<Value> {
     let result = &review.record["result"];
@@ -408,6 +435,7 @@ fn consume_selected_disposition(
         review.identity.clone(),
         review_assignment_id,
         review_result_operation_id,
+        review_assignment_sponsor_id,
     ) {
         Ok(context) => context,
         Err(error)
@@ -482,6 +510,7 @@ fn committed_review_result(
         || assignment_operation["state"] != "settled"
         || assignment_operation["result"]["review_assignment_id"] != assignment_id
         || assignment_operation["result"]["identity"] != assignment["identity"]
+        || assignment_operation["result"]["sponsor_client_id"] != assignment["sponsor_client_id"]
     {
         return Err(Error::new(
             "REVIEW_ASSIGNMENT_DAMAGED",
@@ -554,7 +583,6 @@ fn committed_review_result(
 fn current_subject(
     db: &Connection,
     identity: &ReviewSlotIdentity,
-    required_owner: Option<&str>,
 ) -> Result<Option<(Value, Value)>> {
     let task = tasks::get_task(db, &identity.task_id)?;
     let attempt = tasks::get_attempt(db, &identity.attempt_id)?;
@@ -563,7 +591,6 @@ fn current_subject(
         && task["current_attempt_id"] == identity.attempt_id
         && attempt["task_id"] == identity.task_id
         && attempt["task_revision"] == identity.task_revision
-        && required_owner.is_none_or(|owner| attempt["owner_id"] == owner)
         && attempt["released_at_ms"].is_null()
         && attempt["submission_ref"] == identity.submission_ref
         && attempt["candidate_ref"] == identity.candidate_ref
@@ -683,7 +710,11 @@ fn reserve_feedback_operation(
             && link.cause["id"] == context.review_assignment_id()
             && link.cause["review_assignment_id"] == context.review_assignment_id()
             && link.cause["operation_id"] == context.review_result_operation_id()
-            && link.cause["identity"] == json!(context.identity());
+            && link.cause["identity"] == json!(context.identity())
+            && link
+                .cause
+                .get("review_assignment_sponsor_id")
+                .is_none_or(|sponsor| sponsor == context.review_assignment_sponsor_id());
         if !same_review_cause {
             return Ok((
                 operation_id.clone(),

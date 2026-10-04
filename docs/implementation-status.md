@@ -77,9 +77,9 @@ Cross-platform CI [37184545179](https://github.com/UnknownAlienHuman/eliot-swarm
 failed solely on the outdated MCP table contract, repaired in 2f3e22a. The focused table guard passes; subsequent full Windows and Ubuntu CI37186030488 passed for source 8f3998f. The installed R6 binary and running native environments have
 not been replaced or restarted by these source gates.
 
-**Resume here:** continue successor automatic review/correction from the saved
-transfer increment, then owned native startup qualification. Use the transfer
-candidate below when a fresh harness requires this code. Preserve earlier unknown
+**Resume here:** finish successor RepairDispatch on the retained Attempt's binding,
+then owned native startup qualification. Use the latest built candidate recorded
+below when a fresh harness requires this code. Preserve earlier unknown
 runs without replay. Transferring every former manager's entry automatically
 remains separate from explicit per-entry transfer.
 
@@ -105,11 +105,32 @@ path for `workspace_effect_unknown`. It records an observed held lease and keeps
 the parent unknown; it cannot claim, open, start or replay. Other uncertain native
 start phases retain their existing recovery contracts.
 
-New autonomous ReviewDispatch and non-pass correction of an old-owner Attempt
-are still owner-scoped after entry transfer. Existing old-owner-sponsored passes
-can use the independent-GM acceptance path, and manual successor control remains
-implemented. A new automatic successor review/correction route is the next
-implementation gap; transfer does not establish full autonomous O7.
+Full Windows and Ubuntu CI for source `21343e7afca61d66b0330e4deb7e6a0c3548d4f7`
+passed in [37189940977](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37189940977),
+verified on 2026-10-04 at 09:16 UTC.
+
+### Successor review and correction — source increment, 2026-10-04
+
+After explicit entry transfer, the current GM can assign a new review of the
+former owner's exact current Attempt. A later successor can consume that review
+through the sealed transfer lineage. The actual review sponsor, original Attempt
+owner and submission author remain recorded; the current GM is the acceptance
+or correction decision actor, and feedback still addresses the Attempt owner.
+Historical direct and automatic assignments use their retained assigning
+Operation and actual sponsorship, including after a second GM handover.
+
+Warnings-denied production Clippy, the A→B→C Store regression, the successor-GM
+continuation regression, legacy owner-sponsored acceptance compatibility, and
+debug build passed on 2026-10-04. Production stayed unchanged after Clippy; only
+the new fixture's assertions were aligned with the retained queued receipt.
+The final gate source stayed unchanged. Luna ratified the retained sponsorship
+and authority predicates. Built candidate SHA-256 is
+`6B5978C85B5715E06B8A9C88FB97409D2763A0534CFEB1DDADFF9DED08623764`.
+The gate covers A-owned Attempts, B-sponsored independent reviews, then C's exact
+correction and queued acceptance after a second transfer. Acceptance reservation
+does not establish the final artifact check or accepted Task transition. Fresh
+RepairDispatch on the original owner's binding is the next implementation gap;
+the complete native O7 cycle remains unqualified.
 
 ### Prior C7/C8 evidence
 
