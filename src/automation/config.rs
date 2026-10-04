@@ -78,6 +78,8 @@ pub(crate) struct AutomationEntry {
     pub(crate) work_dispatch: Option<WorkDispatchLaunchSettings>,
     #[serde(default)]
     pub(crate) publication: Option<PublicationSettings>,
+    #[serde(default)]
+    pub(crate) cron: Option<crate::scheduler::CronSettings>,
     pub(crate) review: ReviewSettings,
     pub(crate) created_at_ms: i64,
     pub(crate) updated_at_ms: i64,
@@ -106,6 +108,7 @@ impl AutomationEntry {
             steps: Vec::new(),
             work_dispatch: None,
             publication: None,
+            cron: None,
             review: ReviewSettings {
                 profile: None,
                 required_reviewers: 1,
@@ -179,6 +182,13 @@ impl AutomationEntry {
                 "reason":"select an exact target ref and expected old ref or explicit create before enabling publication"
             }));
         }
+        if self.steps.contains(&AutomationStep::CheckRun) && self.cron.is_none() {
+            gaps.push(json!({
+                "code":"cron_settings_required",
+                "step":"check_run",
+                "reason":"select a validated cron calendar and exact CheckRun target before enabling cron"
+            }));
+        }
         gaps
     }
 
@@ -201,6 +211,13 @@ impl AutomationEntry {
         self.enabled
             && self.steps.contains(&AutomationStep::Publication)
             && self.publication.is_some()
+            && self.scope.work_pool_id.is_none()
+    }
+
+    pub(crate) fn check_run_ready(&self) -> bool {
+        self.enabled
+            && self.steps.contains(&AutomationStep::CheckRun)
+            && self.cron.is_some()
             && self.scope.work_pool_id.is_none()
     }
 }
@@ -653,6 +670,7 @@ pub(crate) fn apply_patch(
             "steps" => next.steps = parse_steps(value)?,
             "work_dispatch" => patch_work_dispatch(&mut next.work_dispatch, value)?,
             "publication" => patch_publication(&mut next.publication, value)?,
+            "cron" => patch_cron(&mut next.cron, value)?,
             "review" => patch_review(&mut next.review, value)?,
             _ => return Err(Error::invalid(format!("unknown automation field: {field}"))),
         }
@@ -685,6 +703,26 @@ fn patch_publication(settings: &mut Option<PublicationSettings>, patch: &Value) 
     let parsed: PublicationSettings = serde_json::from_value(merged)
         .map_err(|_| Error::invalid("invalid publication settings"))?;
     parsed.validate()?;
+    *settings = Some(parsed);
+    Ok(())
+}
+
+fn patch_cron(settings: &mut Option<crate::scheduler::CronSettings>, patch: &Value) -> Result<()> {
+    if patch.is_null() {
+        *settings = None;
+        return Ok(());
+    }
+    if !patch.is_object() {
+        return Err(Error::invalid("cron patch must be an object or null"));
+    }
+    let mut merged = match settings {
+        Some(settings) => serde_json::to_value(settings)?,
+        None => json!({}),
+    };
+    merge_object_patch(&mut merged, patch)?;
+    let parsed: crate::scheduler::CronSettings =
+        serde_json::from_value(merged).map_err(|_| Error::invalid("invalid cron settings"))?;
+    crate::scheduler::validate_cron_settings(&parsed)?;
     *settings = Some(parsed);
     Ok(())
 }
@@ -896,6 +934,14 @@ pub(crate) fn validate_entry(entry: &AutomationEntry) -> Result<()> {
             Error::new(
                 "AUTOMATION_RECORD_INVALID",
                 "stored publication settings do not match the exact Forge target contract",
+            )
+        })?;
+    }
+    if let Some(settings) = entry.cron.as_ref() {
+        crate::scheduler::validate_cron_settings(settings).map_err(|_| {
+            Error::new(
+                "AUTOMATION_RECORD_INVALID",
+                "stored cron settings do not match the validated calendar and CheckRun contract",
             )
         })?;
     }

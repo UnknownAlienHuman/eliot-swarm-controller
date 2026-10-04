@@ -1,14 +1,89 @@
-# Persistent schedule registry
+# Scheduled CheckRuns
 
-Schedules are a controller-owned registry of typed Operation admissions. The
-first slice supports only `check_run`; configuration cannot supply an
-arbitrary method name, model prompt, shell command, or cron expression. A
-scheduled check uses the existing immutable Attempt, source snapshot, exact
-Task revision, and check-profile revision.
+The controller keeps the existing operator-authored interval registry and
+manager-owned calendar automations on one Store scheduler loop. Both admit only
+the closed `check_run` action through the normal CheckRun path. Neither accepts
+an arbitrary method, shell command, model prompt, or runtime-selected target.
 
-## Configuration
+## Manager-owned calendar automation
 
-Add entries under `[[schedules]]` in the controller TOML:
+A registered manager configures a calendar through `automation.config.apply`.
+The automation entry's existing `enabled` field is the only enable switch;
+`cron` contains the calendar and the exact CheckRun action:
+
+```json
+{
+  "project_id": "project-id",
+  "changes": [{
+    "automation_id": "weekday-source-check",
+    "expected_revision": 0,
+    "include_existing": false,
+    "patch": {
+      "enabled": true,
+      "steps": ["check_run"],
+      "cron": {
+        "calendar": {
+          "expression": "0 0 9 * * 1-5",
+          "timezone": "America/New_York",
+          "anchor_ms": 1790899200000
+        },
+        "action": {
+          "kind": "check_run",
+          "attempt_id": "01930000-0000-7000-8000-000000000001",
+          "expected_task_revision": 4,
+          "candidate_ref": "source-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "profile_id": "strict",
+          "profile_revision": "v1"
+        }
+      }
+    }
+  }]
+}
+```
+
+The expression uses Croner's six-field syntax, including seconds. The timezone
+must be an IANA timezone known to the timezone database. `anchor_ms` is an
+inclusive lower boundary: occurrences before it are ignored, and a
+non-second-aligned anchor advances to the first matching whole-second
+occurrence after the boundary. `automation.config.explain` returns the calendar
+generation, next due instant, a read-only preview of the next three occurrences,
+the last considered occurrence and its Operation receipt.
+
+Calendar evaluation and timezone/DST behavior come from the maintained Croner
+and `chrono-tz` libraries, not a controller-specific cron parser. A fixed local
+time in a spring-forward gap runs at the first valid local instant after the
+gap. A fixed local time in a fall-back overlap runs only at its first matching
+instant. Expressions that match repeated wall-clock times, such as every
+minute, follow Croner's occurrence behavior for each real instant.
+
+The manager's selection pins one current open Attempt, task revision, captured
+source snapshot and exact check-profile revision. The scheduler validates that
+target before planning and again in the final admission transaction. The
+normal CheckRun worker rechecks the committed automation and target before it
+starts. A different Attempt, candidate, task revision or profile revision
+requires an explicit automation config edit.
+
+`include_existing` controls the activation cut for a newly enabled calendar or
+changed selected action. `false` starts at the apply time and skips already-due
+occurrences. `true` permits only the latest occurrence already due at that cut.
+It never replays a backlog. Disabling the automation removes its due index;
+reenabling it applies the same `include_existing` rule. An in-flight or
+outcome-unknown CheckRun remains under the normal Store readback path and holds
+later calendar work. The scheduler does not resend an unknown effect.
+
+The occurrence identity is derived from the original manager, project,
+automation, calendar generation and intended UTC due instant. Config revisions,
+display labels, and the current successor manager do not change that identity.
+The Operation receipt, on-behalf attribution, occurrence record and cursor are
+committed atomically. Explicit A→B→C automation transfer relocates only the
+current due-index owner; it preserves the original manager provenance, cursor,
+pending work and historical Attempt owner. A different manager's own entry
+cannot gain access to that Attempt merely by selecting it in its calendar.
+
+## Operator interval registry
+
+The existing `[[schedules]]` TOML entries remain available for fixed-time and
+fixed-interval CheckRuns:
 
 ```toml
 [[schedules]]
@@ -21,70 +96,35 @@ period_ms = 86400000
 kind = "check_run"
 attempt_id = "01930000-0000-7000-8000-000000000001"
 expected_task_revision = 4
-candidate_ref = "01930000-0000-7000-8000-000000000002"
+candidate_ref = "source-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 profile_id = "strict"
 profile_revision = "v1"
 ```
 
-`anchor_ms` is a Unix epoch millisecond value. Omitting `period_ms` makes the
-entry one-shot at its anchor. An interval must be positive and remains anchored
-to that wall-clock instant; the controller does not infer a period from the
-start time. Schedule IDs are unique lowercase identifiers. The registry is
-bounded to 64 retained identities. Once an ID has been used, changing its
-anchor, period, or action is an identity error; define a new ID for new
-semantics. `enabled` may be toggled to pause and resume the same schedule.
+`anchor_ms` is a Unix epoch-millisecond timestamp. Omitting `period_ms` makes
+the entry one-shot; an interval must be positive and remains anchored to the
+configured instant. IDs are unique lowercase identifiers, bounded to 64
+entries. An ID's anchor, period and action are immutable after first use; define
+a new ID for different semantics. The existing interval slot and receipt
+identity format is unchanged. Operator intervals do not accept cron
+expressions; manager calendars use the automation entry described above.
 
-The configured Attempt, Task revision, candidate artifact, and check profile
-revision are pinned. Missing or stale inputs are reported as a schedule
-failure; they are never updated automatically. A new Task/Attempt or check
-profile requires an explicit configuration change under a new schedule ID.
+## Catch-up, persistence and supervision
 
-## Slot identity and catch-up
+Both schedule types consider only the latest due occurrence. Missed intervals
+or calendar instants collapse to one latest-only candidate. Wall time chooses
+the due instant; a monotonic timer waits for it, and a bounded clock recheck
+observes wall-clock jumps. Every pass rereads Store state before admission.
 
-For an interval, the due slot is
-`floor((wall_now_ms - anchor_ms) / period_ms)` when `wall_now_ms >= anchor_ms`.
-The one-shot has slot `0`. Each `(schedule_id, slot)` maps to one stable
-SHA-256 `client_request_id` under the dedicated internal scheduler principal.
-The ordinary Store request-receipt path therefore returns the original receipt
-for a repeated slot.
+Manager calendar definitions, per-generation cursors, due indexes, held
+occurrences and per-occurrence records live in versioned Store `meta` records.
+No second scheduler service or cron-specific database is added. Changes and
+terminal CheckRun readback wake the shared scheduler so held work can be
+re-evaluated promptly. `host.status.schedules.items` continues to report the
+operator interval registry; `automation.config.explain.cron` reports one
+manager entry's calendar state without advancing its cursor or admitting work.
 
-The scheduler considers only the latest due slot. It never replays each missed
-interval after sleep or restart. It uses wall-clock time to select slots and a
-monotonic timer only to wait. A bounded clock recheck lets it observe forward
-wall-clock jumps; every catch-up pass reads Store state again before admission.
-
-Admission and the schedule cursor share one immediate Store transaction. The
-transaction checks `new_work`, confirms the Attempt remains unreleased and the
-Task is still open at the configured revision, validates the candidate and
-profile, applies the typed `check.run`, and records the resulting Operation
-receipt and schedule state. Rejected Operations retain their normal request
-receipt. Structural target/configuration failures are fingerprinted; the same
-inputs do not create repeated Operations on later ticks. A changed input
-fingerprint permits a fresh relevance check.
-
-When `new_work` is disabled or an entry is disabled, due state may be observed
-but no Operation is admitted. Resume computes the current latest due slot, so
-there is at most one catch-up admission. An already queued, running, or
-outcome-unknown scheduled CheckRun blocks a newer slot until normal Store
-reconciliation establishes its disposition. Unknown effects are never replayed
-by the schedule loop.
-
-## Persistence and status
-
-Schedule cursors and definition digests live in one versioned
-`meta.schedule_registry:v1` value, bounded to 64 schedule identities. The
-registry does not add a table or database. Definition digests cover the stable
-schedule ID, anchor, period, and typed action; the enable switch is excluded.
-Retained IDs cannot be repurposed for different actions. Existing Operation
-rows remain the durable receipts and outcomes.
-
-`host.status.schedules.items` reports each configured schedule's ID, enabled
-state, action kind, anchor and period, next due time, last considered and
-observed slots, last receipt/work Operation and state, last outcome, and last
-failure. Reading status is read-only and never advances a cursor or admits
-work.
-
-The scheduler is an in-process host loop under a dedicated internal principal.
-It is not a GM, observer, runtime module, second broker, or model timer. The
-normal CheckRun supervisor retains responsibility for worker launch,
-readback, and completion.
+The existing CheckRun supervisor remains responsible for worker launch,
+completion and readback. The scheduler only admits typed Operations and
+retains their receipts. It is not a GM, observer, runtime module, second broker,
+or model timer.

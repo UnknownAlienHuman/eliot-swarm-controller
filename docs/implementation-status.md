@@ -2,6 +2,23 @@
 
 ## Current state
 
+The delivered source is main `7061e455f04a76bfaa19699edba7f58c14a27748`.
+It implements successor-GM continuation of the retained work, including exact
+repair dispatch across explicit automation transfers. Full Windows/Ubuntu CI
+[37195035427](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37195035427)
+passed. The matching controller was installed on 2026-10-04 at 10:25 UTC;
+its SHA-256 is `C4A28DA65495FAC229EE1202DA7F4E75EA642F4B909F6F375DE0CED07102EF9E`.
+The prior installed controller is preserved in the private installation receipt.
+
+The next source increment adds manager-owned calendar CheckRun automation,
+Command native event envelopes (`command-mod-0.1.0-glue.4`), and bounded parent-side
+OpenCode startup failure observations. The Command fixtures passed 17 glue checks
+and the bridge checks; that artifact has no new native qualification yet. The
+Rust increment is still being integrated and has not passed its source gates.
+The project remains **PARTIAL_PROGRESS**, with the full O7 workflow, the remaining
+automation programs and cross-environment qualification outstanding. All local
+model and inference work remains deferred.
+
 **Source checkpoint:** GM continuity and host-crash submission readback are saved in main. Their production Clippy, debug build and 13 focused GM/Store checks passed. The subsequent MCP table corrections and OpenCode Windows path fix passed full Windows and Ubuntu CI [37186030488](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37186030488) for source 8f3998ffb5da24deaac8445f883fe19780b02f3b, verified on 2026-10-04. Explicit automation transfer now passes production Clippy, its real-Store preservation regression, all 29 MCP checks, the Windows input-probe integration check and debug build. Its qualification boundary and candidate are recorded below. Successful live OpenCode startup, effective hosted-model identity and the full O7 cycle remain unqualified.
 
 C10 adds the optional exact `launch_operation_id` to the actual `task.dispatch` schema and Store contract for launch-owned Attempts. The Store checks the retained parent, exact Task/Attempt/binding/lease lineage, immutable prompt packet, and current C8 MCP capability proof before native input. The owned-provider path accepts one explicitly configured provider credential source and reports `stored_unverified` only for credential metadata; that does not prove key validity or provider/model consumption.
@@ -20,7 +37,7 @@ OpenCode owned-startup diagnostic e2814fe9-ac32-42be-90b5-7ea4173ee2c2 admitted 
 
 An earlier Command preflight stopped before host or model startup with RUN_ROOT_ACL_FAILED while autoloading Get-Acl; an ACL-only private probe passed. Later Command run f413bd5d-149d-4344-972b-125b6b3bf23a passed one bounded Bunny task.dispatch: marker 50 bytes, exit 0, no timeout. Requested route was stealth/space-bunny-alpha; effective model was null/unknown, and the native result exposed no upstream provider/model identity. Proof summary SHA-256 is 1C71DAB9592AE72752032556251A602BD5D268F9BEE42ED06BFCB944196453D2. Module owner family was empty and owner exit was 0; host 50688 exited on EOF with code 0, current owned PIDs were absent, and four Codex processes retained their same birth identities.
 
-This single Command result does not establish Task completion, acceptance, OpenCode service/MCP readiness, model identity, or the full O7 cycle. Installed R6 is unchanged. All local model/inference work, including PR24/Kilo, remains deferred.
+This single Command result does not establish the full O7 cycle, OpenCode service/MCP readiness or served-model identity. R6 was unchanged at that run's historical checkpoint; the current installation is recorded above. All local model/inference work, including PR24/Kilo, remains deferred.
 
 ### Fresh OpenCode diagnostic — 2026-10-04 07:25 UTC
 
@@ -163,8 +180,33 @@ during the final gate. Luna's bounded authority audit found no remaining blocker
 Built candidate SHA-256 is
 `C4A28DA65495FAC229EE1202DA7F4E75EA642F4B909F6F375DE0CED07102EF9E`.
 The gate qualifies retained Store admission and pre-effect checks. It does not
-establish native delivery or the full O7 cycle; the installed runtime remains
-unchanged. The previous GM chat is unnecessary for handover and continuation.
+establish native delivery or the full O7 cycle. The previous GM chat is
+unnecessary for handover and continuation.
+
+Full Windows and Ubuntu CI for source
+`7061e455f04a76bfaa19699edba7f58c14a27748` passed in
+[37195035427](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37195035427),
+verified on 2026-10-04 at 10:40 UTC.
+
+### Installed controller and fresh OpenCode startup — 2026-10-04
+
+The qualified `7061e45` candidate above was installed at
+`C:\Users\kleym\.cargo\bin\swarm.exe` at 10:25 UTC. Installed byte hash and
+`swarm --version` passed readback. The prior R6 binary was preserved for rollback;
+no active controller process existed, and no service, PATH, hook, or provider
+credential was changed by this update.
+
+Fresh native run `f5ad880d-c691-4134-82e3-4784c9384158`, launch
+`8f988bea-bec1-4882-aa67-60dcd37914e2`, progressed beyond the previous Windows
+path failure. Retained native receipts report Bun PID 55076 with the pinned
+executable identity, owner `ready`, then a completed `stdin-eof` stop. The
+controller never retained a ready/native MCP proof and the harness timed out at
+`service_start`. The Operation remains unknown and is retained without replay.
+The source review found that parent-side startup errors lost their stage before
+normal helper EOF cleanup. The next increment retains a bounded stage/code
+observation before that cleanup; C16 will check its actual native result. The
+historical C15 cause remains unknown. No model request was made. All six protected
+Codex processes retained their birth identities.
 
 ### Prior C7/C8 evidence
 

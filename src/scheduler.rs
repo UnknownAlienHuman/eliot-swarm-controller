@@ -1,9 +1,10 @@
-//! Persistent, latest-only scheduler for explicitly configured CheckRuns.
+//! Persistent, latest-only scheduler for configured and manager-owned CheckRuns.
 //!
 //! The scheduler never invokes a model or selects arbitrary Store methods. It
 //! turns one due registry entry into the closed `ScheduleAction::CheckRun`
 //! request and delegates admission, target checks, request receipts and state
-//! persistence to the Store's schedule transaction.
+//! persistence to Store-owned transactions. Manager calendars share this one
+//! loop with the legacy interval registry.
 
 use crate::{
     error::{Error, Result},
@@ -14,9 +15,17 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, time::Duration};
 use tokio::{sync::watch, time::Instant};
 
+pub(crate) mod calendar;
+pub(crate) use calendar::{CalendarOccurrence, CronSettings};
+
 pub(crate) const MAX_SCHEDULES: usize = 64;
 const MAX_SCHEDULE_ID_BYTES: usize = 64;
 const CLOCK_RECHECK: Duration = Duration::from_secs(60);
+
+/// Validate the cron settings stored on a manager-owned automation entry.
+pub(crate) fn validate_cron_settings(settings: &CronSettings) -> Result<()> {
+    calendar::validate_settings(settings)
+}
 
 /// A validated, operator-authored schedule. The action is a tagged closed
 /// enum so config cannot name a Store method or submit arbitrary JSON.
@@ -180,7 +189,9 @@ pub(crate) async fn run(store: Store, mut stopping: watch::Receiver<bool>) -> Re
         store.reconcile_checks_once().await?;
         let now = model::now_ms()?;
         let schedules = store.schedule_configs();
-        let mut next_due = None;
+        let mut next_due = store
+            .reconcile_automation_cron_once(MAX_SCHEDULES, now)
+            .await?;
         for schedule in schedules {
             if let Some(due) = store.consider_scheduled(schedule.clone(), now).await? {
                 next_due = Some(next_due.map_or(due, |old: i64| old.min(due)));

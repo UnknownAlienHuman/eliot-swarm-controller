@@ -35,8 +35,9 @@ import { fileURLToPath } from "node:url";
 export const RUNTIME = "command";
 export const ENTRYPOINT = "native_mod";
 export const TRANSPORT = "headless_ndjson";
-export const MODULE_ARTIFACT_ID = "command-mod-0.1.0-glue.3";
+export const MODULE_ARTIFACT_ID = "command-mod-0.1.0-glue.4";
 export const LEGACY_MODULE_ARTIFACT_ID = "command-mod-0.1.0-glue.2";
+export const PREVIOUS_MODULE_ARTIFACT_ID = "command-mod-0.1.0-glue.3";
 
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
 export const DEFAULT_MOD_PATH = join(MODULE_DIR, "mod", "eliot-command.ts");
@@ -179,6 +180,11 @@ export function outcomeFromRun(run, evidence = run?.evidence_validation) {
       batch_run_id: run?.batch_run_id ?? null,
       ...(cleanEvidence ? { completion_condition: "native_result_observed" } : {}),
       requested_model: run?.requested_model ?? null,
+      native_request_model: run?.native_request_model ?? null,
+      native_request_model_status: run?.native_request_model_status ?? "unknown",
+      native_request_model_evidence: Array.isArray(run?.native_request_model_evidence)
+        ? run.native_request_model_evidence
+        : [],
       effective_model: null,
       effective_model_status: "unknown",
       result_subtype: subtype,
@@ -240,10 +246,10 @@ function persistAdmission(controlDir, admission) {
   });
 }
 
-// Classify one NDJSON line from the headless stream. The stream has two
-// documented shapes: event frames (one per AgentEvent, carrying `type`) and
-// one final result line (carrying `subtype`). Anything else is a protocol
-// gap: preserved, never silently treated as an empty or successful frame.
+// Classify one NDJSON line from the headless stream. Current event frames wrap
+// one AgentEvent in `{type:"event", event}`; direct AgentEvent lines remain
+// readable for older fixture/runtime evidence. Keep the exact original line
+// beside the semantic projection so persisted events retain native evidence.
 export function classifyLine(line) {
   let value;
   try {
@@ -255,10 +261,30 @@ export function classifyLine(line) {
     return { kind: "gap", reason: "non_object_line", raw: line };
   }
   if (typeof value.subtype === "string" && RESULT_SUBTYPES.has(value.subtype)) {
-    return { kind: "result", result: value };
+    return { kind: "result", result: value, raw_line: line, frame_format: "result_line" };
+  }
+  if (value.type === "result") {
+    return { kind: "gap", reason: "unknown_result_subtype", raw: line };
+  }
+  if (value.type === "event") {
+    if (value.event === null || typeof value.event !== "object" || Array.isArray(value.event)
+        || typeof value.event.type !== "string") {
+      return { kind: "gap", reason: "invalid_event_frame", raw: line };
+    }
+    return {
+      kind: "event",
+      event: value.event,
+      raw_line: line,
+      frame_format: "event_envelope",
+    };
   }
   if (typeof value.type === "string") {
-    return { kind: "event", event: value };
+    return {
+      kind: "event",
+      event: value,
+      raw_line: line,
+      frame_format: "direct_event_legacy",
+    };
   }
   return { kind: "gap", reason: "unknown_shape", raw: line };
 }
@@ -311,11 +337,80 @@ function projectNativeResult(result) {
 }
 
 function eventSummary(records) {
-  const events = records.filter((record) => record?.kind === "event").map((record) => record.event);
+  const eventRecords = records.filter((record) => record?.kind === "event");
+  const events = eventRecords.map((record) => record.event);
   const gaps = records.filter((record) => record?.kind === "gap");
   const byType = {};
-  for (const event of events) byType[event.type] = (byType[event.type] ?? 0) + 1;
-  return { events, gaps, byType };
+  for (const event of events) {
+    if (typeof event?.type !== "string") continue;
+    byType[event.type] = (byType[event.type] ?? 0) + 1;
+  }
+  return { events, gaps, byType, nativeRequestModel: nativeRequestModelProjection(eventRecords) };
+}
+
+function nativeRequestModelProjection(eventRecords) {
+  const evidence = eventRecords
+    .filter((record) => record.event?.type === "model_request_start"
+      || record.event?.type === "model_request_end")
+    .filter((record) => typeof record.event.model === "string" && record.event.model.trim() !== "")
+    .map((record) => ({
+      seq: record.seq,
+      event_type: record.event.type,
+      model: record.event.model,
+    }));
+  const models = [...new Set(evidence.map((item) => item.model))];
+  return {
+    model: models.length === 1 ? models[0] : null,
+    status: models.length === 1 ? "observed" : models.length > 1 ? "conflicting" : "unknown",
+    evidence,
+  };
+}
+
+function legacyEventProjection(records) {
+  const projectedRecords = records.map((record) => {
+    if (record?.kind !== "event") return record;
+    const storedEvent = record.event;
+    const wrapped = storedEvent?.type === "event"
+      && storedEvent.event !== null
+      && typeof storedEvent.event === "object"
+      && !Array.isArray(storedEvent.event)
+      && typeof storedEvent.event.type === "string";
+    return {
+      ...record,
+      event: wrapped ? storedEvent.event : storedEvent,
+      stored_frame_format: wrapped ? "event_envelope_parsed" : "direct_event_legacy",
+      stored_raw_frame: storedEvent,
+    };
+  });
+  const eventRecords = projectedRecords.filter((record) => record?.kind === "event");
+  const summary = eventSummary(projectedRecords);
+  return {
+    source_artifact_id: PREVIOUS_MODULE_ARTIFACT_ID,
+    read_only: true,
+    raw_line_available: false,
+    total: summary.events.length,
+    by_type: summary.byType,
+    events: eventRecords.map(({ seq, event, stored_frame_format, stored_raw_frame }) => ({
+      seq,
+      event,
+      frame_format: stored_frame_format,
+      stored_frame: stored_raw_frame,
+    })),
+    gaps: summary.gaps,
+    native_request_model: summary.nativeRequestModel.model,
+    native_request_model_status: summary.nativeRequestModel.status,
+    native_request_model_evidence: summary.nativeRequestModel.evidence,
+  };
+}
+
+function rawNativeFrameMatches(record) {
+  if (typeof record?.raw_line !== "string") return false;
+  const classified = classifyLine(record.raw_line);
+  return classified.kind === record.kind
+    && classified.frame_format === record.frame_format
+    && (record.kind === "event"
+      ? isDeepStrictEqual(classified.event, record.event)
+      : record.kind === "result" && isDeepStrictEqual(classified.result, record.result));
 }
 
 function expectedTerminalFacts(result, exit, timedOut, records) {
@@ -408,6 +503,10 @@ function validateSavedEvidence(controlDir, admission, run, records) {
       || Array.isArray(event) || typeof event.type !== "string")) {
     return invalid("saved_event_frame_invalid");
   }
+  if (records.some((record) => (record.kind === "event" || record.kind === "result")
+      && !rawNativeFrameMatches(record))) {
+    return invalid("saved_native_frame_projection_mismatch");
+  }
   const rawResult = resultRecords[0]?.result ?? null;
   if (rawResult && (!projectNativeResult(rawResult)
       || !isDeepStrictEqual(run.result, projectNativeResult(rawResult)))) {
@@ -418,6 +517,11 @@ function validateSavedEvidence(controlDir, admission, run, records) {
       || !isDeepStrictEqual(run.events?.by_type, summary.byType)
       || !isDeepStrictEqual(run.events?.gaps, summary.gaps)) {
     return invalid("saved_event_summary_mismatch");
+  }
+  if (run.native_request_model !== summary.nativeRequestModel.model
+      || run.native_request_model_status !== summary.nativeRequestModel.status
+      || !isDeepStrictEqual(run.native_request_model_evidence, summary.nativeRequestModel.evidence)) {
+    return invalid("saved_native_request_model_mismatch");
   }
   const exit = run.exit;
   if (!exit || !["number", "object"].includes(typeof exit.code)
@@ -619,6 +723,9 @@ export async function openRun(config, options) {
       operation_id: operationId,
       batch_run_id: priorAdmission.batch_run_id,
       requested_model: requestedModel,
+      native_request_model: null,
+      native_request_model_status: "unknown",
+      native_request_model_evidence: [],
       core_binding: priorAdmission.core_binding,
       effective_model: null,
       effective_model_status: "unknown",
@@ -673,6 +780,7 @@ export async function openRun(config, options) {
   });
 
   const events = [];
+  const eventRecords = [];
   const gaps = [];
   let result = null;
   let resultLineIndex = -1;
@@ -701,9 +809,10 @@ export async function openRun(config, options) {
     if (classified.kind === "result" && result !== null) {
       classified = { kind: "gap", reason: "duplicate_result_line", raw: line };
     }
-    const record = { seq: events.length + gaps.length + 1, ...classified };
+    const record = { seq: lineIndex + 1, ...classified };
     if (classified.kind === "event") {
       events.push(classified.event);
+      eventRecords.push(record);
       if (resultLineIndex >= 0) framesAfterResult += 1;
     } else if (classified.kind === "result") {
       result = classified.result;
@@ -799,10 +908,8 @@ export async function openRun(config, options) {
     }
   }
 
-  const eventTypes = {};
-  for (const event of events) {
-    eventTypes[event.type] = (eventTypes[event.type] ?? 0) + 1;
-  }
+  const summary = eventSummary(eventRecords);
+  const nativeRequestModel = summary.nativeRequestModel;
   const sessionFromEvent = events.find(
     (e) => e.type === "run_start" && typeof e.sessionId === "string",
   )?.sessionId;
@@ -822,6 +929,9 @@ export async function openRun(config, options) {
     // effective-model identity field; never infer one from the request.
     effective_model: null,
     effective_model_status: "unknown",
+    native_request_model: nativeRequestModel.model,
+    native_request_model_status: nativeRequestModel.status,
+    native_request_model_evidence: nativeRequestModel.evidence,
     control_dir: controlDir,
     control_record_ref: expectedAdmission.control_record_ref,
     result_ref: expectedAdmission.result_ref,
@@ -878,7 +988,7 @@ export async function openRun(config, options) {
       queue_admissions: journal.queueAdmissions,
       tools_readbacks: journal.toolsReadbacks,
     },
-    events: { total: events.length, by_type: eventTypes, gaps },
+    events: { total: events.length, by_type: summary.byType, gaps },
     stderr: { text: stderrText, truncated: stderrTruncated },
   };
   const tmpPath = `${runPath}.tmp`;
@@ -901,11 +1011,17 @@ export function snapshotRun(controlDir) {
     : null;
   const admission = readAdmission(resolved);
   const legacy = admission?.schema === 1 && run?.module_artifact_id === LEGACY_MODULE_ARTIFACT_ID;
+  const previousArtifact = admission?.schema === 2
+    && admission.module_artifact_id === PREVIOUS_MODULE_ARTIFACT_ID
+    && run?.schema === 2
+    && run.module_artifact_id === PREVIOUS_MODULE_ARTIFACT_ID;
   const journal = readModJournal(resolved, { legacy });
   const eventRecords = readJsonLines(join(resolved, "events.ndjson"));
   const evidence = legacy
     ? { valid: false, diagnostic_code: "legacy_artifact_read_only" }
-    : validateSavedEvidence(resolved, admission, run, eventRecords);
+    : previousArtifact
+      ? { valid: false, diagnostic_code: "legacy_artifact_read_only" }
+      : validateSavedEvidence(resolved, admission, run, eventRecords);
   return {
     scope: "single_headless_run",
     completeness: "partial",
@@ -914,6 +1030,7 @@ export function snapshotRun(controlDir) {
     terminal: run ? (evidence.valid ? run.disposition : "unknown") : "not_observed",
     run,
     evidence,
+    ...(previousArtifact ? { event_projection: legacyEventProjection(eventRecords) } : {}),
     mod: {
       loaded: journal.loaded,
       ready: journal.ready,

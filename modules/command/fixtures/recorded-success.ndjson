@@ -1,8 +1,8 @@
-{"type": "run_start", "sessionId": "ses_recorded_1"}
-{"type": "turn_start", "turnNumber": 1}
-{"type": "tool_queued", "input": {"tool": "read", "path": "README.md"}}
-{"type": "tool_running", "description": "Read README.md"}
-{"type": "tool_completed", "result": "ok"}
-{"type": "turn_end", "turnNumber": 1, "hadToolCalls": true, "usage": {"inputTokens": 120, "outputTokens": 40}}
-{"type": "run_end", "sessionId": "ses_recorded_1", "result": {"stopReason": "end_turn"}}
-{"subtype": "success", "usage": {"inputTokens": 120, "outputTokens": 40}, "durationMs": 990, "finalText": "done", "sessionId": "ses_recorded_1", "stopReason": "end_turn"}
+{"type":"event","event":{"type":"run_start","sessionId":"ses_recorded_1"}}
+{"type":"event","event":{"type":"turn_start","turnNumber":1}}
+{"type":"event","event":{"type":"tool_queued","input":{"tool":"read","path":"README.md"}}}
+{"type":"event","event":{"type":"tool_running","description":"Read README.md"}}
+{"type":"event","event":{"type":"tool_completed","result":"ok"}}
+{"type":"event","event":{"type":"turn_end","turnNumber":1,"hadToolCalls":true,"usage":{"inputTokens":120,"outputTokens":40}}}
+{"type":"event","event":{"type":"run_end","sessionId":"ses_recorded_1","result":{"stopReason":"end_turn"}}}
+{"type":"result","subtype":"success","usage":{"inputTokens":120,"outputTokens":40},"durationMs":990,"finalText":"done","sessionId":"ses_recorded_1","stopReason":"end_turn"}

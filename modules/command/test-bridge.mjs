@@ -464,6 +464,9 @@ try {
   assert.equal(dispatch.details.execution_shape, "sessionless_batch");
   assert.equal(dispatch.details.completion_condition, "native_result_observed");
   assert.equal(dispatch.details.requested_model, "stealth/space-bunny-alpha");
+  assert.equal(dispatch.details.native_request_model, "stealth/space-bunny-alpha");
+  assert.equal(dispatch.details.native_request_model_status, "observed");
+  assert.equal(dispatch.details.native_request_model_evidence.length, 2);
   assert.equal(dispatch.details.effective_model, null);
   assert.equal(dispatch.details.effective_model_status, "unknown");
   assert.equal(dispatch.details.native_session_id, "ses_fixture_1");
@@ -479,6 +482,8 @@ try {
   ]) {
     assert.equal(receipt.outcome, "unknown");
     assert.equal(receipt.details.requested_model, nativeOptions.modelId);
+    assert.equal(receipt.details.native_request_model, null);
+    assert.equal(receipt.details.native_request_model_status, "unknown");
     assert.deepEqual({
       batch_run_id: receipt.details.batch_run_id,
       prompt_sha256: receipt.details.prompt_sha256,

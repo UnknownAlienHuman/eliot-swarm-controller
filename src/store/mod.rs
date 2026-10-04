@@ -3,6 +3,7 @@ mod acceptance;
 mod assembly;
 mod automation;
 mod automation_acceptance;
+mod automation_cron;
 mod automation_dispatch;
 mod automation_disposition;
 mod automation_intake;
@@ -2809,6 +2810,57 @@ fn mutate_in_transaction(
     mutate_in_transaction_with_check_plan(tx, p, method, v, config, now, None)
 }
 
+pub(super) struct CronAdmission {
+    pub(super) receipt: Result<Value>,
+    pub(super) wake_check_worker: bool,
+}
+
+/// Admit one closed cron CheckRun through the same Operation receipt and
+/// CheckRunner path as a manual check. The context is DB-derived and cannot be
+/// supplied by a Principal or the legacy Scheduler identity.
+fn mutate_cron_check_in_transaction(
+    tx: &Transaction<'_>,
+    context: &crate::automation::authorization::CronExecutionContext,
+    config: &Config,
+    now: i64,
+    resolution: &checks::CheckPlanResolution,
+) -> Result<CronAdmission> {
+    context.require_current_check_target(tx)?;
+    let params = context.request_params()?;
+    let receipt = mutate_in_transaction_with_authority(
+        tx,
+        MutationAuthority::Cron(context),
+        "check.run",
+        &params,
+        config,
+        now,
+        MutationPlan {
+            check_plan: Some(resolution),
+            launch_operation_id: None,
+        },
+    )?;
+    let check_id = receipt
+        .as_ref()
+        .ok()
+        .and_then(|value| value["check_id"].as_str())
+        .map(str::to_owned);
+    let wake_check_worker = if let Some(check_id) = check_id {
+        tx.query_row(
+            "SELECT state='queued' FROM check_runs WHERE check_id=?1",
+            [check_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .optional()?
+        .unwrap_or(false)
+    } else {
+        false
+    };
+    Ok(CronAdmission {
+        receipt,
+        wake_check_worker,
+    })
+}
+
 fn mutate_in_transaction_with_check_plan(
     tx: &Transaction<'_>,
     p: &Principal,
@@ -2871,6 +2923,7 @@ struct MutationPlan<'a> {
 enum MutationAuthority<'a> {
     Direct(&'a Principal),
     Launch(&'a launcher::LaunchActor),
+    Cron(&'a crate::automation::authorization::CronExecutionContext),
 }
 
 impl MutationAuthority<'_> {
@@ -2878,6 +2931,7 @@ impl MutationAuthority<'_> {
         match self {
             Self::Direct(principal) => &principal.client_id,
             Self::Launch(actor) => actor.technical_requester_id(),
+            Self::Cron(_) => crate::automation::authorization::AUTOMATION_TECHNICAL_REQUESTER_ID,
         }
     }
 }
@@ -2919,6 +2973,15 @@ fn mutate_in_transaction_with_authority(
             "FORBIDDEN",
             "scheduler may admit only configured checks",
         ));
+    }
+    if let MutationAuthority::Cron(context) = &authority {
+        if method != "check.run" || plan.launch_operation_id.is_some() {
+            return Err(Error::new(
+                "FORBIDDEN",
+                "cron authority permits only its closed CheckRun action",
+            ));
+        }
+        context.require_current_check_target(tx)?;
     }
     model::validate_mutation(method, v)?;
     let request_id = model::text(v, "client_request_id")?;
@@ -2975,6 +3038,12 @@ fn mutate_in_transaction_with_authority(
                 let actor = match &authority {
                     MutationAuthority::Direct(p) => launcher::LaunchActor::Direct((*p).clone()),
                     MutationAuthority::Launch(actor) => (*actor).clone(),
+                    MutationAuthority::Cron(_) => {
+                        return Err(Error::new(
+                            "FORBIDDEN",
+                            "cron authority cannot register a participant",
+                        ));
+                    }
                 };
                 participant_credentials::validate_launch_registration(
                     tx,
@@ -3080,6 +3149,9 @@ fn mutate_in_transaction_with_authority(
     };
     let id = model::new_id();
     tx.execute("INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,effective_request_json,state,due_at_ms,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,?5,'{}','queued',?6,?6,?6)",params![id,caller_id,request_id,method,original,now])?;
+    if let MutationAuthority::Cron(context) = &authority {
+        crate::automation::authorization::save_cron_operation_link(tx, &id, context, now)?;
+    }
     if let Some(launch_operation_id) = plan.launch_operation_id {
         let admission_path = format!("$.{admission_key}");
         tx.execute("UPDATE operations SET effective_request_json=json_set(effective_request_json,?3,json(?2)) WHERE operation_id=?1", params![id, model::canonical(&json!({"launch_operation_id":launch_operation_id}))?, admission_path])?;
@@ -3101,6 +3173,18 @@ fn mutate_in_transaction_with_authority(
         MutationAuthority::Launch(actor) => apply_launch_child(
             tx,
             actor,
+            method,
+            v,
+            config,
+            ApplyContext {
+                operation_id: &id,
+                now,
+                plan,
+            },
+        ),
+        MutationAuthority::Cron(context) => apply_cron(
+            tx,
+            context,
             method,
             v,
             config,
@@ -3348,6 +3432,35 @@ fn apply_launch_child(
         }
         _ => Err(Error::new("FORBIDDEN", "unsupported launch child action")),
     }
+}
+
+fn apply_cron(
+    tx: &Transaction<'_>,
+    context: &crate::automation::authorization::CronExecutionContext,
+    method: &str,
+    value: &Value,
+    config: &Config,
+    apply: ApplyContext<'_>,
+) -> Result<(Value, bool)> {
+    if method != "check.run" || apply.plan.launch_operation_id.is_some() {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "cron authority permits only its closed CheckRun action",
+        ));
+    }
+    if model::canonical(value)? != model::canonical(&context.request_params()?)? {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "cron CheckRun request does not match its committed action context",
+        ));
+    }
+    checks::reserve_cron(
+        tx,
+        context,
+        apply.operation_id,
+        config,
+        apply.plan.check_plan,
+    )
 }
 
 fn apply(

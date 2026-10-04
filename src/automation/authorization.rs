@@ -31,6 +31,17 @@ pub(crate) struct ManagerExecutionContext {
     cause: AutomationCause,
 }
 
+/// A closed, DB-derived authority for one manager-owned cron CheckRun.
+/// Callers cannot deserialize or construct this context from request JSON;
+/// the exact current AutomationEntry and logical occurrence are revalidated
+/// again in the admission transaction.
+#[derive(Debug, Clone)]
+pub(crate) struct CronExecutionContext {
+    entry: config::AutomationEntry,
+    occurrence_id: String,
+    cause: AutomationCause,
+}
+
 struct CurrentReviewSubject {
     owner_id: String,
     task_id: String,
@@ -297,6 +308,294 @@ impl ManagerExecutionContext {
     }
 }
 
+impl CronExecutionContext {
+    pub(crate) fn from_committed_entry(
+        db: &Connection,
+        entry: &config::AutomationEntry,
+        calendar_generation: &str,
+        occurrence_id: &str,
+        due_at_ms: i64,
+    ) -> Result<Self> {
+        config::validate_entry(entry)?;
+        if !entry.check_run_ready() {
+            return Err(Error::new(
+                "AUTOMATION_ACTION_UNAVAILABLE",
+                "entry does not currently admit check_run",
+            ));
+        }
+        require_registered_manager(db, &entry.owner_manager_id)?;
+        let current = config::load_entry(
+            db,
+            &entry.owner_manager_id,
+            &entry.project_id,
+            &entry.automation_id,
+        )?
+        .ok_or_else(|| Error::new("AUTOMATION_NOT_FOUND", "automation entry disappeared"))?;
+        if current != *entry {
+            return Err(Error::new(
+                "AUTOMATION_ACTION_CHANGED",
+                "cron execution requires the exact current committed entry",
+            ));
+        }
+        let settings = entry.cron.as_ref().ok_or_else(|| {
+            Error::new("AUTOMATION_ACTION_UNAVAILABLE", "cron settings are missing")
+        })?;
+        let generation = crate::scheduler::calendar::generation_digest(&settings.calendar)?;
+        if generation != calendar_generation {
+            return Err(Error::new(
+                "AUTOMATION_ACTION_CHANGED",
+                "calendar generation differs from the committed entry",
+            ));
+        }
+        let lineage = config::transfer_lineage(
+            db,
+            &entry.owner_manager_id,
+            &entry.project_id,
+            &entry.automation_id,
+        )?;
+        let origin_manager_id = lineage
+            .last()
+            .map(|transfer| transfer.former_owner_manager_id.clone())
+            .unwrap_or_else(|| entry.owner_manager_id.clone());
+        let expected_occurrence = crate::scheduler::calendar::occurrence_id(
+            &origin_manager_id,
+            &entry.project_id,
+            &entry.automation_id,
+            &generation,
+            due_at_ms,
+        )?;
+        if expected_occurrence != occurrence_id {
+            return Err(Error::new(
+                "AUTOMATION_OCCURRENCE_INVALID",
+                "cron occurrence identity does not match its committed entry and due time",
+            ));
+        }
+        let action = settings.action.clone();
+        let cause = match action {
+            crate::scheduler::ScheduleAction::CheckRun {
+                attempt_id,
+                expected_task_revision,
+                candidate_ref,
+                profile_id,
+                profile_revision,
+            } => AutomationCause::CronOccurrence {
+                occurrence_id: occurrence_id.to_owned(),
+                calendar_generation: generation.clone(),
+                due_at_ms,
+                task_id: cron_task_id(db, &attempt_id)?,
+                attempt_id,
+                task_revision: expected_task_revision,
+                candidate_ref,
+                profile_id,
+                profile_revision,
+            },
+        };
+        Ok(Self {
+            entry: entry.clone(),
+            occurrence_id: occurrence_id.to_owned(),
+            cause,
+        })
+    }
+
+    pub(crate) fn request_params(&self) -> Result<Value> {
+        let AutomationCause::CronOccurrence {
+            attempt_id,
+            candidate_ref,
+            profile_id,
+            profile_revision,
+            ..
+        } = &self.cause
+        else {
+            return Err(Error::new(
+                "AUTOMATION_LINK_CORRUPT",
+                "cron execution context has an unsupported cause",
+            ));
+        };
+        Ok(json!({
+            "client_request_id":format!("cron-{}", self.occurrence_id),
+            "attempt_id":attempt_id,
+            "candidate_ref":candidate_ref,
+            "profile_id":profile_id,
+            "profile_revision":profile_revision,
+        }))
+    }
+
+    pub(crate) fn cause_value(&self) -> Value {
+        self.cause.as_json()
+    }
+
+    /// Revalidate both the manager-owned action and the exact current
+    /// CheckRun subject at the same SQLite boundary as Operation admission.
+    pub(crate) fn require_current_check_target(&self, db: &Connection) -> Result<()> {
+        let current = config::load_entry(
+            db,
+            &self.entry.owner_manager_id,
+            &self.entry.project_id,
+            &self.entry.automation_id,
+        )?
+        .ok_or_else(|| Error::new("FORBIDDEN", "owning automation was removed"))?;
+        if current != self.entry || !current.check_run_ready() {
+            return Err(Error::new(
+                "FORBIDDEN",
+                "current automation settings no longer permit this exact CheckRun",
+            ));
+        }
+        require_registered_manager(db, &current.owner_manager_id)?;
+        let AutomationCause::CronOccurrence {
+            task_id,
+            attempt_id,
+            task_revision,
+            candidate_ref,
+            ..
+        } = &self.cause
+        else {
+            return Err(Error::new(
+                "AUTOMATION_LINK_CORRUPT",
+                "cron execution context has an unsupported cause",
+            ));
+        };
+        let subject: Option<CurrentTransferredAttemptRow> = db
+            .query_row(
+                "SELECT a.owner_id,a.task_id,a.task_revision,a.state,a.released_at_ms,\
+                        a.submission_ref,a.candidate_ref,t.project_id,t.state,t.revision,\
+                        (SELECT active.attempt_id FROM attempts AS active \
+                         WHERE active.task_id=t.task_id AND active.released_at_ms IS NULL) \
+                 FROM attempts AS a JOIN tasks AS t ON t.task_id=a.task_id \
+                 WHERE a.attempt_id=?1",
+                [attempt_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            attempt_owner_id,
+            attempt_task_id,
+            attempt_revision,
+            _attempt_state,
+            released_at_ms,
+            _submission_ref,
+            _attempt_candidate_ref,
+            project_id,
+            task_state,
+            current_task_revision,
+            current_attempt_id,
+        )) = subject
+        else {
+            return Err(Error::new(
+                "AUTOMATION_ATTEMPT_STALE",
+                "cron CheckRun Attempt was not found",
+            ));
+        };
+        if attempt_task_id != *task_id
+            || attempt_revision != *task_revision
+            || current_task_revision != *task_revision
+            || current_attempt_id.as_deref() != Some(attempt_id.as_str())
+            || project_id != current.project_id
+            || task_state != "open"
+            || released_at_ms.is_some()
+        {
+            return Err(Error::new(
+                "AUTOMATION_ATTEMPT_STALE",
+                "cron CheckRun no longer targets the exact current open Attempt",
+            ));
+        }
+        let artifact: Option<(String, String)> = db
+            .query_row(
+                "SELECT kind,metadata_json FROM artifacts WHERE artifact_id=?1",
+                [candidate_ref],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((kind, metadata_json)) = artifact else {
+            return Err(Error::new(
+                "CHECK_SOURCE_REQUIRED",
+                "cron CheckRun source snapshot is not registered",
+            ));
+        };
+        let metadata: Value = serde_json::from_str(&metadata_json)?;
+        if kind != "source_snapshot"
+            || metadata["task_id"] != *task_id
+            || metadata["attempt_id"] != *attempt_id
+            || metadata["task_revision"] != *task_revision
+        {
+            return Err(Error::new(
+                "CHECK_SOURCE_REQUIRED",
+                "cron CheckRun source snapshot does not match the exact current Attempt",
+            ));
+        }
+
+        // A transferred entry acting for an Attempt from its sealed lineage
+        // needs the exact transfer grant. This path deliberately does not
+        // rewrite the Attempt owner or fall back to broad GM ownership.
+        let lineage = config::transfer_lineage(
+            db,
+            &current.owner_manager_id,
+            &current.project_id,
+            &current.automation_id,
+        )?;
+        let attempt_is_transferred_origin = lineage
+            .iter()
+            .any(|transfer| transfer.former_owner_manager_id == attempt_owner_id);
+        if attempt_owner_id != current.owner_manager_id && attempt_is_transferred_origin {
+            current_transferred_attempt_authority(
+                db,
+                &current,
+                AutomationStep::CheckRun,
+                task_id,
+                *task_revision,
+                attempt_id,
+                "",
+                candidate_ref,
+            )?
+            .ok_or_else(|| {
+                Error::new(
+                    "FORBIDDEN",
+                    "transferred cron CheckRun lacks exact successor authority",
+                )
+            })?;
+        } else if !current_manager_id_has_task_scope(
+            db,
+            &current.owner_manager_id,
+            task_id,
+            &current.project_id,
+        )? {
+            return Err(Error::new(
+                "FORBIDDEN",
+                "automation owner lacks current scope for the exact CheckRun Task",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn cron_task_id(db: &Connection, attempt_id: &str) -> Result<String> {
+    db.query_row(
+        "SELECT task_id FROM attempts WHERE attempt_id=?1",
+        [attempt_id],
+        |row| row.get(0),
+    )
+    .optional()?
+    .ok_or_else(|| {
+        Error::new(
+            "AUTOMATION_ATTEMPT_STALE",
+            "cron CheckRun Attempt was not found",
+        )
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct OnBehalfOperationLink {
@@ -320,6 +619,7 @@ pub(crate) enum AnyOnBehalfOperationLink {
     Review(OnBehalfOperationLink),
     Acceptance(OnBehalfOperationLink),
     Publication(OnBehalfOperationLink),
+    CronCheckRun(OnBehalfOperationLink),
     WorkDispatch(crate::store::automation_work_dispatch::WorkDispatchOperationLink),
     Repair(Box<crate::store::automation_repair::RepairDispatchOperationLink>),
 }
@@ -483,6 +783,7 @@ impl AnyOnBehalfOperationLink {
             Self::Review(link) => link.belongs_to(principal),
             Self::Acceptance(link) => link.belongs_to(principal),
             Self::Publication(link) => link.belongs_to(principal),
+            Self::CronCheckRun(link) => link.belongs_to(principal),
             Self::WorkDispatch(link) => link.belongs_to(principal),
             Self::Repair(link) => {
                 principal.role == Role::Manager && principal.client_id == link.effective_manager_id
@@ -520,6 +821,7 @@ pub(crate) fn operation_link(
         ("task.request_changes", Some("review_result")) => "task.request_changes",
         ("task.accept", Some("review_result")) => "task.accept",
         ("forge.publish_ref", Some("task.acceptance")) => "forge.publish_ref",
+        ("check.run", Some("cron_occurrence")) => "check.run",
         _ => "",
     };
     if link.schema_version != 1
@@ -558,8 +860,168 @@ pub(crate) fn operation_link(
         validate_acceptance_link(db, &link)?;
     } else if link.action == "forge.publish_ref" {
         validate_publication_link(db, &link)?;
+    } else if link.action == "check.run" {
+        validate_cron_check_run_link(db, &link)?;
     }
     Ok(Some(link))
+}
+
+fn validate_cron_check_run_link(db: &Connection, link: &OnBehalfOperationLink) -> Result<()> {
+    let corrupt = || {
+        Error::new(
+            "AUTOMATION_LINK_CORRUPT",
+            "cron CheckRun link does not match its retained request and check record",
+        )
+    };
+    let cause = &link.cause;
+    let occurrence_id = cause["id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(corrupt)?;
+    let generation = cause["calendar_generation"]
+        .as_str()
+        .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(corrupt)?;
+    let due_at_ms = cause["due_at_ms"]
+        .as_i64()
+        .filter(|value| *value >= 0)
+        .ok_or_else(corrupt)?;
+    let task_id = cause["task_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(corrupt)?;
+    let attempt_id = cause["attempt_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(corrupt)?;
+    let task_revision = cause["task_revision"]
+        .as_i64()
+        .filter(|value| *value > 0)
+        .ok_or_else(corrupt)?;
+    let candidate_ref = cause["candidate_ref"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(corrupt)?;
+    let profile_id = cause["profile_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(corrupt)?;
+    let profile_revision = cause["profile_revision"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(corrupt)?;
+    if cause["kind"] != "cron_occurrence"
+        || occurrence_id.len() != 64
+        || !occurrence_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || generation.is_empty()
+    {
+        return Err(corrupt());
+    }
+    type CronCheckOperationRow = (
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let row: Option<CronCheckOperationRow> = db
+        .query_row(
+            "SELECT caller_id,method,original_request_json,task_id,attempt_id,effective_request_json \
+             FROM operations WHERE operation_id=?1",
+            [&link.operation_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+        )
+        .optional()?;
+    let Some((caller, method, original_json, operation_task, operation_attempt, effective_json)) =
+        row
+    else {
+        return Err(corrupt());
+    };
+    let request: Value = serde_json::from_str(&original_json).map_err(|_| corrupt())?;
+    let effective: Value = effective_json
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|_| corrupt())?
+        .ok_or_else(corrupt)?;
+    if link.action != "check.run"
+        || link.technical_requester_id != AUTOMATION_TECHNICAL_REQUESTER_ID
+        || caller != link.technical_requester_id
+        || method != "check.run"
+        || link.automation_revision <= 0
+        || link.effective_manager_id.is_empty()
+        || link.project_id.is_empty()
+        || link.automation_id.is_empty()
+        || request["client_request_id"] != format!("cron-{occurrence_id}")
+        || request["attempt_id"] != attempt_id
+        || request["candidate_ref"] != candidate_ref
+        || request["profile_id"] != profile_id
+        || request["profile_revision"] != profile_revision
+    {
+        return Err(corrupt());
+    }
+    let target_task: Option<String> = db
+        .query_row(
+            "SELECT task_id FROM attempts WHERE attempt_id=?1 AND task_revision=?2",
+            params![attempt_id, task_revision],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if target_task.as_deref() != Some(task_id) {
+        return Err(corrupt());
+    }
+    if effective["receipt"]["ok"] == false {
+        if effective["receipt"]["error"].is_null()
+            || effective.get("check_id").is_some()
+            || effective.get("coalesced_check_id").is_some()
+            || operation_task.is_some()
+            || operation_attempt.is_some()
+        {
+            return Err(corrupt());
+        }
+        return Ok(());
+    }
+    if effective["receipt"]["ok"] != true
+        || operation_task.as_deref() != Some(task_id)
+        || operation_attempt.as_deref() != Some(attempt_id)
+    {
+        return Err(corrupt());
+    }
+    let check_id = effective["check_id"]
+        .as_str()
+        .or_else(|| effective["coalesced_check_id"].as_str())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(corrupt)?;
+    let check: Option<(String, String, String, String)> = db
+        .query_row(
+            "SELECT c.operation_id,c.attempt_id,c.candidate_ref,c.spec_json FROM check_runs c WHERE c.check_id=?1",
+            [check_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((check_operation_id, check_attempt, check_candidate, spec_json)) = check else {
+        return Err(corrupt());
+    };
+    let spec: Value = serde_json::from_str(&spec_json).map_err(|_| corrupt())?;
+    if (effective.get("coalesced_check_id").is_some()
+        && effective["coalesced_check_id"] != check_id)
+        || (effective.get("coalesced_check_id").is_none()
+            && check_operation_id != link.operation_id)
+        || check_attempt != attempt_id
+        || check_candidate != candidate_ref
+        || spec["profile_id"] != profile_id
+        || spec["profile_revision"] != profile_revision
+        || spec["task_revision"] != task_revision
+    {
+        return Err(corrupt());
+    }
+    // Touch both timestamps to reject malformed/noncanonical fields while
+    // keeping these historical facts independent from current activation.
+    if due_at_ms < 0 || generation.len() != 64 {
+        return Err(corrupt());
+    }
+    Ok(())
 }
 
 fn validate_acceptance_link(db: &Connection, link: &OnBehalfOperationLink) -> Result<()> {
@@ -1489,6 +1951,37 @@ pub(crate) fn save_operation_link(
     Ok(link)
 }
 
+pub(crate) fn save_cron_operation_link(
+    db: &Connection,
+    operation_id: &str,
+    context: &CronExecutionContext,
+    now_ms: i64,
+) -> Result<OnBehalfOperationLink> {
+    let link = OnBehalfOperationLink {
+        schema_version: 1,
+        operation_id: operation_id.to_owned(),
+        technical_requester_id: AUTOMATION_TECHNICAL_REQUESTER_ID.to_owned(),
+        effective_manager_id: context.entry.owner_manager_id.clone(),
+        automation_id: context.entry.automation_id.clone(),
+        automation_revision: context.entry.revision,
+        project_id: context.entry.project_id.clone(),
+        action: "check.run".to_owned(),
+        cause: context.cause_value(),
+        linked_at_ms: now_ms,
+    };
+    let key = config::operation_link_key(operation_id)?;
+    let value = link.value()?;
+    config::write_record(db, &key, &value)?;
+    let index_key = config::entry_operation_key(
+        &context.entry.owner_manager_id,
+        &context.entry.project_id,
+        &context.entry.automation_id,
+        operation_id,
+    )?;
+    config::write_record(db, &index_key, &value)?;
+    Ok(link)
+}
+
 pub(crate) fn on_behalf_visible_to(
     db: &Connection,
     principal: &Principal,
@@ -1502,6 +1995,15 @@ pub(crate) fn on_behalf_visible_to(
     }
     match link {
         AnyOnBehalfOperationLink::Review(_) => Ok(true),
+        AnyOnBehalfOperationLink::CronCheckRun(link) => {
+            let task_id = link.cause["task_id"].as_str().ok_or_else(|| {
+                Error::new(
+                    "AUTOMATION_LINK_CORRUPT",
+                    "cron CheckRun link has no exact Task identity",
+                )
+            })?;
+            current_manager_has_task_scope(db, principal, task_id, &link.project_id)
+        }
         AnyOnBehalfOperationLink::Acceptance(link) => {
             let task_id = link.cause["identity"]["task_id"].as_str().ok_or_else(|| {
                 Error::new(
@@ -1605,6 +2107,15 @@ fn current_gm_on_behalf_scope_visible_to(
             };
             current_gm_has_task_project(db, &task_id, &link.project_id)
         }
+        AnyOnBehalfOperationLink::CronCheckRun(link) => {
+            let task_id = link.cause["task_id"].as_str().ok_or_else(|| {
+                Error::new(
+                    "AUTOMATION_LINK_CORRUPT",
+                    "cron CheckRun link has no exact Task identity",
+                )
+            })?;
+            current_gm_has_task_project(db, task_id, &link.project_id)
+        }
         AnyOnBehalfOperationLink::Acceptance(link) => {
             let task_id = link.cause["identity"]["task_id"].as_str().ok_or_else(|| {
                 Error::new(
@@ -1674,6 +2185,9 @@ pub(crate) fn any_on_behalf_operation_link(
     let review = operation_link(db, operation_id)?;
     let work_dispatch = crate::store::automation_work_dispatch::operation_link(db, operation_id)?;
     let repair = crate::store::automation_repair::operation_link(db, operation_id)?;
+    let is_cron = review
+        .as_ref()
+        .is_some_and(|link| link.action == "check.run");
     let mut count = 0;
     if review.is_some() {
         count += 1;
@@ -1691,6 +2205,9 @@ pub(crate) fn any_on_behalf_operation_link(
         ));
     }
     match (review, work_dispatch, repair) {
+        (Some(link), None, None) if link.action == "check.run" && is_cron => {
+            Ok(Some(AnyOnBehalfOperationLink::CronCheckRun(link)))
+        }
         (Some(link), None, None) if link.action == "task.accept" => {
             Ok(Some(AnyOnBehalfOperationLink::Acceptance(link)))
         }
@@ -1746,9 +2263,10 @@ pub(crate) fn current_transferred_attempt_authority(
             | AutomationStep::ReviewDisposition
             | AutomationStep::Acceptance
             | AutomationStep::RepairDispatch
+            | AutomationStep::CheckRun
     ) {
         return Err(Error::invalid(
-            "transferred Attempt authority is limited to review, repair, and acceptance steps",
+            "transferred Attempt authority is limited to review, repair, acceptance, and check steps",
         ));
     }
     config::validate_entry(entry)?;
@@ -1766,6 +2284,7 @@ pub(crate) fn current_transferred_attempt_authority(
     })?;
     let step_ready = match step {
         AutomationStep::ReviewDispatch => current_entry.review_dispatch_ready(),
+        AutomationStep::CheckRun => current_entry.check_run_ready(),
         AutomationStep::ReviewDisposition
         | AutomationStep::Acceptance
         | AutomationStep::RepairDispatch => {
@@ -1836,6 +2355,7 @@ pub(crate) fn current_transferred_attempt_authority(
         AutomationStep::Acceptance => {
             matches!(attempt_state.as_str(), "submitted" | "needs_correction")
         }
+        AutomationStep::CheckRun => true,
         _ => false,
     };
     if attempt_task_id != task_id
@@ -1846,13 +2366,40 @@ pub(crate) fn current_transferred_attempt_authority(
         || task_state != "open"
         || !allowed_attempt_state
         || released_at_ms.is_some()
-        || attempt_submission_ref.as_deref() != Some(submission_ref)
-        || attempt_candidate_ref.as_deref() != Some(candidate_ref)
+        || (step != AutomationStep::CheckRun
+            && (attempt_submission_ref.as_deref() != Some(submission_ref)
+                || attempt_candidate_ref.as_deref() != Some(candidate_ref)))
     {
         return Err(Error::new(
             "AUTOMATION_ATTEMPT_STALE",
             "Task, Attempt, submission, or candidate is no longer the exact live subject",
         ));
+    }
+    if step == AutomationStep::CheckRun {
+        let source: Option<(String, String)> = db
+            .query_row(
+                "SELECT kind,metadata_json FROM artifacts WHERE artifact_id=?1",
+                [candidate_ref],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((kind, metadata_json)) = source else {
+            return Err(Error::new(
+                "CHECK_SOURCE_REQUIRED",
+                "transferred CheckRun source snapshot is not registered",
+            ));
+        };
+        let metadata: Value = serde_json::from_str(&metadata_json)?;
+        if kind != "source_snapshot"
+            || metadata["task_id"] != task_id
+            || metadata["attempt_id"] != attempt_id
+            || metadata["task_revision"] != task_revision
+        {
+            return Err(Error::new(
+                "CHECK_SOURCE_REQUIRED",
+                "transferred CheckRun source snapshot does not match the exact Attempt",
+            ));
+        }
     }
     if attempt_owner_id == entry.owner_manager_id {
         return Ok(None);
@@ -1976,6 +2523,94 @@ pub(crate) fn current_transfer_continuation(
         expected_task_id,
         TransferContinuationPhase::QueuedUnsent,
     )
+}
+
+/// Revalidate a queued, unsent cron CheckRun against the currently committed
+/// Automation entry immediately before CheckRun transitions to sending. A
+/// transferred operation keeps its original caller and attribution; only a
+/// sealed transfer continuation can authorize its successor.
+pub(crate) fn authorize_cron_check_run_start(db: &Connection, operation_id: &str) -> Result<()> {
+    let Some(AnyOnBehalfOperationLink::CronCheckRun(link)) =
+        any_on_behalf_operation_link(db, operation_id)?
+    else {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "queued technical CheckRun has no validated cron attribution",
+        ));
+    };
+    let state: Option<(String, Option<i64>)> = db
+        .query_row(
+            "SELECT state,sent_at_ms FROM operations WHERE operation_id=?1 AND method='check.run'",
+            [operation_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if !state.is_some_and(|(state, sent_at_ms)| state == "queued" && sent_at_ms.is_none()) {
+        return Err(Error::new(
+            "AUTOMATION_TRANSFER_EFFECT_NOT_QUEUED",
+            "cron CheckRun is no longer queued and unsent",
+        ));
+    }
+    let task_id = link.cause["task_id"].as_str().ok_or_else(|| {
+        Error::new(
+            "AUTOMATION_LINK_CORRUPT",
+            "cron CheckRun link has no exact Task identity",
+        )
+    })?;
+    let entry = if config::transfer_from_source(
+        db,
+        &link.effective_manager_id,
+        &link.project_id,
+        &link.automation_id,
+    )?
+    .is_some()
+    {
+        current_transfer_continuation(
+            db,
+            operation_id,
+            "check.run",
+            AutomationStep::CheckRun,
+            task_id,
+        )?
+        .ok_or_else(|| {
+            Error::new(
+                "FORBIDDEN",
+                "queued cron CheckRun has no current sealed transfer continuation",
+            )
+        })?
+        .current_entry
+    } else {
+        config::load_entry(
+            db,
+            &link.effective_manager_id,
+            &link.project_id,
+            &link.automation_id,
+        )?
+        .ok_or_else(|| Error::new("FORBIDDEN", "owning automation was removed"))?
+    };
+    let generation = link.cause["calendar_generation"]
+        .as_str()
+        .ok_or_else(|| Error::new("AUTOMATION_LINK_CORRUPT", "cron generation is missing"))?;
+    let occurrence_id = link.cause["id"]
+        .as_str()
+        .ok_or_else(|| Error::new("AUTOMATION_LINK_CORRUPT", "cron occurrence ID is missing"))?;
+    let due_at_ms = link.cause["due_at_ms"]
+        .as_i64()
+        .ok_or_else(|| Error::new("AUTOMATION_LINK_CORRUPT", "cron due time is missing"))?;
+    let context = CronExecutionContext::from_committed_entry(
+        db,
+        &entry,
+        generation,
+        occurrence_id,
+        due_at_ms,
+    )?;
+    if context.cause_value() != link.cause {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "current cron settings no longer match the retained CheckRun target",
+        ));
+    }
+    context.require_current_check_target(db)
 }
 
 /// Resolve a read-only continuation authority for the exact unknown
@@ -2243,6 +2878,14 @@ fn current_transfer_continuation_at_phase(
             link.automation_id.as_str(),
             link.action.as_str(),
         ),
+        AnyOnBehalfOperationLink::CronCheckRun(link) => (
+            link.operation_id.as_str(),
+            link.effective_manager_id.as_str(),
+            link.automation_revision,
+            link.project_id.as_str(),
+            link.automation_id.as_str(),
+            link.action.as_str(),
+        ),
         AnyOnBehalfOperationLink::WorkDispatch(link) => (
             link.operation_id.as_str(),
             link.effective_manager_id.as_str(),
@@ -2412,6 +3055,7 @@ fn current_transfer_continuation_at_phase(
         | AutomationStep::Acceptance => {
             current_entry.enabled && current_entry.scope.work_pool_id.is_none()
         }
+        AutomationStep::CheckRun => current_entry.check_run_ready(),
         AutomationStep::GithubProjection => false,
     };
     if !ready {
@@ -2452,6 +3096,7 @@ fn transfer_action_matches_step(action: &str, step: AutomationStep) -> bool {
             | ("task.request_changes", AutomationStep::RepairDispatch)
             | ("agent.send", AutomationStep::RepairDispatch)
             | ("task.accept", AutomationStep::Acceptance)
+            | ("check.run", AutomationStep::CheckRun)
             | ("forge.publish_ref", AutomationStep::Publication)
     )
 }
@@ -2700,7 +3345,10 @@ pub(crate) fn entry_operation_links(
                 "Operation appears more than once in the review entry index",
             ));
         }
-        if matches!(link.action.as_str(), "task.accept" | "forge.publish_ref") {
+        if matches!(
+            link.action.as_str(),
+            "task.accept" | "forge.publish_ref" | "check.run"
+        ) {
             let task_id = if link.action == "task.accept" {
                 link.cause["identity"]["task_id"].as_str()
             } else {

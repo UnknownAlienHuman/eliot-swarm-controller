@@ -12,6 +12,8 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   classifyLine,
+  MODULE_ARTIFACT_ID,
+  PREVIOUS_MODULE_ARTIFACT_ID,
   commandReceiptFacts,
   describe,
   openRun,
@@ -64,8 +66,17 @@ try {
       .filter((l) => l.trim() !== "");
     const classified = lines.map(classifyLine);
     assert.equal(classified.filter((c) => c.kind === "event").length, 7);
+    assert.ok(classified.filter((c) => c.kind === "event")
+      .every((c) => c.frame_format === "event_envelope" && c.raw_line.startsWith('{"type":"event"')));
+    assert.equal(classified[0].event.type, "run_start");
+    const legacyDirect = classifyLine('{"type":"run_start","sessionId":"legacy"}');
+    assert.equal(legacyDirect.kind, "event");
+    assert.equal(legacyDirect.frame_format, "direct_event_legacy");
+    assert.equal(legacyDirect.event.sessionId, "legacy");
     assert.equal(classified.filter((c) => c.kind === "result").length, 1);
     assert.equal(classified.find((c) => c.kind === "result").result.subtype, "success");
+    assert.equal(classified.find((c) => c.kind === "result").frame_format, "result_line");
+    assert.equal(classifyLine('{"type":"event","event":{"type":7}}').reason, "invalid_event_frame");
     assert.equal(classifyLine("not json").kind, "gap");
     assert.equal(classifyLine('{"answer": 42}').kind, "gap");
   });
@@ -121,6 +132,12 @@ try {
     assert.equal(record.result.final_text, "done");
     assert.equal(record.operation_id, "success-op");
     assert.equal(record.requested_model, "fixture-model");
+    assert.equal(record.native_request_model, "fixture-model");
+    assert.equal(record.native_request_model_status, "observed");
+    assert.deepEqual(record.native_request_model_evidence.map((event) => event.event_type), [
+      "model_request_start",
+      "model_request_end",
+    ]);
     assert.equal(record.effective_model, null);
     assert.equal(record.effective_model_status, "unknown");
     assert.equal(record.prompt_bytes, Buffer.byteLength("read the readme", "utf8"));
@@ -130,6 +147,12 @@ try {
     assert.equal(record.mod.ready, true);
     assert.equal(record.mod.session_ended, true);
     assert.equal(record.events.by_type.tool_completed, 1);
+    assert.equal(record.events.by_type.model_request_start, 1);
+    assert.equal(record.events.by_type.model_request_end, 1);
+    const nativeEventRecords = readFileSync(join(dir, "events.ndjson"), "utf8")
+      .trim().split(/\r?\n/).map(JSON.parse).filter((frame) => frame.kind === "event");
+    assert.ok(nativeEventRecords.every((frame) => frame.frame_format === "event_envelope"
+      && JSON.parse(frame.raw_line).event.type === frame.event.type));
     assert.equal(existsSync(join(dir, "mod", "mod-journal.ndjson")), true);
     assert.equal(existsSync(join(dir, "mod", "inbox.ndjson")), true);
     assert.equal(existsSync(join(dir, "mod-journal.ndjson")), false);
@@ -182,7 +205,7 @@ try {
     assert.equal("completion_condition" in mismatch.details, false);
   });
 
-  await test("reconcile rejects run records that disagree with the retained result stream and does not replay", async () => {
+  await test("reconcile rejects a saved result projection that disagrees with its raw frame and does not replay", async () => {
     const dir = join(scratch, "tampered-result-stream");
     const invocationFile = join(scratch, "tampered-result-invocations.ndjson");
     process.env.FAKE_CMD_SCENARIO = "success";
@@ -195,7 +218,7 @@ try {
     writeFileSync(join(dir, "events.ndjson"), stream.map((frame) => JSON.stringify(frame)).join("\n") + "\n");
     const snapshot = snapshotRun(dir);
     assert.equal(snapshot.evidence.valid, false);
-    assert.equal(snapshot.evidence.diagnostic_code, "saved_result_projection_mismatch");
+    assert.equal(snapshot.evidence.diagnostic_code, "saved_native_frame_projection_mismatch");
     assert.equal(snapshot.terminal, "unknown");
     const replay = await openFixtureRun("tampered-result-op", "read the fixture", dir);
     assert.equal(replay.replayed_from_saved_evidence, true);
@@ -246,7 +269,7 @@ try {
     delete process.env.FAKE_CMD_INVOCATION_FILE;
   });
 
-  await test("legacy .2 terminal files stay readable and unchanged but cannot authorize .3 replay", async () => {
+  await test("legacy .2 files stay readable and unchanged but cannot authorize .4 replay", async () => {
     const dir = join(scratch, "legacy-v2");
     const operationId = "legacy-v2-op";
     mkdirSync(dir, { recursive: true });
@@ -286,6 +309,49 @@ try {
     await assert.rejects(() => openFixtureRun(operationId, "legacy prompt", dir), /OPERATION_ID_CONFLICT/);
     assert.equal(readFileSync(join(dir, "admission.json"), "utf8"), admissionBefore);
     assert.equal(readFileSync(join(dir, "run.json"), "utf8"), runBefore);
+  });
+
+  await test(".3 snapshots project saved event envelopes read-only", async () => {
+    const dir = join(scratch, "legacy-v3-event-projection");
+    const operationId = "legacy-v3-event-projection-op";
+    mkdirSync(dir, { recursive: true });
+    const eventRecord = {
+      seq: 1,
+      kind: "event",
+      // .3 saved the parsed outer event frame as the event itself.
+      event: {
+        type: "event",
+        event: { type: "model_request_start", model: "stealth/space-bunny-alpha" },
+      },
+    };
+    writeFileSync(join(dir, "admission.json"), JSON.stringify({
+      schema: 2,
+      module_artifact_id: PREVIOUS_MODULE_ARTIFACT_ID,
+      operation_id: operationId,
+    }, null, 2) + "\n");
+    writeFileSync(join(dir, "run.json"), JSON.stringify({
+      schema: 2,
+      module_artifact_id: PREVIOUS_MODULE_ARTIFACT_ID,
+      disposition: "completed",
+      events: { total: 1, by_type: { event: 1 }, gaps: [] },
+    }, null, 2) + "\n");
+    writeFileSync(join(dir, "events.ndjson"), JSON.stringify(eventRecord) + "\n");
+    const savedBefore = ["admission.json", "run.json", "events.ndjson"]
+      .map((name) => readFileSync(join(dir, name), "utf8"));
+    const snapshot = snapshotRun(dir);
+    assert.equal(snapshot.terminal, "unknown");
+    assert.equal(snapshot.evidence.diagnostic_code, "legacy_artifact_read_only");
+    assert.equal(snapshot.event_projection.read_only, true);
+    assert.equal(snapshot.event_projection.raw_line_available, false);
+    assert.deepEqual(snapshot.event_projection.by_type, { model_request_start: 1 });
+    assert.equal(snapshot.event_projection.native_request_model, "stealth/space-bunny-alpha");
+    assert.equal(snapshot.run.events.by_type.event, 1);
+    assert.deepEqual(["admission.json", "run.json", "events.ndjson"]
+      .map((name) => readFileSync(join(dir, name), "utf8")), savedBefore);
+    await assert.rejects(
+      () => openFixtureRun(operationId, "do not replay", dir),
+      /OPERATION_ID_CONFLICT/,
+    );
   });
 
   await test("open: auth error is a failed run with no session and no mod readiness", async () => {
@@ -368,7 +434,7 @@ try {
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, "admission.json"), JSON.stringify({
       schema: 2,
-      module_artifact_id: "command-mod-0.1.0-glue.3",
+      module_artifact_id: MODULE_ARTIFACT_ID,
       operation_id: operationId,
       execution_shape: "sessionless_batch",
       batch_run_id: batchRunId(operationId),

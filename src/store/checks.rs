@@ -2,6 +2,7 @@
 use super::{Store, acceptance, current_principal, meta, operations, results, tasks};
 use crate::{
     artifacts::{ArtifactFiles, ArtifactRecord},
+    automation::authorization,
     checks::{
         inputs,
         model::{CaptureRequest, CheckRequest},
@@ -76,7 +77,16 @@ pub(super) fn plan_inputs(
 ) -> Result<CheckPlanInputs> {
     let input = CheckRequest::parse(v)?;
     let a = attempt(db, p, &input.attempt_id)?;
-    let task = tasks::get_task(db, model::text(&a, "task_id")?)?;
+    plan_inputs_for_attempt(db, &input, &a, config)
+}
+
+fn plan_inputs_for_attempt(
+    db: &Connection,
+    input: &CheckRequest,
+    a: &Value,
+    config: &Config,
+) -> Result<CheckPlanInputs> {
+    let task = tasks::get_task(db, model::text(a, "task_id")?)?;
     let profile = config
         .checks
         .profile(&input.profile_id, &input.profile_revision)?;
@@ -189,6 +199,30 @@ impl Store {
                 plan_inputs(db, &p, &v, &config)
             })
             .await;
+        self.resolve_check_plan_snapshot(snapshot).await
+    }
+
+    pub(super) async fn resolve_cron_check_plan(
+        &self,
+        context: crate::automation::authorization::CronExecutionContext,
+    ) -> Result<CheckPlanResolution> {
+        let params = context.request_params()?;
+        let config = self.config.clone();
+        let snapshot = self
+            .run(move |db| {
+                context.require_current_check_target(db)?;
+                let input = CheckRequest::parse(&params)?;
+                let attempt = tasks::get_attempt(db, &input.attempt_id)?;
+                plan_inputs_for_attempt(db, &input, &attempt, &config)
+            })
+            .await;
+        self.resolve_check_plan_snapshot(snapshot).await
+    }
+
+    async fn resolve_check_plan_snapshot(
+        &self,
+        snapshot: Result<CheckPlanInputs>,
+    ) -> Result<CheckPlanResolution> {
         let snapshot = match snapshot {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -876,6 +910,34 @@ pub(super) fn reserve(
     let input = CheckRequest::parse(v)?;
     let a = attempt(tx, p, &input.attempt_id)?;
     let facts = plan_inputs(tx, p, v, config)?;
+    reserve_with_facts(tx, input, a, facts, id, resolution, None)
+}
+
+pub(super) fn reserve_cron(
+    tx: &Transaction<'_>,
+    context: &crate::automation::authorization::CronExecutionContext,
+    id: &str,
+    config: &Config,
+    resolution: Option<&CheckPlanResolution>,
+) -> Result<(Value, bool)> {
+    let request = context.request_params()?;
+    model::validate_mutation("check.run", &request)?;
+    context.require_current_check_target(tx)?;
+    let input = CheckRequest::parse(&request)?;
+    let a = tasks::get_attempt(tx, &input.attempt_id)?;
+    let facts = plan_inputs_for_attempt(tx, &input, &a, config)?;
+    reserve_with_facts(tx, input, a, facts, id, resolution, Some(context))
+}
+
+fn reserve_with_facts(
+    tx: &Transaction<'_>,
+    input: CheckRequest,
+    a: Value,
+    facts: CheckPlanInputs,
+    id: &str,
+    resolution: Option<&CheckPlanResolution>,
+    cron_context: Option<&crate::automation::authorization::CronExecutionContext>,
+) -> Result<(Value, bool)> {
     let resolution = resolution.ok_or_else(|| {
         Error::new(
             "CHECK_PLAN_REQUIRED",
@@ -902,6 +964,12 @@ pub(super) fn reserve(
     let key = prepared.input_fingerprint.clone();
     let existing:Option<(String,String)>=tx.query_row("SELECT check_id,operation_id FROM check_runs WHERE attempt_id=?1 AND cache_key=?2 AND (state IN ('queued','running','reconciling') OR (resource_claimed_at_ms IS NOT NULL AND resource_released_at_ms IS NULL))",params![input.attempt_id,key],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
     if let Some((check, op)) = existing {
+        if cron_context.is_some() {
+            tx.execute(
+                "UPDATE operations SET task_id=?2,attempt_id=?3,effective_request_json=json_object('coalesced_check_id',?4) WHERE operation_id=?1",
+                params![id, a["task_id"].as_str(), input.attempt_id, check],
+            )?;
+        }
         return Ok((
             json!({"operation_id":op,"check_id":check,"coalesced":true}),
             false,
@@ -1097,15 +1165,19 @@ fn next(db: &mut Connection, config: &Config, root: PathBuf) -> Result<Option<Wo
                 "queued check cancelled before command execution",
             ));
         }
-        let p = current_principal(
-            &tx,
-            Principal {
-                client_id: caller,
-                link_id: String::new(),
-                role: Role::Manager,
-            },
-        )?;
-        attempt(&tx, &p, &attempt_id)?;
+        if caller == authorization::AUTOMATION_TECHNICAL_REQUESTER_ID {
+            authorization::authorize_cron_check_run_start(&tx, &w.operation_id)?;
+        } else {
+            let p = current_principal(
+                &tx,
+                Principal {
+                    client_id: caller,
+                    link_id: String::new(),
+                    role: Role::Manager,
+                },
+            )?;
+            attempt(&tx, &p, &attempt_id)?;
+        }
         let current = config
             .checks
             .profile(&w.profile.profile_id, &w.profile.profile_revision)?;
@@ -1212,6 +1284,8 @@ impl Store {
                 .await?
             {
                 self.run(move |db| finish(db, &work, completion)).await?;
+                self.changed
+                    .send_modify(|revision| *revision = revision.wrapping_add(1));
                 continue;
             }
             let scan = work.clone();
@@ -1220,6 +1294,8 @@ impl Store {
                 .await?
             {
                 self.run(move |db| finish(db, &work, completion)).await?;
+                self.changed
+                    .send_modify(|revision| *revision = revision.wrapping_add(1));
                 continue;
             }
             let scan = work.clone();
@@ -1240,6 +1316,8 @@ impl Store {
                         .await?
                     {
                         self.run(move |db| finish(db, &work, completion)).await?;
+                        self.changed
+                            .send_modify(|revision| *revision = revision.wrapping_add(1));
                     }
                 }
                 Err(error) => return Err(error),
@@ -1296,7 +1374,11 @@ impl Store {
                                 .file_io(move |files| worker::failure(&failed, &files, e))
                                 .await?;
                             let done = w.clone();
-                            return self.run(move |db| finish(db, &done, c)).await;
+                            let result = self.run(move |db| finish(db, &done, c)).await;
+                            if result.is_ok() {
+                                self.changed.send_modify(|revision| *revision = revision.wrapping_add(1));
+                            }
+                            return result;
                         }
                         let scan = w.clone();
                         let complete = self
@@ -1304,7 +1386,11 @@ impl Store {
                             .await?;
                         if let Some(c) = complete {
                             let done = w.clone();
-                            return self.run(move |db| finish(db, &done, c)).await;
+                            let result = self.run(move |db| finish(db, &done, c)).await;
+                            if result.is_ok() {
+                                self.changed.send_modify(|revision| *revision = revision.wrapping_add(1));
+                            }
+                            return result;
                         }
                         // A launch whose worker died before publishing an
                         // identity has no admitted worker to recover; only the
@@ -1334,7 +1420,11 @@ impl Store {
                                 let scan = w.clone();
                                 if let Some(c) = self.file_io(move |files| worker::recover(&scan, &files)).await? {
                                     let done = w.clone();
-                                    return self.run(move |db| finish(db, &done, c)).await;
+                                    let result = self.run(move |db| finish(db, &done, c)).await;
+                                    if result.is_ok() {
+                                        self.changed.send_modify(|revision| *revision = revision.wrapping_add(1));
+                                    }
+                                    return result;
                                 }
                                 return Err(e);
                             }
@@ -1391,8 +1481,10 @@ impl Store {
                         if let Ok(c) = self
                             .file_io(move |files| worker::failure(&failed, &files, error))
                             .await
+                            && self.run(move |db| finish(db, &w, c)).await.is_ok()
                         {
-                            let _ = self.run(move |db| finish(db, &w, c)).await;
+                            self.changed
+                                .send_modify(|revision| *revision = revision.wrapping_add(1));
                         }
                     }
                 }

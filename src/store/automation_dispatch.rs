@@ -729,6 +729,12 @@ fn attempt_review_assignment(
             wake_when: vec!["review_profile_configured".to_owned()],
         });
     };
+    let AutomationCause::AppliedSubmission { operation_id, .. } = cause else {
+        return Err(Error::new(
+            "AUTOMATION_CAUSE_INVALID",
+            "review assignment requires an applied submission cause",
+        ));
+    };
     let submission_ref = cause.id();
     let document = match submissions::document(tx, submission_ref) {
         Ok(document) => document,
@@ -739,10 +745,7 @@ fn attempt_review_assignment(
             });
         }
     };
-    if document["operation_id"]
-        != json!(match cause {
-            AutomationCause::AppliedSubmission { operation_id, .. } => operation_id,
-        })
+    if document["operation_id"] != json!(operation_id)
         || document["task_revision"].as_i64().is_none()
     {
         return Ok(SubjectResult::Pending {

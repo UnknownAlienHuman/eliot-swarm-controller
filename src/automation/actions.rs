@@ -16,6 +16,7 @@ pub(crate) enum AutomationStep {
     RepairDispatch,
     Acceptance,
     Publication,
+    CheckRun,
     GithubProjection,
 }
 
@@ -28,6 +29,7 @@ impl AutomationStep {
             Self::RepairDispatch => "repair_dispatch",
             Self::Acceptance => "acceptance",
             Self::Publication => "publication",
+            Self::CheckRun => "check_run",
             Self::GithubProjection => "github_projection",
         }
     }
@@ -40,6 +42,7 @@ impl AutomationStep {
             "repair_dispatch" => Ok(Self::RepairDispatch),
             "acceptance" => Ok(Self::Acceptance),
             "publication" => Ok(Self::Publication),
+            "check_run" => Ok(Self::CheckRun),
             "github_projection" => Ok(Self::GithubProjection),
             _ => Err(Error::invalid(format!("unknown automation step: {value}"))),
         }
@@ -54,6 +57,7 @@ impl AutomationStep {
                 | Self::RepairDispatch
                 | Self::Acceptance
                 | Self::Publication
+                | Self::CheckRun
         )
     }
 
@@ -75,12 +79,24 @@ pub(crate) enum AutomationCause {
         operation_id: String,
         submission_ref: String,
     },
+    CronOccurrence {
+        occurrence_id: String,
+        calendar_generation: String,
+        due_at_ms: i64,
+        task_id: String,
+        attempt_id: String,
+        task_revision: i64,
+        candidate_ref: String,
+        profile_id: String,
+        profile_revision: String,
+    },
 }
 
 impl AutomationCause {
     pub(crate) fn kind(&self) -> &'static str {
         match self {
             Self::AppliedSubmission { .. } => "applied_submission",
+            Self::CronOccurrence { .. } => "cron_occurrence",
         }
     }
 
@@ -90,6 +106,7 @@ impl AutomationCause {
     pub(crate) fn id(&self) -> &str {
         match self {
             Self::AppliedSubmission { submission_ref, .. } => submission_ref,
+            Self::CronOccurrence { occurrence_id, .. } => occurrence_id,
         }
     }
 
@@ -105,6 +122,28 @@ impl AutomationCause {
                 "operation_id":operation_id,
                 "id":submission_ref
             }),
+            Self::CronOccurrence {
+                occurrence_id,
+                calendar_generation,
+                due_at_ms,
+                task_id,
+                attempt_id,
+                task_revision,
+                candidate_ref,
+                profile_id,
+                profile_revision,
+            } => json!({
+                "kind":self.kind(),
+                "id":occurrence_id,
+                "calendar_generation":calendar_generation,
+                "due_at_ms":due_at_ms,
+                "task_id":task_id,
+                "attempt_id":attempt_id,
+                "task_revision":task_revision,
+                "candidate_ref":candidate_ref,
+                "profile_id":profile_id,
+                "profile_revision":profile_revision,
+            }),
         }
     }
 }
@@ -114,6 +153,7 @@ pub(crate) fn supported_action_for(step: AutomationStep) -> Option<&'static str>
         AutomationStep::WorkDispatch => Some("swarm.launch"),
         AutomationStep::ReviewDispatch => Some("review.assign"),
         AutomationStep::Publication => Some("forge.publish_ref"),
+        AutomationStep::CheckRun => Some("check.run"),
         _ => None,
     }
 }

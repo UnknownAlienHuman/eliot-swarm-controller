@@ -1280,7 +1280,7 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
         MANAGER_ONLY_AUDIENCES,
         Searchable,
         "Validate a revision-checked automation plan without applying it.",
-        "Use before automation.config.apply; inspect plan digest and conflicts before deciding.",
+        "Optionally inspect the plan digest, conflicts, and calendar occurrences before applying changes.",
         &["automation", "preview", "plan", "conflict", "digest"],
         &["project_id", "1..32 unique automation changes"],
         "Read-only plan projection; does not enable or execute a model turn."
@@ -1533,7 +1533,7 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
         MANAGER_ONLY_AUDIENCES,
         ManualOnly,
         "Apply a revision-checked automation definition plan owned by the authenticated Manager.",
-        "Use only after previewing the same exact project and changes; supply the returned digest when applying.",
+        "Save the authenticated manager's selected changes directly; when a preview was used, supply its digest for the same plan.",
         &[
             "automation",
             "apply",

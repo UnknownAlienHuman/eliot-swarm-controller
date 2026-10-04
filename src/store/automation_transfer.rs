@@ -1,11 +1,12 @@
 //! Explicit current-GM transfer of one manager-owned automation entry.
 //!
 //! The source entry remains as a disabled historical snapshot. Its Operations,
-//! callers, causal links, and global cursors are not rewritten. Only the four
+//! callers, causal links, and global cursors are not rewritten. Only the five
 //! typed per-entry ledgers are relocated in this transaction.
 
 use super::{
-    automation_dispatch, automation_publication, automation_work_dispatch, review_disposition,
+    automation_cron, automation_dispatch, automation_publication, automation_work_dispatch,
+    review_disposition,
 };
 use crate::{
     automation::{
@@ -211,6 +212,10 @@ pub(super) fn apply(
         )?,
         &config::transfer_pointer_value(operation_id)?,
     )?;
+    // The cron ledger is keyed by the original logical-entry identity. Call
+    // only after the sealed source/target pointers are present so A→B→C can
+    // resolve the same origin without copying occurrence or Operation state.
+    automation_cron::relocate_state(tx, &former, &successor)?;
 
     Ok(json!({
         "operation_id":operation_id,
@@ -223,6 +228,6 @@ pub(super) fn apply(
         "former_owner_revision":former.revision,
         "new_owner_revision":successor.revision,
         "gm_epoch":gm_epoch,
-        "state_ledgers_relocated":4
+        "state_ledgers_relocated":5
     }))
 }

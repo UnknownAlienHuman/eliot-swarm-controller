@@ -171,6 +171,13 @@ pub(super) fn apply(
                 cut,
                 now_ms,
             )?;
+            super::automation_cron::configure_activation(
+                tx,
+                change.before.as_ref(),
+                &change.after,
+                change.include_existing,
+                now_ms,
+            )?;
             let removed_or_narrowed_dispatch = change.before.as_ref().is_some_and(|before| {
                 (before.enabled && !change.after.enabled)
                     || (before.steps.contains(&AutomationStep::ReviewDispatch)
@@ -182,6 +189,8 @@ pub(super) fn apply(
                     || (before.work_dispatch_ready() && !change.after.work_dispatch_ready())
                     || (before.publication_ready() && !change.after.publication_ready())
                     || (before.publication != change.after.publication)
+                    || (before.check_run_ready() && !change.after.check_run_ready())
+                    || (before.cron != change.after.cron)
                     || (before.review.profile != change.after.review.profile)
                     || (before.scope.work_pool_id != change.after.scope.work_pool_id)
             });
@@ -277,6 +286,7 @@ pub(super) fn explain(db: &Connection, p: &Principal, value: &Value) -> Result<V
     let work_dispatch = automation_work_dispatch::dispatch_state(db, &entry)?;
     let disposition = review_disposition::disposition_state(db, &entry)?;
     let publication = automation_publication::state(db, &entry)?;
+    let cron = super::automation_cron::state(db, &entry)?;
     let work = operation_impacts(db, &owner_manager_id, project, automation_id)?;
     let operation_history =
         linked_operation_history(db, &owner_manager_id, project, automation_id)?;
@@ -291,6 +301,7 @@ pub(super) fn explain(db: &Connection, p: &Principal, value: &Value) -> Result<V
         "work_dispatch":work_dispatch,
         "review_disposition":disposition,
         "publication":publication,
+        "cron":cron,
         "linked_operations":work,
         "linked_operation_history":operation_history
     }))
@@ -542,12 +553,17 @@ fn build_plan(
             && before.as_ref().is_none_or(|prior| {
                 !prior.publication_ready() || prior.publication != after.publication
             });
+        let new_cron_coverage = after.check_run_ready()
+            && before
+                .as_ref()
+                .is_none_or(|prior| !prior.check_run_ready() || prior.cron != after.cron);
         let new_coverage = after.enabled
             && (enabled_now
                 || added_steps
                 || new_work_dispatch_coverage
                 || new_review_dispatch_coverage
-                || new_publication_coverage);
+                || new_publication_coverage
+                || new_cron_coverage);
         if change.include_existing && !new_coverage {
             return Err(Error::invalid(
                 "include_existing is meaningful only when enabling an entry or adding step coverage",

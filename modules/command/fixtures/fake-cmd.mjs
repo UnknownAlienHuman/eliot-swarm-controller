@@ -3,9 +3,8 @@
 //
 // It emulates ONLY what the official documentation states (headless page and
 // Mods page, accessed 2026-10-02; registry ids CC-HEADLESS/CC-MODS):
-// - `-p --output-format json` prints NDJSON: one frame per AgentEvent, then
-//   one final result line (subtype / usage / durationMs / finalText, with
-//   sessionId and stopReason optional).
+// - `-p --output-format json` prints NDJSON: `{type:"event",event}` frames
+//   followed by one `{type:"result", ...}` line.
 // - Documented exit codes (0 success, 3 auth, 8 max turns, 1 general error).
 // - `--mod <path>` loads a mod file: its default-export factory receives a
 //   ModApi object; a mod that fails to import or throws is a warning on
@@ -45,6 +44,14 @@ function parseArgs(argv) {
 
 function printLine(value) {
   process.stdout.write(JSON.stringify(value) + "\n");
+}
+
+function printEventFrame(event) {
+  printLine({ type: "event", event });
+}
+
+function printResultFrame(result) {
+  printLine({ type: "result", ...result });
 }
 
 function recordFilteredEnvironment() {
@@ -99,7 +106,7 @@ function createModHost() {
         handler(event);
       } catch (error) {
         // Documented host behavior: handler throws become mod_error events.
-        printLine({
+        printEventFrame({
           type: "mod_error",
           modId: api.name,
           hook: `on:${event.type}`,
@@ -147,7 +154,7 @@ async function main() {
   const host = createModHost();
   await loadMods(args.mods, host);
   const emit = (event) => {
-    printLine(event);
+    printEventFrame(event);
     host.dispatch(event);
   };
   const lifecycle = (type, payload) => host.dispatch({ type, ...payload });
@@ -157,7 +164,7 @@ async function main() {
     case "auth-error": {
       // Session never binds: the mod factory ran (mod_loaded) but no
       // session_start fires, and the result line has no sessionId.
-      printLine({
+      printResultFrame({
         subtype: "error",
         usage: { inputTokens: 0, outputTokens: 0 },
         durationMs: 9,
@@ -179,7 +186,7 @@ async function main() {
       emit({ type: "run_start", sessionId: "ses_fixture_max" });
       emit({ type: "turn_start", turnNumber: 1 });
       emit({ type: "turn_end", turnNumber: 1, hadToolCalls: false, usage });
-      printLine({
+      printResultFrame({
         subtype: "max_turns",
         usage,
         durationMs: 640,
@@ -204,7 +211,7 @@ async function main() {
       });
       emit({ type: "turn_end", turnNumber: 1, hadToolCalls: false, usage });
       emit({ type: "run_end", sessionId: "ses_fixture_moderr", result: { stopReason: "end_turn" } });
-      printLine({
+      printResultFrame({
         subtype: "success",
         usage,
         durationMs: 210,
@@ -221,7 +228,7 @@ async function main() {
       emit({ type: "run_start" });
       emit({ type: "turn_start", turnNumber: 1 });
       emit({ type: "turn_end", turnNumber: 1, hadToolCalls: false, usage });
-      printLine({
+      printResultFrame({
         subtype: "success",
         usage,
         durationMs: 130,
@@ -237,14 +244,16 @@ async function main() {
       // pre-seeded inbox commands are consumed mid-run.
       lifecycle("session_start", { source: "startup" });
       emit({ type: "run_start", sessionId: "ses_fixture_1" });
+      emit({ type: "model_request_start", model: args.model });
       emit({ type: "turn_start", turnNumber: 1 });
       emit({ type: "tool_queued", input: { tool: "read", path: "README.md" } });
       emit({ type: "tool_running", description: "Read README.md" });
       await sleep(900);
       emit({ type: "tool_completed", result: "ok" });
       emit({ type: "turn_end", turnNumber: 1, hadToolCalls: true, usage });
+      emit({ type: "model_request_end", model: args.model, usage, stopReason: "end_turn" });
       emit({ type: "run_end", sessionId: "ses_fixture_1", result: { stopReason: "end_turn" } });
-      printLine({
+      printResultFrame({
         subtype: "success",
         usage,
         durationMs: 990,

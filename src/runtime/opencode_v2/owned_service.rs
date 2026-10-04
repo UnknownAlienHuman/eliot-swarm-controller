@@ -419,9 +419,48 @@ impl OwnedServiceNoEffect {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum OwnedServiceStartStage {
+    PermitValidation,
+    PreSpawn,
+    HelperSpawn,
+    HelperInput,
+    ReadyReceipt,
+    FromRoute,
+    ConnectOwned,
+    RouteVerify,
+    ProviderScope,
+    Bootstrap,
+    ProviderProof,
+}
+
+impl OwnedServiceStartStage {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::PermitValidation => "permit_validation",
+            Self::PreSpawn => "pre_spawn",
+            Self::HelperSpawn => "helper_spawn",
+            Self::HelperInput => "helper_input",
+            Self::ReadyReceipt => "ready_receipt",
+            Self::FromRoute => "from_route",
+            Self::ConnectOwned => "connect_owned",
+            Self::RouteVerify => "route_verify",
+            Self::ProviderScope => "provider_scope",
+            Self::Bootstrap => "bootstrap",
+            Self::ProviderProof => "provider_proof",
+        }
+    }
+}
+
 pub(crate) enum OwnedServiceStartFailure {
     ProvenNoEffect(OwnedServiceNoEffect),
-    Unknown(Error),
+    Unknown {
+        error: Error,
+        stage: OwnedServiceStartStage,
+        // Keep EOF from stopping a newly ready helper until Store has recorded
+        // the bounded failure diagnostic against this exact start reservation.
+        helper_stdin: Option<ChildStdin>,
+    },
 }
 
 /// Live, bounded process and readiness proof. Private endpoint and credentials
@@ -710,14 +749,18 @@ pub(crate) async fn start_foreground(
         || permit.config_digest != prepared.config_digest
         || permit.scope_digest != prepared.intent.scope_digest()
     {
-        return Err(OwnedServiceStartFailure::Unknown(scope_error(
-            "owned-service start permit is stale or mismatched",
-        )));
+        return Err(start_failure(
+            scope_error("owned-service start permit is stale or mismatched"),
+            OwnedServiceStartStage::PermitValidation,
+            None,
+        ));
     }
     if prepared.provider_credential.is_some() != permit.provider_auth.is_some() {
-        return Err(OwnedServiceStartFailure::Unknown(scope_error(
-            "provider authorization permit differs from the prepared route",
-        )));
+        return Err(start_failure(
+            scope_error("provider authorization permit differs from the prepared route"),
+            OwnedServiceStartStage::PermitValidation,
+            None,
+        ));
     }
     permit.consumed = true;
     if prepared.route.verify_files().is_err() {
@@ -753,26 +796,42 @@ pub(crate) async fn start_foreground(
         .map_err(|error| {
             // An OS spawn error is still an attempted effect. The process may
             // have started even when the parent could not observe its handle.
-            OwnedServiceStartFailure::Unknown(error.into())
+            start_failure(error.into(), OwnedServiceStartStage::HelperSpawn, None)
         })?;
-    complete_foreground_start(prepared, child, permit.provider_auth.take())
-        .await
-        .map_err(OwnedServiceStartFailure::Unknown)
+    complete_foreground_start(prepared, child, permit.provider_auth.take()).await
+}
+
+fn start_failure(
+    error: Error,
+    stage: OwnedServiceStartStage,
+    helper_stdin: Option<ChildStdin>,
+) -> OwnedServiceStartFailure {
+    OwnedServiceStartFailure::Unknown {
+        error,
+        stage,
+        helper_stdin,
+    }
 }
 
 async fn complete_foreground_start(
     prepared: PreparedOwnedService,
     mut child: Child,
     provider_auth_permit: Option<provider_auth::ProviderAuthPermit>,
-) -> Result<OwnedServiceHandle> {
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| readback_error("owned service helper input is unavailable"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| readback_error("owned service helper output is unavailable"))?;
+) -> std::result::Result<OwnedServiceHandle, OwnedServiceStartFailure> {
+    let Some(stdin) = child.stdin.take() else {
+        return Err(start_failure(
+            readback_error("owned service helper input is unavailable"),
+            OwnedServiceStartStage::HelperInput,
+            None,
+        ));
+    };
+    let Some(stdout) = child.stdout.take() else {
+        return Err(start_failure(
+            readback_error("owned service helper output is unavailable"),
+            OwnedServiceStartStage::HelperInput,
+            Some(stdin),
+        ));
+    };
     let bounded_stdout = stdout.take((MAX_HANDSHAKE_BYTES + 1) as u64);
     let mut reader = AsyncBufReader::new(bounded_stdout);
     let mut line = Vec::with_capacity(MAX_HANDSHAKE_BYTES);
@@ -780,34 +839,54 @@ async fn complete_foreground_start(
     let count = match read_result {
         Ok(Ok(count)) if count > 0 && count <= MAX_HANDSHAKE_BYTES => count,
         _ => {
-            drop(stdin);
-            return Err(readback_error(
-                "owned service helper did not publish a bounded ready receipt",
+            return Err(start_failure(
+                readback_error("owned service helper did not publish a bounded ready receipt"),
+                OwnedServiceStartStage::ReadyReceipt,
+                Some(stdin),
             ));
         }
     };
     if line[count - 1] != b'\n' {
-        drop(stdin);
-        return Err(readback_error(
-            "owned service helper receipt is unterminated",
+        return Err(start_failure(
+            readback_error("owned service helper receipt is unterminated"),
+            OwnedServiceStartStage::ReadyReceipt,
+            Some(stdin),
         ));
     }
-    let value: Value = serde_json::from_slice(&line[..count - 1])
-        .map_err(|_| readback_error("owned service helper receipt is invalid"))?;
-    let mut readback = OwnedServiceReadback::from_route_value(
+    let value: Value = match serde_json::from_slice(&line[..count - 1]) {
+        Ok(value) => value,
+        Err(_) => {
+            return Err(start_failure(
+                readback_error("owned service helper receipt is invalid"),
+                OwnedServiceStartStage::ReadyReceipt,
+                Some(stdin),
+            ));
+        }
+    };
+    let mut readback = match OwnedServiceReadback::from_route_value(
         &value,
         &prepared.route,
         prepared.intent.owner_nonce(),
         false,
-    )?;
+    ) {
+        Ok(readback) => readback,
+        Err(error) => {
+            return Err(start_failure(
+                error,
+                OwnedServiceStartStage::FromRoute,
+                Some(stdin),
+            ));
+        }
+    };
     let options = prepared.route.options();
     if readback.config_digest() != prepared.config_digest
         || value["plugin_module_sha256"].as_str() != Some(prepared.plugin.module_sha256())
         || value["plugin_entrypoint_sha256"].as_str() != Some(prepared.plugin.entrypoint_sha256())
     {
-        drop(stdin);
-        return Err(readback_error(
-            "ready receipt differs from the exact prepared plugin config",
+        return Err(start_failure(
+            readback_error("ready receipt differs from the exact prepared plugin config"),
+            OwnedServiceStartStage::FromRoute,
+            Some(stdin),
         ));
     }
     let service = match Service::connect_owned(
@@ -820,22 +899,62 @@ async fn complete_foreground_start(
     {
         Ok(service) => service,
         Err(error) => {
-            drop(stdin);
-            return Err(error);
+            return Err(start_failure(
+                error,
+                OwnedServiceStartStage::ConnectOwned,
+                Some(stdin),
+            ));
         }
     };
-    prepared.route.verify_files()?;
+    if let Err(error) = prepared.route.verify_files() {
+        return Err(start_failure(
+            error,
+            OwnedServiceStartStage::RouteVerify,
+            Some(stdin),
+        ));
+    }
     match (prepared.provider_credential, provider_auth_permit) {
         (Some(credential), Some(permit)) => {
-            let provider_scope = provider_auth_scope(&prepared.route, &readback.proof)?;
+            let provider_scope = match provider_auth_scope(&prepared.route, &readback.proof) {
+                Ok(scope) => scope,
+                Err(error) => {
+                    return Err(start_failure(
+                        error,
+                        OwnedServiceStartStage::ProviderScope,
+                        Some(stdin),
+                    ));
+                }
+            };
             let provider_proof =
-                provider_auth::bootstrap_once(&service, credential, permit, provider_scope).await?;
-            readback = readback.with_provider_auth(&prepared.route, provider_proof)?;
+                match provider_auth::bootstrap_once(&service, credential, permit, provider_scope)
+                    .await
+                {
+                    Ok(proof) => proof,
+                    Err(error) => {
+                        return Err(start_failure(
+                            error,
+                            OwnedServiceStartStage::Bootstrap,
+                            Some(stdin),
+                        ));
+                    }
+                };
+            readback = match readback.with_provider_auth(&prepared.route, provider_proof) {
+                Ok(readback) => readback,
+                Err(error) => {
+                    return Err(start_failure(
+                        error,
+                        OwnedServiceStartStage::ProviderProof,
+                        Some(stdin),
+                    ));
+                }
+            };
         }
         (None, None) => {}
         _ => {
-            return Err(scope_error(
-                "provider credential and one-shot permission do not match",
+            return Err(start_failure(
+                scope_error("provider credential and one-shot permission do not match"),
+                OwnedServiceStartStage::ProviderScope,
+                Some(stdin),
             ));
         }
     }
@@ -859,9 +978,11 @@ fn pre_spawn_failure(
     {
         OwnedServiceStartFailure::ProvenNoEffect(OwnedServiceNoEffect::from_permit(permit))
     } else {
-        OwnedServiceStartFailure::Unknown(readback_error(
-            "owned service start outcome is uncertain",
-        ))
+        start_failure(
+            readback_error("owned service start outcome is uncertain"),
+            OwnedServiceStartStage::PreSpawn,
+            None,
+        )
     }
 }
 

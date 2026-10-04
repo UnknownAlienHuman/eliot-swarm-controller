@@ -14,7 +14,8 @@ use crate::{
         owned_service::{
             OwnedServiceHandle, OwnedServiceIntent, OwnedServiceOrigin, OwnedServiceReadback,
             OwnedServiceRoute, OwnedServiceSeed, OwnedServiceStartFailure, OwnedServiceStartPermit,
-            prepare_owned_service, prepare_owned_service_with_provider_auth, start_foreground,
+            OwnedServiceStartStage, prepare_owned_service,
+            prepare_owned_service_with_provider_auth, start_foreground,
         },
     },
     workspace::LeaseAuthorityRef,
@@ -25,6 +26,7 @@ use std::path::PathBuf;
 use tokio::sync::watch;
 
 const MAX_PROOF_BYTES: usize = 8 * 1024;
+const MAX_START_FAILURE_DIAGNOSTIC_BYTES: usize = 1024;
 const MAX_ID_BYTES: usize = 256;
 const PINNED_SERVICE_VERSION: &str = "2.0.7";
 
@@ -533,7 +535,23 @@ impl Store {
                     "owned service failed before helper spawn; no process was started",
                 ));
             }
-            Err(OwnedServiceStartFailure::Unknown(error)) => return Err(error),
+            Err(OwnedServiceStartFailure::Unknown {
+                error,
+                stage,
+                helper_stdin,
+            }) => {
+                let error_code = safe_start_error_code(&error.code);
+                let row = admission.row.clone();
+                let persist = self
+                    .run(move |db| persist_start_failure_diagnostic(db, &row, stage, error_code))
+                    .await;
+                // This EOF is the existing graceful helper stop. Keep it behind
+                // the durable diagnostic so the next run can identify the
+                // failed startup stage without claiming an observed effect.
+                drop(helper_stdin);
+                persist?;
+                return Err(error);
+            }
         };
         let proof = handle.readback().store_proof();
         let route = admission.route;
@@ -1204,6 +1222,108 @@ fn persist_failed_no_effect(
             "owned service no-effect state transition lost its exact reservation CAS",
         ));
     }
+    tx.commit()?;
+    Ok(())
+}
+
+fn safe_start_error_code(code: &str) -> String {
+    if code.len() <= 64
+        && code.as_bytes().first().is_some_and(u8::is_ascii_uppercase)
+        && code
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || *byte == b'_')
+    {
+        code.to_owned()
+    } else {
+        "UNCLASSIFIED".to_owned()
+    }
+}
+
+fn persist_start_failure_diagnostic(
+    db: &mut Connection,
+    row: &OwnedStartRow,
+    stage: OwnedServiceStartStage,
+    error_code: String,
+) -> Result<()> {
+    let stage = stage.as_str();
+    if !matches!(
+        stage,
+        "permit_validation"
+            | "pre_spawn"
+            | "helper_spawn"
+            | "helper_input"
+            | "ready_receipt"
+            | "from_route"
+            | "connect_owned"
+            | "route_verify"
+            | "provider_scope"
+            | "bootstrap"
+            | "provider_proof"
+    ) || safe_start_error_code(&error_code) != error_code
+    {
+        return Err(corrupt("owned service startup diagnostic is malformed"));
+    }
+    let diagnostic = json!({
+        "schema_version": 1,
+        "status": "startup_failed_unknown",
+        "stage": stage,
+        "error_code": error_code,
+        "native_effect": "unknown",
+    });
+    let canonical = model::canonical(&diagnostic)?;
+    if canonical.len() > MAX_START_FAILURE_DIAGNOSTIC_BYTES {
+        return Err(corrupt(
+            "owned service startup diagnostic exceeds its bound",
+        ));
+    }
+    let event_key = format!("owned-service-start-failure:{}", row.launch_operation_id);
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let current = load_start_row(&tx, &row.binding_id, row.binding_generation)?
+        .ok_or_else(|| corrupt("owned service reservation disappeared before diagnostics"))?;
+    verify_start_row(&current, row)?;
+    if current.state != "outcome_unknown"
+        || current.proof_json != "{}"
+        || current.process_id.is_some()
+        || current.process_birth_token.is_some()
+        || current.executable_sha256.is_some()
+    {
+        return Err(Error::conflict(
+            "owned service startup diagnostic no longer matches its unknown-effect reservation",
+        ));
+    }
+    let existing: Option<String> = tx
+        .query_row(
+            "SELECT payload_json FROM observations
+             WHERE source_event_key=?1 AND operation_id=?2 AND kind='owned_service.start_failure'",
+            params![event_key, row.launch_operation_id],
+            |record| record.get(0),
+        )
+        .optional()?;
+    if let Some(existing) = existing {
+        if existing != canonical {
+            return Err(corrupt(
+                "owned service startup diagnostic conflicts with retained evidence",
+            ));
+        }
+        tx.commit()?;
+        return Ok(());
+    }
+    tx.execute(
+        "INSERT INTO observations(
+             source_stream_id,source_event_key,binding_id,binding_generation,
+             operation_id,kind,payload_json,recorded_at_ms
+         ) VALUES('controller:owned-service',?1,?2,?3,?4,
+                  'owned_service.start_failure',?5,?6)",
+        params![
+            event_key,
+            row.binding_id,
+            row.binding_generation,
+            row.launch_operation_id,
+            canonical,
+            model::now_ms()?,
+        ],
+    )?;
     tx.commit()?;
     Ok(())
 }
