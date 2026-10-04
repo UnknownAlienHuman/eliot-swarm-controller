@@ -18,7 +18,7 @@ fn current(db: &Connection, p: &Principal, input: &SubmitRequest) -> Result<Valu
         ));
     }
     let a = tasks::get_attempt(db, &input.attempt_id)?;
-    p.owns(model::text(&a, "owner_id")?)?;
+    super::gm::require_attempt_control(db, p, &a)?;
     let t = tasks::get_task(db, model::text(&a, "task_id")?)?;
     if t["state"] != "open"
         || t["revision"] != input.expected_revision
@@ -137,6 +137,14 @@ pub(super) fn begin(
     if !matches!(op["state"].as_str(), Some("queued" | "outcome_unknown")) {
         return Ok(None);
     }
+    let original_raw: String = tx.query_row(
+        "SELECT original_request_json FROM operations WHERE operation_id=?1",
+        [id],
+        |r| r.get(0),
+    )?;
+    let original: Value = serde_json::from_str(&original_raw)?;
+    let input = SubmitRequest::parse(&original)?;
+    current(&tx, &p, &input)?;
     let raw: String = tx.query_row(
         "SELECT effective_request_json FROM operations WHERE operation_id=?1",
         [id],
@@ -173,28 +181,88 @@ pub(super) fn finish(
     )?;
     let input = SubmitRequest::parse(&serde_json::from_str(&raw)?)?;
     let checked = outcome.and_then(|record| {
-        let p = current_principal(&tx, p)?;
-        let a = current(&tx, &p, &input)?;
+        // Publication is an already-crossed filesystem boundary. Do not let
+        // a GM handover turn a verified immutable artifact into an orphan;
+        // validate the retained submitter/candidate/Attempt provenance here,
+        // while begin() remains the current-actor authorization boundary.
+        let a = tasks::get_attempt(&tx, &input.attempt_id)?;
+        let task = tasks::get_task(&tx, model::text(&a, "task_id")?)?;
         let candidate = candidate(&tx, &a, &input)?;
-        if record.metadata["candidate_ref"] != candidate.artifact_id
-            || record.metadata["candidate_sha256"] != candidate.content_digest
+        let effective_raw: String = tx.query_row(
+            "SELECT effective_request_json FROM operations WHERE operation_id=?1",
+            [id],
+            |row| row.get(0),
+        )?;
+        let effective: Value = serde_json::from_str(&effective_raw)?;
+        let document = &effective["submission_document"];
+        let mut expected_metadata = document.clone();
+        if let Some(fields) = expected_metadata.as_object_mut() {
+            fields.remove("claims");
+            fields.remove("summary");
+        }
+        let bytes = model::canonical(document)?.into_bytes();
+        let expected_artifact_id = format!("submission-{}", model::digest(id.as_bytes()));
+        if document["schema_version"] != 1
+            || document["operation_id"] != id
+            || document["task_id"] != a["task_id"]
+            || op["task_id"] != document["task_id"]
+            || document["attempt_id"] != input.attempt_id
+            || op["attempt_id"] != document["attempt_id"]
+            || document["task_revision"] != input.expected_revision
+            || document["owner_id"] != a["owner_id"]
+            || document["submitted_by"] != op["caller_id"]
+            || document["candidate_ref"] != candidate.artifact_id
+            || document["candidate_sha256"] != candidate.content_digest
+            || document["candidate_kind"] != candidate.kind
+            || document["candidate_byte_length"] != candidate.byte_length
+            || document["previous_submission_ref"] != json!(input.expected_submission_ref)
+            || record.kind != "task_submission"
+            || record.artifact_id != expected_artifact_id
+            || record.relative_path != format!("artifacts/{expected_artifact_id}.bin")
+            || record.byte_length != bytes.len() as u64
+            || record.content_digest != model::digest(&bytes)
+            || record.metadata != expected_metadata
         {
             return Err(Error::conflict(
-                "candidate changed during submission publication",
+                "published submission differs from its retained operation, Attempt, or candidate",
             ));
         }
-        Ok(record)
+        let still_current = task["state"] == "open"
+            && task["revision"] == input.expected_revision
+            && task["current_attempt_id"] == input.attempt_id
+            && a["task_revision"] == input.expected_revision
+            && a["released_at_ms"].is_null()
+            && a["submission_ref"] == json!(input.expected_submission_ref)
+            && matches!(
+                a["state"].as_str(),
+                Some(
+                    "reserved" | "running" | "submitted" | "needs_correction" | "recovery_pending"
+                )
+            );
+        Ok((record, still_current))
     });
     let now = model::now_ms()?;
     let value = match checked {
-        Ok(a) => {
+        Ok((a, true)) => {
             tx.execute("INSERT INTO artifacts(artifact_id,relative_path,kind,byte_length,content_digest,created_at_ms,metadata_json) VALUES(?1,?2,'task_submission',?3,?4,?5,?6)",
                 params![a.artifact_id,a.relative_path,i64::try_from(a.byte_length).map_err(|_| Error::invalid("submission too large"))?,a.content_digest,now,model::canonical(&a.metadata)?])?;
-            tx.execute("UPDATE attempts SET state='submitted',submission_ref=?2,candidate_ref=?3,updated_at_ms=?4 WHERE attempt_id=?1",
-                params![input.attempt_id,a.artifact_id,input.candidate_ref,now])?;
+            let changed = tx.execute("UPDATE attempts SET state='submitted',submission_ref=?2,candidate_ref=?3,updated_at_ms=?4 WHERE attempt_id=?1 AND released_at_ms IS NULL AND task_revision=?5",
+                params![input.attempt_id,a.artifact_id,input.candidate_ref,now,input.expected_revision])?;
+            if changed != 1 {
+                return Err(Error::conflict(
+                    "Attempt changed before the published submission was recorded",
+                ));
+            }
             json!({"operation_id":id,"outcome":"applied","attempt_id":input.attempt_id,
                 "submission_ref":a.artifact_id,"candidate_ref":input.candidate_ref,
                 "claim_counts":a.metadata["claim_counts"],"state":"submitted","task_accepted":false})
+        }
+        Ok((a, false)) => {
+            tx.execute("INSERT INTO artifacts(artifact_id,relative_path,kind,byte_length,content_digest,created_at_ms,metadata_json) VALUES(?1,?2,'task_submission',?3,?4,?5,?6)",
+                params![a.artifact_id,a.relative_path,i64::try_from(a.byte_length).map_err(|_| Error::invalid("submission too large"))?,a.content_digest,now,model::canonical(&a.metadata)?])?;
+            json!({"operation_id":id,"outcome":"stale_submission_scope","attempt_id":input.attempt_id,
+                "submission_artifact_ref":a.artifact_id,"candidate_ref":input.candidate_ref,
+                "task_accepted":false,"applied_to_attempt":false})
         }
         Err(e) => json!({"operation_id":id,"outcome":"failed","error":e,"task_accepted":false}),
     };
@@ -398,6 +466,9 @@ fn request_changes_core(
     let a = tasks::get_attempt(tx, &input.attempt_id)?;
     let scoped_manager = match actor {
         FeedbackActor::Direct(p) => {
+            if p.role == Role::Manager && a["owner_id"] != p.client_id {
+                super::gm::require_attempt_control(tx, p, &a)?;
+            }
             let legacy_authority = p.role == Role::Operator
                 || (p.role == Role::Manager
                     && super::gm::record(tx)?

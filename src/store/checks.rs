@@ -758,7 +758,7 @@ fn cache_hit_is_current(
 fn attempt(db: &Connection, p: &Principal, id: &str) -> Result<Value> {
     p.require_writer()?;
     let a = tasks::get_attempt(db, id)?;
-    p.owns(model::text(&a, "owner_id")?)?;
+    super::gm::require_attempt_control(db, p, &a)?;
     let t = tasks::get_task(db, model::text(&a, "task_id")?)?;
     if !a["released_at_ms"].is_null() || t["state"] != "open" || t["revision"] != a["task_revision"]
     {
@@ -992,7 +992,7 @@ pub(super) fn cancel(tx: &Transaction<'_>, p: &Principal, v: &Value, id: &str) -
     let reason = model::text(v, "reason")?;
     let c = describe(tx, &json!({"check_id":check}))?;
     let a = tasks::get_attempt(tx, model::text(&c, "attempt_id")?)?;
-    p.owns(model::text(&a, "owner_id")?)?;
+    super::gm::require_attempt_control(tx, p, &a)?;
     if !matches!(
         c["state"].as_str(),
         Some("queued" | "running" | "reconciling")

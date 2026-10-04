@@ -40,7 +40,7 @@ pub(super) fn record(db: &Connection) -> Result<Option<Value>> {
 
 /// Authority for GM-only operations: the local operator, or the client that
 /// currently holds the GM designation. Checks happen both at admission and at
-/// dispatch/begin, so a rotation between the two revokes the old GM there.
+/// dispatch/begin, so a principal rotation between the two revokes the old GM.
 pub(super) fn require_authority(db: &Connection, p: &Principal) -> Result<()> {
     if p.role == Role::Operator {
         return Ok(());
@@ -51,6 +51,53 @@ pub(super) fn require_authority(db: &Connection, p: &Principal) -> Result<()> {
         return Ok(());
     }
     Err(Error::new("FORBIDDEN", "GM or operator authority required"))
+}
+
+/// Admit control of an Attempt by its original owner or the verified local
+/// Operator. A different Manager may control it only while they are the
+/// current GM and it is still the exact unreleased Attempt of the current
+/// Task revision and project.
+pub(super) fn require_attempt_control(
+    db: &Connection,
+    p: &Principal,
+    attempt: &Value,
+) -> Result<()> {
+    let current = super::current_principal(db, p.clone())?;
+    let attempt_id = model::text(attempt, "attempt_id")?;
+    let attempt = super::tasks::get_attempt(db, attempt_id)?;
+    let owner_id = model::text(&attempt, "owner_id")?;
+    if current.owns(owner_id).is_ok() {
+        return Ok(());
+    }
+    if current.role != Role::Manager {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "attempt control requires its owner or the current GM",
+        ));
+    }
+    require_authority(db, &current)?;
+
+    let task_id = model::text(&attempt, "task_id")?;
+    let task = super::tasks::get_task(db, task_id)?;
+    if task["current_attempt_id"] != attempt_id
+        || !attempt["released_at_ms"].is_null()
+        || task["revision"] != attempt["task_revision"]
+    {
+        return Err(Error::new(
+            "ATTEMPT_SCOPE_STALE",
+            "current GM control requires the exact current unreleased Attempt and Task revision",
+        ));
+    }
+    let project_id = model::text(&task, "project_id")?;
+    if !crate::automation::authorization::current_manager_has_task_scope(
+        db, &current, task_id, project_id,
+    )? {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "current GM lacks scope for this Task and project",
+        ));
+    }
+    Ok(())
 }
 
 fn mailbox_watermark(db: &Connection, client: Option<&str>) -> Result<i64> {
@@ -90,8 +137,9 @@ fn resync_checkpoint(db: &Connection, previous: Option<&Value>, successor: &str)
 }
 
 /// Designate a registered client as the current GM, optionally naming the
-/// native binding its GM session runs on. The epoch advances by exactly one
-/// per actual rotation and never otherwise moves.
+/// native binding its GM session runs on. The client principal defines GM
+/// authority; binding changes update only the session pointer and preserve
+/// the epoch.
 pub(super) fn handover(tx: &Transaction<'_>, p: &Principal, v: &Value, id: &str) -> Result<Value> {
     require_authority(tx, p)?;
     model::fields(
@@ -147,12 +195,30 @@ pub(super) fn handover(tx: &Transaction<'_>, p: &Principal, v: &Value, id: &str)
     {
         return Err(Error::conflict("GM designation is unchanged"));
     }
-    let epoch = previous
+    let authority_changed = previous.as_ref().is_none_or(|gm| gm["client_id"] != client);
+    let session_binding_changed = match &previous {
+        Some(gm) => {
+            gm["binding_id"] != binding_id || gm["binding_generation"] != binding_generation
+        }
+        None => !binding_id.is_null(),
+    };
+    let previous_epoch = previous
         .as_ref()
         .and_then(|gm| gm["epoch"].as_i64())
-        .unwrap_or(0)
-        .checked_add(1)
-        .ok_or_else(|| Error::new("EPOCH_OVERFLOW", "GM epoch exhausted"))?;
+        .unwrap_or(0);
+    let epoch = if authority_changed {
+        previous_epoch
+            .checked_add(1)
+            .ok_or_else(|| Error::new("EPOCH_OVERFLOW", "GM epoch exhausted"))?
+    } else {
+        previous_epoch
+    };
+    let previous_binding_id = previous
+        .as_ref()
+        .map_or(Value::Null, |gm| gm["binding_id"].clone());
+    let previous_binding_generation = previous
+        .as_ref()
+        .map_or(Value::Null, |gm| gm["binding_generation"].clone());
     // Captured in the same transaction as the designation. Watermarks name
     // committed facts before the handover observation. They never advance a
     // consumer cursor or discard older, potentially unread historical mail.
@@ -165,6 +231,10 @@ pub(super) fn handover(tx: &Transaction<'_>, p: &Principal, v: &Value, id: &str)
         "handover_operation_id": id,
         "previous_client_id": previous.as_ref().map_or(Value::Null, |gm| gm["client_id"].clone()),
         "previous_gm_epoch": previous.as_ref().map_or(Value::Null, |gm| gm["epoch"].clone()),
+        "previous_binding_id": previous_binding_id,
+        "previous_binding_generation": previous_binding_generation,
+        "authority_changed": authority_changed,
+        "session_binding_changed": session_binding_changed,
         "resync": resync,
     });
     set_meta(tx, "gm", &designation)?;
@@ -176,6 +246,10 @@ pub(super) fn handover(tx: &Transaction<'_>, p: &Principal, v: &Value, id: &str)
         "gm_epoch": epoch,
         "previous_client_id": previous.as_ref().map_or(Value::Null, |gm| gm["client_id"].clone()),
         "previous_gm_epoch": previous.as_ref().map_or(Value::Null, |gm| gm["epoch"].clone()),
+        "previous_binding_id": previous_binding_id,
+        "previous_binding_generation": previous_binding_generation,
+        "authority_changed": authority_changed,
+        "session_binding_changed": session_binding_changed,
         "resync": resync,
         "manager_tasks_automatically_cancelled": false,
     }))
@@ -189,7 +263,7 @@ mod tests {
     fn database() -> Connection {
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch(super::super::SCHEMA).unwrap();
-        for client in ["old", "new"] {
+        for client in ["old", "new", "owner", "unrelated"] {
             set_meta(
                 &db,
                 &format!("client:{client}"),
@@ -198,6 +272,31 @@ mod tests {
             .unwrap();
         }
         db
+    }
+
+    fn binding(db: &Connection, id: &str, lane: &str) {
+        db.execute(
+            "INSERT INTO bindings(binding_id,generation,lane_id,module_instance_id,module_artifact_id,state,route_json,state_json,created_at_ms) \
+             VALUES(?1,1,?2,'test-module','test-artifact','ready','{}','{}',1)",
+            params![id, lane],
+        )
+        .unwrap();
+    }
+
+    fn attempt(db: &Connection, attempt_id: &str, owner_id: &str) -> Value {
+        db.execute(
+            "INSERT INTO tasks(task_id,project_id,revision,state,spec_json,created_at_ms,updated_at_ms) \
+             VALUES('task-1','project-1',1,'open','{}',1,1)",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO attempts(attempt_id,task_id,task_revision,task_snapshot_json,owner_id,start_owner,state,producers_json,created_at_ms,updated_at_ms) \
+             VALUES(?1,'task-1',1,'{}',?2,'controller','running','[]',1,1)",
+            params![attempt_id, owner_id],
+        )
+        .unwrap();
+        super::super::tasks::get_attempt(db, attempt_id).unwrap()
     }
 
     fn principal(client: &str, role: Role) -> Principal {
@@ -284,5 +383,146 @@ mod tests {
         let readback = resync_checkpoint(&tx, Some(&original), "new").unwrap();
         assert_eq!(readback["report_watermark"], 0);
         assert_eq!(record(&tx).unwrap().unwrap(), original);
+    }
+
+    #[test]
+    fn same_client_binding_changes_preserve_gm_epoch_but_principal_rotation_advances_it() {
+        let mut db = database();
+        binding(&db, "gm-session-old", "lane-old");
+        binding(&db, "gm-session-new", "lane-new");
+        set_meta(
+            &db,
+            "gm",
+            &json!({
+                "client_id":"old",
+                "binding_id":"gm-session-old",
+                "binding_generation":1,
+                "epoch":7
+            }),
+        )
+        .unwrap();
+
+        let tx = db.transaction().unwrap();
+        let rebind = handover(
+            &tx,
+            &principal("old", Role::Manager),
+            &json!({
+                "client_id":"old",
+                "binding_id":"gm-session-new",
+                "binding_generation":1
+            }),
+            "same-client-rebind",
+        )
+        .unwrap();
+        assert_eq!(rebind["gm_epoch"], 7);
+        assert_eq!(rebind["authority_changed"], false);
+        assert_eq!(rebind["session_binding_changed"], true);
+        assert_eq!(rebind["previous_binding_id"], "gm-session-old");
+        assert_eq!(rebind["previous_binding_generation"], 1);
+        assert_eq!(rebind["resync"]["resync_required"], true);
+        assert_eq!(record(&tx).unwrap().unwrap()["epoch"], 7);
+        assert!(require_authority(&tx, &principal("old", Role::Manager)).is_ok());
+
+        let unchanged = handover(
+            &tx,
+            &principal("old", Role::Manager),
+            &json!({
+                "client_id":"old",
+                "binding_id":"gm-session-new",
+                "binding_generation":1
+            }),
+            "same-client-same-session",
+        )
+        .unwrap_err();
+        assert_eq!(unchanged.code, "CONFLICT");
+
+        let detach = handover(
+            &tx,
+            &principal("old", Role::Manager),
+            &json!({"client_id":"old"}),
+            "same-client-detach",
+        )
+        .unwrap();
+        assert_eq!(detach["gm_epoch"], 7);
+        assert_eq!(detach["authority_changed"], false);
+        assert_eq!(detach["session_binding_changed"], true);
+        assert_eq!(detach["previous_binding_id"], "gm-session-new");
+        assert_eq!(detach["previous_binding_generation"], 1);
+        assert_eq!(record(&tx).unwrap().unwrap()["epoch"], 7);
+
+        let rotate = handover(
+            &tx,
+            &principal("old", Role::Manager),
+            &json!({"client_id":"new"}),
+            "different-client-handover",
+        )
+        .unwrap();
+        assert_eq!(rotate["gm_epoch"], 8);
+        assert_eq!(rotate["authority_changed"], true);
+        assert_eq!(rotate["session_binding_changed"], false);
+        assert_eq!(rotate["previous_client_id"], "old");
+        assert_eq!(rotate["previous_gm_epoch"], 7);
+        assert!(require_authority(&tx, &principal("old", Role::Manager)).is_err());
+        assert!(require_authority(&tx, &principal("new", Role::Manager)).is_ok());
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn attempt_control_requires_current_gm_scope_and_exact_live_attempt() {
+        let mut db = database();
+        let attempt = attempt(&db, "attempt-1", "owner");
+        set_meta(
+            &db,
+            "gm",
+            &json!({"client_id":"old","binding_id":null,"binding_generation":null,"epoch":1}),
+        )
+        .unwrap();
+        let tx = db.transaction().unwrap();
+        handover(
+            &tx,
+            &principal("old", Role::Manager),
+            &json!({"client_id":"new"}),
+            "promote-successor",
+        )
+        .unwrap();
+        assert!(require_attempt_control(&tx, &principal("new", Role::Manager), &attempt).is_ok());
+        assert_eq!(
+            require_attempt_control(&tx, &principal("unrelated", Role::Manager), &attempt)
+                .unwrap_err()
+                .code,
+            "FORBIDDEN"
+        );
+        // Existing owner authority is preserved even when delegated GM scope
+        // later becomes stale.
+        assert!(require_attempt_control(&tx, &principal("owner", Role::Manager), &attempt).is_ok());
+        tx.commit().unwrap();
+
+        db.execute("UPDATE tasks SET revision=2 WHERE task_id='task-1'", [])
+            .unwrap();
+        assert_eq!(
+            require_attempt_control(&db, &principal("new", Role::Manager), &attempt)
+                .unwrap_err()
+                .code,
+            "ATTEMPT_SCOPE_STALE"
+        );
+        assert!(require_attempt_control(&db, &principal("owner", Role::Manager), &attempt).is_ok());
+
+        db.execute("UPDATE tasks SET revision=1 WHERE task_id='task-1'", [])
+            .unwrap();
+        db.execute(
+            "UPDATE attempts SET state='failed',released_at_ms=2 WHERE attempt_id='attempt-1'",
+            [],
+        )
+        .unwrap();
+        let released = super::super::tasks::get_attempt(&db, "attempt-1").unwrap();
+        assert_eq!(
+            require_attempt_control(&db, &principal("new", Role::Manager), &released)
+                .unwrap_err()
+                .code,
+            "ATTEMPT_SCOPE_STALE"
+        );
+        assert!(
+            require_attempt_control(&db, &principal("owner", Role::Manager), &released).is_ok()
+        );
     }
 }

@@ -52,6 +52,14 @@ The server derives `owner_manager_id` from the authenticated creating manager. A
 
 An actually appointed AI manager has the same configuration path regardless of how its session was launched. Profile titles and script role names do not appoint managers. Stable manager identity is separate from a native session and an ephemeral MCP connection.
 
+For recovery, `automation.config.get` and `automation.config.explain` accept an
+optional `owner_manager_id` read selector. Omission selects the authenticated
+manager. The designated current GM may inspect another manager's retained entries,
+cursors and linked history in the requested project. This read preserves the
+original owner and does not enable, copy, transfer or reset an entry. Ordinary
+manager mutations remain scoped to their own entries. See
+[GM session continuity](../gm-session-continuity.md).
+
 Effective automatic authority is:
 
 ```text

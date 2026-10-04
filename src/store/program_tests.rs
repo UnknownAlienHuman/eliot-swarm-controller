@@ -941,7 +941,7 @@ async fn automatic_publication_retains_exact_cause_and_reuses_slot_after_gm_hand
         .await
         .unwrap();
     owner.store.supervise_forge_once().await.unwrap();
-    let new_manager_error = owner
+    let successor_operation = owner
         .store
         .call(
             principal("review-owner-v2", Role::Manager),
@@ -949,8 +949,67 @@ async fn automatic_publication_retains_exact_cause_and_reuses_slot_after_gm_hand
             json!({"operation_id":automatic_operation_id}),
         )
         .await
+        .unwrap();
+    assert_eq!(successor_operation["state"], "settled");
+    assert_eq!(successor_operation["result"]["outcome"], "stale_gm_epoch");
+    assert_eq!(successor_operation["result"]["publication"], "not_started");
+    assert_eq!(
+        successor_operation["caller_id"],
+        crate::automation::authorization::AUTOMATION_TECHNICAL_REQUESTER_ID
+    );
+    let retained_link_id = automatic_operation_id.clone();
+    let retained_link = owner
+        .store
+        .run(move |db| {
+            crate::automation::authorization::operation_link(db, &retained_link_id)?
+                .ok_or_else(|| Error::new("NOT_FOUND", "retained publication attribution"))
+        })
+        .await
+        .unwrap();
+    assert_eq!(retained_link.effective_manager_id, "review-gm");
+    let successor_history = owner
+        .store
+        .call(
+            principal("review-owner-v2", Role::Manager),
+            "operation.list".into(),
+            json!({"state":"settled","limit":200,"after":0}),
+        )
+        .await
+        .unwrap();
+    assert!(
+        successor_history["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["operation_id"] == automatic_operation_id)
+    );
+    let unrelated = principal("unrelated-manager", Role::Manager);
+    let unrelated_error = owner
+        .store
+        .call(
+            unrelated.clone(),
+            "operation.get".into(),
+            json!({"operation_id":automatic_operation_id}),
+        )
+        .await
         .unwrap_err();
-    assert_eq!(new_manager_error.code, "NOT_FOUND");
+    assert_eq!(unrelated_error.code, "NOT_FOUND");
+    let unrelated_history = owner
+        .store
+        .call(
+            unrelated,
+            "operation.list".into(),
+            json!({"state":"settled","limit":200,"after":0}),
+        )
+        .await
+        .unwrap();
+    assert!(
+        unrelated_history["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["operation_id"] != automatic_operation_id)
+    );
     let retained_operation = owner
         .store
         .call(

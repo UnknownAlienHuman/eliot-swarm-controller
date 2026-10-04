@@ -355,7 +355,7 @@ pub(super) fn release(
         ));
     }
     let a = get_attempt(tx, attempt_id)?;
-    p.owns(model::text(&a, "owner_id")?)?;
+    super::gm::require_attempt_control(tx, p, &a)?;
     if !a["released_at_ms"].is_null() {
         operations::prepare_owned_service_attempt_release(tx, &a, id, now)?;
         return Ok(

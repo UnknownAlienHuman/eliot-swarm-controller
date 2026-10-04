@@ -443,8 +443,13 @@ static TOOLS: &[(bool, ToolSpec)] = &[
     ),
     read(
         "automation.config.get",
-        "Page revisioned automation definitions owned by the authenticated Manager and scoped to one project.",
-        &[f("project_id", S), f("after", I), f("limit", I)],
+        "Page revisioned automation definitions owned by the authenticated Manager and scoped to one project. The current GM may optionally select owner_manager_id to recover another Manager's retained state in that same project; the original owner is preserved.",
+        &[
+            f("project_id", S),
+            f("owner_manager_id", S),
+            f("after", I),
+            f("limit", I),
+        ],
         &["project_id"],
     ),
     read(
@@ -455,8 +460,12 @@ static TOOLS: &[(bool, ToolSpec)] = &[
     ),
     read(
         "automation.config.explain",
-        "Explain one owned automation's dispatch state and linked operations by exact project and automation ID.",
-        &[f("project_id", S), f("automation_id", S)],
+        "Explain one automation's dispatch state and linked operations by exact project and automation ID. The current GM may optionally select owner_manager_id to recover another Manager's retained state; the original owner is preserved.",
+        &[
+            f("project_id", S),
+            f("automation_id", S),
+            f("owner_manager_id", S),
+        ],
         &["project_id", "automation_id"],
     ),
     read("host.status", "Controller status snapshot.", &[], &[]),

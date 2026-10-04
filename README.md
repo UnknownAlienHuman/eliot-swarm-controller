@@ -96,7 +96,27 @@ Mailbox readers have independent cursors. Module credentials are binding-scoped 
 
 ### GM designation and handover
 
-GM authority is a designation with its own epoch, not another client role. `gm.handover` — callable by the local operator or the current GM — names a registered non-module client, optionally with the binding its GM session runs on, and advances the GM epoch by exactly one. Until the first handover, GM-only authority (acceptance and its invalidation, client registration/list, host mode) rests with the local operator alone; afterwards the current GM holds it alongside the operator, and a former GM loses it at both admission and the later dispatch/begin rechecks. Handover changes only the designation record: manager Attempts keep their owners, admitted native work is neither restarted nor cancelled, and pending decisions and per-reader mailbox cursors survive. `host.status` reports the current designation, its epoch and `gm_wake_mode`. No native push path is qualified for the GM entrypoint, so the wake mode is the explicit `checkpoint_poll`: the GM reads `report.delta`/`message.read` itself and the host runs no hidden model polls. Queued Forge publication freezes its admission epoch; a changed epoch prevents its external push even when the same manager later becomes GM again. Only the bootstrap local operator may cancel that never-sent stale publication. Sent or unknown effects require readback, and historical client-addressed mailbox entries retain their recipients.
+The project is persistent controller state and survives loss of the GM chat.
+An authenticated connection has a fresh `link_id`; the saved credential retains
+its durable `client_id`. A new chat using that credential needs no handover.
+`gm.handover`, called by the local operator or current GM, appoints a registered
+successor without requiring participation from the old chat. The epoch advances
+when the designated client changes; rebinding the same client to another native
+session preserves it.
+
+The successor can read retained project Operations and explicitly continue exact
+current Attempts. Attempts keep their original owners and audit history records
+the actual acting successor. Initial dispatch identity, native binding generation,
+unresolved-effect readback and independent acceptance remain checked. Former-owner
+automation settings and explanations are available to the current GM through the
+explicit read-only `owner_manager_id` selector. See the
+[reconnect and recovery commands](docs/gm-session-continuity.md).
+
+`host.status` reports the current designation, epoch and `gm_wake_mode`. Wake is
+`checkpoint_poll` until a native push entrypoint is qualified. Queued Forge
+publication freezes its authority epoch; a client handover prevents the old
+never-sent publication from pushing. Sent or unknown effects require readback,
+and historical client-addressed mailbox entries retain their recipients.
 
 ### Recorded Muse recovery
 

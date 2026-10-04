@@ -2,7 +2,7 @@
 
 ## Current state
 
-**Current source status:** C12 source fa38ea3287dfba0bf9c7e3c7658c4f3aad9580d8 is published. Formatting, JavaScript syntax, production Clippy (14.39 s), debug build (39.04 s), the corrected real-Store regression (1/1, 0.10 s; owner-positive, GM-self and Operator-negative cases), and exact-source audit SHA-256 5A28B4C381492C70D86F7ACE68DEF82EA9DA2202261B26F03FA7C6C4B5CA389D passed. CI run [37176386371](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37176386371) completed successfully on Windows and Ubuntu, verified on 2026-10-04 at 04:28 UTC. The earlier C11 run [37174102156](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37174102156) remains green for exact source 4ecc030e072be1b3fdf39e2b3ead122953e4de82.
+**Published source checkpoint:** C13/C14 source 509715b34f2739fd1d71d2d62418ea0ff9cdf1cc is saved in main. CI run [37180875162](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37180875162) completed successfully on Windows and Ubuntu, verified on 2026-10-04 at 06:00 UTC. It includes owned-crate formatting, production Clippy, the complete Rust application/protocol suite, offline native-module fixtures and builds. C12 source fa38ea3287dfba0bf9c7e3c7658c4f3aad9580d8 and C11 source 4ecc030e072be1b3fdf39e2b3ead122953e4de82 also have successful cross-platform CI. Live model and full O7 qualification remain separate.
 
 C10 adds the optional exact `launch_operation_id` to the actual `task.dispatch` schema and Store contract for launch-owned Attempts. The Store checks the retained parent, exact Task/Attempt/binding/lease lineage, immutable prompt packet, and current C8 MCP capability proof before native input. The owned-provider path accepts one explicitly configured provider credential source and reports `stored_unverified` only for credential metadata; that does not prove key validity or provider/model consumption.
 
@@ -28,7 +28,25 @@ C13 implements an explicit accepted-candidate publication consumer, typed curren
 
 Production formatting, warnings-denied Clippy (15.19 s) and debug build (37.78 s) passed. The candidate SHA-256 is 984B38A3567E572D14EE1D01BADBD343C1FE1575BB6ECEB75AD2A55598B6371B. The existing owner-sponsored acceptance/history check passed. The dedicated publication regression exposed an incomplete synthetic submission result, an outdated explain method name, and an incorrect successor-manager history-read expectation. All three are corrected; the final corrected regression and pending Forge endpoint check have not yet run. No production permission check was weakened.
 
-**Resume here:** run only `automatic_publication_retains_exact_cause_and_reuses_slot_after_gm_handover` and `exact_push_endpoint_controls_expected_old_and_readback_with_split_remote_urls`, then inspect CI for this saved source. The private root gate supports reusing the unchanged successful production gates. The C14 fresh-start diagnostic harness is prepared and source-audited, but unexecuted; preserve all earlier unknown runs without replay. The full native O7 cycle remains incomplete. Save further implementation increments before extended verification.
+The later full CI for 509715b passed both publication and Forge endpoint regressions. The successor-manager denial in that historical publication test is being changed to the explicit continuity requirement below; its old passing result does not qualify the new behavior. The C14 fresh-start diagnostic harness is prepared and source-audited, but unexecuted; preserve all earlier unknown runs without replay. The full native O7 cycle remains incomplete.
+
+### GM continuity correction — 2026-10-04
+
+The accepted requirement is that losing a GM chat must not strand project work.
+Same-credential reconnect already preserves the durable client identity. The
+source now implements different-successor control of current Attempts,
+native admission and operational history, former-owner automation readback, and
+same-client binding changes that previously rotated the GM epoch. Original owner,
+caller, workspace and producer history remain retained. It also preserves verified
+submission artifacts when GM authority changes during local publication. The
+source increment is ready to save; its focused verification is pending. The requirement is saved in ac6691c and
+described in [GM session continuity](gm-session-continuity.md).
+
+**Resume here:** run the saved continuity increment's focused Store checks once.
+Continue owned native startup diagnosis and full O7 afterwards. Deterministic
+file readback for a submission left unknown by a host crash remains separate.
+Automatic transfer of every former manager's automation entry remains separate;
+readback must not reset its cursors or replay its effects.
 
 ### Prior C7/C8 evidence
 
@@ -56,7 +74,7 @@ and qualification follow it.
    negotiated contracts, unsupported watch predicates and durable Concilium
    rounds remain.
 
-2. **O1 manager-owned automation actions — Partial.** Owner-scoped configuration get/preview/apply/explain, WorkDispatch, ReviewDispatch, bounded ReviewDisposition, typed manager authority, and shared manual/automatic semantic slots are wired. C10 publishes the launch-parent dispatch schema and Store gate. C11 adds RepairDispatch and acceptance consumers on typed ledgers/cursors, with same-slot reuse, GM epoch and byte-verification checks, structured reviews, and manager history/visibility. C12 publishes the owner-sponsored acceptance route to an independent GM. Automated publication and GitHub projection remain gaps.
+2. **O1 manager-owned automation actions — Partial.** Owner-scoped configuration get/preview/apply/explain, WorkDispatch, ReviewDispatch, bounded ReviewDisposition, typed manager authority, and shared manual/automatic semantic slots are wired. C10 publishes the launch-parent dispatch schema and Store gate. C11 adds RepairDispatch and acceptance consumers on typed ledgers/cursors, with same-slot reuse, GM epoch and byte-verification checks, structured reviews, and manager history/visibility. C12 publishes owner-sponsored acceptance to an independent GM. C13 implements automated accepted-candidate publication; live publication qualification and GitHub projection remain gaps.
 
 3. **O2 durable intake and shared monitoring — Partial.** The dispatcher consumes bounded shared intake and journal readback for committed local controller/task.submission observations. Participant credential issuance, authenticated configured/connect readback, and C9 fresh-owned service lifecycle/readback are in the source path. Other source adapters are not admitted. C10 actual MCP schema and provider-auth gate are source-verified. Native OpenCode and end-to-end qualification remain partial; see Current State above for the latest evidence.
 

@@ -1342,6 +1342,30 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
         )
     )
     OR (
+        op.method IN ('check.run', 'check.cancel')
+        AND op.task_id IS NOT NULL
+        AND op.attempt_id IS NOT NULL
+        AND EXISTS (
+            SELECT 1 FROM check_runs AS check_run
+            JOIN attempts AS target_attempt
+              ON target_attempt.attempt_id = check_run.attempt_id
+            JOIN tasks AS target ON target.task_id = target_attempt.task_id
+            JOIN meta AS manager ON manager.key = 'client:' || :client
+            JOIN meta AS current_gm ON current_gm.key = 'gm'
+            WHERE target_attempt.attempt_id = op.attempt_id
+              AND target_attempt.task_id = op.task_id
+              AND target_attempt.released_at_ms IS NULL
+              AND (SELECT latest.attempt_id FROM attempts AS latest
+                   WHERE latest.task_id = target.task_id AND latest.released_at_ms IS NULL
+                   ORDER BY latest.created_at_ms DESC, latest.attempt_id DESC LIMIT 1) = op.attempt_id
+              AND (check_run.operation_id = op.operation_id
+                   OR check_run.check_id = json_extract(op.original_request_json, '$.check_id'))
+              AND json_extract(manager.value_json, '$.role') = 'manager'
+              AND COALESCE(json_extract(manager.value_json, '$.disabled'), 0) = 0
+              AND json_extract(current_gm.value_json, '$.client_id') = :client
+        )
+    )
+    OR (
         op.caller_id = 'eliot-internal-automation-v1'
         AND op.method NOT IN ('task.accept','agent.send')
         AND op.method != 'forge.publish_ref'
@@ -1349,9 +1373,24 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
             SELECT 1 FROM meta AS link
             WHERE link.key = 'automation:v1:operation:' || op.operation_id
               AND json_extract(link.value_json, '$.record.operation_id') = op.operation_id
+              AND json_extract(link.value_json, '$.record.action') = op.method
               AND json_extract(link.value_json, '$.record.technical_requester_id') = op.caller_id
-              AND json_extract(link.value_json, '$.record.effective_manager_id') = :client
-              AND json_extract(op.effective_request_json, '$.automation_on_behalf.effective_manager_id') = :client
+              AND json_extract(op.effective_request_json, CASE op.method
+                    WHEN 'review.assign' THEN '$.on_behalf.effective_manager_id'
+                    ELSE '$.automation_on_behalf.effective_manager_id' END)
+                  = json_extract(link.value_json, '$.record.effective_manager_id')
+              AND (
+                  json_extract(link.value_json, '$.record.effective_manager_id') = :client
+                  OR EXISTS (
+                      SELECT 1 FROM meta AS successor_manager JOIN meta AS current_gm ON current_gm.key='gm'
+                      JOIN tasks AS target ON target.task_id=op.task_id
+                      WHERE successor_manager.key='client:' || :client
+                        AND json_extract(successor_manager.value_json,'$.role')='manager'
+                        AND COALESCE(json_extract(successor_manager.value_json,'$.disabled'),0)=0
+                        AND json_extract(current_gm.value_json,'$.client_id')=:client
+                        AND target.project_id=json_extract(link.value_json,'$.record.project_id')
+                  )
+              )
         )
     )
     OR (
@@ -1378,7 +1417,10 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
               AND json_type(link.value_json, '$.record.technical_requester_id') = 'text'
               AND json_extract(link.value_json, '$.record.technical_requester_id') = op.caller_id
               AND json_type(link.value_json, '$.record.effective_manager_id') = 'text'
-              AND json_extract(link.value_json, '$.record.effective_manager_id') = :client
+              AND json_type(op.effective_request_json, '$.automation_on_behalf.effective_manager_id') = 'text'
+              AND json_extract(op.effective_request_json, '$.automation_on_behalf.effective_manager_id') = json_extract(link.value_json, '$.record.effective_manager_id')
+              AND (json_extract(link.value_json, '$.record.effective_manager_id') = :client
+                   OR json_extract((SELECT value_json FROM meta WHERE key='gm'), '$.client_id') = :client)
               AND json_type(link.value_json, '$.record.automation_id') = 'text'
               AND length(json_extract(link.value_json, '$.record.automation_id')) > 0
               AND json_type(link.value_json, '$.record.automation_revision') = 'integer'
@@ -1403,6 +1445,8 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
               AND json_extract(link.value_json, '$.record.cause.observation_id') > 0
               AND json_type(link.value_json, '$.record.cause.task_id') = 'text'
               AND json_type(link.value_json, '$.record.cause.task_revision') = 'integer'
+              AND json_type(link.value_json, '$.record.cause.canonical_repository') = 'text'
+              AND length(json_extract(link.value_json, '$.record.cause.canonical_repository')) > 0
               AND json_extract(link.value_json, '$.record.cause.task_revision') > 0
               AND json_type(link.value_json, '$.record.cause.attempt_id') = 'text'
               AND json_type(link.value_json, '$.record.cause.submission_ref') = 'text'
@@ -1440,10 +1484,11 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
               AND json_extract(op.original_request_json, '$.expected_old_ref') IS json_extract(link.value_json, '$.record.cause.expected_old_ref')
               AND json_type(op.original_request_json, '$.expected_create') IN ('true', 'false')
               AND json_extract(op.original_request_json, '$.expected_create') IS json_extract(link.value_json, '$.record.cause.expected_create')
-              AND json_extract(op.effective_request_json, '$.automation_on_behalf.effective_manager_id') = :client
+              AND json_extract(op.effective_request_json, '$.automation_on_behalf.effective_manager_id') = json_extract(link.value_json, '$.record.effective_manager_id')
               AND json_type(op.effective_request_json, '$.publication_intent') = 'object'
               AND json_extract(op.effective_request_json, '$.publication_intent.operation_id') = op.operation_id
               AND json_extract(op.effective_request_json, '$.publication_intent.project_id') = target.project_id
+              AND json_extract(op.effective_request_json, '$.publication_intent.canonical_repository') = json_extract(link.value_json, '$.record.cause.canonical_repository')
               AND json_extract(op.effective_request_json, '$.publication_intent.attempt_id') = op.attempt_id
               AND json_extract(op.effective_request_json, '$.publication_intent.task_revision') = json_extract(link.value_json, '$.record.cause.task_revision')
               AND json_extract(op.effective_request_json, '$.publication_intent.admitted_gm_epoch') = json_extract(link.value_json, '$.record.cause.gm_epoch')
@@ -1511,7 +1556,9 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
               AND json_extract(link.value_json,'$.record.operation_id')=op.operation_id
               AND json_extract(link.value_json,'$.record.action')='task.accept'
               AND json_extract(link.value_json,'$.record.technical_requester_id')=op.caller_id
-              AND json_extract(link.value_json,'$.record.effective_manager_id')=:client
+              AND json_extract(link.value_json,'$.record.effective_manager_id')=json_extract(op.effective_request_json,'$.automation_on_behalf.effective_manager_id')
+              AND (json_extract(link.value_json,'$.record.effective_manager_id')=:client
+                   OR EXISTS (SELECT 1 FROM meta AS current_gm WHERE current_gm.key='gm' AND json_extract(current_gm.value_json,'$.client_id')=:client))
               AND json_extract(link.value_json,'$.record.project_id')=target.project_id
               AND json_extract(link.value_json,'$.record.cause.kind')='review_result'
               AND json_extract(link.value_json,'$.record.cause.identity.task_id')=op.task_id
@@ -1520,7 +1567,7 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
               AND json_extract(op.original_request_json,'$.expected_revision')=json_extract(link.value_json,'$.record.cause.identity.task_revision')
               AND json_extract(op.original_request_json,'$.submission_ref')=json_extract(link.value_json,'$.record.cause.identity.submission_ref')
               AND json_extract(op.original_request_json,'$.candidate_ref')=json_extract(link.value_json,'$.record.cause.identity.candidate_ref')
-              AND json_extract(op.effective_request_json,'$.automation_on_behalf.effective_manager_id')=:client
+              AND json_extract(op.effective_request_json,'$.automation_on_behalf.effective_manager_id')=json_extract(link.value_json,'$.record.effective_manager_id')
               AND json_extract(manager.value_json,'$.role')='manager'
               AND COALESCE(json_extract(manager.value_json,'$.disabled'),0)=0
               AND (EXISTS (SELECT 1 FROM attempts AS owned WHERE owned.task_id=target.task_id AND owned.owner_id=:client AND owned.released_at_ms IS NULL)
@@ -1536,7 +1583,12 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
               AND json_extract(link.value_json, '$.record.operation_id') = op.operation_id
               AND json_extract(link.value_json, '$.record.action') = op.method
               AND json_extract(link.value_json, '$.record.technical_requester_id') = op.caller_id
-              AND json_extract(link.value_json, '$.record.effective_manager_id') = :client
+              AND json_extract(link.value_json, '$.record.effective_manager_id') = json_extract(op.effective_request_json, '$.launch_manifest.actor.effective_manager_id')
+              AND (json_extract(link.value_json, '$.record.effective_manager_id') = :client
+                   OR EXISTS (SELECT 1 FROM meta AS current_gm WHERE current_gm.key='gm' AND json_extract(current_gm.value_json,'$.client_id')=:client))
+              AND json_extract(link.value_json, '$.record.automation_id') = json_extract(op.effective_request_json, '$.launch_manifest.actor.automation_id')
+              AND json_extract(link.value_json, '$.record.automation_revision') = json_extract(op.effective_request_json, '$.launch_manifest.actor.automation_revision')
+              AND json_extract(link.value_json, '$.record.semantic_slot_id') = json_extract(op.effective_request_json, '$.launch_manifest.actor.semantic_slot_id')
               AND EXISTS (
                   SELECT 1 FROM tasks AS target JOIN meta AS manager
                     ON manager.key = 'client:' || :client
@@ -1559,7 +1611,9 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
               AND json_extract(link.value_json,'$.record.operation_id')=op.operation_id
               AND json_extract(link.value_json,'$.record.action')='agent.send'
               AND json_extract(link.value_json,'$.record.technical_requester_id')=op.caller_id
-              AND json_extract(link.value_json,'$.record.effective_manager_id')=:client
+              AND json_extract(link.value_json,'$.record.effective_manager_id')=json_extract(op.effective_request_json,'$.automation_on_behalf.effective_manager_id')
+              AND (json_extract(link.value_json,'$.record.effective_manager_id')=:client
+                   OR EXISTS (SELECT 1 FROM meta AS current_gm WHERE current_gm.key='gm' AND json_extract(current_gm.value_json,'$.client_id')=:client))
               AND json_extract(link.value_json,'$.record.project_id')=target.project_id
               AND json_extract(link.value_json,'$.record.task_id')=op.task_id
               AND json_extract(link.value_json,'$.record.attempt_id')=op.attempt_id
@@ -1568,7 +1622,7 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
               AND json_extract(op.original_request_json,'$.binding_id')=op.binding_id
               AND json_extract(op.original_request_json,'$.generation')=op.binding_generation
               AND json_extract(op.original_request_json,'$.delivery')='next_turn'
-              AND json_extract(op.effective_request_json,'$.automation_on_behalf.effective_manager_id')=:client
+              AND json_extract(op.effective_request_json,'$.automation_on_behalf.effective_manager_id')=json_extract(link.value_json,'$.record.effective_manager_id')
               AND json_extract(op.effective_request_json,'$.automation_on_behalf.semantic_slot_id')=json_extract(link.value_json,'$.record.semantic_slot_id')
               AND json_extract(manager.value_json,'$.role')='manager'
               AND COALESCE(json_extract(manager.value_json,'$.disabled'),0)=0
@@ -1590,7 +1644,9 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
                 ELSE json_extract(op.effective_request_json,'$.operation_contract.parent_launch_operation_id') END
               AND parent.method='swarm.launch' AND parent.caller_id=op.caller_id
               AND json_extract(link.value_json,'$.record.operation_id')=parent.operation_id
-              AND json_extract(link.value_json,'$.record.effective_manager_id')=:client
+              AND json_extract(link.value_json,'$.record.effective_manager_id')=json_extract(parent.effective_request_json,'$.launch_manifest.actor.effective_manager_id')
+              AND (json_extract(link.value_json,'$.record.effective_manager_id')=:client
+                   OR EXISTS (SELECT 1 FROM meta AS current_gm WHERE current_gm.key='gm' AND json_extract(current_gm.value_json,'$.client_id')=:client))
               AND json_extract(link.value_json,'$.record.technical_requester_id')=op.caller_id
               AND parent.task_id=json_extract(link.value_json,'$.record.task_id')
               AND json_extract(parent.effective_request_json,'$.launch_manifest.task.task_id')=parent.task_id
@@ -1705,15 +1761,34 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
     )
     OR (
         op.method = 'review.submit'
-        AND json_extract(op.result_json, '$.sponsor_client_id') = :client
         AND EXISTS (
             SELECT 1 FROM observations AS assignment
+            JOIN tasks AS target
+              ON target.task_id = json_extract(assignment.payload_json, '$.identity.task_id')
             WHERE assignment.source_stream_id = 'controller:review'
               AND assignment.kind = 'review.assignment'
               AND json_extract(assignment.payload_json, '$.review_assignment_id') =
                   json_extract(op.result_json, '$.review_assignment_id')
-              AND json_extract(assignment.payload_json, '$.sponsor_client_id') = :client
+              AND json_extract(assignment.payload_json, '$.review_assignment_id') = json_extract(op.result_json, '$.review_assignment_id')
               AND json_extract(assignment.payload_json, '$.reviewer_client_id') = op.caller_id
+              AND json_extract(assignment.payload_json, '$.identity.task_id') = op.task_id
+              AND json_extract(assignment.payload_json, '$.identity.attempt_id') = op.attempt_id
+              AND (
+                  (json_extract(op.result_json, '$.sponsor_client_id') = :client
+                   AND json_extract(assignment.payload_json, '$.sponsor_client_id') = :client)
+                  OR (
+                      target.project_id IS NOT NULL
+                      AND json_extract(assignment.payload_json, '$.on_behalf.effective_manager_id') = json_extract(assignment.payload_json, '$.sponsor_client_id')
+                      AND json_extract(assignment.payload_json, '$.on_behalf.project_id') = target.project_id
+                      AND EXISTS (
+                          SELECT 1 FROM meta AS manager JOIN meta AS current_gm ON current_gm.key='gm'
+                          WHERE manager.key='client:' || :client
+                            AND json_extract(manager.value_json, '$.role')='manager'
+                            AND COALESCE(json_extract(manager.value_json, '$.disabled'), 0)=0
+                            AND json_extract(current_gm.value_json, '$.client_id')=:client
+                      )
+                  )
+              )
         )
     )
     OR (
@@ -3514,6 +3589,8 @@ fn cancel_message(tx: &Transaction<'_>, p: &Principal, v: &Value, id: &str) -> R
 
 #[cfg(test)]
 mod capacity_tests;
+#[cfg(test)]
+mod gm_automation_recovery_tests;
 #[cfg(test)]
 mod mailbox_tests;
 #[cfg(test)]

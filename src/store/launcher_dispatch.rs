@@ -87,7 +87,7 @@ pub(super) fn prepare_admission(
     validate_parent_tuple(&parent, attempt, task, binding, None)?;
 
     let actor = super::launcher::dispatch_launch_actor(tx, &parent.operation_id, None)?;
-    validate_dispatch_caller(&actor, caller, model::text(attempt, "owner_id")?)?;
+    validate_dispatch_caller(tx, &actor, caller, attempt)?;
     let proof = super::launcher_mcp_tools::require_current_connection(
         tx,
         config,
@@ -947,10 +947,12 @@ fn validate_capability_proof(
 }
 
 fn validate_dispatch_caller(
+    db: &Connection,
     actor: &super::launcher::LaunchActor,
     caller: &Principal,
-    owner_id: &str,
+    attempt: &Value,
 ) -> Result<()> {
+    let owner_id = model::text(attempt, "owner_id")?;
     match caller.role {
         // Operators retain the same direct Store scope they had before this
         // launch-specific gate, but a WorkDispatch child must be submitted by
@@ -963,24 +965,22 @@ fn validate_dispatch_caller(
         }
         Role::Operator => {}
         Role::Manager => {
-            if caller.client_id != owner_id {
-                return Err(Error::new("FORBIDDEN", "Manager does not own this Attempt"));
-            }
-            if actor.work_dispatch_context().is_some()
-                && actor.effective_manager_id() != caller.client_id
-            {
+            // A live current GM may continue this exact prepared Attempt, but
+            // the immutable launch actor and Attempt owner stay unchanged.
+            super::gm::require_attempt_control(db, caller, attempt)?;
+            if actor.work_dispatch_context().is_some() && actor.effective_manager_id() != owner_id {
                 return Err(Error::new(
                     "FORBIDDEN",
-                    "WorkDispatch effective manager differs from the dispatch caller",
+                    "WorkDispatch effective manager differs from the Attempt owner",
                 ));
             }
             if actor.role() == Role::Manager
                 && actor.work_dispatch_context().is_none()
-                && actor.effective_manager_id() != caller.client_id
+                && actor.effective_manager_id() != owner_id
             {
                 return Err(Error::new(
                     "FORBIDDEN",
-                    "retained Manager launch actor differs from the dispatch owner",
+                    "retained Manager launch actor differs from the Attempt owner",
                 ));
             }
         }

@@ -1267,7 +1267,7 @@ pub(crate) fn on_behalf_visible_to(
         return Ok(false);
     };
     if !link.belongs_to(principal) {
-        return Ok(false);
+        return current_gm_on_behalf_scope_visible_to(db, principal, &link);
     }
     match link {
         AnyOnBehalfOperationLink::Review(_) => Ok(true),
@@ -1299,6 +1299,137 @@ pub(crate) fn on_behalf_visible_to(
             &link.project_id,
         ),
     }
+}
+
+/// A registered current GM may read validated project/task history whose
+/// immutable attribution names a former GM. This grants read continuity only;
+/// it does not change the recorded requester or the admission authority.
+fn current_gm_on_behalf_scope_visible_to(
+    db: &Connection,
+    principal: &Principal,
+    link: &AnyOnBehalfOperationLink,
+) -> Result<bool> {
+    if !is_current_registered_gm(db, principal)? {
+        return Ok(false);
+    }
+    match link {
+        AnyOnBehalfOperationLink::Review(link) => {
+            let task_id: Option<String> = if link.action == "review.assign" {
+                db.query_row(
+                    "SELECT assignment_op.task_id
+                     FROM operations AS assignment_op
+                     JOIN observations AS assignment
+                       ON assignment.operation_id=assignment_op.operation_id
+                     JOIN tasks AS target ON target.task_id=assignment_op.task_id
+                     WHERE assignment_op.operation_id=?1
+                       AND assignment_op.caller_id=?2
+                       AND assignment_op.method='review.assign'
+                       AND assignment.source_stream_id='controller:review'
+                       AND assignment.kind='review.assignment'
+                       AND assignment_op.task_id=json_extract(assignment.payload_json,'$.identity.task_id')
+                       AND assignment_op.attempt_id=json_extract(assignment.payload_json,'$.identity.attempt_id')
+                       AND target.project_id=?3
+                       AND json_extract(assignment.payload_json,'$.technical_requester_id')=?2
+                       AND json_extract(assignment.payload_json,'$.sponsor_client_id')=?4
+                       AND json_extract(assignment.payload_json,'$.on_behalf.effective_manager_id')=?4
+                       AND json_extract(assignment.payload_json,'$.on_behalf.project_id')=?3
+                       AND json_extract(assignment.payload_json,'$.on_behalf.cause.kind')=?5
+                       AND json_extract(assignment.payload_json,'$.on_behalf.cause.observation_id')=?6
+                       AND json_extract(assignment.payload_json,'$.on_behalf.cause.operation_id')=?7
+                       AND json_extract(assignment.payload_json,'$.on_behalf.cause.id')=?8
+                       AND json_extract(assignment_op.effective_request_json,'$.on_behalf.effective_manager_id')=?4
+                       AND json_extract(assignment_op.effective_request_json,'$.on_behalf.project_id')=?3
+                       AND json_extract(assignment_op.effective_request_json,'$.on_behalf.cause.observation_id')=?6
+                       AND json_extract(assignment_op.effective_request_json,'$.on_behalf.cause.operation_id')=?7
+                       AND json_extract(assignment_op.effective_request_json,'$.on_behalf.cause.id')=?8",
+                    params![
+                        link.operation_id,
+                        AUTOMATION_TECHNICAL_REQUESTER_ID,
+                        link.project_id,
+                        link.effective_manager_id,
+                        link.cause["kind"].as_str().unwrap_or_default(),
+                        link.cause["observation_id"].as_i64().unwrap_or_default(),
+                        link.cause["operation_id"].as_str().unwrap_or_default(),
+                        link.cause["id"].as_str().unwrap_or_default(),
+                    ],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten()
+            } else {
+                db.query_row(
+                    "SELECT task_id FROM operations WHERE operation_id=?1 AND caller_id=?2 AND method=?3",
+                    params![
+                        link.operation_id,
+                        AUTOMATION_TECHNICAL_REQUESTER_ID,
+                        link.action,
+                    ],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten()
+            };
+            let Some(task_id) = task_id else {
+                return Ok(false);
+            };
+            current_gm_has_task_project(db, &task_id, &link.project_id)
+        }
+        AnyOnBehalfOperationLink::Acceptance(link) => {
+            let task_id = link.cause["identity"]["task_id"].as_str().ok_or_else(|| {
+                Error::new(
+                    "AUTOMATION_LINK_CORRUPT",
+                    "acceptance link has no exact Task identity",
+                )
+            })?;
+            current_gm_has_task_project(db, task_id, &link.project_id)
+        }
+        AnyOnBehalfOperationLink::Publication(link) => {
+            let task_id = link.cause["task_id"].as_str().ok_or_else(|| {
+                Error::new(
+                    "AUTOMATION_LINK_CORRUPT",
+                    "publication link has no exact Task identity",
+                )
+            })?;
+            current_gm_has_task_project(db, task_id, &link.project_id)
+        }
+        AnyOnBehalfOperationLink::WorkDispatch(link) => {
+            current_gm_has_task_project(db, &link.task_id, &link.project_id)
+        }
+        AnyOnBehalfOperationLink::Repair(link) => {
+            current_gm_has_task_project(db, &link.task_id, &link.project_id)
+        }
+    }
+}
+
+fn is_current_registered_gm(db: &Connection, principal: &Principal) -> Result<bool> {
+    if principal.role != Role::Manager {
+        return Ok(false);
+    }
+    if let Err(error) = require_registered_manager(db, &principal.client_id) {
+        if error.code == "FORBIDDEN" {
+            return Ok(false);
+        }
+        return Err(error);
+    }
+    let current_gm: Option<String> = db
+        .query_row(
+            "SELECT json_extract(value_json,'$.client_id') FROM meta WHERE key='gm'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(current_gm.as_deref() == Some(principal.client_id.as_str()))
+}
+
+fn current_gm_has_task_project(db: &Connection, task_id: &str, project_id: &str) -> Result<bool> {
+    let current_project: Option<String> = db
+        .query_row(
+            "SELECT project_id FROM tasks WHERE task_id=?1",
+            [task_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(current_project.as_deref() == Some(project_id))
 }
 
 /// Load a retained on-behalf link and validate its own durable provenance.

@@ -323,7 +323,7 @@ pub(super) fn bind(
     let run = model::text(v, "native_run_id")?;
     let evidence_id = model::positive(v, "observation_id")?;
     let a = tasks::get_attempt(tx, attempt_id)?;
-    p.owns(model::text(&a, "owner_id")?)?;
+    super::gm::require_attempt_control(tx, p, &a)?;
     if !a["released_at_ms"].is_null()
         || matches!(
             a["state"].as_str(),

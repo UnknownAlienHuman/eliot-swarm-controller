@@ -513,12 +513,33 @@ fn next_internal(
             ));
         }
         if method != "agent.open" && repair_context.is_none() && caller["role"] != "operator" {
-            let owns:bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM attempts WHERE owner_id=?1 AND binding_id=?2 AND binding_generation=?3 AND released_at_ms IS NULL)",params![o["caller_id"].as_str(),id,generation],|r|r.get(0))?;
-            if caller["role"] != "manager" || !owns {
-                return Err(Error::new(
-                    "FORBIDDEN",
-                    "original caller no longer has an assignment here",
-                ));
+            let caller_id = model::text(&o, "caller_id")?;
+            let owns: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM attempts WHERE owner_id=?1 AND binding_id=?2 AND binding_generation=?3 AND released_at_ms IS NULL)",
+                params![caller_id, id, generation],
+                |r| r.get(0),
+            )?;
+            if !owns {
+                if caller["role"] != "manager" {
+                    return Err(Error::new(
+                        "FORBIDDEN",
+                        "original caller no longer has an assignment here",
+                    ));
+                }
+                let attempt_id = if method == "task.dispatch" {
+                    model::text(&input, "attempt_id")?
+                } else {
+                    model::text(&o, "attempt_id")?
+                };
+                let attempt = tasks::get_attempt(&tx, attempt_id)?;
+                if attempt["binding_id"] != id || attempt["binding_generation"] != generation {
+                    return Err(Error::new(
+                        "FORBIDDEN",
+                        "queued Operation Attempt belongs to another binding generation",
+                    ));
+                }
+                let operation_principal = operation_caller_principal(&tx, &o)?;
+                super::gm::require_attempt_control(&tx, &operation_principal, &attempt)?;
             }
         }
         if method == "task.dispatch" {
@@ -538,13 +559,9 @@ fn next_internal(
                     "task changed before native admission",
                 ));
             }
-            if caller["role"] != "operator"
-                && (caller["role"] != "manager" || o["caller_id"] != a["owner_id"])
-            {
-                return Err(Error::new(
-                    "FORBIDDEN",
-                    "original caller no longer owns this task",
-                ));
+            if caller["role"] != "operator" {
+                let operation_principal = operation_caller_principal(&tx, &o)?;
+                super::gm::require_attempt_control(&tx, &operation_principal, &a)?;
             }
             trusted_launch_dispatch_packet =
                 super::launcher_dispatch::validate_before_effect(&tx, config, &op, &input, &b)?;
@@ -2413,6 +2430,42 @@ impl UserCommandActor<'_> {
     }
 }
 
+fn operation_caller_principal(db: &Connection, operation: &Value) -> Result<Principal> {
+    let client_id = model::text(operation, "caller_id")?.to_owned();
+    let registration = meta(db, &format!("client:{client_id}"))?
+        .ok_or_else(|| Error::new("UNAUTHORIZED", "original caller no longer registered"))?;
+    let role: Role = serde_json::from_value(registration["role"].clone())?;
+    super::current_principal(
+        db,
+        Principal {
+            client_id,
+            link_id: String::new(),
+            role,
+        },
+    )
+}
+
+fn current_attempts_for_binding(
+    db: &Connection,
+    binding_id: &str,
+    generation: i64,
+) -> Result<Vec<Value>> {
+    let attempt_ids = {
+        let mut statement = db.prepare(
+            "SELECT a.attempt_id FROM attempts AS a JOIN tasks AS t ON t.task_id=a.task_id \
+             WHERE a.binding_id=?1 AND a.binding_generation=?2 AND a.released_at_ms IS NULL \
+               AND a.task_revision=t.revision \
+             ORDER BY a.created_at_ms,a.attempt_id LIMIT 2",
+        )?;
+        let rows = statement.query_map(params![binding_id, generation], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<String>>>()?
+    };
+    attempt_ids
+        .iter()
+        .map(|attempt_id| tasks::get_attempt(db, attempt_id))
+        .collect()
+}
+
 /// Derive the sole repair request from Store-validated immutable feedback.
 /// A technical requester receives no general Manager or Operator authority.
 pub(super) fn user_command_for_repair(
@@ -2460,10 +2513,55 @@ fn user_command_with_actor(
             "native session is not ready",
         ));
     }
+    let mut manager_attempt = None;
     if !actor.is_operator() {
-        let owns:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM attempts WHERE owner_id=?1 AND binding_id=?2 AND binding_generation=?3 AND released_at_ms IS NULL)",params![actor.effective_client_id(),id,generation],|r|r.get(0))?;
-        if !owns {
-            return Err(Error::new("FORBIDDEN", "no assignment on this binding"));
+        let owns: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM attempts WHERE owner_id=?1 AND binding_id=?2 AND binding_generation=?3 AND released_at_ms IS NULL)",
+            params![actor.effective_client_id(), id, generation],
+            |row| row.get(0),
+        )?;
+        match &actor {
+            UserCommandActor::Direct(principal) if principal.role == Role::Manager => {
+                let principal = super::current_principal(tx, (*principal).clone())?;
+                let requested_attempt = v
+                    .get("attempt_id")
+                    .filter(|value| !value.is_null())
+                    .map(|_| model::text(v, "attempt_id").map(str::to_owned))
+                    .transpose()?;
+                let attempts = current_attempts_for_binding(tx, id, generation)?;
+                let selected = if let Some(requested) = requested_attempt {
+                    let attempt = tasks::get_attempt(tx, &requested)?;
+                    if attempt["binding_id"] != id
+                        || attempt["binding_generation"] != generation
+                        || !attempt["released_at_ms"].is_null()
+                    {
+                        return Err(Error::new(
+                            "FORBIDDEN",
+                            "requested Attempt is outside this binding generation",
+                        ));
+                    }
+                    Some(attempt)
+                } else if attempts.len() == 1 {
+                    attempts.into_iter().next()
+                } else {
+                    None
+                };
+                if let Some(attempt) = selected {
+                    if principal.owns(model::text(&attempt, "owner_id")?).is_err() {
+                        super::gm::require_attempt_control(tx, &principal, &attempt)?;
+                    }
+                    manager_attempt = Some(attempt);
+                } else if !owns {
+                    return Err(Error::new(
+                        "FORBIDDEN",
+                        "Manager has no unique current Attempt on this binding",
+                    ));
+                }
+            }
+            _ if !owns => {
+                return Err(Error::new("FORBIDDEN", "no assignment on this binding"));
+            }
+            _ => {}
         }
     }
     if method == "agent.recover" {
@@ -2652,6 +2750,16 @@ fn user_command_with_actor(
                 op,
                 context.identity().task_id,
                 context.identity().attempt_id
+            ],
+        )?;
+    }
+    if let Some(attempt) = manager_attempt {
+        tx.execute(
+            "UPDATE operations SET task_id=?2,attempt_id=?3 WHERE operation_id=?1",
+            params![
+                op,
+                attempt["task_id"].as_str(),
+                attempt["attempt_id"].as_str()
             ],
         )?;
     }

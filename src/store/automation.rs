@@ -2,7 +2,7 @@
 //! schema-versioned per-record `meta` entries. No migration is required.
 
 use super::{
-    automation_dispatch, automation_publication, automation_work_dispatch, operations, page,
+    automation_dispatch, automation_publication, automation_work_dispatch, gm, operations, page,
     review_disposition,
 };
 use crate::{
@@ -30,10 +30,11 @@ struct PlannedChange {
 
 pub(super) fn get(db: &Connection, p: &Principal, value: &Value) -> Result<Value> {
     require_manager(p)?;
-    model::fields(value, &["project_id", "after", "limit"])?;
+    model::validate_automation_config_read("automation.config.get", value)?;
     let project = model::text(value, "project_id")?;
+    let owner_manager_id = read_owner_manager_id(db, p, value)?;
     let (limit, after) = page(value)?;
-    let entries = scoped_entries(db, &p.client_id, project)?;
+    let entries = scoped_entries(db, &owner_manager_id, project)?;
     let start =
         usize::try_from(after).map_err(|_| Error::invalid("after exceeds platform range"))?;
     if start > entries.len() {
@@ -46,7 +47,7 @@ pub(super) fn get(db: &Connection, p: &Principal, value: &Value) -> Result<Value
         .collect::<Result<Vec<_>>>()?;
     Ok(json!({
         "project_id":project,
-        "owner_manager_id":p.client_id,
+        "owner_manager_id":owner_manager_id,
         "items":items,
         "after":after,
         "next_after":if end < entries.len() { Some(end) } else { None },
@@ -265,18 +266,21 @@ pub(super) fn apply(
 
 pub(super) fn explain(db: &Connection, p: &Principal, value: &Value) -> Result<Value> {
     require_manager(p)?;
-    model::fields(value, &["project_id", "automation_id"])?;
+    model::validate_automation_config_read("automation.config.explain", value)?;
     let project = model::text(value, "project_id")?;
     let automation_id = model::text(value, "automation_id")?;
-    let entry = config::load_entry(db, &p.client_id, project, automation_id)?
+    let owner_manager_id = read_owner_manager_id(db, p, value)?;
+    let entry = config::load_entry(db, &owner_manager_id, project, automation_id)?
         .ok_or_else(|| Error::new("NOT_FOUND", "automation entry was not found in this scope"))?;
     let state = automation_dispatch::dispatch_state(db, &entry)?;
     let work_dispatch = automation_work_dispatch::dispatch_state(db, &entry)?;
     let disposition = review_disposition::disposition_state(db, &entry)?;
     let publication = automation_publication::state(db, &entry)?;
-    let work = operation_impacts(db, &p.client_id, project, automation_id)?;
-    let operation_history = linked_operation_history(db, &p.client_id, project, automation_id)?;
+    let work = operation_impacts(db, &owner_manager_id, project, automation_id)?;
+    let operation_history =
+        linked_operation_history(db, &owner_manager_id, project, automation_id)?;
     Ok(json!({
+        "owner_manager_id":owner_manager_id,
         "entry":entry_projection(&entry)?,
         "dispatch":state,
         "work_dispatch":work_dispatch,
@@ -327,6 +331,33 @@ fn require_manager(p: &Principal) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn read_owner_manager_id(db: &Connection, p: &Principal, value: &Value) -> Result<String> {
+    let requested = value
+        .get("owner_manager_id")
+        .map(|_| model::text(value, "owner_manager_id"))
+        .transpose()?
+        .unwrap_or(&p.client_id);
+    if requested == p.client_id.as_str() {
+        return Ok(p.client_id.clone());
+    }
+
+    // Cross-owner recovery is read-only and available only to the live,
+    // registered current GM. Never construct or substitute another Principal:
+    // the requested owner selects a provenance-preserving metadata scope only.
+    authorization::require_registered_manager(db, &p.client_id)?;
+    let is_current_gm = gm::record(db)?.is_some_and(|designation| {
+        designation["client_id"] == p.client_id
+            && designation["epoch"].as_i64().is_some_and(|epoch| epoch > 0)
+    });
+    if !is_current_gm {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "only the current enabled Manager may inspect another owner's automation state",
+        ));
+    }
+    Ok(requested.to_owned())
 }
 
 fn scoped_entries(db: &Connection, owner: &str, project: &str) -> Result<Vec<AutomationEntry>> {

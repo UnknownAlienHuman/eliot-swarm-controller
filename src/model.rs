@@ -122,6 +122,35 @@ pub fn fields(value: &Value, allowed: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// Validate the closed request shapes for the two automation configuration
+/// reads. `owner_manager_id` is an optional read selector; authorization for
+/// selecting another owner's scope remains in the Store handler.
+pub fn validate_automation_config_read(method: &str, params: &Value) -> Result<()> {
+    let allowed = match method {
+        "automation.config.get" => &["project_id", "owner_manager_id", "after", "limit"][..],
+        "automation.config.explain" => &["project_id", "automation_id", "owner_manager_id"][..],
+        _ => return Err(Error::new("METHOD_NOT_FOUND", method)),
+    };
+    fields(params, allowed)?;
+    text(params, "project_id")?;
+    if method == "automation.config.explain" {
+        text(params, "automation_id")?;
+    }
+    if params.get("owner_manager_id").is_some() {
+        let owner = text(params, "owner_manager_id")?;
+        if owner.len() > 128
+            || owner
+                .bytes()
+                .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+        {
+            return Err(Error::invalid(
+                "owner_manager_id must be 1..=128 bytes without whitespace",
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {

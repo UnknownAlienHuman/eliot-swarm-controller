@@ -32,8 +32,50 @@ readback path. A successor's fresh request is checked against the current Task,
 Attempt, binding generation and candidate. Chat recovery does not imply native
 bridge restart; `agent.recover` retains its separate runtime recovery contract.
 
-The continuity implementation is being updated to this requirement. Acceptance
-requires a real Store regression with an old GM, a successor using a different
+## Reconnect or appoint a successor
+
+For a new chat using the same manager identity, start its MCP connection with the
+saved credential and the existing controller data directory. Read current state
+before sending new work; no handover is needed for a changed transport link.
+
+For a different manager identity, the local operator can use the existing CLI:
+
+```powershell
+swarm --data-dir C:\SwarmState --request-id register-successor client-create GM-next --role manager --out C:\SwarmState\GM-next.credential.json
+swarm --data-dir C:\SwarmState --request-id designate-successor gm-handover GM-next
+swarm --data-dir C:\SwarmState --credential C:\SwarmState\GM-next.credential.json status
+swarm --data-dir C:\SwarmState --credential C:\SwarmState\GM-next.credential.json task list
+```
+
+Use the actual existing data directory. The operator's credential is local;
+neither command needs a response from the previous GM chat. The successor then
+uses its own manager credential for continuation. Retain each mutation's
+`client_request_id` when a response is lost.
+
+Former-owner automation read parameters are explicit:
+
+```json
+{
+  "project_id": "project-a",
+  "owner_manager_id": "GM-previous",
+  "automation_id": "submission-audit"
+}
+```
+
+Pass these to `automation.config.explain`; omit `automation_id` for
+`automation.config.get`. This read does not enable, transfer or duplicate an
+automation entry. Owner transfer remains a separate management operation.
+
+The source now implements this continuity requirement. Verification requires a
+real Store regression with an old GM, a successor using a different
 client identity, preserved Attempt ownership and dispatch identity, positive
 successor continuation and a denied unrelated manager. Native qualification is
 recorded separately in [implementation status](implementation-status.md).
+
+The local submission writer also separates admission from completion: a GM
+change during immutable artifact publication cannot discard the verified file.
+Completion retains the original submitting actor; a changed Task scope keeps
+the artifact as history without applying it to the current Attempt. Successor
+readback of a submission left `outcome_unknown` by a controller host crash still
+needs its separate deterministic-file recovery path. This is distinct from
+losing the GM chat while the controller host remains running.

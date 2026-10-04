@@ -527,7 +527,7 @@ pub(super) fn dispatch(
     let attempt = model::text(v, "attempt_id")?;
     let body = model::text(v, "text")?;
     let a = tasks::get_attempt(tx, attempt)?;
-    p.owns(model::text(&a, "owner_id")?)?;
+    super::gm::require_attempt_control(tx, p, &a)?;
     if a["start_owner"] != "controller" {
         return Err(Error::new(
             "START_OWNED_BY_MANAGER",
@@ -1092,7 +1092,26 @@ pub(super) fn cancel(
         && (o["method"] != "review.assign"
             || linked.as_ref().is_some_and(|link| link.belongs_to(p)));
     if !manager_owns_link {
-        p.owns(model::text(&o, "caller_id")?)?;
+        if p.role == Role::Manager && o["state"] == "queued" {
+            if o["caller_id"] == p.client_id {
+                p.owns(model::text(&o, "caller_id")?)?;
+            } else if let Some(attempt_id) = o["attempt_id"].as_str()
+                && manager_attempt_continuation_method(model::text(&o, "method")?)
+            {
+                let attempt = tasks::get_attempt(tx, attempt_id)?;
+                if o["task_id"] != attempt["task_id"] {
+                    return Err(Error::new(
+                        "FORBIDDEN",
+                        "queued Operation Task differs from its Attempt",
+                    ));
+                }
+                super::gm::require_attempt_control(tx, p, &attempt)?;
+            } else {
+                p.owns(model::text(&o, "caller_id")?)?;
+            }
+        } else {
+            p.owns(model::text(&o, "caller_id")?)?;
+        }
     }
     let stale_publication = o["method"] == "forge.publish_ref"
         && o["state"] == "settled"
@@ -1176,4 +1195,11 @@ pub(super) fn cancel(
         tx.execute("UPDATE bindings SET state='closed',released_at_ms=?3 WHERE binding_id=?1 AND generation=?2 AND state='opening' AND native_root_id IS NULL AND native_scope_key IS NULL",params![o["binding_id"].as_str(),o["binding_generation"].as_i64(),now])?;
     }
     Ok(json!({"operation_id":id,"cancelled_operation_id":target,"native_cancel_sent":false}))
+}
+
+fn manager_attempt_continuation_method(method: &str) -> bool {
+    matches!(
+        method,
+        "task.dispatch" | "task.submit" | "task.request_changes" | "review.assign" | "swarm.launch"
+    ) || (method.starts_with("agent.") && method != "agent.recover")
 }

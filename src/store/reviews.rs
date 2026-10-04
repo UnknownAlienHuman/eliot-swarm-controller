@@ -229,7 +229,7 @@ fn manager_may_assign(
             if principal.role == Role::Operator {
                 principal.require_operator()?;
             } else if principal.role == Role::Manager {
-                principal.owns(owner_id)?;
+                super::gm::require_attempt_control(tx, principal, &submission.attempt)?;
             } else {
                 return Err(Error::new(
                     "FORBIDDEN",
@@ -853,7 +853,22 @@ fn authorize_assignment_read(
         return principal.require_operator();
     }
     if principal.role == Role::Manager {
-        return principal.owns(model::text(assignment, "sponsor_client_id")?);
+        if principal
+            .owns(model::text(assignment, "sponsor_client_id")?)
+            .is_ok()
+        {
+            return Ok(());
+        }
+        let attempt = tasks::get_attempt(db, &identity.attempt_id)?;
+        if attempt["task_id"] != identity.task_id
+            || attempt["task_revision"] != identity.task_revision
+        {
+            return Err(Error::new(
+                "FORBIDDEN",
+                "review assignment is outside the current Task and Attempt scope",
+            ));
+        }
+        return super::gm::require_attempt_control(db, principal, &attempt);
     }
     if principal.role == Role::Participant
         && principal.client_id == assignment["reviewer_client_id"]

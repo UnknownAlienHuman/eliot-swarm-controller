@@ -117,7 +117,7 @@ enum Command {
         generation: Option<i64>,
     },
     /// Designate the current GM client, optionally naming its native binding.
-    /// Rotates the GM epoch; the previous GM keeps no GM-only rights afterwards.
+    /// A different client rotates the epoch; rebinding the same client preserves it.
     GmHandover {
         client_id: String,
         #[arg(long, requires = "generation")]
