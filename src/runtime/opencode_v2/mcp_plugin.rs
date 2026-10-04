@@ -55,6 +55,7 @@ pub(crate) struct OwnedServiceIntent {
     service_version: String,
     route_digest: String,
     owner_nonce: String,
+    scope_digest: String,
     origin: OwnedServiceOrigin,
 }
 
@@ -100,11 +101,37 @@ impl OwnedServiceIntent {
         if !valid_uuid(&seed.owner_nonce) {
             return Err(scope_error("owned service owner nonce is invalid"));
         }
+        let scope_identity = json!({
+            "launch_operation_id": &seed.launch_operation_id,
+            "open_operation_id": &seed.open_operation_id,
+            "open_operation_state": &seed.open_operation_state,
+            "technical_requester_id": seed.actor.technical_requester_id(),
+            "effective_manager_id": seed.actor.effective_manager_id(),
+            "actor_role": seed.actor.role(),
+            "actor_link_id": seed.actor.link_id(),
+            "task_id": &seed.task_id,
+            "task_revision": seed.task_revision,
+            "attempt_id": &seed.attempt_id,
+            "lease_id": &seed.lease_id,
+            "lease_state": &seed.lease_state,
+            "lease_generation": seed.lease_generation,
+            "binding_id": &seed.binding_id,
+            "binding_state": &seed.binding_state,
+            "binding_generation": seed.binding_generation,
+            "binding_digest": &seed.binding_digest,
+            "service_id": &seed.service_id,
+            "service_version": &seed.service_version,
+            "route_digest": &seed.route_digest,
+            "owner_nonce": &seed.owner_nonce,
+            "origin": "fresh_owned_service"
+        });
+        let scope_digest = model::digest(model::canonical(&scope_identity)?.as_bytes());
         Ok(Self {
             service_id: seed.service_id,
             service_version: seed.service_version,
             route_digest: seed.route_digest,
             owner_nonce: seed.owner_nonce,
+            scope_digest,
             origin: seed.origin,
         })
     }
@@ -114,6 +141,9 @@ impl OwnedServiceIntent {
     }
     pub(crate) fn route_digest(&self) -> &str {
         &self.route_digest
+    }
+    pub(crate) fn scope_digest(&self) -> &str {
+        &self.scope_digest
     }
 }
 

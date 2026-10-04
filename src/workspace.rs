@@ -1097,28 +1097,90 @@ fn reject_reparse_components(path: &Path) -> Result<()> {
         ));
     }
     let mut current = PathBuf::new();
+    let mut anchored = false;
     for component in path.components() {
-        match component {
-            Component::Prefix(_) | Component::RootDir => current.push(component.as_os_str()),
-            Component::CurDir => {}
+        let inspect = match component {
+            // A Windows prefix (for example `C:` or `\\?\C:`) is not yet
+            // an absolute path. Wait until RootDir has been appended so the
+            // first metadata query addresses the assembled volume root.
+            Component::Prefix(_) => {
+                current.push(component.as_os_str());
+                false
+            }
+            Component::RootDir => {
+                current.push(component.as_os_str());
+                anchored = current.is_absolute();
+                if !anchored {
+                    return Err(Error::new(
+                        "WORKSPACE_PATH",
+                        "workspace path root could not be assembled",
+                    ));
+                }
+                true
+            }
+            Component::CurDir => false,
             Component::ParentDir => {
                 return Err(Error::new(
                     "WORKSPACE_PATH",
                     "workspace paths cannot traverse parent components",
                 ));
             }
-            Component::Normal(part) => current.push(part),
-        }
-        let metadata = fs::symlink_metadata(&current)
-            .map_err(|_| Error::new("WORKSPACE_PATH", "workspace path component is unavailable"))?;
-        if is_reparse_or_symlink(&metadata) {
-            return Err(Error::new(
-                "WORKSPACE_PATH_REPARSE",
-                "workspace paths cannot traverse symlinks or reparse points",
-            ));
+            Component::Normal(part) => {
+                if !anchored {
+                    return Err(Error::new(
+                        "WORKSPACE_PATH",
+                        "workspace path component preceded its absolute root",
+                    ));
+                }
+                current.push(part);
+                true
+            }
+        };
+        if inspect {
+            let metadata = fs::symlink_metadata(&current).map_err(|_| {
+                Error::new("WORKSPACE_PATH", "workspace path component is unavailable")
+            })?;
+            if is_reparse_or_symlink(&metadata) {
+                return Err(Error::new(
+                    "WORKSPACE_PATH_REPARSE",
+                    "workspace paths cannot traverse symlinks or reparse points",
+                ));
+            }
         }
     }
+    if !anchored {
+        return Err(Error::new(
+            "WORKSPACE_PATH",
+            "workspace path root could not be assembled",
+        ));
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn absolute_root_is_assembled_before_component_metadata_checks() {
+        let cwd = std::env::current_dir().expect("test working directory is available");
+        let mut root = PathBuf::new();
+        for component in cwd.components() {
+            match component {
+                Component::Prefix(_) | Component::RootDir => {
+                    root.push(component.as_os_str());
+                }
+                _ => break,
+            }
+        }
+        assert!(root.is_absolute());
+        reject_reparse_components(&root).expect("assembled absolute root is available");
+
+        let traversing = root.join("..");
+        let error =
+            reject_reparse_components(&traversing).expect_err("parent traversal remains forbidden");
+        assert_eq!(error.code, "WORKSPACE_PATH");
+    }
 }
 
 fn is_reparse_or_symlink(metadata: &fs::Metadata) -> bool {

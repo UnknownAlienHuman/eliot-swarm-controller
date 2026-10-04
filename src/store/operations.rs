@@ -612,8 +612,17 @@ struct OwnedServiceStartLink {
     attempt_id: String,
     technical_requester_id: String,
     effective_manager_id: String,
+    intent_nonce: String,
+    route_digest: String,
+    intent_digest: String,
     state: String,
+    process_id: Option<i64>,
+    process_birth_token: Option<String>,
+    executable_sha256: Option<String>,
+    proof_json: String,
 }
+
+const MAX_OWNED_SERVICE_PROOF_BYTES: usize = 8 * 1024;
 
 type OwnedBindingRow = (String, Option<i64>, Option<String>, Option<String>);
 
@@ -641,7 +650,14 @@ fn owned_service_start_from_row(
         attempt_id: row.get(6)?,
         technical_requester_id: row.get(7)?,
         effective_manager_id: row.get(8)?,
-        state: row.get(9)?,
+        intent_nonce: row.get(9)?,
+        route_digest: row.get(10)?,
+        intent_digest: row.get(11)?,
+        state: row.get(12)?,
+        process_id: row.get(13)?,
+        process_birth_token: row.get(14)?,
+        executable_sha256: row.get(15)?,
+        proof_json: row.get(16)?,
     })
 }
 
@@ -652,7 +668,8 @@ fn owned_service_start_for_operation(
     let mut statement = db.prepare(
         "SELECT launch_operation_id,open_operation_id,binding_id,binding_generation,
                 task_id,task_revision,attempt_id,technical_requester_id,
-                effective_manager_id,state
+                effective_manager_id,intent_nonce,route_digest,intent_digest,state,
+                process_id,process_birth_token,executable_sha256,proof_json
          FROM owned_service_starts
          WHERE launch_operation_id=?1 OR open_operation_id=?1 LIMIT 2",
     )?;
@@ -671,7 +688,8 @@ fn owned_service_starts_for_attempt(
     let mut statement = db.prepare(
         "SELECT launch_operation_id,open_operation_id,binding_id,binding_generation,
                 task_id,task_revision,attempt_id,technical_requester_id,
-                effective_manager_id,state
+                effective_manager_id,intent_nonce,route_digest,intent_digest,state,
+                process_id,process_birth_token,executable_sha256,proof_json
          FROM owned_service_starts WHERE attempt_id=?1 ORDER BY launch_operation_id",
     )?;
     let rows = statement.query_map([attempt_id], owned_service_start_from_row)?;
@@ -708,10 +726,55 @@ fn fail_reserved_owned_service_start(
                     "reserved service start no longer proves an unreleased pre-native binding",
                 ));
             }
+            if link.proof_json != "{}"
+                || link.process_id.is_some()
+                || link.process_birth_token.is_some()
+                || link.executable_sha256.is_some()
+                || !valid_sha256_digest(&link.route_digest)
+                || !valid_sha256_digest(&link.intent_digest)
+                || link.intent_nonce.is_empty()
+            {
+                return Err(owned_service_link_corrupt());
+            }
+            let cancellation_proof = model::canonical(&json!({
+                "schema_version":1,
+                "status":"failed_no_effect",
+                "safe_code":"OWNED_SERVICE_CANCELLED_BEFORE_START",
+                "owner_nonce":link.intent_nonce,
+                "route_digest":link.route_digest,
+                "intent_digest":link.intent_digest,
+                "process_spawn_attempted":false,
+            }))?;
+            if cancellation_proof.len() > MAX_OWNED_SERVICE_PROOF_BYTES {
+                return Err(owned_service_link_corrupt());
+            }
             let changed = tx.execute(
-                "UPDATE owned_service_starts SET state='failed_no_effect',updated_at_ms=?2
-                 WHERE launch_operation_id=?1 AND state='reserved'",
-                params![link.launch_operation_id, now],
+                "UPDATE owned_service_starts
+                 SET state='failed_no_effect',proof_json=?1,updated_at_ms=?2
+                 WHERE launch_operation_id=?3 AND open_operation_id=?4
+                   AND binding_id=?5 AND binding_generation=?6 AND task_id=?7
+                   AND task_revision=?8 AND attempt_id=?9
+                   AND technical_requester_id=?10 AND effective_manager_id=?11
+                   AND intent_nonce=?12 AND route_digest=?13 AND intent_digest=?14
+                   AND state='reserved' AND process_id IS NULL
+                   AND process_birth_token IS NULL AND executable_sha256 IS NULL
+                   AND proof_json='{}'",
+                params![
+                    cancellation_proof,
+                    now,
+                    link.launch_operation_id,
+                    link.open_operation_id,
+                    link.binding_id,
+                    link.binding_generation,
+                    link.task_id,
+                    link.task_revision,
+                    link.attempt_id,
+                    link.technical_requester_id,
+                    link.effective_manager_id,
+                    link.intent_nonce,
+                    link.route_digest,
+                    link.intent_digest,
+                ],
             )?;
             if changed != 1 {
                 return Err(Error::conflict(
@@ -720,7 +783,8 @@ fn fail_reserved_owned_service_start(
             }
             Ok(())
         }
-        "failed_no_effect" | "service_departed" => Ok(()),
+        "failed_no_effect" => validate_failed_no_effect_proof(link),
+        "service_departed" => Ok(()),
         "outcome_unknown" => Err(Error::new(
             "OUTCOME_UNKNOWN",
             "owned service start may have crossed its process boundary; reconcile it before cancellation or release",
@@ -731,6 +795,76 @@ fn fail_reserved_owned_service_start(
         )),
         _ => Err(owned_service_link_corrupt()),
     }
+}
+
+fn validate_failed_no_effect_proof(link: &OwnedServiceStartLink) -> Result<()> {
+    if link.process_id.is_some()
+        || link.process_birth_token.is_some()
+        || link.executable_sha256.is_some()
+        || link.proof_json.len() > MAX_OWNED_SERVICE_PROOF_BYTES
+        || !valid_sha256_digest(&link.route_digest)
+        || !valid_sha256_digest(&link.intent_digest)
+        || link.intent_nonce.is_empty()
+    {
+        return Err(owned_service_link_corrupt());
+    }
+    let proof: Value =
+        serde_json::from_str(&link.proof_json).map_err(|_| owned_service_link_corrupt())?;
+    let canonical = model::canonical(&proof).map_err(|_| owned_service_link_corrupt())?;
+    let Some(object) = proof.as_object() else {
+        return Err(owned_service_link_corrupt());
+    };
+    let shared_valid = proof["schema_version"] == 1
+        && proof["status"] == "failed_no_effect"
+        && proof["owner_nonce"] == link.intent_nonce
+        && proof["route_digest"] == link.route_digest
+        && proof["intent_digest"] == link.intent_digest
+        && proof["process_spawn_attempted"] == false;
+    let valid = match proof["safe_code"].as_str() {
+        Some("OWNED_SERVICE_CANCELLED_BEFORE_START") => {
+            object.len() == 7
+                && object.contains_key("schema_version")
+                && object.contains_key("status")
+                && object.contains_key("safe_code")
+                && object.contains_key("owner_nonce")
+                && object.contains_key("route_digest")
+                && object.contains_key("intent_digest")
+                && object.contains_key("process_spawn_attempted")
+                && shared_valid
+        }
+        Some("OWNED_SERVICE_PRE_SPAWN_NO_EFFECT") => {
+            object.len() == 9
+                && object.contains_key("schema_version")
+                && object.contains_key("status")
+                && object.contains_key("safe_code")
+                && object.contains_key("owner_nonce")
+                && object.contains_key("route_digest")
+                && object.contains_key("intent_digest")
+                && object.contains_key("config_digest")
+                && object.contains_key("process_spawn_attempted")
+                && object.contains_key("scope_revalidation")
+                && shared_valid
+                && proof["config_digest"]
+                    .as_str()
+                    .is_some_and(valid_sha256_digest)
+                && matches!(
+                    proof["scope_revalidation"].as_str(),
+                    Some("current" | "stale_or_unavailable")
+                )
+        }
+        _ => false,
+    };
+    if canonical != link.proof_json || !valid {
+        return Err(owned_service_link_corrupt());
+    }
+    Ok(())
+}
+
+fn valid_sha256_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn owned_service_link_corrupt() -> Error {

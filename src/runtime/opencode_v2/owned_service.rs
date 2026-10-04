@@ -229,6 +229,12 @@ pub(crate) struct PreparedOwnedService {
     intent: OwnedServiceIntent,
 }
 
+impl PreparedOwnedService {
+    pub(crate) fn config_digest(&self) -> &str {
+        &self.config_digest
+    }
+}
+
 pub(crate) fn prepare_owned_service(
     route: &OwnedServiceRoute,
     intent: &OwnedServiceIntent,
@@ -259,12 +265,14 @@ pub(crate) fn prepare_owned_service(
     })
 }
 
-/// Single-use in-process permit minted only after Store persists its
-/// `outcome_unknown` write-ahead state. It has no Serde or Clone path.
+/// Single-use in-process permit built from the exact Store admission. Store
+/// keeps it local until its `outcome_unknown` write-ahead state commits, then
+/// consumes it here. It has no Serde or Clone path.
 pub(crate) struct OwnedServiceStartPermit {
     owner_nonce: String,
     route_digest: String,
     config_digest: String,
+    scope_digest: String,
     consumed: bool,
 }
 
@@ -276,8 +284,10 @@ impl OwnedServiceStartPermit {
         let route_digest = prepared.route.route_digest()?;
         if intent.owner_nonce() != prepared.route.owner_nonce()
             || intent.route_digest() != route_digest
+            || intent.scope_digest() != prepared.intent.scope_digest()
             || prepared.intent.owner_nonce() != intent.owner_nonce()
             || prepared.intent.route_digest() != intent.route_digest()
+            || prepared.intent.scope_digest() != intent.scope_digest()
             || prepared.plugin.owner_nonce() != intent.owner_nonce()
         {
             return Err(scope_error(
@@ -288,9 +298,47 @@ impl OwnedServiceStartPermit {
             owner_nonce: intent.owner_nonce().to_owned(),
             route_digest,
             config_digest: prepared.config_digest.clone(),
+            scope_digest: intent.scope_digest().to_owned(),
             consumed: false,
         })
     }
+}
+
+/// The only recoverable start failure. Its private identity was copied from
+/// the same single-use Store permit; callers cannot manufacture or deserialize
+/// proof that the exact operation stopped before any helper spawn attempt.
+pub(crate) struct OwnedServiceNoEffect {
+    owner_nonce: String,
+    route_digest: String,
+    config_digest: String,
+    scope_digest: String,
+}
+
+impl OwnedServiceNoEffect {
+    fn from_permit(permit: &OwnedServiceStartPermit) -> Self {
+        Self {
+            owner_nonce: permit.owner_nonce.clone(),
+            route_digest: permit.route_digest.clone(),
+            config_digest: permit.config_digest.clone(),
+            scope_digest: permit.scope_digest.clone(),
+        }
+    }
+
+    pub(crate) fn matches(&self, intent: &OwnedServiceIntent, config_digest: &str) -> bool {
+        self.owner_nonce == intent.owner_nonce()
+            && self.route_digest == intent.route_digest()
+            && self.config_digest == config_digest
+            && self.scope_digest == intent.scope_digest()
+    }
+
+    pub(crate) fn safe_code(&self) -> &'static str {
+        "OWNED_SERVICE_PRE_SPAWN_NO_EFFECT"
+    }
+}
+
+pub(crate) enum OwnedServiceStartFailure {
+    ProvenNoEffect(OwnedServiceNoEffect),
+    Unknown(Error),
 }
 
 /// Live, bounded process and readiness proof. Private endpoint and credentials
@@ -496,21 +544,38 @@ impl OwnedServiceHandle {
 pub(crate) async fn start_foreground(
     prepared: PreparedOwnedService,
     mut permit: OwnedServiceStartPermit,
-) -> Result<OwnedServiceHandle> {
+) -> std::result::Result<OwnedServiceHandle, OwnedServiceStartFailure> {
     if permit.consumed
         || permit.owner_nonce != prepared.route.owner_nonce()
-        || permit.route_digest != prepared.route.route_digest()?
+        || permit.route_digest != prepared.intent.route_digest()
         || permit.config_digest != prepared.config_digest
+        || permit.scope_digest != prepared.intent.scope_digest()
     {
-        return Err(scope_error(
+        return Err(OwnedServiceStartFailure::Unknown(scope_error(
             "owned-service start permit is stale or mismatched",
-        ));
+        )));
     }
     permit.consumed = true;
-    prepared.route.verify_files()?;
-    let plan_path = materialize_launch(&prepared)?;
-    let executable = std::env::current_exe()?;
-    let mut child = AsyncCommand::new(executable)
+    if prepared.route.verify_files().is_err() {
+        return Err(pre_spawn_failure(&prepared.route, &permit, false));
+    }
+    let plan_path = match materialize_launch(&prepared) {
+        Ok(plan_path) => plan_path,
+        Err(failure) => {
+            return Err(pre_spawn_failure(
+                &prepared.route,
+                &permit,
+                failure.state_root_created,
+            ));
+        }
+    };
+    let executable = match std::env::current_exe() {
+        Ok(executable) => executable,
+        Err(_) => {
+            return Err(pre_spawn_failure(&prepared.route, &permit, true));
+        }
+    };
+    let child = AsyncCommand::new(executable)
         .arg("owned-opencode-service")
         .arg("--file")
         .arg(&plan_path)
@@ -520,7 +585,21 @@ pub(crate) async fn start_foreground(
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(false)
-        .spawn()?;
+        .spawn()
+        .map_err(|error| {
+            // An OS spawn error is still an attempted effect. The process may
+            // have started even when the parent could not observe its handle.
+            OwnedServiceStartFailure::Unknown(error.into())
+        })?;
+    complete_foreground_start(prepared, child)
+        .await
+        .map_err(OwnedServiceStartFailure::Unknown)
+}
+
+async fn complete_foreground_start(
+    prepared: PreparedOwnedService,
+    mut child: Child,
+) -> Result<OwnedServiceHandle> {
     let stdin = child
         .stdin
         .take()
@@ -584,6 +663,43 @@ pub(crate) async fn start_foreground(
         helper: Some(child),
         helper_stdin: Some(stdin),
     })
+}
+
+fn pre_spawn_failure(
+    route: &OwnedServiceRoute,
+    permit: &OwnedServiceStartPermit,
+    state_root_created: bool,
+) -> OwnedServiceStartFailure {
+    if no_helper_effect_evidence(route)
+        && (state_root_created || path_is_absent(&route.state_root).unwrap_or(false))
+    {
+        OwnedServiceStartFailure::ProvenNoEffect(OwnedServiceNoEffect::from_permit(permit))
+    } else {
+        OwnedServiceStartFailure::Unknown(readback_error(
+            "owned service start outcome is uncertain",
+        ))
+    }
+}
+
+fn no_helper_effect_evidence(route: &OwnedServiceRoute) -> bool {
+    if validate_directory_components(&route.state_root).is_err() {
+        return false;
+    }
+    [
+        ".owned-launch-consumed",
+        "process-observation.json",
+        "helper-observation.json",
+        "helper-family-stop.json",
+        "owner.json",
+        "connection.json",
+        "stop-receipt.json",
+        "data",
+        "home",
+        "tmp",
+        "cache",
+    ]
+    .iter()
+    .all(|name| path_is_absent(&route.state_root.join(name)).unwrap_or(false))
 }
 
 /// Strict no-spawn readback for a Store row already in an uncertain/observed
@@ -737,61 +853,82 @@ struct HelperPlan {
     entrypoint_sha256: String,
 }
 
-fn materialize_launch(prepared: &PreparedOwnedService) -> Result<PathBuf> {
+struct MaterializeFailure {
+    state_root_created: bool,
+}
+
+fn materialize_launch(
+    prepared: &PreparedOwnedService,
+) -> std::result::Result<PathBuf, MaterializeFailure> {
     let route = &prepared.route;
-    ensure_directory_tree(&route.base_state_root)?;
-    let launch_parent = route.base_state_root.join("launches");
-    ensure_directory_tree(&launch_parent)?;
-    if fs::symlink_metadata(&route.state_root).is_ok() {
-        return Err(Error::new(
-            "OWNED_SERVICE_STATE_EXISTS",
-            "fresh owned service state already exists; uncertain launches are never replayed",
-        ));
-    }
-    fs::create_dir(&route.state_root)?;
-    private_permissions(&route.state_root, true)?;
-    let config_dir = route
-        .config_file
-        .parent()
-        .ok_or_else(|| config_error("owned config path is invalid"))?;
-    ensure_directory_tree(config_dir)?;
-    let config = model::canonical(prepared.plugin.config_value())?;
-    if model::digest(config.as_bytes()) != prepared.config_digest {
-        return Err(source_error("prepared plugin config digest changed"));
-    }
-    write_private_new(&route.config_file, format!("{config}\n").as_bytes())?;
-    let password = format!(
-        "{}{}",
-        model::new_id().replace('-', ""),
-        model::new_id().replace('-', "")
-    );
-    write_private_new(&route.password_file, password.as_bytes())?;
-    let plan = HelperPlan {
-        schema_version: 1,
-        owner_nonce: route.owner_nonce.clone(),
-        service_id: route.service_id.clone(),
-        version: VERSION.into(),
-        model: route.model.clone(),
-        model_catalog: route.model_catalog.clone(),
-        bun_executable: route.bun_executable.clone(),
-        bun_sha256: route.bun_sha256.clone(),
-        server_program: route.server_program.clone(),
-        server_program_sha256: route.server_program_sha256.clone(),
-        state_root: route.state_root.clone(),
-        password_file: route.password_file.clone(),
-        connection_file: route.connection_file.clone(),
-        config_file: route.config_file.clone(),
-        workspace_directory: route.workspace_directory.clone(),
-        port: route.port,
-        route_digest: route.route_digest()?,
-        config_digest: prepared.config_digest.clone(),
-        module_sha256: prepared.plugin.module_sha256().to_owned(),
-        entrypoint_sha256: prepared.plugin.entrypoint_sha256().to_owned(),
-    };
-    let plan_path = route.state_root.join(".owned-launch-plan.json");
-    let canonical_plan = model::canonical(&serde_json::to_value(plan)?)?;
-    write_private_new(&plan_path, canonical_plan.as_bytes())?;
-    Ok(plan_path)
+    (|| -> Result<()> {
+        ensure_directory_tree(&route.base_state_root)?;
+        let launch_parent = route.base_state_root.join("launches");
+        ensure_directory_tree(&launch_parent)?;
+        match fs::symlink_metadata(&route.state_root) {
+            Ok(_) => Err(Error::new(
+                "OWNED_SERVICE_STATE_EXISTS",
+                "fresh owned service state already exists; uncertain launches are never replayed",
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    })()
+    .map_err(|_| MaterializeFailure {
+        state_root_created: false,
+    })?;
+    fs::create_dir(&route.state_root).map_err(|_| MaterializeFailure {
+        state_root_created: false,
+    })?;
+
+    let after_root = (|| -> Result<PathBuf> {
+        private_permissions(&route.state_root, true)?;
+        let config_dir = route
+            .config_file
+            .parent()
+            .ok_or_else(|| config_error("owned config path is invalid"))?;
+        ensure_directory_tree(config_dir)?;
+        let config = model::canonical(prepared.plugin.config_value())?;
+        if model::digest(config.as_bytes()) != prepared.config_digest {
+            return Err(source_error("prepared plugin config digest changed"));
+        }
+        write_private_new(&route.config_file, format!("{config}\n").as_bytes())?;
+        let password = format!(
+            "{}{}",
+            model::new_id().replace('-', ""),
+            model::new_id().replace('-', "")
+        );
+        write_private_new(&route.password_file, password.as_bytes())?;
+        let plan = HelperPlan {
+            schema_version: 1,
+            owner_nonce: route.owner_nonce.clone(),
+            service_id: route.service_id.clone(),
+            version: VERSION.into(),
+            model: route.model.clone(),
+            model_catalog: route.model_catalog.clone(),
+            bun_executable: route.bun_executable.clone(),
+            bun_sha256: route.bun_sha256.clone(),
+            server_program: route.server_program.clone(),
+            server_program_sha256: route.server_program_sha256.clone(),
+            state_root: route.state_root.clone(),
+            password_file: route.password_file.clone(),
+            connection_file: route.connection_file.clone(),
+            config_file: route.config_file.clone(),
+            workspace_directory: route.workspace_directory.clone(),
+            port: route.port,
+            route_digest: route.route_digest()?,
+            config_digest: prepared.config_digest.clone(),
+            module_sha256: prepared.plugin.module_sha256().to_owned(),
+            entrypoint_sha256: prepared.plugin.entrypoint_sha256().to_owned(),
+        };
+        let plan_path = route.state_root.join(".owned-launch-plan.json");
+        let canonical_plan = model::canonical(&serde_json::to_value(plan)?)?;
+        write_private_new(&plan_path, canonical_plan.as_bytes())?;
+        Ok(plan_path)
+    })();
+    after_root.map_err(|_| MaterializeFailure {
+        state_root_created: true,
+    })
 }
 
 /// Hidden CLI entrypoint. It creates a non-killing per-service Job in this

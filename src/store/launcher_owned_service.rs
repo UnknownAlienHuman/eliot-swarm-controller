@@ -13,8 +13,8 @@ use crate::{
         Options,
         owned_service::{
             OwnedServiceHandle, OwnedServiceIntent, OwnedServiceOrigin, OwnedServiceReadback,
-            OwnedServiceRoute, OwnedServiceSeed, OwnedServiceStartPermit, prepare_owned_service,
-            start_foreground,
+            OwnedServiceRoute, OwnedServiceSeed, OwnedServiceStartFailure, OwnedServiceStartPermit,
+            prepare_owned_service, start_foreground,
         },
     },
     workspace::LeaseAuthorityRef,
@@ -411,6 +411,12 @@ impl Store {
         if *stopping.borrow() {
             return Err(shutdown_error());
         }
+        // Validate and mint the opaque, one-shot token before the durable
+        // unknown boundary so token-construction failure cannot strand it.
+        // The token stays local and is not handed to the runtime until the CAS
+        // below commits successfully.
+        let prepared_config_digest = prepared.config_digest().to_owned();
+        let permit = OwnedServiceStartPermit::from_store_admission(&admission.intent, &prepared)?;
 
         // A stop racing this transaction leaves the durable row `reserved`,
         // which can be safely resumed with the same nonce. After this commit,
@@ -472,13 +478,50 @@ impl Store {
         })
         .await?;
 
-        // This non-serializable permit is minted only after the `unknown`
-        // boundary commits. A failure from here onward remains fenced and is
+        // The permit was validated before the `unknown` boundary but stayed
+        // local until that boundary committed. A failure from here onward is
         // never interpreted as permission to retry the spawn.
-        let permit = OwnedServiceStartPermit::from_store_admission(&admission.intent, &prepared)?;
         let handle = match start_foreground(prepared, permit).await {
             Ok(handle) => handle,
-            Err(error) => return Err(error),
+            Err(OwnedServiceStartFailure::ProvenNoEffect(no_effect)) => {
+                if !no_effect.matches(&admission.intent, &prepared_config_digest) {
+                    return Err(corrupt(
+                        "pre-spawn no-effect proof differs from the exact Store launch intent",
+                    ));
+                }
+
+                let row = admission.row.clone();
+                let config = self.config.clone();
+                let binding_id = row.binding_id.clone();
+                let expected_actor = admission.actor.clone();
+                let expected_row = row.clone();
+                let workspace_directory = admission.route.workspace_directory().to_path_buf();
+                let scope_current = self
+                    .run(move |db| {
+                        let scope = opening_scope(&*db, &config, &binding_id, generation)?;
+                        verify_scope_for_admission(
+                            &scope,
+                            &expected_actor,
+                            &expected_row,
+                            &workspace_directory,
+                        )
+                    })
+                    .await
+                    .is_ok();
+                let proof_json = failed_no_effect_proof(
+                    &row,
+                    &prepared_config_digest,
+                    no_effect.safe_code(),
+                    scope_current,
+                )?;
+                self.run(move |db| persist_failed_no_effect(db, &row, &proof_json))
+                    .await?;
+                return Err(Error::new(
+                    no_effect.safe_code(),
+                    "owned service failed before helper spawn; no process was started",
+                ));
+            }
+            Err(OwnedServiceStartFailure::Unknown(error)) => return Err(error),
         };
         let proof = handle.readback().store_proof();
         let route = admission.route;
@@ -1028,6 +1071,128 @@ fn verify_scope_for_admission(
     if digest != expected.intent_digest {
         return Err(scope_changed());
     }
+    Ok(())
+}
+
+fn failed_no_effect_proof(
+    row: &OwnedStartRow,
+    config_digest: &str,
+    safe_code: &str,
+    scope_current: bool,
+) -> Result<String> {
+    if safe_code != "OWNED_SERVICE_PRE_SPAWN_NO_EFFECT" || !is_sha256(config_digest) {
+        return Err(corrupt("pre-spawn no-effect proof is malformed"));
+    }
+    let proof = json!({
+        "schema_version":1,
+        "status":"failed_no_effect",
+        "safe_code":safe_code,
+        "owner_nonce":row.owner_nonce,
+        "route_digest":row.route_digest,
+        "intent_digest":row.intent_digest,
+        "config_digest":config_digest,
+        "process_spawn_attempted":false,
+        "scope_revalidation":if scope_current { "current" } else { "stale_or_unavailable" },
+    });
+    let canonical = model::canonical(&proof)?;
+    if canonical.len() > MAX_PROOF_BYTES {
+        return Err(corrupt(
+            "pre-spawn no-effect proof exceeds its storage bound",
+        ));
+    }
+    Ok(canonical)
+}
+
+fn persist_failed_no_effect(
+    db: &mut Connection,
+    row: &OwnedStartRow,
+    proof_json: &str,
+) -> Result<()> {
+    if proof_json.len() > MAX_PROOF_BYTES {
+        return Err(corrupt(
+            "pre-spawn no-effect proof exceeds its storage bound",
+        ));
+    }
+    let proof: Value = serde_json::from_str(proof_json)
+        .map_err(|_| corrupt("pre-spawn no-effect proof is invalid JSON"))?;
+    let canonical = model::canonical(&proof)?;
+    let object = proof
+        .as_object()
+        .ok_or_else(|| corrupt("pre-spawn no-effect proof is not an object"))?;
+    let expected_fields = [
+        "schema_version",
+        "status",
+        "safe_code",
+        "owner_nonce",
+        "route_digest",
+        "intent_digest",
+        "config_digest",
+        "process_spawn_attempted",
+        "scope_revalidation",
+    ];
+    if canonical != proof_json
+        || object.len() != expected_fields.len()
+        || expected_fields
+            .iter()
+            .any(|field| !object.contains_key(*field))
+        || proof["schema_version"] != 1
+        || proof["status"] != "failed_no_effect"
+        || proof["safe_code"] != "OWNED_SERVICE_PRE_SPAWN_NO_EFFECT"
+        || proof["owner_nonce"] != row.owner_nonce
+        || proof["route_digest"] != row.route_digest
+        || proof["intent_digest"] != row.intent_digest
+        || !proof["config_digest"].as_str().is_some_and(is_sha256)
+        || proof["process_spawn_attempted"] != false
+        || !matches!(
+            proof["scope_revalidation"].as_str(),
+            Some("current" | "stale_or_unavailable")
+        )
+    {
+        return Err(corrupt(
+            "pre-spawn no-effect proof differs from its exact launch row",
+        ));
+    }
+
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let current =
+        load_start_row(&tx, &row.binding_id, row.binding_generation)?.ok_or_else(|| {
+            corrupt("owned service reservation disappeared before no-effect retention")
+        })?;
+    verify_start_row(&current, row)?;
+    if current.state != "outcome_unknown"
+        || current.proof_json != "{}"
+        || current.process_id.is_some()
+        || current.process_birth_token.is_some()
+        || current.executable_sha256.is_some()
+    {
+        return Err(Error::conflict(
+            "owned service startup no longer has an empty unknown-effect reservation",
+        ));
+    }
+    let changed = tx.execute(
+        "UPDATE owned_service_starts
+         SET state='failed_no_effect',proof_json=?1,updated_at_ms=?2
+         WHERE launch_operation_id=?3 AND binding_id=?4 AND binding_generation=?5
+           AND state='outcome_unknown' AND intent_nonce=?6 AND route_digest=?7 AND intent_digest=?8
+           AND process_id IS NULL AND process_birth_token IS NULL AND executable_sha256 IS NULL
+           AND proof_json='{}'",
+        params![
+            canonical,
+            model::now_ms()?,
+            row.launch_operation_id,
+            row.binding_id,
+            row.binding_generation,
+            row.owner_nonce,
+            row.route_digest,
+            row.intent_digest,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(Error::conflict(
+            "owned service no-effect state transition lost its exact reservation CAS",
+        ));
+    }
+    tx.commit()?;
     Ok(())
 }
 
