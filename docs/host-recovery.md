@@ -46,16 +46,33 @@ credential-issue and commit stages. Database persistence and selector failures
 propagate to the host instead of being reported as an issuance diagnostic. The
 receipt reports an issuance failure and does not authorize Task input replay.
 
-C23 ended with an outer `service_start` timeout, but current-manager readback
-identified the exact retained `NATIVE_MCP_ROUTE_MISMATCH` at
-`native_capability_readback`. The registered enabled participant and current
-binding had passed pre-dispatch scope checks and were ready and connected. The
-owned route lacked `native_options.service_id` and `native_options.expected_version`,
-while validation looked for them in external options. The source-qualified
-repair now derives owned identity and PID from the exact verified Store
-projection. Its focused tests and independent review passed; fresh C25 native
-qualification is pending. Preserve the consumed C23 run; the timeout itself is
-not the root-cause diagnosis. Native MCP proof and model execution remain unqualified.
+C23's route mismatch was repaired in qualified source 22420c8: owned identity
+and PID now come from the verified projection for the exact binding generation.
+C25 exercised that route but ended with outer `service_start` timeout and
+`OWNED_SERVICE_OR_NATIVE_PROOF_TIMEOUT`. Its C7 owned-service readback was
+retained twice; 23 runtime snapshots succeeded with zero gaps or axis failures,
+and four current-manager C7 readbacks validated. C8's actual retained failure
+was `NATIVE_MCP_PROOF_SOURCE` at `challenge_preflight`, before effect
+reservation. The participant was installed, registered and connected and the
+challenge was prepared, but no effect was reserved and tool readback was null.
+The exact failed predicate remains unproven because the source merged multiple
+guards and did not retain the native response. At the C25 source, C8 failure was not exposed
+by current-manager `operation.get` or `swarm.exceptions.get`; native MCP proof
+and model execution remain unqualified. Preserve the consumed C25 run without
+replay.
+
+The source-qualified increment adds the bounded `native_mcp_tools_readback` operation
+projection, precise closed source-guard codes, and a readback-only action for
+admitted launches whose unknown start predates a validated interruption and the
+current host start. Formatting, strict production Clippy, seven distinct Manager
+regressions, build and independent review passed as recorded in
+`implementation-status.md`. The action preserves exact binding references and
+current-GM authority independently of the previous chat. It reports an unresolved
+reservation and does not establish which process started, create a terminal
+observation or authorize retry. C8 diagnostics include scheduler-only safe codes;
+corrupt optional metadata produces a safe gap without hiding the original
+Operation. C26 is preparing a fresh safe-error watch, and C24 hosted Bunny
+remains private preparation until full native MCP proof exists.
 
 An OpenCode snapshot requires a validated root-session read. Its independent
 optional read axes share a bounded deadline inside the existing whole-snapshot

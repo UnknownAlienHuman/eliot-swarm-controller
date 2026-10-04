@@ -64,6 +64,12 @@ pub(super) fn get_operation_for_current_manager(
     if current_manager && let Some(readback) = native_mcp_readback_for_operation(db, id)? {
         operation["native_mcp_readback"] = readback;
     }
+    if current_manager
+        && operation["method"] == "swarm.launch"
+        && let Some(readback) = super::launcher_mcp_tools::diagnostic_for_operation(db, id)?
+    {
+        operation["native_mcp_tools_readback"] = readback;
+    }
     if current_manager && let Some(issuance) = participant_issuance_failure_for_operation(db, id)? {
         operation["participant_issuance"] = issuance;
     }
@@ -332,9 +338,9 @@ pub(super) fn record_owned_open_dispatch_failure(
     Ok(inserted == 1)
 }
 
-/// A startup rejection remains an unknown native effect until exact readback.
-/// Project only the closed, bounded diagnostic attached to this exact
-/// launch/open pair; never return its raw payload or a process error message.
+/// A startup diagnostic or interrupted unknown reservation remains an unknown
+/// native effect until exact readback. Keep the projection bound to this
+/// launch/open pair and never return raw observation payloads or process errors.
 fn owned_service_start_action_for_operation(
     db: &Connection,
     operation_id: &str,
@@ -355,13 +361,109 @@ fn owned_service_start_action_for_operation(
     }
 }
 
+#[derive(Clone, Copy)]
+struct InterruptedStartCut {
+    host_epoch: i64,
+    observed_at_ms: i64,
+    current_started_at_ms: i64,
+}
+
+impl InterruptedStartCut {
+    fn includes(self, start_updated_at_ms: i64) -> bool {
+        start_updated_at_ms >= 0
+            && start_updated_at_ms < self.observed_at_ms
+            && start_updated_at_ms < self.current_started_at_ms
+    }
+}
+
+/// Return only a validated restart cut. The lifecycle receipt identifies the
+/// interrupted host, but owned-service rows do not store their host epoch, so
+/// this proves only that the exact reservation was unresolved before the
+/// interruption cut; it does not attribute the original start to that epoch.
+fn interrupted_start_cut(db: &Connection) -> Result<Option<InterruptedStartCut>> {
+    let lifecycle = super::host_lifecycle::status(db)?;
+    let current = &lifecycle["current"];
+    let failure = &lifecycle["latest_failure"];
+    if current["state"] != "running"
+        || failure["schema_version"] != 1
+        || failure["error_code"] != "HOST_INTERRUPTED"
+        || failure["manager_action_required"] != true
+        || failure["retry_authorized"] != false
+    {
+        return Ok(None);
+    }
+
+    let Some(host_epoch) = failure["host_epoch"].as_i64().filter(|epoch| *epoch > 0) else {
+        return Ok(None);
+    };
+    let Some(observed_at_ms) = failure["observed_at_ms"].as_i64().filter(|time| *time > 0) else {
+        return Ok(None);
+    };
+    let Some(current_host_epoch) = current["host_epoch"].as_i64().filter(|epoch| *epoch > 0) else {
+        return Ok(None);
+    };
+    let Some(current_started_at_ms) = current["started_at_ms"].as_i64().filter(|time| *time > 0)
+    else {
+        return Ok(None);
+    };
+    if current_host_epoch <= host_epoch || current_started_at_ms < observed_at_ms {
+        return Ok(None);
+    }
+
+    Ok(Some(InterruptedStartCut {
+        host_epoch,
+        observed_at_ms,
+        current_started_at_ms,
+    }))
+}
+
+fn interrupted_owned_service_start_action(
+    launch_operation_id: &str,
+    open_operation_id: &str,
+    binding_id: &str,
+    binding_generation: i64,
+    task_id: &str,
+    attempt_id: &str,
+    cut: InterruptedStartCut,
+) -> Value {
+    json!({
+        "status":"required",
+        "kind":"owned_service_start_readback_required",
+        "schema_version":1,
+        "manager_actionable":true,
+        "launch_operation_id":launch_operation_id,
+        "open_operation_id":open_operation_id,
+        "binding_id":binding_id,
+        "binding_generation":binding_generation,
+        "task_id":task_id,
+        "attempt_id":attempt_id,
+        "start_state":"outcome_unknown",
+        "native_effect":"unknown",
+        "host_interruption":{
+            "source":"host_lifecycle.latest_failure",
+            "host_epoch":cut.host_epoch,
+            "observed_at_ms":cut.observed_at_ms,
+        },
+        "retry_authorized":false,
+        "next_readback":{
+            "method":"operation.get",
+            "params":{"operation_id":launch_operation_id},
+        },
+        "actions":[
+            "Read the exact linked launch and owned-service state before any retry.",
+            "The reservation was still unresolved at a host interruption; do not infer whether the helper started.",
+        ],
+    })
+}
+
 fn owned_service_start_action_for_operation_inner(
     db: &Connection,
     operation_id: &str,
 ) -> Result<Option<Value>> {
     let mut statement = db.prepare(
         "SELECT launch_operation_id,open_operation_id,binding_id,binding_generation,
-                task_id,attempt_id,state,process_id,process_birth_token,executable_sha256,proof_json
+                task_id,attempt_id,state,process_id,process_birth_token,executable_sha256,proof_json,
+                updated_at_ms
          FROM owned_service_starts
          WHERE (launch_operation_id=?1 OR open_operation_id=?1)
          ORDER BY launch_operation_id LIMIT 2",
@@ -380,6 +482,7 @@ fn owned_service_start_action_for_operation_inner(
                 row.get::<_, Option<String>>(8)?,
                 row.get::<_, Option<String>>(9)?,
                 row.get::<_, String>(10)?,
+                row.get::<_, i64>(11)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -398,6 +501,7 @@ fn owned_service_start_action_for_operation_inner(
         process_birth_token,
         executable_sha256,
         proof_json,
+        start_updated_at_ms,
     )) = rows.into_iter().next()
     else {
         return Ok(None);
@@ -410,6 +514,7 @@ fn owned_service_start_action_for_operation_inner(
         || executable_sha256.is_some()
         || proof_json != "{}"
         || binding_generation <= 0
+        || start_updated_at_ms < 0
         || [
             launch_operation_id.as_str(),
             open_operation_id.as_str(),
@@ -502,9 +607,21 @@ fn owned_service_start_action_for_operation_inner(
         payload_bytes,
     )) = rows.into_iter().next()
     else {
-        // An outcome-unknown reservation may still be in flight or recovered
-        // without a terminal start-failure observation.
-        return Ok(None);
+        let Some(cut) = interrupted_start_cut(db)? else {
+            return Ok(None);
+        };
+        if !cut.includes(start_updated_at_ms) {
+            return Ok(None);
+        }
+        return Ok(Some(interrupted_owned_service_start_action(
+            &launch_operation_id,
+            &open_operation_id,
+            &binding_id,
+            binding_generation,
+            &task_id,
+            &attempt_id,
+            cut,
+        )));
     };
     if observation_id <= 0
         || source_stream_id != "controller:owned-service"
@@ -1079,20 +1196,33 @@ pub(super) fn owned_service_dispatch_failure_actions(db: &Connection) -> Result<
     }))
 }
 /// Bounded current-attention projection for the exact current GM. The stored
-/// Operation result remains unchanged; this links unresolved startup failures
-/// to their retained, closed-schema evidence.
+/// Operation result remains unchanged; this links unresolved startup readback
+/// to its retained diagnostic or validated host-interruption cut.
 pub(super) fn owned_service_start_failure_actions(db: &Connection) -> Result<Value> {
+    let interruption_cut = interrupted_start_cut(db)?;
+    let interruption_at_ms = interruption_cut.map(|cut| cut.observed_at_ms);
+    let current_started_at_ms = interruption_cut.map(|cut| cut.current_started_at_ms);
     let total_items: i64 = db.query_row(
         "SELECT count(*)
          FROM owned_service_starts AS start
          WHERE start.state='outcome_unknown'
-           AND EXISTS(
-             SELECT 1 FROM observations AS diagnostic
-             WHERE diagnostic.source_event_key='owned-service-start-failure:' || start.launch_operation_id
-                OR (diagnostic.operation_id=start.launch_operation_id
-                    AND diagnostic.kind='owned_service.start_failure')
+           AND (
+             EXISTS(
+               SELECT 1 FROM observations AS diagnostic
+               WHERE diagnostic.source_event_key='owned-service-start-failure:' || start.launch_operation_id
+                  OR (diagnostic.operation_id=start.launch_operation_id
+                      AND diagnostic.kind='owned_service.start_failure')
+             )
+             OR (?1 IS NOT NULL AND ?2 IS NOT NULL
+                 AND start.updated_at_ms<?1 AND start.updated_at_ms<?2
+                 AND NOT EXISTS(
+                   SELECT 1 FROM observations AS diagnostic
+                   WHERE diagnostic.source_event_key='owned-service-start-failure:' || start.launch_operation_id
+                      OR (diagnostic.operation_id=start.launch_operation_id
+                          AND diagnostic.kind='owned_service.start_failure')
+                 ))
            )",
-        [],
+        params![interruption_at_ms, current_started_at_ms],
         |row| row.get(0),
     )?;
     let launch_ids = {
@@ -1100,18 +1230,33 @@ pub(super) fn owned_service_start_failure_actions(db: &Connection) -> Result<Val
             "SELECT start.launch_operation_id
              FROM owned_service_starts AS start
              WHERE start.state='outcome_unknown'
-               AND EXISTS(
-                 SELECT 1 FROM observations AS diagnostic
-                 WHERE diagnostic.source_event_key='owned-service-start-failure:' || start.launch_operation_id
-                    OR (diagnostic.operation_id=start.launch_operation_id
-                        AND diagnostic.kind='owned_service.start_failure')
+               AND (
+                 EXISTS(
+                   SELECT 1 FROM observations AS diagnostic
+                   WHERE diagnostic.source_event_key='owned-service-start-failure:' || start.launch_operation_id
+                      OR (diagnostic.operation_id=start.launch_operation_id
+                          AND diagnostic.kind='owned_service.start_failure')
+                 )
+                 OR (?1 IS NOT NULL AND ?2 IS NOT NULL
+                     AND start.updated_at_ms<?1 AND start.updated_at_ms<?2
+                     AND NOT EXISTS(
+                       SELECT 1 FROM observations AS diagnostic
+                       WHERE diagnostic.source_event_key='owned-service-start-failure:' || start.launch_operation_id
+                          OR (diagnostic.operation_id=start.launch_operation_id
+                              AND diagnostic.kind='owned_service.start_failure')
+                     ))
                )
              ORDER BY start.updated_at_ms DESC,start.launch_operation_id
-             LIMIT ?1",
+             LIMIT ?3",
         )?;
-        let rows = statement.query_map([MAX_MANAGER_ACTION_REQUIRED_ITEMS], |row| {
-            row.get::<_, String>(0)
-        })?;
+        let rows = statement.query_map(
+            params![
+                interruption_at_ms,
+                current_started_at_ms,
+                MAX_MANAGER_ACTION_REQUIRED_ITEMS
+            ],
+            |row| row.get::<_, String>(0),
+        )?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
     let mut items = Vec::with_capacity(launch_ids.len());

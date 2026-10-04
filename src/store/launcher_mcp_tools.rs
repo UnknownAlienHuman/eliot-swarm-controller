@@ -18,7 +18,7 @@ use crate::{
     runtime::opencode_v2::{Options, Service},
     store::{launcher_native_mcp, native_mcp},
 };
-use rusqlite::{Connection, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::{Value, json};
 use std::{sync::Arc, time::Duration};
 
@@ -2409,6 +2409,258 @@ fn record_key(operation_id: &str) -> String {
         "{RECORD_KEY_PREFIX}{}",
         model::digest(operation_id.as_bytes())
     )
+}
+
+const MAX_PUBLIC_C8_RECORD_BYTES: usize = MAX_PRIVATE_READBACK_BYTES + 65_536;
+const MAX_PUBLIC_C8_SCHEDULE_BYTES: usize = 4096;
+
+enum DiagnosticMeta {
+    Missing,
+    Value(Value),
+    Corrupt,
+}
+
+struct PublicC8Schedule<'a> {
+    state: &'a str,
+    failure_attempts: i64,
+    next_retry_at_ms: Option<i64>,
+    last_error_code: Option<&'a str>,
+    launch_identity_digest: &'a str,
+}
+
+/// Return only the validated, bounded C8 status needed by the current-GM
+/// Operation projection. This deliberately does not revalidate the historical
+/// launch against today's Participant grant or assignment: the operation ID
+/// binds these diagnostics, while current authority and operation visibility
+/// are enforced by the caller.
+pub(super) fn diagnostic_for_operation(
+    db: &Connection,
+    operation_id: &str,
+) -> Result<Option<Value>> {
+    let method: Option<String> = db
+        .query_row(
+            "SELECT method FROM operations WHERE operation_id=?1",
+            [operation_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if method.as_deref() != Some("swarm.launch") {
+        return Ok(None);
+    }
+
+    let record = read_diagnostic_meta(db, &record_key(operation_id), MAX_PUBLIC_C8_RECORD_BYTES)?;
+    let schedule = read_diagnostic_meta(
+        db,
+        &supervisor_key(operation_id),
+        MAX_PUBLIC_C8_SCHEDULE_BYTES,
+    )?;
+    if matches!(&record, DiagnosticMeta::Missing) && matches!(&schedule, DiagnosticMeta::Missing) {
+        return Ok(None);
+    }
+    let corrupt = || Some(native_mcp_tools_diagnostic_corrupt());
+    if matches!(&record, DiagnosticMeta::Corrupt) || matches!(&schedule, DiagnosticMeta::Corrupt) {
+        return Ok(corrupt());
+    }
+
+    let record = match record {
+        DiagnosticMeta::Value(value) => Some(value),
+        DiagnosticMeta::Missing => None,
+        DiagnosticMeta::Corrupt => return Ok(corrupt()),
+    };
+    let schedule = match schedule {
+        DiagnosticMeta::Value(value) => Some(value),
+        DiagnosticMeta::Missing => None,
+        DiagnosticMeta::Corrupt => return Ok(corrupt()),
+    };
+
+    let record_digest = if let Some(record) = record.as_ref() {
+        if !valid_public_c8_record(record, operation_id) {
+            return Ok(corrupt());
+        }
+        record["launch_identity_digest"].as_str()
+    } else {
+        None
+    };
+    let Some(schedule) = schedule.as_ref() else {
+        // Every durable C8 record is created only after the supervisor claim.
+        return Ok(corrupt());
+    };
+    let Some(schedule) = public_c8_schedule(schedule, operation_id) else {
+        return Ok(corrupt());
+    };
+    if let Some(record_digest) = record_digest
+        && schedule.launch_identity_digest != record_digest
+    {
+        return Ok(corrupt());
+    }
+
+    let latest_failure = match record.as_ref().map(|record| &record["last_error"]) {
+        None | Some(Value::Null) => Value::Null,
+        Some(failure) if valid_public_c8_failure(failure) => json!({
+            "schema_version":1,
+            "code":failure["code"],
+            "stage":failure["stage"],
+            "recorded_at_ms":failure["recorded_at_ms"],
+        }),
+        Some(_) => return Ok(corrupt()),
+    };
+
+    Ok(Some(json!({
+        "schema_version":1,
+        "state":schedule.state,
+        "failure_attempts":schedule.failure_attempts,
+        "next_retry_at_ms":schedule.next_retry_at_ms,
+        "last_error_code":schedule.last_error_code,
+        "latest_failure":latest_failure,
+        "model_consumed":"unknown",
+        "dispatch_permitted":false,
+    })))
+}
+
+fn read_diagnostic_meta(db: &Connection, key: &str, max_bytes: usize) -> Result<DiagnosticMeta> {
+    let bounded_max = i64::try_from(max_bytes).unwrap_or(i64::MAX);
+    let raw: Option<(i64, Option<String>)> = db
+        .query_row(
+            "SELECT length(CAST(value_json AS BLOB)),
+                    CASE WHEN length(CAST(value_json AS BLOB))<=?2 THEN value_json END
+             FROM meta WHERE key=?1",
+            params![key, bounded_max],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((bytes, raw)) = raw else {
+        return Ok(DiagnosticMeta::Missing);
+    };
+    if bytes < 0 || bytes > bounded_max {
+        return Ok(DiagnosticMeta::Corrupt);
+    }
+    let Some(raw) = raw else {
+        return Ok(DiagnosticMeta::Corrupt);
+    };
+    match serde_json::from_str(&raw) {
+        Ok(value) => Ok(DiagnosticMeta::Value(value)),
+        Err(_) => Ok(DiagnosticMeta::Corrupt),
+    }
+}
+
+fn valid_public_c8_record(record: &Value, operation_id: &str) -> bool {
+    record["schema_version"] == 1
+        && record["kind"] == "launcher_native_mcp_tools"
+        && record["operation_id"].as_str() == Some(operation_id)
+        && record["launch_identity_digest"]
+            .as_str()
+            .is_some_and(valid_prefixed_sha256)
+        && record.get("last_error").is_some()
+}
+
+fn public_c8_schedule<'a>(schedule: &'a Value, operation_id: &str) -> Option<PublicC8Schedule<'a>> {
+    if schedule["schema_version"] != 1
+        || schedule["kind"] != "launcher_native_mcp_tools_supervisor"
+        || schedule["operation_id"].as_str() != Some(operation_id)
+        || schedule["claim_generation"]
+            .as_i64()
+            .is_none_or(|value| value < 0)
+        || schedule["failure_attempts"]
+            .as_i64()
+            .is_none_or(|value| value < 0)
+    {
+        return None;
+    }
+    let state = schedule["state"].as_str()?;
+    if !matches!(
+        state,
+        "ready" | "running" | "retry_wait" | "observed_partial" | "stale"
+    ) {
+        return None;
+    }
+    let digest = schedule["launch_identity_digest"].as_str()?;
+    if !digest.is_empty() && !valid_prefixed_sha256(digest) {
+        return None;
+    }
+    if digest.is_empty() && state != "stale" {
+        return None;
+    }
+    let nonnegative_or_null = |field: &str| -> Option<Option<i64>> {
+        if schedule.get(field)?.is_null() {
+            Some(None)
+        } else {
+            schedule[field]
+                .as_i64()
+                .filter(|value| *value >= 0)
+                .map(Some)
+        }
+    };
+    let started_at_ms = nonnegative_or_null("started_at_ms")?;
+    let next_retry_at_ms = nonnegative_or_null("next_retry_at_ms")?;
+    let finished_at_ms = nonnegative_or_null("finished_at_ms")?;
+    let valid_timing = match state {
+        "ready" | "retry_wait" => next_retry_at_ms.is_some() && started_at_ms.is_none(),
+        "running" => {
+            next_retry_at_ms.is_none() && started_at_ms.is_some() && finished_at_ms.is_none()
+        }
+        "observed_partial" | "stale" => {
+            next_retry_at_ms.is_none() && started_at_ms.is_none() && finished_at_ms.is_some()
+        }
+        _ => false,
+    };
+    if !valid_timing {
+        return None;
+    }
+    schedule.get("last_error_code")?;
+    let last_error_code = if let Some(error_code) = schedule["last_error_code"].as_str() {
+        if !valid_public_c8_code(error_code) {
+            return None;
+        }
+        Some(error_code)
+    } else if !schedule["last_error_code"].is_null() {
+        return None;
+    } else {
+        None
+    };
+    Some(PublicC8Schedule {
+        state,
+        failure_attempts: schedule["failure_attempts"].as_i64()?,
+        next_retry_at_ms,
+        last_error_code,
+        launch_identity_digest: digest,
+    })
+}
+
+fn valid_public_c8_failure(failure: &Value) -> bool {
+    failure.is_object()
+        && valid_public_c8_code(failure["code"].as_str().unwrap_or_default())
+        && matches!(
+            failure["stage"].as_str(),
+            Some(
+                "install"
+                    | "install_readback"
+                    | "challenge_preflight"
+                    | "challenge"
+                    | "tools_readback"
+            )
+        )
+        && failure["recorded_at_ms"]
+            .as_i64()
+            .is_some_and(|value| value >= 0)
+}
+
+fn valid_public_c8_code(code: &str) -> bool {
+    !code.is_empty()
+        && code.len() <= 64
+        && code.as_bytes().first().is_some_and(u8::is_ascii_uppercase)
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn native_mcp_tools_diagnostic_corrupt() -> Value {
+    json!({
+        "schema_version":1,
+        "state":"unknown",
+        "latest_failure":{"schema_version":1,"code":"NATIVE_MCP_TOOLS_DIAGNOSTIC_CORRUPT"},
+        "model_consumed":"unknown",
+        "dispatch_permitted":false,
+    })
 }
 
 fn public_summary(record: &Value) -> Value {

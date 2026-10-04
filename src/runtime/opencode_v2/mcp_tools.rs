@@ -110,15 +110,28 @@ pub(crate) fn challenge_metadata(challenge: &NativeMcpChallenge) -> Value {
 /// config is installed; this helper only projects the verified source identity.
 pub(crate) fn plugin_config_value(options: &Options) -> Result<Value> {
     if options.expected_version != PINNED_VERSION {
-        return Err(scope_error("native MCP observer requires OpenCode 2.0.7"));
+        return Err(source_error_code(
+            "NATIVE_MCP_PROOF_PLUGIN_CONFIG_MISMATCH",
+            "native MCP observer requires OpenCode 2.0.7",
+        ));
     }
     let (module_path, module_sha256) = module_source()?;
     let entry = plugin_entry_path(&module_path)?;
     let package = entry
         .parent()
-        .ok_or_else(|| source_error("native MCP plugin directory is missing"))?
+        .ok_or_else(|| {
+            source_error_code(
+                "NATIVE_MCP_PROOF_PLUGIN_CONFIG_INVALID",
+                "native MCP plugin directory is missing",
+            )
+        })?
         .to_str()
-        .ok_or_else(|| source_error("native MCP observer path is not valid Unicode"))?;
+        .ok_or_else(|| {
+            source_error_code(
+                "NATIVE_MCP_PROOF_PLUGIN_CONFIG_INVALID",
+                "native MCP observer path is not valid Unicode",
+            )
+        })?;
     Ok(json!({
         "package": package,
         "options": {
@@ -146,7 +159,8 @@ pub(crate) fn restore_challenge(
 ) -> Result<NativeMcpChallenge> {
     let (module_path, current_sha256) = module_source()?;
     if !module_hash_valid(&module_sha256) {
-        return Err(source_error(
+        return Err(source_error_code(
+            "NATIVE_MCP_PROOF_MODULE_INTEGRITY",
             "native MCP observer challenge has an invalid source hash",
         ));
     }
@@ -191,9 +205,12 @@ pub(crate) fn restore_challenge_metadata(
         .directory
         .to_str()
         .ok_or_else(|| scope_error("native project directory is not valid Unicode"))?;
-    let module_path_text = module_path
-        .to_str()
-        .ok_or_else(|| source_error("native MCP observer path is not valid Unicode"))?;
+    let module_path_text = module_path.to_str().ok_or_else(|| {
+        source_error_code(
+            "NATIVE_MCP_PROOF_MODULE_INTEGRITY",
+            "native MCP observer path is not valid Unicode",
+        )
+    })?;
     if stored.schema != "opencode-v2-native-mcp-challenge-v1"
         || model::canonical(&stored.assignment)? != model::canonical(&assignment.as_value())?
         || stored.service_id != options.service_id
@@ -309,18 +326,33 @@ fn expected_plugin_config(options: &Options, challenge: &NativeMcpChallenge) -> 
     let package_path = challenge
         .module_path
         .parent()
-        .ok_or_else(|| source_error("native MCP plugin directory is missing"))?
+        .ok_or_else(|| {
+            source_error_code(
+                "NATIVE_MCP_PROOF_PLUGIN_CONFIG_INVALID",
+                "native MCP plugin directory is missing",
+            )
+        })?
         .to_str()
-        .ok_or_else(|| source_error("native MCP observer path is not valid Unicode"))?;
-    if config["package"] != package_path
-        || config["options"]["moduleSha256"] != challenge.module_sha256
-    {
+        .ok_or_else(|| {
+            source_error_code(
+                "NATIVE_MCP_PROOF_PLUGIN_CONFIG_INVALID",
+                "native MCP observer path is not valid Unicode",
+            )
+        })?;
+    if config["package"] != package_path {
+        return Err(source_error_code(
+            "NATIVE_MCP_PROOF_PLUGIN_CONFIG_MISMATCH",
+            "native MCP observer package differs from its expected configuration",
+        ));
+    }
+    if config["options"]["moduleSha256"] != challenge.module_sha256 {
         return Err(rotated_module());
     }
     if config["options"]["serviceId"] != challenge.service_id
         || config["options"]["serviceVersion"] != challenge.service_version
     {
-        return Err(source_error(
+        return Err(source_error_code(
+            "NATIVE_MCP_PROOF_PLUGIN_CONFIG_MISMATCH",
             "expected native MCP observer configuration differs from its challenge",
         ));
     }
@@ -359,9 +391,7 @@ pub(crate) async fn read(
     verify_plugin_source(service, options, challenge).await?;
     let (_, source_hash_after) = module_source()?;
     if source_hash_after != challenge.module_sha256 {
-        return Err(source_error(
-            "native MCP observer source changed while evidence was read",
-        ));
+        return Err(rotated_module());
     }
 
     let value = project_readback(raw, challenge, service)?;
@@ -567,28 +597,42 @@ pub(crate) fn module_source() -> Result<(PathBuf, String)> {
         .join("modules")
         .join("opencode")
         .join("native-mcp-proof.mjs");
-    let metadata = fs::symlink_metadata(&path)
-        .map_err(|_| source_error("native MCP observer module is unavailable"))?;
+    let metadata = fs::symlink_metadata(&path).map_err(|_| {
+        source_error_code(
+            "NATIVE_MCP_PROOF_MODULE_UNAVAILABLE",
+            "native MCP observer module is unavailable",
+        )
+    })?;
     if !metadata.is_file()
         || metadata.file_type().is_symlink()
         || metadata.len() > MAX_PLUGIN_SOURCE_BYTES
     {
-        return Err(source_error(
+        return Err(source_error_code(
+            "NATIVE_MCP_PROOF_MODULE_INTEGRITY",
             "native MCP observer module must be a bounded regular file",
         ));
     }
-    let canonical = path
-        .canonicalize()
-        .map_err(|_| source_error("native MCP observer module path is invalid"))?;
+    let canonical = path.canonicalize().map_err(|_| {
+        source_error_code(
+            "NATIVE_MCP_PROOF_MODULE_INTEGRITY",
+            "native MCP observer module path is invalid",
+        )
+    })?;
     if canonical.to_str().is_none() {
-        return Err(source_error(
+        return Err(source_error_code(
+            "NATIVE_MCP_PROOF_MODULE_INTEGRITY",
             "native MCP observer module path is not valid Unicode",
         ));
     }
-    let bytes = fs::read(&canonical)
-        .map_err(|_| source_error("native MCP observer module cannot be read"))?;
+    let bytes = fs::read(&canonical).map_err(|_| {
+        source_error_code(
+            "NATIVE_MCP_PROOF_MODULE_UNAVAILABLE",
+            "native MCP observer module cannot be read",
+        )
+    })?;
     if bytes.is_empty() || bytes.len() as u64 > MAX_PLUGIN_SOURCE_BYTES {
-        return Err(source_error(
+        return Err(source_error_code(
+            "NATIVE_MCP_PROOF_MODULE_INTEGRITY",
             "native MCP observer module exceeds the source boundary",
         ));
     }
@@ -598,25 +642,43 @@ pub(crate) fn module_source() -> Result<(PathBuf, String)> {
 /// OpenCode 2.0.7 config resolves a directory's index/server entrypoint.
 /// Accept only this exact transparent entry; the observer has its own hash.
 pub(crate) fn plugin_entry_path(module_path: &Path) -> Result<PathBuf> {
-    let directory = module_path
-        .parent()
-        .ok_or_else(|| source_error("native MCP plugin directory is missing"))?;
+    let directory = module_path.parent().ok_or_else(|| {
+        source_error_code(
+            "NATIVE_MCP_PROOF_ENTRY_INTEGRITY",
+            "native MCP plugin directory is missing",
+        )
+    })?;
     let entry = directory.join("index.mjs");
-    let metadata = fs::symlink_metadata(&entry)
-        .map_err(|_| source_error("native MCP plugin entry is unavailable"))?;
+    let metadata = fs::symlink_metadata(&entry).map_err(|_| {
+        source_error_code(
+            "NATIVE_MCP_PROOF_ENTRY_UNAVAILABLE",
+            "native MCP plugin entry is unavailable",
+        )
+    })?;
     if !metadata.is_file()
         || metadata.file_type().is_symlink()
         || metadata.len() != PLUGIN_ENTRY_BYTES.len() as u64
     {
-        return Err(source_error(
+        return Err(source_error_code(
+            "NATIVE_MCP_PROOF_ENTRY_INTEGRITY",
             "native MCP plugin entry is not the bounded canonical wrapper",
         ));
     }
-    let canonical = entry
-        .canonicalize()
-        .map_err(|_| source_error("native MCP plugin entry path is invalid"))?;
-    if canonical.parent() != Some(directory) || fs::read(&canonical)? != PLUGIN_ENTRY_BYTES {
-        return Err(source_error(
+    let canonical = entry.canonicalize().map_err(|_| {
+        source_error_code(
+            "NATIVE_MCP_PROOF_ENTRY_INTEGRITY",
+            "native MCP plugin entry path is invalid",
+        )
+    })?;
+    let bytes = fs::read(&canonical).map_err(|_| {
+        source_error_code(
+            "NATIVE_MCP_PROOF_ENTRY_UNAVAILABLE",
+            "native MCP plugin entry cannot be read",
+        )
+    })?;
+    if canonical.parent() != Some(directory) || bytes != PLUGIN_ENTRY_BYTES {
+        return Err(source_error_code(
+            "NATIVE_MCP_PROOF_ENTRY_INTEGRITY",
             "native MCP plugin entry differs from the canonical wrapper",
         ));
     }
@@ -644,39 +706,67 @@ async fn verify_plugin_source(
         )
         .await?;
     let inventory: LocationEnvelope<Vec<Value>> = decode(response)?;
-    if inventory.location.directory != directory || inventory.data.len() > 512 {
-        return Err(source_error(
-            "native plugin inventory is outside the requested location or bound",
+    if inventory.location.directory != directory {
+        return Err(source_error_code(
+            "NATIVE_MCP_PROOF_INVENTORY_SCOPE",
+            "native plugin inventory is outside the requested location",
+        ));
+    }
+    if inventory.data.len() > 512 {
+        return Err(source_error_code(
+            "NATIVE_MCP_PROOF_INVENTORY_BOUND",
+            "native plugin inventory exceeds its bound",
         ));
     }
     let mut matching = inventory
         .data
         .iter()
         .filter(|plugin| plugin.get("id").and_then(Value::as_str) == Some(PLUGIN_ID));
-    let plugin = matching
-        .next()
-        .ok_or_else(|| source_error("native MCP observer plugin is not loaded"))?;
+    let plugin = matching.next().ok_or_else(|| {
+        source_error_code(
+            "NATIVE_MCP_PROOF_PLUGIN_MISSING",
+            "native MCP observer plugin is not loaded",
+        )
+    })?;
     // In 2.0.7, features.rpc describes a separate rpc file entrypoint.
     // This server plugin registers its RPC through the effect context;
     // arm/read acknowledgements below verify that concrete registration.
-    if matching.next().is_some()
-        || plugin["state"]["status"] != "active"
-        || plugin["features"]["server"] != true
-        || plugin["source"]["type"] != "local"
-    {
-        return Err(source_error(
-            "native MCP observer plugin identity or active server feature is invalid",
+    if matching.next().is_some() {
+        return Err(source_error_code(
+            "NATIVE_MCP_PROOF_PLUGIN_NONUNIQUE",
+            "native MCP observer plugin identity is not unique",
+        ));
+    }
+    if plugin["state"]["status"] != "active" || plugin["features"]["server"] != true {
+        return Err(source_error_code(
+            "NATIVE_MCP_PROOF_PLUGIN_STATE_MISMATCH",
+            "native MCP observer plugin is not active with the server feature",
+        ));
+    }
+    if plugin["source"]["type"] != "local" {
+        return Err(source_error_code(
+            "NATIVE_MCP_PROOF_PLUGIN_SOURCE_MISMATCH",
+            "native MCP observer plugin is not loaded from a local source",
         ));
     }
     let loaded_path = plugin["source"]["path"]
         .as_str()
         .filter(|path| !path.is_empty() && path.len() <= 4096)
-        .ok_or_else(|| source_error("native MCP observer source path is missing"))?;
-    let loaded_path = Path::new(loaded_path)
-        .canonicalize()
-        .map_err(|_| source_error("loaded native MCP observer source path is invalid"))?;
+        .ok_or_else(|| {
+            source_error_code(
+                "NATIVE_MCP_PROOF_PLUGIN_PATH_MISSING",
+                "native MCP observer source path is missing",
+            )
+        })?;
+    let loaded_path = Path::new(loaded_path).canonicalize().map_err(|_| {
+        source_error_code(
+            "NATIVE_MCP_PROOF_PLUGIN_PATH_INVALID",
+            "loaded native MCP observer source path is invalid",
+        )
+    })?;
     if loaded_path != expected_entry || expected_hash != challenge.module_sha256 {
-        return Err(source_error(
+        return Err(source_error_code(
+            "NATIVE_MCP_PROOF_PLUGIN_PATH_MISMATCH",
             "loaded native MCP observer does not match the host-owned module",
         ));
     }
@@ -1041,6 +1131,10 @@ fn scope_error(message: &str) -> Error {
 
 fn source_error(message: &str) -> Error {
     Error::new("NATIVE_MCP_PROOF_SOURCE", message)
+}
+
+fn source_error_code(code: &'static str, message: &str) -> Error {
+    Error::new(code, message)
 }
 
 fn challenge_error(message: &str) -> Error {

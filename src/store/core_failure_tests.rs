@@ -316,6 +316,10 @@ fn stored_admission_result(db: &Connection) -> String {
     .unwrap()
 }
 
+fn native_mcp_tools_meta_key(prefix: &str, operation_id: &str) -> String {
+    format!("{prefix}{}", model::digest(operation_id.as_bytes()))
+}
+
 fn handover_to_successor(fixture: &mut Fixture) {
     let receipt = store_mutate(
         &mut fixture.db,
@@ -980,5 +984,458 @@ fn native_mcp_failure_survives_successful_readback_and_successor_gm_handover() {
     assert!(!encoded.contains(RAW_MESSAGE));
     assert!(!encoded.contains(RAW_AUTH));
     assert!(!encoded.contains(RAW_PATH));
+    assert_eq!(stored_admission_result(&fixture.db), original_result);
+}
+
+#[test]
+fn native_mcp_tools_preflight_failure_is_bounded_and_visible_to_successor_gm() {
+    const RAW_MESSAGE: &str = "RAW_C8_ERROR_MESSAGE_private_6312";
+    const RAW_AUTH: &str = "RAW_C8_AUTH_private_9124";
+    const RAW_CONFIG: &str = "RAW_C8_CONFIG_private_7721";
+    const RAW_ENDPOINT: &str = "https://private.example.invalid/mcp";
+    const RAW_SCHEMA: &str = "RAW_C8_TOOL_SCHEMA_private_0835";
+
+    let mut fixture = fixture();
+    let original_receipt = stored_admission_result(&fixture.db);
+    let launch_digest = format!("sha256:{}", "d".repeat(64));
+    let record_key =
+        native_mcp_tools_meta_key("launcher:native_mcp_tools:v1:", LAUNCH_OPERATION_ID);
+    let schedule_key = native_mcp_tools_meta_key(
+        "launcher:native_mcp_tools:supervisor:v1:",
+        LAUNCH_OPERATION_ID,
+    );
+    let before_c8 = store_read(
+        &fixture.db,
+        principal(ORIGINAL_GM, Role::Manager),
+        "operation.get",
+        json!({"operation_id":LAUNCH_OPERATION_ID}),
+    );
+    assert!(before_c8.get("native_mcp_tools_readback").is_none());
+    let record = json!({
+        "schema_version":1,
+        "kind":"launcher_native_mcp_tools",
+        "operation_id":LAUNCH_OPERATION_ID,
+        "launch_identity_digest":launch_digest,
+        "service":{"endpoint":RAW_ENDPOINT,"authorization":RAW_AUTH},
+        "challenge":{"metadata":{"nonce":RAW_CONFIG}},
+        "tools_readback":{"native_discovered":{"tools":[{"schema":RAW_SCHEMA}]}},
+        "last_error":{
+            "stage":"challenge_preflight",
+            "code":"NATIVE_MCP_PROOF_SOURCE",
+            "recorded_at_ms":41,
+            "message":RAW_MESSAGE,
+            "authorization":RAW_AUTH,
+            "config":RAW_CONFIG,
+            "endpoint":RAW_ENDPOINT,
+            "tool_schema":RAW_SCHEMA,
+        },
+    });
+    let schedule = json!({
+        "schema_version":1,
+        "kind":"launcher_native_mcp_tools_supervisor",
+        "operation_id":LAUNCH_OPERATION_ID,
+        "launch_identity_digest":launch_digest,
+        "state":"retry_wait",
+        "claim_generation":1,
+        "started_at_ms":null,
+        "next_retry_at_ms":15_041,
+        "finished_at_ms":41,
+        "failure_attempts":1,
+        "last_error_code":"NATIVE_MCP_PROOF_SOURCE",
+    });
+    set_meta(&fixture.db, &record_key, &record).unwrap();
+    set_meta(&fixture.db, &schedule_key, &schedule).unwrap();
+
+    let original_operation = store_read(
+        &fixture.db,
+        principal(ORIGINAL_GM, Role::Manager),
+        "operation.get",
+        json!({"operation_id":LAUNCH_OPERATION_ID}),
+    );
+    let expected = json!({
+        "schema_version":1,
+        "state":"retry_wait",
+        "failure_attempts":1,
+        "next_retry_at_ms":15_041,
+        "last_error_code":"NATIVE_MCP_PROOF_SOURCE",
+        "latest_failure":{
+            "schema_version":1,
+            "code":"NATIVE_MCP_PROOF_SOURCE",
+            "stage":"challenge_preflight",
+            "recorded_at_ms":41,
+        },
+        "model_consumed":"unknown",
+        "dispatch_permitted":false,
+    });
+    assert_eq!(original_operation["result"], fixture.admission_result);
+    assert_eq!(original_operation["native_mcp_tools_readback"], expected);
+    let original_json = serde_json::to_string(&original_operation).unwrap();
+    for marker in [RAW_MESSAGE, RAW_AUTH, RAW_CONFIG, RAW_ENDPOINT, RAW_SCHEMA] {
+        assert!(!original_json.contains(marker));
+    }
+
+    handover_to_successor(&mut fixture);
+    let successor_operation = store_read(
+        &fixture.db,
+        principal(SUCCESSOR_GM, Role::Manager),
+        "operation.get",
+        json!({"operation_id":LAUNCH_OPERATION_ID}),
+    );
+    assert_eq!(successor_operation["result"], fixture.admission_result);
+    assert_eq!(successor_operation["native_mcp_tools_readback"], expected);
+    let former_operation = store_read(
+        &fixture.db,
+        principal(ORIGINAL_GM, Role::Manager),
+        "operation.get",
+        json!({"operation_id":LAUNCH_OPERATION_ID}),
+    );
+    assert_eq!(former_operation["result"], fixture.admission_result);
+    assert!(former_operation.get("native_mcp_tools_readback").is_none());
+    let successor_json = serde_json::to_string(&successor_operation).unwrap();
+    for marker in [RAW_MESSAGE, RAW_AUTH, RAW_CONFIG, RAW_ENDPOINT, RAW_SCHEMA] {
+        assert!(!successor_json.contains(marker));
+    }
+
+    // Invalid optional record shape and schedule fields must leave Operation
+    // readback available while returning only the closed corruption marker.
+    let invalid_record = model::canonical(&json!({
+        "schema_version":1,
+        "kind":"wrong_private_record_kind",
+        "operation_id":LAUNCH_OPERATION_ID,
+        "message":RAW_MESSAGE,
+        "authorization":RAW_AUTH,
+    }))
+    .unwrap();
+    fixture
+        .db
+        .execute(
+            "UPDATE meta SET value_json=?1 WHERE key=?2",
+            params![invalid_record, record_key],
+        )
+        .unwrap();
+    let malformed_record = store_read(
+        &fixture.db,
+        principal(SUCCESSOR_GM, Role::Manager),
+        "operation.get",
+        json!({"operation_id":LAUNCH_OPERATION_ID}),
+    );
+    assert_eq!(malformed_record["result"], fixture.admission_result);
+    assert_eq!(
+        malformed_record["native_mcp_tools_readback"],
+        json!({
+            "schema_version":1,
+            "state":"unknown",
+            "latest_failure":{
+                "schema_version":1,
+                "code":"NATIVE_MCP_TOOLS_DIAGNOSTIC_CORRUPT",
+            },
+            "model_consumed":"unknown",
+            "dispatch_permitted":false,
+        })
+    );
+    let public_record = serde_json::to_string(&malformed_record).unwrap();
+    assert!(!public_record.contains(RAW_MESSAGE));
+    assert!(!public_record.contains(RAW_AUTH));
+
+    set_meta(&fixture.db, &record_key, &record).unwrap();
+    set_meta(
+        &fixture.db,
+        &schedule_key,
+        &json!({
+            "schema_version":1,
+            "kind":"launcher_native_mcp_tools_supervisor",
+            "operation_id":LAUNCH_OPERATION_ID,
+            "launch_identity_digest":launch_digest,
+            "state":"retry_wait",
+            "claim_generation":1,
+            "started_at_ms":null,
+            "next_retry_at_ms":-1,
+            "finished_at_ms":41,
+            "failure_attempts":1,
+            "last_error_code":"NATIVE_MCP_PROOF_SOURCE",
+            "message":RAW_MESSAGE,
+        }),
+    )
+    .unwrap();
+    let malformed_schedule = store_read(
+        &fixture.db,
+        principal(SUCCESSOR_GM, Role::Manager),
+        "operation.get",
+        json!({"operation_id":LAUNCH_OPERATION_ID}),
+    );
+    assert_eq!(malformed_schedule["result"], fixture.admission_result);
+    assert_eq!(
+        malformed_schedule["native_mcp_tools_readback"]["latest_failure"]["code"],
+        "NATIVE_MCP_TOOLS_DIAGNOSTIC_CORRUPT"
+    );
+    assert!(
+        !serde_json::to_string(&malformed_schedule)
+            .unwrap()
+            .contains(RAW_MESSAGE)
+    );
+
+    // A preparation failure can be retained by the supervisor before a C8
+    // private record exists. Expose only its safe code and retry status; do not
+    // invent a stage or timestamp.
+    fixture
+        .db
+        .execute("DELETE FROM meta WHERE key=?1", [&record_key])
+        .unwrap();
+    set_meta(
+        &fixture.db,
+        &schedule_key,
+        &json!({
+            "schema_version":1,
+            "kind":"launcher_native_mcp_tools_supervisor",
+            "operation_id":LAUNCH_OPERATION_ID,
+            "launch_identity_digest":launch_digest,
+            "state":"retry_wait",
+            "claim_generation":1,
+            "started_at_ms":null,
+            "next_retry_at_ms":30_000,
+            "finished_at_ms":41,
+            "failure_attempts":2,
+            "last_error_code":"PRIVATE_ARTIFACT_REFERENCE",
+            "message":RAW_MESSAGE,
+        }),
+    )
+    .unwrap();
+    let schedule_only = store_read(
+        &fixture.db,
+        principal(SUCCESSOR_GM, Role::Manager),
+        "operation.get",
+        json!({"operation_id":LAUNCH_OPERATION_ID}),
+    );
+    assert_eq!(schedule_only["result"], fixture.admission_result);
+    assert_eq!(
+        schedule_only["native_mcp_tools_readback"],
+        json!({
+            "schema_version":1,
+            "state":"retry_wait",
+            "failure_attempts":2,
+            "next_retry_at_ms":30_000,
+            "last_error_code":"PRIVATE_ARTIFACT_REFERENCE",
+            "latest_failure":null,
+            "model_consumed":"unknown",
+            "dispatch_permitted":false,
+        })
+    );
+    assert!(
+        !serde_json::to_string(&schedule_only)
+            .unwrap()
+            .contains(RAW_MESSAGE)
+    );
+    assert_eq!(stored_admission_result(&fixture.db), original_receipt);
+}
+
+fn persist_prior_host_interruption(fixture: &mut Fixture) {
+    set_meta(&fixture.db, "host_epoch", &json!(2)).unwrap();
+    set_meta(
+        &fixture.db,
+        "host:lifecycle:v1",
+        &json!({
+            "schema_version":1,
+            "host_epoch":1,
+            "state":"running",
+            "started_at_ms":1,
+            "updated_at_ms":2,
+        }),
+    )
+    .unwrap();
+    let tx = fixture
+        .db
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+    super::host_lifecycle::start(&tx, 3).unwrap();
+    super::host_lifecycle::ready(&tx, 4).unwrap();
+    tx.commit().unwrap();
+}
+
+#[test]
+fn successor_manager_gets_readback_action_for_unknown_start_after_host_interruption() {
+    let mut fixture = fixture();
+    let original_result = stored_admission_result(&fixture.db);
+    fixture
+        .db
+        .execute(
+            "DELETE FROM observations WHERE observation_id=?1",
+            [fixture.observation_id],
+        )
+        .unwrap();
+    let terminal_failure_count: i64 = fixture
+        .db
+        .query_row(
+            "SELECT count(*) FROM observations WHERE source_event_key=?1 \
+             OR (operation_id=?2 AND kind='owned_service.start_failure')",
+            params![
+                format!("owned-service-start-failure:{LAUNCH_OPERATION_ID}"),
+                LAUNCH_OPERATION_ID,
+            ],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(terminal_failure_count, 0);
+    let (start_state, process_id, process_birth_token, executable_sha256, proof_json): (
+        String,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        String,
+    ) = fixture
+        .db
+        .query_row(
+            "SELECT state,process_id,process_birth_token,executable_sha256,proof_json \
+             FROM owned_service_starts WHERE launch_operation_id=?1",
+            [LAUNCH_OPERATION_ID],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(start_state, "outcome_unknown");
+    assert!(process_id.is_none());
+    assert!(process_birth_token.is_none());
+    assert!(executable_sha256.is_none());
+    assert_eq!(proof_json, "{}");
+
+    // A pending unknown start without a matching interruption stays unresolved
+    // and does not acquire a fabricated crash diagnosis.
+    let live_pending = store_read(
+        &fixture.db,
+        principal(ORIGINAL_GM, Role::Manager),
+        "operation.get",
+        json!({"operation_id":LAUNCH_OPERATION_ID}),
+    );
+    assert_eq!(live_pending["result"], fixture.admission_result);
+    assert!(live_pending.get("manager_action_required").is_none());
+    let pending_exceptions = store_read(
+        &fixture.db,
+        principal(ORIGINAL_GM, Role::Manager),
+        "swarm.exceptions.get",
+        json!({"after":0,"limit":32}),
+    );
+    assert!(pending_exceptions["host_lifecycle"]["latest_failure"].is_null());
+    assert_eq!(
+        pending_exceptions["manager_action_required"]["status"],
+        "clear"
+    );
+    assert!(
+        pending_exceptions["manager_action_required"]["items"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    persist_prior_host_interruption(&mut fixture);
+    let original_launch = store_read(
+        &fixture.db,
+        principal(ORIGINAL_GM, Role::Manager),
+        "operation.get",
+        json!({"operation_id":LAUNCH_OPERATION_ID}),
+    );
+    assert_eq!(original_launch["result"], fixture.admission_result);
+    let action = &original_launch["manager_action_required"];
+    assert_eq!(action["status"], "required");
+    assert_eq!(action["kind"], "owned_service_start_readback_required");
+    assert_eq!(action["manager_actionable"], true);
+    assert_eq!(action["launch_operation_id"], LAUNCH_OPERATION_ID);
+    assert_eq!(action["open_operation_id"], OPEN_OPERATION_ID);
+    assert_eq!(action["binding_id"], BINDING_ID);
+    assert_eq!(action["binding_generation"], 1);
+    assert_eq!(action["task_id"], TASK_ID);
+    assert_eq!(action["attempt_id"], ATTEMPT_ID);
+    assert_eq!(action["start_state"], "outcome_unknown");
+    assert_eq!(action["native_effect"], "unknown");
+    assert_eq!(action["retry_authorized"], false);
+    assert_eq!(
+        action["host_interruption"],
+        json!({
+            "source":"host_lifecycle.latest_failure",
+            "host_epoch":1,
+            "observed_at_ms":3,
+        })
+    );
+    assert_eq!(
+        action["next_readback"],
+        json!({
+            "method":"operation.get",
+            "params":{"operation_id":LAUNCH_OPERATION_ID},
+        })
+    );
+
+    let original_exceptions = store_read(
+        &fixture.db,
+        principal(ORIGINAL_GM, Role::Manager),
+        "swarm.exceptions.get",
+        json!({"after":0,"limit":32}),
+    );
+    assert_eq!(
+        original_exceptions["host_lifecycle"]["latest_failure"]["error_code"],
+        "HOST_INTERRUPTED"
+    );
+    let original_feed = &original_exceptions["manager_action_required"];
+    assert_eq!(original_feed["status"], "required");
+    let original_feed_item = original_feed["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["launch_operation_id"] == LAUNCH_OPERATION_ID)
+        .unwrap();
+    assert_eq!(original_feed_item, action);
+
+    handover_to_successor(&mut fixture);
+    let successor_launch = store_read(
+        &fixture.db,
+        principal(SUCCESSOR_GM, Role::Manager),
+        "operation.get",
+        json!({"operation_id":LAUNCH_OPERATION_ID}),
+    );
+    assert_eq!(successor_launch["result"], fixture.admission_result);
+    assert_eq!(successor_launch["manager_action_required"], action.clone());
+    let successor_open = store_read(
+        &fixture.db,
+        principal(SUCCESSOR_GM, Role::Manager),
+        "operation.get",
+        json!({"operation_id":OPEN_OPERATION_ID}),
+    );
+    assert_eq!(successor_open["manager_action_required"], action.clone());
+    let successor_exceptions = store_read(
+        &fixture.db,
+        principal(SUCCESSOR_GM, Role::Manager),
+        "swarm.exceptions.get",
+        json!({"after":0,"limit":32}),
+    );
+    let successor_feed = &successor_exceptions["manager_action_required"];
+    assert_eq!(successor_feed["status"], "required");
+    let successor_feed_item = successor_feed["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["launch_operation_id"] == LAUNCH_OPERATION_ID)
+        .unwrap();
+    assert_eq!(successor_feed_item, action);
+
+    let former_launch = store_read(
+        &fixture.db,
+        principal(ORIGINAL_GM, Role::Manager),
+        "operation.get",
+        json!({"operation_id":LAUNCH_OPERATION_ID}),
+    );
+    assert_eq!(former_launch["result"], fixture.admission_result);
+    assert!(former_launch.get("manager_action_required").is_none());
+    let former_exceptions = store_read(
+        &fixture.db,
+        principal(ORIGINAL_GM, Role::Manager),
+        "swarm.exceptions.get",
+        json!({"after":0,"limit":32}),
+    );
+    assert!(former_exceptions.get("manager_action_required").is_none());
+    assert!(former_exceptions.get("host_lifecycle").is_none());
     assert_eq!(stored_admission_result(&fixture.db), original_result);
 }

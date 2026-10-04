@@ -2,25 +2,68 @@
 
 ## Current state
 
-### Owned-service MCP route repair — 2026-10-04
+### Current-manager error delivery and interrupted-start readback — 2026-10-04
 
-The Store now resolves the owned service's directory, service ID, pinned version
-and PID from the verified projection for the exact current binding generation.
-It no longer requires external-service fields for an owned route. The readback
-must match that verified PID; external routes retain their configured identity
-checks. Assignment, API, directory digest, unknown loaded-tool state and held
-dispatch checks remain in place.
+Current-manager `operation.get` now includes `native_mcp_tools_readback` for
+the exact launch. It exposes validated C8 error code, stage and recorded time,
+plus scheduler state, retry time, failure count and scheduler-only error code.
+Malformed optional metadata returns a safe corruption marker while preserving
+the Operation. Private paths, configuration, schemas, proof and credentials
+are omitted. Reading historical diagnostics does not require the former
+Manager's grant or chat.
 
-Gate `00a31d17-a9a5-43ea-8da4-ad701aaa98a1` passed formatting, strict production
-Clippy, ten focused tests and debug build with unchanged source. Independent
-Luna source review passed. Candidate SHA-256:
+A start that remains unknown without process proof or a terminal diagnostic
+can produce a readback action after a validated host interruption. Its timestamp
+must predate both the interruption and the current host start. The action links
+the exact admitted launch/open pair, reports the effect as unknown and grants
+no retry. Preflight source checks now retain distinct bounded codes for the
+existing module, entry, inventory, plugin and configuration predicates.
+
+Final gate `211c07a6-a6be-4fe2-85a6-84ddbbd46ec5` passed formatting, the
+corrected C8 Store regression and debug build with unchanged source. Strict
+production Clippy and six other successful Manager regressions are retained
+from `d2102fff-eded-40b8-962c-f9bda23ae425` by exact source equivalence; only
+the test fixture changed to respect SQLite's JSON constraint. Seven distinct
+regressions passed. Independent Luna reviews passed. Candidate SHA-256:
+`62564B7EB8DD574A39AF6284422504BA97E13A525DD9B28970975696936063E7`.
+Fresh C26 qualification and this increment's full CI remain pending. Native
+MCP proof and hosted Bunny execution remain unqualified.
+
+### Previous qualified source and C25 evidence — 2026-10-04
+
+Source `22420c899c337b4e5b8186e5f97abb70f3b8dc70` is published on main. Gate
+`00a31d17-a9a5-43ea-8da4-ad701aaa98a1` passed formatting, strict production
+Clippy, ten focused tests, debug build and independent Luna review with
+unchanged source. The candidate SHA-256 is
 `1E9021E0EA2F85A1C8FAE9F56E2D967563E92C6C4953DDCAF1F44EC2F6973DAD`.
-The three new identity tests exercise helpers; the full owned-process proof path
-still requires the fresh C25 startup qualification. C25 is prepared and has not
-run at this publication. C24 hosted Bunny remains preparation only. Native MCP
-and model execution are not yet qualified; the project remains **PARTIAL_PROGRESS**.
+Full Windows/Ubuntu CI [37225573566](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37225573566)
+completed successfully for this source.
 
-### Latest qualified source and C23 evidence — 2026-10-04
+C25 run `06375985-3de6-4f3b-9bae-2715121fbb25` ended with outer result
+`OWNED_SERVICE_OR_NATIVE_PROOF_TIMEOUT` at `service_start`. C7's owned-service
+readback was retained twice. The run recorded 23 successful runtime snapshots,
+zero gaps or axis failures, and four successful current-manager C7 readbacks.
+C8 then recorded `NATIVE_MCP_PROOF_SOURCE` at `challenge_preflight`, before
+effect reservation. The participant was installed, registered and connected;
+the challenge was prepared, but no effect was reserved and tool readback
+remained null. The exact failed predicate is unproven because the source merged
+multiple guards and did not retain the native response. At the C25 source, the C8 safe error was
+not visible through current-manager `operation.get` or
+`swarm.exceptions.get`. No native MCP proof or model call occurred; preserve
+the consumed run without replay.
+
+The increment above adds the current-manager C8 projection, precise source
+codes and interrupted-start readback action. It does not invent a crash cause,
+write a new native observation or replay an effect. The action retains exact
+binding references and current-GM authority independently of the former chat.
+C26 is preparing a fresh
+safe-error watch. C24 hosted Bunny remains frozen private preparation and must
+not execute before full native MCP proof. The project remains
+**PARTIAL_PROGRESS**. The installed `C4A28DA` controller and running
+Codex/OpenCodex remain unchanged; local Linux, WSL and local models remain
+deferred.
+
+### Previous qualified source and C23 evidence — 2026-10-04
 
 Source `251dd55ddd817460d5816a80964abd0d864e0610` was pushed to main after
 final gate `d312a3a6-36ac-47c4-a1aa-5526931ada52`: formatting, strict production
@@ -44,19 +87,19 @@ with 22 successful native snapshots. The owned route omitted
 looked for those values in external options. Native MCP proof was not
 confirmed; no model prompt or inference ran.
 
-The route repair has passed the source gate above; fresh native qualification
-remains outstanding. The source gate for 251 includes atomic
+The route repair passed the source gate and CI recorded above; C25 exercised it
+and exposed the separate C8 blocker described in the current checkpoint. The
+source gate for 251 includes atomic
 participant identity promotion on successful issuance and passive stale-status
 repair only after full pre-dispatch validation and compare-and-set. It also
 retains participant preparation, credential-issue and commit failures as a
 durable parent diagnostic with current-manager readback; persistence and
 selector errors propagate to the host. Their closed stages are
 `participant_issuance_prepare`, `participant_credential_issue` and
-`participant_issuance_commit`. Preserve the consumed C23 run; a fresh,
-separately prepared qualification is required after the route repair before
-native MCP proof can be claimed. The project remains **PARTIAL_PROGRESS**. The
-installed controller and running Codex/OpenCodex remain unchanged; local Linux,
-WSL and local models remain deferred.
+`participant_issuance_commit`. Preserve the consumed C23 and C25 runs without
+replay. Native MCP proof remains unqualified. The project remains
+**PARTIAL_PROGRESS**. The installed controller and running Codex/OpenCodex
+remain unchanged; local Linux, WSL and local models remain deferred.
 
 ### Previous qualified source and C22 evidence — 2026-10-04
 
