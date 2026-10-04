@@ -5,10 +5,11 @@
 //! loaded-tool claim.
 
 use crate::{
-    config::McpToolProfile,
+    config::{Config, McpToolProfile},
     error::{Error, Result},
     model::{self, Principal},
     native_mcp::{AssignmentContext, AssignmentSeed, NativeMcpReadback},
+    runtime::opencode_v2::Options,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
@@ -26,6 +27,7 @@ pub(crate) fn validate_and_record(
     principal: &Principal,
     observation: &NativeMcpReadback,
     now: i64,
+    config: &Config,
 ) -> Result<Value> {
     principal.require_participant()?;
     if now <= 0 || principal.client_id != observation.scope().participant_id() {
@@ -45,7 +47,7 @@ pub(crate) fn validate_and_record(
     }
 
     let payload = observation.payload();
-    validate_readback_payload(tx, &current, &payload, now)?;
+    validate_readback_payload(tx, config, &current, &payload, now)?;
 
     let encoded = model::canonical(&payload)?;
     tx.execute(
@@ -368,8 +370,105 @@ fn valid_opaque_ref(value: &str, prefix: &str) -> bool {
         && uuid::Uuid::parse_str(id).is_ok_and(|parsed| parsed.to_string() == id)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReadbackRouteIdentity {
+    directory: String,
+    service_id: String,
+    expected_version: String,
+    expected_process_id: Option<u32>,
+}
+
+fn owned_readback_route_identity(
+    options: Options,
+    verified_service_id: &str,
+    verified_version: &str,
+    process_id: u32,
+) -> Result<ReadbackRouteIdentity> {
+    let directory = options.directory.to_str().ok_or_else(|| {
+        Error::new(
+            "NATIVE_MCP_ROUTE_MISMATCH",
+            "verified OpenCode directory is not valid Unicode",
+        )
+    })?;
+    if process_id == 0
+        || options.service_id != verified_service_id
+        || options.expected_version != verified_version
+    {
+        return Err(Error::new(
+            "NATIVE_MCP_ROUTE_MISMATCH",
+            "verified OpenCode service identity is inconsistent",
+        ));
+    }
+    Ok(ReadbackRouteIdentity {
+        directory: directory.to_owned(),
+        service_id: verified_service_id.to_owned(),
+        expected_version: verified_version.to_owned(),
+        expected_process_id: Some(process_id),
+    })
+}
+
+fn external_readback_route_identity(route: &Value) -> Result<ReadbackRouteIdentity> {
+    let options = &route["native_options"];
+    let directory = options["directory"].as_str().ok_or_else(|| {
+        Error::new(
+            "NATIVE_MCP_ROUTE_MISMATCH",
+            "OpenCode binding has no explicit native directory",
+        )
+    })?;
+    let service_id = options["service_id"].as_str().ok_or_else(|| {
+        Error::new(
+            "NATIVE_MCP_ROUTE_MISMATCH",
+            "OpenCode binding has no explicit native service ID",
+        )
+    })?;
+    let expected_version = options["expected_version"].as_str().ok_or_else(|| {
+        Error::new(
+            "NATIVE_MCP_ROUTE_MISMATCH",
+            "OpenCode binding has no explicit native version",
+        )
+    })?;
+    Ok(ReadbackRouteIdentity {
+        directory: directory.to_owned(),
+        service_id: service_id.to_owned(),
+        expected_version: expected_version.to_owned(),
+        expected_process_id: None,
+    })
+}
+
+fn validate_readback_source_identity(
+    route: &Value,
+    source: &Value,
+    identity: &ReadbackRouteIdentity,
+) -> Result<()> {
+    let expected_pid_matches = match identity.expected_process_id {
+        Some(process_id) => source["service_pid"].as_u64() == Some(u64::from(process_id)),
+        None => source["service_pid"].as_u64().is_some_and(|pid| pid > 0),
+    };
+    let directory_digest = format!("sha256:{}", model::digest(identity.directory.as_bytes()));
+    if route["runtime"] != crate::runtime::opencode_v2::RUNTIME
+        || route["module_artifact_id"] != crate::runtime::opencode_v2::ARTIFACT_ID
+        || identity.expected_version != OPENCODE_VERSION
+        || source["runtime"] != crate::runtime::opencode_v2::RUNTIME
+        || source["api_contract"] != MCP_API_CONTRACT
+        || source["api_method"] != "GET /api/mcp"
+        || source["api_scope"] != "configured_server_connection_status_only"
+        || source["service_id"] != identity.service_id
+        || source["service_identity_basis"] != SERVICE_IDENTITY_BASIS
+        || source["service_version"] != identity.expected_version
+        || !expected_pid_matches
+        || source["directory_sha256"] != directory_digest
+    {
+        return Err(Error::new(
+            "NATIVE_MCP_ROUTE_MISMATCH",
+            "native MCP readback does not match the current route or required unknown-state boundary",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_readback_payload(
     tx: &Transaction<'_>,
+    config: &Config,
     assignment: &AssignmentContext,
     payload: &Value,
     now: i64,
@@ -398,40 +497,23 @@ fn validate_readback_payload(
         ));
     }
     let route: Value = serde_json::from_str(&route_json)?;
-    let options = &route["native_options"];
-    let directory = options["directory"].as_str().ok_or_else(|| {
-        Error::new(
-            "NATIVE_MCP_ROUTE_MISMATCH",
-            "OpenCode binding has no explicit native directory",
-        )
-    })?;
-    let expected_service_id = options["service_id"].as_str().ok_or_else(|| {
-        Error::new(
-            "NATIVE_MCP_ROUTE_MISMATCH",
-            "OpenCode binding has no explicit native service ID",
-        )
-    })?;
-    let expected_version = options["expected_version"].as_str().ok_or_else(|| {
-        Error::new(
-            "NATIVE_MCP_ROUTE_MISMATCH",
-            "OpenCode binding has no explicit native version",
-        )
-    })?;
+    let identity = match super::opencode::owned_service_for_binding(
+        tx,
+        config,
+        assignment.binding_id(),
+        assignment.binding_generation(),
+    )? {
+        Some(binding) => owned_readback_route_identity(
+            binding.options(),
+            binding.service_id(),
+            binding.service_version(),
+            binding.process_id(),
+        )?,
+        None => external_readback_route_identity(&route)?,
+    };
     let source = &payload["source"];
-    let directory_digest = format!("sha256:{}", model::digest(directory.as_bytes()));
-    if route["runtime"] != crate::runtime::opencode_v2::RUNTIME
-        || route["module_artifact_id"] != crate::runtime::opencode_v2::ARTIFACT_ID
-        || expected_version != OPENCODE_VERSION
-        || source["runtime"] != crate::runtime::opencode_v2::RUNTIME
-        || source["api_contract"] != MCP_API_CONTRACT
-        || source["api_method"] != "GET /api/mcp"
-        || source["api_scope"] != "configured_server_connection_status_only"
-        || source["service_id"] != expected_service_id
-        || source["service_identity_basis"] != SERVICE_IDENTITY_BASIS
-        || source["service_version"] != expected_version
-        || source["service_pid"].as_u64().is_none_or(|pid| pid == 0)
-        || source["directory_sha256"] != directory_digest
-        || payload["assignment"] != assignment.as_value()
+    validate_readback_source_identity(&route, source, &identity)?;
+    if payload["assignment"] != assignment.as_value()
         || payload["native_session"]["id"] != assignment.native_session_id()
         || payload["loaded_tool_set"]["status"] != "unknown"
         || !payload["loaded_tool_set"]["items"].is_null()
@@ -486,3 +568,7 @@ fn positive_i64(value: &Value, field: &str) -> Result<i64> {
             )
         })
 }
+
+#[cfg(test)]
+#[path = "native_mcp_route_tests.rs"]
+mod route_tests;

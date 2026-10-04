@@ -2,43 +2,77 @@
 
 ## Current state
 
-### Latest qualified source and C22 evidence — 2026-10-04
+### Owned-service MCP route repair — 2026-10-04
+
+The Store now resolves the owned service's directory, service ID, pinned version
+and PID from the verified projection for the exact current binding generation.
+It no longer requires external-service fields for an owned route. The readback
+must match that verified PID; external routes retain their configured identity
+checks. Assignment, API, directory digest, unknown loaded-tool state and held
+dispatch checks remain in place.
+
+Gate `00a31d17-a9a5-43ea-8da4-ad701aaa98a1` passed formatting, strict production
+Clippy, ten focused tests and debug build with unchanged source. Independent
+Luna source review passed. Candidate SHA-256:
+`1E9021E0EA2F85A1C8FAE9F56E2D967563E92C6C4953DDCAF1F44EC2F6973DAD`.
+The three new identity tests exercise helpers; the full owned-process proof path
+still requires the fresh C25 startup qualification. C25 is prepared and has not
+run at this publication. C24 hosted Bunny remains preparation only. Native MCP
+and model execution are not yet qualified; the project remains **PARTIAL_PROGRESS**.
+
+### Latest qualified source and C23 evidence — 2026-10-04
+
+Source `251dd55ddd817460d5816a80964abd0d864e0610` was pushed to main after
+final gate `d312a3a6-36ac-47c4-a1aa-5526931ada52`: formatting, strict production
+Clippy, eight focused regression tests and debug build passed. The final test
+fixture change preserved production source equivalence with the initial Clippy
+gate. Exact-commit Luna review passed. The qualified debug candidate SHA-256 is
+`10A9526215BB07DD02B802DD7AE57D6E1B52F916AEFA2F0267BDE393731A77E0`.
+Full Windows and remote Ubuntu CI
+[37224289253](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37224289253)
+passed, verified on 2026-10-04. No local Linux or WSL environment was used.
+
+C23 run `7ed16c9d-bc85-4b05-867a-45499ac3a707` ended with the outer result
+`OWNED_SERVICE_OR_NATIVE_PROOF_TIMEOUT` at `service_start`. The exact retained
+current-manager readback successfully validated ten times and exposed
+`NATIVE_MCP_ROUTE_MISMATCH` at
+`native_capability_readback`; this is the proven blocker, not an inference from
+the harness timeout or cleanup. Pre-dispatch scope validation passed. The
+registered enabled participant and current binding were ready and connected,
+with 22 successful native snapshots. The owned route omitted
+`native_options.service_id` and `native_options.expected_version`, while the validator
+looked for those values in external options. Native MCP proof was not
+confirmed; no model prompt or inference ran.
+
+The route repair has passed the source gate above; fresh native qualification
+remains outstanding. The source gate for 251 includes atomic
+participant identity promotion on successful issuance and passive stale-status
+repair only after full pre-dispatch validation and compare-and-set. It also
+retains participant preparation, credential-issue and commit failures as a
+durable parent diagnostic with current-manager readback; persistence and
+selector errors propagate to the host. Their closed stages are
+`participant_issuance_prepare`, `participant_credential_issue` and
+`participant_issuance_commit`. Preserve the consumed C23 run; a fresh,
+separately prepared qualification is required after the route repair before
+native MCP proof can be claimed. The project remains **PARTIAL_PROGRESS**. The
+installed controller and running Codex/OpenCodex remain unchanged; local Linux,
+WSL and local models remain deferred.
+
+### Previous qualified source and C22 evidence — 2026-10-04
 
 Source `71f76a46a48df81d45de8f5697f389bce74f36ac` passed formatting,
 warnings-denied production Clippy, focused producer/Manager regressions, debug
 build and independent review. Full Windows and remote Ubuntu CI
 [37221493452](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37221493452)
-passed. The qualified debug candidate SHA-256 is
+passed. The debug candidate SHA-256 was
 `44AC5642E861DA1C3E5CA9DFC94DC83BC2713895C257310CFC2F5447CF5D2750`.
 
 C22 run `b78151ea-e516-4a4a-be75-64b00c2e02bc` ended with
-`NATIVE_MCP_SCOPE_MISMATCH` at `launch_snapshot_validate`. Four actual
-current-manager `operation.get` receipts validated and none failed; three
-actual snapshots were read. Native MCP proof was not confirmed and no model
-prompt ran. The cause was traced to the manifest MCP identity status remaining
-`assignment_template` after the participant was registered, while validation
-required `registered_enabled_participant`.
-
-The following core increment atomically promotes identity status on successful
-issuance. It also repairs a stale status passively only after the complete
-pre-dispatch validator and compare-and-set both pass; this adds no effect and
-does not weaken authority. The working source adds durable parent
-`participant_issuance_latest_failure` history for preparation, credential
-issuance and commit failures, with current-manager `operation.get` readback at
-`participant_issuance.latest_failure`. Its closed stages are
-`participant_issuance_prepare`, `participant_credential_issue` and
-`participant_issuance_commit`; Store persistence or selector errors propagate
-to the host. Package formatting, strict production Clippy, eight focused
-regressions and debug build passed. One negative registration test was added
-after the initial gate; its two-test module passed at the final source, with
-production Clippy, build and unchanged tests retained by exact source equivalence.
-The debug candidate SHA-256 is
-`10A9526215BB07DD02B802DD7AE57D6E1B52F916AEFA2F0267BDE393731A77E0`.
-Independent Luna source review passed. C23 has only a prepared namespace and
-has not run; full CI for the following source is pending. Native MCP proof and model execution remain
-unqualified. The project remains **PARTIAL_PROGRESS**. The installed controller
-and running Codex/OpenCodex remain unchanged; local Linux, WSL and local models
-remain deferred.
+`NATIVE_MCP_SCOPE_MISMATCH` at `launch_snapshot_validate`. Actual current-manager
+`operation.get` receipts validated; actual snapshots were read. Native MCP proof
+was not confirmed and no model prompt ran. The cause was traced to the manifest
+MCP identity status remaining `assignment_template` after participant
+registration, while validation required `registered_enabled_participant`.
 
 ### Previous verified source and C21 evidence — 2026-10-04
 

@@ -380,6 +380,7 @@ impl Store {
                     &p,
                     &observation,
                     observation_at,
+                    &config,
                 )?;
                 let inserted_id = stored["observation_id"].as_i64().ok_or_else(|| {
                     Error::new("NATIVE_MCP_STORE", "readback observation receipt is incomplete")

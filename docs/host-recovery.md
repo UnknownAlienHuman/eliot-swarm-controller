@@ -38,14 +38,24 @@ The receipt is failure history, not native MCP
 proof, dispatch authority or retry permission. Reading it does not authorize
 replaying a `task.dispatch` or repeating an uncertain input.
 
-The current working source also retains participant-issuance failures on the
+The qualified 251dd55 source also retains participant-issuance failures on the
 exact parent launch as `participant_issuance_latest_failure`. Current-manager
 `operation.get` exposes the safe code, closed stage, timestamp and category at
 `participant_issuance.latest_failure`, including the preparation,
 credential-issue and commit stages. Database persistence and selector failures
-propagate to the host instead of being reported as an issuance diagnostic. This
-follow-on change is awaiting its gate; see `implementation-status.md`. The
+propagate to the host instead of being reported as an issuance diagnostic. The
 receipt reports an issuance failure and does not authorize Task input replay.
+
+C23 ended with an outer `service_start` timeout, but current-manager readback
+identified the exact retained `NATIVE_MCP_ROUTE_MISMATCH` at
+`native_capability_readback`. The registered enabled participant and current
+binding had passed pre-dispatch scope checks and were ready and connected. The
+owned route lacked `native_options.service_id` and `native_options.expected_version`,
+while validation looked for them in external options. The source-qualified
+repair now derives owned identity and PID from the exact verified Store
+projection. Its focused tests and independent review passed; fresh C25 native
+qualification is pending. Preserve the consumed C23 run; the timeout itself is
+not the root-cause diagnosis. Native MCP proof and model execution remain unqualified.
 
 An OpenCode snapshot requires a validated root-session read. Its independent
 optional read axes share a bounded deadline inside the existing whole-snapshot
