@@ -64,7 +64,68 @@ pub(super) fn get_operation_for_current_manager(
     if current_manager && let Some(readback) = native_mcp_readback_for_operation(db, id)? {
         operation["native_mcp_readback"] = readback;
     }
+    if current_manager && let Some(issuance) = participant_issuance_failure_for_operation(db, id)? {
+        operation["participant_issuance"] = issuance;
+    }
     Ok(operation)
+}
+
+fn participant_issuance_failure_for_operation(db: &Connection, id: &str) -> Result<Option<Value>> {
+    let retained: Option<(Option<String>, String)> = db
+        .query_row(
+            "SELECT json_type(effective_request_json,'$.launch_manifest.participant_issuance_latest_failure'),
+                    json_quote(json_extract(effective_request_json,'$.launch_manifest.participant_issuance_latest_failure'))
+             FROM operations WHERE operation_id=?1 AND method='swarm.launch'",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((Some(kind), raw)) = retained else {
+        return Ok(None);
+    };
+    let failure = if kind == "object" && raw.len() <= 1024 {
+        serde_json::from_str::<Value>(&raw).ok()
+    } else {
+        None
+    };
+    let valid = failure.as_ref().is_some_and(|failure| {
+        failure["schema_version"].as_u64() == Some(1)
+            && failure["code"]
+                .as_str()
+                .is_some_and(safe_start_failure_error_code)
+            && failure["stage"].as_str().is_some_and(|stage| {
+                matches!(
+                    stage,
+                    "participant_issuance_prepare"
+                        | "participant_credential_issue"
+                        | "participant_issuance_commit"
+                )
+            })
+            && failure["recorded_at_ms"]
+                .as_i64()
+                .is_some_and(|time| time >= 0)
+            && failure["category"].as_str().is_some_and(|category| {
+                matches!(
+                    category,
+                    "scoped_artifact_unavailable"
+                        | "participant_registration_rejected"
+                        | "participant_issuance_incomplete"
+                )
+            })
+    });
+    let latest_failure = match failure {
+        Some(failure) if valid => json!({
+            "schema_version":1,
+            "code":failure["code"],
+            "stage":failure["stage"],
+            "recorded_at_ms":failure["recorded_at_ms"],
+            "category":failure["category"],
+        }),
+        _ => json!({"schema_version":1,"code":"PARTICIPANT_ISSUANCE_DIAGNOSTIC_CORRUPT"}),
+    };
+    Ok(Some(
+        json!({"schema_version":1,"latest_failure":latest_failure}),
+    ))
 }
 
 fn native_mcp_readback_for_operation(db: &Connection, id: &str) -> Result<Option<Value>> {

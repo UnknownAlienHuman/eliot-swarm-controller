@@ -9,7 +9,7 @@ use crate::{
     error::{Error, Result},
     model, participant_credentials,
 };
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
@@ -154,23 +154,9 @@ impl super::Store {
         };
 
         let after = issuance_cursor().lock().await.clone();
-        let ids = match self
+        let ids = self
             .run(move |db| pending_launch_issuance(db, after.as_deref()))
-            .await
-        {
-            Ok(ids) => ids,
-            Err(_) => {
-                return Ok(json!({
-                    "coalesced":false,
-                    "selected":0,
-                    "attempted":0,
-                    "committed":0,
-                    "outcome_unknown":0,
-                    "deferred":0,
-                    "gaps":["participant_issuance_selector_unavailable"],
-                }));
-            }
-        };
+            .await?;
         if let Some(last) = ids.last() {
             *issuance_cursor().lock().await = Some(last.clone());
         } else {
@@ -206,13 +192,26 @@ impl super::Store {
                         &prepare_id,
                         &prepare_config,
                     )?;
+                    let effective_request_json: String = tx.query_row(
+                        "SELECT effective_request_json FROM operations WHERE operation_id=?1 AND method='swarm.launch' AND state='queued' \
+                         AND json_extract(effective_request_json,'$.launch_manifest.state')='awaiting_participant_credential'",
+                        [&prepare_id],
+                        |row| row.get(0),
+                    )?;
                     tx.commit()?;
-                    Ok((actor, request))
+                    Ok((actor, request, effective_request_json))
                 })
                 .await;
-            let (actor, request) = match prepared {
+            let (actor, request, effective_request_json) = match prepared {
                 Ok(value) => value,
                 Err(error) => {
+                    self.record_participant_issuance_failure(
+                        operation_id.clone(),
+                        None,
+                        IssuanceFailureStage::Preparation,
+                        &error,
+                    )
+                    .await?;
                     let gap = safe_gap(&error);
                     if gap == "participant_registration_effect_unknown_readback_only" {
                         unknown += 1;
@@ -232,6 +231,13 @@ impl super::Store {
             let issued = match issued {
                 Ok(issued) => issued,
                 Err(error) => {
+                    self.record_participant_issuance_failure(
+                        operation_id.clone(),
+                        Some(effective_request_json.clone()),
+                        IssuanceFailureStage::CredentialIssue,
+                        &error,
+                    )
+                    .await?;
                     let gap = safe_gap(&error);
                     if gap == "participant_registration_effect_unknown_readback_only" {
                         unknown += 1;
@@ -271,6 +277,13 @@ impl super::Store {
                     clear_backoff(&operation_id).await;
                 }
                 Err(error) => {
+                    self.record_participant_issuance_failure(
+                        operation_id.clone(),
+                        Some(effective_request_json.clone()),
+                        IssuanceFailureStage::Commit,
+                        &error,
+                    )
+                    .await?;
                     let gap = safe_gap(&error);
                     if gap == "participant_registration_effect_unknown_readback_only" {
                         unknown += 1;
@@ -299,4 +312,125 @@ impl super::Store {
             "gaps":gaps,
         }))
     }
+
+    async fn record_participant_issuance_failure(
+        &self,
+        operation_id: String,
+        expected_effective_request_json: Option<String>,
+        stage: IssuanceFailureStage,
+        error: &Error,
+    ) -> Result<bool> {
+        let expected_effective_request_json = match expected_effective_request_json {
+            Some(snapshot) => Some(snapshot),
+            None => {
+                let snapshot_id = operation_id.clone();
+                self.run(move |db| {
+                    let retained: Option<(String, String)> = db
+                        .query_row(
+                            "SELECT state,effective_request_json FROM operations \
+                             WHERE operation_id=?1 AND method='swarm.launch'",
+                            [&snapshot_id],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )
+                        .optional()?;
+                    Ok(retained.and_then(|(state, effective)| {
+                        (state == "queued"
+                            && serde_json::from_str::<Value>(&effective).is_ok_and(|value| {
+                                value["launch_manifest"]["state"]
+                                    == "awaiting_participant_credential"
+                            }))
+                        .then_some(effective)
+                    }))
+                })
+                .await?
+            }
+        };
+        let Some(expected_effective_request_json) = expected_effective_request_json else {
+            return Ok(false);
+        };
+        let now = model::now_ms()?;
+        let failure = participant_issuance_failure(error, stage, now);
+        let changed = self
+            .run(move |db| {
+                let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let mut effective: Value = serde_json::from_str(&expected_effective_request_json)?;
+                if effective["launch_manifest"]["state"] != "awaiting_participant_credential" {
+                    tx.commit()?;
+                    return Ok(false);
+                }
+                effective["launch_manifest"]["participant_issuance_latest_failure"] = failure;
+                let changed = tx.execute(
+                    "UPDATE operations SET effective_request_json=?3,updated_at_ms=?4 \
+                     WHERE operation_id=?1 AND method='swarm.launch' AND state='queued' \
+                       AND effective_request_json=?2 \
+                       AND json_extract(effective_request_json,'$.launch_manifest.state')='awaiting_participant_credential'",
+                    rusqlite::params![
+                        operation_id,
+                        expected_effective_request_json,
+                        model::canonical(&effective)?,
+                        now,
+                    ],
+                )?;
+                tx.commit()?;
+                Ok(changed == 1)
+            })
+            .await?;
+        if changed {
+            self.changed
+                .send_modify(|revision| *revision = revision.wrapping_add(1));
+        }
+        Ok(changed)
+    }
 }
+
+#[derive(Clone, Copy)]
+enum IssuanceFailureStage {
+    Preparation,
+    CredentialIssue,
+    Commit,
+}
+
+impl IssuanceFailureStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Preparation => "participant_issuance_prepare",
+            Self::CredentialIssue => "participant_credential_issue",
+            Self::Commit => "participant_issuance_commit",
+        }
+    }
+}
+
+fn participant_issuance_failure(error: &Error, stage: IssuanceFailureStage, now: i64) -> Value {
+    let category = match error.code.as_str() {
+        "LAUNCH_ISSUANCE_REJECTED" => "participant_registration_rejected",
+        "CONFIG_ERROR" | "IO_ERROR" | "PRIVATE_ARTIFACT_PATH" | "PRIVATE_ARTIFACT_REFERENCE" => {
+            "scoped_artifact_unavailable"
+        }
+        _ => "participant_issuance_incomplete",
+    };
+    json!({
+        "schema_version":1,
+        "code":safe_participant_issuance_error_code(&error.code),
+        "stage":stage.as_str(),
+        "recorded_at_ms":now,
+        "category":category,
+    })
+}
+
+fn safe_participant_issuance_error_code(code: &str) -> String {
+    if !code.is_empty()
+        && code.len() <= 64
+        && code.as_bytes().first().is_some_and(u8::is_ascii_uppercase)
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        code.to_owned()
+    } else {
+        "PARTICIPANT_ISSUANCE_FAILED".to_owned()
+    }
+}
+
+#[cfg(test)]
+#[path = "participant_issuance_failure_tests.rs"]
+mod participant_issuance_failure_tests;

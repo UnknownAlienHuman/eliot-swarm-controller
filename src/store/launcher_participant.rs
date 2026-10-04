@@ -770,6 +770,10 @@ pub(super) fn commit_launch_issuance(
     manifest["progress"]["task_dispatch"] = json!("not_started");
     manifest["runtime"]["state"] = json!(AWAITING_NATIVE_MCP);
     manifest["runtime"]["dispatch_permitted"] = json!(false);
+    // The preview used this identity as a template because the concrete
+    // Participant did not exist yet. Promote the retained summary only after
+    // the exact Store registration has been validated above.
+    manifest["mcp"]["identity"]["status"] = json!("registered_enabled_participant");
     manifest["mcp"]["capability_state"] = json!("unknown");
     manifest["mcp"]["participant_client_id"] = json!(client_id);
     manifest["mcp"]["credential_ref"] = json!(issued.credential_ref);

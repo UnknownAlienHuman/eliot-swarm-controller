@@ -608,16 +608,48 @@ fn claim_next_readback(tx: &Transaction<'_>, now: i64, config: &Config) -> Resul
     };
 
     if let Some(operation_id) = ids.into_iter().next() {
-        let (row, manifest) = load_launch_manifest(tx, &operation_id)?;
+        let (mut row, mut manifest) = load_launch_manifest(tx, &operation_id)?;
+        let mut legacy_repair_error = None;
+        if manifest["state"] == "awaiting_native_mcp"
+            && manifest["progress"]["participant_credential"] == "registered_and_refs_retained"
+            && manifest["mcp"]["identity"]["status"] == "assignment_template"
+            && manifest["mcp"]["identity"]["role"] == "participant"
+        {
+            // Legacy Participant launches retained the preview's assignment
+            // template after registration. Promote only when the ordinary
+            // pre-dispatch validator proves the exact current registration,
+            // Task, Attempt, binding, lease, and actor tuple.
+            let mut candidate = manifest.clone();
+            candidate["mcp"]["identity"]["status"] = json!("registered_enabled_participant");
+            match validate_launch_snapshot(
+                tx,
+                &row,
+                &candidate,
+                config,
+                LaunchSnapshotPhase::PreDispatch,
+            ) {
+                Ok(_) => {
+                    persist_manifest(tx, &row, &candidate, now)?;
+                    (row, manifest) = load_launch_manifest(tx, &operation_id)?;
+                }
+                Err(error) => legacy_repair_error = Some(error),
+            }
+        }
         let previous = readback_marker(&manifest);
         let attempt = marker_attempts(previous).saturating_add(1);
-        match validate_launch_snapshot(
-            tx,
-            &row,
-            &manifest,
-            config,
-            LaunchSnapshotPhase::PreDispatch,
-        ) {
+        let validation = legacy_repair_error.map_or_else(
+            || {
+                validate_launch_snapshot(
+                    tx,
+                    &row,
+                    &manifest,
+                    config,
+                    LaunchSnapshotPhase::PreDispatch,
+                )
+            },
+            Err,
+        );
+        match validation {
             Ok(snapshot) => {
                 let claim = ReadbackClaim {
                     snapshot,

@@ -38,6 +38,15 @@ The receipt is failure history, not native MCP
 proof, dispatch authority or retry permission. Reading it does not authorize
 replaying a `task.dispatch` or repeating an uncertain input.
 
+The current working source also retains participant-issuance failures on the
+exact parent launch as `participant_issuance_latest_failure`. Current-manager
+`operation.get` exposes the safe code, closed stage, timestamp and category at
+`participant_issuance.latest_failure`, including the preparation,
+credential-issue and commit stages. Database persistence and selector failures
+propagate to the host instead of being reported as an issuance diagnostic. This
+follow-on change is awaiting its gate; see `implementation-status.md`. The
+receipt reports an issuance failure and does not authorize Task input replay.
+
 An OpenCode snapshot requires a validated root-session read. Its independent
 optional read axes share a bounded deadline inside the existing whole-snapshot
 budget. A slow configuration, family, request or child-log read produces a

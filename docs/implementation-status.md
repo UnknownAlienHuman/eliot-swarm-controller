@@ -2,7 +2,45 @@
 
 ## Current state
 
-### Latest verified source and C21 evidence — 2026-10-04
+### Latest qualified source and C22 evidence — 2026-10-04
+
+Source `71f76a46a48df81d45de8f5697f389bce74f36ac` passed formatting,
+warnings-denied production Clippy, focused producer/Manager regressions, debug
+build and independent review. Full Windows and remote Ubuntu CI
+[37221493452](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37221493452)
+passed. The qualified debug candidate SHA-256 is
+`44AC5642E861DA1C3E5CA9DFC94DC83BC2713895C257310CFC2F5447CF5D2750`.
+
+C22 run `b78151ea-e516-4a4a-be75-64b00c2e02bc` ended with
+`NATIVE_MCP_SCOPE_MISMATCH` at `launch_snapshot_validate`. Four actual
+current-manager `operation.get` receipts validated and none failed; three
+actual snapshots were read. Native MCP proof was not confirmed and no model
+prompt ran. The cause was traced to the manifest MCP identity status remaining
+`assignment_template` after the participant was registered, while validation
+required `registered_enabled_participant`.
+
+The following core increment atomically promotes identity status on successful
+issuance. It also repairs a stale status passively only after the complete
+pre-dispatch validator and compare-and-set both pass; this adds no effect and
+does not weaken authority. The working source adds durable parent
+`participant_issuance_latest_failure` history for preparation, credential
+issuance and commit failures, with current-manager `operation.get` readback at
+`participant_issuance.latest_failure`. Its closed stages are
+`participant_issuance_prepare`, `participant_credential_issue` and
+`participant_issuance_commit`; Store persistence or selector errors propagate
+to the host. Package formatting, strict production Clippy, eight focused
+regressions and debug build passed. One negative registration test was added
+after the initial gate; its two-test module passed at the final source, with
+production Clippy, build and unchanged tests retained by exact source equivalence.
+The debug candidate SHA-256 is
+`10A9526215BB07DD02B802DD7AE57D6E1B52F916AEFA2F0267BDE393731A77E0`.
+Independent Luna source review passed. C23 has only a prepared namespace and
+has not run; full CI for the following source is pending. Native MCP proof and model execution remain
+unqualified. The project remains **PARTIAL_PROGRESS**. The installed controller
+and running Codex/OpenCodex remain unchanged; local Linux, WSL and local models
+remain deferred.
+
+### Previous verified source and C21 evidence — 2026-10-04
 
 Source `4aa85e52d8dfef82431ac9b85537a29bf628341c` passed full Windows and
 remote Ubuntu CI in [37219293550](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37219293550),
@@ -19,20 +57,6 @@ attempt reported `assignment_scope_unavailable`; its exact cause remains
 unknown. The later `native_unavailable`/`reconciling` state came from scoped
 harness cleanup and is not evidence of the startup cause. Preserve the consumed
 run without replay.
-
-The following core increment adds a sibling `native_mcp_latest_failure` record
-with safe exact error code, closed stage, timestamp and category, plus
-current-GM `operation.get` readback at `native_mcp_readback.latest_failure`
-after handover. Package formatting, strict production Clippy, six focused
-producer/Manager startup regressions and debug build passed with unchanged source.
-The producer test passed after correcting an initial filter that selected zero
-tests. Independent Luna source review passed. The new debug candidate SHA-256 is
-`44AC5642E861DA1C3E5CA9DFC94DC83BC2713895C257310CFC2F5447CF5D2750`.
-Full CI and fresh C22 qualification for this follow-on source are pending. Failure
-readback is not input-retry authority and does not authorize replaying a
-`task.dispatch`. The project remains **PARTIAL_PROGRESS**. The installed
-controller and running Codex/OpenCodex remain unchanged; local Linux, WSL and
-local models remain deferred.
 
 ### Earlier source and qualification checkpoints
 
