@@ -160,6 +160,13 @@ Forge publication is the current epoch-fenced queued operation. Its immutable in
 - If the old GM is unavailable, the local operator performs recovery/handover.
 - Network or tunnel loss never changes GM automatically.
 
+The project is independent of the GM chat. Reconnecting the same durable client
+or changing its optional native binding preserves GM authority and epoch. A
+designation change grants the successor explicit control of exact current
+Attempts and readback of retained project work; historical owner and caller
+identities remain recorded. The previous chat is not required for recovery.
+See [GM session continuity](gm-session-continuity.md).
+
 ### 5.4. Mailbox and attention
 
 Client-addressed historical mail is not reassigned. Task/Attempt/native attention is controller state and is reprojected to the successor through `report.attention`. Handover records the observation/mailbox cursors used for the transfer; the successor resyncs authoritative reads rather than inheriting an opaque live stream.
