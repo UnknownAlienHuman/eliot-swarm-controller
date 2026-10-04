@@ -24,7 +24,19 @@ function delay(ms) {
 }
 
 function pathKey(value) {
-  return path.resolve(value).replace(/[\\/]+$/, "").toLocaleLowerCase("en-US");
+  let resolved = path.resolve(value);
+  if (process.platform === "win32") {
+    resolved = resolved.replaceAll("/", "\\");
+    if (resolved.startsWith("\\\\?\\UNC\\")) {
+      resolved = `\\\\${resolved.slice("\\\\?\\UNC\\".length)}`;
+    } else if (
+      resolved.startsWith("\\\\?\\") &&
+      /^[A-Za-z]:\\/.test(resolved.slice("\\\\?\\".length))
+    ) {
+      resolved = resolved.slice("\\\\?\\".length);
+    }
+  }
+  return resolved.replace(/[\\/]+$/, "").toLocaleLowerCase("en-US");
 }
 
 function isInside(root, candidate) {
