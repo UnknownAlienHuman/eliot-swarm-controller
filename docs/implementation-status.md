@@ -39,11 +39,17 @@ native admission and operational history, former-owner automation readback, and
 same-client binding changes that previously rotated the GM epoch. Original owner,
 caller, workspace and producer history remain retained. It also preserves verified
 submission artifacts when GM authority changes during local publication. The
-source increment is ready to save; its focused verification is pending. The requirement is saved in ac6691c and
+source increment is saved in f3eda2883474b28b8d3e8c6e587e696fad5477f6.
+Production Clippy (16.10 s), debug build (35.66 s), and 11 focused GM/Store
+regressions passed on 2026-10-04 at 06:23 UTC. The source remained unchanged during
+these gates; candidate SHA-256 is 6AC53A11511AF1C3A34A7571D5B3A505E66CA50AC471E70E7A3EC9D748FECDBA.
+Cross-platform CI [37182521189](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37182521189)
+is still pending. The requirement is saved in ac6691c and
 described in [GM session continuity](gm-session-continuity.md).
 
-**Resume here:** run the saved continuity increment's focused Store checks once.
-Continue owned native startup diagnosis and full O7 afterwards. Deterministic
+**Resume here:** finish the separate native-command continuation regression and
+inspect CI for the saved source. Continue owned native startup diagnosis and full
+O7 afterwards. Deterministic
 file readback for a submission left unknown by a host crash remains separate.
 Automatic transfer of every former manager's automation entry remains separate;
 readback must not reset its cursors or replay its effects.
