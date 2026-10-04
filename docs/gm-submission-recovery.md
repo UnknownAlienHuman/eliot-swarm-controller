@@ -16,9 +16,9 @@ The equivalent Store/MCP method is `task.submit.recover` with the exact target
 `operation_id` and the usual mutation `client_request_id`. A target already
 settled by another completion path returns its stored result without repeating
 artifact registration. Use a new request ID for a later recovery attempt after
-a prior recovery settled as held-unknown. Check the recovery Operation with
-`operation.get`; its admission receipt is immutable, while the current result
-reports whether readback completed.
+a prior recovery settled as held-unknown. The CLI and Store response report the
+current recovery result; `operation.get` also exposes that durable result.
+The initial admission receipt remains immutable and separate from completion.
 
 Recovery retains the original submitter, Task, Attempt, candidate, prior
 submission, and canonical `submission_document`. The Store reconstructs the

@@ -911,25 +911,31 @@ impl Store {
         let start = self
             .run(move |db| submissions::begin_recovery(db, p, &start_id))
             .await?;
-        if let submissions::SubmissionRecoveryStart::Verify {
-            target_operation_id,
-            expected_artifact,
-        } = start
-        {
-            let artifact = expected_artifact;
-            let verified = self
-                .file_io(move |files| files.verify_existing(&artifact))
-                .await?;
-            let p = principal;
-            let finish_id = recovery_id.clone();
-            let finish_target = target_operation_id;
-            self.run(move |db| {
-                submissions::finish_recovery(db, p, &finish_id, &finish_target, verified)
-            })
-            .await?;
-            self.changed.send_modify(|n| *n = n.wrapping_add(1));
+        match start {
+            submissions::SubmissionRecoveryStart::Complete(value) => Ok(value),
+            submissions::SubmissionRecoveryStart::Verify {
+                target_operation_id,
+                expected_artifact,
+            } => {
+                let verified = self
+                    .file_io(move |files| files.verify_existing(&expected_artifact))
+                    .await?;
+                let finish_id = recovery_id;
+                let value = self
+                    .run(move |db| {
+                        submissions::finish_recovery(
+                            db,
+                            principal,
+                            &finish_id,
+                            &target_operation_id,
+                            verified,
+                        )
+                    })
+                    .await?;
+                self.changed.send_modify(|n| *n = n.wrapping_add(1));
+                Ok(value)
+            }
         }
-        Ok(receipt)
     }
     async fn accept_task(&self, principal: Principal, params: Value) -> Result<Value> {
         let p = principal.clone();
