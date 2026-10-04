@@ -25,9 +25,19 @@ All source stayed unchanged during the final gate. Candidate SHA-256 is
 `BC74D592B6C422E82B0E1E9277C0D1C33DA59E037D1A92A88C95F0E6F5C55910`.
 Luna's bounded authority/consumer and native-diagnostic reviews passed after
 the transferred-CheckRun allowlist and coalesced-receipt corrections. The
-current source is locally verified; its full cross-platform CI and native C16
-startup result remain pending. The installed controller is still the prior
-qualified `7061e45` candidate.
+current source passed its local gates. Full CI
+[37199464664](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37199464664)
+completed on 2026-10-04: Windows passed; Ubuntu had 247 passing Rust tests and
+one failure in `current_gm_transfer_preserves_all_entry_journals_and_retires_old_owner`.
+The assertion expected four relocated ledgers and observed five after the new
+calendar ledger; its source contract and fixture correction are being reviewed.
+The fresh one-attempt C16 run `b93b7821-e6ce-409d-88f4-d1f6f51a3ab9`
+ended at `owned_service_start_bootstrap` with `NATIVE_REJECTED` before a model
+call. The retained parent diagnostic identifies the bootstrap stage; it does
+not establish credential validity or the exact rejected API contract. The
+OpenCode bootstrap implementation is being investigated against the pinned
+native source. Preserve the consumed run claim and unknown operation without
+replay. The installed controller is still the prior qualified `7061e45` candidate.
 The project remains **PARTIAL_PROGRESS**, with the full O7 workflow, the remaining
 automation programs and cross-environment qualification outstanding. All local
 model and inference work remains deferred.
