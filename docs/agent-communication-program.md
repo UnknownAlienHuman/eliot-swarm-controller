@@ -1,12 +1,12 @@
 # ELIOT Agent Communication, Launcher and MCP Program
 ## Start here
 
-**Current C9 status:** Main/remote source 2e609ecf7d826da7019fe5e5f2ed397a992bc45a passed full Windows/Linux CI ([run 37168223030](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37168223030)). The held-workspace overlay fix is not yet locally rebuilt or native-retested. Run f368339d-1247-4118-bdac-a5441d29b8be timed out at service_start before an owned_service row, native MCP or model. See [Implementation Status](implementation-status.md).
+**Current C10 status:** Published source `cea63dde1d923f821c436c61f2561bcfb6a4bb0d` passed owned-source formatting, warnings-denied Clippy (12.16 s) and debug build (34.84 s); four bounded source audits passed. CI run [37170376636](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37170376636) completed successfully on Windows and Ubuntu. Native run `bb070791-ba7c-4c71-9cc7-660fbb531418` failed before an owned-service row, MCP proof or Bun/model call; the cause was traced to a manifest-route object/alias-string comparison. The three-file follow-up source repair passed independent audit, package formatting, production Clippy (14.67 s) and debug build (35.37 s; candidate SHA-256 `DEDBF403020780A35ED0141A31EF8A43654073B9B2A96CC4BF88AC77B462B528`), but has no final commit SHA or CI yet. Native run `46cef212-aa65-418a-a911-b54502fe9fd7` is active at `awaiting_binding` with a held lease and no owned-service row or MCP proof; opening-fence diagnosis is active. Do not classify this run as a final success or failure. See [Implementation Status](implementation-status.md).
 
-The C7/C8 paragraph below preserves prior qualification only; use the current C9 status above.
+The C7/C8 and C9 paragraphs below preserve prior qualification only; use the current C10 status above.
 
-**Revision:** 17 — 2026-10-03
-**Latest committed source:** 2e609ecf7d826da7019fe5e5f2ed397a992bc45a. Prior Windows Git-argv CI fix dd4a965571c8f846be8465309acebcb97bfb3f0c passed CI 37166867596.
+**Revision:** 18 — 2026-10-03
+**Latest committed source:** `cea63dde1d923f821c436c61f2561bcfb6a4bb0d`. C9 source `2e609ecf7d826da7019fe5e5f2ed397a992bc45a` remains the prior green CI baseline (run 37168223030).
 **Historical C7/C8 CI:** Exact runs and source commits are recorded in [Implementation Status](implementation-status.md).
 
 For the public list of remaining implementation blocks and their critical path, see [Implementation Status](implementation-status.md).

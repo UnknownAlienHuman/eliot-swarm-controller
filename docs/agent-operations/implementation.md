@@ -1,9 +1,9 @@
 # Implementation Plan — Rust Operations on Behalf of the Manager
 
-**Current C9 status:** Main/remote source 2e609ecf7d826da7019fe5e5f2ed397a992bc45a passed full Windows/Linux CI ([run 37168223030](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37168223030)). The held-workspace overlay fix is not yet locally rebuilt or native-retested. Run f368339d-1247-4118-bdac-a5441d29b8be timed out at service_start before an owned_service row, native MCP or model. See [Implementation Status](implementation-status.md).
+**Current C10 status:** Published source `cea63dde1d923f821c436c61f2561bcfb6a4bb0d` passed owned-source formatting, warnings-denied Clippy (12.16 s) and debug build (34.84 s); four bounded source audits passed. CI run [37170376636](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37170376636) completed successfully on Windows and Ubuntu. A three-file follow-up repair for the prior native route-shape failure passed independent audit, formatting, production Clippy and debug build; it has no final commit SHA or CI yet. New native run `46cef212-aa65-418a-a911-b54502fe9fd7` is active at `awaiting_binding` with held lease and no owned-service row or MCP proof yet. See [Implementation Status](../implementation-status.md).
 
 ### Historical C7/C8 qualification snapshots
-Revision 18 · 2026-10-03 · current source 2e609ecf7d826da7019fe5e5f2ed397a992bc45a; prior Git-argv CI fix dd4a965571c8f846be8465309acebcb97bfb3f0c.
+Revision 19 · 2026-10-03 · current source `cea63dde1d923f821c436c61f2561bcfb6a4bb0d`; C9 CI baseline `2e609ecf7d826da7019fe5e5f2ed397a992bc45a`.
 
 Read [README](README.md), then the relevant [Configuration](configuration.md), [Architecture](architecture.md), [Delivery](delivery.md) and [Donor map](donor-map.md). The program remains partial. C4's 221 Rust tests apply only to `2607c8858e573ae40459c27d76d8ae9e1ca9f8fc`.
 
@@ -83,7 +83,7 @@ src/monitoring/pump.rs
 src/store/monitoring.rs
 ```
 
-Current source status: commit `e035c0c3fe855490863be81902c5152b548c42cd`
+Historical C6 source status: commit `e035c0c3fe855490863be81902c5152b548c42cd`
 wires the dispatcher to consume shared bounded intake and journal readback for
 the local `controller/task.submission` producer once per Store reconciliation
 transaction. C7 commit `2f00c2b3d7862788ca8a6bead4645d3ce64dc0ea` adds
@@ -120,19 +120,48 @@ configured/connect readback, and bounded review-disposition handling. C8 added
 manager-authorized WorkDispatch, the shared launch slot, and MCP install/proof
 handlers. C7 and repaired C8 full-CI evidence is summarized above.
 
-C9 source 2e609ecf7d826da7019fe5e5f2ed397a992bc45a includes fresh-owned
+C9 source `2e609ecf7d826da7019fe5e5f2ed397a992bc45a` includes fresh-owned
 OpenCode startup/readback, plugin-directory index and pinned 2.0.7 syntax
 preparation, plus bounded service-departure reconciliation. Workspace leases
 remain database-backed; departure proof is a separate service-specific fence,
-not an OS-level workspace lock. The held-workspace overlay fix permits only
-the exact native_options.directory lease overlay and requires all remaining
-route fields to match; its native-derived integration has not been locally
-built or retested. Git-argv commit dd4a965571c8f846be8465309acebcb97bfb3f0c
-passed full Windows/Linux CI run 37166867596. CI 37168223030 passed all Windows/Linux steps for source 2e609ec, including formatting, Clippy, tests, build and native offline fixtures.
-Native run f368339d-1247-4118-bdac-a5441d29b8be timed out before owned_service
-after repeated OWNED_SERVICE_SCOPE_STALE; no replay occurred. Native tool/model
-loading, productive dispatch and the full manager-owned cycle remain
-unqualified.
+not an OS-level workspace lock. C9 CI 37168223030 passed Windows/Linux
+formatting, Clippy, tests, build and native offline fixtures for that exact
+source. The native overlay fix had not passed a live retest; earlier runs
+f368339d and 114d4ca7 remain retained as unknown, with no replay.
+
+C10 source `cea63dde1d923f821c436c61f2561bcfb6a4bb0d` adds the optional exact
+`launch_operation_id` to the actual `task.dispatch` schema and binds launch-owned
+dispatch to retained Task/Attempt/binding/lease ancestry. Store retains and
+rechecks an immutable prompt packet and current C8 MCP capability proof before
+native input. Its provider-auth path accepts one explicit host-side credential
+source; `stored_unverified` means metadata was observed, not that the key works
+or was consumed by a model. Formatting, warnings-denied Clippy and debug build
+passed, and four bounded source audits passed exact current pins. CI 37170376636
+passed on Windows and Ubuntu. A follow-up three-file route-shape repair also
+passed independent audit, formatting, production Clippy (14.67 s) and debug
+build (35.37 s; candidate SHA-256
+`DEDBF403020780A35ED0141A31EF8A43654073B9B2A96CC4BF88AC77B462B528`); it has
+no final commit SHA or CI yet.
+
+Native run `bb070791-ba7c-4c71-9cc7-660fbb531418` ended
+`OWNED_SERVICE_OR_NATIVE_PROOF_TIMEOUT` at `service_start`, after repeated
+`OWNED_SERVICE_SCOPE_STALE` and before any owned-service row, MCP proof, Bun
+call or model call. Its cause was a manifest-route object/alias-string
+comparison before start reservation. The three-file follow-up repair passed
+independent source audit (report SHA-256
+`A4089D435AC3DE11D1DFE1A12DED3FEC147FAE21520068697B02ABE98E734BB1`),
+formatting, Clippy and debug build, but has no final commit SHA or CI yet.
+The prior host exited by normal EOF; no replay occurred.
+
+New native run `46cef212-aa65-418a-a911-b54502fe9fd7` is active at
+`awaiting_binding` with held lease and no owned-service row or MCP proof yet;
+diagnosis of the remaining opening fences is active. Do not classify it as a
+failure or success. Neither run produced a new credential observation. C11
+repair/acceptance work is being authored and wired across shared tracked files
+plus four new modules, but remains uncompiled and unpublished. Native tool
+loading, productive dispatch, provider/model use and the complete
+manager-owned cycle remain unqualified. All local model/inference execution,
+including PR24/Kilo, remains deferred.
 - Port owned transport/translation to Rust through documented protocols or maintained libraries; preserve vendor loops externally. Do not silently retain a mandatory internal JS/Python service.
 - Qualify installed protocol/capabilities, not exact release equality. Preserve unknown consequential values and safe additive data.
 - Maintain native binding/generation/session/turn/family and actual process ownership. Never restart/adopt by heuristic merely to activate a new adapter.

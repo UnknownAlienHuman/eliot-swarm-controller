@@ -1,14 +1,14 @@
 # ELIOT MCP Tool Catalog and Deferred Loading
 ## Small role-specific core, searchable domain groups, hard authorization and verified runtime capability
 
-**Current C9 status:** Source 2e609ecf7d826da7019fe5e5f2ed397a992bc45a passed full Windows/Linux CI ([run 37168223030](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37168223030)), including native offline fixtures; this does not prove a live owned service, MCP loading or model call. The committed held-workspace overlay fix still needs local rebuild and native retest. Run f368339d-1247-4118-bdac-a5441d29b8be timed out before an owned_service row. See [Implementation Status](implementation-status.md).
+**Current C10 status:** Published source `cea63dde1d923f821c436c61f2561bcfb6a4bb0d` passed owned-source formatting, warnings-denied Clippy and debug build; four bounded source audits passed. CI run [37170376636](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37170376636) completed successfully on Windows and Ubuntu. The actual `task.dispatch` schema now carries the optional exact `launch_operation_id` for launch-owned Attempts. The Store packet/current-capability gate and provider-auth path are source-present. The prior native run `bb070791-ba7c-4c71-9cc7-660fbb531418` failed before an owned-service row, MCP proof or Bun call because manifest `runtime.route` metadata was compared as an object against an alias string. The three-file follow-up repair passed independent source audit, formatting, production Clippy (14.67 s) and debug build (35.37 s; candidate SHA-256 `DEDBF403020780A35ED0141A31EF8A43654073B9B2A96CC4BF88AC77B462B528`), but has no final commit SHA or CI yet. New native run `46cef212-aa65-418a-a911-b54502fe9fd7` is active at `awaiting_binding` with held lease and no owned-service row or MCP proof; opening-fence diagnosis is active. Native tool loading and productive dispatch remain unqualified. See [Implementation Status](implementation-status.md).
 
 ### Historical C7/C8 catalog qualification snapshot
-**Revision:** 10 — 2026-10-03
-**Source baseline:** latest 2e609ecf7d826da7019fe5e5f2ed397a992bc45a; prior Git-argv CI fix dd4a965571c8f846be8465309acebcb97bfb3f0c.
+**Revision:** 11 — 2026-10-03
+**Source baseline:** C10 `cea63dde1d923f821c436c61f2561bcfb6a4bb0d`; prior C9 CI baseline `2e609ecf7d826da7019fe5e5f2ed397a992bc45a`.
 **Applies to:** [Communication Program](agent-communication-program.md), [Fleet-Scale Freedom](agent-communication-fleet-scale-freedom.md), [MCP Profiles](mcp-profiles.md)
 **Historical C7/C8 CI:** Exact runs and source commits are recorded in [Implementation Status](implementation-status.md).
-All local model/inference remains deferred by owner. C9 readiness and plugin-index preparation do not prove native loading or model-visible capability.
+All local model/inference remains deferred by owner. C10's provider credential state `stored_unverified` is metadata evidence only, not proof the key is valid or consumed. The prior native run made zero Bun calls and produced no new auth observation or native MCP proof. The current run is active at `awaiting_binding` with no owned-service row or MCP proof; diagnosis continues. The route-shape follow-up passed source audit and build gates, but has no final commit SHA, CI or native qualification yet.
 
 **Precedence:** this file governs MCP grouping, eager/deferred loading, catalog metadata and launcher-facing tool UX. Existing application authorization and Task/Attempt authority remain unchanged.
 
@@ -68,17 +68,32 @@ manual/automatic launch slot, and MCP install/proof handlers and readback.
 Historical full-CI evidence for C7 and the repaired C8 source is summarized
 above.
 
-C9 source 2e609ecf7d826da7019fe5e5f2ed397a992bc45a wires per-binding
+C9 source `2e609ecf7d826da7019fe5e5f2ed397a992bc45a` wires per-binding
 fresh-owned startup/readback, plugin-directory index and pinned 2.0.7 syntax
-preparation. Its held-workspace overlay fix is reviewed against source SHA prefix 0A905. Full Windows/Linux CI passed run 37168223030, including formatting, Clippy, tests, build and native offline fixtures. The native-derived integration has not been locally rebuilt or retested; prior Git-argv commit dd4a965571c8f846be8465309acebcb97bfb3f0c also passed full Windows/Linux CI. Native run f368339d-1247-4118-bdac-a5441d29b8be
-timed out before an owned_service row, native MCP or model after repeated
-OWNED_SERVICE_SCOPE_STALE. Native plugin loading, actual harness consumption,
-callable tool capability, productive dispatch and model execution remain
-unqualified. Workspace leases remain database-backed; departure evidence does
-not establish an OS-level workspace lock. Scoped credentials and readback do
-not prove secret confidentiality or model-visible capability.
+preparation, plus bounded service departure reconciliation. CI 37168223030
+passed Windows/Linux formatting, Clippy, tests, build and native offline
+fixtures for that exact source. Native run `f368339d-1247-4118-bdac-a5441d29b8be`
+timed out before an owned-service row, MCP proof or model after repeated
+`OWNED_SERVICE_SCOPE_STALE`; earlier runs remain unknown with no replay.
 
-The [Canonical MCP Surfaces](mcp-canonical-surfaces-and-topologies.md) document owns exact public names. This document owns group metadata and deferred-loading design. Remaining end-to-end gaps include actual native harness consumption/qualification, productive dispatch beyond the lease/claim/`agent.open` admission, watch predicates without authoritative sources, broader integration/scope-Git, Concilium, cron, Goal and native-Rust program paths. Do not replace the application authorization layer with catalog metadata.
+C10 source `cea63dde1d923f821c436c61f2561bcfb6a4bb0d` adds the actual
+`task.dispatch` schema field `launch_operation_id`, Store validation of exact
+launch ancestry, an immutable prompt packet, a current C8 capability-proof gate,
+and explicit single-provider credential bootstrap. Owned-source formatting,
+warnings-denied Clippy, debug build and four bounded source audits passed; CI
+37170376636 passed on Windows and Ubuntu. Native run `bb070791-ba7c-4c71-9cc7-660fbb531418`
+ended in `service_start` before an owned-service row, MCP proof or Bun call.
+The cause was a manifest-route object/alias-string comparison before start
+reservation. The three-file follow-up passed independent audit, formatting,
+production Clippy and debug build, but has no final commit SHA or CI yet. Native
+run `46cef212-aa65-418a-a911-b54502fe9fd7` is active at `awaiting_binding`
+with held lease and no owned-service row or MCP proof; diagnosis remains active.
+Native plugin loading, actual harness consumption, callable tools, productive
+dispatch and provider/model execution remain unqualified. `stored_unverified`
+means metadata only, and the failed run made no new credential observation.
+Workspace leases remain database-backed, not an OS-level lock.
+
+The [Canonical MCP Surfaces](mcp-canonical-surfaces-and-topologies.md) document owns exact public names. This document owns group metadata and deferred-loading design. Remaining end-to-end gaps include actual native harness consumption/qualification, productive dispatch after `agent.open`, watched predicates without authoritative sources, broader integration/scope-Git, Concilium, cron, Goal and native-Rust program paths. Do not replace the application authorization layer with catalog metadata.
 
 ## 2. Evidence-based design constraints
 

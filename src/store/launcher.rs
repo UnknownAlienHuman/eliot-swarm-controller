@@ -418,6 +418,14 @@ impl LaunchActor {
                         Error::new("LAUNCH_MANIFEST_CORRUPT", "Attempt start owner is missing")
                     })?;
                 let expected_preview = request.preview_params();
+                let runtime_route_alias = model::text(&manifest["runtime"]["route"], "alias")
+                    .map_err(|_| {
+                        Error::new(
+                            "LAUNCH_MANIFEST_CORRUPT",
+                            "launch runtime route alias is invalid",
+                        )
+                    })?;
+                let expected_route_alias = model::text(&expected_preview, "route")?;
                 let open_operation_id = manifest["binding"]["operation_id"]
                     .as_str()
                     .filter(|value| !value.is_empty())
@@ -444,7 +452,7 @@ impl LaunchActor {
                     || manifest["workspace"]["dirty_state"] != "clean_verified"
                     || manifest["workspace"]["filesystem_inspected"] != true
                     || manifest["workspace"]["manifest_digest"].as_str().is_none()
-                    || manifest["runtime"]["route"] != expected_preview["route"]
+                    || runtime_route_alias != expected_route_alias
                     || manifest["runtime"]["agent_profile"] != expected_preview["agent_profile"]
                     || manifest["runtime"]["requested_model"] != expected_preview["requested_model"]
                     || manifest["runtime"]["requested_effort"]
@@ -966,6 +974,13 @@ fn require_dispatch_launch_parent_stage(
         .get("launch_manifest")
         .ok_or_else(|| Error::new("INVALID_LAUNCH_MANIFEST", "launch manifest is missing"))?
         .clone();
+    let runtime_route_alias =
+        model::text(&manifest["runtime"]["route"], "alias").map_err(|_| {
+            Error::new(
+                "LAUNCH_MANIFEST_CORRUPT",
+                "launch runtime route alias is invalid",
+            )
+        })?;
     let expected_contract = json!({
         "effect_scope":"one_exact_launch_plan",
         "completion_condition":"workspace_binding_dispatch_and_capability_readback",
@@ -987,7 +1002,7 @@ fn require_dispatch_launch_parent_stage(
         || manifest["binding"]["binding_id"] != binding_id
         || manifest["binding"]["generation"] != binding_generation
         || manifest["binding"]["state"] != "ready"
-        || manifest["runtime"]["route"] != request.preview.route
+        || runtime_route_alias != request.preview.route
     {
         return Err(Error::new(
             "LAUNCH_MANIFEST_CORRUPT",

@@ -804,7 +804,7 @@ fn opening_scope(
         .filter(|id| !id.is_empty())
         .ok_or_else(|| corrupt("queued agent.open identity is missing"))?
         .to_owned();
-    if stored_route.alias != manifest["runtime"]["route"]
+    if launch_manifest_route_alias(manifest)? != stored_route.alias.as_str()
         || binding.lane_id
             != format!(
                 "launch-{}",
@@ -1330,7 +1330,7 @@ fn retained_scope(
         || manifest["binding"]["operation_id"] != row.open_operation_id
         || manifest["binding"]["binding_id"] != binding_id
         || manifest["binding"]["generation"] != generation
-        || manifest["runtime"]["route"] != stored_route.alias
+        || launch_manifest_route_alias(manifest)? != stored_route.alias.as_str()
     {
         return Err(corrupt(
             "owned service parent manifest differs from its startup row",
@@ -1818,7 +1818,7 @@ fn departure_source(
         || manifest["binding"]["operation_id"] != row.open_operation_id
         || manifest["binding"]["binding_id"] != row.binding_id
         || manifest["binding"]["generation"] != row.binding_generation
-        || manifest["runtime"]["route"] != stored_route.alias
+        || launch_manifest_route_alias(manifest)? != stored_route.alias.as_str()
         || manifest["workspace"]["lease_authority"]["lease_id"] != row.lease_id
         || binding.lane_id != format!("launch-{}", row.lease_id)
     {
@@ -2239,6 +2239,16 @@ fn binding_row(db: &Connection, binding_id: &str, generation: i64) -> Result<Bin
 
 fn parse_route(raw: &str) -> Result<Route> {
     serde_json::from_str(raw).map_err(|_| corrupt("binding route configuration is invalid"))
+}
+
+fn launch_manifest_route_alias(manifest: &Value) -> Result<&str> {
+    manifest
+        .get("runtime")
+        .and_then(|runtime| runtime.get("route"))
+        .and_then(|route| route.get("alias"))
+        .and_then(Value::as_str)
+        .filter(|alias| !alias.trim().is_empty())
+        .ok_or_else(|| corrupt("launch runtime route alias is missing"))
 }
 
 fn current_route(config: &Config, stored: &Route) -> Result<Route> {

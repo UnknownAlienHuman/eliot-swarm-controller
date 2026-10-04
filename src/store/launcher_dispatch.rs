@@ -16,6 +16,21 @@ const LINK_KEY_PREFIX: &str = "launcher:task_dispatch:v1:";
 const LINK_KIND: &str = "launcher_task_dispatch";
 const PACKET_REVISION: &str = "launch-dispatch-v1";
 
+fn launch_manifest_route_alias(manifest: &Value) -> Result<&str> {
+    manifest
+        .get("runtime")
+        .and_then(|runtime| runtime.get("route"))
+        .and_then(|route| route.get("alias"))
+        .and_then(Value::as_str)
+        .filter(|alias| !alias.trim().is_empty())
+        .ok_or_else(|| {
+            Error::new(
+                "LAUNCH_MANIFEST_CORRUPT",
+                "launch runtime route alias is missing",
+            )
+        })
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct LaunchDispatchAdmission {
     pub(super) launch_operation_id: String,
@@ -498,6 +513,7 @@ fn validate_parent_tuple(
     let generation = model::positive(attempt, "binding_generation")?;
     let task_revision = model::positive(attempt, "task_revision")?;
     let progress = &parent.manifest["progress"];
+    let route_alias = launch_manifest_route_alias(&parent.manifest)?;
     let stage_ok = match dispatch_operation_id {
         None => {
             progress["task_dispatch"] == "not_started"
@@ -539,7 +555,7 @@ fn validate_parent_tuple(
         || !attempt["released_at_ms"].is_null()
         || binding["state"] != "ready"
         || !binding["released_at_ms"].is_null()
-        || binding["route"]["alias"] != parent.manifest["runtime"]["route"]
+        || binding["route"]["alias"].as_str() != Some(route_alias)
     {
         return Err(Error::new(
             "STALE_LAUNCH_DISPATCH_SCOPE",
@@ -556,6 +572,7 @@ fn build_packet(
     proof: &Value,
 ) -> Result<Value> {
     let capability_identity_digest = validate_capability_proof(parent, attempt, binding, proof)?;
+    let route_alias = launch_manifest_route_alias(&parent.manifest)?;
     let contracts = crate::mcp::participant_core_tool_contracts()?;
     let server_name = model::text(&proof["install"], "server_name")?;
     let tools = proof["native_discovered"]["tools"]
@@ -627,7 +644,7 @@ fn build_packet(
             "snapshot_digest":digest_value(&attempt["task_snapshot"])?,
         },
         "selection":{
-            "route":parent.manifest["runtime"]["route"],
+            "route":route_alias,
             "provider":model::text(model,"provider_id")?,
             "model":model::text(model,"id")?,
             "variant":model::text(model,"variant")?,
@@ -744,6 +761,7 @@ fn validate_capability_proof(
         "grant_revision":expected_assignment["grant_revision"],
         "native_session_id":expected_assignment["native_session_id"],
     });
+    let route_alias = launch_manifest_route_alias(&parent.manifest)?;
 
     if proof["schema_version"] != 1
         || proof["kind"] != "launcher_native_mcp_dispatch_capability"
@@ -786,7 +804,7 @@ fn validate_capability_proof(
             .as_str()
             .is_none_or(|value| !name_is_bounded(value))
         || proof["native_discovered"]["tools"].as_array().is_none()
-        || binding["route"]["alias"] != parent.manifest["runtime"]["route"]
+        || binding["route"]["alias"].as_str() != Some(route_alias)
         || parent.manifest["participant"]["role"] != "participant"
         || parent.manifest["participant"]["participation_basis"]["kind"] != "attempt_owner"
         || parent.manifest["participant"]["client_id"]
