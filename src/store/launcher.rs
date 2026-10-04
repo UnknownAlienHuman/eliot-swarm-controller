@@ -325,7 +325,7 @@ impl LaunchActor {
                 );
                 let parent: Option<OpeningLaunchParentRow> = db
                     .query_row(
-                        "SELECT caller_id,method,state,task_id,attempt_id,binding_id,binding_generation,\
+                        "SELECT caller_id,method,state,task_id,attempt_id,binding_id,binding_generation, \
                          original_request_json,effective_request_json FROM operations WHERE operation_id=?1",
                         [launch_operation_id],
                         |row| {
@@ -538,8 +538,8 @@ impl LaunchActor {
 
                 let child: Option<OpeningChildRow> = db
                     .query_row(
-                        "SELECT caller_id,method,client_request_id,prerequisite_operation_id,task_id,\
-                         attempt_id,binding_id,binding_generation,state,original_request_json,\
+                        "SELECT caller_id,method,client_request_id,prerequisite_operation_id,task_id, \
+                         attempt_id,binding_id,binding_generation,state,original_request_json, \
                          effective_request_json,result_json FROM operations WHERE operation_id=?1",
                         [open_operation_id],
                         |row| {
@@ -2286,8 +2286,8 @@ pub(crate) fn admit_work_dispatch(
 
     let operation_id = model::new_id();
     tx.execute(
-        "INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,\
-         effective_request_json,state,due_at_ms,created_at_ms,updated_at_ms)\
+        "INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json, \
+         effective_request_json,state,due_at_ms,created_at_ms,updated_at_ms) \
          VALUES(?1,?2,?3,'swarm.launch',?4,'{}','queued',?5,?5,?5)",
         params![
             operation_id,
@@ -2567,9 +2567,9 @@ fn persist_launch_progress(
     )
     .then_some(progress.now);
     let changed = tx.execute(
-        "UPDATE operations SET task_id=?2,attempt_id=COALESCE(?3,attempt_id),\
-         binding_id=COALESCE(?4,binding_id),binding_generation=COALESCE(?5,binding_generation),\
-         state=?6,result_json=?7,effective_request_json=?8,settled_at_ms=?9,updated_at_ms=?10\
+        "UPDATE operations SET task_id=?2,attempt_id=COALESCE(?3,attempt_id), \
+         binding_id=COALESCE(?4,binding_id),binding_generation=COALESCE(?5,binding_generation), \
+         state=?6,result_json=?7,effective_request_json=?8,settled_at_ms=?9,updated_at_ms=?10 \
          WHERE operation_id=?1 AND method='swarm.launch' AND state IN ('queued','outcome_unknown')",
         params![
             operation_id,
@@ -2591,7 +2591,7 @@ fn persist_launch_progress(
     }
     let digest = model::digest(model::canonical(progress.result)?.as_bytes());
     tx.execute(
-        "INSERT OR IGNORE INTO observations(source_stream_id,source_event_key,operation_id,kind,payload_json,recorded_at_ms)\
+        "INSERT OR IGNORE INTO observations(source_stream_id,source_event_key,operation_id,kind,payload_json,recorded_at_ms) \
          VALUES('controller',?1,?2,'swarm.launch.progress',?3,?4)",
         params![
             format!("launch-progress:{operation_id}:{digest}"),
@@ -2738,11 +2738,11 @@ pub(super) fn pending_launches(db: &Connection, limit: i64) -> Result<Vec<String
         ));
     }
     let mut statement = db.prepare(
-        "SELECT operation_id FROM operations\
-         WHERE method='swarm.launch' AND state IN ('queued','outcome_unknown')\
-           AND json_extract(effective_request_json,'$.launch_manifest.state')\
-             IN ('pending_workspace','awaiting_binding','awaiting_capability',\
-                 'awaiting_participant_credential','outcome_unknown')\
+        "SELECT operation_id FROM operations \
+         WHERE method='swarm.launch' AND state IN ('queued','outcome_unknown') \
+           AND json_extract(effective_request_json,'$.launch_manifest.state') \
+             IN ('pending_workspace','awaiting_binding','awaiting_capability', \
+                 'awaiting_participant_credential','outcome_unknown') \
          ORDER BY updated_at_ms,operation_id LIMIT ?1",
     )?;
     statement
@@ -3014,8 +3014,8 @@ fn admit_launch_open(
     let original = model::canonical(params_value)?;
     let existing: Option<LaunchOpenOperationRow> = tx
         .query_row(
-            "SELECT operation_id,method,original_request_json,state,result_json,effective_request_json,\
-                    prerequisite_operation_id\
+            "SELECT operation_id,method,original_request_json,state,result_json,effective_request_json, \
+                    prerequisite_operation_id \
              FROM operations WHERE caller_id=?1 AND client_request_id=?2",
             params![actor.technical_requester_id(), request_id],
             |row| {
@@ -3071,8 +3071,8 @@ fn admit_launch_open(
     }
     let child_id = model::new_id();
     tx.execute(
-        "INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,\
-         effective_request_json,prerequisite_operation_id,state,due_at_ms,created_at_ms,updated_at_ms)\
+        "INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json, \
+         effective_request_json,prerequisite_operation_id,state,due_at_ms,created_at_ms,updated_at_ms) \
          VALUES(?1,?2,?3,'agent.open',?4,'{}',?5,'queued',?6,?6,?6)",
         params![
             child_id,
@@ -3119,8 +3119,8 @@ fn retain_launch_open(
     });
     effective["receipt"] = json!({"ok":true,"value":receipt.result});
     let changed = tx.execute(
-        "UPDATE operations SET task_id=?2,attempt_id=?3,result_json=?4,effective_request_json=?5,\
-         updated_at_ms=?6 WHERE operation_id=?1 AND prerequisite_operation_id=?7\
+        "UPDATE operations SET task_id=?2,attempt_id=?3,result_json=?4,effective_request_json=?5, \
+         updated_at_ms=?6 WHERE operation_id=?1 AND prerequisite_operation_id=?7 \
          AND method='agent.open' AND state='queued'",
         params![
             operation_id,
@@ -3140,7 +3140,7 @@ fn retain_launch_open(
     super::capacity::sync_operation(tx, operation_id, receipt.now)?;
     let digest = model::digest(model::canonical(receipt.result)?.as_bytes());
     tx.execute(
-        "INSERT OR IGNORE INTO observations(source_stream_id,source_event_key,operation_id,kind,payload_json,recorded_at_ms)\
+        "INSERT OR IGNORE INTO observations(source_stream_id,source_event_key,operation_id,kind,payload_json,recorded_at_ms) \
          VALUES('controller',?1,?2,'agent.open',?3,?4)",
         params![
             format!("launch-open:{operation_id}:{digest}"),
@@ -3444,9 +3444,9 @@ pub(super) fn launch_after_workspace_held(
     let binding_id = model::text(&open_result, "binding_id")?.to_owned();
     let binding_generation = model::positive(&open_result, "generation")?;
     let linked = tx.execute(
-        "UPDATE attempts SET binding_id=?2,binding_generation=?3,updated_at_ms=?4\
-         WHERE attempt_id=?1 AND task_id=?5 AND task_revision=?6 AND owner_id=?7\
-           AND state='reserved' AND released_at_ms IS NULL\
+        "UPDATE attempts SET binding_id=?2,binding_generation=?3,updated_at_ms=?4 \
+         WHERE attempt_id=?1 AND task_id=?5 AND task_revision=?6 AND owner_id=?7 \
+           AND state='reserved' AND released_at_ms IS NULL \
            AND binding_id IS NULL AND binding_generation IS NULL",
         params![
             attempt_id,
