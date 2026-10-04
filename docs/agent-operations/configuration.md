@@ -93,9 +93,19 @@ use the successor as sponsor, while the assigned reviewer supplies the review
 evidence. A resulting correction is attributed to the successor and addressed
 to the original Attempt owner. A later transfer does not rewrite an existing
 assignment sponsor; its result remains usable only when that sponsor is in the
-validated transfer lineage. Use the current source revision from
-`automation.config.get` and a stable `client_request_id` for the explicit
-mutation.
+validated transfer lineage.
+
+`repair_dispatch` is a separate opt-in step. It can queue one bounded next-turn
+correction only after the exact assigned finding has an applied return-for-
+correction decision, and only while the exact current Task, Attempt,
+submission, candidate, ready binding generation and transfer chain remain
+valid. The original Attempt owner remains the delivery recipient and binding
+owner; the review sponsor and correction decision manager remain their
+recorded actors; a later successor owns only the new semantic repair slot.
+`agent.send` staying queued does not establish that a native delivery occurred,
+and this step does not grant general `agent.send` authority. Use the current
+source revision from `automation.config.get` and a stable `client_request_id`
+for the explicit mutation.
 
 The CLI form is `swarm automation config transfer --file <json>`, with
 `--request-id <stable-id>` supplying `client_request_id`. A GM may inspect the
@@ -141,7 +151,7 @@ This manager already has review-assignment rights. One request enables that help
 }
 ```
 
-Only applied immutable submissions qualify. Queue launch, return, repair and acceptance remain manual. Publication can be automated only when the manager explicitly selects and configures the Publication step below. No extra global switch, Root decision or grant-creation round follows.
+Only applied immutable submissions qualify. This `review_dispatch`-only example leaves queue launch, return, repair and acceptance manual; other effects require their explicit automation step and guards. Publication also requires the manager to explicitly select and configure the Publication step below. No extra global switch, Root decision or grant-creation round follows.
 
 To prevent future automatic audits:
 

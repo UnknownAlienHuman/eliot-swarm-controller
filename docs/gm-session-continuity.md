@@ -107,6 +107,17 @@ If the entry is transferred again, a retained assignment sponsor is not
 rewritten; the next successor can consume that result only through the exact
 recorded transfer lineage.
 
+An explicitly selected `repair_dispatch` step can use one retained actionable
+finding only after a manager applies its exact return-for-correction feedback.
+After an A→B→C automation transfer, C may queue one fresh correction on the
+original ready binding only while the exact Task, unreleased Attempt, submission,
+candidate, binding generation and full transfer lineage remain current. The
+Attempt owner and feedback recipient remain A; the review sponsor remains the
+recorded sponsor; the feedback decision remains attributed to B; C is the
+current automation manager and owns the new semantic slot. A queued `agent.send`
+is not evidence that a native delivery occurred. A prior B-owned repair slot is
+readback/continuation evidence and is never overwritten with C's new request.
+
 The source now implements this continuity requirement. Verification requires a
 real Store regression with an old GM, a successor using a different
 client identity, preserved Attempt ownership and dispatch identity, positive

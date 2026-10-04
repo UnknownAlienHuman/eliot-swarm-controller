@@ -77,8 +77,9 @@ Cross-platform CI [37184545179](https://github.com/UnknownAlienHuman/eliot-swarm
 failed solely on the outdated MCP table contract, repaired in 2f3e22a. The focused table guard passes; subsequent full Windows and Ubuntu CI37186030488 passed for source 8f3998f. The installed R6 binary and running native environments have
 not been replaced or restarted by these source gates.
 
-**Resume here:** finish successor RepairDispatch on the retained Attempt's binding,
-then owned native startup qualification. Use the latest built candidate recorded
+**Resume here:** qualify owned native startup and the complete local O7 cycle.
+Successor RepairDispatch on the retained Attempt's binding now passes its Store gate.
+Use the latest built candidate recorded
 below when a fresh harness requires this code. Preserve earlier unknown
 runs without replay. Transferring every former manager's entry automatically
 remains separate from explicit per-entry transfer.
@@ -129,8 +130,41 @@ and authority predicates. Built candidate SHA-256 is
 The gate covers A-owned Attempts, B-sponsored independent reviews, then C's exact
 correction and queued acceptance after a second transfer. Acceptance reservation
 does not establish the final artifact check or accepted Task transition. Fresh
-RepairDispatch on the original owner's binding is the next implementation gap;
-the complete native O7 cycle remains unqualified.
+RepairDispatch on the original owner's binding is qualified in the next source
+increment below; the complete native O7 cycle remains unqualified.
+
+Full Windows and Ubuntu CI for source
+`4ce438b10d5facb82188feea34daeba36bd8216f` passed in
+[37192501762](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37192501762),
+verified on 2026-10-04 at 09:49 UTC.
+
+### Successor repair continuation — qualified source increment, 2026-10-04
+
+After explicit A→B→C entry transfer, C can queue a fresh correction on A's
+retained ready binding. Attempt owner and feedback recipient A, retained review
+sponsor, disposition decision manager B, and current automation manager C stay
+distinct. The validator preserves the decision manager's committed correction
+reason while checking the original reviewer provenance separately. Historical
+manager slots are checked across the complete transfer lineage before a new
+slot is admitted. Existing direct slots are retained for readback; an exact
+queued unsent automation slot uses its explicit transfer continuation.
+
+The queued effect retains its captured GM epoch. A designation change away from
+C and back to C invalidates that old effect without overwriting its Operation or
+duplicating its slot. Canonical current Attempts are derived from unreleased
+Attempt records rather than an absent Task column.
+
+Warnings-denied production Clippy passed (18.96 s). The real-Store A→B→C repair,
+duplicate-consumption and C→B→C epoch regression passed (0.11 s execution;
+44.10 s including compilation), followed by debug build (39.77 s), verified on
+2026-10-04 at 10:19 UTC. Production source stayed unchanged after Clippy; only
+the fixture's canonical request read was corrected. All source stayed unchanged
+during the final gate. Luna's bounded authority audit found no remaining blocker.
+Built candidate SHA-256 is
+`C4A28DA65495FAC229EE1202DA7F4E75EA642F4B909F6F375DE0CED07102EF9E`.
+The gate qualifies retained Store admission and pre-effect checks. It does not
+establish native delivery or the full O7 cycle; the installed runtime remains
+unchanged. The previous GM chat is unnecessary for handover and continuation.
 
 ### Prior C7/C8 evidence
 

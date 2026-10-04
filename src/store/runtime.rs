@@ -2521,6 +2521,49 @@ fn user_command_with_actor(
             |row| row.get(0),
         )?;
         match &actor {
+            UserCommandActor::Repair(context) => {
+                if method != "agent.send" || v["delivery"] != "next_turn" {
+                    return Err(Error::new(
+                        "FORBIDDEN",
+                        "repair authority is limited to its exact next-turn delivery",
+                    ));
+                }
+                context.require_current_for_admission(tx)?;
+                let expected_request = context.delivery_request()?.value();
+                if id != context.binding_id()
+                    || generation != context.binding_generation()
+                    || model::canonical(v)? != model::canonical(&expected_request)?
+                {
+                    return Err(Error::new(
+                        "FORBIDDEN",
+                        "repair delivery differs from its exact retained request or binding",
+                    ));
+                }
+
+                // The delivery request intentionally carries no caller-chosen
+                // Attempt ID. Resolve the one retained by the sealed repair
+                // context and independently confirm it is still the Task's
+                // current correction Attempt on this exact binding.
+                let identity = context.identity();
+                let task = tasks::get_task(tx, &identity.task_id)?;
+                let attempt = tasks::get_attempt(tx, &identity.attempt_id)?;
+                if task["state"] != "open"
+                    || task["revision"] != identity.task_revision
+                    || task["current_attempt_id"] != identity.attempt_id
+                    || attempt["task_id"] != identity.task_id
+                    || attempt["task_revision"] != identity.task_revision
+                    || attempt["attempt_id"] != identity.attempt_id
+                    || attempt["state"] != "needs_correction"
+                    || !attempt["released_at_ms"].is_null()
+                    || attempt["binding_id"] != id
+                    || attempt["binding_generation"] != generation
+                {
+                    return Err(Error::new(
+                        "STALE_REPAIR_SUBJECT",
+                        "the exact repair Attempt is no longer current on this binding",
+                    ));
+                }
+            }
             UserCommandActor::Direct(principal) if principal.role == Role::Manager => {
                 let principal = super::current_principal(tx, (*principal).clone())?;
                 let requested_attempt = v

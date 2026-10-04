@@ -51,12 +51,31 @@ type RepairFeedbackOperationRow = (
     Option<String>,
     Option<String>,
     Option<String>,
+    String,
+    String,
+);
+type RepairCommittedAttemptRow = (
+    String,
+    String,
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    String,
 );
 
 #[derive(Debug, Clone)]
 pub(crate) struct RepairDispatchContext {
     technical_requester_id: String,
     effective_manager_id: String,
+    source_attempt_owner_id: String,
+    review_assignment_sponsor_id: String,
+    decision_manager_id: String,
+    transfer_operation_ids: Vec<String>,
+    prior_effect_manager_ids: Vec<String>,
+    captured_transfer_gm_epoch: Option<i64>,
+    transferred_authority: Option<authorization::TransferredAttemptAuthority>,
     automation_id: String,
     automation_revision: i64,
     project_id: String,
@@ -70,6 +89,16 @@ pub(crate) struct RepairDispatchContext {
     binding_id: String,
     binding_generation: i64,
     semantic_slot_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RepairCommittedLineage {
+    pub(crate) source_attempt_owner_id: String,
+    pub(crate) review_assignment_sponsor_id: String,
+    pub(crate) decision_manager_id: String,
+    pub(crate) project_id: String,
+    pub(crate) binding_id: String,
+    pub(crate) binding_generation: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,11 +173,70 @@ impl RepairDispatchContext {
         }
         authorization::require_registered_manager(db, &entry.owner_manager_id)?;
         require_current_entry_action(db, entry)?;
-        let (binding_id, binding_generation) =
-            current_subject_binding(db, &identity, &entry.owner_manager_id, &entry.project_id)?;
+        let lineage = validate_committed_review_and_feedback(
+            db,
+            &identity,
+            review_assignment_id,
+            review_result_operation_id,
+            disposition_operation_id,
+            feedback_operation_id,
+            feedback_observation_id,
+            &finding,
+        )?;
+        if lineage.project_id != entry.project_id {
+            return Err(source_damaged());
+        }
+        let transferred_authority = authorization::current_transferred_attempt_authority(
+            db,
+            entry,
+            AutomationStep::RepairDispatch,
+            &identity.task_id,
+            identity.task_revision,
+            &identity.attempt_id,
+            &identity.submission_ref,
+            &identity.candidate_ref,
+        )?;
+        let transfer_operation_ids = validate_repair_transfer_authority(
+            &lineage,
+            &entry.owner_manager_id,
+            transferred_authority.as_ref(),
+            db,
+            entry,
+        )?;
+        let prior_effect_manager_ids = match transferred_authority.as_ref() {
+            Some(authority) => {
+                let owners = authority.owner_lineage();
+                if owners.len() < 2
+                    || owners.first().map(String::as_str)
+                        != Some(lineage.source_attempt_owner_id.as_str())
+                    || owners.last().map(String::as_str) != Some(entry.owner_manager_id.as_str())
+                    || owners.len() != transfer_operation_ids.len() + 1
+                {
+                    return Err(source_damaged());
+                }
+                owners[..owners.len() - 1].to_vec()
+            }
+            None => vec![entry.owner_manager_id.clone()],
+        };
+        let captured_transfer_gm_epoch = transferred_authority
+            .as_ref()
+            .map(authorization::TransferredAttemptAuthority::current_gm_epoch);
+        let (binding_id, binding_generation) = current_subject_binding(
+            db,
+            &identity,
+            &lineage.source_attempt_owner_id,
+            &entry.project_id,
+        )?;
         let context = Self {
             technical_requester_id: authorization::AUTOMATION_TECHNICAL_REQUESTER_ID.to_owned(),
             effective_manager_id: entry.owner_manager_id.clone(),
+            source_attempt_owner_id: lineage.source_attempt_owner_id,
+            review_assignment_sponsor_id: lineage.review_assignment_sponsor_id,
+            decision_manager_id: lineage.decision_manager_id,
+            transfer_operation_ids,
+            prior_effect_manager_ids,
+            captured_transfer_gm_epoch,
+            transferred_authority,
             automation_id: entry.automation_id.clone(),
             automation_revision: entry.revision,
             project_id: entry.project_id.clone(),
@@ -192,6 +280,7 @@ impl RepairDispatchContext {
         binding_id: &str,
         binding_generation: i64,
         semantic_slot_id: &str,
+        captured_transfer_gm_epoch: Option<i64>,
     ) -> Result<Self> {
         validate_identity_text(owner_manager_id, "owner_manager_id")?;
         validate_identity_text(automation_id, "automation_id")?;
@@ -216,6 +305,7 @@ impl RepairDispatchContext {
             finding,
             binding_id,
             binding_generation,
+            captured_transfer_gm_epoch,
         )?;
         if context.semantic_slot_id != semantic_slot_id {
             return Err(source_damaged());
@@ -239,6 +329,7 @@ impl RepairDispatchContext {
         finding: ReviewFinding,
         expected_binding_id: &str,
         expected_binding_generation: i64,
+        captured_transfer_gm_epoch: Option<i64>,
     ) -> Result<Self> {
         validate_identity_text(review_assignment_id, "review_assignment_id")?;
         validate_identity_text(review_result_operation_id, "review_result_operation_id")?;
@@ -253,6 +344,13 @@ impl RepairDispatchContext {
         let mut context = Self {
             technical_requester_id: authorization::AUTOMATION_TECHNICAL_REQUESTER_ID.to_owned(),
             effective_manager_id: owner_manager_id.to_owned(),
+            source_attempt_owner_id: String::new(),
+            review_assignment_sponsor_id: String::new(),
+            decision_manager_id: String::new(),
+            transfer_operation_ids: Vec::new(),
+            prior_effect_manager_ids: Vec::new(),
+            captured_transfer_gm_epoch,
+            transferred_authority: None,
             automation_id: automation_id.to_owned(),
             automation_revision,
             project_id: project_id.to_owned(),
@@ -267,6 +365,46 @@ impl RepairDispatchContext {
             binding_generation: expected_binding_generation,
             semantic_slot_id: String::new(),
         };
+        let lineage = validate_committed_review_and_feedback(
+            db,
+            &context.identity,
+            review_assignment_id,
+            review_result_operation_id,
+            disposition_operation_id,
+            feedback_operation_id,
+            feedback_observation_id,
+            &context.finding,
+        )?;
+        if lineage.project_id != project_id
+            || lineage.binding_id != expected_binding_id
+            || lineage.binding_generation != expected_binding_generation
+        {
+            return Err(source_damaged());
+        }
+        context.source_attempt_owner_id = lineage.source_attempt_owner_id;
+        context.review_assignment_sponsor_id = lineage.review_assignment_sponsor_id;
+        context.decision_manager_id = lineage.decision_manager_id;
+        let (transfer_operation_ids, owner_lineage) = transfer_path_through_owner(
+            db,
+            &context.source_attempt_owner_id,
+            owner_manager_id,
+            project_id,
+            automation_id,
+        )?;
+        context.transfer_operation_ids = transfer_operation_ids;
+        if context
+            .captured_transfer_gm_epoch
+            .is_some_and(|epoch| epoch <= 0)
+            || (context.transfer_operation_ids.is_empty()
+                && context.captured_transfer_gm_epoch.is_some())
+        {
+            return Err(source_damaged());
+        }
+        context.prior_effect_manager_ids = if context.transfer_operation_ids.is_empty() {
+            vec![owner_manager_id.to_owned()]
+        } else {
+            owner_lineage[..owner_lineage.len() - 1].to_vec()
+        };
         context.semantic_slot_id = context.compute_semantic_slot_id()?;
         context.require_committed_lineage(db)?;
         Ok(context)
@@ -275,6 +413,7 @@ impl RepairDispatchContext {
     pub(crate) fn require_current_for_admission(&self, db: &Connection) -> Result<()> {
         self.require_current_action(db)?;
         self.require_current_subject(db)?;
+        self.require_current_transfer_authority(db, !self.transfer_operation_ids.is_empty())?;
         self.require_committed_lineage(db)?;
         self.require_no_unresolved_effect(db, None)
     }
@@ -302,6 +441,7 @@ impl RepairDispatchContext {
             self.require_transfer_continuation_matches(&continuation)?;
         } else {
             self.require_current_action(db)?;
+            self.require_current_transfer_authority(db, !self.transfer_operation_ids.is_empty())?;
         }
         self.require_no_unresolved_effect(db, Some(delivery_operation_id))
     }
@@ -357,7 +497,7 @@ impl RepairDispatchContext {
     fn require_current_subject(&self, db: &Connection) -> Result<()> {
         let subject = read_current_subject(db, &self.identity)?;
         if subject.project_id != self.project_id
-            || subject.owner_id != self.effective_manager_id
+            || subject.owner_id != self.source_attempt_owner_id
             || subject.task_state != "open"
             || subject.current_task_revision != self.identity.task_revision
             || subject.current_attempt_id.as_deref() != Some(self.identity.attempt_id.as_str())
@@ -385,16 +525,97 @@ impl RepairDispatchContext {
         if !binding_state.is_some_and(|(state, released)| state == "ready" && released.is_none()) {
             return Err(Error::new(
                 "REPAIR_OWNER_UNAVAILABLE",
-                "the current owner's exact native binding is not ready",
+                "the Attempt owner's exact native binding is not ready",
             ));
         }
         Ok(())
     }
 
-    fn require_committed_lineage(&self, db: &Connection) -> Result<()> {
-        validate_committed_review_and_feedback(
+    fn require_current_transfer_authority(
+        &self,
+        db: &Connection,
+        require_captured_epoch: bool,
+    ) -> Result<()> {
+        let entry = config::load_entry(
             db,
             &self.effective_manager_id,
+            &self.project_id,
+            &self.automation_id,
+        )?
+        .ok_or_else(|| {
+            Error::new(
+                "AUTOMATION_ACTION_CHANGED",
+                "current RepairDispatch entry disappeared",
+            )
+        })?;
+        let refreshed = authorization::current_transferred_attempt_authority(
+            db,
+            &entry,
+            AutomationStep::RepairDispatch,
+            &self.identity.task_id,
+            self.identity.task_revision,
+            &self.identity.attempt_id,
+            &self.identity.submission_ref,
+            &self.identity.candidate_ref,
+        )?;
+        let lineage = RepairCommittedLineage {
+            source_attempt_owner_id: self.source_attempt_owner_id.clone(),
+            review_assignment_sponsor_id: self.review_assignment_sponsor_id.clone(),
+            decision_manager_id: self.decision_manager_id.clone(),
+            project_id: self.project_id.clone(),
+            binding_id: self.binding_id.clone(),
+            binding_generation: self.binding_generation,
+        };
+        let ids = validate_repair_transfer_authority(
+            &lineage,
+            &self.effective_manager_id,
+            refreshed.as_ref(),
+            db,
+            &entry,
+        )?;
+        if ids != self.transfer_operation_ids {
+            return Err(Error::new(
+                "AUTOMATION_TRANSFER_SCOPE",
+                "current RepairDispatch transfer lineage differs from its retained operation",
+            ));
+        }
+        if require_captured_epoch {
+            let Some(captured_epoch) = self.captured_transfer_gm_epoch else {
+                return Err(Error::new(
+                    "AUTOMATION_TRANSFER_SCOPE",
+                    "transferred RepairDispatch has no retained admission GM epoch",
+                ));
+            };
+            let Some(current) = refreshed.as_ref() else {
+                return Err(Error::new(
+                    "AUTOMATION_TRANSFER_SCOPE",
+                    "current transferred RepairDispatch proof disappeared",
+                ));
+            };
+            if current.current_gm_epoch() != captured_epoch
+                || current.transfer_operation_ids() != self.transfer_operation_ids
+                || self.transferred_authority.as_ref().is_some_and(|captured| {
+                    captured.source_attempt_owner_id() != current.source_attempt_owner_id()
+                        || captured.successor_manager_id() != current.successor_manager_id()
+                        || captured.current_gm_epoch() != current.current_gm_epoch()
+                        || captured.transfer_operation_ids() != current.transfer_operation_ids()
+                        || captured.owner_lineage() != current.owner_lineage()
+                })
+            {
+                return Err(Error::new(
+                    "AUTOMATION_TRANSFER_SCOPE",
+                    "RepairDispatch GM epoch or captured transfer proof changed",
+                ));
+            }
+            Ok(())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn require_committed_lineage(&self, db: &Connection) -> Result<()> {
+        let lineage = validate_committed_review_and_feedback(
+            db,
             &self.identity,
             &self.review_assignment_id,
             &self.review_result_operation_id,
@@ -402,7 +623,17 @@ impl RepairDispatchContext {
             &self.feedback_operation_id,
             self.feedback_observation_id,
             &self.finding,
-        )
+        )?;
+        if lineage.source_attempt_owner_id != self.source_attempt_owner_id
+            || lineage.review_assignment_sponsor_id != self.review_assignment_sponsor_id
+            || lineage.decision_manager_id != self.decision_manager_id
+            || lineage.project_id != self.project_id
+            || lineage.binding_id != self.binding_id
+            || lineage.binding_generation != self.binding_generation
+        {
+            return Err(source_damaged());
+        }
+        Ok(())
     }
 
     fn require_delivery_operation(&self, db: &Connection, operation_id: &str) -> Result<()> {
@@ -501,6 +732,30 @@ impl RepairDispatchContext {
         &self.effective_manager_id
     }
 
+    pub(crate) fn source_attempt_owner_id(&self) -> &str {
+        &self.source_attempt_owner_id
+    }
+
+    pub(crate) fn review_assignment_sponsor_id(&self) -> &str {
+        &self.review_assignment_sponsor_id
+    }
+
+    pub(crate) fn decision_manager_id(&self) -> &str {
+        &self.decision_manager_id
+    }
+
+    pub(crate) fn transfer_operation_ids(&self) -> &[String] {
+        &self.transfer_operation_ids
+    }
+
+    pub(crate) fn prior_effect_manager_ids(&self) -> &[String] {
+        &self.prior_effect_manager_ids
+    }
+
+    pub(crate) fn captured_transfer_gm_epoch(&self) -> Option<i64> {
+        self.captured_transfer_gm_epoch
+    }
+
     pub(crate) fn automation_id(&self) -> &str {
         &self.automation_id
     }
@@ -554,7 +809,7 @@ impl RepairDispatchContext {
     }
 
     pub(crate) fn cause_value(&self) -> Value {
-        json!({
+        let mut cause = json!({
             "kind":"review_disposition",
             "id":self.review_assignment_id,
             "review_assignment_id":self.review_assignment_id,
@@ -564,8 +819,30 @@ impl RepairDispatchContext {
             "feedback_observation_id":self.feedback_observation_id,
             "identity":self.identity,
             "finding_id":self.finding.finding_id,
-            "semantic_slot_id":self.semantic_slot_id
-        })
+            "semantic_slot_id":self.semantic_slot_id,
+            "source_attempt_owner_id":self.source_attempt_owner_id,
+            "review_assignment_sponsor_id":self.review_assignment_sponsor_id,
+            "decision_manager_id":self.decision_manager_id,
+            "transfer_operation_ids":self.transfer_operation_ids
+        });
+        if let (Some(object), Some(epoch)) =
+            (cause.as_object_mut(), self.captured_transfer_gm_epoch)
+        {
+            object.insert("transferred_gm_epoch".to_owned(), json!(epoch));
+        }
+        cause
+    }
+
+    pub(crate) fn legacy_cause_value(&self) -> Value {
+        let mut value = self.cause_value();
+        if let Some(object) = value.as_object_mut() {
+            object.remove("source_attempt_owner_id");
+            object.remove("review_assignment_sponsor_id");
+            object.remove("decision_manager_id");
+            object.remove("transfer_operation_ids");
+            object.remove("transferred_gm_epoch");
+        }
+        value
     }
 
     pub(crate) fn linkage_value(&self) -> Value {
@@ -652,7 +929,9 @@ fn read_current_subject(db: &Connection, identity: &ReviewSlotIdentity) -> Resul
     let raw: Option<RepairCurrentSubjectRow> = db
         .query_row(
             "SELECT a.owner_id,a.task_id,a.task_revision,a.state,a.released_at_ms,a.submission_ref,a.candidate_ref, \
-                    a.binding_id,a.binding_generation,a.task_snapshot_json,t.project_id,t.state,t.revision,t.current_attempt_id \
+                    a.binding_id,a.binding_generation,a.task_snapshot_json,t.project_id,t.state,t.revision, \
+                    (SELECT current_attempt.attempt_id FROM attempts AS current_attempt \
+                     WHERE current_attempt.task_id=t.task_id AND current_attempt.released_at_ms IS NULL) \
              FROM attempts AS a JOIN tasks AS t ON t.task_id=a.task_id WHERE a.attempt_id=?1",
             [&identity.attempt_id],
             |row| {
@@ -713,11 +992,11 @@ fn read_current_subject(db: &Connection, identity: &ReviewSlotIdentity) -> Resul
 fn current_subject_binding(
     db: &Connection,
     identity: &ReviewSlotIdentity,
-    manager_id: &str,
+    attempt_owner_id: &str,
     project_id: &str,
 ) -> Result<(String, i64)> {
     let subject = read_current_subject(db, identity)?;
-    if subject.owner_id != manager_id
+    if subject.owner_id != attempt_owner_id
         || subject.task_id != identity.task_id
         || subject.task_revision != identity.task_revision
         || subject.project_id != project_id
@@ -753,6 +1032,101 @@ fn current_subject_binding(
     Ok((binding_id, generation))
 }
 
+fn validate_repair_transfer_authority(
+    lineage: &RepairCommittedLineage,
+    effective_manager_id: &str,
+    authority: Option<&authorization::TransferredAttemptAuthority>,
+    db: &Connection,
+    entry: &config::AutomationEntry,
+) -> Result<Vec<String>> {
+    match authority {
+        Some(authority)
+            if authority.source_attempt_owner_id() == lineage.source_attempt_owner_id
+                && authority.successor_manager_id() == effective_manager_id
+                && authority.current_gm_epoch() > 0
+                && authority.contains_manager_id(&lineage.review_assignment_sponsor_id)
+                && authority.contains_manager_id(&lineage.decision_manager_id) =>
+        {
+            let expected_ids = transfer_operation_ids_through_owner(
+                db,
+                &lineage.source_attempt_owner_id,
+                effective_manager_id,
+                &entry.project_id,
+                &entry.automation_id,
+            )?;
+            if authority.transfer_operation_ids() != expected_ids.as_slice() {
+                return Err(Error::new(
+                    "AUTOMATION_TRANSFER_SCOPE",
+                    "RepairDispatch proof differs from the retained transfer lineage",
+                ));
+            }
+            Ok(expected_ids)
+        }
+        None if lineage.source_attempt_owner_id == effective_manager_id
+            && lineage.review_assignment_sponsor_id == effective_manager_id
+            && lineage.decision_manager_id == effective_manager_id =>
+        {
+            Ok(Vec::new())
+        }
+        _ => Err(Error::new(
+            "FORBIDDEN",
+            "RepairDispatch sponsor, decision, and Attempt owner lack exact current transfer authority",
+        )),
+    }
+}
+
+/// Reconstruct the immutable transfer prefix that had reached one historical
+/// effective manager. This is attribution-only: it does not prove current GM,
+/// Task state, or permission to start an effect.
+fn transfer_operation_ids_through_owner(
+    db: &Connection,
+    source_owner_id: &str,
+    destination_owner_id: &str,
+    project_id: &str,
+    automation_id: &str,
+) -> Result<Vec<String>> {
+    Ok(transfer_path_through_owner(
+        db,
+        source_owner_id,
+        destination_owner_id,
+        project_id,
+        automation_id,
+    )?
+    .0)
+}
+
+fn transfer_path_through_owner(
+    db: &Connection,
+    source_owner_id: &str,
+    destination_owner_id: &str,
+    project_id: &str,
+    automation_id: &str,
+) -> Result<(Vec<String>, Vec<String>)> {
+    if source_owner_id == destination_owner_id {
+        return Ok((Vec::new(), vec![source_owner_id.to_owned()]));
+    }
+    let successors = config::transfer_successors(db, source_owner_id, project_id, automation_id)?;
+    let mut expected_owner = source_owner_id.to_owned();
+    let mut operation_ids = Vec::new();
+    let mut owner_lineage = vec![source_owner_id.to_owned()];
+    for edge in successors {
+        if edge.former_owner_manager_id != expected_owner
+            || edge.project_id != project_id
+            || edge.automation_id != automation_id
+            || edge.former_owner_revision.checked_add(1) != Some(edge.new_owner_revision)
+        {
+            return Err(source_damaged());
+        }
+        operation_ids.push(edge.transfer_operation_id);
+        expected_owner.clone_from(&edge.new_owner_manager_id);
+        owner_lineage.push(expected_owner.clone());
+        if expected_owner == destination_owner_id {
+            return Ok((operation_ids, owner_lineage));
+        }
+    }
+    Err(source_damaged())
+}
+
 fn require_current_entry_action(db: &Connection, entry: &config::AutomationEntry) -> Result<()> {
     let current = config::load_entry(
         db,
@@ -782,7 +1156,6 @@ fn require_current_entry_action(db: &Connection, entry: &config::AutomationEntry
 #[allow(clippy::too_many_arguments)] // Parameters are the distinct immutable review/feedback evidence anchors.
 pub(crate) fn validate_committed_review_and_feedback(
     db: &Connection,
-    manager_id: &str,
     identity: &ReviewSlotIdentity,
     assignment_id: &str,
     result_operation_id: &str,
@@ -790,8 +1163,57 @@ pub(crate) fn validate_committed_review_and_feedback(
     feedback_operation_id: &str,
     feedback_observation_id: i64,
     finding: &ReviewFinding,
-) -> Result<()> {
+) -> Result<RepairCommittedLineage> {
     let damaged = source_damaged;
+    let attempt: Option<RepairCommittedAttemptRow> = db
+        .query_row(
+            "SELECT a.owner_id,a.task_id,a.task_revision,a.submission_ref,a.candidate_ref,\
+                    a.binding_id,a.binding_generation,t.project_id \
+             FROM attempts AS a JOIN tasks AS t ON t.task_id=a.task_id \
+             WHERE a.attempt_id=?1",
+            [&identity.attempt_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        source_attempt_owner_id,
+        attempt_task_id,
+        attempt_revision,
+        attempt_submission_ref,
+        attempt_candidate_ref,
+        binding_id,
+        binding_generation,
+        project_id,
+    )) = attempt
+    else {
+        return Err(damaged());
+    };
+    if attempt_task_id != identity.task_id
+        || attempt_revision != identity.task_revision
+        || attempt_submission_ref.as_deref() != Some(identity.submission_ref.as_str())
+        || attempt_candidate_ref.as_deref() != Some(identity.candidate_ref.as_str())
+        || binding_id.as_deref().is_none_or(str::is_empty)
+        || binding_generation.is_none_or(|generation| generation <= 0)
+    {
+        return Err(damaged());
+    }
+    for (value, field) in [
+        (&source_attempt_owner_id, "source_attempt_owner_id"),
+        (&project_id, "project_id"),
+    ] {
+        validate_identity_text(value, field).map_err(|_| damaged())?;
+    }
     let assignment_key = format!("assignment:{assignment_id}");
     let assignment_row: Option<(String, String)> = db
         .query_row(
@@ -804,10 +1226,15 @@ pub(crate) fn validate_committed_review_and_feedback(
         return Err(damaged());
     };
     let assignment: Value = serde_json::from_str(&assignment_json).map_err(|_| damaged())?;
+    let review_assignment_sponsor_id = assignment["sponsor_client_id"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(damaged)?;
+    validate_identity_text(review_assignment_sponsor_id, "review_assignment_sponsor_id")
+        .map_err(|_| damaged())?;
     if assignment["review_assignment_id"] != assignment_id
         || assignment["operation_id"] != assignment_operation_id
         || assignment["identity"] != json!(identity)
-        || assignment["sponsor_client_id"] != manager_id
     {
         return Err(damaged());
     }
@@ -827,7 +1254,7 @@ pub(crate) fn validate_committed_review_and_feedback(
         || state != "settled"
         || assignment_result["review_assignment_id"] != assignment_id
         || assignment_result["identity"] != json!(identity)
-        || assignment_result["sponsor_client_id"] != manager_id
+        || assignment_result["sponsor_client_id"] != review_assignment_sponsor_id
     {
         return Err(damaged());
     }
@@ -872,7 +1299,7 @@ pub(crate) fn validate_committed_review_and_feedback(
                 .unwrap_or_default()
         || result_value != review_result["result"]
         || result_value["review_assignment_id"] != assignment_id
-        || result_value["sponsor_client_id"] != manager_id
+        || result_value["sponsor_client_id"] != review_assignment_sponsor_id
         || result_value["task_id"] != identity.task_id
         || result_value["task_revision"] != identity.task_revision
         || result_value["attempt_id"] != identity.attempt_id
@@ -904,6 +1331,11 @@ pub(crate) fn validate_committed_review_and_feedback(
         return Err(damaged());
     };
     let disposition: Value = serde_json::from_str(&disposition_json).map_err(|_| damaged())?;
+    let decision_manager_id = disposition["decided_by"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(damaged)?;
+    validate_identity_text(decision_manager_id, "decision_manager_id").map_err(|_| damaged())?;
     if disposition["schema_version"] != 1
         || disposition["kind"] != "review.disposition"
         || disposition["review_assignment_id"] != assignment_id
@@ -912,19 +1344,36 @@ pub(crate) fn validate_committed_review_and_feedback(
         || disposition["review_result_operation_id"] != result_operation_id
         || disposition["identity"] != json!(identity)
         || disposition["disposition"] != "return_for_correction"
-        || disposition["decided_by"] != manager_id
         || disposition["finding_ids"] != json!([finding.finding_id])
         || disposition["task_feedback_operation_id"] != feedback_operation_id
     {
         return Err(damaged());
     }
-    validate_manager_disposition_operation(db, manager_id, disposition_operation_id, identity)?;
+    validate_manager_disposition_operation(
+        db,
+        decision_manager_id,
+        disposition_operation_id,
+        assignment_id,
+        identity,
+    )?;
 
     let feedback_operation: Option<RepairFeedbackOperationRow> = db
         .query_row(
-            "SELECT caller_id,method,state,result_json,task_id,attempt_id FROM operations WHERE operation_id=?1",
+            "SELECT caller_id,method,state,result_json,task_id,attempt_id,original_request_json,client_request_id \
+             FROM operations WHERE operation_id=?1",
             [feedback_operation_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
         )
         .optional()?;
     let Some((
@@ -934,33 +1383,44 @@ pub(crate) fn validate_committed_review_and_feedback(
         feedback_result_json,
         feedback_task,
         feedback_attempt,
+        feedback_request_json,
+        feedback_client_request_id,
     )) = feedback_operation
     else {
         return Err(damaged());
     };
     let feedback_result: Value =
         serde_json::from_str(&feedback_result_json.ok_or_else(damaged)?).map_err(|_| damaged())?;
-    let expected_finding = json!({
-        "attempt_id":identity.attempt_id,
-        "task_revision":identity.task_revision,
-        "submission_ref":identity.submission_ref,
-        "candidate_ref":identity.candidate_ref,
-        "finding_id":finding.finding_id,
-        "reason":finding.reason,
-        "requirement_ids":finding.requirement_ids,
-        "evidence":finding.evidence_refs
-    });
+    let feedback_request_value: Value =
+        serde_json::from_str(&feedback_request_json).map_err(|_| damaged())?;
+    let feedback_request =
+        crate::submission::ChangeRequest::parse(&feedback_request_value).map_err(|_| damaged())?;
+    let feedback_request_finding = feedback_request.finding();
+    let preserves_review_scope = feedback_request.attempt_id == identity.attempt_id
+        && feedback_request.expected_revision == identity.task_revision
+        && feedback_request.submission_ref == identity.submission_ref
+        && feedback_request.candidate_ref == identity.candidate_ref
+        && feedback_request.finding_id == finding.finding_id
+        && feedback_request.requirement_ids.as_slice() == finding.requirement_ids.as_slice()
+        && finding
+            .evidence_refs
+            .iter()
+            .all(|reference| feedback_request.evidence.contains(reference));
     if feedback_method != "task.request_changes"
         || feedback_state != "settled"
+        || feedback_client_request_id != feedback_request.client_request_id
+        || !preserves_review_scope
         || feedback_task.as_deref() != Some(identity.task_id.as_str())
         || feedback_attempt.as_deref() != Some(identity.attempt_id.as_str())
         || feedback_result["operation_id"] != feedback_operation_id
         || feedback_result["applied"] != true
         || feedback_result["status"] != "needs_correction"
         || feedback_result["delivery"] != "durable_mailbox_only"
-        || feedback_result["recipient"] != manager_id
+        || feedback_result["sender"] != decision_manager_id
+        || feedback_result["recipient"] != source_attempt_owner_id
         || feedback_result["task_id"] != identity.task_id
-        || feedback_result["finding"] != expected_finding
+        || feedback_result["finding"] != feedback_request_finding
+        || feedback_result["text"] != feedback_request.reason
         || feedback_result["review_provenance"]["review_assignment_id"] != assignment_id
         || feedback_result["review_provenance"]["review_operation_id"] != result_operation_id
         || feedback_result["review_provenance"]["identity"] != json!(identity)
@@ -970,10 +1430,10 @@ pub(crate) fn validate_committed_review_and_feedback(
     {
         return Err(damaged());
     }
-    if feedback_caller != manager_id {
+    if feedback_caller != decision_manager_id {
         let link = authorization::operation_link(db, feedback_operation_id)?.ok_or_else(damaged)?;
         if link.action != "task.request_changes"
-            || link.effective_manager_id != manager_id
+            || link.effective_manager_id != decision_manager_id
             || link.cause["identity"] != json!(identity)
             || link.cause["review_assignment_id"] != assignment_id
         {
@@ -995,13 +1455,21 @@ pub(crate) fn validate_committed_review_and_feedback(
     if stream != REVIEW_STREAM || kind != "task.feedback" || feedback_payload != feedback_result {
         return Err(damaged());
     }
-    Ok(())
+    Ok(RepairCommittedLineage {
+        source_attempt_owner_id,
+        review_assignment_sponsor_id: review_assignment_sponsor_id.to_owned(),
+        decision_manager_id: decision_manager_id.to_owned(),
+        project_id,
+        binding_id: binding_id.ok_or_else(damaged)?,
+        binding_generation: binding_generation.ok_or_else(damaged)?,
+    })
 }
 
 fn validate_manager_disposition_operation(
     db: &Connection,
     manager_id: &str,
     operation_id: &str,
+    assignment_id: &str,
     identity: &ReviewSlotIdentity,
 ) -> Result<()> {
     let row: Option<(String, String, String, Option<String>)> = db
@@ -1031,6 +1499,7 @@ fn validate_manager_disposition_operation(
     if link.action != "task.request_changes"
         || link.effective_manager_id != manager_id
         || link.cause["identity"] != json!(identity)
+        || link.cause["review_assignment_id"] != assignment_id
     {
         return Err(source_damaged());
     }

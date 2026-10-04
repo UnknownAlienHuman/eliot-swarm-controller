@@ -55,6 +55,16 @@ struct RepairSlotReceipt {
     parameters_digest: String,
     operation_id: String,
     reserved_at_ms: i64,
+    #[serde(default)]
+    source_attempt_owner_id: Option<String>,
+    #[serde(default)]
+    review_assignment_sponsor_id: Option<String>,
+    #[serde(default)]
+    decision_manager_id: Option<String>,
+    #[serde(default)]
+    transfer_operation_ids: Option<Vec<String>>,
+    #[serde(default)]
+    captured_transfer_gm_epoch: Option<i64>,
 }
 
 /// Validated on-behalf provenance for one exact correction delivery
@@ -91,6 +101,16 @@ pub(crate) struct RepairDispatchOperationLink {
     pub(crate) finding: ReviewFinding,
     pub(crate) cause: Value,
     pub(crate) linked_at_ms: i64,
+    #[serde(default)]
+    pub(crate) source_attempt_owner_id: Option<String>,
+    #[serde(default)]
+    pub(crate) review_assignment_sponsor_id: Option<String>,
+    #[serde(default)]
+    pub(crate) decision_manager_id: Option<String>,
+    #[serde(default)]
+    pub(crate) transfer_operation_ids: Option<Vec<String>>,
+    #[serde(default)]
+    pub(crate) captured_transfer_gm_epoch: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -122,6 +142,27 @@ pub(crate) struct DirectRepairSlot {
 struct CommittedRepairReview {
     result: Value,
     identity: ReviewSlotIdentity,
+}
+
+#[derive(Debug, Clone)]
+struct RepairSourceFacts {
+    source_attempt_owner_id: String,
+    review_assignment_sponsor_id: String,
+    decision_manager_id: String,
+    transfer_operation_ids: Vec<String>,
+    captured_transfer_gm_epoch: Option<i64>,
+}
+
+impl RepairSourceFacts {
+    fn from_context(context: &RepairDispatchContext) -> Self {
+        Self {
+            source_attempt_owner_id: context.source_attempt_owner_id().to_owned(),
+            review_assignment_sponsor_id: context.review_assignment_sponsor_id().to_owned(),
+            decision_manager_id: context.decision_manager_id().to_owned(),
+            transfer_operation_ids: context.transfer_operation_ids().to_vec(),
+            captured_transfer_gm_epoch: context.captured_transfer_gm_epoch(),
+        }
+    }
 }
 
 impl PreparedRepairDispatch {
@@ -266,13 +307,10 @@ pub(crate) fn consume_review_result_for_entry(
             "manager_disposition_does_not_request_correction",
         ));
     }
-    if disposition["decided_by"] != review_sponsor {
-        return Ok(repair_skipped(
-            assignment_id,
-            result_operation_id,
-            "feedback_was_not_applied_by_review_sponsor",
-        ));
-    }
+    let decision_manager_id = disposition["decided_by"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| source_gap("review disposition has no decision manager identity"))?;
     let finding_ids = disposition["finding_ids"]
         .as_array()
         .ok_or_else(|| source_gap("review disposition has no selected finding list"))?;
@@ -331,20 +369,6 @@ pub(crate) fn consume_review_result_for_entry(
     }
     let finding: ReviewFinding = serde_json::from_value(provenance["finding"].clone())
         .map_err(|_| source_gap("actionable review finding fields are invalid"))?;
-    if review_sponsor != entry.owner_manager_id {
-        return consume_transferred_repair_slot(
-            tx,
-            entry,
-            review_sponsor,
-            assignment_id,
-            result_operation_id,
-            &disposition_operation_id,
-            feedback_operation_id,
-            feedback_observation_id,
-            review.identity,
-            finding,
-        );
-    }
     let context = match RepairDispatchContext::from_committed_disposition(
         tx,
         entry,
@@ -417,6 +441,22 @@ pub(crate) fn consume_review_result_for_entry(
         Err(error) => return Err(error),
     };
     let prepared = PreparedRepairDispatch { context, request };
+    if prepared.context.review_assignment_sponsor_id() != review_sponsor
+        || prepared.context.decision_manager_id() != decision_manager_id
+    {
+        return Err(source_gap(
+            "repair context differs from the exact saved sponsor or disposition actor",
+        ));
+    }
+    if prepared
+        .context
+        .prior_effect_manager_ids()
+        .iter()
+        .any(|owner| owner.as_str() != prepared.context.effective_manager_id())
+        && let Some(result) = consume_transferred_repair_slot(tx, entry, &prepared)?
+    {
+        return Ok(result);
+    }
     match resolve_semantic_slot(tx, &prepared)? {
         RepairSlotResolution::Existing {
             operation_id,
@@ -471,75 +511,143 @@ fn repair_entry_is_current(db: &Connection, entry: &AutomationEntry) -> Result<b
         && current.scope.work_pool_id.is_none())
 }
 
-#[allow(clippy::too_many_arguments)] // The bridge matches one exact transferred review source and its durable historical slot.
 fn consume_transferred_repair_slot(
     tx: &Transaction<'_>,
     entry: &AutomationEntry,
-    historical_owner_id: &str,
-    assignment_id: &str,
-    result_operation_id: &str,
-    disposition_operation_id: &str,
-    feedback_operation_id: &str,
-    feedback_observation_id: i64,
-    identity: ReviewSlotIdentity,
-    finding: ReviewFinding,
-) -> Result<Value> {
-    let lineage = config::transfer_lineage(
-        tx,
-        &entry.owner_manager_id,
-        &entry.project_id,
-        &entry.automation_id,
-    )?;
-    if !lineage
+    current: &PreparedRepairDispatch,
+) -> Result<Option<Value>> {
+    let current_context = current.context();
+    let assignment_id = current_context.review_assignment_id();
+    let result_operation_id = current_context.review_result_operation_id();
+    let prior_owners = current_context
+        .prior_effect_manager_ids()
         .iter()
-        .any(|edge| edge.former_owner_manager_id == historical_owner_id)
-    {
-        return Ok(repair_skipped(
-            assignment_id,
-            result_operation_id,
-            "review_sponsor_is_not_in_current_automation_transfer_lineage",
-        ));
+        .filter(|owner| owner.as_str() != current_context.effective_manager_id());
+    let mut prior_slot: Option<(String, String, RepairSlotReceipt)> = None;
+    for owner_id in prior_owners {
+        let semantic_slot_id = crate::automation::repair::semantic_slot_id(
+            owner_id,
+            current_context.identity(),
+            &current_context.finding().finding_id,
+        )?;
+        let Some(value) = config::read_record(
+            tx,
+            &slot_key(&semantic_slot_id),
+            "historical RepairDispatch semantic slot",
+        )?
+        else {
+            continue;
+        };
+        let receipt: RepairSlotReceipt = serde_json::from_value(value).map_err(|_| {
+            Error::new(
+                "REPAIR_SLOT_CORRUPT",
+                "historical RepairDispatch slot fields are invalid",
+            )
+        })?;
+        if receipt.schema_version != SLOT_SCHEMA_VERSION
+            || receipt.semantic_slot_id != semantic_slot_id
+            || receipt.effective_manager_id != owner_id.as_str()
+            || receipt.task_id != current_context.identity().task_id
+            || receipt.task_revision != current_context.identity().task_revision
+            || receipt.attempt_id != current_context.identity().attempt_id
+            || receipt.submission_ref != current_context.identity().submission_ref
+            || receipt.candidate_ref != current_context.identity().candidate_ref
+            || receipt.finding_id != current_context.finding().finding_id
+            || receipt
+                .source_attempt_owner_id
+                .as_deref()
+                .is_some_and(|source| source != current_context.source_attempt_owner_id())
+            || receipt
+                .review_assignment_sponsor_id
+                .as_deref()
+                .is_some_and(|sponsor| sponsor != current_context.review_assignment_sponsor_id())
+            || receipt
+                .decision_manager_id
+                .as_deref()
+                .is_some_and(|manager| manager != current_context.decision_manager_id())
+        {
+            return Err(Error::new(
+                "REPAIR_SLOT_CORRUPT",
+                "historical RepairDispatch slot belongs to another semantic subject",
+            ));
+        }
+
+        let request = normalized_repair_request(&current.request_value(), &semantic_slot_id)
+            .ok_or_else(|| {
+                Error::new(
+                    "REPAIR_OPERATION_CORRUPT",
+                    "current correction request has an invalid shape",
+                )
+            })?;
+        match resolve_slot_parts(
+            tx,
+            owner_id,
+            current_context.identity(),
+            &current_context.finding().finding_id,
+            current_context.binding_id(),
+            current_context.binding_generation(),
+            &semantic_slot_id,
+            &request,
+            &current.request.parameters_digest()?,
+        )? {
+            RepairSlotResolution::Existing { operation_id, .. }
+                if operation_id == receipt.operation_id => {}
+            RepairSlotResolution::Conflict { .. } => {
+                return Ok(Some(repair_skipped(
+                    assignment_id,
+                    result_operation_id,
+                    "historical_repair_semantic_slot_conflict",
+                )));
+            }
+            RepairSlotResolution::Existing { .. } | RepairSlotResolution::Vacant => {
+                return Err(Error::new(
+                    "REPAIR_SLOT_CORRUPT",
+                    "historical RepairDispatch slot resolved to a different Operation",
+                ));
+            }
+        }
+        if prior_slot.is_some() {
+            return Ok(Some(repair_skipped(
+                assignment_id,
+                result_operation_id,
+                "multiple_historical_repair_operations_require_readback",
+            )));
+        }
+        prior_slot = Some((owner_id.clone(), semantic_slot_id, receipt));
     }
 
-    let semantic_slot_id = crate::automation::repair::semantic_slot_id(
-        historical_owner_id,
-        &identity,
-        &finding.finding_id,
-    )?;
-    let Some(value) = config::read_record(
-        tx,
-        &slot_key(&semantic_slot_id),
-        "historical RepairDispatch semantic slot",
-    )?
-    else {
-        // Transfer history alone is not authority to create a new slot or a
-        // new native send. Continuation is limited to the exact old queued op.
-        return Ok(repair_skipped(
+    let Some((historical_owner_id, semantic_slot_id, receipt)) = prior_slot else {
+        return Ok(None);
+    };
+    let (caller, method, operation_state, _, _, _, _, _) =
+        read_repair_operation(tx, &receipt.operation_id)?;
+    if method != "agent.send" {
+        return Err(Error::new(
+            "REPAIR_OPERATION_CORRUPT",
+            "historical repair slot is linked to a non-send Operation",
+        ));
+    }
+    if caller != crate::automation::authorization::AUTOMATION_TECHNICAL_REQUESTER_ID {
+        if caller != historical_owner_id
+            || current_context.decision_manager_id() != historical_owner_id
+            || receipt.source_attempt_owner_id.is_some()
+            || receipt.review_assignment_sponsor_id.is_some()
+            || receipt.decision_manager_id.is_some()
+            || receipt.transfer_operation_ids.is_some()
+            || receipt.captured_transfer_gm_epoch.is_some()
+        {
+            return Err(Error::new(
+                "REPAIR_OPERATION_CORRUPT",
+                "historical direct repair Operation has the wrong decision manager",
+            ));
+        }
+        return Ok(Some(historical_direct_repair_readback(
+            tx,
+            &receipt.operation_id,
             assignment_id,
             result_operation_id,
-            "transferred_repair_operation_not_previously_admitted",
-        ));
-    };
-    let receipt: RepairSlotReceipt = serde_json::from_value(value).map_err(|_| {
-        Error::new(
-            "REPAIR_SLOT_CORRUPT",
-            "historical RepairDispatch slot fields are invalid",
-        )
-    })?;
-    if receipt.schema_version != SLOT_SCHEMA_VERSION
-        || receipt.semantic_slot_id != semantic_slot_id
-        || receipt.effective_manager_id != historical_owner_id
-        || receipt.task_id != identity.task_id
-        || receipt.task_revision != identity.task_revision
-        || receipt.attempt_id != identity.attempt_id
-        || receipt.submission_ref != identity.submission_ref
-        || receipt.candidate_ref != identity.candidate_ref
-        || receipt.finding_id != finding.finding_id
-    {
-        return Err(Error::new(
-            "REPAIR_SLOT_CORRUPT",
-            "historical RepairDispatch slot belongs to another semantic subject",
-        ));
+            &semantic_slot_id,
+        )?));
     }
 
     let context = context_for_delivery_operation(tx, &receipt.operation_id)?;
@@ -549,11 +657,22 @@ fn consume_transferred_repair_slot(
         || context.semantic_slot_id() != semantic_slot_id
         || context.review_assignment_id() != assignment_id
         || context.review_result_operation_id() != result_operation_id
-        || context.disposition_operation_id() != disposition_operation_id
-        || context.feedback_operation_id() != feedback_operation_id
-        || context.feedback_observation_id() != feedback_observation_id
-        || context.identity() != &identity
-        || serde_json::to_value(context.finding())? != serde_json::to_value(&finding)?
+        || context.disposition_operation_id() != current_context.disposition_operation_id()
+        || context.feedback_operation_id() != current_context.feedback_operation_id()
+        || context.feedback_observation_id() != current_context.feedback_observation_id()
+        || context.identity() != current_context.identity()
+        || context.binding_id() != current_context.binding_id()
+        || context.binding_generation() != current_context.binding_generation()
+        || context.source_attempt_owner_id() != current_context.source_attempt_owner_id()
+        || context.review_assignment_sponsor_id() != current_context.review_assignment_sponsor_id()
+        || context.decision_manager_id() != current_context.decision_manager_id()
+        || receipt
+            .transfer_operation_ids
+            .as_ref()
+            .is_some_and(|operations| operations.as_slice() != context.transfer_operation_ids())
+        || receipt.captured_transfer_gm_epoch != context.captured_transfer_gm_epoch()
+        || serde_json::to_value(context.finding())?
+            != serde_json::to_value(current_context.finding())?
     {
         return Err(Error::new(
             "REPAIR_LINK_CORRUPT",
@@ -561,16 +680,29 @@ fn consume_transferred_repair_slot(
         ));
     }
     let request = context.delivery_request()?;
+    let expected_request = normalized_repair_request(&current.request_value(), &semantic_slot_id)
+        .ok_or_else(|| {
+        Error::new(
+            "REPAIR_LINK_CORRUPT",
+            "current correction request has an invalid shape",
+        )
+    })?;
+    if model::canonical(&request.value())? != model::canonical(&expected_request)? {
+        return Err(Error::new(
+            "REPAIR_LINK_CORRUPT",
+            "historical RepairDispatch request differs from the exact current correction",
+        ));
+    }
     let prepared = PreparedRepairDispatch { context, request };
     match resolve_semantic_slot(tx, &prepared)? {
         RepairSlotResolution::Existing { operation_id, .. }
             if operation_id == receipt.operation_id => {}
         RepairSlotResolution::Conflict { .. } => {
-            return Ok(repair_skipped(
+            return Ok(Some(repair_skipped(
                 assignment_id,
                 result_operation_id,
                 "historical_repair_semantic_slot_conflict",
-            ));
+            )));
         }
         RepairSlotResolution::Existing { .. } | RepairSlotResolution::Vacant => {
             return Err(Error::new(
@@ -580,18 +712,19 @@ fn consume_transferred_repair_slot(
         }
     }
 
-    let (operation_state, sent_at_ms): (String, Option<i64>) = tx.query_row(
-        "SELECT state,sent_at_ms FROM operations WHERE operation_id=?1",
+    let sent_at_ms: Option<i64> = tx.query_row(
+        "SELECT sent_at_ms FROM operations WHERE operation_id=?1",
         [&receipt.operation_id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        |row| row.get(0),
     )?;
+    let mut continued_queued_operation = false;
     if operation_state == "queued" && sent_at_ms.is_none() {
         let continuation = crate::automation::authorization::current_transfer_continuation(
             tx,
             &receipt.operation_id,
             "agent.send",
             AutomationStep::RepairDispatch,
-            &identity.task_id,
+            &current_context.identity().task_id,
         )?
         .ok_or_else(|| {
             Error::new(
@@ -599,28 +732,99 @@ fn consume_transferred_repair_slot(
                 "historical queued RepairDispatch has no current-GM transfer continuation",
             )
         })?;
+        if continuation.current_owner_id() != current_context.effective_manager_id() {
+            return Err(Error::new(
+                "AUTOMATION_TRANSFER_SCOPE",
+                "historical RepairDispatch continuation targets a different current GM",
+            ));
+        }
         prepared
             .context
             .require_transfer_continuation_matches(&continuation)?;
+        continued_queued_operation = true;
     }
 
-    match delivery_state(tx, &receipt.operation_id, &prepared)? {
-        DeliveryState::Verified => Ok(repair_delivered(
+    let result = match delivery_state(tx, &receipt.operation_id, &prepared)? {
+        DeliveryState::Verified => repair_delivered(
             assignment_id,
             result_operation_id,
             &receipt.operation_id,
             &semantic_slot_id,
-        )),
-        DeliveryState::NoEffect => Ok(repair_skipped(
+        ),
+        DeliveryState::NoEffect => repair_skipped(
+            assignment_id,
+            result_operation_id,
+            "prior_repair_operation_ended_without_delivery",
+        ),
+        DeliveryState::Pending(reason) => repair_pending(
+            assignment_id,
+            result_operation_id,
+            &reason,
+            if continued_queued_operation {
+                "current_transfer_continuation"
+            } else {
+                "exact_historical_delivery_operation_readback"
+            },
+        ),
+    };
+    Ok(Some(result))
+}
+
+fn historical_direct_repair_readback(
+    db: &Connection,
+    operation_id: &str,
+    assignment_id: &str,
+    result_operation_id: &str,
+    semantic_slot_id: &str,
+) -> Result<Value> {
+    let (state, result_json): (String, Option<String>) = db.query_row(
+        "SELECT state,result_json FROM operations WHERE operation_id=?1",
+        [operation_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    match state.as_str() {
+        "settled" => {
+            let result: Value = serde_json::from_str(&result_json.ok_or_else(|| {
+                Error::new(
+                    "REPAIR_OPERATION_CORRUPT",
+                    "settled direct repair Operation has no result",
+                )
+            })?)?;
+            if result["outcome"] == "applied"
+                && result["native_input_id"]
+                    .as_str()
+                    .is_some_and(|value| !value.is_empty())
+                && result["details"]["completion_condition"] == "native_input_admitted"
+            {
+                Ok(repair_delivered(
+                    assignment_id,
+                    result_operation_id,
+                    operation_id,
+                    semantic_slot_id,
+                ))
+            } else {
+                Ok(repair_pending(
+                    assignment_id,
+                    result_operation_id,
+                    "native_delivery_receipt_is_not_sufficiently_proved",
+                    "exact_historical_direct_operation_readback",
+                ))
+            }
+        }
+        "rejected" | "cancelled" => Ok(repair_skipped(
             assignment_id,
             result_operation_id,
             "prior_repair_operation_ended_without_delivery",
         )),
-        DeliveryState::Pending(reason) => Ok(repair_pending(
+        "queued" | "sending" | "native_accepted" | "outcome_unknown" => Ok(repair_pending(
             assignment_id,
             result_operation_id,
-            &reason,
-            "exact_historical_delivery_operation_readback",
+            "direct_historical_correction_requires_readback",
+            "exact_historical_direct_operation_readback",
+        )),
+        _ => Err(Error::new(
+            "REPAIR_OPERATION_CORRUPT",
+            "direct correction Operation has an unsupported lifecycle state",
         )),
     }
 }
@@ -972,7 +1176,10 @@ pub(crate) fn recognize_direct_correction_request(
            AND a.owner_id=?2 AND a.binding_id=?3 AND a.binding_generation=?4 \
            AND a.state='needs_correction' AND a.released_at_ms IS NULL \
            AND t.state='open' AND t.revision=a.task_revision \
-           AND t.current_attempt_id=a.attempt_id \
+           AND a.attempt_id=(SELECT active_attempt.attempt_id FROM attempts AS active_attempt \
+                             WHERE active_attempt.task_id=t.task_id \
+                               AND active_attempt.released_at_ms IS NULL \
+                             ORDER BY active_attempt.created_at_ms DESC,active_attempt.attempt_id DESC LIMIT 1) \
          ORDER BY o.observation_id DESC LIMIT 64",
     )?;
     let rows = statement
@@ -1063,9 +1270,8 @@ pub(crate) fn recognize_direct_correction_request(
         }
         let finding: ReviewFinding = serde_json::from_value(provenance["finding"].clone())
             .map_err(|_| source_gap("actionable finding fields are invalid"))?;
-        crate::automation::repair::validate_committed_review_and_feedback(
+        let lineage = crate::automation::repair::validate_committed_review_and_feedback(
             db,
-            &principal.client_id,
             &identity,
             assignment_id,
             model::text(&disposition, "review_result_operation_id")?,
@@ -1074,6 +1280,14 @@ pub(crate) fn recognize_direct_correction_request(
             feedback_observation_id,
             &finding,
         )?;
+        if lineage.decision_manager_id.as_str() != principal.client_id.as_str()
+            || lineage.binding_id.as_str() != binding_id
+            || lineage.binding_generation != binding_generation
+        {
+            return Err(source_gap(
+                "direct correction actor or binding differs from the retained disposition lineage",
+            ));
+        }
         crate::automation::repair::require_current_manual_owner(
             db,
             &principal.client_id,
@@ -1363,9 +1577,8 @@ pub(crate) fn retain_direct_admission(
             "direct repair slot can only be retained for its authenticated Manager owner",
         ));
     }
-    crate::automation::repair::validate_committed_review_and_feedback(
+    let lineage = crate::automation::repair::validate_committed_review_and_feedback(
         tx,
-        &slot.manager_id,
         &slot.identity,
         &slot.assignment_id,
         &slot.result_operation_id,
@@ -1374,6 +1587,14 @@ pub(crate) fn retain_direct_admission(
         slot.feedback_observation_id,
         &slot.finding,
     )?;
+    if lineage.decision_manager_id.as_str() != slot.manager_id.as_str()
+        || lineage.binding_id.as_str() != slot.binding_id.as_str()
+        || lineage.binding_generation != slot.binding_generation
+    {
+        return Err(source_gap(
+            "direct correction slot differs from the retained disposition lineage",
+        ));
+    }
     crate::automation::repair::require_current_manual_owner(
         tx,
         &slot.manager_id,
@@ -1445,6 +1666,7 @@ pub(crate) fn retain_direct_admission(
         operation_id,
         &slot.request_digest,
         now_ms,
+        None,
     )
 }
 
@@ -1464,6 +1686,7 @@ fn retain_slot(
         operation_id,
         parameters_digest,
         now_ms,
+        Some(RepairSourceFacts::from_context(context)),
     )
 }
 
@@ -1477,6 +1700,7 @@ fn retain_slot_parts(
     operation_id: &str,
     parameters_digest: &str,
     now_ms: i64,
+    provenance: Option<RepairSourceFacts>,
 ) -> Result<()> {
     let key = slot_key(semantic_slot_id);
     if let Some(value) = config::read_record(tx, &key, "RepairDispatch semantic slot")? {
@@ -1497,6 +1721,21 @@ fn retain_slot_parts(
             "another correction Operation already occupies this semantic slot",
         ));
     }
+    let (
+        source_attempt_owner_id,
+        review_assignment_sponsor_id,
+        decision_manager_id,
+        transfer_operation_ids,
+        captured_transfer_gm_epoch,
+    ) = provenance.map_or((None, None, None, None, None), |facts| {
+        (
+            Some(facts.source_attempt_owner_id),
+            Some(facts.review_assignment_sponsor_id),
+            Some(facts.decision_manager_id),
+            Some(facts.transfer_operation_ids),
+            facts.captured_transfer_gm_epoch,
+        )
+    });
     let receipt = RepairSlotReceipt {
         schema_version: SLOT_SCHEMA_VERSION,
         semantic_slot_id: semantic_slot_id.to_owned(),
@@ -1510,6 +1749,11 @@ fn retain_slot_parts(
         parameters_digest: parameters_digest.to_owned(),
         operation_id: operation_id.to_owned(),
         reserved_at_ms: now_ms,
+        source_attempt_owner_id,
+        review_assignment_sponsor_id,
+        decision_manager_id,
+        transfer_operation_ids,
+        captured_transfer_gm_epoch,
     };
     config::write_record(
         tx,
@@ -1555,6 +1799,11 @@ fn link_from_context(
         finding: context.finding().clone(),
         cause: context.cause_value(),
         linked_at_ms,
+        source_attempt_owner_id: Some(context.source_attempt_owner_id().to_owned()),
+        review_assignment_sponsor_id: Some(context.review_assignment_sponsor_id().to_owned()),
+        decision_manager_id: Some(context.decision_manager_id().to_owned()),
+        transfer_operation_ids: Some(context.transfer_operation_ids().to_vec()),
+        captured_transfer_gm_epoch: context.captured_transfer_gm_epoch(),
     }
 }
 
@@ -1626,6 +1875,7 @@ pub(crate) fn context_for_delivery_operation(
         &link.binding_id,
         link.binding_generation,
         &link.semantic_slot_id,
+        link.captured_transfer_gm_epoch,
     )
 }
 
@@ -1673,10 +1923,11 @@ fn validate_operation_link(
         &link.binding_id,
         link.binding_generation,
         &link.semantic_slot_id,
+        link.captured_transfer_gm_epoch,
     )
     .map_err(|_| corrupt())?;
     if link.semantic_cause_id != context.review_assignment_id()
-        || link.cause != context.cause_value()
+        || !link_provenance_matches_context(link, &context)
     {
         return Err(corrupt());
     }
@@ -1703,6 +1954,32 @@ fn validate_operation_link(
         return Err(corrupt());
     }
     validate_slot_for_link(db, link).map_err(|_| corrupt())
+}
+
+fn link_provenance_matches_context(
+    link: &RepairDispatchOperationLink,
+    context: &RepairDispatchContext,
+) -> bool {
+    let fields = [
+        link.source_attempt_owner_id.is_some(),
+        link.review_assignment_sponsor_id.is_some(),
+        link.decision_manager_id.is_some(),
+        link.transfer_operation_ids.is_some(),
+    ];
+    if fields.iter().all(|present| !present) {
+        return link.captured_transfer_gm_epoch.is_none()
+            && link.cause == context.legacy_cause_value();
+    }
+    if fields.iter().any(|present| !present) {
+        return false;
+    }
+    link.source_attempt_owner_id.as_deref() == Some(context.source_attempt_owner_id())
+        && link.review_assignment_sponsor_id.as_deref()
+            == Some(context.review_assignment_sponsor_id())
+        && link.decision_manager_id.as_deref() == Some(context.decision_manager_id())
+        && link.transfer_operation_ids.as_deref() == Some(context.transfer_operation_ids())
+        && link.captured_transfer_gm_epoch == context.captured_transfer_gm_epoch()
+        && link.cause == context.cause_value()
 }
 
 fn validate_slot_for_link(db: &Connection, link: &RepairDispatchOperationLink) -> Result<()> {
@@ -1734,6 +2011,11 @@ fn validate_slot_for_link(db: &Connection, link: &RepairDispatchOperationLink) -
         || slot.finding_id != link.finding_id
         || slot.operation_id != link.operation_id
         || slot.parameters_digest != link.request_digest
+        || slot.source_attempt_owner_id != link.source_attempt_owner_id
+        || slot.review_assignment_sponsor_id != link.review_assignment_sponsor_id
+        || slot.decision_manager_id != link.decision_manager_id
+        || slot.transfer_operation_ids != link.transfer_operation_ids
+        || slot.captured_transfer_gm_epoch != link.captured_transfer_gm_epoch
     {
         return Err(Error::new(
             "REPAIR_SLOT_CORRUPT",

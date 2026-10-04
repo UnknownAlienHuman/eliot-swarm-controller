@@ -394,6 +394,10 @@ impl TransferredAttemptAuthority {
         &self.transfer_operation_ids
     }
 
+    pub(crate) fn owner_lineage(&self) -> &[String] {
+        &self.owner_lineage
+    }
+
     pub(crate) fn contains_manager_id(&self, manager_id: &str) -> bool {
         self.owner_lineage.iter().any(|owner| owner == manager_id)
     }
@@ -1741,9 +1745,10 @@ pub(crate) fn current_transferred_attempt_authority(
         AutomationStep::ReviewDispatch
             | AutomationStep::ReviewDisposition
             | AutomationStep::Acceptance
+            | AutomationStep::RepairDispatch
     ) {
         return Err(Error::invalid(
-            "transferred Attempt authority is limited to review and acceptance steps",
+            "transferred Attempt authority is limited to review, repair, and acceptance steps",
         ));
     }
     config::validate_entry(entry)?;
@@ -1761,7 +1766,9 @@ pub(crate) fn current_transferred_attempt_authority(
     })?;
     let step_ready = match step {
         AutomationStep::ReviewDispatch => current_entry.review_dispatch_ready(),
-        AutomationStep::ReviewDisposition | AutomationStep::Acceptance => {
+        AutomationStep::ReviewDisposition
+        | AutomationStep::Acceptance
+        | AutomationStep::RepairDispatch => {
             current_entry.enabled
                 && current_entry.steps.contains(&step)
                 && current_entry.scope.work_pool_id.is_none()
@@ -1825,6 +1832,7 @@ pub(crate) fn current_transferred_attempt_authority(
             matches!(attempt_state.as_str(), "submitted" | "needs_correction")
         }
         AutomationStep::ReviewDispatch => attempt_state == "submitted",
+        AutomationStep::RepairDispatch => attempt_state == "needs_correction",
         AutomationStep::Acceptance => {
             matches!(attempt_state.as_str(), "submitted" | "needs_correction")
         }

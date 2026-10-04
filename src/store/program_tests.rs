@@ -1375,6 +1375,97 @@ async fn add_submission_source_fact(store: &Store, suffix: &str, subject: &Revie
         .unwrap();
 }
 
+async fn attach_ready_repair_binding(store: &Store, subject: &ReviewSubject) -> String {
+    let binding_id = format!("repair-binding-{}", subject.attempt_id);
+    let module_client_id = format!("repair-module-{}", subject.attempt_id);
+    let module_link_id = format!("repair-module-link-{}", subject.attempt_id);
+    let attempt_id = subject.attempt_id.clone();
+    let returned_binding_id = binding_id.clone();
+    store
+        .run(move |db| {
+            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            set_meta(
+                &tx,
+                &format!("client:{module_client_id}"),
+                &json!({
+                    "role":"module",
+                    "disabled":false,
+                    "binding_id":binding_id,
+                    "binding_generation":1
+                }),
+            )?;
+            let route = json!({
+                "alias":"repair-continuation-fixture",
+                "runtime":"muse",
+                "module_artifact_id":"muse-sdk-1.3.0-bridge.5",
+                "enabled":true,
+                "native_options":{"workspaceRoot":"C:\\fixture","modelId":"fixture-model"}
+            });
+            let state = json!({
+                "connection":"connected",
+                "module_client_id":module_client_id,
+                "module_link_id":module_link_id,
+                "bridge_boot_id":"repair-fixture-boot"
+            });
+            tx.execute(
+                "INSERT INTO bindings(binding_id,generation,lane_id,module_instance_id,module_artifact_id,state,route_json,state_json,created_at_ms) \
+                 VALUES(?1,1,'repair-fixture-lane',?2,'muse-sdk-1.3.0-bridge.5','ready',?3,?4,1)",
+                params![
+                    binding_id,
+                    module_client_id,
+                    model::canonical(&route)?,
+                    model::canonical(&state)?,
+                ],
+            )?;
+            tx.execute(
+                "UPDATE attempts SET binding_id=?2,binding_generation=1 WHERE attempt_id=?1",
+                params![attempt_id, binding_id],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    returned_binding_id
+}
+
+async fn consume_repair_result_for_entry(
+    store: &Store,
+    manager_id: &str,
+    project_id: &str,
+    automation_id: &str,
+    assignment_id: &str,
+    result_operation_id: &str,
+) -> Result<Value> {
+    let manager_id = manager_id.to_owned();
+    let project_id = project_id.to_owned();
+    let automation_id = automation_id.to_owned();
+    let assignment_id = assignment_id.to_owned();
+    let result_operation_id = result_operation_id.to_owned();
+    store
+        .run(move |db| {
+            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let entry = crate::automation::config::load_entry(
+                &tx,
+                &manager_id,
+                &project_id,
+                &automation_id,
+            )?
+            .ok_or_else(|| Error::new("NOT_FOUND", "transferred RepairDispatch entry"))?;
+            let value = super::automation_repair::consume_review_result_for_entry(
+                &tx,
+                &Config::default(),
+                &entry,
+                &assignment_id,
+                &result_operation_id,
+                model::now_ms()?,
+            )?;
+            tx.commit()?;
+            Ok(value)
+        })
+        .await
+}
+
 async fn configure_subject_acceptance_policy(store: &Store, subject: &ReviewSubject) {
     let task_id = subject.task_id.clone();
     let attempt_id = subject.attempt_id.clone();
@@ -1777,6 +1868,397 @@ async fn transferred_gm_dispatches_exact_reviews_and_keeps_attempt_owner_provena
     assert_eq!(operations.5["submitted_by"], "review-owner-v2");
     assert_eq!(operations.6, 2);
     assert!(dispositions["entries"].is_array());
+
+    owner.close().await.unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn transferred_repair_dispatch_preserves_sponsor_decider_owner_and_reuses_current_slot() {
+    let (owner, directory, bootstrap) = start_store("gm-successor-repair").await;
+    let operator = owner.store.authenticate(bootstrap).await.unwrap();
+    seed_clients(&owner.store).await;
+
+    let source_owner = principal("review-owner-v2", Role::Manager);
+    let decision_manager = principal("review-gm", Role::Manager);
+    let current_manager = principal("review-owner-v1", Role::Manager);
+    owner
+        .store
+        .call(
+            operator.clone(),
+            "gm.handover".into(),
+            json!({"client_request_id":"designate-repair-source-owner","client_id":source_owner.client_id}),
+        )
+        .await
+        .unwrap();
+
+    let project_id = "fixture";
+    let automation_id = "successor-repair-continuation";
+    let changes = json!([{
+        "automation_id":automation_id,
+        "expected_revision":0,
+        "include_existing":false,
+        "patch":{
+            "enabled":true,
+            "scope":{"work_pool_id":null},
+            "steps":["repair_dispatch"]
+        }
+    }]);
+    let preview = owner
+        .store
+        .call(
+            source_owner.clone(),
+            "automation.config.preview".into(),
+            json!({"project_id":project_id,"changes":changes.clone()}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(preview["valid"], true);
+    owner
+        .store
+        .call(
+            source_owner.clone(),
+            "automation.config.apply".into(),
+            json!({
+                "client_request_id":"enable-successor-repair-continuation",
+                "project_id":project_id,
+                "changes":changes,
+                "preview_digest":preview["plan_sha256"]
+            }),
+        )
+        .await
+        .unwrap();
+
+    let subject = seed_subject(
+        &owner.store,
+        "successor-repair",
+        &source_owner.client_id,
+        crate::policy::OWNER_POLICY_V2_ID,
+        false,
+    )
+    .await;
+    add_submission_source_fact(&owner.store, "successor-repair", &subject).await;
+    let binding_id = attach_ready_repair_binding(&owner.store, &subject).await;
+    let (reviewer, assignment_id) = assign_sponsored_reviewer(
+        &owner.store,
+        source_owner.clone(),
+        &subject,
+        "successor-repair-reviewer",
+        "successor-repair-reviewer-token",
+    )
+    .await;
+    let review_result = owner
+        .store
+        .call(
+            reviewer,
+            "review.submit".into(),
+            review_result_request(&subject, &assignment_id, "successor-repair-result"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(review_result["verdict"], "changes_requested");
+    let result_operation_id = review_result["operation_id"].as_str().unwrap().to_owned();
+
+    owner
+        .store
+        .call(
+            operator.clone(),
+            "gm.handover".into(),
+            json!({"client_request_id":"designate-repair-decision-manager","client_id":decision_manager.client_id}),
+        )
+        .await
+        .unwrap();
+    let feedback = owner
+        .store
+        .call(
+            decision_manager.clone(),
+            "task.request_changes".into(),
+            json!({
+                "client_request_id":"successor-repair-return-for-correction",
+                "attempt_id":subject.attempt_id,
+                "expected_revision":1,
+                "submission_ref":subject.submission_ref,
+                "candidate_ref":subject.candidate_ref,
+                "finding_id":"missing-r1-evidence",
+                "reason":"Add the retained evidence for R1.",
+                "requirement_ids":["R1"],
+                "evidence":["evidence://review/r1"]
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(feedback["applied"], true);
+    assert_eq!(feedback["sender"], decision_manager.client_id);
+    assert_eq!(feedback["recipient"], source_owner.client_id);
+    assert_eq!(
+        feedback["finding"]["reason"],
+        "Add the retained evidence for R1."
+    );
+    assert_ne!(
+        feedback["finding"]["reason"],
+        "The candidate omits the requested evidence."
+    );
+    assert_eq!(
+        feedback["review_provenance"]["review_assignment_id"],
+        assignment_id
+    );
+
+    let first_transfer = owner
+        .store
+        .call(
+            decision_manager.clone(),
+            "automation.config.transfer".into(),
+            json!({
+                "client_request_id":"transfer-repair-to-decision-manager",
+                "project_id":project_id,
+                "former_owner_manager_id":source_owner.client_id,
+                "automation_id":automation_id,
+                "expected_revision":1
+            }),
+        )
+        .await
+        .unwrap();
+    let first_transfer_id = first_transfer["transfer_operation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    owner
+        .store
+        .call(
+            operator.clone(),
+            "gm.handover".into(),
+            json!({"client_request_id":"designate-current-repair-manager","client_id":current_manager.client_id}),
+        )
+        .await
+        .unwrap();
+    let second_transfer = owner
+        .store
+        .call(
+            current_manager.clone(),
+            "automation.config.transfer".into(),
+            json!({
+                "client_request_id":"transfer-repair-to-current-manager",
+                "project_id":project_id,
+                "former_owner_manager_id":decision_manager.client_id,
+                "automation_id":automation_id,
+                "expected_revision":first_transfer["new_owner_revision"]
+            }),
+        )
+        .await
+        .unwrap();
+    let second_transfer_id = second_transfer["transfer_operation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        second_transfer["new_owner_manager_id"],
+        current_manager.client_id
+    );
+
+    let first = consume_repair_result_for_entry(
+        &owner.store,
+        &current_manager.client_id,
+        project_id,
+        automation_id,
+        &assignment_id,
+        &result_operation_id,
+    )
+    .await
+    .unwrap();
+    assert_eq!(first["status"], "pending");
+    let second = consume_repair_result_for_entry(
+        &owner.store,
+        &current_manager.client_id,
+        project_id,
+        automation_id,
+        &assignment_id,
+        &result_operation_id,
+    )
+    .await
+    .unwrap();
+    assert_eq!(second["status"], "pending");
+    assert_eq!(second["delivery_verified"], false);
+
+    let operation_id = owner
+        .store
+        .run({
+            let assignment_id = assignment_id.clone();
+            let result_operation_id = result_operation_id.clone();
+            move |db| {
+                Ok(db.query_row(
+                    "SELECT operation_id FROM operations WHERE method='agent.send' \
+                     AND json_extract(effective_request_json,'$.automation_on_behalf.cause.review_assignment_id')=?1 \
+                     AND json_extract(effective_request_json,'$.automation_on_behalf.cause.review_result_operation_id')=?2 \
+                     ORDER BY created_at_ms,operation_id LIMIT 1",
+                    params![assignment_id, result_operation_id],
+                    |row| row.get::<_, String>(0),
+                )?)
+            }
+        })
+        .await
+        .unwrap();
+
+    let observed = owner
+        .store
+        .run({
+            let operation_id = operation_id.clone();
+            let attempt_id = subject.attempt_id.clone();
+            let assignment_id = assignment_id.clone();
+            let result_operation_id = result_operation_id.clone();
+            move |db| {
+                let row: (String, String, String, String, String) = db.query_row(
+                    "SELECT caller_id,client_request_id,state,effective_request_json,original_request_json FROM operations WHERE operation_id=?1 AND method='agent.send'",
+                    [&operation_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                )?;
+                let effective: Value = serde_json::from_str(&row.3)?;
+                let original: Value = serde_json::from_str(&row.4)?;
+                let duplicate_count: i64 = db.query_row(
+                    "SELECT COUNT(*) FROM operations WHERE method='agent.send' \
+                     AND json_extract(effective_request_json,'$.automation_on_behalf.cause.review_assignment_id')=?1 \
+                     AND json_extract(effective_request_json,'$.automation_on_behalf.cause.review_result_operation_id')=?2",
+                    params![assignment_id, result_operation_id],
+                    |row| row.get(0),
+                )?;
+                let attempt = tasks::get_attempt(db, &attempt_id)?;
+                let link = super::automation_repair::operation_link(db, &operation_id)?
+                    .ok_or_else(|| Error::new("NOT_FOUND", "retained RepairDispatch link"))?;
+                let current_gm_epoch: i64 = db.query_row(
+                    "SELECT json_extract(value_json,'$.epoch') FROM meta WHERE key='gm'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                Ok((
+                    row,
+                    effective,
+                    original,
+                    duplicate_count,
+                    attempt,
+                    serde_json::to_value(link)?,
+                    current_gm_epoch,
+                ))
+            }
+        })
+        .await
+        .unwrap();
+    let (operation_row, effective, original, duplicate_count, attempt, link, captured_gm_epoch) =
+        observed;
+    assert_eq!(
+        operation_row.0,
+        crate::automation::authorization::AUTOMATION_TECHNICAL_REQUESTER_ID
+    );
+    assert_eq!(operation_row.2, "queued");
+    assert_eq!(duplicate_count, 1);
+    assert_eq!(original["binding_id"], binding_id);
+    assert_eq!(original["generation"], 1);
+    assert_eq!(original["delivery"], "next_turn");
+    assert_eq!(
+        effective["automation_on_behalf"]["effective_manager_id"],
+        current_manager.client_id
+    );
+    let cause = &effective["automation_on_behalf"]["cause"];
+    assert_eq!(operation_row.1, cause["semantic_slot_id"]);
+    assert_eq!(cause["source_attempt_owner_id"], source_owner.client_id);
+    assert_eq!(
+        cause["review_assignment_sponsor_id"],
+        source_owner.client_id
+    );
+    assert_eq!(cause["decision_manager_id"], decision_manager.client_id);
+    assert_eq!(
+        cause["transfer_operation_ids"],
+        json!([first_transfer_id, second_transfer_id])
+    );
+    assert_eq!(cause["transferred_gm_epoch"], captured_gm_epoch);
+    assert_eq!(link["captured_transfer_gm_epoch"], captured_gm_epoch);
+    assert_eq!(link["effective_manager_id"], current_manager.client_id);
+    assert_eq!(link["binding_id"], binding_id);
+    assert_eq!(link["binding_generation"], 1);
+    assert_eq!(link["cause"], cause.clone());
+    assert_eq!(attempt["owner_id"], source_owner.client_id);
+    assert_eq!(attempt["binding_id"], binding_id);
+    assert_eq!(attempt["binding_generation"], 1);
+    assert_eq!(attempt["state"], "needs_correction");
+
+    let admitted_effect = owner
+        .store
+        .run({
+            let operation_id = operation_id.clone();
+            move |db| {
+                let context =
+                    super::automation_repair::context_for_delivery_operation(db, &operation_id)?;
+                context.require_current_for_effect(db, &operation_id)
+            }
+        })
+        .await;
+    assert!(admitted_effect.is_ok());
+
+    owner
+        .store
+        .call(
+            operator.clone(),
+            "gm.handover".into(),
+            json!({"client_request_id":"temporarily-remove-repair-manager","client_id":decision_manager.client_id}),
+        )
+        .await
+        .unwrap();
+    owner
+        .store
+        .call(
+            operator,
+            "gm.handover".into(),
+            json!({"client_request_id":"restore-repair-manager","client_id":current_manager.client_id}),
+        )
+        .await
+        .unwrap();
+
+    let renewed_gm_epoch = owner
+        .store
+        .run(|db| {
+            Ok(db.query_row(
+                "SELECT json_extract(value_json,'$.epoch') FROM meta WHERE key='gm'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert!(renewed_gm_epoch > captured_gm_epoch);
+    let stale_effect = owner
+        .store
+        .run({
+            let operation_id = operation_id.clone();
+            move |db| {
+                let context =
+                    super::automation_repair::context_for_delivery_operation(db, &operation_id)?;
+                context.require_current_for_effect(db, &operation_id)
+            }
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(stale_effect.code, "AUTOMATION_TRANSFER_SCOPE");
+
+    let retained_operation = owner
+        .store
+        .run({
+            let operation_id = operation_id.clone();
+            let slot_id = cause["semantic_slot_id"].as_str().unwrap().to_owned();
+            move |db| {
+                let state: String = db.query_row(
+                    "SELECT state FROM operations WHERE operation_id=?1 AND method='agent.send'",
+                    [&operation_id],
+                    |row| row.get(0),
+                )?;
+                let count: i64 = db.query_row(
+                    "SELECT COUNT(*) FROM operations WHERE method='agent.send' AND client_request_id=?1",
+                    [&slot_id],
+                    |row| row.get(0),
+                )?;
+                Ok((state, count))
+            }
+        })
+        .await
+        .unwrap();
+    assert_eq!(retained_operation, ("queued".to_owned(), 1));
 
     owner.close().await.unwrap();
     std::fs::remove_dir_all(directory).unwrap();

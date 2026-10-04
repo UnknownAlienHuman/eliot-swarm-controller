@@ -1256,7 +1256,9 @@ impl WorkDispatchContext {
         require_new_work_enabled(db)?;
         let current_attempt_id: Option<String> = db
             .query_row(
-                "SELECT current_attempt_id FROM tasks WHERE task_id=?1",
+                "SELECT (SELECT a.attempt_id FROM attempts AS a \
+                         WHERE a.task_id=t.task_id AND a.released_at_ms IS NULL) \
+                 FROM tasks AS t WHERE t.task_id=?1",
                 [task_id],
                 |row| row.get(0),
             )
