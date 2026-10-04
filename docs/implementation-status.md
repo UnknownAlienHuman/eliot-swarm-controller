@@ -2,32 +2,46 @@
 
 ## Current state
 
-### Current-manager error delivery and interrupted-start readback — 2026-10-04
+### Latest qualified source and C27 terminal outcome — 2026-10-04
 
-Current-manager `operation.get` now includes `native_mcp_tools_readback` for
-the exact launch. It exposes validated C8 error code, stage and recorded time,
-plus scheduler state, retry time, failure count and scheduler-only error code.
-Malformed optional metadata returns a safe corruption marker while preserving
-the Operation. Private paths, configuration, schemas, proof and credentials
-are omitted. Reading historical diagnostics does not require the former
-Manager's grant or chat.
-
-A start that remains unknown without process proof or a terminal diagnostic
-can produce a readback action after a validated host interruption. Its timestamp
-must predate both the interruption and the current host start. The action links
-the exact admitted launch/open pair, reports the effect as unknown and grants
-no retry. Preflight source checks now retain distinct bounded codes for the
-existing module, entry, inventory, plugin and configuration predicates.
-
+Source `60398688823c07c9d796bc1df6dd5b7c3e2abf6a` is published on main.
 Final gate `211c07a6-a6be-4fe2-85a6-84ddbbd46ec5` passed formatting, the
 corrected C8 Store regression and debug build with unchanged source. Strict
 production Clippy and six other successful Manager regressions are retained
 from `d2102fff-eded-40b8-962c-f9bda23ae425` by exact source equivalence; only
-the test fixture changed to respect SQLite's JSON constraint. Seven distinct
-regressions passed. Independent Luna reviews passed. Candidate SHA-256:
+the test fixture changed. Seven distinct regressions passed across those gates.
+Independent Luna review passed. The
+qualified candidate SHA-256 is
 `62564B7EB8DD574A39AF6284422504BA97E13A525DD9B28970975696936063E7`.
-Fresh C26 qualification and this increment's full CI remain pending. Native
-MCP proof and hosted Bunny execution remain unqualified.
+Full Windows and remote Ubuntu CI [37228196378](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37228196378)
+passed, verified on 2026-10-04.
+
+Current-manager `operation.get` includes `native_mcp_tools_readback` for the
+exact launch, exposing validated failure code, stage and time plus scheduler
+state. Historical diagnostics omit private paths, configuration, schemas,
+proof and credentials, and remain readable after Manager handover. A
+readback-only action for an interrupted unknown start grants no retry.
+
+C27 run `b967289b-c085-48f0-9464-d882b2a1213c` ended at
+`native_mcp_tools_manager_readback` (`exec1819`, exit 1). Its actual retained C8
+failure was `NATIVE_MCP_PROOF_PLUGIN_MISSING` at `challenge_preflight`, recorded
+at `1791143831520`, after `agent.open` at `1791143730468` and first-ready at
+`1791143749914`; no challenge effect was reserved. The corrected harness
+validated the exact current-Manager C8 readback (1 valid, 0 failed), C7
+readbacks (2 valid, 0 failed), and six runtime snapshots (zero failures or
+gaps). It produced no corruption or private-read error. This closes live error
+delivery for this exact C8 failure, but native MCP proof and model execution
+remain unqualified. C15 and C8 are auditing the plugin registration/loader
+cause; no production root cause or fix is claimed. Preserve the consumed C27
+claim without replay.
+
+C26's earlier projection mismatch was a harness alias-collision defect, not a
+product diagnosis: aliases generated from `assignment_type`,
+`last_error_type` and `challenge_type` were checked as extracted values rather
+than JSON type aliases. The corrected C27 parser did not reproduce that error.
+The installed controller and active Codex/OpenCodex remain unchanged; local
+Linux, WSL and local models remain deferred. The project remains
+**PARTIAL_PROGRESS**.
 
 ### Previous qualified source and C25 evidence — 2026-10-04
 
@@ -47,8 +61,8 @@ C8 then recorded `NATIVE_MCP_PROOF_SOURCE` at `challenge_preflight`, before
 effect reservation. The participant was installed, registered and connected;
 the challenge was prepared, but no effect was reserved and tool readback
 remained null. The exact failed predicate is unproven because the source merged
-multiple guards and did not retain the native response. At the C25 source, the C8 safe error was
-not visible through current-manager `operation.get` or
+multiple guards and did not retain the native response. At the C25 source, the
+C8 safe error was not visible through current-manager `operation.get` or
 `swarm.exceptions.get`. No native MCP proof or model call occurred; preserve
 the consumed run without replay.
 
@@ -56,10 +70,10 @@ The increment above adds the current-manager C8 projection, precise source
 codes and interrupted-start readback action. It does not invent a crash cause,
 write a new native observation or replay an effect. The action retains exact
 binding references and current-GM authority independently of the former chat.
-C26 is preparing a fresh
-safe-error watch. C24 hosted Bunny remains frozen private preparation and must
-not execute before full native MCP proof. The project remains
-**PARTIAL_PROGRESS**. The installed `C4A28DA` controller and running
+The C26 harness defect and C27 terminal result are recorded in the latest
+checkpoint above. C24 hosted Bunny remains frozen private preparation and must
+not execute before full native MCP proof. The project remains **PARTIAL_PROGRESS**.
+The installed `C4A28DA` controller and running
 Codex/OpenCodex remain unchanged; local Linux, WSL and local models remain
 deferred.
 

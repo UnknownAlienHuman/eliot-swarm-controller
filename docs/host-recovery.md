@@ -65,14 +65,39 @@ The source-qualified increment adds the bounded `native_mcp_tools_readback` oper
 projection, precise closed source-guard codes, and a readback-only action for
 admitted launches whose unknown start predates a validated interruption and the
 current host start. Formatting, strict production Clippy, seven distinct Manager
-regressions, build and independent review passed as recorded in
-`implementation-status.md`. The action preserves exact binding references and
-current-GM authority independently of the previous chat. It reports an unresolved
-reservation and does not establish which process started, create a terminal
-observation or authorize retry. C8 diagnostics include scheduler-only safe codes;
-corrupt optional metadata produces a safe gap without hiding the original
-Operation. C26 is preparing a fresh safe-error watch, and C24 hosted Bunny
-remains private preparation until full native MCP proof exists.
+regressions, build, full Windows/Ubuntu CI and independent review passed as
+recorded in `implementation-status.md`. The action preserves exact binding
+references and current-GM authority independently of the previous chat. It
+reports an unresolved reservation and does not establish which process started,
+create a terminal observation or authorize retry. C8 diagnostics include
+scheduler-only safe codes; corrupt optional metadata produces a safe gap without
+hiding the original Operation.
+
+C26's manager-readback harness ended in phase
+`native_mcp_tools_manager_readback` with `NATIVE_MCP_TOOLS_MANAGER_READBACK_REQUIRED`
+after classifying one public C8 readback as
+`MANAGER_NATIVE_MCP_TOOLS_PROJECTION_MISMATCH` (zero valid, one failed). Three
+independent read-only reviews found a harness alias collision: schema names
+`assignment_type`, `last_error_type` and `challenge_type` generated `*_type_type`
+JSON type aliases, while the harness inspected extracted object/null values.
+The underlying C8 state was valid/running with no persisted error and no effect
+reserved. C26 did not validate the public projection and established no
+production source-guard diagnosis. The corrected C27 parser did not reproduce
+the corruption/private-read error. Preserve the consumed C26 claim without
+replay.
+
+C27 run `b967289b-c085-48f0-9464-d882b2a1213c` ended at
+`native_mcp_tools_manager_readback` (`exec1819`, exit 1). The exact retained C8
+failure was `NATIVE_MCP_PROOF_PLUGIN_MISSING` at `challenge_preflight`, recorded
+at `1791143831520`, after open at `1791143730468` and first-ready at
+`1791143749914`; no challenge effect was reserved. The corrected harness
+validated the exact current-Manager C8 readback (1 valid, 0 failed), C7
+readbacks (2 valid, 0 failed), and six successful runtime snapshots (zero
+failures or gaps). This proves current-Manager error delivery for this exact
+failure, but not native MCP proof or model execution. C15 and C8 are auditing
+the plugin registration/loader cause; no production cause or fix is claimed.
+Preserve the consumed C27 claim without replay. C24 hosted Bunny remains private
+preparation until full native MCP proof exists.
 
 An OpenCode snapshot requires a validated root-session read. Its independent
 optional read axes share a bounded deadline inside the existing whole-snapshot
