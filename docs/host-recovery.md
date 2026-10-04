@@ -12,4 +12,20 @@ Owned OpenCode startup failures are persisted separately with their exact launch
 
 After an owned service is observed, an error selecting its exact queued `agent.open` is retained separately as `runtime_dispatch_action_required` on the same read APIs. A deterministic opening-actor validation error rejects the queued operation before command admission. Ordinary idle and prerequisite waits remain waits. The diagnostic retains only the error code, stage and exact operation references, survives manager handover and service departure, and does not replace the launch admission receipt. `not_dispatched` describes the specific open command only when its retained state and absent send timestamp prove that boundary. A later send or native rejection keeps the outcome unknown. Readback never authorizes an automatic retry.
 
+An OpenCode `agent.reconcile` whose retained target cannot be loaded records an
+unknown outcome with the safe error code and `reconcile_target_load` stage in
+its Operation result. It does not claim that native readback ran, settle the
+reconcile request, or replay the original input. A completed readback can still
+report `resolved: false`; that describes the actual read attempt and leaves the
+original target unresolved.
+
+`agent.state.observation.latest_native_failure` retains the latest safe native
+connection or snapshot failure as `code` and `recorded_at_ms`. A later successful
+connection check, snapshot, disconnect or host restart does not erase it. The
+current `connection` and `native_transport_error` fields still describe current
+transport status; historical failure does not block work or establish readiness.
+Managers receive only the validated code and timestamp. Damaged optional history
+produces `NATIVE_FAILURE_DIAGNOSTIC_CORRUPT` without a fabricated timestamp and
+does not hide the rest of the binding state.
+
 Implementation qualification is recorded in `docs/implementation-status.md`. These receipts do not introduce an automatic host restart, a model call or a new daemon.

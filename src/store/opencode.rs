@@ -315,6 +315,65 @@ impl Store {
             .send_modify(|revision| *revision = revision.wrapping_add(1));
         Ok(())
     }
+
+    async fn oc_reconcile_outcome(
+        &self,
+        p: &Principal,
+        service: &Service,
+        binding_options: &Options,
+        command: &RuntimeCommand,
+    ) -> RuntimeOutcome {
+        let target_id = command.input["operation_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        let config = self.config.clone();
+        let principal = p.clone();
+        let target = self
+            .run(move |db| original_with_config(db, &principal, &target_id, &config))
+            .await;
+        let resolved = match target {
+            Ok(target) if target.method == "agent.result" => {
+                self.oc_result_outcome(p, service, binding_options, &target)
+                    .await
+            }
+            Ok(target) => {
+                let result = service.reconcile(&target, binding_options).await;
+                let resolved = matches!(result.outcome, EffectOutcome::Applied);
+                self.record_oc_outcome(p, result).await.is_ok() && resolved
+            }
+            Err(error) => {
+                return RuntimeOutcome {
+                    operation_id: command.operation_id.clone(),
+                    outcome: EffectOutcome::Unknown,
+                    native_root_id: command.native_root_id.clone(),
+                    native_scope_key: Some(binding_options.scope()),
+                    turn_id: None,
+                    native_input_id: None,
+                    details: json!({
+                        "stage":"reconcile_target_load",
+                        "code":safe_runtime_error_code(&error.code)
+                            .unwrap_or("NATIVE_RECONCILE_TARGET_LOAD_FAILED"),
+                        "replayed_native_input":false
+                    }),
+                };
+            }
+        };
+        RuntimeOutcome {
+            operation_id: command.operation_id.clone(),
+            outcome: EffectOutcome::Applied,
+            native_root_id: command.native_root_id.clone(),
+            native_scope_key: Some(binding_options.scope()),
+            turn_id: None,
+            native_input_id: None,
+            details: json!({
+                "completion_condition":"readback_attempted",
+                "resolved":resolved,
+                "replayed_native_input":false
+            }),
+        }
+    }
+
     async fn oc_connection(
         &self,
         p: &Principal,
@@ -323,10 +382,27 @@ impl Store {
     ) -> Result<()> {
         let p = p.clone();
         let detail = error.map(oc::diagnostic).unwrap_or(Value::Null);
+        let failure_code = error.map(|error| {
+            safe_runtime_error_code(&error.code)
+                .unwrap_or("NATIVE_CONNECTION_FAILURE")
+                .to_owned()
+        });
         self.run(move|db|{
             let (id,generation,_)=runtime::scope(db,&p,true)?;
-            db.execute("UPDATE bindings SET state=CASE WHEN NOT ?3 AND state='ready' THEN 'reconciling' ELSE state END,state_json=json_set(state_json,'$.connection',?4,'$.native_transport_error',json(?5)) WHERE binding_id=?1 AND generation=?2",
-                params![id,generation,connected,if connected{"connected"}else{"native_unavailable"},model::canonical(&detail)?])?;Ok(())
+            let connection = if connected {"connected"} else {"native_unavailable"};
+            let native_transport_error = model::canonical(&detail)?;
+            if let Some(code) = failure_code {
+                let latest_native_failure = model::canonical(&json!({
+                    "code":code,
+                    "recorded_at_ms":model::now_ms()?
+                }))?;
+                db.execute("UPDATE bindings SET state=CASE WHEN NOT ?3 AND state='ready' THEN 'reconciling' ELSE state END,state_json=json_set(state_json,'$.connection',?4,'$.native_transport_error',json(?5),'$.latest_native_failure',json(?6)) WHERE binding_id=?1 AND generation=?2",
+                    params![id,generation,connected,connection,native_transport_error,latest_native_failure])?;
+            } else {
+                db.execute("UPDATE bindings SET state=CASE WHEN NOT ?3 AND state='ready' THEN 'reconciling' ELSE state END,state_json=json_set(state_json,'$.connection',?4,'$.native_transport_error',json(?5)) WHERE binding_id=?1 AND generation=?2",
+                    params![id,generation,connected,connection,native_transport_error])?;
+            }
+            Ok(())
         }).await
     }
     async fn oc_snapshot(
@@ -597,36 +673,8 @@ impl Store {
                     },
                 }
             } else if command.method == "agent.reconcile" {
-                let target_id = command.input["operation_id"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_owned();
-                let config = self.config.clone();
-                let principal = p.clone();
-                let target = self
-                    .run(move |db| original_with_config(db, &principal, &target_id, &config))
-                    .await;
-                let resolved = if let Ok(target) = target {
-                    if target.method == "agent.result" {
-                        self.oc_result_outcome(p, service, &binding_options, &target)
-                            .await
-                    } else {
-                        let result = service.reconcile(&target, &binding_options).await;
-                        let resolved = matches!(result.outcome, EffectOutcome::Applied);
-                        self.record_oc_outcome(p, result).await.is_ok() && resolved
-                    }
-                } else {
-                    false
-                };
-                RuntimeOutcome {
-                    operation_id: command.operation_id.clone(),
-                    outcome: EffectOutcome::Applied,
-                    native_root_id: command.native_root_id.clone(),
-                    native_scope_key: Some(binding_options.scope()),
-                    turn_id: None,
-                    native_input_id: None,
-                    details: json!({"completion_condition":"readback_attempted","resolved":resolved,"replayed_native_input":false}),
-                }
+                self.oc_reconcile_outcome(p, service, &binding_options, &command)
+                    .await
             } else {
                 service.execute(&command, &binding_options).await
             };
@@ -906,3 +954,7 @@ fn safe_runtime_error_code(code: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "opencode/reconcile_failure_tests.rs"]
+mod reconcile_failure_tests;

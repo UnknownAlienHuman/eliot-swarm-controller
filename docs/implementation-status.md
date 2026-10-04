@@ -36,7 +36,33 @@ production Clippy, the actor regression, the real-Store WorkDispatch regression
 and debug build passed on unchanged source on 2026-10-04. Independent Luna
 review found no authority regression. The resulting debug candidate SHA-256 is
 `FB792948EF9908D34CBC0F9CC7A03FF17D495EA0E11E10D20A753ADD42236298`.
-Fresh C19 native startup qualification remains pending.
+Full Windows and remote Ubuntu CI for source
+`6ba14b9a56f1de653fcbdb3fe0c9427fba180c81`
+[37213706029](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37213706029)
+passed, verified on 2026-10-04.
+C19 run `0dbbc8c9-e5d5-454d-b4e2-fe21342651de` confirmed the Direct
+`agent.open` as settled/applied with `native_session_created`. The owned service
+and native session were observed, but native MCP tool proof was not observed
+before `OWNED_SERVICE_OR_NATIVE_PROOF_TIMEOUT` at `service_start`. No model call
+occurred. This qualifies session creation, while native capability and the full
+launch remain unqualified. Preserve the consumed run without replay; the missing
+MCP proof is being investigated.
+
+The subsequent reliability increment prevents a failed
+OpenCode reconcile target load from claiming completed native readback, and
+retains manager-visible `latest_native_failure` history across connection checks
+and shutdown. C19 proved that transport status updates could erase the exact
+snapshot failure before later inspection. Package formatting, strict production
+Clippy, two actual Store/Manager failure regressions, the existing shared-reader
+host-recovery regression and debug build passed on unchanged source on
+2026-10-04. The candidate SHA-256 is
+`243FFA9571BDF69FAB496F064F4C941713C31C7C1800A7F5C1EFA6CAA1B78A6B`.
+The initial fixture gates exposed a retained Store sender preventing test
+shutdown and a completed JoinHandle being polled twice; both were corrected in
+test code. Production stayed unchanged after the successful Clippy gate.
+Independent Luna review found no actionable issue in the failure-history
+projection. Fresh C20 native diagnostic qualification is pending; this source
+is not covered by the CI run above.
 
 The previous core increment is `3c1a93b476fc31a4d60345fcac627291e9fe4e54`.
 Full Windows and Ubuntu CI for that source

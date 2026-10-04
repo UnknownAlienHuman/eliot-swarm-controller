@@ -1232,6 +1232,20 @@ fn public_observation(value: &Value) -> Value {
     if let Some(model) = value.get("model").and_then(public_model) {
         observation.insert("model".to_owned(), model);
     }
+    if let Some(failure) = value.get("latest_native_failure").filter(|v| !v.is_null()) {
+        let projected = match (
+            failure["code"].as_str(),
+            failure["recorded_at_ms"]
+                .as_i64()
+                .filter(|value| *value > 0),
+        ) {
+            (Some(code), Some(recorded_at_ms)) if safe_start_failure_error_code(code) => {
+                json!({"code":code,"recorded_at_ms":recorded_at_ms})
+            }
+            _ => json!({"code":"NATIVE_FAILURE_DIAGNOSTIC_CORRUPT"}),
+        };
+        observation.insert("latest_native_failure".to_owned(), projected);
+    }
     for key in ["opening_evidence", "first_dispatch_adoption"] {
         if let Some(details) = value.get(key) {
             observation.insert(key.to_owned(), public_receipt(details));
