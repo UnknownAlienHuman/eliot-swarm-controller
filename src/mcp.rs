@@ -2853,6 +2853,7 @@ mod tests {
             "task.claim",
             "task.dispatch",
             "task.submit",
+            "task.submit.recover",
             "task.request_changes",
             "task.accept",
             "forge.publish_ref",
