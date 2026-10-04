@@ -42,6 +42,227 @@ pub(crate) struct CronExecutionContext {
     cause: AutomationCause,
 }
 
+/// A direct Manager invocation of an entry's saved CheckRun action. Unlike a
+/// CronExecutionContext this carries no calendar generation or due slot and
+/// deliberately does not require `entry.enabled`.
+#[derive(Debug, Clone)]
+pub(crate) struct ManualCheckRunContext {
+    entry: config::AutomationEntry,
+    manager_id: String,
+    check_request_id: String,
+}
+
+type ManualCheckRunSubjectRow = (
+    String,
+    i64,
+    Option<i64>,
+    String,
+    String,
+    i64,
+    Option<String>,
+);
+
+pub(crate) fn manual_run_now_check_request_id(
+    manager_id: &str,
+    client_request_id: &str,
+    project_id: &str,
+    automation_id: &str,
+) -> Result<String> {
+    let identity = json!({
+        "schema_version":1,
+        "method":"schedule.run_now",
+        "manager_id":manager_id,
+        "client_request_id":client_request_id,
+        "project_id":project_id,
+        "automation_id":automation_id,
+    });
+    Ok(format!(
+        "manual-{}",
+        model::digest(model::canonical(&identity)?.as_bytes())
+    ))
+}
+
+impl ManualCheckRunContext {
+    pub(crate) fn from_committed_entry(
+        db: &Connection,
+        principal: &Principal,
+        project_id: &str,
+        automation_id: &str,
+        client_request_id: &str,
+    ) -> Result<Self> {
+        if principal.role != Role::Manager {
+            return Err(Error::new(
+                "FORBIDDEN",
+                "schedule.run_now requires the owning Manager",
+            ));
+        }
+        require_registered_manager(db, &principal.client_id)?;
+        let entry = config::load_entry(db, &principal.client_id, project_id, automation_id)?
+            .ok_or_else(|| Error::new("AUTOMATION_NOT_FOUND", "automation entry was not found"))?;
+        config::validate_entry(&entry)?;
+        if !manual_check_run_selected(&entry) {
+            return Err(Error::new(
+                "AUTOMATION_ACTION_UNAVAILABLE",
+                "entry has no supported saved CheckRun action",
+            ));
+        }
+        let context = Self {
+            check_request_id: manual_run_now_check_request_id(
+                &principal.client_id,
+                client_request_id,
+                project_id,
+                automation_id,
+            )?,
+            manager_id: principal.client_id.clone(),
+            entry,
+        };
+        context.require_current_check_target(db, principal)?;
+        Ok(context)
+    }
+
+    pub(crate) fn request_params(&self) -> Result<Value> {
+        let settings = self.entry.cron.as_ref().ok_or_else(|| {
+            Error::new(
+                "AUTOMATION_ACTION_UNAVAILABLE",
+                "saved CheckRun settings are missing",
+            )
+        })?;
+        match &settings.action {
+            crate::scheduler::ScheduleAction::CheckRun {
+                attempt_id,
+                candidate_ref,
+                profile_id,
+                profile_revision,
+                ..
+            } => Ok(json!({
+                "client_request_id":self.check_request_id,
+                "attempt_id":attempt_id,
+                "candidate_ref":candidate_ref,
+                "profile_id":profile_id,
+                "profile_revision":profile_revision,
+            })),
+        }
+    }
+
+    /// Recheck the exact saved action and pinned source target before the
+    /// normal direct `check.run` grant and reservation checks execute.
+    pub(crate) fn require_current_check_target(
+        &self,
+        db: &Connection,
+        principal: &Principal,
+    ) -> Result<()> {
+        if principal.role != Role::Manager || principal.client_id != self.manager_id {
+            return Err(Error::new(
+                "FORBIDDEN",
+                "manual CheckRun actor is not the authenticated automation owner",
+            ));
+        }
+        let current = config::load_entry(
+            db,
+            &self.manager_id,
+            &self.entry.project_id,
+            &self.entry.automation_id,
+        )?
+        .ok_or_else(|| Error::new("FORBIDDEN", "owning automation was removed"))?;
+        if current != self.entry || !manual_check_run_selected(&current) {
+            return Err(Error::new(
+                "AUTOMATION_ACTION_CHANGED",
+                "current automation no longer has this exact manual CheckRun action",
+            ));
+        }
+        require_registered_manager(db, &self.manager_id)?;
+        let crate::scheduler::ScheduleAction::CheckRun {
+            attempt_id,
+            expected_task_revision,
+            candidate_ref,
+            ..
+        } = &current
+            .cron
+            .as_ref()
+            .expect("selected CheckRun has settings")
+            .action;
+        let subject: Option<ManualCheckRunSubjectRow> = db
+            .query_row(
+                "SELECT a.task_id,a.task_revision,a.released_at_ms,t.project_id,t.state,t.revision,\
+                        (SELECT active.attempt_id FROM attempts AS active \
+                         WHERE active.task_id=t.task_id AND active.released_at_ms IS NULL) \
+                 FROM attempts AS a JOIN tasks AS t ON t.task_id=a.task_id \
+                 WHERE a.attempt_id=?1",
+                [attempt_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            task_id,
+            attempt_revision,
+            released_at_ms,
+            project_id,
+            task_state,
+            task_revision,
+            current_attempt,
+        )) = subject
+        else {
+            return Err(Error::new(
+                "AUTOMATION_ATTEMPT_STALE",
+                "manual CheckRun Attempt was not found",
+            ));
+        };
+        if attempt_revision != *expected_task_revision
+            || task_revision != *expected_task_revision
+            || current_attempt.as_deref() != Some(attempt_id.as_str())
+            || released_at_ms.is_some()
+            || task_state != "open"
+            || project_id != current.project_id
+        {
+            return Err(Error::new(
+                "AUTOMATION_ATTEMPT_STALE",
+                "manual CheckRun no longer targets the exact current open Attempt revision",
+            ));
+        }
+        let artifact: Option<(String, String)> = db
+            .query_row(
+                "SELECT kind,metadata_json FROM artifacts WHERE artifact_id=?1",
+                [candidate_ref],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((kind, metadata_json)) = artifact else {
+            return Err(Error::new(
+                "CHECK_SOURCE_REQUIRED",
+                "manual CheckRun source snapshot is not registered",
+            ));
+        };
+        let metadata: Value = serde_json::from_str(&metadata_json)?;
+        if kind != "source_snapshot"
+            || metadata["task_id"] != task_id
+            || metadata["attempt_id"] != *attempt_id
+            || metadata["task_revision"] != *expected_task_revision
+        {
+            return Err(Error::new(
+                "CHECK_SOURCE_REQUIRED",
+                "manual CheckRun source does not match the exact current Attempt",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn manual_check_run_selected(entry: &config::AutomationEntry) -> bool {
+    entry.steps.contains(&AutomationStep::CheckRun)
+        && entry.cron.is_some()
+        && entry.scope.work_pool_id.is_none()
+}
+
 struct CurrentReviewSubject {
     owner_id: String,
     task_id: String,

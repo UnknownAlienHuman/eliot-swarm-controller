@@ -773,6 +773,12 @@ static TOOLS: &[(bool, ToolSpec)] = &[
         &["project_id", "changes"],
     ),
     mutation(
+        "schedule.run_now",
+        "Run the authenticated Manager's saved CheckRun action once without enabling recurrence. Supply the same client_request_id to read back this manual invocation.",
+        &[f("project_id", S), f("automation_id", S)],
+        &["project_id", "automation_id"],
+    ),
+    mutation(
         "automation.config.transfer",
         "Transfer one former-manager automation to the current GM while preserving its cursors and pending operations. Requires current GM or local Operator authority and the exact source revision.",
         &[
@@ -1420,7 +1426,7 @@ fn input_schema(spec: &ToolSpec, read_only: bool, require_request_id: bool) -> A
             "client_request_id".to_string(),
             json!({
                 "type": "string",
-                "description": if require_request_id || spec.method == "swarm.launch" {
+                "description": if require_request_id || spec.method == "swarm.launch" || spec.method == "schedule.run_now" {
                     "Caller-owned stable logical request ID. Choose it before dispatch and reuse it to reconcile a lost reply; the server does not retry mutations."
                 } else {
                     "Caller-owned stable logical request ID. Reuse it to reconcile a lost reply; the local full compatibility profile generates one only when omitted and a result arrives."
@@ -1438,7 +1444,11 @@ fn input_schema(spec: &ToolSpec, read_only: bool, require_request_id: bool) -> A
         "additionalProperties": false,
     });
     let mut required = spec.required.to_vec();
-    if !read_only && (require_request_id || spec.method == "swarm.launch") {
+    if !read_only
+        && (require_request_id
+            || spec.method == "swarm.launch"
+            || spec.method == "schedule.run_now")
+    {
         required.push("client_request_id");
     }
     if !required.is_empty() {
@@ -1457,6 +1467,11 @@ fn refine_input_schema(method: &str, schema: &mut Value) {
     }
     let properties = &mut schema["properties"];
     match method {
+        "schedule.run_now" => {
+            properties["client_request_id"]["minLength"] = json!(1);
+            properties["client_request_id"]["maxLength"] = json!(128);
+            properties["client_request_id"]["pattern"] = json!("^\\S+$");
+        }
         "task.dispatch" => {
             properties["launch_operation_id"] = json!({
                 "type":"string",
@@ -3350,6 +3365,7 @@ mod tests {
             "review.submit",
             "automation.config.apply",
             "automation.config.transfer",
+            "schedule.run_now",
             "hook.source.get",
             "hook.source.revoke",
             "goal.create",
@@ -3376,11 +3392,11 @@ mod tests {
         .into_iter()
         .collect();
         assert_eq!(methods, expected);
-        assert_eq!(TOOLS.len(), 115);
+        assert_eq!(TOOLS.len(), 116);
         assert_eq!(TOOLS.iter().filter(|(read_only, _)| *read_only).count(), 54);
         assert_eq!(
             TOOLS.iter().filter(|(read_only, _)| !*read_only).count(),
-            61
+            62
         );
     }
 
@@ -3394,6 +3410,14 @@ mod tests {
                 assert!(schema["properties"].get("client_request_id").is_some());
             }
         }
+        let run_now = find_tool("schedule_run_now").unwrap();
+        let schema = input_schema(&run_now.1, run_now.0, false);
+        assert_eq!(
+            schema["required"],
+            json!(["project_id", "automation_id", "client_request_id"])
+        );
+        assert_eq!(schema["properties"]["client_request_id"]["minLength"], 1);
+        assert_eq!(schema["properties"]["client_request_id"]["maxLength"], 128);
         let send = find_tool("message_send").unwrap();
         let schema = input_schema(&send.1, send.0, false);
         for field in [

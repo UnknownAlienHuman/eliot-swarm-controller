@@ -42,6 +42,9 @@ mod results;
 mod review_disposition;
 mod reviews;
 mod runtime;
+mod schedule_run_now;
+#[cfg(test)]
+mod schedule_run_now_tests;
 mod schedules;
 mod scripts;
 mod status_reader;
@@ -719,6 +722,9 @@ impl Store {
         }
         if method == "check.run" {
             return self.check_run(principal, params).await;
+        }
+        if method == "schedule.run_now" {
+            return self.schedule_run_now(principal, params).await;
         }
         if method == "task.accept" {
             return self.accept_task(principal, params).await;

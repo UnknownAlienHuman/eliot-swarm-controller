@@ -2476,3 +2476,7 @@ async fn assigned_reviewer_can_record_and_read_only_the_historical_result_after_
     owner.close().await.unwrap();
     std::fs::remove_dir_all(directory).unwrap();
 }
+
+#[cfg(test)]
+#[path = "o7_repair_cycle_tests.rs"]
+mod o7_repair_cycle_tests;

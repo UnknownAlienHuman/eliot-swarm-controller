@@ -2,6 +2,37 @@
 
 ## Current state
 
+### Manual automation invocation and correction cycle — 2026-10-04
+
+`schedule.run_now` is implemented for the authenticated Manager's saved
+CheckRun action. Its closed request contains `client_request_id`, `project_id`
+and `automation_id`. The action uses normal CheckRun planning and admission,
+rechecks the exact saved entry and current Attempt/source in the committing
+transaction, and retains a durable manual invocation marker. The same request
+reads back its original receipt after the entry changes. Recurrence may stay
+disabled; the invocation neither creates a calendar occurrence nor advances
+cron cursors. Independent Luna production and regression reviews passed.
+
+One real-Store regression exercises disabled recurrence, one queued CheckRun,
+exact receipt replay after removing the selected step, unchanged cron state and
+foreign-Manager rejection. A second real-Store scenario creates one Task and
+Attempt, submits A, records its assigned review and return, submits correction B,
+records B's distinct passing review, rejects acceptance of stale A and accepts
+only B. Candidate artifacts are fixture inputs; submissions, reviews and
+acceptance use the actual Store handlers. Both Store scenarios passed. All 34
+distinct MCP checks passed across the final gates, including the new closed
+request and Manager/GM discovery contract. Strict production Clippy passed in
+`b515f416-e657-4e58-b096-831622840ec3`; subsequent changes corrected only test
+fixtures/contracts, with exact production equivalence checked. Final gate
+`cf1b8530-6ffc-44b1-ae24-4cabf208f64e` passed formatting, the corrected profile
+contract and build with unchanged source, retaining the two Store checks and
+33 other MCP passes. The new debug candidate SHA-256 is
+`A26E038B93A766E55FFA708B21F56213B4BD4A68678F6C3EE8A25825A6F205A0`.
+Full CI for this new Rust increment is pending publication; the activation-fix
+CI linked below proves its historical source only.
+These scenarios do not establish native correction delivery, checker execution
+or publication. Typed event rules and shared Goal progression remain incomplete.
+
 ### Plugin activation context correction — 2026-10-04
 
 The pinned plugin supervisor activates effects with Scope and logging services;
@@ -20,13 +51,23 @@ scoped native tool readback, invalid-scope rejection before MCP reads, and
 duplicate-arm deduplication. It preserves unknown context/provider/model state.
 CI now runs this regression with its existing pinned Bun runtime.
 
-All 188 other source pins from the previous gate and the debug binary are
-unchanged, retaining the Rust Clippy, tests and build results. Windows and remote
-Ubuntu CI [37233398047](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37233398047)
-passed for source `df61ae7010c71777deca5155a975c6e28eeeef3b`; that historical CI
-does not prove this new JavaScript increment. Fresh C29 native qualification is
-prepared, with no claim or run yet. Model execution remains unqualified and the
-project remains **PARTIAL_PROGRESS**.
+At activation-fix source `2f9e24136024da6654ec447762cc1b3c69f69e62`, all 188
+other source pins and the previous debug binary were unchanged. Exact-source
+Windows and remote Ubuntu CI
+[37235180822](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37235180822)
+passed Clippy, Rust tests, offline module checks and build, verified 2026-10-04.
+
+C29 run `4877b0e9-d11d-44cd-b81f-e4ac3dbdb9d2` ended once (`exec54614`, exit 1).
+Plugin identity, active server and source preflight passed. The first observed
+retained failure was `NATIVE_REJECTED` at `challenge`, after challenge effect
+reservation; later read-only recovery retained the same code at `tools_readback`.
+The outer `OWNED_SERVICE_OR_NATIVE_PROOF_TIMEOUT` at `service_start` does not
+identify the rejected RPC's cause. The raw rejection class/body was not retained,
+and bounded input metadata inspection found no proven field mismatch. The
+harness validated four current-Manager C7 readbacks but made no C8 Manager
+readback for this post-reservation code; it does not qualify C8 delivery for C29.
+Preserve the consumed claim and uncertain arm without replay. Native MCP proof
+and model execution remain unqualified; the project remains **PARTIAL_PROGRESS**.
 
 ### Windows plugin configuration path correction — 2026-10-04
 
@@ -53,7 +94,8 @@ server state did not pass. The current-Manager error projection validated once
 with zero failures or corruption; C7 readbacks validated twice with zero failures.
 The challenge remained prepared and no effect was reserved. Plugin activation
 is under a bounded source audit; the exact native error body was not retained.
-Preserve the consumed C28 claim without replay. C29 is fresh preparation only.
+Preserve the consumed C28 claim without replay. C29's terminal evidence is
+recorded above.
 
 The offline probe and source gate do not prove plugin activation, callable MCP
 tools or model execution. Hosted Bunny qualification follows successful native
@@ -608,7 +650,7 @@ and qualification follow it.
 
 3. **O2 durable intake and shared monitoring — Partial.** The dispatcher consumes bounded shared intake and journal readback for committed local controller/task.submission observations. Participant credential issuance, authenticated configured/connect readback, and C9 fresh-owned service lifecycle/readback are in the source path. Other source adapters are not admitted. C10 actual MCP schema and provider-auth gate are source-verified. Native OpenCode and end-to-end qualification remain partial; see Current State above for the latest evidence.
 
-4. **Productive launcher, workspace ownership and complete local O7 cycle — Partial.** Queue/context/overlap projections, launch preview, async lease, exact Task claim, agent.open, Participant context, WorkDispatch admission and C10 launch-linked task.dispatch gate are implemented. Native service capability remains unqualified. Workspace enforcement remains database-backed, with a separate retained-proof service-departure fence. Productive dispatch and the full candidate/review/return/correction/fresh-review/acceptance path remain unqualified.
+4. **Productive launcher, workspace ownership and complete local O7 cycle — Partial.** Queue/context/overlap projections, launch preview, async lease, exact Task claim, agent.open, Participant context, WorkDispatch admission and C10 launch-linked task.dispatch gate are implemented. The same-Task/Attempt Store return/correction/fresh-review/exact-B-acceptance chain now passes as recorded above. Native service capability and productive correction delivery remain unqualified. Workspace enforcement remains database-backed, with a separate retained-proof service-departure fence. Full native workflow and publication qualification remain.
 5. **O3 Rust adapters and provider lifecycle — Partial.** Rust OpenCode V2 and
    Zed paths exist alongside JavaScript/Python module bridges. C10 publishes the
    exact provider credential gate; `stored_unverified` denotes credential
@@ -633,8 +675,10 @@ and qualification follow it.
    Manager-owned calendar CheckRuns now share the legacy scheduler, entry
    enablement, durable occurrence identities, normal CheckRunner and explicit
    transfer/restart paths. The current source gates are recorded above.
-   Typed event rules, the manual run-now editor and shared Goal progression
-    remain. Task-scoped Goal reminders exist. OpenCode has a controller-recorded
+   Manual `schedule.run_now` admission with disabled recurrence now passes the
+   Store and MCP source checks recorded above. Typed event rules, remaining
+   editor/client parity and shared Goal progression remain. Task-scoped Goal
+   reminders exist. OpenCode has a controller-recorded
     Goal with one activation;
    native Goal APIs and shared manager-enabled progression remain incomplete.
 

@@ -71,6 +71,21 @@ fn profile_tables_are_closed_and_keep_gm_authority_separate() {
     ));
     assert!(profiles::allows_method(
         McpToolProfile::Manager,
+        "schedule.run_now"
+    ));
+    assert!(profiles::allows_method(
+        McpToolProfile::Gm,
+        "schedule.run_now"
+    ));
+    for profile in [
+        McpToolProfile::Observer,
+        McpToolProfile::Reviewer,
+        McpToolProfile::Participant,
+    ] {
+        assert!(!profiles::allows_method(profile, "schedule.run_now"));
+    }
+    assert!(profiles::allows_method(
+        McpToolProfile::Manager,
         "agent.background"
     ));
     assert!(profiles::allows_method(

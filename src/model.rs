@@ -642,6 +642,25 @@ pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
             crate::checks::model::CheckRequest::parse(params)?;
             return Ok(());
         }
+        "schedule.run_now" => {
+            fields(
+                params,
+                &["client_request_id", "project_id", "automation_id"],
+            )?;
+            let request_id = text(params, "client_request_id")?;
+            if request_id.len() > 128
+                || request_id
+                    .bytes()
+                    .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+            {
+                return Err(Error::invalid(
+                    "client_request_id must be 1..=128 bytes without whitespace",
+                ));
+            }
+            text(params, "project_id")?;
+            text(params, "automation_id")?;
+            return Ok(());
+        }
         "check.cancel" => &["client_request_id", "check_id", "reason"],
 
         "artifact.assemble" => &["client_request_id", "page_refs", "expected_sha256"],

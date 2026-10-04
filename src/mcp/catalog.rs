@@ -1320,6 +1320,17 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
         "One scoped entry explanation and bounded linked-work projection."
     ),
     entry!(
+        "schedule.run_now",
+        Schedules,
+        MANAGER_ONLY_AUDIENCES,
+        ManualOnly,
+        "Run the exact saved CheckRun action once without enabling its recurrence.",
+        "Use only for an explicit manual invocation of the authenticated Manager's selected CheckRun action; recurrence state and cron cursors are unchanged.",
+        &["schedule", "run now", "manual", "check", "cron"],
+        &["automation_id", "project_id", "client_request_id"],
+        "One normal durable CheckRun Operation under the Manager's current action rights."
+    ),
+    entry!(
         "coordination.participant.register",
         ParticipantCoordination,
         MANAGER_AUDIENCES,

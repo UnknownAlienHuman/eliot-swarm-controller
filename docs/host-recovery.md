@@ -118,8 +118,15 @@ The activation correction resolves the internal MCP service only inside the
 guarded `arm` RPC handler, where the pinned request location provides it, rather
 than during plugin activation. A controlled offline regression verifies bare
 activation, scoped native readback and rejection/deduplication before extra MCP
-reads. It does not establish live registration or model consumption; fresh C29
-qualification is still required.
+reads. C29 then passed plugin identity/active-server/source preflight but retained
+`NATIVE_REJECTED` at `challenge` after reserving the arm effect. Subsequent
+read-only recovery retained `NATIVE_REJECTED` at `tools_readback`. The outer
+startup timeout does not explain the RPC rejection, and the raw rejection class
+was not retained. C29's harness validated four C7 Manager readbacks but did not
+read this post-reservation failure through the Manager C8 projection. Neither
+native MCP proof nor model consumption is qualified. Preserve the consumed C29
+claim and uncertain arm without replay; further diagnosis does not authorize
+resending either.
 
 An OpenCode snapshot requires a validated root-session read. Its independent
 optional read axes share a bounded deadline inside the existing whole-snapshot
