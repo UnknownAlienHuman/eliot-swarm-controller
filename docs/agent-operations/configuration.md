@@ -1,6 +1,9 @@
 # Configuration — Automations Enabled by Their Manager
 
-Revision 8 · 2026-10-03 · WorkDispatch field schema follows `src/automation/config.rs` and `src/automation/work_dispatch.rs`; C8 source commit `a1577aee63094e6fcb3feea6fc6079d1a8454850`; fixture repair commit `7d518ef4edb84c5e8ce677fafa778de914abed30`. C8 source passed owned-crate formatting, warnings-denied Clippy (12.46 s), and the bounded StoreAPI regression (1/1; 0.06 s; build 35.09 s). C8 CI run `37157609062` failed in both OS jobs on three projection fixtures: the fixture database installed schema `001core` but omitted `002workspace`, so `workspace_leases` was absent. Fix commit `7d518ef4edb84c5e8ce677fafa778de914abed30` installs `002workspace`; the targeted projection filter passed 6/6 (0.05 s; build 37.36 s; `.local/qualification/r7-build-gate/projection-c8-ci-repaired.log`). Full Rust CI run `37158328828` passed all Ubuntu and Windows job steps for repair commit `7d518ef4edb84c5e8ce677fafa778de914abed30`, including formatting, Clippy, Rust application/protocol tests, native offline fixtures, and release build. C7 full Rust CI run `37153513585` remains historical evidence for exact CI commit `8570dae7f478b6dd2b604727b34c285a86ee9acc`.
+**Current C9 operator note:** Source 4218e7a4c67f5de244081d6e9dd37e2ee2e30544 is committed. The prior source passed formatting and production Clippy (11.95 s); the SQL-only repair passed formatting and the debug candidate build passed (35.85 s). Bounded exact-source Store-authority and runtime audits passed for 4218e7a. A previous native host passed workspace configuration but failed at the first Store tick; corrected acceptance and hosted CI remain pending. Unknown spawn outcomes remain no-replay. See [Implementation Status](../implementation-status.md) for audit digests.
+
+### Historical C7/C8 WorkDispatch qualification
+Historical C7/C8 CI details are in [Implementation Status](../implementation-status.md).
 
 [Architecture](architecture.md) owns execution; [Delivery](delivery.md) owns the shared work handlers.
 
@@ -115,8 +118,7 @@ below with values from the manager's current `runtime.catalog`. Use
 Task still goes through the canonical launcher preview and can wait on route,
 workspace, MCP, capacity or other readiness. C8 source commit
 `a1577aee63094e6fcb3feea6fc6079d1a8454850` wires manager-authorized automatic
-WorkDispatch and passed a bounded StoreAPI regression; C8 hosted CI has not yet
-run. This does not qualify productive dispatch or a complete local cycle. All local model/inference
+WorkDispatch and passed a bounded StoreAPI regression. Hosted CI evidence is recorded in the linked Implementation Status. This does not qualify productive dispatch or a complete local cycle. All local model/inference
 execution remains deferred by owner.
 
 The authenticated current Manager enables one entry for one project. The server
@@ -219,8 +221,7 @@ current progress/result using `operation.get` with `operation_id`; the intended
 WorkDispatch recent entry carries the admitted Operation ID and semantic slot
 ID. In the example, timestamp `0` is a numeric placeholder; the server supplies
 the actual receipt time. Current progress and result come from live
-`operation.get`, not the immutable receipt snapshot. C8 hosted CI has not yet
-run; productive dispatch and the full cycle remain unqualified.
+`operation.get`, not the immutable receipt snapshot. productive dispatch and the full cycle remain unqualified.
 
 ## 5. Preset steps and prerequisites
 
@@ -314,3 +315,42 @@ Goal tracking starts no work. Its selected progression uses one enabled manager 
 Keep #22's small eager cores. Config get/preview/apply/explain and detailed runtime, hook, script, schedule, Goal, review and forge methods are deferred groups. Schedule/rule/Goal editors update the same entry and enabled flag, not parallel records. Before exposing them, wire their real application handler and result reader.
 
 For review, the normal assigned-auditor result tool is `review.submit`; `task.request_changes` remains the guarded manager disposition. Scoped Manager feedback is available only when a TaskSpec explicitly selects [owner-policy-v2](../owner-policy-v2.md) for a new Attempt. Existing v1 Attempts and their feedback rights/evidence remain frozen and unchanged. Existing legacy MCP schemas do not silently acquire new rights. `automation.explain` and manual review/context reads must find on-behalf Operations through their owner linkage even though the service is their technical requester.
+
+## 11. Fresh-owned OpenCode service
+
+This host/operator route is separate from a manager-owned automation definition. A route declaration is not a launch request: Store starts the service only after an exact Manager/Operator admission for the opening binding, Task revision, Attempt, and held workspace lease. Use the explicit fresh-owned origin and the exact OpenCode V2 runtime/artifact.
+
+~~~toml
+[[routes]]
+alias = "opencode-owned"
+runtime = "opencode_v2"
+module_artifact_id = "eliot-opencode-v2.http.1"
+enabled = true
+native_options = {}
+
+[routes.owned_service]
+origin = "fresh_owned_service"
+service_id = "opencode-owned"
+model = { id = "approved-model-id", providerID = "approved-provider", variant = "approved-variant" }
+model_catalog = "offline"
+bun_executable = "C:/approved/runtime/bun.exe"
+bun_sha256 = "<64 hexadecimal characters: SHA-256 of the Bun executable>"
+server_program = "C:/approved/repo/modules/opencode/serve.mjs"
+server_program_sha256 = "<64 hexadecimal characters: SHA-256 of the pinned serve.mjs>"
+state_root = "C:/approved/private-state/opencode"
+port = 0
+~~~
+
+This is a schema example only. Replace the generic paths and hashes with approved values. The Bun path must identify a canonical regular file with the supplied matching SHA-256; the running Bun version is checked as 1.4.0. The server program must be the canonical repository-pinned modules/opencode/serve.mjs at the build's compile-time repository root, and its configured SHA-256 must match. The existing state_root must be a canonical, non-reparse directory with access restricted to the service owner. Port 0 requests an OS-selected loopback port; the actual bound endpoint and process identity are read back.
+
+The owned service uses repository-pinned @opencode/server 2.0.7. This differs from the separately installed global OpenCode 2.0.22; this route does not reuse the global installation's profile, databases, credentials, or receipts. The private config contains one plugin-directory entry for the pinned package directory. Its exact index.mjs wrapper re-exports native-mcp-proof.mjs; the server's 2.0.7 input is the singular plugin tuple [package-directory, options]. Configuration/index preparation and source hashes do not prove that the native server loaded the plugin or exposed callable tools.
+
+model_catalog accepts offline or refresh. offline disables the bundled snapshot and fetching. refresh uses the bundled snapshot and fetches public Models.dev metadata. Neither choice authenticates a provider or executes a model call. Historical provider receipts remain historical and separately scoped; they are not proof for this new service. All local model/inference execution remains deferred, including PR24/Kilo.
+
+Each admitted launch receives its own retained owner nonce and private state directory under state_root/launches/<owner_nonce>. Do not copy global OpenCode state into it or manually reuse a nonce directory. The controller embeds a dedicated helper child and keeps its stdin open while the service is owned. Closing that stdin sends EOF as the graceful-stop signal; the helper must exit successfully and produce exact owner/stop receipts. Do not substitute a kill or launch retry.
+
+Before spawn, Store reserves one durable start. A proven pre-helper-spawn NoEffect is recorded only after an exact empty-unknown compare-and-swap. If spawn was attempted or the result is uncertain, the disposition remains outcome_unknown and must not be replayed; recovery is readback-only. Operation readers accept only the two exact negative-proof shapes with NULL process fields, and reserved cancellation writes a canonical bounded negative proof. A retained service that cannot be proved stays fenced.
+
+Workspace cancellation/release remains blocked while the start is outcome_unknown or service_observed, even if the Task revision, Attempt, or current Manager changes. Bounded reconciliation reconstructs the original route and workspace from immutable launch/lease provenance, then requires matching clean server-stop receipts, the exact Bun PID birth/image to be absent, and a matching helper-family stop receipt proving no children remain. Only an exact durable compare-and-swap marks service_departed and removes this service-specific fence; it does not claim a general OS workspace lock.
+
+The first model-free attempt failed before readiness with WORKSPACE_PATH; the assembled Windows-prefix/root fix now passes workspace configuration. The subsequent host failed at the first Store tick before Manager, Task or service because launcher::pending_launches produced invalid operations WHERE SQL from escaped continuation whitespace. Repair 4218e7a4c67f5de244081d6e9dd37e2ee2e30544 is committed, and the exact extracted query passed read-only preparation against the retained database. Exact-source Store-authority and runtime audits passed; the corrected staged run and C9 hosted CI remain pending.

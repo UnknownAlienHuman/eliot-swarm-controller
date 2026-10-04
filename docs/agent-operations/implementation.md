@@ -1,13 +1,13 @@
 # Implementation Plan — Rust Operations on Behalf of the Manager
 
-Revision 13 · 2026-10-03 · C8 implementation commit `a1577aee63094e6fcb3feea6fc6079d1a8454850`; CI fixture repair `7d518ef4edb84c5e8ce677fafa778de914abed30`.
+**Current C9 status:** Source 4218e7a4c67f5de244081d6e9dd37e2ee2e30544 is committed. The previous source passed formatting and production Clippy (11.95 s); the SQL-only repair passed formatting and the debug candidate build passed (35.85 s). Bounded exact-source Store-authority and runtime audits passed for 4218e7a. A prior native host passed workspace configuration but failed at its first Store tick; corrected acceptance and hosted CI remain pending. Native MCP loading, productive dispatch, model execution and the full manager-owned cycle remain unqualified. See [Implementation Status](../implementation-status.md) for audit digests.
+
+### Historical C7/C8 qualification snapshots
+Revision 16 · 2026-10-03 · C9 source 4218e7a4c67f5de244081d6e9dd37e2ee2e30544. Historical C7/C8 CI: [Implementation Status](../implementation-status.md).
 
 Read [README](README.md), then the relevant [Configuration](configuration.md), [Architecture](architecture.md), [Delivery](delivery.md) and [Donor map](donor-map.md). The program remains partial. C4's 221 Rust tests apply only to `2607c8858e573ae40459c27d76d8ae9e1ca9f8fc`.
 
-C7 at `2f00c2b3d7862788ca8a6bead4645d3ce64dc0ea` passed canonical formatting, warnings-denied Clippy (13.06 s), the corrected targeted Windows `check_probe`, and full Rust CI run `37153513585` for exact CI commit `8570dae7f478b6dd2b604727b34c285a86ee9acc` (all Ubuntu and Windows steps, including Rust application/protocol tests, native-bridge fixtures/offline smoke, and release build). Exact reviews of C7 privacy, authority, disposition and lifecycle paths passed, as did the final Windows-delta review. The fixture mismatch involved missing outer `CREATE_NO_WINDOW`; the precise historical OS/root cause remains unconfirmed. C7 binds Participant credential issuance and private assignment context to launch admission, provides partial authenticated configured/connect readback, and consumes review disposition with exact manager-on-behalf authority. Workspace lease/release is database-only. Credential/profile references are visible in Operation readback; confidentiality is not qualified.
-
-C8 implementation commit `a1577aee63094e6fcb3feea6fc6079d1a8454850` wires manager-authorized WorkDispatch auto-admission, the immutable semantic launch slot shared with manual launch, and MCP install/proof handlers and readback. Owned-crate formatting and warnings-denied Clippy passed (12.46 s; `.local/qualification/r7-build-gate/clippy-c8-qualified.log`). The bounded StoreAPI regression passed 1/1 (0.06 s; build 35.09 s; `.local/qualification/r7-build-gate/work-dispatch-c8-qualified.log`), including Task-fact admission, exact slot reuse/conflict, idempotent receipt, one Operation, and Manager/outsider operation-scope filtering before pagination. C8 CI run `37157609062` failed in both OS jobs on three projection fixtures: the fixture database installed schema `001core` but omitted `002workspace`, so `workspace_leases` was absent. Fix commit `7d518ef4edb84c5e8ce677fafa778de914abed30` installs `002workspace`; the targeted projection filter passed 6/6 (0.05 s; build 37.36 s; `.local/qualification/r7-build-gate/projection-c8-ci-repaired.log`). Full Rust CI run `37158328828` passed all Ubuntu and Windows job steps for repair commit `7d518ef4edb84c5e8ce677fafa778de914abed30`, including formatting, Clippy, Rust application/protocol tests, native offline fixtures, and release build. The fresh-owned `mcp_plugin` startup remains unwired and unqualified. Productive/native dispatch, the full manager-owned cycle, native MCP harness/tool loading and model execution remain unqualified.
-
+Historical C7/C8 CI details and exact source pins are in [Implementation Status](../implementation-status.md).
 The runtime `0.160.0` schema and three DTOs are repaired, and Node `--check` passed without model execution; native-compose/trial remains unqualified. All local model/inference execution is deferred by owner. The C6 catalog had 91 `ToolSpec` entries and includes five passive watch kinds, integration sync, recomputed overlap, manager-admitted asynchronous workspace lease, exact Task claim and `agent.open`.
 
 ## 1. Delivery discipline
@@ -113,28 +113,14 @@ Done: monitoring works with no enabled automation, dropped notifications recover
 
 Read existing `src/runtime/owner.rs`, `src/runtime/warm_stream.rs`, `src/runtime/opencode_v2/*`, `src/platform/process_group.rs`, Doctor and module mappings.
 
-Committed C6 work adds a manager-admitted asynchronous workspace lease, an
-exact Task claim, and the `agent.open` path. C7 source binds a Participant
-credential and private assignment context atomically with a held database
-workspace lease at launch admission, and records database-only release
-lifecycle. Authenticated native MCP readback is partial: configured/connect
-state is observed, while tool loading and model-visible capability remain
-unproven. C8 at `a1577aee63094e6fcb3feea6fc6079d1a8454850` wires
-manager-authorized WorkDispatch auto-admission, the manual-shared immutable
-launch slot, and MCP install/proof handlers and readback. Formatting and
-warnings-denied Clippy passed; the bounded StoreAPI regression passed 1/1,
-including scoped operation filtering before pagination. The fresh-owned
-`mcp_plugin` startup remains unwired and unqualified.
-Canonical formatting and Clippy passed C7; the corrected Windows
-`check_probe` passed one targeted test (1.04 s; build 43.34 s). The earlier
-fixture omitted the production outer `CREATE_NO_WINDOW` setting. A matching
-model-free `cmd-echo` diagnostic passed but observed no live PID, so the exact
-OS/root cause is unconfirmed. `feedback_audit` passed exact review of the final
-three-file Windows delta (`.local/qualification/r7-build-gate/windows-probe-lifecycle-audit.md`).
-The C7 build/CI gates are green; C8 CI run `37157609062` failed in both OS jobs on three projection fixtures: the fixture database installed schema `001core` but omitted `002workspace`, so `workspace_leases` was absent. Fix commit `7d518ef4edb84c5e8ce677fafa778de914abed30` installs `002workspace`; the targeted projection filter passed 6/6 (0.05 s; build 37.36 s; `.local/qualification/r7-build-gate/projection-c8-ci-repaired.log`). Full Rust CI run `37158328828` passed all Ubuntu and Windows job steps for repair commit `7d518ef4edb84c5e8ce677fafa778de914abed30`, including formatting, Clippy, Rust application/protocol tests, native offline fixtures, and release build. Productive/native
-dispatch, native-MCP tool/model capability and the full manager-owned cycle
-remain unqualified.
+C6 added manager-admitted asynchronous workspace leasing, exact Task claim,
+agent.open, and bounded local TaskSubmission intake. C7 added Participant
+credential issuance with private assignment context, authenticated
+configured/connect readback, and bounded review-disposition handling. C8 added
+manager-authorized WorkDispatch, the shared launch slot, and MCP install/proof
+handlers. C7 and repaired C8 full-CI evidence is summarized above.
 
+C9 source 4218e7a4c67f5de244081d6e9dd37e2ee2e30544 adds fresh-owned OpenCode startup/readback, plugin-directory index and pinned 2.0.7 syntax preparation, plus bounded service-departure reconciliation. Workspace leases remain database-backed; departure proof is a separate service-specific fence, not an OS-level workspace lock. The managed-service NoEffect path requires an exact empty-unknown CAS; spawn-attempt/post-spawn ambiguity remains unknown. The 4218e7a SQL-only repair fixes escaped continuation whitespace in launcher::pending_launches; bounded exact-source Store-authority and runtime audits passed for 4218e7a; hosted CI and the corrected staged native run are pending. Native plugin/tool loading, productive dispatch, model capability and the full manager-owned cycle remain unqualified.
 - Port owned transport/translation to Rust through documented protocols or maintained libraries; preserve vendor loops externally. Do not silently retain a mandatory internal JS/Python service.
 - Qualify installed protocol/capabilities, not exact release equality. Preserve unknown consequential values and safe additive data.
 - Maintain native binding/generation/session/turn/family and actual process ownership. Never restart/adopt by heuristic merely to activate a new adapter.
