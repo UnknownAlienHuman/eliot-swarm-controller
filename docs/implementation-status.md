@@ -20,7 +20,15 @@ OpenCode owned-startup diagnostic e2814fe9-ac32-42be-90b5-7ea4173ee2c2 admitted 
 
 An earlier Command preflight stopped before host or model startup with RUN_ROOT_ACL_FAILED while autoloading Get-Acl; an ACL-only private probe passed. Later Command run f413bd5d-149d-4344-972b-125b6b3bf23a passed one bounded Bunny task.dispatch: marker 50 bytes, exit 0, no timeout. Requested route was stealth/space-bunny-alpha; effective model was null/unknown, and the native result exposed no upstream provider/model identity. Proof summary SHA-256 is 1C71DAB9592AE72752032556251A602BD5D268F9BEE42ED06BFCB944196453D2. Module owner family was empty and owner exit was 0; host 50688 exited on EOF with code 0, current owned PIDs were absent, and four Codex processes retained their same birth identities.
 
-This single Command result does not establish Task completion, acceptance, OpenCode service/MCP readiness, model identity, or the full O7 cycle. C13 publication work is active across four writers and remains unbuilt. Its integration exposed a mismatch between the acceptance producer envelope and the historical linkage reader; a producer correction is prepared and unbuilt. Installed R6 is unchanged. All local model/inference work, including PR24/Kilo, remains deferred.
+This single Command result does not establish Task completion, acceptance, OpenCode service/MCP readiness, model identity, or the full O7 cycle. Installed R6 is unchanged. All local model/inference work, including PR24/Kilo, remains deferred.
+
+### C13/C14 saved implementation checkpoint — 2026-10-04 05:46 UTC
+
+C13 implements an explicit accepted-candidate publication consumer, typed current-GM authority, shared manual/automatic effect slots, no-effect slot release after handover, and scoped operation/history/explanation readback. C14 adds bounded private startup diagnostics: a closed process-identity failure class, the actual immediate child exit observation, and redacted stderr metadata. These are implemented source paths; live automatic publication and successful owned OpenCode startup are not qualified.
+
+Production formatting, warnings-denied Clippy (15.19 s) and debug build (37.78 s) passed. The candidate SHA-256 is 984B38A3567E572D14EE1D01BADBD343C1FE1575BB6ECEB75AD2A55598B6371B. The existing owner-sponsored acceptance/history check passed. The dedicated publication regression exposed an incomplete synthetic submission result, an outdated explain method name, and an incorrect successor-manager history-read expectation. All three are corrected; the final corrected regression and pending Forge endpoint check have not yet run. No production permission check was weakened.
+
+**Resume here:** run only `automatic_publication_retains_exact_cause_and_reuses_slot_after_gm_handover` and `exact_push_endpoint_controls_expected_old_and_readback_with_split_remote_urls`, then inspect CI for this saved source. The private root gate supports reusing the unchanged successful production gates. The C14 fresh-start diagnostic harness is prepared and source-audited, but unexecuted; preserve all earlier unknown runs without replay. The full native O7 cycle remains incomplete. Save further implementation increments before extended verification.
 
 ### Prior C7/C8 evidence
 

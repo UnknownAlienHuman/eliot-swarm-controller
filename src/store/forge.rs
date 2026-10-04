@@ -4,6 +4,7 @@
 use super::{current_principal, gm, meta, operations, results, submissions, tasks};
 use crate::{
     artifacts::ArtifactRecord,
+    automation::publication::PublicationContext,
     checks::source,
     config::Config,
     error::{Error, Result},
@@ -34,9 +35,12 @@ enum WorkMode {
     ReadbackOnly,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum DispatchAuthorization {
     Authorized,
+    Coalesced {
+        owner_operation_id: String,
+    },
     StaleGmEpoch {
         admitted_gm_epoch: i64,
         current_gm_epoch: i64,
@@ -53,6 +57,9 @@ struct ForgeWork {
 
 #[derive(Debug, Clone)]
 enum ForgeOutcome {
+    Coalesced {
+        owner_operation_id: String,
+    },
     Applied {
         readback: RefReadback,
         push_exit_code: Option<i32>,
@@ -75,6 +82,136 @@ enum ForgeOutcome {
     },
 }
 
+#[derive(Debug, Clone)]
+enum ForgeActor {
+    Direct { client_id: String },
+    OnBehalf(Box<PublicationContext>),
+}
+
+impl ForgeActor {
+    fn caller_id(&self) -> &str {
+        match self {
+            Self::Direct { client_id } => client_id,
+            Self::OnBehalf(context) => context.technical_requester_id(),
+        }
+    }
+
+    fn require_current_write_authority(&self, db: &Connection) -> Result<i64> {
+        match self {
+            Self::Direct { client_id } => require_direct_write_authority(db, client_id),
+            Self::OnBehalf(context) => {
+                context.require_current(db)?;
+                Ok(context.gm_epoch())
+            }
+        }
+    }
+
+    fn require_readback_authority(&self, db: &Connection, config: &Config) -> Result<()> {
+        match self {
+            // Direct manual publications keep their existing recovery path:
+            // the durable caller/Operation link is enough to read its exact ref.
+            Self::Direct { .. } => Ok(()),
+            Self::OnBehalf(context) => context.require_readback_authority(db, config),
+        }
+    }
+
+    fn require_request_matches(&self, input: &PublishRefRequest) -> Result<()> {
+        match self {
+            Self::Direct { .. } => Ok(()),
+            Self::OnBehalf(context) => {
+                let expected = PublishRefRequest::parse(&context.request_value()?)?;
+                if &expected != input {
+                    return Err(Error::new(
+                        "AUTOMATION_LINK_CORRUPT",
+                        "publication request differs from its retained automation context",
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn require_intent_matches(&self, intent: &PublicationIntent) -> Result<()> {
+        let Self::OnBehalf(context) = self else {
+            return Ok(());
+        };
+        if intent.project_id != context.project_id()
+            || intent.canonical_repository != context.canonical_repository()
+            || intent.attempt_id != context.attempt_id()
+            || intent.task_revision != context.task_revision()
+            || intent.admitted_gm_epoch != context.gm_epoch()
+            || intent.submission_ref != context.submission_ref()
+            || intent.accepted_operation_id != context.accepted_operation_id()
+            || intent.candidate_ref != context.candidate_ref()
+            || intent.policy_revision != context.policy_revision()
+            || intent.target_ref != context.target_ref()
+            || intent.expected_old_ref.as_deref() != context.expected_old_ref()
+            || intent.expected_create != context.expected_create()
+        {
+            return Err(Error::new(
+                "AUTOMATION_LINK_CORRUPT",
+                "publication intent differs from its retained automation context",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn require_direct_write_authority(db: &Connection, client_id: &str) -> Result<i64> {
+    let registration = meta(db, &format!("client:{client_id}"))?
+        .ok_or_else(|| Error::new("UNAUTHORIZED", "client no longer registered"))?;
+    if registration["disabled"] == true {
+        return Err(Error::new("UNAUTHORIZED", "client disabled"));
+    }
+    let role: Role = serde_json::from_value(registration["role"].clone())?;
+    match role {
+        Role::Operator => super::require_local_operator(db, client_id)?,
+        Role::Manager
+            if gm::record(db)?
+                .as_ref()
+                .is_some_and(|record| record["client_id"] == client_id) => {}
+        Role::Manager => {
+            return Err(Error::new("FORBIDDEN", "current GM authority required"));
+        }
+        _ => return Err(Error::new("FORBIDDEN", "operator or current GM required")),
+    }
+    current_gm_epoch(db)
+}
+
+fn actor_for_operation(db: &Connection, id: &str, operation: &Value) -> Result<ForgeActor> {
+    let caller_id = model::text(operation, "caller_id")?;
+    let effective_raw: String = db.query_row(
+        "SELECT effective_request_json FROM operations WHERE operation_id=?1",
+        [id],
+        |row| row.get(0),
+    )?;
+    let effective: Value = serde_json::from_str(&effective_raw).map_err(|_| {
+        Error::new(
+            "FORGE_INTENT_INVALID",
+            "publication effective request is invalid",
+        )
+    })?;
+    if !effective["automation_on_behalf"].is_null() {
+        let context = PublicationContext::from_committed_operation(db, id)?;
+        if caller_id != context.technical_requester_id() {
+            return Err(Error::new(
+                "AUTOMATION_LINK_CORRUPT",
+                "publication technical requester differs from its retained Operation",
+            ));
+        }
+        Ok(ForgeActor::OnBehalf(Box::new(context)))
+    } else if caller_id == crate::automation::authorization::AUTOMATION_TECHNICAL_REQUESTER_ID {
+        Err(Error::new(
+            "AUTOMATION_LINK_CORRUPT",
+            "internal publication Operation has no on-behalf attribution",
+        ))
+    } else {
+        Ok(ForgeActor::Direct {
+            client_id: caller_id.to_owned(),
+        })
+    }
+}
+
 fn current_gm_epoch(db: &Connection) -> Result<i64> {
     match gm::record(db)? {
         None => Ok(0),
@@ -84,12 +221,12 @@ fn current_gm_epoch(db: &Connection) -> Result<i64> {
 
 fn accepted_candidate(
     db: &Connection,
-    p: &Principal,
+    actor: &ForgeActor,
     input: &PublishRefRequest,
     config: &ForgeConfig,
 ) -> Result<(PublicationIntent, ForgeProject, ArtifactRecord)> {
-    gm::require_authority(db, p)?;
-    let admitted_gm_epoch = current_gm_epoch(db)?;
+    let admitted_gm_epoch = actor.require_current_write_authority(db)?;
+    actor.require_request_matches(input)?;
     let attempt = tasks::get_attempt(db, &input.attempt_id)?;
     let task_id = model::text(&attempt, "task_id")?;
     let task = tasks::get_task(db, task_id)?;
@@ -176,6 +313,17 @@ fn accepted_candidate(
         admitted_gm_epoch,
     );
     intent.validate()?;
+    if let ForgeActor::OnBehalf(context) = actor
+        && (context.project_id() != project_id
+            || context.policy_revision() != project.policy_revision
+            || crate::forge::canonical_repository(&project.canonical_repository)?
+                != context.canonical_repository())
+    {
+        return Err(Error::new(
+            "AUTOMATION_LINK_CORRUPT",
+            "publication project mapping differs from its retained automation context",
+        ));
+    }
     Ok((intent, project, candidate))
 }
 
@@ -186,28 +334,220 @@ pub(super) fn reserve(
     id: &str,
     config: &Config,
 ) -> Result<Value> {
-    gm::require_authority(tx, p)?;
+    let current = current_principal(tx, p.clone())?;
+    if !matches!(current.role, Role::Operator | Role::Manager) {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "publication requires the operator or current GM",
+        ));
+    }
+    gm::require_authority(tx, &current)?;
+    let actor = ForgeActor::Direct {
+        client_id: current.client_id.clone(),
+    };
     let input = PublishRefRequest::parse(value)?;
-    let (mut intent, _project, _candidate) = accepted_candidate(tx, p, &input, &config.forge)?;
-    require_no_process_tree_hold(tx, &intent.canonical_repository)?;
+    let (mut intent, _project, _candidate) = accepted_candidate(tx, &actor, &input, &config.forge)?;
     intent.operation_id = id.to_owned();
+    persist_intent(tx, id, &input, &intent, None)?;
+    if let Some(owner) = exact_slot_owner(tx, id, &intent)? {
+        return Ok(coalesced_receipt(id, &owner));
+    }
+    require_no_process_tree_hold(tx, &intent.canonical_repository)?;
+    Ok(queued_receipt(id, &input))
+}
+
+pub(super) fn reserve_on_behalf(
+    tx: &Transaction<'_>,
+    context: &PublicationContext,
+    value: &Value,
+    id: &str,
+    config: &Config,
+) -> Result<Value> {
+    let operation = operations::get_operation(tx, id)?;
+    if operation["method"] != "forge.publish_ref"
+        || operation["caller_id"] != context.technical_requester_id()
+    {
+        return Err(Error::new(
+            "AUTOMATION_LINK_CORRUPT",
+            "automatic publication Operation has the wrong technical requester",
+        ));
+    }
+    context.require_current(tx)?;
+    let actor = ForgeActor::OnBehalf(Box::new(context.clone()));
+    let input = PublishRefRequest::parse(value)?;
+    let (mut intent, _project, _candidate) = accepted_candidate(tx, &actor, &input, &config.forge)?;
+    intent.operation_id = id.to_owned();
+    persist_intent(tx, id, &input, &intent, Some(&context.linkage_value()))?;
+    if let Some(owner) = exact_slot_owner(tx, id, &intent)? {
+        return Ok(coalesced_receipt(id, &owner));
+    }
+    require_no_process_tree_hold(tx, &intent.canonical_repository)?;
+    Ok(queued_receipt(id, &input))
+}
+
+fn persist_intent(
+    tx: &Transaction<'_>,
+    id: &str,
+    input: &PublishRefRequest,
+    intent: &PublicationIntent,
+    attribution: Option<&Value>,
+) -> Result<()> {
     let task_id = model::text(&tasks::get_attempt(tx, &input.attempt_id)?, "task_id")?.to_owned();
+    let mut effective = json!({"publication_intent":intent});
+    if let Some(attribution) = attribution {
+        if attribution.is_null() {
+            return Err(Error::new(
+                "AUTOMATION_LINK_CORRUPT",
+                "automatic publication attribution could not be serialized",
+            ));
+        }
+        effective["automation_on_behalf"] = attribution.clone();
+    }
     tx.execute(
-        "UPDATE operations SET task_id=?2,attempt_id=?3,effective_request_json=?4 WHERE operation_id=?1",
-        params![
-            id,
-            task_id,
-            input.attempt_id,
-            model::canonical(&json!({"publication_intent":intent}))?
-        ],
+        "UPDATE operations SET task_id=?2,attempt_id=?3,effective_request_json=?4 WHERE operation_id=?1 AND method='forge.publish_ref'",
+        params![id, task_id, input.attempt_id, model::canonical(&effective)?],
     )?;
-    Ok(json!({
+    Ok(())
+}
+
+fn queued_receipt(id: &str, input: &PublishRefRequest) -> Value {
+    json!({
         "operation_id":id,
         "attempt_id":input.attempt_id,
         "state":"queued",
         "publication":"not_started",
         "force":false
-    }))
+    })
+}
+
+fn coalesced_receipt(id: &str, owner_operation_id: &str) -> Value {
+    json!({
+        "operation_id":id,
+        "outcome":"coalesced",
+        "state":"settled",
+        "publication":"coalesced",
+        "coalesced":true,
+        "coalesced_to":owner_operation_id,
+        "publication_may_have_started":false,
+        "force":false
+    })
+}
+
+fn exact_slot_owner(
+    db: &Connection,
+    operation_id: &str,
+    intent: &PublicationIntent,
+) -> Result<Option<String>> {
+    let current_epoch = current_gm_epoch(db)?;
+    let mut statement = db.prepare(
+        "SELECT operation_id,effective_request_json,state,result_json FROM operations \
+         WHERE method='forge.publish_ref' AND operation_id<>?1 \
+           AND json_extract(effective_request_json,'$.publication_intent.project_id')=?2 \
+           AND json_extract(effective_request_json,'$.publication_intent.canonical_repository')=?3 \
+           AND json_extract(effective_request_json,'$.publication_intent.candidate_ref')=?4 \
+         ORDER BY created_at_ms,operation_id",
+    )?;
+    let mut rows = statement.query(params![
+        operation_id,
+        intent.project_id,
+        intent.canonical_repository,
+        intent.candidate_ref
+    ])?;
+    while let Some(row) = rows.next()? {
+        let candidate_operation_id: String = row.get(0)?;
+        let effective_raw: String = row.get(1)?;
+        let state: String = row.get(2)?;
+        let result_raw: Option<String> = row.get(3)?;
+        if matches!(state.as_str(), "cancelled" | "rejected") {
+            continue;
+        }
+        let effective: Value = serde_json::from_str(&effective_raw).map_err(|_| {
+            Error::new(
+                "FORGE_SLOT_CORRUPT",
+                "retained publication intent is invalid",
+            )
+        })?;
+        let candidate: PublicationIntent =
+            serde_json::from_value(effective["publication_intent"].clone()).map_err(|_| {
+                Error::new(
+                    "FORGE_SLOT_CORRUPT",
+                    "retained publication intent is invalid",
+                )
+            })?;
+        candidate.validate().map_err(|_| {
+            Error::new(
+                "FORGE_SLOT_CORRUPT",
+                "retained publication intent is invalid",
+            )
+        })?;
+        if candidate.operation_id != candidate_operation_id {
+            return Err(Error::new(
+                "FORGE_SLOT_CORRUPT",
+                "retained publication intent differs from its Operation identity",
+            ));
+        }
+        let result = result_raw
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|_| {
+                Error::new(
+                    "FORGE_SLOT_CORRUPT",
+                    "retained publication result is invalid",
+                )
+            })?
+            .unwrap_or(Value::Null);
+        if same_effect_slot(&candidate, intent)
+            && operation_owns_slot(&state, &result, &candidate, current_epoch)
+        {
+            return Ok(Some(candidate_operation_id));
+        }
+    }
+    Ok(None)
+}
+
+/// A retained slot blocks an identical request only while it is current work,
+/// may have crossed the write boundary, or confirms the remote effect. Known
+/// no-effect records (cancelled, stale-epoch, pre-write failure, definite Git
+/// rejection, and coalesced duplicates) remain in history but release the slot.
+fn operation_owns_slot(
+    state: &str,
+    result: &Value,
+    intent: &PublicationIntent,
+    current_epoch: i64,
+) -> bool {
+    match state {
+        "queued" => intent.admitted_gm_epoch == current_epoch,
+        "sending" | "outcome_unknown" => true,
+        "cancelled" | "rejected" => false,
+        "settled" => match result["outcome"].as_str() {
+            Some("applied" | "unknown") => true,
+            Some("coalesced" | "stale_gm_epoch") => false,
+            Some("failed")
+                if result["publication"] == "not_started"
+                    || result["error"]["code"] == "FORGE_PUSH_REJECTED"
+                    || result["publication_may_have_started"] == false =>
+            {
+                false
+            }
+            _ => result["publication_may_have_started"] != false,
+        },
+        // Unexpected retained states fail closed rather than releasing a
+        // possibly effectful slot.
+        _ => true,
+    }
+}
+
+fn same_effect_slot(left: &PublicationIntent, right: &PublicationIntent) -> bool {
+    left.project_id == right.project_id
+        && left.canonical_repository == right.canonical_repository
+        && left.candidate_ref == right.candidate_ref
+        && left.candidate_sha256 == right.candidate_sha256
+        && left.commit == right.commit
+        && left.tree == right.tree
+        && left.target_ref == right.target_ref
+        && left.expected_old_ref == right.expected_old_ref
+        && left.expected_create == right.expected_create
 }
 
 fn unresolved_process_tree_hold(
@@ -236,6 +576,29 @@ fn require_no_process_tree_hold(db: &Connection, canonical_repository: &str) -> 
             ),
         ));
     }
+    Ok(())
+}
+
+fn settle_queued_coalesced(
+    tx: &Transaction<'_>,
+    operation_id: &str,
+    owner_operation_id: &str,
+) -> Result<()> {
+    let now = model::now_ms()?;
+    let result = coalesced_receipt(operation_id, owner_operation_id);
+    tx.execute(
+        "UPDATE operations SET state='settled',result_json=?2,settled_at_ms=?3,updated_at_ms=?3 WHERE operation_id=?1 AND method='forge.publish_ref' AND state='queued'",
+        params![operation_id, model::canonical(&result)?, now],
+    )?;
+    super::capacity::sync_operation(tx, operation_id, now)?;
+    tx.execute(
+        "INSERT OR IGNORE INTO observations(source_stream_id,source_event_key,operation_id,kind,payload_json,recorded_at_ms) VALUES('controller:forge',?1,?1,'forge.publication',?2,?3)",
+        params![
+            format!("coalesced:{operation_id}:{owner_operation_id}"),
+            model::canonical(&result)?,
+            now
+        ],
+    )?;
     Ok(())
 }
 
@@ -276,6 +639,7 @@ fn settle_before_write(tx: &Transaction<'_>, id: &str, error: Error) -> Result<(
         "operation_id":id,
         "outcome":"failed",
         "publication":"not_started",
+        "publication_may_have_started":false,
         "force":false,
         "error":error
     });
@@ -356,26 +720,34 @@ fn work_from_saved(
     })
 }
 
-fn begin(
-    db: &mut Connection,
-    p: Principal,
-    id: &str,
-    config: &ForgeConfig,
-) -> Result<Option<ForgeWork>> {
+fn begin(db: &mut Connection, id: &str, config: &Config) -> Result<Option<ForgeWork>> {
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let operation = operations::get_operation(&tx, id)?;
-    if operation["method"] != "forge.publish_ref" || operation["caller_id"] != p.client_id {
+    if operation["method"] != "forge.publish_ref" {
         return Err(Error::new(
             "FORBIDDEN",
-            "publication belongs to another caller or method",
+            "Operation is not a Forge publication",
+        ));
+    }
+    let actor = actor_for_operation(&tx, id, &operation)?;
+    if operation["caller_id"] != actor.caller_id() {
+        return Err(Error::new(
+            "FORGE_INTENT_INVALID",
+            "publication Operation caller differs from its retained actor",
         ));
     }
     match operation["state"].as_str() {
         Some("queued") => {
             let saved = saved_intent(&tx, id)?;
+            actor.require_intent_matches(&saved)?;
             let current_epoch = current_gm_epoch(&tx)?;
             if saved.admitted_gm_epoch != current_epoch {
                 settle_stale_gm_epoch(&tx, id, saved.admitted_gm_epoch, current_epoch)?;
+                tx.commit()?;
+                return Ok(None);
+            }
+            if let Some(owner_operation_id) = exact_slot_owner(&tx, id, &saved)? {
+                settle_queued_coalesced(&tx, id, &owner_operation_id)?;
                 tx.commit()?;
                 return Ok(None);
             }
@@ -390,16 +762,8 @@ fn begin(
                 return Ok(None);
             }
             let start = (|| -> Result<ForgeWork> {
-                let current = current_principal(&tx, p.clone())?;
-                if !matches!(current.role, Role::Operator | Role::Manager) {
-                    return Err(Error::new(
-                        "FORBIDDEN",
-                        "publication requires the operator or current GM",
-                    ));
-                }
-                gm::require_authority(&tx, &current)?;
                 let input = request(&tx, id)?;
-                let (mut expected, _, _) = accepted_candidate(&tx, &current, &input, config)?;
+                let (mut expected, _, _) = accepted_candidate(&tx, &actor, &input, &config.forge)?;
                 expected.operation_id = id.to_owned();
                 if expected != saved {
                     return Err(Error::new(
@@ -407,7 +771,7 @@ fn begin(
                         "current accepted candidate differs from saved publication intent",
                     ));
                 }
-                work_from_saved(&tx, saved, config, WorkMode::PushOnce)
+                work_from_saved(&tx, saved, &config.forge, WorkMode::PushOnce)
             })();
             match start {
                 Ok(work) => {
@@ -427,8 +791,22 @@ fn begin(
             }
         }
         Some("outcome_unknown") => {
-            let work =
-                work_from_saved(&tx, saved_intent(&tx, id)?, config, WorkMode::ReadbackOnly)?;
+            let saved = saved_intent(&tx, id)?;
+            actor.require_intent_matches(&saved)?;
+            if matches!(actor, ForgeActor::OnBehalf(_))
+                && actor.require_readback_authority(&tx, config).is_err()
+            {
+                tx.commit()?;
+                return Ok(None);
+            }
+            let work = match work_from_saved(&tx, saved, &config.forge, WorkMode::ReadbackOnly) {
+                Ok(work) => work,
+                Err(_) if matches!(actor, ForgeActor::OnBehalf(_)) => {
+                    tx.commit()?;
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
             tx.commit()?;
             Ok(Some(work))
         }
@@ -439,18 +817,18 @@ fn begin(
 /// Convert an abandoned in-process send to unknown only after the caller has
 /// acquired the Git process slot, proving its owned command closure has ended.
 /// This path is strictly readback-only.
-fn begin_reconciliation(
-    db: &mut Connection,
-    p: Principal,
+fn reconcile_in_transaction(
+    tx: &Transaction<'_>,
+    actor: &ForgeActor,
     id: &str,
-    config: &ForgeConfig,
+    forge_config: &ForgeConfig,
+    full_config: Option<&Config>,
 ) -> Result<Option<ForgeWork>> {
-    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let operation = operations::get_operation(&tx, id)?;
-    if operation["method"] != "forge.publish_ref" || operation["caller_id"] != p.client_id {
+    let operation = operations::get_operation(tx, id)?;
+    if operation["method"] != "forge.publish_ref" || operation["caller_id"] != actor.caller_id() {
         return Err(Error::new(
             "FORBIDDEN",
-            "publication belongs to another caller or method",
+            "publication actor differs from its retained Operation",
         ));
     }
     match operation["state"].as_str() {
@@ -464,27 +842,77 @@ fn begin_reconciliation(
         Some("outcome_unknown") => {}
         _ => return Ok(None),
     }
-    let work = work_from_saved(&tx, saved_intent(&tx, id)?, config, WorkMode::ReadbackOnly)?;
+    let saved = saved_intent(tx, id)?;
+    actor.require_intent_matches(&saved)?;
+    if matches!(actor, ForgeActor::OnBehalf(_)) {
+        let Some(config) = full_config else {
+            return Ok(None);
+        };
+        if actor.require_readback_authority(tx, config).is_err() {
+            return Ok(None);
+        }
+        let work = match work_from_saved(tx, saved, forge_config, WorkMode::ReadbackOnly) {
+            Ok(work) => work,
+            Err(_) => return Ok(None),
+        };
+        Ok(Some(work))
+    } else {
+        Ok(Some(work_from_saved(
+            tx,
+            saved,
+            forge_config,
+            WorkMode::ReadbackOnly,
+        )?))
+    }
+}
+
+fn begin_reconciliation_operation(
+    db: &mut Connection,
+    id: &str,
+    config: &Config,
+) -> Result<Option<ForgeWork>> {
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let operation = operations::get_operation(&tx, id)?;
+    let actor = actor_for_operation(&tx, id, &operation)?;
+    let work = reconcile_in_transaction(&tx, &actor, id, &config.forge, Some(config))?;
     tx.commit()?;
-    Ok(Some(work))
+    Ok(work)
+}
+
+// Kept for the existing direct-caller fixture and manual recovery behavior.
+#[cfg(test)]
+fn begin_reconciliation(
+    db: &mut Connection,
+    principal: Principal,
+    id: &str,
+    config: &ForgeConfig,
+) -> Result<Option<ForgeWork>> {
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let actor = ForgeActor::Direct {
+        client_id: principal.client_id,
+    };
+    let work = reconcile_in_transaction(&tx, &actor, id, config, None)?;
+    tx.commit()?;
+    Ok(work)
 }
 
 fn dispatch_authorized(
     db: &Connection,
-    p: Principal,
     work: &ForgeWork,
-    config: &ForgeConfig,
+    config: &Config,
 ) -> Result<DispatchAuthorization> {
     let operation = operations::get_operation(db, &work.intent.operation_id)?;
+    let actor = actor_for_operation(db, &work.intent.operation_id, &operation)?;
     if operation["method"] != "forge.publish_ref"
         || operation["state"] != "sending"
-        || operation["caller_id"] != p.client_id
+        || operation["caller_id"] != actor.caller_id()
     {
         return Err(Error::conflict(
             "publication is no longer in its pre-write phase",
         ));
     }
     let saved = saved_intent(db, &work.intent.operation_id)?;
+    actor.require_intent_matches(&saved)?;
     if saved != work.intent {
         return Err(Error::new(
             "FORGE_INTENT_CHANGED",
@@ -492,6 +920,9 @@ fn dispatch_authorized(
         ));
     }
     require_no_process_tree_hold(db, &saved.canonical_repository)?;
+    if let Some(owner_operation_id) = exact_slot_owner(db, &work.intent.operation_id, &saved)? {
+        return Ok(DispatchAuthorization::Coalesced { owner_operation_id });
+    }
     let admitted_gm_epoch = saved.admitted_gm_epoch;
     let current_epoch = current_gm_epoch(db)?;
     if admitted_gm_epoch != current_epoch {
@@ -500,16 +931,8 @@ fn dispatch_authorized(
             current_gm_epoch: current_epoch,
         });
     }
-    let current = current_principal(db, p)?;
-    if !matches!(current.role, Role::Operator | Role::Manager) {
-        return Err(Error::new(
-            "FORBIDDEN",
-            "publication requires the operator or current GM",
-        ));
-    }
-    gm::require_authority(db, &current)?;
     let input = request(db, &work.intent.operation_id)?;
-    let (expected, project, candidate) = accepted_candidate(db, &current, &input, config)?;
+    let (expected, project, candidate) = accepted_candidate(db, &actor, &input, &config.forge)?;
     let mut expected = expected;
     expected.operation_id = work.intent.operation_id.clone();
     if expected != work.intent
@@ -985,6 +1408,9 @@ fn restart_readback_outcome(intent: &PublicationIntent, readback: RefReadback) -
 
 fn outcome_value(id: &str, outcome: &ForgeOutcome) -> (Value, &'static str) {
     match outcome {
+        ForgeOutcome::Coalesced { owner_operation_id } => {
+            (coalesced_receipt(id, owner_operation_id), "settled")
+        }
         ForgeOutcome::Applied {
             readback,
             push_exit_code,
@@ -1103,7 +1529,7 @@ fn finish(db: &mut Connection, id: &str, outcome: ForgeOutcome) -> Result<()> {
     result["publication_may_have_started"] =
         json!(publication_may_have_started(&operation["result"]));
     preserve_process_tree_hold(&operation["result"], &mut result, &mut state);
-    if state == "settled" {
+    if state == "settled" && !matches!(outcome, ForgeOutcome::Coalesced { .. }) {
         let intent = saved_intent(&tx, id)?;
         let task = tasks::get_task(&tx, &intent_attempt_task(&tx, &intent)?)?;
         result["acceptance_current_at_finish"] = json!(
@@ -1680,20 +2106,20 @@ mod tests {
     }
 }
 
-fn pending(db: &Connection) -> Result<Vec<(String, String)>> {
+fn pending(db: &Connection) -> Result<Vec<String>> {
     let mut statement = db.prepare(
-        "SELECT operation_id,caller_id FROM operations WHERE method='forge.publish_ref' AND state IN ('sending','outcome_unknown') ORDER BY created_at_ms,operation_id",
+        "SELECT operation_id FROM operations WHERE method='forge.publish_ref' AND state IN ('sending','outcome_unknown') ORDER BY created_at_ms,operation_id",
     )?;
-    let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    let rows = statement.query_map([], |row| row.get(0))?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
 }
 
-fn queued_pending(db: &Connection) -> Result<Vec<(String, String)>> {
+fn queued_pending(db: &Connection) -> Result<Vec<String>> {
     let mut statement = db.prepare(
-        "SELECT operation_id,caller_id FROM operations WHERE method='forge.publish_ref' AND state='queued' ORDER BY created_at_ms,operation_id",
+        "SELECT operation_id FROM operations WHERE method='forge.publish_ref' AND state='queued' ORDER BY created_at_ms,operation_id",
     )?;
-    let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    let rows = statement.query_map([], |row| row.get(0))?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
 }
@@ -1732,21 +2158,15 @@ impl super::Store {
         let _guard = lock.lock().await;
         self.reconcile_forge_locked().await?;
         let queued = self.run(|db| queued_pending(db)).await?;
-        let config = self.config.forge.clone();
-        for (id, caller_id) in queued {
-            let caller = Principal {
-                link_id: "forge-queue-supervisor".into(),
-                client_id: caller_id,
-                role: Role::Operator,
-            };
+        let config = self.config.clone();
+        for id in queued {
             let local_config = config.clone();
-            let local_caller = caller.clone();
             let local_id = id.clone();
             let work = self
-                .run(move |db| begin(db, local_caller, &local_id, &local_config))
+                .run(move |db| begin(db, &local_id, &local_config))
                 .await?;
             if let Some(work) = work {
-                self.drive_forge(work, caller).await;
+                self.drive_forge(work).await;
             }
         }
         Ok(())
@@ -1763,27 +2183,21 @@ impl super::Store {
             .map_err(|_| Error::new("FORGE_PROCESS_CLOSED", "forge process slot stopped"))?;
         drop(process_guard);
         let pending = self.run(|db| pending(db)).await?;
-        let config = self.config.forge.clone();
-        for (id, caller_id) in pending {
-            let caller = Principal {
-                link_id: "forge-reconciler".into(),
-                client_id: caller_id,
-                role: Role::Operator,
-            };
+        let config = self.config.clone();
+        for id in pending {
             let local_config = config.clone();
-            let local_caller = caller.clone();
             let local_id = id.clone();
             let work = self
-                .run(move |db| begin_reconciliation(db, local_caller, &local_id, &local_config))
+                .run(move |db| begin_reconciliation_operation(db, &local_id, &local_config))
                 .await?;
             if let Some(work) = work {
-                self.drive_forge(work, caller).await;
+                self.drive_forge(work).await;
             }
         }
         Ok(())
     }
 
-    async fn drive_forge(&self, work: ForgeWork, principal: Principal) {
+    async fn drive_forge(&self, work: ForgeWork) {
         let id = work.intent.operation_id.clone();
         let outcome = if work.mode == WorkMode::ReadbackOnly {
             let config = self.config.forge.clone();
@@ -1820,12 +2234,9 @@ impl super::Store {
                         Err(error) => runner_error_outcome(error),
                         Ok(push_url) => {
                             let auth_work = work.clone();
-                            let auth_principal = principal.clone();
-                            let config = self.config.forge.clone();
+                            let config = self.config.clone();
                             match self
-                                .run(move |db| {
-                                    dispatch_authorized(db, auth_principal, &auth_work, &config)
-                                })
+                                .run(move |db| dispatch_authorized(db, &auth_work, &config))
                                 .await
                             {
                                 Err(error) => runner_error_outcome(error),
@@ -1852,6 +2263,9 @@ impl super::Store {
                                         stderr_bytes: None,
                                         process_tree_unconfirmed: true,
                                     })
+                                }
+                                Ok(DispatchAuthorization::Coalesced { owner_operation_id }) => {
+                                    ForgeOutcome::Coalesced { owner_operation_id }
                                 }
                             }
                         }

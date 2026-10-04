@@ -1,7 +1,10 @@
 //! Revisioned manager-owned automation configuration stored in authenticated,
 //! schema-versioned per-record `meta` entries. No migration is required.
 
-use super::{automation_dispatch, automation_work_dispatch, operations, page, review_disposition};
+use super::{
+    automation_dispatch, automation_publication, automation_work_dispatch, operations, page,
+    review_disposition,
+};
 use crate::{
     automation::{
         actions::AutomationStep,
@@ -158,13 +161,25 @@ pub(super) fn apply(
                 change.include_existing,
                 now_ms,
             )?;
+            automation_publication::configure_activation(
+                tx,
+                change.before.as_ref(),
+                &change.after,
+                change.include_existing,
+                cut,
+                now_ms,
+            )?;
             let removed_or_narrowed_dispatch = change.before.as_ref().is_some_and(|before| {
                 (before.enabled && !change.after.enabled)
                     || (before.steps.contains(&AutomationStep::ReviewDispatch)
                         && !change.after.steps.contains(&AutomationStep::ReviewDispatch))
                     || (before.steps.contains(&AutomationStep::WorkDispatch)
                         && !change.after.steps.contains(&AutomationStep::WorkDispatch))
+                    || (before.steps.contains(&AutomationStep::Publication)
+                        && !change.after.steps.contains(&AutomationStep::Publication))
                     || (before.work_dispatch_ready() && !change.after.work_dispatch_ready())
+                    || (before.publication_ready() && !change.after.publication_ready())
+                    || (before.publication != change.after.publication)
                     || (before.review.profile != change.after.review.profile)
                     || (before.scope.work_pool_id != change.after.scope.work_pool_id)
             });
@@ -258,6 +273,7 @@ pub(super) fn explain(db: &Connection, p: &Principal, value: &Value) -> Result<V
     let state = automation_dispatch::dispatch_state(db, &entry)?;
     let work_dispatch = automation_work_dispatch::dispatch_state(db, &entry)?;
     let disposition = review_disposition::disposition_state(db, &entry)?;
+    let publication = automation_publication::state(db, &entry)?;
     let work = operation_impacts(db, &p.client_id, project, automation_id)?;
     let operation_history = linked_operation_history(db, &p.client_id, project, automation_id)?;
     Ok(json!({
@@ -265,6 +281,7 @@ pub(super) fn explain(db: &Connection, p: &Principal, value: &Value) -> Result<V
         "dispatch":state,
         "work_dispatch":work_dispatch,
         "review_disposition":disposition,
+        "publication":publication,
         "linked_operations":work,
         "linked_operation_history":operation_history
     }))
@@ -436,11 +453,16 @@ fn build_plan(
             && before
                 .as_ref()
                 .is_none_or(|prior| !prior.review_dispatch_ready());
+        let new_publication_coverage = after.publication_ready()
+            && before.as_ref().is_none_or(|prior| {
+                !prior.publication_ready() || prior.publication != after.publication
+            });
         let new_coverage = after.enabled
             && (enabled_now
                 || added_steps
                 || new_work_dispatch_coverage
-                || new_review_dispatch_coverage);
+                || new_review_dispatch_coverage
+                || new_publication_coverage);
         if change.include_existing && !new_coverage {
             return Err(Error::invalid(
                 "include_existing is meaningful only when enabling an entry or adding step coverage",

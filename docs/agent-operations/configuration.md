@@ -24,7 +24,7 @@ swarm.tools.search -> automation.config.get + runtime.catalog
 - `automation.config.get` returns scoped, paged entries, editable settings, revisions, effective owner, profiles and diagnostics; no secrets or global roster.
 - `automation.config.preview` is an effect-free validation/diff, useful for a bulk change. It is not mandatory approval or a second authority.
 - `automation.config.apply` atomically applies the explicitly requested changes, including `enabled`, using caller-owned request identity and expected entry revisions.
-- `automation.explain` shows why an entry/action is waiting or running, on whose behalf, its source cause, retained inputs and next useful action. It calls no model.
+- `automation.config.explain` shows why an entry/action is waiting or running, on whose behalf, its source cause, retained inputs and next useful action. It calls no model.
 
 The discarded `automation.control.*` proposal has no compatibility aliases. `runtime.profile.get/list/preview/apply` edits model/executor preferences; owned profile changes may be included in one configuration transaction without a separate call per field.
 
@@ -89,7 +89,7 @@ This manager already has review-assignment rights. One request enables that help
 }
 ```
 
-Only applied immutable submissions qualify. Queue launch, return, repair, acceptance and publication remain manual. No extra global switch, Root decision or grant-creation round follows.
+Only applied immutable submissions qualify. Queue launch, return, repair and acceptance remain manual. Publication can be automated only when the manager explicitly selects and configures the Publication step below. No extra global switch, Root decision or grant-creation round follows.
 
 To prevent future automatic audits:
 
@@ -188,7 +188,7 @@ remote deliveries. Cursor, pending readiness state, semantic launch-slot
 reservation and admitted Operation are committed through the Store path. The
 bounded C8 StoreAPI regression passed. CI run `37157609062` failed because the test fixture omitted `002workspace`; repair `7d518ef4edb84c5e8ce677fafa778de914abed30` adds it, the focused projection filter passed 6/6, and CI run `37158328828` passed all Ubuntu and Windows steps for repair commit `7d518ef4edb84c5e8ce677fafa778de914abed30`.
 
-The `automation.explain` `work_dispatch` projection contains:
+The `automation.config.explain` `work_dispatch` projection contains:
 `cursor`, `activation_cut`, optional `catch_up_until`, retained `pending`
 subjects with readiness reason/wake conditions, and a bounded `recent` window.
 Pending readiness is distinct from a source-integrity `gap`; gaps are surfaced
@@ -222,6 +222,51 @@ WorkDispatch recent entry carries the admitted Operation ID and semantic slot
 ID. In the example, timestamp `0` is a numeric placeholder; the server supplies
 the actual receipt time. Current progress and result come from live
 `operation.get`, not the immutable receipt snapshot. productive dispatch and the full cycle remain unqualified.
+
+### 4.2 Publication: explicit accepted-candidate target
+
+Publication settings are optional. The project must also have an enabled local
+Forge mapping for the same project and target. Omitting `publication` when
+creating an entry leaves it unset; `publication: null` explicitly clears it.
+If `publication` is selected without settings, the entry reports
+`publication_settings_required` and reserves no Forge Operation.
+
+The manager supplies one exact target and one expected remote state. Set
+`expected_create: true` with `expected_old_ref: null` only for an explicit
+branch create. For an update, set `expected_create: false` and provide the full
+expected old object ID. The two forms are mutually exclusive:
+
+```json
+{
+  "client_request_id": "enable-accepted-candidate-publication",
+  "project_id": "project-a",
+  "changes": [
+    {
+      "automation_id": "publish-reviewed-candidate",
+      "expected_revision": 0,
+      "include_existing": false,
+      "patch": {
+        "enabled": true,
+        "scope": {"work_pool_id": null},
+        "steps": ["publication"],
+        "publication": {
+          "target_ref": "refs/heads/release",
+          "expected_old_ref": null,
+          "expected_create": true
+        }
+      }
+    }
+  ]
+}
+```
+
+`include_existing: false` starts at the activation cut and considers later
+acceptance facts. Setting it to `true` requests bounded catch-up only through
+the captured cut; it does not replay arbitrary remote history. An eligible
+accepted candidate reserves the normal immutable `forge.publish_ref` action
+under the current manager and GM epoch. Operation admission is separate from
+Git effect execution; this example makes no live publication qualification
+claim.
 
 ## 5. Preset steps and prerequisites
 
@@ -314,7 +359,7 @@ Goal tracking starts no work. Its selected progression uses one enabled manager 
 
 Keep #22's small eager cores. Config get/preview/apply/explain and detailed runtime, hook, script, schedule, Goal, review and forge methods are deferred groups. Schedule/rule/Goal editors update the same entry and enabled flag, not parallel records. Before exposing them, wire their real application handler and result reader.
 
-For review, the normal assigned-auditor result tool is `review.submit`; `task.request_changes` remains the guarded manager disposition. Scoped Manager feedback is available only when a TaskSpec explicitly selects [owner-policy-v2](../owner-policy-v2.md) for a new Attempt. Existing v1 Attempts and their feedback rights/evidence remain frozen and unchanged. Existing legacy MCP schemas do not silently acquire new rights. `automation.explain` and manual review/context reads must find on-behalf Operations through their owner linkage even though the service is their technical requester.
+For review, the normal assigned-auditor result tool is `review.submit`; `task.request_changes` remains the guarded manager disposition. Scoped Manager feedback is available only when a TaskSpec explicitly selects [owner-policy-v2](../owner-policy-v2.md) for a new Attempt. Existing v1 Attempts and their feedback rights/evidence remain frozen and unchanged. Existing legacy MCP schemas do not silently acquire new rights. `automation.config.explain` and manual review/context reads must find on-behalf Operations through their owner linkage even though the service is their technical requester.
 
 ## 11. Fresh-owned OpenCode service
 

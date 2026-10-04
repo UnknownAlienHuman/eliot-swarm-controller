@@ -23,6 +23,8 @@ use std::{
     io::{Read, Write},
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
+    sync::{Arc, Mutex},
+    thread,
     time::{Duration, Instant},
 };
 use tokio::{
@@ -38,6 +40,8 @@ const MAX_OWNER_BYTES: usize = 64 * 1024;
 const MAX_HANDSHAKE_BYTES: usize = 32 * 1024;
 const MAX_CONFIG_BYTES: usize = 16 * 1024;
 const MAX_OBSERVATION_BYTES: usize = 4096;
+const MAX_BUN_STDERR_BYTES: usize = 16 * 1024;
+const MAX_BUN_STDERR_DIAGNOSTIC_BYTES: usize = 48 * 1024;
 const MAX_PATH_BYTES: usize = 4096;
 const START_TIMEOUT: Duration = Duration::from_secs(120);
 const STOP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1193,6 +1197,10 @@ pub(crate) fn run_owned_service_helper(plan_path: &Path) -> Result<()> {
             ));
         }
     };
+    let stderr_capture = match bun.stderr.take() {
+        Some(stderr) => start_bun_stderr_capture(stderr),
+        None => unavailable_bun_stderr_capture(),
+    };
     let spawned_pid = bun.id();
     if write_helper_start_receipt(
         &plan,
@@ -1215,14 +1223,32 @@ pub(crate) fn run_owned_service_helper(plan_path: &Path) -> Result<()> {
     }
     let observation = match ProcessObservation::for_spawned_process(&plan, spawned_pid) {
         Ok(observation) => observation,
-        Err(_) => {
-            let _ = write_helper_start_receipt(
+        Err(error) => {
+            // This one immediate wait is observational only. A live result or
+            // an unreadable wait never establishes identity, departure, or a
+            // retry-safe no-effect outcome.
+            let process_status = match bun.try_wait() {
+                Ok(Some(status)) => ImmediateProcessStatus::Exited {
+                    exit_code: status.code(),
+                },
+                Ok(None) => ImmediateProcessStatus::StillRunning,
+                Err(error) => ImmediateProcessStatus::WaitFailed {
+                    error_kind: SafeSpawnErrorKind::from(error.kind()),
+                },
+            };
+            let identity_failure = SafeProcessIdentityFailureCode::from_error(&error);
+            let _ = write_bun_stderr_diagnostic(
                 &plan,
                 &helper_observation,
-                HelperStartPhase::ProcessIdentityFailed,
-                Some(spawned_pid),
-                None,
-                None,
+                spawned_pid,
+                &stderr_capture,
+            );
+            let _ = write_process_identity_failed_receipt(
+                &plan,
+                &helper_observation,
+                spawned_pid,
+                identity_failure,
+                process_status,
             );
             return Err(readback_error(
                 "spawned owner process identity could not be validated",
@@ -1236,6 +1262,8 @@ pub(crate) fn run_owned_service_helper(plan_path: &Path) -> Result<()> {
     )
     .is_err()
     {
+        let _ =
+            write_bun_stderr_diagnostic(&plan, &helper_observation, spawned_pid, &stderr_capture);
         let _ = write_helper_start_receipt(
             &plan,
             &helper_observation,
@@ -1248,7 +1276,13 @@ pub(crate) fn run_owned_service_helper(plan_path: &Path) -> Result<()> {
             "spawned owner process observation could not be retained",
         ));
     }
-    let ready = wait_for_ready(&plan, &mut bun, &helper_observation, spawned_pid)?;
+    let ready = wait_for_ready(
+        &plan,
+        &mut bun,
+        &helper_observation,
+        spawned_pid,
+        &stderr_capture,
+    )?;
     if ready.pid != observation.pid {
         return Err(readback_error(
             "ready owner PID differs from the spawned process",
@@ -1331,7 +1365,7 @@ fn bun_command(plan: &HelperPlan) -> Command {
         .envs(safe_bun_environment(&plan.state_root))
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     command
 }
 
@@ -1340,6 +1374,7 @@ fn wait_for_ready(
     bun: &mut std::process::Child,
     helper_observation: &HelperObservation,
     spawned_pid: u32,
+    stderr_capture: &Arc<Mutex<BunStderrCapture>>,
 ) -> Result<ReadyRecord> {
     let owner_path = plan.state_root.join("owner.json");
     let connection_path = &plan.connection_file;
@@ -1347,6 +1382,12 @@ fn wait_for_ready(
     loop {
         match bun.try_wait() {
             Ok(Some(status)) => {
+                let _ = write_bun_stderr_diagnostic(
+                    plan,
+                    helper_observation,
+                    spawned_pid,
+                    stderr_capture,
+                );
                 let _ = write_helper_start_receipt(
                     plan,
                     helper_observation,
@@ -1362,6 +1403,12 @@ fn wait_for_ready(
             }
             Ok(None) => {}
             Err(error) => {
+                let _ = write_bun_stderr_diagnostic(
+                    plan,
+                    helper_observation,
+                    spawned_pid,
+                    stderr_capture,
+                );
                 let _ = write_helper_start_receipt(
                     plan,
                     helper_observation,
@@ -1396,6 +1443,8 @@ fn wait_for_ready(
             });
         }
         if Instant::now() >= deadline {
+            let _ =
+                write_bun_stderr_diagnostic(plan, helper_observation, spawned_pid, stderr_capture);
             let _ = write_helper_start_receipt(
                 plan,
                 helper_observation,
@@ -1665,7 +1714,7 @@ fn retain_spawn_pid(current: &mut Option<u32>, observed: Option<u32>) -> Result<
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum SafeSpawnErrorKind {
     NotFound,
@@ -1701,6 +1750,66 @@ impl From<std::io::ErrorKind> for SafeSpawnErrorKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SafeProcessIdentityFailureClass {
+    ProcessExitRace,
+    IdentityUnavailable,
+    SystemIo,
+    IdentityValidation,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SafeProcessIdentityFailureCode {
+    ProcessGone,
+    ProcessIdentity,
+    ProcessWait,
+    IoError,
+    OwnedServiceReadback,
+    OwnedServiceConfig,
+    Other,
+}
+
+impl SafeProcessIdentityFailureCode {
+    fn from_error(error: &Error) -> Self {
+        match error.code.as_str() {
+            "PROCESS_GONE" => Self::ProcessGone,
+            "PROCESS_IDENTITY" => Self::ProcessIdentity,
+            "PROCESS_WAIT" => Self::ProcessWait,
+            "IO_ERROR" => Self::IoError,
+            "OWNED_SERVICE_READBACK" => Self::OwnedServiceReadback,
+            "OWNED_SERVICE_CONFIG" => Self::OwnedServiceConfig,
+            _ => Self::Other,
+        }
+    }
+
+    fn class(self) -> SafeProcessIdentityFailureClass {
+        match self {
+            Self::ProcessGone => SafeProcessIdentityFailureClass::ProcessExitRace,
+            Self::ProcessIdentity | Self::ProcessWait => {
+                SafeProcessIdentityFailureClass::IdentityUnavailable
+            }
+            Self::IoError => SafeProcessIdentityFailureClass::SystemIo,
+            Self::OwnedServiceReadback | Self::OwnedServiceConfig => {
+                SafeProcessIdentityFailureClass::IdentityValidation
+            }
+            Self::Other => SafeProcessIdentityFailureClass::Other,
+        }
+    }
+}
+
+/// Result of the immediate `Child::try_wait` after process identity failed.
+/// `StillRunning` is only a point-in-time observation, not live-process proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ImmediateProcessStatus {
+    StillRunning,
+    Exited { exit_code: Option<i32> },
+    WaitFailed { error_kind: SafeSpawnErrorKind },
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HelperStartStageReceipt {
@@ -1718,6 +1827,102 @@ struct HelperStartStageReceipt {
     os_error_code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     process_exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    identity_failure_class: Option<SafeProcessIdentityFailureClass>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    identity_failure_code: Option<SafeProcessIdentityFailureCode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    immediate_process_status: Option<ImmediateProcessStatus>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum BunStderrReaderStatus {
+    Reading,
+    Complete,
+    ReadFailed,
+    Unavailable,
+}
+
+#[derive(Debug, Clone)]
+struct BunStderrCapture {
+    retained_prefix: Vec<u8>,
+    total_bytes: u64,
+    truncated: bool,
+    status: BunStderrReaderStatus,
+}
+
+impl BunStderrCapture {
+    fn new(status: BunStderrReaderStatus) -> Self {
+        Self {
+            retained_prefix: Vec::with_capacity(MAX_BUN_STDERR_BYTES.min(8192)),
+            total_bytes: 0,
+            truncated: false,
+            status,
+        }
+    }
+}
+
+fn unavailable_bun_stderr_capture() -> Arc<Mutex<BunStderrCapture>> {
+    Arc::new(Mutex::new(BunStderrCapture::new(
+        BunStderrReaderStatus::Unavailable,
+    )))
+}
+
+fn start_bun_stderr_capture<R>(reader: R) -> Arc<Mutex<BunStderrCapture>>
+where
+    R: Read + Send + 'static,
+{
+    let capture = Arc::new(Mutex::new(BunStderrCapture::new(
+        BunStderrReaderStatus::Reading,
+    )));
+    let thread_capture = Arc::clone(&capture);
+    match thread::Builder::new()
+        .name("owned-opencode-bun-stderr".into())
+        .spawn(move || drain_bun_stderr(reader, thread_capture))
+    {
+        Ok(reader_thread) => drop(reader_thread),
+        Err(_) => {
+            let mut state = capture
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.status = BunStderrReaderStatus::Unavailable;
+        }
+    }
+    capture
+}
+
+fn drain_bun_stderr<R: Read>(mut reader: R, capture: Arc<Mutex<BunStderrCapture>>) {
+    let mut buffer = [0_u8; 4096];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => {
+                let mut state = capture
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.status = BunStderrReaderStatus::Complete;
+                return;
+            }
+            Ok(count) => {
+                let mut state = capture
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.total_bytes = state.total_bytes.saturating_add(count as u64);
+                let remaining = MAX_BUN_STDERR_BYTES.saturating_sub(state.retained_prefix.len());
+                let keep = remaining.min(count);
+                state.retained_prefix.extend_from_slice(&buffer[..keep]);
+                state.truncated |= keep < count;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => {
+                let mut state = capture
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.status = BunStderrReaderStatus::ReadFailed;
+                return;
+            }
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1765,23 +1970,47 @@ impl HelperStartStageReceipt {
         helper.validate(&plan.owner_nonce, &plan.route_digest)?;
         let has_no_error = self.os_error_kind.is_none() && self.os_error_code.is_none();
         let has_no_exit = self.process_exit_code.is_none();
+        let has_no_identity_details = self.identity_failure_class.is_none()
+            && self.identity_failure_code.is_none()
+            && self.immediate_process_status.is_none();
+        let valid_identity_failure_details = has_no_exit
+            && match (
+                self.identity_failure_class,
+                self.identity_failure_code,
+                self.immediate_process_status,
+            ) {
+                // Legacy C12 receipts remain readable as an unknown snapshot.
+                (None, None, None) => true,
+                (Some(class), Some(code), Some(_)) => class == code.class(),
+                _ => false,
+            };
         let valid_stage_fields = match self.phase {
             HelperStartPhase::SpawnAttempted => {
-                self.spawned_pid.is_none() && has_no_error && has_no_exit
+                self.spawned_pid.is_none() && has_no_error && has_no_exit && has_no_identity_details
             }
             HelperStartPhase::SpawnFailed => {
-                self.spawned_pid.is_none() && self.os_error_kind.is_some() && has_no_exit
+                self.spawned_pid.is_none()
+                    && self.os_error_kind.is_some()
+                    && has_no_exit
+                    && has_no_identity_details
             }
             HelperStartPhase::Spawned
             | HelperStartPhase::SpawnReceiptWriteFailed
-            | HelperStartPhase::ProcessIdentityFailed
             | HelperStartPhase::ProcessObservationWriteFailed
             | HelperStartPhase::ReadinessTimedOut => {
-                self.spawned_pid.is_some() && has_no_error && has_no_exit
+                self.spawned_pid.is_some() && has_no_error && has_no_exit && has_no_identity_details
             }
-            HelperStartPhase::BunExitedBeforeReady => self.spawned_pid.is_some() && has_no_error,
+            HelperStartPhase::ProcessIdentityFailed => {
+                self.spawned_pid.is_some() && has_no_error && valid_identity_failure_details
+            }
+            HelperStartPhase::BunExitedBeforeReady => {
+                self.spawned_pid.is_some() && has_no_error && has_no_identity_details
+            }
             HelperStartPhase::BunWaitFailed => {
-                self.spawned_pid.is_some() && self.os_error_kind.is_some() && has_no_exit
+                self.spawned_pid.is_some()
+                    && self.os_error_kind.is_some()
+                    && has_no_exit
+                    && has_no_identity_details
             }
         };
         if self.schema_version != 1
@@ -1798,6 +2027,8 @@ impl HelperStartStageReceipt {
                     self.phase,
                     HelperStartPhase::SpawnFailed | HelperStartPhase::BunWaitFailed
                 ))
+            || (self.identity_failure_class.is_some()
+                && self.phase != HelperStartPhase::ProcessIdentityFailed)
         {
             return Err(readback_error(
                 "private helper start stage differs from its exact launch",
@@ -1832,11 +2063,115 @@ fn write_helper_start_receipt(
         os_error_kind: spawn_error.map(|error| SafeSpawnErrorKind::from(error.kind())),
         os_error_code: spawn_error.and_then(std::io::Error::raw_os_error),
         process_exit_code,
+        identity_failure_class: None,
+        identity_failure_code: None,
+        immediate_process_status: None,
     };
     receipt.validate(plan, helper)?;
     let path = plan.state_root.join(phase.file_name());
     let body = model::canonical(&serde_json::to_value(receipt)?)?;
     write_private_new(&path, body.as_bytes())
+}
+
+fn write_process_identity_failed_receipt(
+    plan: &HelperPlan,
+    helper: &HelperObservation,
+    spawned_pid: u32,
+    failure_code: SafeProcessIdentityFailureCode,
+    process_status: ImmediateProcessStatus,
+) -> Result<()> {
+    helper.validate(&plan.owner_nonce, &plan.route_digest)?;
+    if helper.helper_pid != std::process::id()
+        || spawned_pid == 0
+        || spawned_pid == helper.helper_pid
+    {
+        return Err(readback_error(
+            "process identity failure receipt is not bound to this helper and child",
+        ));
+    }
+    let receipt = HelperStartStageReceipt {
+        schema_version: 1,
+        owner_nonce: plan.owner_nonce.clone(),
+        route_digest: plan.route_digest.clone(),
+        helper_pid: helper.helper_pid,
+        helper_birth_token: helper.helper_birth_token.clone(),
+        phase: HelperStartPhase::ProcessIdentityFailed,
+        spawned_pid: Some(spawned_pid),
+        os_error_kind: None,
+        os_error_code: None,
+        process_exit_code: None,
+        identity_failure_class: Some(failure_code.class()),
+        identity_failure_code: Some(failure_code),
+        immediate_process_status: Some(process_status),
+    };
+    receipt.validate(plan, helper)?;
+    let body = model::canonical(&serde_json::to_value(receipt)?)?;
+    write_private_new(
+        &plan
+            .state_root
+            .join(HelperStartPhase::ProcessIdentityFailed.file_name()),
+        body.as_bytes(),
+    )
+}
+
+fn write_bun_stderr_diagnostic(
+    plan: &HelperPlan,
+    helper: &HelperObservation,
+    spawned_pid: u32,
+    capture: &Arc<Mutex<BunStderrCapture>>,
+) -> Result<()> {
+    helper.validate(&plan.owner_nonce, &plan.route_digest)?;
+    if helper.helper_pid != std::process::id()
+        || spawned_pid == 0
+        || spawned_pid == helper.helper_pid
+    {
+        return Err(readback_error(
+            "Bun diagnostic is not bound to this helper and child",
+        ));
+    }
+    let snapshot = capture
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if snapshot.retained_prefix.len() > MAX_BUN_STDERR_BYTES {
+        return Err(readback_error(
+            "Bun diagnostic capture exceeds its memory bound",
+        ));
+    }
+    let diagnostic = if snapshot.retained_prefix.is_empty() {
+        Value::Null
+    } else {
+        let text = String::from_utf8_lossy(&snapshot.retained_prefix).into_owned();
+        crate::redaction::value(json!({"stderr":text}))
+    };
+    let mut receipt = json!({
+        "schema_version":1,
+        "owner_nonce":plan.owner_nonce,
+        "route_digest":plan.route_digest,
+        "helper_pid":helper.helper_pid,
+        "helper_birth_token":helper.helper_birth_token,
+        "spawned_pid":spawned_pid,
+        "reader_status":snapshot.status,
+        "bytes_observed":snapshot.total_bytes,
+        "bytes_retained":snapshot.retained_prefix.len(),
+        "truncated":snapshot.truncated,
+        "diagnostic":diagnostic
+    });
+    let mut body = model::canonical(&receipt)?;
+    if body.len() > MAX_BUN_STDERR_DIAGNOSTIC_BYTES {
+        receipt["diagnostic"] = json!({"status":"redacted_output_over_limit"});
+        receipt["diagnostic_status"] = json!("redacted_output_over_limit");
+        body = model::canonical(&receipt)?;
+    }
+    if body.len() > MAX_BUN_STDERR_DIAGNOSTIC_BYTES {
+        return Err(readback_error(
+            "private Bun diagnostic exceeds its serialized file bound",
+        ));
+    }
+    write_private_new(
+        &plan.state_root.join("bun-stderr-diagnostic.json"),
+        body.as_bytes(),
+    )
 }
 
 fn write_helper_observation(plan: &HelperPlan) -> Result<HelperObservation> {

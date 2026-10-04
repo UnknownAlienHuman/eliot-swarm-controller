@@ -6,6 +6,7 @@ mod automation_acceptance;
 mod automation_dispatch;
 mod automation_disposition;
 mod automation_intake;
+mod automation_publication;
 pub(crate) mod automation_repair;
 pub(crate) mod automation_work_dispatch;
 pub(crate) mod capacity;
@@ -444,10 +445,11 @@ impl Store {
             let now = model::now_ms()?;
             let review_dispatch = automation_dispatch::reconcile(&tx, 16, 64, now)?;
             let work_dispatch = automation_work_dispatch::reconcile(&tx, &config, 16, 64, now)?;
+            let publication = automation_publication::reconcile(&tx, &config, 16, 64, now)?;
             // The cursor, pending reasons, semantic slot and Operation are
             // durable before the host can observe an admitted action.
             tx.commit()?;
-            Ok(json!({"review_dispatch":review_dispatch,"work_dispatch":work_dispatch}))
+            Ok(json!({"review_dispatch":review_dispatch,"work_dispatch":work_dispatch,"publication":publication}))
         })
         .await
     }
@@ -1342,6 +1344,7 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
     OR (
         op.caller_id = 'eliot-internal-automation-v1'
         AND op.method NOT IN ('task.accept','agent.send')
+        AND op.method != 'forge.publish_ref'
         AND EXISTS (
             SELECT 1 FROM meta AS link
             WHERE link.key = 'automation:v1:operation:' || op.operation_id
@@ -1349,6 +1352,153 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
               AND json_extract(link.value_json, '$.record.technical_requester_id') = op.caller_id
               AND json_extract(link.value_json, '$.record.effective_manager_id') = :client
               AND json_extract(op.effective_request_json, '$.automation_on_behalf.effective_manager_id') = :client
+        )
+    )
+    OR (
+        op.caller_id = 'eliot-internal-automation-v1'
+        AND op.method = 'forge.publish_ref'
+        AND EXISTS (
+            SELECT 1
+            FROM meta AS link
+            JOIN operations AS accepted
+              ON accepted.operation_id = json_extract(link.value_json, '$.record.cause.operation_id')
+            JOIN tasks AS target
+              ON target.task_id = json_extract(link.value_json, '$.record.cause.task_id')
+            JOIN meta AS manager ON manager.key = 'client:' || :client
+            JOIN observations AS accepted_event
+              ON accepted_event.observation_id = json_extract(link.value_json, '$.record.cause.observation_id')
+            JOIN attempts AS source_attempt
+              ON source_attempt.attempt_id = json_extract(link.value_json, '$.record.cause.attempt_id')
+            WHERE link.key = 'automation:v1:operation:' || op.operation_id
+              AND json_type(link.value_json, '$.record') = 'object'
+              AND json_type(link.value_json, '$.record.schema_version') = 'integer'
+              AND json_extract(link.value_json, '$.record.schema_version') = 1
+              AND json_type(link.value_json, '$.record.operation_id') = 'text'
+              AND json_extract(link.value_json, '$.record.operation_id') = op.operation_id
+              AND json_type(link.value_json, '$.record.technical_requester_id') = 'text'
+              AND json_extract(link.value_json, '$.record.technical_requester_id') = op.caller_id
+              AND json_type(link.value_json, '$.record.effective_manager_id') = 'text'
+              AND json_extract(link.value_json, '$.record.effective_manager_id') = :client
+              AND json_type(link.value_json, '$.record.automation_id') = 'text'
+              AND length(json_extract(link.value_json, '$.record.automation_id')) > 0
+              AND json_type(link.value_json, '$.record.automation_revision') = 'integer'
+              AND json_extract(link.value_json, '$.record.automation_revision') > 0
+              AND json_type(link.value_json, '$.record.project_id') = 'text'
+              AND json_extract(link.value_json, '$.record.project_id') = target.project_id
+              AND json_type(link.value_json, '$.record.action') = 'text'
+              AND json_extract(link.value_json, '$.record.action') = op.method
+              AND json_type(link.value_json, '$.record.linked_at_ms') = 'integer'
+              AND json_extract(link.value_json, '$.record.linked_at_ms') >= 0
+              AND json_type(link.value_json, '$.record.cause') = 'object'
+              AND json_type(link.value_json, '$.record.cause.kind') = 'text'
+              AND json_extract(link.value_json, '$.record.cause.kind') = 'task.acceptance'
+              AND json_type(link.value_json, '$.record.cause.id') = 'text'
+              AND json_extract(link.value_json, '$.record.cause.id') = accepted.operation_id
+              AND json_type(link.value_json, '$.record.cause.operation_id') = 'text'
+              AND json_extract(link.value_json, '$.record.cause.operation_id') = accepted.operation_id
+              AND json_extract(link.value_json, '$.record.cause.task_id') = accepted.task_id
+              AND accepted.task_id = target.task_id
+              AND accepted.attempt_id = json_extract(link.value_json, '$.record.cause.attempt_id')
+              AND json_type(link.value_json, '$.record.cause.observation_id') = 'integer'
+              AND json_extract(link.value_json, '$.record.cause.observation_id') > 0
+              AND json_type(link.value_json, '$.record.cause.task_id') = 'text'
+              AND json_type(link.value_json, '$.record.cause.task_revision') = 'integer'
+              AND json_extract(link.value_json, '$.record.cause.task_revision') > 0
+              AND json_type(link.value_json, '$.record.cause.attempt_id') = 'text'
+              AND json_type(link.value_json, '$.record.cause.submission_ref') = 'text'
+              AND json_type(link.value_json, '$.record.cause.candidate_ref') = 'text'
+              AND json_type(link.value_json, '$.record.cause.gm_epoch') = 'integer'
+              AND json_extract(link.value_json, '$.record.cause.gm_epoch') > 0
+              AND json_type(link.value_json, '$.record.cause.policy_revision') = 'text'
+              AND json_type(link.value_json, '$.record.cause.target_ref') = 'text'
+              AND json_type(link.value_json, '$.record.cause.expected_old_ref') IN ('null', 'text')
+              AND json_type(link.value_json, '$.record.cause.expected_create') IN ('true', 'false')
+              AND (
+                  (json_extract(link.value_json, '$.record.cause.expected_create') = 1
+                   AND json_type(link.value_json, '$.record.cause.expected_old_ref') = 'null')
+                  OR (json_extract(link.value_json, '$.record.cause.expected_create') = 0
+                      AND json_type(link.value_json, '$.record.cause.expected_old_ref') = 'text')
+              )
+              AND json_type(link.value_json, '$.record.cause.activation_cut') = 'integer'
+              AND json_extract(link.value_json, '$.record.cause.activation_cut') >= 0
+              AND json_type(link.value_json, '$.record.cause.historical_replay_authorized') IN ('true', 'false')
+              AND json_extract(link.value_json, '$.record.cause.historical_replay_authorized') =
+                  CASE WHEN json_extract(link.value_json, '$.record.cause.observation_id')
+                                 <= json_extract(link.value_json, '$.record.cause.activation_cut')
+                       THEN 1 ELSE 0 END
+              AND op.task_id = target.task_id
+              AND op.attempt_id = json_extract(link.value_json, '$.record.cause.attempt_id')
+              AND json_extract(op.original_request_json, '$.accepted_operation_id') = accepted.operation_id
+              AND json_type(op.original_request_json, '$.expected_revision') = 'integer'
+              AND json_extract(op.original_request_json, '$.attempt_id') = json_extract(link.value_json, '$.record.cause.attempt_id')
+              AND json_extract(op.original_request_json, '$.attempt_id') = accepted.attempt_id
+              AND json_extract(op.original_request_json, '$.expected_revision') = json_extract(link.value_json, '$.record.cause.task_revision')
+              AND json_extract(op.original_request_json, '$.submission_ref') = json_extract(link.value_json, '$.record.cause.submission_ref')
+              AND json_extract(op.original_request_json, '$.candidate_ref') = json_extract(link.value_json, '$.record.cause.candidate_ref')
+              AND json_extract(op.original_request_json, '$.expected_policy_revision') = json_extract(link.value_json, '$.record.cause.policy_revision')
+              AND json_extract(op.original_request_json, '$.target_ref') = json_extract(link.value_json, '$.record.cause.target_ref')
+              AND json_extract(op.original_request_json, '$.expected_old_ref') IS json_extract(link.value_json, '$.record.cause.expected_old_ref')
+              AND json_type(op.original_request_json, '$.expected_create') IN ('true', 'false')
+              AND json_extract(op.original_request_json, '$.expected_create') IS json_extract(link.value_json, '$.record.cause.expected_create')
+              AND json_extract(op.effective_request_json, '$.automation_on_behalf.effective_manager_id') = :client
+              AND json_type(op.effective_request_json, '$.publication_intent') = 'object'
+              AND json_extract(op.effective_request_json, '$.publication_intent.operation_id') = op.operation_id
+              AND json_extract(op.effective_request_json, '$.publication_intent.project_id') = target.project_id
+              AND json_extract(op.effective_request_json, '$.publication_intent.attempt_id') = op.attempt_id
+              AND json_extract(op.effective_request_json, '$.publication_intent.task_revision') = json_extract(link.value_json, '$.record.cause.task_revision')
+              AND json_extract(op.effective_request_json, '$.publication_intent.admitted_gm_epoch') = json_extract(link.value_json, '$.record.cause.gm_epoch')
+              AND json_extract(op.effective_request_json, '$.publication_intent.submission_ref') = json_extract(link.value_json, '$.record.cause.submission_ref')
+              AND json_extract(op.effective_request_json, '$.publication_intent.accepted_operation_id') = accepted.operation_id
+              AND json_extract(op.effective_request_json, '$.publication_intent.candidate_ref') = json_extract(link.value_json, '$.record.cause.candidate_ref')
+              AND json_extract(op.effective_request_json, '$.publication_intent.policy_revision') = json_extract(link.value_json, '$.record.cause.policy_revision')
+              AND json_extract(op.effective_request_json, '$.publication_intent.target_ref') = json_extract(link.value_json, '$.record.cause.target_ref')
+              AND json_extract(op.effective_request_json, '$.publication_intent.expected_old_ref') IS json_extract(link.value_json, '$.record.cause.expected_old_ref')
+              AND json_extract(op.effective_request_json, '$.publication_intent.expected_create') IS json_extract(link.value_json, '$.record.cause.expected_create')
+              AND json_type(op.effective_request_json, '$.publication_intent.force') = 'false'
+              AND json_extract(op.effective_request_json, '$.publication_intent.force') = 0
+              AND accepted.method = 'task.accept'
+              AND accepted.state = 'settled'
+              AND json_extract(accepted.result_json, '$.outcome') = 'applied'
+              AND json_type(accepted.result_json, '$.task_accepted') = 'true'
+              AND json_extract(accepted.result_json, '$.task_accepted') = 1
+              AND json_extract(accepted.result_json, '$.acceptance_operation_id') = accepted.operation_id
+              AND json_extract(accepted.result_json, '$.task_id') = target.task_id
+              AND json_extract(accepted.result_json, '$.attempt_id') = accepted.attempt_id
+              AND json_extract(accepted.result_json, '$.task_revision') = json_extract(link.value_json, '$.record.cause.task_revision')
+              AND json_extract(accepted.result_json, '$.submission_ref') = json_extract(link.value_json, '$.record.cause.submission_ref')
+              AND json_extract(accepted.result_json, '$.candidate_ref') = json_extract(link.value_json, '$.record.cause.candidate_ref')
+              AND json_extract(accepted.original_request_json, '$.attempt_id') = accepted.attempt_id
+              AND json_extract(accepted.original_request_json, '$.expected_revision') = json_extract(link.value_json, '$.record.cause.task_revision')
+              AND json_extract(accepted.original_request_json, '$.submission_ref') = json_extract(link.value_json, '$.record.cause.submission_ref')
+              AND json_extract(accepted.original_request_json, '$.candidate_ref') = json_extract(link.value_json, '$.record.cause.candidate_ref')
+              AND accepted_event.source_stream_id = 'controller:acceptance'
+              AND accepted_event.source_event_key = 'accept:' || accepted.operation_id
+              AND accepted_event.kind = 'task.acceptance'
+              AND accepted_event.operation_id = accepted.operation_id
+              AND json_extract(accepted_event.payload_json, '$.outcome') = 'applied'
+              AND json_type(accepted_event.payload_json, '$.task_accepted') = 'true'
+              AND json_extract(accepted_event.payload_json, '$.task_accepted') = 1
+              AND json_extract(accepted_event.payload_json, '$.acceptance_operation_id') = accepted.operation_id
+              AND json_extract(accepted_event.payload_json, '$.task_id') = target.task_id
+              AND json_extract(accepted_event.payload_json, '$.attempt_id') = accepted.attempt_id
+              AND json_extract(accepted_event.payload_json, '$.task_revision') = json_extract(link.value_json, '$.record.cause.task_revision')
+              AND json_extract(accepted_event.payload_json, '$.submission_ref') = json_extract(link.value_json, '$.record.cause.submission_ref')
+              AND json_extract(accepted_event.payload_json, '$.candidate_ref') = json_extract(link.value_json, '$.record.cause.candidate_ref')
+              AND source_attempt.task_id = target.task_id
+              AND source_attempt.task_revision = json_extract(link.value_json, '$.record.cause.task_revision')
+              AND source_attempt.submission_ref = json_extract(link.value_json, '$.record.cause.submission_ref')
+              AND source_attempt.candidate_ref = json_extract(link.value_json, '$.record.cause.candidate_ref')
+              AND json_extract(manager.value_json, '$.role') = 'manager'
+              AND COALESCE(json_extract(manager.value_json, '$.disabled'), 0) = 0
+              AND (
+                  (SELECT owned.owner_id FROM attempts AS owned
+                   WHERE owned.task_id = target.task_id AND owned.released_at_ms IS NULL
+                   ORDER BY owned.created_at_ms DESC, owned.attempt_id DESC LIMIT 1) = :client
+                  OR EXISTS (
+                      SELECT 1 FROM meta AS gm
+                      WHERE gm.key = 'gm' AND json_extract(gm.value_json, '$.client_id') = :client
+                  )
+              )
         )
     )
     OR (
@@ -3127,7 +3277,10 @@ fn apply(
         "automation.config.apply" => {
             automation::apply(tx, p, v, id, config, now).map(|value| (value, false))
         }
-        "forge.publish_ref" => forge::reserve(tx, p, v, id, config).map(|v| (v, true)),
+        "forge.publish_ref" => forge::reserve(tx, p, v, id, config).map(|value| {
+            let queued = value.get("coalesced") != Some(&Value::Bool(true));
+            (value, queued)
+        }),
         "source.capture" => checks::reserve_source(tx, p, v, id, config).map(|v| (v, true)),
         "check.run" => checks::reserve(tx, p, v, id, config, plan.check_plan),
         "check.cancel" => checks::cancel(tx, p, v, id).map(|v| (v, false)),

@@ -59,10 +59,28 @@ expected old value or create intent, `force=false`, and policy revision before
 any network write. The request contains no local path, Git executable, remote
 URL, credential, or arbitrary command.
 
+An explicitly selected `publication` automation consumes applied
+`task.acceptance` observations. Its entry owner must be the current GM, and
+its settings select the exact allowlisted target and expected-old/create
+intent. The typed context records the real manager, technical requester,
+entry revision and immutable acceptance cause; it does not create a manager
+credential. Admission, worker start and the write boundary recheck current
+authority, acceptance, candidate and local Forge policy. See the
+[configuration contract](agent-operations/configuration.md) for the optional
+settings and explicit `include_existing` activation choice.
+
+Manual and automatic requests share the exact repository/candidate/commit/tree/
+target/expected-old-or-create slot. A duplicate links to the retained winner
+without another push. Sending, unknown and applied outcomes continue to own
+that slot. Proven no-effect cancellation, stale epoch, pre-write failure or
+completed Git rejection releases it for a new request under current rights;
+the old operation remains in history and is neither adopted nor replayed.
+
 ## Effect and recovery
 
-`forge.publish_ref` ends at durable admission: it returns the queued Operation
-receipt after the intent is committed and notifies the Store change signal. It
+`forge.publish_ref` ends at durable admission: a new intent returns a queued
+Operation receipt, while an exact duplicate returns a settled coalesced
+receipt naming its retained winner. Admission notifies the Store change signal. It
 does not run Git in the request/IPC future. The host-owned supervisor polls;
 each pass reads earlier uncertain work first, then starts queued work only
 while `host.mode.new_work` is enabled. Host shutdown awaits the supervisor

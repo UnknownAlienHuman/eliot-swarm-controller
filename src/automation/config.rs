@@ -34,6 +34,31 @@ pub(crate) struct ReviewSettings {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct PublicationSettings {
+    pub(crate) target_ref: String,
+    pub(crate) expected_old_ref: Option<String>,
+    pub(crate) expected_create: bool,
+}
+
+impl PublicationSettings {
+    fn validate(&self) -> Result<()> {
+        if !crate::forge::valid_branch_ref(&self.target_ref)
+            || self.expected_create == self.expected_old_ref.is_some()
+            || self
+                .expected_old_ref
+                .as_deref()
+                .is_some_and(|value| !crate::forge::valid_object_id(value))
+        {
+            return Err(Error::invalid(
+                "publication settings require a valid full branch ref and exactly one of expected_old_ref or expected_create=true",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AutomationEntry {
     pub(crate) schema_version: u32,
     pub(crate) automation_id: String,
@@ -48,6 +73,8 @@ pub(crate) struct AutomationEntry {
     pub(crate) steps: Vec<AutomationStep>,
     #[serde(default)]
     pub(crate) work_dispatch: Option<WorkDispatchLaunchSettings>,
+    #[serde(default)]
+    pub(crate) publication: Option<PublicationSettings>,
     pub(crate) review: ReviewSettings,
     pub(crate) created_at_ms: i64,
     pub(crate) updated_at_ms: i64,
@@ -75,6 +102,7 @@ impl AutomationEntry {
             scope: AutomationScope { work_pool_id: None },
             steps: Vec::new(),
             work_dispatch: None,
+            publication: None,
             review: ReviewSettings {
                 profile: None,
                 required_reviewers: 1,
@@ -141,6 +169,13 @@ impl AutomationEntry {
                 }));
             }
         }
+        if self.steps.contains(&AutomationStep::Publication) && self.publication.is_none() {
+            gaps.push(json!({
+                "code":"publication_settings_required",
+                "step":"publication",
+                "reason":"select an exact target ref and expected old ref or explicit create before enabling publication"
+            }));
+        }
         gaps
     }
 
@@ -156,6 +191,13 @@ impl AutomationEntry {
         self.enabled
             && self.steps.contains(&AutomationStep::WorkDispatch)
             && self.work_dispatch.is_some()
+            && self.scope.work_pool_id.is_none()
+    }
+
+    pub(crate) fn publication_ready(&self) -> bool {
+        self.enabled
+            && self.steps.contains(&AutomationStep::Publication)
+            && self.publication.is_some()
             && self.scope.work_pool_id.is_none()
     }
 }
@@ -311,6 +353,7 @@ pub(crate) fn apply_patch(
             "scope" => patch_scope(&mut next.scope, value)?,
             "steps" => next.steps = parse_steps(value)?,
             "work_dispatch" => patch_work_dispatch(&mut next.work_dispatch, value)?,
+            "publication" => patch_publication(&mut next.publication, value)?,
             "review" => patch_review(&mut next.review, value)?,
             _ => return Err(Error::invalid(format!("unknown automation field: {field}"))),
         }
@@ -323,6 +366,28 @@ pub(crate) fn apply_patch(
         next.updated_at_ms = now_ms;
     }
     Ok(next)
+}
+
+fn patch_publication(settings: &mut Option<PublicationSettings>, patch: &Value) -> Result<()> {
+    if patch.is_null() {
+        *settings = None;
+        return Ok(());
+    }
+    if !patch.is_object() {
+        return Err(Error::invalid(
+            "publication patch must be an object or null",
+        ));
+    }
+    let mut merged = match settings {
+        Some(settings) => serde_json::to_value(settings)?,
+        None => json!({}),
+    };
+    merge_object_patch(&mut merged, patch)?;
+    let parsed: PublicationSettings = serde_json::from_value(merged)
+        .map_err(|_| Error::invalid("invalid publication settings"))?;
+    parsed.validate()?;
+    *settings = Some(parsed);
+    Ok(())
 }
 
 fn patch_work_dispatch(
@@ -524,6 +589,14 @@ pub(crate) fn validate_entry(entry: &AutomationEntry) -> Result<()> {
             Error::new(
                 "AUTOMATION_RECORD_INVALID",
                 "stored work-dispatch settings do not match the launcher request contract",
+            )
+        })?;
+    }
+    if let Some(settings) = entry.publication.as_ref() {
+        settings.validate().map_err(|_| {
+            Error::new(
+                "AUTOMATION_RECORD_INVALID",
+                "stored publication settings do not match the exact Forge target contract",
             )
         })?;
     }

@@ -296,7 +296,7 @@ Reconcile these interfaces with #22 in the same implementation increment:
 | Watches | One service and one enabled/owner record for recurring actions; one-shot notices create no model work. |
 | Catalog | Profile permission differs from schema loading; list changes do not prove model consumption. |
 
-Register authorization, input validation, dispatch, durable links, result projection, CLI/MCP schema, profile tests and current documentation together. A missing optional source produces a scoped gap, not a disabled manual toolbox. `automation.explain` uses normal reasons such as waiting for capacity/manager or an existing result, not a fabricated failure.
+Register authorization, input validation, dispatch, durable links, result projection, CLI/MCP schema, profile tests and current documentation together. A missing optional source produces a scoped gap, not a disabled manual toolbox. `automation.config.explain` uses normal reasons such as waiting for capacity/manager or an existing result, not a fabricated failure.
 
 ## 13. O11 — Qualification
 

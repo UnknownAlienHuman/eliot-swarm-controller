@@ -587,15 +587,15 @@ fn reserve_with_actor(
                 }
             }
             if let Some(linkage) = actor.automation_linkage() {
+                let mut effective = json!({"request":v});
+                effective["automation_on_behalf"] = linkage;
                 tx.execute(
                     "UPDATE operations SET task_id=?2,attempt_id=?3,effective_request_json=?4 WHERE operation_id=?1",
                     params![
                         id,
                         task_id,
                         input.attempt_id,
-                        model::canonical(&json!({
-                            "automation_on_behalf":linkage,
-                        }))?,
+                        model::canonical(&effective)?,
                     ],
                 )?;
             }
@@ -610,6 +610,9 @@ fn reserve_with_actor(
     }
     let (manifest, _) = evidence(tx, actor, &input)?;
     let mut effective = json!({"evidence":manifest});
+    if actor.is_on_behalf() {
+        effective["request"] = v.clone();
+    }
     if let Some(linkage) = actor.automation_linkage() {
         effective["automation_on_behalf"] = linkage;
     }

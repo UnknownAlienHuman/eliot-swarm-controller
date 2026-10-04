@@ -263,11 +263,13 @@ pub(crate) struct OnBehalfOperationLink {
 }
 
 /// A validated retained attribution for an Operation admitted by automation.
-/// Review, Acceptance, WorkDispatch and Repair links keep separate provenance
-/// contracts; this enum is only their shared visibility boundary.
+/// Review, Acceptance, Publication, WorkDispatch and Repair links keep
+/// separate provenance contracts; this enum is only their shared visibility
+/// boundary.
 pub(crate) enum AnyOnBehalfOperationLink {
     Review(OnBehalfOperationLink),
     Acceptance(OnBehalfOperationLink),
+    Publication(OnBehalfOperationLink),
     WorkDispatch(crate::store::automation_work_dispatch::WorkDispatchOperationLink),
     Repair(Box<crate::store::automation_repair::RepairDispatchOperationLink>),
 }
@@ -277,6 +279,7 @@ impl AnyOnBehalfOperationLink {
         match self {
             Self::Review(link) => link.belongs_to(principal),
             Self::Acceptance(link) => link.belongs_to(principal),
+            Self::Publication(link) => link.belongs_to(principal),
             Self::WorkDispatch(link) => link.belongs_to(principal),
             Self::Repair(link) => {
                 principal.role == Role::Manager && principal.client_id == link.effective_manager_id
@@ -313,6 +316,7 @@ pub(crate) fn operation_link(
         ("review.assign", Some("applied_submission")) => "review.assign",
         ("task.request_changes", Some("review_result")) => "task.request_changes",
         ("task.accept", Some("review_result")) => "task.accept",
+        ("forge.publish_ref", Some("task.acceptance")) => "forge.publish_ref",
         _ => "",
     };
     if link.schema_version != 1
@@ -349,6 +353,8 @@ pub(crate) fn operation_link(
         validate_review_disposition_link(db, &link)?;
     } else if link.action == "task.accept" {
         validate_acceptance_link(db, &link)?;
+    } else if link.action == "forge.publish_ref" {
+        validate_publication_link(db, &link)?;
     }
     Ok(Some(link))
 }
@@ -753,6 +759,322 @@ fn validate_acceptance_review_pass(
     Ok(())
 }
 
+struct PublicationOperationRow {
+    caller_id: String,
+    method: String,
+    task_id: Option<String>,
+    attempt_id: Option<String>,
+    original_request_json: String,
+    effective_request_json: String,
+}
+
+struct AcceptedSourceOperationRow {
+    method: String,
+    state: String,
+    task_id: Option<String>,
+    attempt_id: Option<String>,
+    original_request_json: String,
+    effective_request_json: String,
+    result_json: Option<String>,
+}
+
+struct AcceptanceObservationRow {
+    observation_id: i64,
+    operation_id: String,
+    payload_json: String,
+}
+
+struct PublicationAttemptSubjectRow {
+    task_id: String,
+    task_revision: i64,
+    submission_ref: Option<String>,
+    candidate_ref: Option<String>,
+}
+
+fn validate_publication_link(db: &Connection, link: &OnBehalfOperationLink) -> Result<()> {
+    let corrupt = || {
+        Error::new(
+            "AUTOMATION_LINK_CORRUPT",
+            "publication link does not match its exact accepted candidate and Forge intent",
+        )
+    };
+    let cause = &link.cause;
+    model::fields(
+        cause,
+        &[
+            "kind",
+            "observation_id",
+            "operation_id",
+            "id",
+            "task_id",
+            "task_revision",
+            "attempt_id",
+            "submission_ref",
+            "candidate_ref",
+            "canonical_repository",
+            "gm_epoch",
+            "policy_revision",
+            "target_ref",
+            "expected_old_ref",
+            "expected_create",
+            "activation_cut",
+            "historical_replay_authorized",
+        ],
+    )
+    .map_err(|_| corrupt())?;
+    let accepted_operation_id = cause["operation_id"].as_str().ok_or_else(corrupt)?;
+    let observation_id = cause["observation_id"].as_i64().ok_or_else(corrupt)?;
+    let activation_cut = cause["activation_cut"].as_i64().ok_or_else(corrupt)?;
+    let historical_replay_authorized = cause["historical_replay_authorized"]
+        .as_bool()
+        .ok_or_else(corrupt)?;
+    if link.action != "forge.publish_ref"
+        || cause["kind"] != "task.acceptance"
+        || accepted_operation_id.is_empty()
+        || cause["id"] != accepted_operation_id
+        || observation_id <= 0
+        || activation_cut < 0
+        || historical_replay_authorized != (observation_id <= activation_cut)
+        || cause["gm_epoch"].as_i64().is_none_or(|epoch| epoch <= 0)
+    {
+        return Err(corrupt());
+    }
+
+    let accepted_key = format!("accept:{accepted_operation_id}");
+    let observation: Option<AcceptanceObservationRow> = db
+        .query_row(
+            "SELECT observation_id,operation_id,payload_json FROM observations \
+             WHERE source_stream_id='controller:acceptance' AND source_event_key=?1 \
+               AND kind='task.acceptance'",
+            [&accepted_key],
+            |row| {
+                Ok(AcceptanceObservationRow {
+                    observation_id: row.get(0)?,
+                    operation_id: row.get(1)?,
+                    payload_json: row.get(2)?,
+                })
+            },
+        )
+        .optional()?;
+    let Some(observation) = observation else {
+        return Err(corrupt());
+    };
+    let observed_payload: Value =
+        serde_json::from_str(&observation.payload_json).map_err(|_| corrupt())?;
+
+    let accepted_operation: Option<AcceptedSourceOperationRow> = db
+        .query_row(
+            "SELECT method,state,task_id,attempt_id,original_request_json, \
+                    effective_request_json,result_json \
+             FROM operations WHERE operation_id=?1",
+            [accepted_operation_id],
+            |row| {
+                Ok(AcceptedSourceOperationRow {
+                    method: row.get(0)?,
+                    state: row.get(1)?,
+                    task_id: row.get(2)?,
+                    attempt_id: row.get(3)?,
+                    original_request_json: row.get(4)?,
+                    effective_request_json: row.get(5)?,
+                    result_json: row.get(6)?,
+                })
+            },
+        )
+        .optional()?;
+    let Some(accepted_operation) = accepted_operation else {
+        return Err(corrupt());
+    };
+    let accepted_result: Value =
+        serde_json::from_str(&accepted_operation.result_json.ok_or_else(corrupt)?)
+            .map_err(|_| corrupt())?;
+    let accepted_request_value: Value =
+        serde_json::from_str(&accepted_operation.original_request_json).map_err(|_| corrupt())?;
+    let accepted_request = AcceptRequest::parse(&accepted_request_value).map_err(|_| corrupt())?;
+    let accepted_task_id = cause["task_id"].as_str().ok_or_else(corrupt)?;
+    let attempt_id = cause["attempt_id"].as_str().ok_or_else(corrupt)?;
+    let task_revision = cause["task_revision"].as_i64().ok_or_else(corrupt)?;
+    let submission_ref = cause["submission_ref"].as_str().ok_or_else(corrupt)?;
+    let candidate_ref = cause["candidate_ref"].as_str().ok_or_else(corrupt)?;
+    let canonical_repository = cause["canonical_repository"].as_str().ok_or_else(corrupt)?;
+    if crate::forge::canonical_repository(canonical_repository).map_err(|_| corrupt())?
+        != canonical_repository
+    {
+        return Err(corrupt());
+    }
+    let target_ref = cause["target_ref"].as_str().ok_or_else(corrupt)?;
+    let expected_old_ref = match &cause["expected_old_ref"] {
+        Value::Null => None,
+        Value::String(value) => Some(value.clone()),
+        _ => return Err(corrupt()),
+    };
+    let expected_create = cause["expected_create"].as_bool().ok_or_else(corrupt)?;
+    let source_task: Option<String> = db
+        .query_row(
+            "SELECT project_id FROM tasks WHERE task_id=?1",
+            [accepted_task_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let source_attempt: Option<PublicationAttemptSubjectRow> = db
+        .query_row(
+            "SELECT task_id,task_revision,submission_ref,candidate_ref \
+             FROM attempts WHERE attempt_id=?1",
+            [attempt_id],
+            |row| {
+                Ok(PublicationAttemptSubjectRow {
+                    task_id: row.get(0)?,
+                    task_revision: row.get(1)?,
+                    submission_ref: row.get(2)?,
+                    candidate_ref: row.get(3)?,
+                })
+            },
+        )
+        .optional()?;
+    if observation.observation_id != observation_id
+        || observation.operation_id != accepted_operation_id
+        || observed_payload != accepted_result
+        || accepted_operation.method != "task.accept"
+        || accepted_operation.state != "settled"
+        || accepted_operation.task_id.as_deref() != Some(accepted_task_id)
+        || accepted_operation.attempt_id.as_deref() != Some(attempt_id)
+        || accepted_result["outcome"] != "applied"
+        || accepted_result["task_accepted"] != true
+        || accepted_result["acceptance_operation_id"] != accepted_operation_id
+        || accepted_result["task_id"] != accepted_task_id
+        || accepted_result["attempt_id"] != attempt_id
+        || accepted_result["task_revision"] != task_revision
+        || accepted_result["submission_ref"] != submission_ref
+        || accepted_result["candidate_ref"] != candidate_ref
+        || accepted_request.attempt_id != attempt_id
+        || accepted_request.expected_revision != task_revision
+        || accepted_request.submission_ref != submission_ref
+        || accepted_request.candidate_ref != candidate_ref
+        || source_task.as_deref() != Some(link.project_id.as_str())
+        || !source_attempt.is_some_and(|attempt| {
+            attempt.task_id == accepted_task_id
+                && attempt.task_revision == task_revision
+                && attempt.submission_ref.as_deref() == Some(submission_ref)
+                && attempt.candidate_ref.as_deref() == Some(candidate_ref)
+        })
+    {
+        return Err(corrupt());
+    }
+
+    let accepted_effective: Value =
+        serde_json::from_str(&accepted_operation.effective_request_json).map_err(|_| corrupt())?;
+    match accepted_effective.get("automation_on_behalf") {
+        Some(Value::Object(_)) => {
+            if !operation_link(db, accepted_operation_id)?
+                .is_some_and(|source_link| source_link.action == "task.accept")
+            {
+                return Err(corrupt());
+            }
+        }
+        None | Some(Value::Null) => {
+            if operation_link(db, accepted_operation_id)?.is_some() {
+                return Err(corrupt());
+            }
+        }
+        Some(_) => return Err(corrupt()),
+    }
+
+    let publication_operation: Option<PublicationOperationRow> = db
+        .query_row(
+            "SELECT caller_id,method,task_id,attempt_id,original_request_json, \
+                    effective_request_json \
+             FROM operations WHERE operation_id=?1",
+            [&link.operation_id],
+            |row| {
+                Ok(PublicationOperationRow {
+                    caller_id: row.get(0)?,
+                    method: row.get(1)?,
+                    task_id: row.get(2)?,
+                    attempt_id: row.get(3)?,
+                    original_request_json: row.get(4)?,
+                    effective_request_json: row.get(5)?,
+                })
+            },
+        )
+        .optional()?;
+    let Some(publication_operation) = publication_operation else {
+        return Err(corrupt());
+    };
+    let request_value: Value = serde_json::from_str(&publication_operation.original_request_json)
+        .map_err(|_| corrupt())?;
+    let request = crate::forge::PublishRefRequest::parse(&request_value).map_err(|_| corrupt())?;
+    let effective: Value = serde_json::from_str(&publication_operation.effective_request_json)
+        .map_err(|_| corrupt())?;
+    model::fields(
+        &effective,
+        &["publication_intent", "automation_on_behalf", "receipt"],
+    )
+    .map_err(|_| corrupt())?;
+    let saved_linkage = effective
+        .get("automation_on_behalf")
+        .filter(|value| value.is_object())
+        .ok_or_else(corrupt)?;
+    let expected_linkage = json!({
+        "schema_version":link.schema_version,
+        "technical_requester_id":link.technical_requester_id,
+        "effective_manager_id":link.effective_manager_id,
+        "automation_id":link.automation_id,
+        "automation_revision":link.automation_revision,
+        "project_id":link.project_id,
+        "action":link.action,
+        "cause":link.cause
+    });
+    let receipt = effective
+        .get("receipt")
+        .filter(|value| value.is_object())
+        .ok_or_else(corrupt)?;
+    model::fields(receipt, &["ok", "value"]).map_err(|_| corrupt())?;
+    if receipt["ok"] != true || receipt["value"]["operation_id"] != link.operation_id {
+        return Err(corrupt());
+    }
+    let intent: crate::forge::PublicationIntent = serde_json::from_value(
+        effective
+            .get("publication_intent")
+            .cloned()
+            .ok_or_else(corrupt)?,
+    )
+    .map_err(|_| corrupt())?;
+    intent.validate().map_err(|_| corrupt())?;
+    let gm_epoch = cause["gm_epoch"].as_i64().ok_or_else(corrupt)?;
+    let policy_revision = cause["policy_revision"].as_str().ok_or_else(corrupt)?;
+    if publication_operation.caller_id != link.technical_requester_id
+        || publication_operation.method != "forge.publish_ref"
+        || publication_operation.task_id.as_deref() != Some(accepted_task_id)
+        || publication_operation.attempt_id.as_deref() != Some(attempt_id)
+        || saved_linkage != &expected_linkage
+        || request.accepted_operation_id != accepted_operation_id
+        || request.attempt_id != attempt_id
+        || request.expected_revision != task_revision
+        || request.submission_ref != submission_ref
+        || request.candidate_ref != candidate_ref
+        || request.expected_policy_revision != policy_revision
+        || request.target_ref != target_ref
+        || request.expected_old_ref != expected_old_ref
+        || request.expected_create != expected_create
+        || intent.operation_id != link.operation_id
+        || intent.project_id != link.project_id
+        || intent.attempt_id != attempt_id
+        || intent.task_revision != task_revision
+        || intent.canonical_repository != canonical_repository
+        || intent.admitted_gm_epoch != gm_epoch
+        || intent.submission_ref != submission_ref
+        || intent.accepted_operation_id != accepted_operation_id
+        || intent.candidate_ref != candidate_ref
+        || intent.policy_revision != policy_revision
+        || intent.target_ref != target_ref
+        || intent.expected_old_ref != expected_old_ref
+        || intent.expected_create != expected_create
+        || intent.force
+    {
+        return Err(corrupt());
+    }
+    Ok(())
+}
+
 fn validate_review_disposition_link(db: &Connection, link: &OnBehalfOperationLink) -> Result<()> {
     let corrupt = || {
         Error::new(
@@ -958,6 +1280,15 @@ pub(crate) fn on_behalf_visible_to(
             })?;
             current_manager_has_task_scope(db, principal, task_id, &link.project_id)
         }
+        AnyOnBehalfOperationLink::Publication(link) => {
+            let task_id = link.cause["task_id"].as_str().ok_or_else(|| {
+                Error::new(
+                    "AUTOMATION_LINK_CORRUPT",
+                    "publication link has no exact Task identity",
+                )
+            })?;
+            current_manager_has_task_scope(db, principal, task_id, &link.project_id)
+        }
         AnyOnBehalfOperationLink::WorkDispatch(link) => {
             current_work_dispatch_scope_visible_to(db, principal, &link)
         }
@@ -1001,6 +1332,9 @@ pub(crate) fn any_on_behalf_operation_link(
         (Some(link), None, None) if link.action == "task.accept" => {
             Ok(Some(AnyOnBehalfOperationLink::Acceptance(link)))
         }
+        (Some(link), None, None) if link.action == "forge.publish_ref" => {
+            Ok(Some(AnyOnBehalfOperationLink::Publication(link)))
+        }
         (Some(link), None, None) => Ok(Some(AnyOnBehalfOperationLink::Review(link))),
         (None, Some(link), None) => Ok(Some(AnyOnBehalfOperationLink::WorkDispatch(link))),
         (None, None, Some(link)) => Ok(Some(AnyOnBehalfOperationLink::Repair(Box::new(link)))),
@@ -1036,7 +1370,7 @@ pub(crate) fn current_manager_has_task_scope(
     current_manager_id_has_task_scope(db, &principal.client_id, task_id, project_id)
 }
 
-fn current_manager_id_has_task_scope(
+pub(crate) fn current_manager_id_has_task_scope(
     db: &Connection,
     manager_id: &str,
     task_id: &str,
@@ -1138,11 +1472,16 @@ pub(crate) fn entry_operation_links(
                 "Operation appears more than once in the review entry index",
             ));
         }
-        if link.action == "task.accept" {
-            let task_id = link.cause["identity"]["task_id"].as_str().ok_or_else(|| {
+        if matches!(link.action.as_str(), "task.accept" | "forge.publish_ref") {
+            let task_id = if link.action == "task.accept" {
+                link.cause["identity"]["task_id"].as_str()
+            } else {
+                link.cause["task_id"].as_str()
+            }
+            .ok_or_else(|| {
                 Error::new(
                     "AUTOMATION_LINK_CORRUPT",
-                    "acceptance link has no exact Task identity",
+                    "on-behalf link has no exact Task identity",
                 )
             })?;
             if !current_manager_id_has_task_scope(db, owner, task_id, project)? {

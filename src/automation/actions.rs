@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 /// Steps retained in the manager-owned configuration format.
-/// Selected delivery and acceptance steps use the existing Store ledgers.
-/// Publication and GitHub projection retain explicit capability gaps.
+/// Selected delivery, acceptance, and publication steps use the existing Store
+/// ledgers. GitHub projection remains an explicit capability gap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum AutomationStep {
@@ -53,6 +53,7 @@ impl AutomationStep {
                 | Self::ReviewDisposition
                 | Self::RepairDispatch
                 | Self::Acceptance
+                | Self::Publication
         )
     }
 
@@ -112,6 +113,7 @@ pub(crate) fn supported_action_for(step: AutomationStep) -> Option<&'static str>
     match step {
         AutomationStep::WorkDispatch => Some("swarm.launch"),
         AutomationStep::ReviewDispatch => Some("review.assign"),
+        AutomationStep::Publication => Some("forge.publish_ref"),
         _ => None,
     }
 }
