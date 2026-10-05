@@ -1,6 +1,6 @@
 # Agent Operations — Rust Architecture and Execution Contracts
 
-Revision 13 · 2026-10-05 · source baseline `821251f5e59e88df38de9659393a50f4c0546984`.
+Revision 14 · 2026-10-05 · source review `2aec51bb1e3c8122da7d496142ac8e25a21969a3`.
 
 [Configuration](configuration.md) owns editable settings; [Delivery](delivery.md) owns work transitions; [Donor map](donor-map.md) separates source evidence from proposals. These contracts are not implementation claims.
 
@@ -9,6 +9,24 @@ Revision 13 · 2026-10-05 · source baseline `821251f5e59e88df38de9659393a50f4c0
 All owned host/Store, authorization, configuration, native transport/adapters, supervision, monitoring, GitHub, hooks, distribution/review, cron, Goal, MCP/gateway and script-runner logic is Rust. Python/PowerShell are optional external extensions. Vendor binaries and native Git remain external tools reached through typed Rust boundaries.
 
 Reuse maintained complete Rust libraries where suitable; qualify installed protocols/capabilities rather than prescribe a fixed release. Existing owned non-Rust bridges are migration inputs. Unsupported non-Rust-only integration remains an explicit gap, not invented parity or copied private vendor internals. New adapter settings do not restart existing work implicitly.
+
+### 1.0 Build, process and observability boundaries
+
+[Modular Runtime](modularity.md) defines independently compiled packages,
+versioned worker IPC, on-demand activation and per-module restart. A Rust `mod`
+or folder is not that boundary. Kernel/frontends/supervisor must not link adapter
+implementations. The bus dispatcher is separately replaceable, while durable
+journal append and Operation/cursor transactions stay inside the sole Store.
+An adapter-only change must not rebuild/restart the kernel or unrelated adapters.
+
+[Observability](observability.md) defines configurable levels/content depth,
+correlated error/exit/recovery facts, a bounded recorder and a live read-only view.
+Business receipts are not optional logs. Unused optional workers have no polling
+loop or native connection; failed optional workers restart locally, not through
+host-wide shutdown. Store/journal failure remains a distinct critical condition.
+Current source does not yet meet these boundaries; the [source recheck](modularity-review-2026-10-05.md)
+records the precise remaining defects. Do not interpret this specification as
+runtime qualification or as permission to repeat uncertain model/remote effects.
 
 ### 1.1 Universal transactional kernel and adapters
 
@@ -102,7 +120,7 @@ revision in its existing durable journal while unrelated entries progress.
 The current manager can read the bounded reason and pending/history through
 `automation.config.explain`. A valid replacement revision can release the hold
 through ordinary revalidation; changing the manager does not discard the cause.
-Store-wide failures remain visible failures of the supervisor.
+Store-wide failures remain visible failures of the supervisor. An optional worker failure is not automatically a Store-wide failure: isolate and restart that worker under the modular lifecycle contract; do not drop the core listener or signal unrelated workers to stop.
 
 A restart may temporarily invalidate an adapter's current binding while its
 previous confirmed observations remain valid historical facts. Reconciliation
