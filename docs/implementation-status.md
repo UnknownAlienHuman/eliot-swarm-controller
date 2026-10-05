@@ -71,6 +71,15 @@ Task/Attempt attribution requires the retained transactional binding. Manager
 attention and observer timeline gaps preserve bounded typed metadata without raw
 payloads; telemetry schema versions 1 and 2 remain supported.
 
+The optional recorder now applies an Info baseline and bounded live overrides
+for an exact module, client or Operation, including Off. Operation overrides
+take precedence over client and module overrides. Absolute expiration survives
+restart, and invalid updates retain the last valid policy. The existing lazy
+writer and reload loop apply filters without restarting producers. File schema
+1 remains readable; schema 2 adds scoped policy without changing diagnostic
+record schemas 1, 2 or 3. Recording currently supports metadata only. Manager
+logging controls and actual redacted content producers are still in progress.
+
 The Claude version-4 standalone Rust controller source is integrated with a
 provider-neutral retained `pre_input_open` contract and exact first-dispatch
 identity adoption. Rust owns IPC and durable operation receipts; the pinned

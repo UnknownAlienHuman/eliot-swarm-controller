@@ -373,8 +373,13 @@ impl Default for Counters {
 
 struct QueuedRecord {
     bytes: Vec<u8>,
+    // Sidecar identities keep the existing DiagnosticRecord wire schemas
+    // unchanged while allowing the writer to select a scoped policy.
     severity: DiagnosticSeverity,
     kind: DiagnosticKind,
+    module_id: Option<String>,
+    client_id: Option<String>,
+    operation_id: Option<String>,
 }
 
 enum Command {
@@ -516,6 +521,9 @@ impl Recorder {
             bytes,
             severity,
             kind,
+            module_id: record.module_id.clone(),
+            client_id: record.client_id.clone(),
+            operation_id: record.operation_id.clone(),
         })) {
             Ok(()) => {
                 self.counters
@@ -904,7 +912,14 @@ fn recorder_loop(
             Command::Shutdown => break,
             Command::Append(record) => {
                 let size = record.bytes.len() as u64;
-                if !live_settings.allows(record.severity, record.kind) {
+                if !live_settings.allows(
+                    now_unix_ms(),
+                    record.severity,
+                    record.kind,
+                    record.module_id.as_deref(),
+                    record.client_id.as_deref(),
+                    record.operation_id.as_deref(),
+                ) {
                     release_pending(&counters, size);
                     record_filtered(&counters, size);
                     continue;
@@ -1796,6 +1811,10 @@ fn project_capacity_item(item: &Value) -> Result<CapacityItemMetadata> {
 }
 
 fn read_completed_at_unix_ms() -> u64 {
+    now_unix_ms()
+}
+
+fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
