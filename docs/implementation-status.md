@@ -2,6 +2,57 @@
 
 ## Current state
 
+### PR #25 adapter processes, supervisor and diagnostics — 2026-10-05
+
+The workspace now contains independent production binaries for Codex,
+OpenCode, Command Code and Antigravity, plus the `swarm-checks` executor.
+Their shared protocol carries exact Operation, binding, generation, artifact
+and receipt identities. Selected-module admission rejects a command missing
+from the retained descriptor before queuing a native effect; reconcile checks
+the original command and delivery mode. Existing unselected bindings retain
+their legacy path.
+
+The optional `swarm-supervisor` actor connects durable Store demand to the
+standalone `swarm-module-owner` process. Startup is single-flight per retained
+module scope. An adapter becomes running after Store accepts its typed hello,
+not merely after process creation. Host restart reads retained work and scoped
+process evidence before reopening starts; it does not resend unknown input.
+Scoped failure observations reach `agent.state`, `report.delta` and Manager
+attention. Store failures keep recovery closed rather than acknowledge an
+uncommitted transition. This actor is outside the required host worker set;
+the remaining legacy optional worker extraction is still unfinished.
+
+The checks executable uses the existing CheckRun admission, process group and
+ACK/Go barrier. An explicitly configured executable must match its pinned image
+and artifact; an invalid selected executor cannot fall back to another worker.
+Plans resolve only after Store Go, and pending output readers retain the run.
+
+`swarm-observer` adds lazy, bounded diagnostic recording and the CLI commands
+`observer snapshot` and `observer follow`. The recorder is optional and starts
+only on the first emitted record. Invalid recorder bounds disable that recorder
+with a named diagnostic while the Store retains its ordinary telemetry producer.
+Recorder saturation and shutdown expose loss and pending counters. These files
+are diagnostic metadata, not transactional receipts or Task authority.
+An optional scoped JSON file can reload severity/category filters and retention
+settings on the existing lazy writer. Valid versions replace the whole snapshot;
+invalid updates retain prior settings and report bounded failure counters.
+
+Manual package build and create-only module installation tools are under
+`tools/ci` and `tools/modules`. They preserve immutable artifacts and publish
+the installed descriptor last. The package workflow builds one selected
+executable package only when explicitly dispatched; normal source pushes run
+the existing scoped compiler checks. Library-only packages are not installable
+binary artifacts.
+
+This entry records integrated source, not live deployment. The preceding
+`d36358cb7f4bcbb502572328923c4abd500d35a4` passed scoped formatting and strict
+production Clippy on Windows and remote Ubuntu in
+[run 37344640764](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37344640764).
+The new combined source requires its own compiler gate. Native models,
+process-failure injection, independent installation and full qualification
+remain unverified. No owner-machine build, model call or Codex restart was
+performed for this integration.
+
 ### PR #25 scoped child environment — 2026-10-05
 
 The module-owner wrapper clears the adapter child's inherited environment.

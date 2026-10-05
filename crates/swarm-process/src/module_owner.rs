@@ -23,11 +23,15 @@ use std::{
 use swarm_contracts::error::{Error, Result};
 
 const PLAN_VERSION: u64 = 1;
+const RESOLVER_MAP_VERSION: u64 = 2;
 const MAX_PLAN_BYTES: u64 = 65_536;
 const MAX_ARGV: usize = 128;
 const MAX_ARG_BYTES: usize = 4_096;
 const MAX_REFS: usize = 32;
 const MAX_REF_BYTES: usize = 4_096;
+const MAX_CREDENTIAL_FILE_BYTES: u64 = 4_096;
+const MAX_PROTECTED_REF_FILE_BYTES: u64 = 65_536;
+const MODULE_CREDENTIAL_FILE_ENV: &str = "ELIOT_SWARM_MODULE_CREDENTIAL_FILE";
 const OWNER_MAX_BYTES: u64 = 65_536;
 const MARKER: &str = "ELIOT_SWARM_MODULE_V1\n";
 
@@ -126,10 +130,12 @@ pub struct ModuleOwnerPlan {
 struct ResolverEntry {
     reference: String,
     credential_file: PathBuf,
+    sha256: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ProtectedResolverMap {
+    version: u64,
     module: String,
     binding: String,
     generation: String,
@@ -210,6 +216,18 @@ impl ProtectedRefResolver for ProtectedResolverMap {
         }
         let mut environment = plan.environment.clone();
         environment.reserve(plan.protected_refs.len());
+        let mut credential_refs = 0usize;
+        if self.version == 1
+            && plan
+                .protected_refs
+                .iter()
+                .any(|reference| reference.name == MODULE_CREDENTIAL_FILE_ENV)
+        {
+            return Err(Error::new(
+                "MODULE_OWNER_CREDENTIAL_DIGEST_MISSING",
+                "legacy path-only resolver maps cannot authorize a binding credential",
+            ));
+        }
         for reference in &plan.protected_refs {
             let entry = self
                 .entries
@@ -237,9 +255,44 @@ impl ProtectedRefResolver for ProtectedResolverMap {
                     ),
                 )
             })?;
+            if self.version == 2 {
+                let expected_sha256 = entry.sha256.as_deref().ok_or_else(|| {
+                    Error::new(
+                        "MODULE_OWNER_RESOLUTION_FAILED",
+                        "versioned resolver entry has no protected-file digest",
+                    )
+                })?;
+                let max_bytes = if reference.name == MODULE_CREDENTIAL_FILE_ENV {
+                    MAX_CREDENTIAL_FILE_BYTES
+                } else {
+                    MAX_PROTECTED_REF_FILE_BYTES
+                };
+                let actual_sha256 = hash_bounded_file_sha256(&credential_file, max_bytes)?;
+                if !actual_sha256.eq_ignore_ascii_case(expected_sha256) {
+                    return Err(Error::new(
+                        if reference.name == MODULE_CREDENTIAL_FILE_ENV {
+                            "MODULE_OWNER_CREDENTIAL_DIGEST_MISMATCH"
+                        } else {
+                            "MODULE_OWNER_PROTECTED_REF_DIGEST_MISMATCH"
+                        },
+                        "protected file differs from its resolver-map SHA-256 pin",
+                    ));
+                }
+            }
+            if reference.name == MODULE_CREDENTIAL_FILE_ENV {
+                credential_refs += 1;
+            }
             environment.push((
                 reference.name.clone(),
                 credential_file.to_string_lossy().into_owned(),
+            ));
+        }
+        if (self.version == 2 && credential_refs != 1)
+            || (self.version == 1 && credential_refs != 0)
+        {
+            return Err(Error::new(
+                "MODULE_OWNER_CREDENTIAL_DIGEST_MISSING",
+                "versioned resolver requires exactly one Store credential; legacy path-only maps cannot carry one",
             ));
         }
         Ok(ResolvedLaunch {
@@ -750,7 +803,11 @@ fn parse_resolver_map(value: Value) -> Result<ProtectedResolverMap> {
     if keys != expected.into_iter().collect() {
         return Err(Error::invalid("resolver map has unknown or missing fields"));
     }
-    if object.get("version").and_then(Value::as_u64) != Some(PLAN_VERSION) {
+    let version = object
+        .get("version")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| Error::new("MODULE_RESOLVER_VERSION", "resolver map version is missing"))?;
+    if !matches!(version, 1 | RESOLVER_MAP_VERSION) {
         return Err(Error::new(
             "MODULE_RESOLVER_VERSION",
             "unsupported resolver map version",
@@ -769,7 +826,12 @@ fn parse_resolver_map(value: Value) -> Result<ProtectedResolverMap> {
             .as_object()
             .ok_or_else(|| Error::invalid("resolver entry must be an object"))?;
         let entry_keys: BTreeSet<&str> = item.keys().map(String::as_str).collect();
-        if entry_keys != BTreeSet::from(["reference", "credential_file"]) {
+        let expected_entry_keys = if version == RESOLVER_MAP_VERSION {
+            BTreeSet::from(["reference", "credential_file", "sha256"])
+        } else {
+            BTreeSet::from(["reference", "credential_file"])
+        };
+        if entry_keys != expected_entry_keys {
             return Err(Error::invalid(
                 "resolver entry has unknown or missing fields",
             ));
@@ -780,6 +842,19 @@ fn parse_resolver_map(value: Value) -> Result<ProtectedResolverMap> {
             "resolver reference",
         )?;
         let credential_file = absolute_path(item, "credential_file")?;
+        let sha256 = if version == RESOLVER_MAP_VERSION {
+            Some(text_field(item, "sha256")?.to_owned())
+        } else {
+            None
+        };
+        if sha256
+            .as_deref()
+            .is_some_and(|digest| !is_sha256_hex(digest))
+        {
+            return Err(Error::invalid(
+                "resolver credential digest must be a 64-character SHA-256 hex value",
+            ));
+        }
         if !entries
             .iter()
             .all(|entry: &ResolverEntry| entry.reference.as_str() != reference.as_str())
@@ -789,9 +864,11 @@ fn parse_resolver_map(value: Value) -> Result<ProtectedResolverMap> {
         entries.push(ResolverEntry {
             reference,
             credential_file,
+            sha256,
         });
     }
     Ok(ProtectedResolverMap {
+        version,
         module: bounded_string(text_field(object, "module")?, MAX_REF_BYTES, "module")?,
         binding: bounded_string(text_field(object, "binding")?, MAX_REF_BYTES, "binding")?,
         generation: bounded_string(
@@ -818,6 +895,45 @@ fn parse_resolver_map(value: Value) -> Result<ProtectedResolverMap> {
         )?,
         entries,
     })
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn hash_bounded_file_sha256(path: &Path, max_bytes: u64) -> Result<String> {
+    use sha2::{Digest, Sha256};
+
+    let mut file = File::open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > max_bytes {
+        return Err(Error::new(
+            "MODULE_OWNER_PROTECTED_FILE_INVALID",
+            "protected file exceeds the regular-file size bound",
+        ));
+    }
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 1024];
+    let mut total = 0_u64;
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        total = total.saturating_add(read as u64);
+        if total > max_bytes {
+            return Err(Error::new(
+                "MODULE_OWNER_PROTECTED_FILE_INVALID",
+                "protected file exceeds the regular-file size bound",
+            ));
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 fn absolute_path(object: &Map<String, Value>, field: &str) -> Result<PathBuf> {

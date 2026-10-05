@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "module_id": "example.adapter",
+  "artifact": {
+    "artifact_id": "example.adapter.binary",
+    "version": "1.0.0",
+    "build_id": "build-2026-10-05"
+  },
+  "launch": {
+    "executable": "replaced-by-installer",
+    "argv": [],
+    "environment": [],
+    "credential_ref": null,
+    "working_directory": null,
+    "inherited_environment_allowlist": [],
+    "executable_sha256": null
+  },
+  "config_schema": null,
+  "command_schemas": [],
+  "event_schemas": [],
+  "protocol": {
+    "minimum": { "major": 1, "minor": 0 },
+    "maximum": { "major": 1, "minor": 0 }
+  },
+  "capabilities": [],
+  "lifecycle": "owned_service",
+  "activation": "on_demand",
+  "enabled": false,
+  "restart": {
+    "max_starts": 5,
+    "window_ms": 60000,
+    "initial_backoff_ms": 250,
+    "max_backoff_ms": 30000,
+    "reset_after_healthy_ms": 60000,
+    "jitter": true
+  }
+}

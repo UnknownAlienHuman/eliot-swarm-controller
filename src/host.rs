@@ -5,7 +5,8 @@ use crate::{
     platform::{DataRoot, bootstrap_credential},
     store::{Store, StoreOwner},
 };
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
+use swarm_observer::{LiveConfigSource, RecorderConfig};
 use tokio::{
     sync::{Semaphore, watch},
     task::{Id, JoinSet},
@@ -74,10 +75,39 @@ async fn run_until(
     let credential = bootstrap_credential(&root.path)
         .map_err(|error| startup_error("credential_bootstrap", error))?;
     let root_path = root.path.clone();
+    let observer = config.observability.enabled.then(|| {
+        let live_config = config
+            .observability
+            .live_config_file
+            .as_ref()
+            .map(|path| LiveConfigSource::new(path.clone(), &root.path));
+        let recorder_config = RecorderConfig {
+            directory: config.observability.recording_directory(&root.path),
+            queue_records: config.observability.queue_records,
+            queue_bytes: config.observability.queue_bytes,
+            max_record_bytes: config.observability.max_record_bytes,
+            segment_bytes: config.observability.file_segment_bytes,
+            retention_bytes: config.observability.retention_bytes,
+            retention_days: config.observability.retention_days,
+        };
+        let recorder = if recorder_config.validate().is_ok() {
+            swarm_observer::host::HostRecorder::new_with_live_config(recorder_config, live_config)
+        } else {
+            swarm_observer::host::HostRecorder::disabled_for_invalid_config(recorder_config)
+        };
+        Arc::new(recorder)
+    });
+    let line_observer = observer.as_ref().map(|recorder| {
+        let recorder = Arc::clone(recorder);
+        Arc::new(move |line: &[u8]| {
+            let _ = recorder.observe_line(line);
+        }) as swarm_telemetry::LineObserver
+    });
     let config = Arc::new(config);
-    let owner = StoreOwner::start(root, config.clone(), credential)
-        .await
-        .map_err(|error| startup_error("store_start", error))?;
+    let owner =
+        StoreOwner::start_with_line_observer(root, config.clone(), credential, line_observer)
+            .await
+            .map_err(|error| startup_error("store_start", error))?;
     let ipc_config = Arc::new(config.ipc.clone());
     let startup: Result<ipc::Listener> = async {
         owner.store.record_host_start().await?;
@@ -97,13 +127,35 @@ async fn run_until(
             {
                 eprintln!("host startup failure receipt: {}", receipt_error.code);
             }
+            let producer_drained = owner.store.drain_diagnostics(Duration::from_secs(5)).await;
+            let producer_stats = owner.store.diagnostic_stats();
             if let Err(close_error) = owner.close().await {
                 eprintln!("host startup Store close: {}", close_error.code);
             }
+            report_observer_shutdown(&observer, Some(producer_stats), producer_drained);
             return Err(error);
         }
     };
     let (shutdown, stopping) = watch::channel(false);
+    // Keep the optional actor outside the host's required JoinSet: a module
+    // failure cannot stop the Store, listener, or unrelated workers.
+    let optional_module_supervisor = if config.module_supervisor.enabled {
+        Some(
+            crate::host_module_supervisor::spawn_isolated_module_supervisor(
+                owner.store.clone(),
+                owner.module_supervisor_credential(),
+                root_path.clone(),
+                (*ipc_config).clone(),
+                config.module_supervisor.clone(),
+                stopping.clone(),
+            ),
+        )
+    } else {
+        None
+    };
+    let module_supervisor_handle = optional_module_supervisor
+        .as_ref()
+        .map(|actor| actor.handle.clone());
     let mut supervisors: JoinSet<(&'static str, Result<()>)> = JoinSet::new();
     // A JoinError contains the task ID but no output label; retain only each
     // fixed supervisor name so a panic can be attributed without its payload.
@@ -221,9 +273,12 @@ async fn run_until(
                 let stream=match accepted{Ok(s)=>s,Err(e)=>break Err(e)};
                 let permit=match semaphore.clone().try_acquire_owned(){Ok(p)=>p,Err(_)=>{drop(stream);continue}};
                 let store=owner.store.clone();let config=ipc_config.clone();let stopping=stopping.clone();
+                let module_supervisor=module_supervisor_handle.clone();
                 connections.spawn(async move{
                     let _permit=permit;
-                    if let Err(e)=ipc::serve(stream,store,config,stopping).await{eprintln!("IPC connection: {}",e.code);}
+                    if let Err(e)=ipc::serve_with_module_supervisor(
+                        stream,store,config,stopping,module_supervisor
+                    ).await{eprintln!("IPC connection: {}",e.code);}
                 });
             }
         }
@@ -231,6 +286,9 @@ async fn run_until(
     drop(listener);
     let _ = shutdown.send(true);
     while connections.join_next().await.is_some() {}
+    if let Some(actor) = optional_module_supervisor {
+        actor.join().await;
+    }
     // Await host-owned workers. Dropping the IPC caller or beginning shutdown
     // must not detach or replay an already admitted external publication.
     while let Some(result) = supervisors.join_next_with_id().await {
@@ -269,12 +327,88 @@ async fn run_until(
             exit = Err(error);
         }
     }
+    let producer_drained = owner.store.drain_diagnostics(Duration::from_secs(5)).await;
+    let producer_stats = owner.store.diagnostic_stats();
     if let Err(error) = owner.close().await
         && exit.is_ok()
     {
         exit = Err(error);
     }
+    report_observer_shutdown(&observer, Some(producer_stats), producer_drained);
     exit
+}
+
+fn report_observer_shutdown(
+    observer: &Option<Arc<swarm_observer::host::HostRecorder>>,
+    producer: Option<swarm_telemetry::Stats>,
+    producer_drained: bool,
+) {
+    let Some(observer) = observer else { return };
+    let (stats, shutdown_attempted, error_code) = if producer_drained {
+        let (stats, error_code) = observer.shutdown_with_status();
+        (Some(stats), true, error_code)
+    } else {
+        (
+            observer.try_stats(),
+            false,
+            Some("TELEMETRY_PRODUCER_DRAIN_TIMEOUT"),
+        )
+    };
+    let dropped_records = stats.as_ref().map(|stats| {
+        stats
+            .recorder
+            .dropped_records
+            .saturating_add(stats.startup_dropped_records)
+            .saturating_add(stats.post_shutdown_dropped_records)
+    });
+    let dropped_bytes = stats.as_ref().map(|stats| {
+        stats
+            .recorder
+            .dropped_bytes
+            .saturating_add(stats.startup_dropped_bytes)
+            .saturating_add(stats.post_shutdown_dropped_bytes)
+    });
+    eprintln!(
+        "{}",
+        serde_json::json!({
+            "event": "observer.shutdown",
+            "enabled": true,
+            "recorder_started": stats.as_ref().map(|stats| stats.started),
+            "recorder_shutdown_attempted": shutdown_attempted,
+            "recorder_stats_available": stats.is_some(),
+            "producer_drained": producer_drained,
+            "producer_pending_records": producer.as_ref().map(|value| value.pending_records),
+            "producer_pending_bytes": producer.as_ref().map(|value| value.pending_bytes),
+            "producer_enqueued_records": producer.as_ref().map(|value| value.enqueued_records),
+            "producer_written_records": producer.as_ref().map(|value| value.written_records),
+            "producer_written_bytes": producer.as_ref().map(|value| value.written_bytes),
+            "producer_dropped_records": producer.as_ref().map(|value| value.dropped_records),
+            "producer_dropped_bytes": producer.as_ref().map(|value| value.dropped_bytes),
+            "producer_sink_failures": producer.as_ref().map(|value| value.sink_failures),
+            "producer_startup_failures": producer.as_ref().map(|value| value.startup_failures),
+            "producer_observer_panics": producer.as_ref().map(|value| value.observer_panics),
+            "accepted_records": stats.as_ref().map(|stats| stats.recorder.accepted_records),
+            "written_records": stats.as_ref().map(|stats| stats.recorder.written_records),
+            "written_bytes": stats.as_ref().map(|stats| stats.recorder.written_bytes),
+            "dropped_records": dropped_records,
+            "dropped_bytes": dropped_bytes,
+            "durability_unknown_records": stats.as_ref().map(|stats| stats.recorder.durability_unknown_records),
+            "durability_unknown_bytes": stats.as_ref().map(|stats| stats.recorder.durability_unknown_bytes),
+            "sink_failures": stats.as_ref().map(|stats| stats.recorder.sink_failures),
+            "startup_failures": stats.as_ref().map(|stats| stats.startup_failures),
+            "callback_errors": stats.as_ref().map(|stats| stats.callback_errors),
+            "post_shutdown_dropped_records": stats.as_ref().map(|stats| stats.post_shutdown_dropped_records),
+            "post_shutdown_dropped_bytes": stats.as_ref().map(|stats| stats.post_shutdown_dropped_bytes),
+            "pending_records": stats.as_ref().map(|stats| stats.recorder.pending_records),
+            "pending_bytes": stats.as_ref().map(|stats| stats.recorder.pending_bytes),
+            "filtered_records": stats.as_ref().map(|stats| stats.recorder.filtered_records),
+            "filtered_bytes": stats.as_ref().map(|stats| stats.recorder.filtered_bytes),
+            "live_config_version": stats.as_ref().map(|stats| stats.recorder.live_config_version),
+            "live_config_reload_failures": stats.as_ref().map(|stats| stats.recorder.live_config_reload_failures),
+            "live_config_last_error_code": stats.as_ref().and_then(|stats| stats.recorder.live_config_last_error_code),
+            "error_code": error_code
+        })
+    );
 }
 
 /// Before the Store is available, the foreground launcher receives a precise

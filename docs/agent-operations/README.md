@@ -57,6 +57,7 @@ Enabling audit assignment does not enable distribution, repair or push. Importin
 | [Donor map](donor-map.md) | Source observations and precisely limited reuse. |
 | [Implementation](implementation.md) | Shared ownership, O1–O11 production work and qualification scenarios. |
 | [Modular Runtime](modularity.md) | Independent Cargo/process boundaries, bus transaction seam, module lifecycle, authority simplification and M1–M6 extraction order. |
+| [Module installation](module-installation.md) | Build, install, register and select one local Rust adapter with current config fields. |
 | [Observability](observability.md) | Log levels/content depth, correlated failures, live monitoring, bounded storage and future chart/export data. |
 | [Source recheck](modularity-review-2026-10-05.md) | Reproduced manager defect, source-confirmed failure/build seams, retained working invariants and remaining risk checks. |
 

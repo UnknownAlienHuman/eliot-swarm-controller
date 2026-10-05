@@ -654,7 +654,74 @@ pub(super) fn retained_contract_identity(
     }))
 }
 
-fn retained_descriptor(
+/// Reject a native runtime command that is outside the exact descriptor
+/// retained by this binding. Capabilities are compatibility metadata only;
+/// the existing Store authorization and reservation checks remain authoritative.
+/// A missing selector preserves the legacy route contract.
+pub(super) fn require_selected_native_command(
+    db: &Connection,
+    binding_id: &str,
+    binding_artifact_id: &str,
+    selector: Option<&Value>,
+    method: &str,
+    input: &Value,
+) -> Result<()> {
+    match selected_native_command_supported(db, binding_artifact_id, selector, method, input)? {
+        None | Some(true) => Ok(()),
+        Some(false) => Err(Error::new(
+            "MODULE_COMMAND_UNSUPPORTED",
+            format!("binding {binding_id} does not support runtime method {method}"),
+        )),
+    }
+}
+
+/// `None` means the binding has no retained descriptor and must keep legacy
+/// route behavior. `Some(true/false)` is an exact compatibility answer for a
+/// selected module descriptor.
+pub(super) fn selected_native_command_supported(
+    db: &Connection,
+    binding_artifact_id: &str,
+    selector: Option<&Value>,
+    method: &str,
+    input: &Value,
+) -> Result<Option<bool>> {
+    let Some(required) = native_command_capability(method, input) else {
+        return Ok(Some(true));
+    };
+    let Some(retained) = retained_contract_identity(db, binding_artifact_id, selector)? else {
+        return Ok(None);
+    };
+    Ok(Some(retained.capabilities.iter().any(|capability| {
+        capability_satisfies(capability.as_str(), required)
+    })))
+}
+
+fn native_command_capability(method: &str, input: &Value) -> Option<&'static str> {
+    Some(match method {
+        "agent.open" => "agent.open",
+        "task.dispatch" => "task.dispatch",
+        "agent.send" => match input.get("delivery").and_then(Value::as_str) {
+            Some("next_turn") => "agent.send/next_turn",
+            Some("steer") => "agent.send/steer",
+            _ => "agent.send",
+        },
+        "agent.reply" => "agent.reply",
+        "agent.configure" => "agent.configure",
+        "agent.goal" => "agent.goal",
+        "agent.background" => "agent.background",
+        "agent.refresh" => "agent.refresh",
+        "agent.reconcile" => "agent.reconcile",
+        "agent.result" => "agent.result",
+        "agent.recover" => "agent.recover",
+        _ => return None,
+    })
+}
+
+fn capability_satisfies(advertised: &str, required: &str) -> bool {
+    advertised == required || (required.starts_with("agent.send/") && advertised == "agent.send")
+}
+
+pub(super) fn retained_descriptor(
     db: &Connection,
     identity: &RetainedModuleIdentity,
 ) -> Result<ModuleDescriptor> {

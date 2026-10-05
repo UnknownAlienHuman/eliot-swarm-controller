@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "module_id": "runtime.command",
+  "artifact": {
+    "artifact_id": "eliot-command.rust-headless.1",
+    "version": "1",
+    "build_id": null
+  },
+  "launch": {
+    "executable": "<INSTALLER_ABSOLUTE_ADAPTER_PATH>",
+    "argv": [
+      { "kind": "literal", "value": "--config" },
+      { "kind": "literal", "value": "<INSTALLER_ABSOLUTE_ADAPTER_CONFIG_PATH>" }
+    ],
+    "environment": [],
+    "credential_ref": "credential:REPLACE_AT_INSTALL:command-module-binding",
+    "working_directory": null,
+    "inherited_environment_allowlist": [],
+    "executable_sha256": null
+  },
+  "config_schema": null,
+  "command_schemas": [
+    { "schema_id": "swarm.runtime_command", "version": "1", "sha256": null }
+  ],
+  "event_schemas": [
+    { "schema_id": "swarm.runtime_outcome", "version": "1", "sha256": null }
+  ],
+  "protocol": {
+    "minimum": { "major": 1, "minor": 0 },
+    "maximum": { "major": 1, "minor": 0 }
+  },
+  "capabilities": [
+    "agent.open",
+    "agent.reconcile",
+    "agent.refresh",
+    "task.dispatch"
+  ],
+  "lifecycle": "owned_service",
+  "activation": "on_demand",
+  "enabled": false,
+  "restart": {
+    "max_starts": 5,
+    "window_ms": 60000,
+    "initial_backoff_ms": 250,
+    "max_backoff_ms": 30000,
+    "reset_after_healthy_ms": 60000,
+    "jitter": true
+  }
+}

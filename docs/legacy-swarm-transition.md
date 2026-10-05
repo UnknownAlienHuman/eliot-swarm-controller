@@ -2,6 +2,14 @@
 
 The legacy Swarm skill supplied routing guidance, launch templates, scripts, and evidence habits. ELIOT already owns task admission, native sessions, operations, checks, reports, and acceptance. Carry useful controls through those owners; do not introduce a second scheduler, session owner, run database, or completion authority. This document describes mechanisms and gaps, not live qualification of a provider or installed launcher.
 
+## Host-specific skill migration boundary
+
+The retired host-specific skill is migration evidence, not an execution or authority surface. Do not carry its provider/model defaults, fixed manager or conversation/session bindings, direct host start/stop scripts, heuristic retries/timeouts, or usage-as-quota rules into current controller behavior. Any native session identity that a supported adapter still needs belongs only to the current authenticated binding and its exact durable Operation/readback contract; a legacy manager handle does not establish ownership.
+
+The launcher assignment context defines swarm.launch.preview as an effect-free plan and swarm.launch as the manager/current-owner admission operation using the exact preview digest and a caller-owned request ID. It revalidates current Task/Attempt/dependency/workspace facts, records intent before external effects, delegates work to existing owners, and reconciles uncertain effects by exact readback. That document explicitly marks its methods as design targets until implemented and qualified; method names or a historical successful input do not establish a live endpoint or accepted Task.
+
+Carry forward only host-independent collaboration controls that fit current owners: explicit objective/scope/stop conditions, one manager for fan-out, exclusive writer scope, independent verification, and evidence tied to exact durable Operations/source revisions. Keep Task, Attempt, Operation, artifact, check, and acceptance records as the existing sources of truth; do not restore a parallel skill run database, session scheduler, provider quota ledger, or completion authority.
+
 ## Mechanism mapping
 
 | Legacy control | Current owner | Coverage and boundary |

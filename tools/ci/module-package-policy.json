@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "format": "eliot.module_build_policy.v1",
+  "approved_package_names": [
+    "swarm-adapter-codex",
+    "swarm-adapter-command",
+    "swarm-antigravity-adapter",
+    "swarm-adapter-opencode",
+    "swarm-process",
+    "swarm-observer",
+    "swarm-checks",
+    "swarm-forge",
+    "swarm-forge-worker",
+    "swarm-bus"
+  ]
+}

@@ -1,0 +1,16 @@
+# Merge into the host's existing config.toml. Paths are absolute in this
+# example so their meaning is independent of the current working directory.
+[module_supervisor]
+enabled = true
+install_root = 'C:\ProgramData\EliotSwarm\modules'
+descriptor_files = [
+  'C:\ProgramData\EliotSwarm\modules\artifact-0000000000000000000000000000000000000000000000000000000000000000\module-descriptor.json',
+]
+owner_helper = 'C:\Program Files\Eliot Swarm\swarm-module-owner.exe'
+owner_helper_sha256 = '<lowercase sha256 emitted by Install-ModuleOwnerHelper.ps1>'
+route_config_mapper = 'descriptor_schema'
+
+# Add a [module_supervisor.protected_files] table only for additional
+# descriptor-declared protected references that have an already-existing
+# operator-provided file. Binding module IPC credentials are provisioned by
+# Store and must not be copied into this static table.

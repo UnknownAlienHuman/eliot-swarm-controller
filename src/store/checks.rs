@@ -6,7 +6,7 @@ use crate::{
     checks::{
         inputs,
         model::{CaptureRequest, CheckRequest},
-        source,
+        source, standalone_host,
         worker::{self, CancelRequest, Completion, Work},
     },
     config::Config,
@@ -1483,7 +1483,13 @@ impl Store {
             self.record_check_process_diagnostic(&work).await?;
             let scan = work.clone();
             if let Some(completion) = self
-                .file_io(move |files| worker::completion(&scan, &files))
+                .file_io(move |files| {
+                    if standalone_host::owns_work(&scan)? {
+                        standalone_host::finalize_execution(&scan, &files)
+                    } else {
+                        worker::completion(&scan, &files)
+                    }
+                })
                 .await?
             {
                 self.record_check_process_diagnostic(&work).await?;
@@ -1588,7 +1594,13 @@ impl Store {
                         }
                         let scan = w.clone();
                         let complete = self
-                            .file_io(move |files| worker::completion(&scan, &files))
+                            .file_io(move |files| {
+                                if standalone_host::owns_work(&scan)? {
+                                    standalone_host::finalize_execution(&scan, &files)
+                                } else {
+                                    worker::completion(&scan, &files)
+                                }
+                            })
                             .await?;
                         if let Some(c) = complete {
                             self.record_check_process_diagnostic(&w).await?;
@@ -1614,10 +1626,28 @@ impl Store {
                         match self.file_io(move |_| worker::ready(&scan)).await {
                             Ok(Some(identity)) => {
                                 let active = w.clone();
+                                let accepted_worker = identity.clone();
                                 if self.run(move |db| ready(db, &active, identity)).await? {
                                     let allow = w.clone();
-                                    // Persisted cancellation is delivered before go-ahead when both are pending.
-                                    self.file_io(move |_| { worker::deliver_cancel(&allow)?; worker::allow(&allow) }).await?;
+                                    self.file_io(move |files| {
+                                        // Persisted cancellation is delivered before go-ahead when both are pending.
+                                        worker::deliver_cancel(&allow)?;
+                                        worker::allow(&allow)?;
+                                        if standalone_host::owns_work(&allow)? {
+                                            if let Err(error) = standalone_host::materialize_plan(
+                                                &allow,
+                                                &files,
+                                                &accepted_worker,
+                                            ) {
+                                                standalone_host::publish_plan_failure(
+                                                    &allow,
+                                                    &accepted_worker,
+                                                )?;
+                                                return Err(error);
+                                            }
+                                        }
+                                        Ok(())
+                                    }).await?;
                                 }
                             }
                             Ok(None) => {},
@@ -1656,11 +1686,15 @@ impl Store {
             match self.run(move |db| next(db, &config, root)).await {
                 Ok(Some(w)) => {
                     let launch = w.clone();
+                    let executor = self.config.checks.executor.clone();
                     let error = if let Some(e) = w.preflight_error.clone() {
                         Some(e)
                     } else {
                         match self
-                            .file_io(move |_| worker::prepare_and_spawn(&launch))
+                            .file_io(move |_| match executor {
+                                Some(pin) => standalone_host::prepare_and_spawn(&launch, &pin),
+                                None => worker::prepare_and_spawn(&launch),
+                            })
                             .await
                         {
                             Ok(receipt) => {

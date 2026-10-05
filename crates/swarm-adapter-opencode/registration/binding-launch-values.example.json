@@ -1,0 +1,9 @@
+{
+  "OPENCODE_SERVICE_ID": "<operator-stable-service-id>",
+  "OPENCODE_CONNECTION_FILE": "<absolute-path-to-existing-connection-record>",
+  "OPENCODE_EXPECTED_VERSION": "<exact-version-from-attached-server>",
+  "OPENCODE_DIRECTORY": "<absolute-workspace-path>",
+  "OPENCODE_MODEL_ID": "<exact-model-id-from-manager-route>",
+  "OPENCODE_PROVIDER_ID": "<exact-case-sensitive-providerID-from-manager-route>",
+  "OPENCODE_VARIANT": "<exact-variant-from-manager-route>"
+}

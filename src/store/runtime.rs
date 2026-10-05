@@ -567,7 +567,8 @@ fn next_internal(
         let reconcile_starts_work = if method == "agent.reconcile"
             && b["observation"].get("module_contract_selector").is_some()
         {
-            let target = operations::get_operation(&tx, model::text(&input, "operation_id")?)?;
+            let target_id = model::text(&input, "operation_id")?;
+            let target = operations::get_operation(&tx, target_id)?;
             if target["binding_id"] != id
                 || target["binding_generation"] != generation
                 || !matches!(
@@ -578,6 +579,7 @@ fn next_internal(
                     &tx,
                     &b,
                     model::text(&target, "method")?,
+                    Some(target_id),
                 )?
                 .is_none()
             {
@@ -710,6 +712,14 @@ fn next_internal(
             trusted_launch_dispatch_packet =
                 super::launcher_dispatch::validate_before_effect(&tx, config, &op, &input, &b)?;
         }
+        super::module_handshake::require_selected_native_command(
+            &tx,
+            &id,
+            model::text(&b, "module_artifact_id")?,
+            b["observation"].get("module_contract_selector"),
+            &method,
+            &input,
+        )?;
         Ok(())
     })();
     if let Err(e) = guard {
@@ -1169,6 +1179,7 @@ fn validate_registered_module_recovery_link(
                 db,
                 binding,
                 model::text(&target, "method")?,
+                Some(&target_id),
             )?
             .is_none()
         {
@@ -1223,6 +1234,7 @@ fn validate_registered_module_recovery_link(
                 db,
                 binding,
                 model::text(operation, "method")?,
+                Some(&outcome.operation_id),
             )?
             .is_none()
         {
@@ -2846,7 +2858,13 @@ fn allows_rootless_open_reconcile(
             target["state"].as_str(),
             Some("sending" | "native_accepted" | "outcome_unknown")
         )
-        && operations::module_recovery_contract_for_binding(db, binding, "agent.open")?.is_some())
+        && operations::module_recovery_contract_for_binding(
+            db,
+            binding,
+            "agent.open",
+            Some(target_id),
+        )?
+        .is_some())
 }
 
 fn is_recovery_control(
@@ -3246,7 +3264,8 @@ fn user_command_with_actor(
         model::text(v, "session_id")?;
     }
     if method == "agent.reconcile" {
-        let target = operations::get_operation(tx, model::text(v, "operation_id")?)?;
+        let target_id = model::text(v, "operation_id")?;
+        let target = operations::get_operation(tx, target_id)?;
         if target["binding_id"] != id
             || target["binding_generation"] != generation
             || !matches!(
@@ -3258,17 +3277,42 @@ fn user_command_with_actor(
                 "reconcile requires an unresolved operation on this exact binding",
             ));
         }
-        if b["observation"].get("module_contract_selector").is_some()
-            && operations::registered_module_recovery_contract(
+        if let Some(selector) = b["observation"].get("module_contract_selector") {
+            super::module_handshake::require_selected_native_command(
+                tx,
+                id,
+                model::text(&b, "module_artifact_id")?,
+                Some(selector),
+                method,
+                v,
+            )?;
+            let target_method = model::text(&target, "method")?;
+            let target_request_json: String = tx.query_row(
+                "SELECT original_request_json FROM operations WHERE operation_id=?1 AND binding_id=?2 AND binding_generation=?3",
+                params![target_id, id, generation],
+                |row| row.get(0),
+            )?;
+            let target_input: Value = serde_json::from_str(&target_request_json)?;
+            super::module_handshake::require_selected_native_command(
+                tx,
+                id,
+                model::text(&b, "module_artifact_id")?,
+                Some(selector),
+                target_method,
+                &target_input,
+            )?;
+            if operations::registered_module_recovery_contract(
                 tx,
                 &b,
-                model::text(&target, "method")?,
+                target_method,
+                Some(target_id),
             )?
             .is_none()
-        {
-            return Err(Error::invalid(
-                "selected module descriptor does not support readback for this exact operation kind",
-            ));
+            {
+                return Err(Error::invalid(
+                    "selected module descriptor does not support readback for this exact operation kind",
+                ));
+            }
         }
         if crate::runtime::batch::is_sessionless_route(&b["route"])
             && !matches!(
@@ -3281,6 +3325,14 @@ fn user_command_with_actor(
             ));
         }
     }
+    super::module_handshake::require_selected_native_command(
+        tx,
+        id,
+        model::text(&b, "module_artifact_id")?,
+        b["observation"].get("module_contract_selector"),
+        method,
+        v,
+    )?;
     let prerequisite = prerequisites::validate_request(tx, &b, v, op)?;
     let prerequisite_id = prerequisite.operation_id().map(str::to_owned);
     let prerequisite_contract_revision = prerequisite.contract_revision().map(str::to_owned);

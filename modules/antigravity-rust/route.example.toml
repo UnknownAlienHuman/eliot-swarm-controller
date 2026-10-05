@@ -1,0 +1,10 @@
+
+[[routes]]
+alias = 'antigravity-rust-example'
+runtime = 'antigravity'
+module_artifact_id = 'eliot-antigravity.rust-headless.1'
+enabled = false
+[routes.native_options]
+workspaceRoot = 'C:\\Projects\\YourRepository'
+modelId = 'gemini-3.8-flash-high'
+reasoningEffort = 'high'

@@ -1,0 +1,5 @@
+{
+  "hostDataDir": "<INSTALLER_ABSOLUTE_HOST_DATA_DIR>",
+  "nativeExecutable": "<INSTALLER_ABSOLUTE_ANTIGRAVITY_CLI_PATH>",
+  "moduleArtifactId": "eliot-antigravity.rust-headless.1"
+}

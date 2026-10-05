@@ -1,0 +1,63 @@
+name: Manual module package
+on:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: Exact approved Cargo package name; it must already be a workspace member with owned binary targets.
+        type: string
+        required: true
+      profile:
+        description: Workspace build profile for the selected package.
+        type: choice
+        options:
+          - iterate
+          - release
+        default: iterate
+        required: true
+permissions:
+  contents: read
+jobs:
+  package:
+    name: Build one selected Windows module package
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+      - name: Install the repository-pinned Rust toolchain
+        shell: pwsh
+        run: |
+          $toolchain = [regex]::Match((Get-Content -Raw rust-toolchain.toml), '(?m)^\s*channel\s*=\s*"([^"]+)"\s*$')
+          if (-not $toolchain.Success) { throw 'rust-toolchain.toml has no exact channel.' }
+          rustup toolchain install $toolchain.Groups[1].Value --profile minimal --no-self-update
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustc --version --verbose
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo --version --verbose
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Resolve one package from Cargo metadata and build only its binaries
+        shell: pwsh
+        env:
+          MODULE_PACKAGE: ${{ inputs.package }}
+          MODULE_PROFILE: ${{ inputs.profile }}
+        run: |
+          $sharedTargetDir = Join-Path $env:RUNNER_TEMP 'eliot-module-shared-target'
+          $artifactDir = Join-Path $env:RUNNER_TEMP 'eliot-module-package'
+          $buildArgs = @(
+            '-NoProfile',
+            '-File', 'tools/ci/build-module-package.ps1',
+            '-Package', $env:MODULE_PACKAGE,
+            '-Profile', $env:MODULE_PROFILE,
+            '-TargetDir', $sharedTargetDir,
+            '-OutputDir', $artifactDir
+          )
+          & pwsh @buildArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: module-${{ inputs.package }}-${{ inputs.profile }}-${{ github.sha }}
+          path: ${{ runner.temp }}/eliot-module-package/
+          if-no-files-found: error
+          retention-days: 14

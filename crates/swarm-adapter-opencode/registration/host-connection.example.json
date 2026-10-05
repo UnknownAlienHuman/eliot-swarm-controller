@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "host_data_dir": "<INSTALLER_ABSOLUTE_HOST_DATA_DIR>",
+  "ipc": {
+    "max_frame_bytes": 1048576,
+    "max_connections": 256,
+    "max_inflight_per_connection": 8,
+    "write_timeout_seconds": 15
+  }
+}

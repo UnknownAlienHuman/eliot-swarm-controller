@@ -1,4 +1,5 @@
 use crate::error::{Error, Result};
+pub use crate::module_supervisor_config::{ModuleRouteConfigMapper, ModuleSupervisorConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -13,11 +14,58 @@ const COMMAND_RUST_ARTIFACT_ID: &str = "eliot-command.rust-headless.1";
 const ANTIGRAVITY_RUST_ARTIFACT_ID: &str = "eliot-antigravity.rust-headless.1";
 const ANTIGRAVITY_RUST_MODEL_ID: &str = "gemini-3.8-flash-high";
 
+/// Trusted local recorder settings. This controls only optional diagnostic
+/// metadata; it never disables or redirects Store/business receipts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ObservabilityConfig {
+    pub enabled: bool,
+    /// Relative paths resolve against the controller config file. When absent,
+    /// the host uses `<storage.data_dir>/diagnostics`.
+    #[serde(default, skip_serializing)]
+    pub directory: Option<PathBuf>,
+    /// Optional pinned JSON settings for live severity/category filters and
+    /// retention; read only after the lazy recorder starts.
+    #[serde(default, skip_serializing)]
+    pub live_config_file: Option<PathBuf>,
+    pub queue_records: usize,
+    pub queue_bytes: usize,
+    pub max_record_bytes: usize,
+    pub file_segment_bytes: u64,
+    pub retention_bytes: u64,
+    pub retention_days: u64,
+}
+
+impl Default for ObservabilityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            directory: None,
+            live_config_file: None,
+            queue_records: 256,
+            queue_bytes: 8_388_608,
+            max_record_bytes: 65_536,
+            file_segment_bytes: 16_777_216,
+            retention_bytes: 134_217_728,
+            retention_days: 7,
+        }
+    }
+}
+
+impl ObservabilityConfig {
+    pub fn recording_directory(&self, data_dir: &Path) -> PathBuf {
+        self.directory
+            .clone()
+            .unwrap_or_else(|| data_dir.join("diagnostics"))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub schema_version: u32,
     pub storage: Storage,
+    pub observability: ObservabilityConfig,
     pub ipc: Ipc,
     pub routes: Vec<Route>,
     /// Explicit operator-authorized OpenCode auth.json sources. References
@@ -31,6 +79,8 @@ pub struct Config {
     pub forge: crate::forge::ForgeConfig,
     pub workspace: crate::workspace::WorkspaceConfig,
     pub schedules: Vec<crate::scheduler::ScheduleConfig>,
+    /// Optional module failures isolate the actor while the Store remains available.
+    pub module_supervisor: ModuleSupervisorConfig,
 }
 
 /// Closed MCP method surfaces. A profile never changes the ELIOT role carried
@@ -462,6 +512,7 @@ impl Default for Config {
         Self {
             schema_version: 1,
             storage: Storage::default(),
+            observability: ObservabilityConfig::default(),
             ipc: Ipc::default(),
             routes: Vec::new(),
             opencode_provider_auth_sources: BTreeMap::new(),
@@ -471,6 +522,7 @@ impl Default for Config {
             forge: crate::forge::ForgeConfig::default(),
             workspace: crate::workspace::WorkspaceConfig::default(),
             schedules: Vec::new(),
+            module_supervisor: ModuleSupervisorConfig::default(),
         }
     }
 }
@@ -728,6 +780,17 @@ impl Config {
         cfg.mcp.validate()?;
         let config_dir =
             std::env::current_dir()?.join(path.and_then(Path::parent).unwrap_or(Path::new(".")));
+        if let Some(path) = cfg.observability.live_config_file.as_mut()
+            && path.is_relative()
+        {
+            *path = config_dir.join(&*path);
+        }
+        if let Some(directory) = cfg.observability.directory.as_mut()
+            && directory.is_relative()
+        {
+            *directory = config_dir.join(&*directory);
+        }
+        cfg.module_supervisor.resolve_paths(&config_dir);
         cfg.gateway.resolve_paths(&config_dir);
         cfg.gateway.validate(&cfg.mcp, &cfg.ipc)?;
         cfg.forge.resolve_paths(&config_dir)?;

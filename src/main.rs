@@ -184,6 +184,31 @@ enum Command {
         #[arg(long, default_value_t = 50)]
         limit: i64,
     },
+    Observer {
+        #[command(subcommand)]
+        command: ObserverCommand,
+    },
+}
+#[derive(Subcommand)]
+enum ObserverCommand {
+    /// Read the authenticated delta, attention, and capacity projections once.
+    Snapshot {
+        #[arg(long, default_value_t = 0)]
+        after: u64,
+        #[arg(long, default_value_t = 200)]
+        limit: u64,
+    },
+    /// Follow privacy-protected local diagnostic segments from an optional
+    /// `(segment, byte offset)` cursor. This is not a Store journal cursor.
+    Follow {
+        #[arg(long)]
+        after_segment: Option<u64>,
+        #[arg(long)]
+        after_offset: Option<u64>,
+        /// Return after the current file pass; without a cursor, begin at the newest segment's end.
+        #[arg(long)]
+        once: bool,
+    },
 }
 #[derive(Subcommand)]
 enum SourceCommand {
@@ -783,10 +808,66 @@ async fn run(cli: Cli) -> Result<()> {
         let bearer_token = load_local_bearer(bearer_path)?;
         return eliot_swarm_controller::gateway::run(config, credential, bearer_token).await;
     }
+    if let Command::Observer {
+        command:
+            ObserverCommand::Follow {
+                after_segment,
+                after_offset,
+                once,
+            },
+    } = &cli.command
+    {
+        if cli.request_id.is_some() || cli.credential.is_some() {
+            return Err(Error::invalid(
+                "observer follow reads only the current user's private local files and accepts no request or credential override",
+            ));
+        }
+        let cursor = match (after_segment, after_offset) {
+            (Some(segment), Some(offset)) => Some(swarm_observer::follow::FileCursor {
+                segment: *segment,
+                offset: *offset,
+            }),
+            (None, None) => None,
+            _ => {
+                return Err(Error::invalid(
+                    "--after-segment and --after-offset must be supplied together",
+                ));
+            }
+        };
+        swarm_observer::follow::follow_local(
+            &config
+                .observability
+                .recording_directory(&config.storage.data_dir),
+            cursor,
+            !*once,
+            &mut std::io::stdout(),
+        )?;
+        return Ok(());
+    }
     let credential = platform::load_credential(
         &cli.credential
             .unwrap_or_else(|| config.storage.data_dir.join("operator.json")),
     )?;
+    if let Command::Observer {
+        command: ObserverCommand::Snapshot { after, limit },
+    } = &cli.command
+    {
+        if cli.request_id.is_some() {
+            return Err(Error::invalid(
+                "--request-id is not used for observer snapshot reads",
+            ));
+        }
+        let snapshot = swarm_observer::readback_snapshot(
+            &config.storage.data_dir,
+            &credential,
+            &config.ipc,
+            *after,
+            *limit,
+        )
+        .await?;
+        println!("{}", serde_json::to_string_pretty(&snapshot)?);
+        return Ok(());
+    }
     if let Command::Mcp { profile } = &cli.command {
         return eliot_swarm_controller::mcp::run_profiled(config, credential, profile.as_deref())
             .await;
@@ -836,6 +917,7 @@ async fn run(cli: Cli) -> Result<()> {
         | Command::ModuleRun { .. } => {
             unreachable!("executor returned above")
         }
+        Command::Observer { .. } => unreachable!("observer read command returned above"),
         Command::Source {
             command: SourceCommand::Capture { file },
         } => ("source.capture".into(), read_json(&file)?),

@@ -217,7 +217,7 @@ fn module_bridge_recovery_action_for_operation(
         return Ok(None);
     }
     let Some((runtime, artifact_id, readback_boundary)) =
-        module_recovery_contract_for_binding(db, &binding, target_method)?
+        module_recovery_contract_for_binding(db, &binding, target_method, Some(operation_id))?
     else {
         return Ok(None);
     };
@@ -345,7 +345,7 @@ fn module_outcome_readback_action_for_operation(
         return Ok(None);
     }
     let Some((runtime, artifact_id, readback_boundary)) =
-        module_recovery_contract_for_binding(db, &binding, target_method)?
+        module_recovery_contract_for_binding(db, &binding, target_method, Some(operation_id))?
     else {
         return Ok(None);
     };
@@ -470,12 +470,18 @@ pub(super) fn module_recovery_contract_for_binding(
     db: &Connection,
     binding: &Value,
     target_method: &str,
+    target_operation_id: Option<&str>,
 ) -> Result<Option<(String, String, &'static str)>> {
     if binding["observation"]
         .get("module_contract_selector")
         .is_some()
     {
-        return registered_module_recovery_contract(db, binding, target_method);
+        return registered_module_recovery_contract(
+            db,
+            binding,
+            target_method,
+            target_operation_id,
+        );
     }
 
     Ok(
@@ -488,12 +494,13 @@ pub(super) fn module_recovery_contract_for_binding(
 }
 
 /// Return a readback contract only when the retained descriptor declares both
-/// the reconcile command and the exact target operation kind. The selected
-/// capability set is compatibility metadata, never authorization.
+/// the reconcile command and the exact target operation kind/mode. The
+/// selected capability set is compatibility metadata, never authorization.
 pub(super) fn registered_module_recovery_contract(
     db: &Connection,
     binding: &Value,
     target_method: &str,
+    target_operation_id: Option<&str>,
 ) -> Result<Option<(String, String, &'static str)>> {
     if !matches!(target_method, "agent.open" | "task.dispatch" | "agent.send") {
         return Ok(None);
@@ -520,7 +527,42 @@ pub(super) fn registered_module_recovery_contract(
             .iter()
             .any(|id| id.as_str() == capability)
     };
-    if !supports("agent.reconcile") || !supports(target_method) {
+    let target_input = if target_method == "agent.send" {
+        let Some(target_operation_id) = target_operation_id else {
+            return Ok(None);
+        };
+        let target_request: Option<String> = db
+            .query_row(
+                "SELECT original_request_json FROM operations WHERE operation_id=?1 AND method='agent.send' AND binding_id=?2 AND binding_generation=?3",
+                params![
+                    target_operation_id,
+                    model::text(binding, "binding_id")?,
+                    model::positive(binding, "generation")?
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(target_request) = target_request else {
+            return Ok(None);
+        };
+        serde_json::from_str::<Value>(&target_request).map_err(|_| {
+            Error::new(
+                "MODULE_RECONCILIATION_INVALID",
+                "stored target Operation request is malformed",
+            )
+        })?
+    } else {
+        json!({})
+    };
+    let supports_target = super::module_handshake::selected_native_command_supported(
+        db,
+        artifact_id,
+        Some(selector),
+        target_method,
+        &target_input,
+    )?
+    .unwrap_or(false);
+    if !supports("agent.reconcile") || !supports_target {
         return Ok(None);
     }
     let Some(runtime) = binding["route"]["runtime"]
@@ -2110,6 +2152,11 @@ fn public_observation(value: &Value) -> Value {
             observation.insert("native".to_owned(), native);
         }
     }
+    let module_supervisor =
+        super::module_supervisor_observation::public_projection(&value["module_supervisor"]);
+    if !module_supervisor.is_null() {
+        observation.insert("module_supervisor".to_owned(), module_supervisor);
+    }
     Value::Object(observation)
 }
 
@@ -2359,6 +2406,14 @@ fn reserve_open_route(
         &route.runtime,
         &route.module_artifact_id,
     )?;
+    super::module_handshake::require_selected_native_command(
+        tx,
+        &binding,
+        &route.module_artifact_id,
+        module_contract_selector.as_ref(),
+        "agent.open",
+        &json!({}),
+    )?;
     let mut binding_state = json!({
         "execution":"not_observed",
         "waiting_for":"runtime_adapter",
@@ -2451,6 +2506,14 @@ pub(super) fn dispatch(
             "native binding has not been observed ready",
         ));
     }
+    super::module_handshake::require_selected_native_command(
+        tx,
+        binding,
+        model::text(&b, "module_artifact_id")?,
+        b["observation"].get("module_contract_selector"),
+        "task.dispatch",
+        v,
+    )?;
     let prerequisite = prerequisites::validate_request(tx, &b, v, id)?;
     let launch_dispatch = launcher_dispatch::prepare_admission(tx, config, p, v, &a, &task, &b)?;
     let prerequisite_id = prerequisite.operation_id().map(str::to_owned);

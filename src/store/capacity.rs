@@ -1172,6 +1172,16 @@ fn build_attention_items(db: &Connection, now: i64) -> Result<Vec<Value>> {
             &binding_id,
         );
         let scope_key = scope["scope_key"].as_str().unwrap_or_default().to_owned();
+        if let Some(item) = super::module_supervisor_observation::manager_attention_item(
+            &binding["observation"]["module_supervisor"],
+            &scope_key,
+            &binding_id,
+            generation,
+            now,
+            STALE_AFTER_MS,
+        ) {
+            items.push(item);
+        }
         let native = &binding["observation"]["native"];
         let observed_at = binding["observation"]["observed_at_ms"].as_i64();
         let has_native = native.is_object();

@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://eliot.invalid/schemas/opencode-v2-native-options/1",
+  "title": "OpenCode V2 binding launch values",
+  "description": "Values passed individually as ELIOT_SWARM_CONFIG_<KEY>; they are copied from the exact immutable OpenCode route and are not synthesized by the supervisor.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "OPENCODE_SERVICE_ID",
+    "OPENCODE_CONNECTION_FILE",
+    "OPENCODE_EXPECTED_VERSION",
+    "OPENCODE_DIRECTORY",
+    "OPENCODE_MODEL_ID",
+    "OPENCODE_PROVIDER_ID",
+    "OPENCODE_VARIANT"
+  ],
+  "properties": {
+    "OPENCODE_SERVICE_ID": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._-]+$",
+      "description": "Operator-stable OpenCode service namespace; independent of native PID and GM incarnation."
+    },
+    "OPENCODE_CONNECTION_FILE": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "^(?:[A-Za-z]:\\\\|/)",
+      "description": "Absolute path to the existing operator-owned OpenCode connection record."
+    },
+    "OPENCODE_EXPECTED_VERSION": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "description": "Exact expected version reported by the attached server."
+    },
+    "OPENCODE_DIRECTORY": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "^(?:[A-Za-z]:\\\\|/)",
+      "description": "Absolute workspace path; mapped from the selected route's directory value."
+    },
+    "OPENCODE_MODEL_ID": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "OPENCODE_PROVIDER_ID": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "description": "Case-sensitive OpenCode providerID from the selected Manager route; no alias or default."
+    },
+    "OPENCODE_VARIANT": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    }
+  }
+}

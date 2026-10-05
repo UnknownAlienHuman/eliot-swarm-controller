@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "module_id": "eliot.opencode.v2",
+  "artifact": {
+    "artifact_id": "eliot-opencode-v2.rust-http.1",
+    "version": "0.1.0",
+    "build_id": null
+  },
+  "launch": {
+    "executable": "<INSTALLER_ABSOLUTE_ADAPTER_PATH>",
+    "argv": [
+      {"kind": "literal", "value": "--config"},
+      {"kind": "literal", "value": "<INSTALLER_ABSOLUTE_HOST_CONNECTION_CONFIG_PATH>"}
+    ],
+    "environment": [],
+    "credential_ref": "host.module-binding-credential",
+    "working_directory": null,
+    "inherited_environment_allowlist": [],
+    "executable_sha256": null
+  },
+  "config_schema": {
+    "schema_id": "opencode-v2-native-options",
+    "version": "1",
+    "sha256": "d597be6bae80dc82535b658b5daaf3037a09976e5704d799a6715a673a62f662"
+  },
+  "command_schemas": [
+    {"schema_id": "swarm.runtime_command", "version": "1"}
+  ],
+  "event_schemas": [
+    {"schema_id": "swarm.runtime_outcome", "version": "1"}
+  ],
+  "protocol": {
+    "minimum": {"major": 1, "minor": 0},
+    "maximum": {"major": 1, "minor": 0}
+  },
+  "capabilities": [
+    "agent.open",
+    "agent.reconcile",
+    "agent.send/next_turn",
+    "task.dispatch"
+  ],
+  "lifecycle": "external_attach",
+  "activation": "on_demand",
+  "enabled": false,
+  "restart": {
+    "max_starts": 5,
+    "window_ms": 60000,
+    "initial_backoff_ms": 250,
+    "max_backoff_ms": 30000,
+    "reset_after_healthy_ms": 60000,
+    "jitter": true
+  }
+}

@@ -1503,6 +1503,41 @@ pub(crate) fn reconcile_source_page(
     })
 }
 
+/// Advance one bounded page only when this local producer already has a
+/// durable source registration. Recovery callers must not register HookCommit
+/// before an automation selects it, because that would widen its history cut.
+pub(crate) fn reconcile_registered_source_page(
+    tx: &Transaction<'_>,
+    producer: LocalProducer,
+    limit: usize,
+    now_ms: i64,
+) -> Result<Option<ReconcilePage>> {
+    let source_id = producer.source_id();
+    let Some(registration) = load_registration(tx, source_id)? else {
+        return Ok(None);
+    };
+    validate_registration(&registration, source_id)?;
+    let cursor = load_cursor(tx, source_id)?.ok_or_else(|| {
+        Error::new(
+            "AUTOMATION_INTAKE_CURSOR_MISSING",
+            "registered intake source has no durable cursor",
+        )
+    })?;
+    let page = reconcile_source_page(tx, source_id, cursor.observation_id, limit, now_ms)?;
+    if matches!(
+        page.status,
+        IntakeStatus::UnknownSource | IntakeStatus::StaleCursor
+    ) || page.cursor.is_none()
+        || page.high_water.is_none()
+    {
+        return Err(Error::new(
+            "AUTOMATION_INTAKE_RECONCILIATION_FAILED",
+            "registered local source did not produce a current durable journal page",
+        ));
+    }
+    Ok(Some(page))
+}
+
 /// Read durable subjects by observation cursor. The query is bounded and
 /// repeatable; consumers advance their own read cursor only after handling
 /// the returned page. No task, Operation, or model call is created here.

@@ -91,7 +91,17 @@ pub async fn serve(
     stream: Stream,
     store: Store,
     config: Arc<Ipc>,
+    stopping: watch::Receiver<bool>,
+) -> Result<()> {
+    serve_with_module_supervisor(stream, store, config, stopping, None).await
+}
+
+pub(crate) async fn serve_with_module_supervisor(
+    stream: Stream,
+    store: Store,
+    config: Arc<Ipc>,
     mut stopping: watch::Receiver<bool>,
+    module_supervisor: Option<crate::host_module_supervisor::ModuleSupervisorHandle>,
 ) -> Result<()> {
     let (read, write) = tokio::io::split(stream);
     let mut reader = FramedRead::new(
@@ -153,9 +163,42 @@ pub async fn serve(
             incoming=reader.next(), if requests.len()<config.max_inflight_per_connection=>{
                 let line=match incoming{Some(Ok(line))=>line,_=>break};
                 let store=store.clone();let principal=principal.clone();let output=output.clone();let limit=config.max_frame_bytes;
+                let module_supervisor=module_supervisor.clone();
                 requests.spawn(async move{
                     let (id,result)=match decode(&line){
-                        Ok(r)=>{let id=json!(r.id);(id,store.call(principal,r.method,r.params).await)},
+                        Ok(r)=>{
+                            let id=json!(r.id);
+                            let method=r.method;
+                            let params=r.params;
+                            let result=store.call(principal,method.clone(),params.clone()).await;
+                            // Store has already authenticated this worker, compared
+                            // its claim to the retained descriptor, and verified the
+                            // existing owner boundary. Confirmation only clears the
+                            // lifecycle's hello wait; it grants no Operation rights.
+                            if method=="module.hello" {
+                                if let (Some(supervisor),Ok(reply))=(&module_supervisor,&result) {
+                                    let negotiation=&reply["module_contract_negotiation"];
+                                    if negotiation["status"]=="negotiated" {
+                                        let identity=(
+                                            negotiation["module_id"].as_str(),
+                                            reply["binding_id"].as_str(),
+                                            reply["generation"].as_u64(),
+                                            params["boot_id"].as_str(),
+                                        );
+                                        if let (Some(module_id),Some(binding_id),Some(generation),Some(boot_id))=identity {
+                                            let scope=swarm_supervisor::ServiceScope {
+                                                binding_id:binding_id.to_owned(),
+                                                generation,
+                                            };
+                                            if let Err(error)=supervisor.confirm_module_hello(module_id,&scope,boot_id).await {
+                                                eprintln!("module hello lifecycle confirmation: {}",error.code);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            (id,result)
+                        },
                         Err(e)=>(Value::Null,Err(e)),
                     };
                     let frame=match encode(&model::response(id.clone(),result),limit){

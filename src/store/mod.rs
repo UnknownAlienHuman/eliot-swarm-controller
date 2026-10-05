@@ -42,7 +42,11 @@ mod launcher_participant;
 mod message_batch;
 #[cfg(test)]
 mod module_bridge_recovery_tests;
+mod module_credential;
+pub(crate) use module_credential::ProvisionedModuleCredential;
+pub(crate) mod module_demand;
 mod module_handshake;
+mod module_supervisor_observation;
 mod native_mcp;
 #[cfg(test)]
 mod o6_taskless_path_fixture;
@@ -88,7 +92,7 @@ use rusqlite::{
     Connection, OptionalExtension, Transaction, TransactionBehavior, named_params, params,
 };
 use serde_json::{Value, json};
-use std::{path::Path, sync::Arc, thread::JoinHandle};
+use std::{path::Path, sync::Arc, thread::JoinHandle, time::Duration};
 use tokio::sync::{Semaphore, oneshot, watch};
 
 const SCHEMA: &str = include_str!("../../migrations/001_core.sql");
@@ -134,6 +138,17 @@ impl StoreOwner {
         config: Arc<Config>,
         credential: Credential,
     ) -> Result<Self> {
+        Self::start_with_line_observer(root, config, credential, None).await
+    }
+
+    pub(crate) async fn start_with_line_observer(
+        root: DataRoot,
+        config: Arc<Config>,
+        credential: Credential,
+        line_observer: Option<swarm_telemetry::LineObserver>,
+    ) -> Result<Self> {
+        // Recorder limits cannot reconfigure or prevent the operational stderr producer.
+        let telemetry_config = swarm_telemetry::Config::default();
         let artifacts = ArtifactFiles::new(&root.path)?;
         let data_dir = root.path.clone();
         let module_supervisor_credential = Credential {
@@ -194,7 +209,10 @@ impl StoreOwner {
                 artifacts,
                 data_dir,
                 artifact_io: Arc::new(Semaphore::new(4)),
-                telemetry: swarm_telemetry::Producer::new(swarm_telemetry::Config::default()),
+                telemetry: swarm_telemetry::Producer::with_line_observer(
+                    telemetry_config,
+                    line_observer,
+                ),
             },
         })
     }
@@ -232,6 +250,59 @@ async fn join_store_thread(thread: JoinHandle<()>, name: &'static str) -> Result
         .map_err(|_| Error::new("STORE_PANIC", format!("{name} panicked")))
 }
 impl Store {
+    /// A periodic durable snapshot covers missed change notifications and restarts.
+    pub(crate) fn subscribe_module_demand_changes(&self) -> watch::Receiver<u64> {
+        self.changed.subscribe()
+    }
+
+    pub(crate) async fn module_demand_snapshot(
+        &self,
+        cursor: Option<module_demand::ModuleDemandCursor>,
+    ) -> Result<module_demand::ModuleDemandSnapshot> {
+        self.run(move |db| module_demand::pending(db, cursor.as_ref()))
+            .await
+    }
+
+    /// Trusted status readback before releasing a stale scope's final demand lease.
+    pub(crate) async fn module_scope_readback(
+        &self,
+        module_id: String,
+        binding_id: String,
+        generation: i64,
+    ) -> Result<module_demand::ModuleScopeReadback> {
+        self.run(move |db| module_demand::scope_readback(db, &module_id, &binding_id, generation))
+            .await
+    }
+
+    /// Recover existing bounded source journals without dispatching automations.
+    pub(crate) async fn reconcile_module_recovery_journal_page(&self) -> Result<()> {
+        self.run(move |db| {
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let now = model::now_ms()?;
+            automation_dispatch::reconcile_source_intake(&tx, 64, false, now)?;
+            automation_intake::reconcile_registered_source_page(
+                &tx,
+                crate::automation::intake::LocalProducer::HookCommit,
+                64,
+                now,
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub(crate) async fn drain_diagnostics(&self, timeout: Duration) -> bool {
+        let telemetry = self.telemetry.clone();
+        tokio::task::spawn_blocking(move || telemetry.wait_for_idle(timeout))
+            .await
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn diagnostic_stats(&self) -> swarm_telemetry::Stats {
+        self.telemetry.stats()
+    }
+
     pub(crate) async fn record_host_start(&self) -> Result<()> {
         self.run(move |db| {
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;

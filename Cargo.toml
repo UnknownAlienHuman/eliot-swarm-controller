@@ -35,11 +35,13 @@ swarm-contracts = { path = "crates/swarm-contracts" }
 swarm-kernel = { path = "crates/swarm-kernel" }
 swarm-process = { path = "crates/swarm-process" }
 swarm-store = { path = "crates/swarm-store" }
+swarm-supervisor = { path = "crates/swarm-supervisor" }
 swarm-telemetry = { path = "crates/swarm-telemetry" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 swarm-checks = { path = "crates/swarm-checks" }
+swarm-observer = { path = "crates/swarm-observer" }
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "process", "sync", "signal", "time"] }
 tokio-util = { version = "0.7", features = ["codec"] }
@@ -68,13 +70,19 @@ lto = "off"
 # Own workspace boundary; the default entrypoint remains the root CLI/kernel.
 [workspace]
 members = [
+    "crates/swarm-adapter-codex",
+    "crates/swarm-adapter-command",
+    "crates/swarm-adapter-opencode",
     "crates/swarm-contracts",
     "crates/swarm-client",
     "crates/swarm-checks",
+    "crates/swarm-observer",
     "crates/swarm-kernel",
     "crates/swarm-process",
     "crates/swarm-store",
+    "crates/swarm-supervisor",
     "crates/swarm-telemetry",
+    "modules/antigravity-rust",
 ]
 default-members = ["."]
 resolver = "3"

@@ -16,6 +16,11 @@ pub struct CheckConfig {
     pub max_running: usize,
     pub git_executable: PathBuf,
     pub profiles: Vec<CheckProfile>,
+    /// Optional operator-pinned, separately built process adapter. When absent
+    /// the current in-process worker remains the migration-compatible path.
+    /// A selected pin is verified on every launch and never falls back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor: Option<ExecutorPin>,
 }
 impl Default for CheckConfig {
     fn default() -> Self {
@@ -24,8 +29,60 @@ impl Default for CheckConfig {
             max_running: 2,
             git_executable: "git".into(),
             profiles: Vec::new(),
+            executor: None,
         }
     }
+}
+
+/// Identity pin for the standalone `swarm-checks` process. This is trusted
+/// local controller configuration; a Manager cannot choose an executor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutorPin {
+    pub executable: PathBuf,
+    pub sha256: String,
+    pub artifact_id: String,
+    pub version: String,
+}
+
+impl ExecutorPin {
+    pub fn validate_shape(&self) -> Result<()> {
+        if !self.executable.is_absolute()
+            || !opaque_atom(&self.artifact_id)
+            || !version_atom(&self.version)
+            || !canonical_sha256(&self.sha256)
+        {
+            return Err(Error::invalid("standalone checks executor pin is invalid"));
+        }
+        Ok(())
+    }
+}
+
+fn opaque_atom(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value != "."
+        && value != ".."
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._:-+".contains(&byte))
+}
+
+fn version_atom(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value != "."
+        && value != ".."
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._+-".contains(&byte))
+}
+
+fn canonical_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -80,6 +137,9 @@ impl CheckConfig {
             return Err(Error::invalid(
                 "checks require max_running > 0 and git_executable",
             ));
+        }
+        if let Some(executor) = &self.executor {
+            executor.validate_shape()?;
         }
         let mut ids = BTreeSet::new();
         for p in &self.profiles {

@@ -11,12 +11,12 @@ use std::{
     io::{self, Write},
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
-        Arc, OnceLock,
+        Arc, Condvar, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
         mpsc::{Receiver, SyncSender, TrySendError, sync_channel},
     },
     thread,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const STATE_UNSTARTED: u8 = 0;
@@ -305,16 +305,26 @@ struct Counters {
     pending_bytes: AtomicU64,
     sink_failures: AtomicU64,
     startup_failures: AtomicU64,
+    observer_panics: AtomicU64,
     sink_failed: AtomicBool,
+    idle_mutex: Mutex<()>,
+    idle: Condvar,
 }
 
 struct Inner {
     config: Config,
+    line_observer: Option<LineObserver>,
     sender: OnceLock<SyncSender<Queued>>,
     state: Arc<AtomicU8>,
     next_sequence: AtomicU64,
     counters: Arc<Counters>,
 }
+
+/// A second best-effort consumer for the already-serialized closed metadata
+/// record. Implementations must use a nonblocking bounded handoff. The host
+/// recorder is called on this crate's diagnostic writer thread, never on a
+/// Store/kernel caller.
+pub type LineObserver = Arc<dyn Fn(&[u8]) + Send + Sync + 'static>;
 
 /// Cloneable, per-owner producer with no global state or mandatory install.
 #[derive(Clone)]
@@ -326,9 +336,17 @@ impl Producer {
     /// Construct without starting a worker. The first enabled emission starts
     /// one blocking stderr writer on a dedicated thread.
     pub fn new(config: Config) -> Self {
+        Self::with_line_observer(config, None)
+    }
+
+    /// Construct a producer that also offers each admitted closed metadata line
+    /// to an optional observer. The existing stderr sink and its accounting
+    /// remain independent; an observer panic is counted and cannot disable it.
+    pub fn with_line_observer(config: Config, line_observer: Option<LineObserver>) -> Self {
         Self {
             inner: Arc::new(Inner {
                 config,
+                line_observer,
                 sender: OnceLock::new(),
                 state: Arc::new(AtomicU8::new(STATE_UNSTARTED)),
                 next_sequence: AtomicU64::new(0),
@@ -450,7 +468,37 @@ impl Producer {
             pending_bytes: load(&self.inner.counters.pending_bytes),
             sink_failures: load(&self.inner.counters.sink_failures),
             startup_failures: load(&self.inner.counters.startup_failures),
+            observer_panics: load(&self.inner.counters.observer_panics),
         }
+    }
+
+    /// Wait for currently admitted diagnostics and line-observer callbacks to
+    /// finish. Call only after all event producers have stopped; this is not a
+    /// barrier against a concurrent future `emit`.
+    pub fn wait_for_idle(&self, timeout: Duration) -> bool {
+        let Some(deadline) = Instant::now().checked_add(timeout) else {
+            return false;
+        };
+        let mut guard = self
+            .inner
+            .counters
+            .idle_mutex
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while load(&self.inner.counters.pending_records) != 0 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let waited = self.inner.counters.idle.wait_timeout(guard, remaining);
+            let (next_guard, timeout_result) =
+                waited.unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard = next_guard;
+            if timeout_result.timed_out() && load(&self.inner.counters.pending_records) != 0 {
+                return false;
+            }
+        }
+        true
     }
 
     fn ensure_writer(&self) -> Result<&SyncSender<Queued>, DropReason> {
@@ -491,12 +539,19 @@ impl Producer {
         let (sender, receiver) = sync_channel(self.inner.config.queue_records);
         let counters = Arc::clone(&self.inner.counters);
         let state = Arc::clone(&self.inner.state);
+        let line_observer = self.inner.line_observer.clone();
         let spawned = thread::Builder::new()
             .name("swarm-telemetry-stderr".to_owned())
             .spawn(move || {
                 let mut active_bytes = None;
                 let result = catch_unwind(AssertUnwindSafe(|| {
-                    writer_loop(&receiver, &counters, &state, &mut active_bytes)
+                    writer_loop(
+                        &receiver,
+                        &counters,
+                        &state,
+                        line_observer,
+                        &mut active_bytes,
+                    )
                 }));
                 if result.is_err() {
                     mark_failed(&counters, &state);
@@ -580,12 +635,16 @@ pub struct Stats {
     pub pending_bytes: u64,
     pub sink_failures: u64,
     pub startup_failures: u64,
+    /// Observer callbacks that panicked. Recorder queue/sink losses are
+    /// counted by the observer itself and reported separately.
+    pub observer_panics: u64,
 }
 
 fn writer_loop(
     receiver: &Receiver<Queued>,
     counters: &Counters,
     state: &AtomicU8,
+    line_observer: Option<LineObserver>,
     active_bytes: &mut Option<u64>,
 ) {
     let stderr = io::stderr();
@@ -593,6 +652,11 @@ fn writer_loop(
     while let Ok(item) = receiver.recv() {
         let byte_count = item.bytes.len() as u64;
         *active_bytes = Some(byte_count);
+        if let Some(observer) = &line_observer
+            && catch_unwind(AssertUnwindSafe(|| observer(&item.bytes))).is_err()
+        {
+            atomic_add(&counters.observer_panics, 1);
+        }
         if sink_failed {
             finish_pending(counters, byte_count);
             record_drop(counters, 1, byte_count);
@@ -633,8 +697,15 @@ fn record_drop(counters: &Counters, records: u64, bytes: u64) {
 }
 
 fn finish_pending(counters: &Counters, bytes: u64) {
+    let _guard = counters
+        .idle_mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     atomic_sub(&counters.pending_records, 1);
     atomic_sub(&counters.pending_bytes, bytes);
+    if load(&counters.pending_records) == 0 {
+        counters.idle.notify_all();
+    }
 }
 
 fn reserve(counter: &AtomicU64, capacity: u64, amount: u64) -> bool {

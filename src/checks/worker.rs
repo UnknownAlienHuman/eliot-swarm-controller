@@ -1005,7 +1005,7 @@ pub fn failure(work: &Work, files: &ArtifactFiles, error: Value) -> Result<Compl
     failure_with_process(work, files, error, Value::Null)
 }
 
-fn failure_with_process(
+pub(super) fn failure_with_process(
     work: &Work,
     files: &ArtifactFiles,
     error: Value,
@@ -1227,7 +1227,7 @@ fn environment(profile: &CheckProfile) -> BTreeMap<String, String> {
     inputs::effective_environment(profile)
 }
 
-fn ensure_owned_directories(root: &Path, directory: &Path) -> Result<()> {
+pub(super) fn ensure_owned_directories(root: &Path, directory: &Path) -> Result<()> {
     let root = fs::canonicalize(root)?;
     let relative = directory.strip_prefix(&root).map_err(|_| {
         Error::new(
@@ -1261,7 +1261,7 @@ fn ensure_owned_directories(root: &Path, directory: &Path) -> Result<()> {
     Ok(())
 }
 
-fn ensure_execution_inputs(
+pub(super) fn ensure_execution_inputs(
     data_dir: &Path,
     files: &ArtifactFiles,
     candidate: &ArtifactRecord,
@@ -1316,7 +1316,7 @@ fn ensure_execution_inputs(
     Ok((workspace, descriptor, verified.manifest.clone()))
 }
 
-fn executable(program: &Path, env: &BTreeMap<String, String>) -> Result<PathBuf> {
+pub(super) fn executable(program: &Path, env: &BTreeMap<String, String>) -> Result<PathBuf> {
     if program.is_absolute() {
         if program.is_file() {
             return Ok(program.to_path_buf());
@@ -1362,7 +1362,7 @@ fn executable(program: &Path, env: &BTreeMap<String, String>) -> Result<PathBuf>
         program.display().to_string(),
     ))
 }
-fn parse_cargo(
+pub(super) fn parse_cargo(
     path: &Path,
     targets: &[String],
     scope_plan: &Value,

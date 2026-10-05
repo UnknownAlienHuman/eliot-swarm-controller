@@ -1,0 +1,18 @@
+{
+  "alias": "<operator-selected-route-alias>",
+  "runtime": "module",
+  "module_artifact_id": "eliot-opencode-v2.rust-http.1",
+  "enabled": false,
+  "workspace_option": "directory",
+  "native_options": {
+    "service_id": "<operator-stable-service-id>",
+    "connection_file": "<absolute-path-to-existing-connection-record>",
+    "expected_version": "<exact-version-from-attached-server>",
+    "directory": "<absolute-workspace-path>",
+    "model": {
+      "id": "<exact-model-id-from-manager-route>",
+      "providerID": "<exact-case-sensitive-providerID-from-manager-route>",
+      "variant": "<exact-variant-from-manager-route>"
+    }
+  }
+}
