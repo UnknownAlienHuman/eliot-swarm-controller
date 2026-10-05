@@ -151,6 +151,28 @@ pub fn list(db: &Connection, after: i64, limit: i64) -> Result<Value> {
     }))
 }
 
+/// Paginate only a Manager's own scripts. Filtering happens before OFFSET so
+/// inaccessible script IDs cannot leak through page boundaries or counts.
+pub fn list_owned(db: &Connection, owner_id: &str, after: i64, limit: i64) -> Result<Value> {
+    let mut statement = db.prepare(
+        "SELECT script_id FROM scripts WHERE owner_id=?1 ORDER BY script_id LIMIT ?2 OFFSET ?3",
+    )?;
+    let ids = statement
+        .query_map(params![owner_id, limit, after], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let items = ids
+        .iter()
+        .map(|id| describe(db, id, None))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(json!({
+        "items":items,
+        "next_after":after.saturating_add(items.len() as i64),
+        "pagination":"offset_snapshot_not_inventory_proof",
+    }))
+}
+
 pub fn register_artifact(tx: &Transaction<'_>, artifact: &ArtifactRecord, now: i64) -> Result<()> {
     if artifact.kind != BUNDLE_KIND
         || artifact.byte_length

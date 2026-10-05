@@ -332,20 +332,33 @@ impl ProtectedResolver for ResolverMapDirectory {
     }
 }
 
+/// All evidence needed to publish a binding-scoped resolver map. Keeping the
+/// credential file and digest together prevents callers from omitting the
+/// immediate file-integrity check while keeping this API below seven inputs.
+pub struct BindingMapPublication<'a> {
+    pub context: &'a ProtectedResolverContext,
+    pub descriptor: &'a ModuleDescriptor,
+    pub claim: &'a ModuleContractClaim,
+    pub credential_ref: &'a ProtectedRef,
+    pub credential_file: &'a Path,
+    pub credential_file_sha256: &'a str,
+    pub additional_files: &'a BTreeMap<ProtectedRef, PathBuf>,
+}
+
 impl ResolverMapDirectory {
     /// Publish the exact per-binding protected-reference map consumed by the
     /// shared `swarm-module-owner` bootstrap. The map contains file paths only;
     /// credential bytes stay in the Store-provisioned private file.
-    pub fn publish_binding_map(
-        &self,
-        context: &ProtectedResolverContext,
-        descriptor: &ModuleDescriptor,
-        claim: &ModuleContractClaim,
-        credential_ref: &ProtectedRef,
-        credential_file: &Path,
-        credential_file_sha256: &str,
-        additional_files: &BTreeMap<ProtectedRef, PathBuf>,
-    ) -> Result<PathBuf> {
+    pub fn publish_binding_map(&self, publication: BindingMapPublication<'_>) -> Result<PathBuf> {
+        let BindingMapPublication {
+            context,
+            descriptor,
+            claim,
+            credential_ref,
+            credential_file,
+            credential_file_sha256,
+            additional_files,
+        } = publication;
         descriptor
             .validate()
             .map_err(|error| Error::new("MODULE_DESCRIPTOR_INVALID", error.to_string()))?;

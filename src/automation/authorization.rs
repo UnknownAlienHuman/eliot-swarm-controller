@@ -876,6 +876,7 @@ pub(crate) enum AnyOnBehalfOperationLink {
     CronCheckRun(OnBehalfOperationLink),
     GoalProgression(OnBehalfOperationLink),
     ScriptRun(OnBehalfOperationLink),
+    ScriptEffect(OnBehalfOperationLink),
     WorkDispatch(crate::store::automation_work_dispatch::WorkDispatchOperationLink),
     Repair(Box<crate::store::automation_repair::RepairDispatchOperationLink>),
 }
@@ -1042,6 +1043,7 @@ impl AnyOnBehalfOperationLink {
             Self::CronCheckRun(link) => link.belongs_to(principal),
             Self::GoalProgression(link) => link.belongs_to(principal),
             Self::ScriptRun(link) => link.belongs_to(principal),
+            Self::ScriptEffect(link) => link.belongs_to(principal),
             Self::WorkDispatch(link) => link.belongs_to(principal),
             Self::Repair(link) => {
                 principal.role == Role::Manager && principal.client_id == link.effective_manager_id
@@ -1083,6 +1085,7 @@ pub(crate) fn operation_link(
         ("agent.goal", Some("goal_progression")) => "agent.goal",
         ("script.run", Some("applied_submission")) => "script.run",
         ("script.run", Some("system_event")) => "script.run",
+        ("message.send", Some("script_controller_effect")) => "message.send",
         _ => "",
     };
     if link.schema_version != 1
@@ -1127,8 +1130,364 @@ pub(crate) fn operation_link(
         crate::store::automation_goal_progression::validate_operation_link(db, &link)?;
     } else if link.action == "script.run" {
         validate_script_run_operation_link(db, &link)?;
+    } else if link.action == "message.send" {
+        validate_script_controller_effect_operation_link(db, &link)?;
     }
     Ok(Some(link))
+}
+
+struct ScriptControllerEffectOperationRow {
+    caller_id: String,
+    method: String,
+    client_request_id: String,
+    task_id: Option<String>,
+    attempt_id: Option<String>,
+    original_request_json: String,
+    effective_request_json: String,
+    state: String,
+    settled_at_ms: Option<i64>,
+    result_json: Option<String>,
+}
+
+struct ScriptControllerEffectParentRow {
+    caller_id: String,
+    method: String,
+    task_id: Option<String>,
+    attempt_id: Option<String>,
+    state: String,
+    result_json: Option<String>,
+    run_state: String,
+    script_id: String,
+    script_revision: i64,
+    bundle_ref: String,
+    run_task_id: Option<String>,
+    run_task_revision: Option<i64>,
+    run_attempt_id: Option<String>,
+    spec_json: String,
+}
+
+/// Validate the retained child effect against its completed ScriptRun. This
+/// confirms provenance only; current Manager and exact subject rights remain a
+/// separate read/admission check.
+fn validate_script_controller_effect_operation_link(
+    db: &Connection,
+    link: &OnBehalfOperationLink,
+) -> Result<()> {
+    let corrupt = || {
+        Error::new(
+            "AUTOMATION_LINK_CORRUPT",
+            "ScriptRun effect link does not match its exact retained child Operation",
+        )
+    };
+    const CAUSE_FIELDS: &[&str] = &[
+        "kind",
+        "id",
+        "script_run_operation_id",
+        "script_run_id",
+        "script_id",
+        "script_revision",
+        "effect",
+        "task_id",
+        "task_revision",
+        "attempt_id",
+        "recipient",
+        "request_sha256",
+        "effective_manager_id",
+    ];
+    let cause = &link.cause;
+    let Some(cause_object) = cause.as_object() else {
+        return Err(corrupt());
+    };
+    if cause_object.len() != CAUSE_FIELDS.len()
+        || CAUSE_FIELDS
+            .iter()
+            .any(|field| !cause_object.contains_key(*field))
+        || link.action != "message.send"
+        || cause["kind"] != "script_controller_effect"
+        || cause["effect"] != "task_owner_message"
+        || cause["effective_manager_id"] != link.effective_manager_id
+    {
+        return Err(corrupt());
+    }
+    let parent_operation_id = cause["script_run_operation_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(corrupt)?;
+    let run_id = cause["script_run_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(corrupt)?;
+    let script_id = cause["script_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(corrupt)?;
+    let script_revision = cause["script_revision"]
+        .as_i64()
+        .filter(|value| *value > 0)
+        .ok_or_else(corrupt)?;
+    let task_id = cause["task_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(corrupt)?;
+    let task_revision = cause["task_revision"]
+        .as_i64()
+        .filter(|value| *value > 0)
+        .ok_or_else(corrupt)?;
+    let attempt_id = cause["attempt_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(corrupt)?;
+    let recipient = cause["recipient"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(corrupt)?;
+    let request_id = cause["id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(corrupt)?;
+    let expected_request_id = format!(
+        "script-effect-{}",
+        model::digest(
+            model::canonical(&json!([
+                "script-effect-v1",
+                parent_operation_id,
+                run_id,
+                "task_owner_message"
+            ]))?
+            .as_bytes()
+        )
+    );
+    if request_id != expected_request_id {
+        return Err(corrupt());
+    }
+
+    let child: Option<ScriptControllerEffectOperationRow> = db
+        .query_row(
+            "SELECT caller_id,method,client_request_id,task_id,attempt_id,original_request_json,effective_request_json,
+                    state,settled_at_ms,result_json
+             FROM operations WHERE operation_id=?1",
+            [&link.operation_id],
+            |row| {
+                Ok(ScriptControllerEffectOperationRow {
+                    caller_id: row.get(0)?,
+                    method: row.get(1)?,
+                    client_request_id: row.get(2)?,
+                    task_id: row.get(3)?,
+                    attempt_id: row.get(4)?,
+                    original_request_json: row.get(5)?,
+                    effective_request_json: row.get(6)?,
+                    state: row.get(7)?,
+                    settled_at_ms: row.get(8)?,
+                    result_json: row.get(9)?,
+                })
+            },
+        )
+        .optional()?;
+    let Some(child) = child else {
+        return Err(corrupt());
+    };
+    let original: Value =
+        serde_json::from_str(&child.original_request_json).map_err(|_| corrupt())?;
+    if child.caller_id != AUTOMATION_TECHNICAL_REQUESTER_ID
+        || child.method != "message.send"
+        || child.client_request_id != request_id
+        || child.task_id.is_some()
+        || child.attempt_id.is_some()
+        || original.as_object().is_none_or(|object| object.len() != 3)
+        || original["client_request_id"] != request_id
+        || original["recipient"] != recipient
+        || original["text"].as_str().is_none_or(str::is_empty)
+        || model::digest(model::canonical(&original)?.as_bytes())
+            != cause["request_sha256"].as_str().ok_or_else(corrupt)?
+    {
+        return Err(corrupt());
+    }
+
+    let parent_link = operation_link(db, parent_operation_id)?.ok_or_else(corrupt)?;
+    if parent_link.action != "script.run"
+        || parent_link.technical_requester_id != link.technical_requester_id
+        || parent_link.effective_manager_id != link.effective_manager_id
+        || parent_link.automation_id != link.automation_id
+        || parent_link.automation_revision != link.automation_revision
+        || parent_link.project_id != link.project_id
+    {
+        return Err(corrupt());
+    }
+    let parent: Option<ScriptControllerEffectParentRow> = db
+        .query_row(
+            "SELECT o.caller_id,o.method,o.task_id,o.attempt_id,o.state,o.result_json,
+                    r.state,r.script_id,r.revision,r.bundle_ref,r.task_id,r.task_revision,r.attempt_id,r.spec_json
+             FROM operations AS o JOIN script_runs AS r ON r.operation_id=o.operation_id
+             WHERE o.operation_id=?1 AND r.run_id=?2",
+            params![parent_operation_id, run_id],
+            |row| {
+                Ok(ScriptControllerEffectParentRow {
+                    caller_id: row.get(0)?,
+                    method: row.get(1)?,
+                    task_id: row.get(2)?,
+                    attempt_id: row.get(3)?,
+                    state: row.get(4)?,
+                    result_json: row.get(5)?,
+                    run_state: row.get(6)?,
+                    script_id: row.get(7)?,
+                    script_revision: row.get(8)?,
+                    bundle_ref: row.get(9)?,
+                    run_task_id: row.get(10)?,
+                    run_task_revision: row.get(11)?,
+                    run_attempt_id: row.get(12)?,
+                    spec_json: row.get(13)?,
+                })
+            },
+        )
+        .optional()?;
+    let Some(parent) = parent else {
+        return Err(corrupt());
+    };
+    let parent_result: Value = parent
+        .result_json
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|_| corrupt())?
+        .ok_or_else(corrupt)?;
+    let spec: Value = serde_json::from_str(&parent.spec_json).map_err(|_| corrupt())?;
+    let declared_effects: Vec<crate::scripts::manifest::ScriptControllerEffect> =
+        serde_json::from_value(spec["capabilities"].clone()).map_err(|_| corrupt())?;
+    let bundle = crate::scripts::registry::bundle_record(db, script_id, script_revision)
+        .map_err(|_| corrupt())?;
+    let bundle_effects: Vec<crate::scripts::manifest::ScriptControllerEffect> =
+        serde_json::from_value(
+            bundle
+                .metadata
+                .get("controller_effects")
+                .cloned()
+                .unwrap_or_else(|| json!([])),
+        )
+        .map_err(|_| corrupt())?;
+    if parent.caller_id != AUTOMATION_TECHNICAL_REQUESTER_ID
+        || parent.method != "script.run"
+        || parent.state != "settled"
+        || parent.run_state != "completed"
+        || parent.task_id.as_deref() != Some(task_id)
+        || parent.attempt_id.as_deref() != Some(attempt_id)
+        || parent.script_id != script_id
+        || parent.script_revision != script_revision
+        || bundle.kind != crate::scripts::registry::BUNDLE_KIND
+        || bundle.artifact_id != parent.bundle_ref
+        || declared_effects != bundle_effects
+        || declared_effects
+            != vec![crate::scripts::manifest::ScriptControllerEffect::TaskOwnerMessage]
+        || parent.run_task_id.as_deref() != Some(task_id)
+        || parent.run_task_revision != Some(task_revision)
+        || parent.run_attempt_id.as_deref() != Some(attempt_id)
+        || spec["invocation"]["operation_id"] != parent_operation_id
+        || spec["invocation"]["run_id"] != run_id
+        || spec["invocation"]["script_id"] != script_id
+        || spec["invocation"]["script_revision"] != script_revision
+        || spec["invocation"]["task_id"] != task_id
+        || spec["invocation"]["task_revision"] != task_revision
+        || spec["invocation"]["attempt_id"] != attempt_id
+        || spec["invocation"]["effective_manager_id"] != link.effective_manager_id
+        || spec["automation_on_behalf"] != parent_link.value().map_err(|_| corrupt())?
+    {
+        return Err(corrupt());
+    }
+
+    let expected_invocation_cause = json!({
+        "kind":"script_invocation",
+        "id":parent_operation_id,
+        "script_run_operation_id":parent_operation_id,
+        "script_run_id":run_id,
+        "identity":{
+            "script_id":script_id,
+            "script_revision":script_revision,
+            "task_id":task_id,
+            "task_revision":task_revision,
+            "attempt_id":attempt_id,
+        },
+        "effective_manager_id":link.effective_manager_id,
+    });
+    let effective: Value =
+        serde_json::from_str(&child.effective_request_json).map_err(|_| corrupt())?;
+    let expected_invocation_link = json!({
+        "schema_version":1,
+        "operation_id":link.operation_id,
+        "technical_requester_id":link.technical_requester_id,
+        "effective_manager_id":link.effective_manager_id,
+        "action":"message.send",
+        "grant":"task_owner_message",
+        "cause":expected_invocation_cause,
+    });
+    let expected_link_value = link.value().map_err(|_| corrupt())?;
+    if effective["automation_on_behalf"] != expected_link_value
+        || effective["script_invocation"] != expected_invocation_link
+    {
+        return Err(corrupt());
+    }
+    let index_key = config::entry_operation_key(
+        &link.effective_manager_id,
+        &link.project_id,
+        &link.automation_id,
+        &link.operation_id,
+    )?;
+    if config::read_record(db, &index_key, "ScriptRun effect entry index")?.as_ref()
+        != Some(&expected_link_value)
+    {
+        return Err(corrupt());
+    }
+
+    let effect = parent_result["controller_effects"]
+        .as_array()
+        .filter(|effects| effects.len() == 1)
+        .and_then(|effects| effects.first())
+        .ok_or_else(corrupt)?;
+    if parent_result["operation_id"] != parent_operation_id
+        || parent_result["run_id"] != run_id
+        || parent_result["state"] != "completed"
+        || effect["effect"] != "task_owner_message"
+        || effect["operation_id"] != link.operation_id
+        || effect["recipient"] != recipient
+        || effect["cause"] != expected_invocation_cause
+    {
+        return Err(corrupt());
+    }
+    let child_result: Value = child
+        .result_json
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|_| corrupt())?
+        .ok_or_else(corrupt)?;
+    let receipt = &effective["receipt"];
+    match effect["status"].as_str() {
+        Some("applied")
+            if child.state == "settled"
+                && child.settled_at_ms.is_some()
+                && receipt["ok"] == true
+                && child_result == receipt["value"]
+                && child_result["operation_id"] == link.operation_id
+                && child_result["message_id"] == link.operation_id
+                && child_result["sender"] == link.effective_manager_id
+                && child_result["recipient"] == recipient
+                && child_result["text"] == original["text"]
+                && effect["message_id"] == link.operation_id
+                && effect.get("error").is_none() =>
+        {
+            Ok(())
+        }
+        Some("rejected")
+            if child.state == "rejected"
+                && child.settled_at_ms.is_some()
+                && receipt["ok"] == false
+                && child_result == receipt["error"]
+                && effect["error"]["code"] == child_result["code"]
+                && effect["error"]["message"] == child_result["message"]
+                && effect.get("message_id").is_none() =>
+        {
+            Ok(())
+        }
+        _ => Err(corrupt()),
+    }
 }
 
 /// Retain exact automation, submission, Task, Attempt, script and immutable
@@ -2827,29 +3186,20 @@ pub(crate) fn on_behalf_visible_to(
             })?;
             current_manager_has_task_scope(db, principal, task_id, &link.project_id)
         }
-        AnyOnBehalfOperationLink::ScriptRun(link) => {
-            if link.cause["kind"] == "system_event" && link.cause["task_id"].as_str().is_none() {
-                if !link.belongs_to(principal) || principal.role != Role::Manager {
-                    return Ok(false);
-                }
-                let current_manager: Option<String> = db
-                    .query_row(
-                        "SELECT json_extract(value_json,'$.client_id') FROM meta WHERE key='gm'",
-                        [],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-                Ok(current_manager.as_deref() == Some(principal.client_id.as_str()))
-            } else {
-                let task_id = link.cause["task_id"].as_str().ok_or_else(|| {
-                    Error::new(
-                        "AUTOMATION_LINK_CORRUPT",
-                        "Task-bound ScriptRun link has no exact Task identity",
-                    )
-                })?;
-                current_manager_has_task_scope(db, principal, task_id, &link.project_id)
-            }
+        AnyOnBehalfOperationLink::ScriptRun(_) => {
+            // The immutable Operation link is fully validated before this
+            // scope check. Its effective Manager owns this history even after
+            // Task completion, automation disable, or GM handover; current
+            // admission rights are checked separately before a new ScriptRun.
+            require_registered_manager(db, &principal.client_id)?;
+            Ok(true)
         }
+        AnyOnBehalfOperationLink::ScriptEffect(link) => script_effect_historical_task_scope(
+            db,
+            &principal.client_id,
+            &link.project_id,
+            &link.cause,
+        ),
         AnyOnBehalfOperationLink::CronCheckRun(link) => {
             let task_id = link.cause["task_id"].as_str().ok_or_else(|| {
                 Error::new(
@@ -2989,6 +3339,15 @@ fn current_gm_on_behalf_scope_visible_to(
             })?;
             current_gm_has_task_project(db, task_id, &link.project_id)
         }
+        AnyOnBehalfOperationLink::ScriptEffect(link) => {
+            let task_id = link.cause["task_id"].as_str().ok_or_else(|| {
+                Error::new(
+                    "AUTOMATION_LINK_CORRUPT",
+                    "ScriptRun effect link has no exact Task identity",
+                )
+            })?;
+            current_gm_has_task_project(db, task_id, &link.project_id)
+        }
         AnyOnBehalfOperationLink::Acceptance(link) => {
             let task_id = link.cause["identity"]["task_id"].as_str().ok_or_else(|| {
                 Error::new(
@@ -3095,6 +3454,12 @@ pub(crate) fn any_on_behalf_operation_link(
         }
         (Some(link), None, None) if link.action == "script.run" && is_script_run => {
             Ok(Some(AnyOnBehalfOperationLink::ScriptRun(link)))
+        }
+        (Some(link), None, None)
+            if link.action == "message.send"
+                && link.cause["kind"] == "script_controller_effect" =>
+        {
+            Ok(Some(AnyOnBehalfOperationLink::ScriptEffect(link)))
         }
         (Some(link), None, None) => Ok(Some(AnyOnBehalfOperationLink::Review(link))),
         (None, Some(link), None) => Ok(Some(AnyOnBehalfOperationLink::WorkDispatch(link))),
@@ -3784,6 +4149,14 @@ fn current_transfer_continuation_at_phase(
             link.automation_id.as_str(),
             link.action.as_str(),
         ),
+        AnyOnBehalfOperationLink::ScriptEffect(link) => (
+            link.operation_id.as_str(),
+            link.effective_manager_id.as_str(),
+            link.automation_revision,
+            link.project_id.as_str(),
+            link.automation_id.as_str(),
+            link.action.as_str(),
+        ),
         AnyOnBehalfOperationLink::WorkDispatch(link) => (
             link.operation_id.as_str(),
             link.effective_manager_id.as_str(),
@@ -4191,6 +4564,47 @@ pub(crate) fn current_manager_id_has_task_scope(
     Ok(current_gm.as_deref() == Some(manager_id))
 }
 
+/// ScriptEffect history is visible to its retained effective Manager while the
+/// exact historical Task and Attempt still match the immutable link. Admission
+/// rechecks live authority separately; completion, release, later revisions,
+/// and automation disable do not erase the Manager's own receipt history.
+fn script_effect_historical_task_scope(
+    db: &Connection,
+    manager_id: &str,
+    project_id: &str,
+    cause: &Value,
+) -> Result<bool> {
+    let corrupt = || {
+        Error::new(
+            "AUTOMATION_LINK_CORRUPT",
+            "ScriptRun effect link has no exact historical Task and Attempt identity",
+        )
+    };
+    let task_id = cause["task_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(corrupt)?;
+    let task_revision = cause["task_revision"]
+        .as_i64()
+        .filter(|value| *value > 0)
+        .ok_or_else(corrupt)?;
+    let attempt_id = cause["attempt_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(corrupt)?;
+    require_registered_manager(db, manager_id)?;
+    db.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM tasks AS t JOIN attempts AS a ON a.task_id=t.task_id
+            WHERE t.task_id=?1 AND t.project_id=?2
+              AND a.attempt_id=?4 AND a.task_revision=?3
+        )",
+        params![task_id, project_id, task_revision, attempt_id],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
 pub(crate) fn entry_operation_links(
     db: &Connection,
     owner: &str,
@@ -4247,7 +4661,7 @@ pub(crate) fn entry_operation_links(
         }
         if matches!(
             link.action.as_str(),
-            "task.accept" | "forge.publish_ref" | "check.run"
+            "task.accept" | "forge.publish_ref" | "check.run" | "message.send"
         ) {
             let task_id = if link.action == "task.accept" {
                 link.cause["identity"]["task_id"].as_str()
@@ -4260,7 +4674,14 @@ pub(crate) fn entry_operation_links(
                     "on-behalf link has no exact Task identity",
                 )
             })?;
-            if !current_manager_id_has_task_scope(db, owner, task_id, project)? {
+            let in_scope = if link.action == "message.send"
+                && link.cause["kind"] == "script_controller_effect"
+            {
+                script_effect_historical_task_scope(db, owner, project, &link.cause)?
+            } else {
+                current_manager_id_has_task_scope(db, owner, task_id, project)?
+            };
+            if !in_scope {
                 continue;
             }
         }

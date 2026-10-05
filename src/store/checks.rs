@@ -1633,8 +1633,8 @@ impl Store {
                                         // Persisted cancellation is delivered before go-ahead when both are pending.
                                         worker::deliver_cancel(&allow)?;
                                         worker::allow(&allow)?;
-                                        if standalone_host::owns_work(&allow)? {
-                                            if let Err(error) = standalone_host::materialize_plan(
+                                        if standalone_host::owns_work(&allow)?
+                                            && let Err(error) = standalone_host::materialize_plan(
                                                 &allow,
                                                 &files,
                                                 &accepted_worker,
@@ -1644,7 +1644,6 @@ impl Store {
                                                     &accepted_worker,
                                                 )?;
                                                 return Err(error);
-                                            }
                                         }
                                         Ok(())
                                     }).await?;

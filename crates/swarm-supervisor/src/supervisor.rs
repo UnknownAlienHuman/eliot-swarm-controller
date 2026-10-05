@@ -9,11 +9,13 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    collections::{BTreeSet, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fs::{self, File, OpenOptions},
+    future::Future,
     hash::{Hash, Hasher},
     io::{Read, Write},
     path::{Path, PathBuf},
+    pin::Pin,
     process::ExitStatus,
     sync::{
         Arc, Mutex, RwLock,
@@ -107,15 +109,33 @@ pub enum AdmissionState {
 pub enum LifecycleState {
     WaitingForDemand,
     WaitingForKernel,
-    Starting { boot_id: String },
-    ProcessRunning { boot_id: String },
-    RestartBackoff { delay_ms: u64 },
-    ProcessExited { exit_code: Option<i32> },
-    OwnerGroupRetained { owner_pid: u32 },
+    Starting {
+        boot_id: String,
+    },
+    ProcessRunning {
+        boot_id: String,
+    },
+    RestartBackoff {
+        delay_ms: u64,
+    },
+    ProcessExited {
+        exit_code: Option<i32>,
+        #[serde(default)]
+        exit_proven: bool,
+    },
+    OwnerGroupRetained {
+        owner_pid: u32,
+    },
     OwnerIdentityUnknown,
-    ProcessIdentityUnknown { pid: Option<u32> },
-    Completed { exit_code: Option<i32> },
-    Isolated { reason: String },
+    ProcessIdentityUnknown {
+        pid: Option<u32>,
+    },
+    Completed {
+        exit_code: Option<i32>,
+    },
+    Isolated {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -275,6 +295,33 @@ impl OperationReadback {
     }
 }
 
+/// All fixed construction inputs for one shared module registry. Grouping
+/// them makes the host lifecycle boundary explicit and keeps the public
+/// constructor stable as optional runtime dependencies evolve.
+pub struct SupervisorRegistryConfig {
+    pub catalog: DescriptorCatalog,
+    pub state_root: PathBuf,
+    pub ipc_root: PathBuf,
+    pub supervisor_credential: Credential,
+    pub ipc: IpcConfig,
+    pub owner_executable: ModuleOwnerExecutable,
+    pub resolver: Arc<dyn ProtectedResolver>,
+    pub admission: watch::Sender<AdmissionState>,
+}
+
+/// One already-authorized per-binding demand. The request contains no Manager
+/// credential or authority beyond the supplied retained scope and cause.
+pub struct ModuleDemandRequest {
+    pub selector: ArtifactSelector,
+    pub host_protocol: ProtocolRange,
+    pub required_capabilities: BTreeSet<CapabilityId>,
+    pub scope: ServiceScope,
+    pub cause: DemandCause,
+    pub launch_config: BindingLaunchConfig,
+    pub module_client_id: String,
+    pub readback: Option<OperationReadback>,
+}
+
 struct RegistryKey {
     module_id: String,
     scope: ServiceScope,
@@ -320,7 +367,7 @@ impl SupervisorRegistry {
         resolver: Arc<dyn ProtectedResolver>,
     ) -> Result<Self> {
         let (admission, _) = watch::channel(AdmissionState::Open);
-        Self::new_with_admission(
+        Self::new_with_admission(SupervisorRegistryConfig {
             catalog,
             state_root,
             ipc_root,
@@ -329,22 +376,23 @@ impl SupervisorRegistry {
             owner_executable,
             resolver,
             admission,
-        )
+        })
     }
 
     /// Build a registry over the host actor's retained admission gate. The
     /// gate survives optional actor recreation so a local panic or IPC retry
     /// cannot reopen module starts after a Store or journal failure.
-    pub fn new_with_admission(
-        catalog: DescriptorCatalog,
-        state_root: PathBuf,
-        ipc_root: PathBuf,
-        supervisor_credential: Credential,
-        ipc: IpcConfig,
-        owner_executable: ModuleOwnerExecutable,
-        resolver: Arc<dyn ProtectedResolver>,
-        admission: watch::Sender<AdmissionState>,
-    ) -> Result<Self> {
+    pub fn new_with_admission(config: SupervisorRegistryConfig) -> Result<Self> {
+        let SupervisorRegistryConfig {
+            catalog,
+            state_root,
+            ipc_root,
+            supervisor_credential,
+            ipc,
+            owner_executable,
+            resolver,
+            admission,
+        } = config;
         if !state_root.is_absolute() {
             return Err(Error::invalid("module state root must be an absolute path"));
         }
@@ -467,24 +515,24 @@ impl SupervisorRegistry {
         Ok(response)
     }
 
-    pub async fn demand(
-        &self,
-        selector: &ArtifactSelector,
-        host_protocol: ProtocolRange,
-        required_capabilities: &BTreeSet<CapabilityId>,
-        scope: ServiceScope,
-        cause: DemandCause,
-        launch_config: BindingLaunchConfig,
-        module_client_id: String,
-        readback: Option<OperationReadback>,
-    ) -> Result<DemandLease> {
+    pub async fn demand(&self, request: ModuleDemandRequest) -> Result<DemandLease> {
+        let ModuleDemandRequest {
+            selector,
+            host_protocol,
+            required_capabilities,
+            scope,
+            cause,
+            launch_config,
+            module_client_id,
+            readback,
+        } = request;
         scope.validate()?;
         cause.validate()?;
         launch_config.validate()?;
         validate_identifier(&module_client_id, "module_client_id")?;
         let catalog = read_lock(&self.catalog).clone();
         let descriptor = catalog
-            .select_exact(selector, host_protocol, required_capabilities)
+            .select_exact(&selector, host_protocol, &required_capabilities)
             .map_err(|error| Error::new("MODULE_SELECTION", error.to_string()))?
             .clone();
         let claim = module_contract_claim(&descriptor, host_protocol)?;
@@ -532,20 +580,20 @@ impl SupervisorRegistry {
                         ));
                     }
                     existing.clear_restart_history()?;
-                    let replacement = Arc::new(Service::new(
-                        descriptor.clone(),
-                        wanted,
-                        scope.clone(),
-                        service_state_dir(&self.state_root, &descriptor, &scope)?,
-                        self.state_root.clone(),
-                        launch_config.clone(),
-                        module_client_id.clone(),
-                        claim.protocol,
-                        contract_json.clone(),
-                        self.owner_executable.clone(),
-                        self.resolver.clone(),
-                        self.admission.clone(),
-                    ));
+                    let replacement = Arc::new(Service::new(ServiceInitialization {
+                        descriptor: Arc::new(descriptor.clone()),
+                        descriptor_fingerprint: wanted,
+                        scope: scope.clone(),
+                        state_dir: service_state_dir(&self.state_root, &descriptor, &scope)?,
+                        state_root: self.state_root.clone(),
+                        launch_config: launch_config.clone(),
+                        module_client_id: module_client_id.clone(),
+                        protocol: claim.protocol,
+                        module_contract_json: contract_json.clone(),
+                        owner_executable: self.owner_executable.clone(),
+                        resolver: self.resolver.clone(),
+                        admission: self.admission.clone(),
+                    }));
                     services.insert(key, replacement.clone());
                     replacement
                 } else {
@@ -558,20 +606,20 @@ impl SupervisorRegistry {
                     &module_client_id,
                     claim.protocol,
                 )?;
-                let service = Arc::new(Service::new(
-                    descriptor.clone(),
-                    digest,
-                    scope.clone(),
-                    service_state_dir(&self.state_root, &descriptor, &scope)?,
-                    self.state_root.clone(),
-                    launch_config.clone(),
-                    module_client_id.clone(),
-                    claim.protocol,
-                    contract_json,
-                    self.owner_executable.clone(),
-                    self.resolver.clone(),
-                    self.admission.clone(),
-                ));
+                let service = Arc::new(Service::new(ServiceInitialization {
+                    descriptor: Arc::new(descriptor.clone()),
+                    descriptor_fingerprint: digest,
+                    scope: scope.clone(),
+                    state_dir: service_state_dir(&self.state_root, &descriptor, &scope)?,
+                    state_root: self.state_root.clone(),
+                    launch_config: launch_config.clone(),
+                    module_client_id: module_client_id.clone(),
+                    protocol: claim.protocol,
+                    module_contract_json: contract_json,
+                    owner_executable: self.owner_executable.clone(),
+                    resolver: self.resolver.clone(),
+                    admission: self.admission.clone(),
+                }));
                 services.insert(key, service.clone());
                 service
             }
@@ -751,10 +799,26 @@ struct Service {
     runner: AsyncMutex<Option<JoinHandle<()>>>,
 }
 
+struct ServiceInitialization {
+    descriptor: Arc<ModuleDescriptor>,
+    descriptor_fingerprint: String,
+    scope: ServiceScope,
+    state_dir: PathBuf,
+    state_root: PathBuf,
+    launch_config: BindingLaunchConfig,
+    module_client_id: String,
+    protocol: ProtocolVersion,
+    module_contract_json: String,
+    owner_executable: ModuleOwnerExecutable,
+    resolver: Arc<dyn ProtectedResolver>,
+    admission: watch::Sender<AdmissionState>,
+}
+
 struct OwnerHelperExit {
     exit: ExitStatus,
     worker: Option<ProcessIdentity>,
     safe_to_replace: bool,
+    family_departure_proven: bool,
     failure_code: Option<String>,
     failure_stage: Option<String>,
     effect_certainty: ModuleEffectCertainty,
@@ -762,28 +826,15 @@ struct OwnerHelperExit {
 }
 
 impl Service {
-    fn new(
-        descriptor: Arc<ModuleDescriptor>,
-        descriptor_fingerprint: String,
-        scope: ServiceScope,
-        state_dir: PathBuf,
-        state_root: PathBuf,
-        launch_config: BindingLaunchConfig,
-        module_client_id: String,
-        protocol: ProtocolVersion,
-        module_contract_json: String,
-        owner_executable: ModuleOwnerExecutable,
-        resolver: Arc<dyn ProtectedResolver>,
-        admission: watch::Sender<AdmissionState>,
-    ) -> Self {
-        let prior_state = has_prior_module_state(&state_dir);
+    fn new(initialization: ServiceInitialization) -> Self {
+        let prior_state = has_prior_module_state(&initialization.state_dir);
         let (status, _) = watch::channel(SupervisorStatus {
-            module_id: descriptor.module_id.to_string(),
-            artifact_id: descriptor.artifact.artifact_id.to_string(),
-            artifact_version: descriptor.artifact.version.to_string(),
-            build_id: descriptor.artifact.build_id.clone(),
-            scope: scope.clone(),
-            admission: admission.borrow().clone(),
+            module_id: initialization.descriptor.module_id.to_string(),
+            artifact_id: initialization.descriptor.artifact.artifact_id.to_string(),
+            artifact_version: initialization.descriptor.artifact.version.to_string(),
+            build_id: initialization.descriptor.artifact.build_id.clone(),
+            scope: initialization.scope.clone(),
+            admission: initialization.admission.borrow().clone(),
             lifecycle: if prior_state {
                 LifecycleState::WaitingForKernel
             } else {
@@ -808,18 +859,18 @@ impl Service {
         let (demand_epoch, _) = watch::channel(0);
         let (recovery_epoch, _) = watch::channel(0);
         Self {
-            descriptor,
-            descriptor_fingerprint,
-            scope,
-            state_dir,
-            state_root,
-            launch_config,
-            module_client_id,
-            protocol,
-            module_contract_json,
-            owner_executable,
-            resolver,
-            admission,
+            descriptor: initialization.descriptor,
+            descriptor_fingerprint: initialization.descriptor_fingerprint,
+            scope: initialization.scope,
+            state_dir: initialization.state_dir,
+            state_root: initialization.state_root,
+            launch_config: initialization.launch_config,
+            module_client_id: initialization.module_client_id,
+            protocol: initialization.protocol,
+            module_contract_json: initialization.module_contract_json,
+            owner_executable: initialization.owner_executable,
+            resolver: initialization.resolver,
+            admission: initialization.admission,
             status,
             demands: Mutex::new(HashMap::new()),
             demand_epoch,
@@ -913,30 +964,34 @@ impl Service {
         Ok(())
     }
 
-    async fn after_runner_exit(self: &Arc<Self>) {
-        let mut runner = self.runner.lock().await;
-        *runner = None;
-        if !self.has_demand()
-            || matches!(
-                self.admission.borrow().clone(),
-                AdmissionState::Closed { .. }
-            )
-            || !matches!(
-                &self.status.borrow().lifecycle,
-                LifecycleState::WaitingForDemand | LifecycleState::WaitingForKernel
-            )
-        {
-            return;
-        }
+    // This cleanup may spawn another lifecycle task. A boxed Send boundary
+    // avoids a recursive opaque-future type while preserving the runner mutex.
+    fn after_runner_exit(self: &Arc<Self>) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            let mut runner = self.runner.lock().await;
+            *runner = None;
+            if !self.has_demand()
+                || matches!(
+                    self.admission.borrow().clone(),
+                    AdmissionState::Closed { .. }
+                )
+                || !matches!(
+                    &self.status.borrow().lifecycle,
+                    LifecycleState::WaitingForDemand | LifecycleState::WaitingForKernel
+                )
+            {
+                return;
+            }
 
-        // Demand can race the runner's final no-demand check. Recheck and
-        // replace the finished handle under the same mutex used by demand().
-        let service = self.clone();
-        *runner = Some(tokio::spawn(async move {
-            let cleanup = service.clone();
-            service.run_lifecycle().await;
-            cleanup.after_runner_exit().await;
-        }));
+            // Demand can race the runner's final no-demand check. Recheck and
+            // replace the finished handle under the same mutex used by demand().
+            let service = self.clone();
+            *runner = Some(tokio::spawn(async move {
+                let cleanup = service.clone();
+                service.run_lifecycle().await;
+                cleanup.after_runner_exit().await;
+            }));
+        })
     }
 
     async fn can_replace_descriptor(&self) -> bool {
@@ -1041,7 +1096,7 @@ impl Service {
     }
 
     async fn run_lifecycle(self: Arc<Self>) {
-        let policy = self.descriptor.restart.clone();
+        let policy = self.descriptor.restart;
         let mut starts = match self.read_restart_history() {
             Ok(starts) => starts,
             Err(error) => {
@@ -1250,7 +1305,7 @@ impl Service {
                 return;
             }
 
-            let (mut helper, plan_path) = match self.spawn_owner_helper(&boot_id) {
+            let (mut helper, _plan_path) = match self.spawn_owner_helper(&boot_id) {
                 Ok(spawned) => spawned,
                 Err(error) => {
                     if let Err(cleanup_error) = self.remove_plan(&boot_id) {
@@ -1283,7 +1338,12 @@ impl Service {
                     self.record_failure(&error.code, "module-owner helper could not be started");
                     self.update_status(|status| {
                         status.restart.starts_in_window = starts.len();
-                        status.lifecycle = LifecycleState::ProcessExited { exit_code: None };
+                        status.lifecycle = LifecycleState::ProcessExited {
+                            exit_code: None,
+                            // No helper process was created, so no process-family
+                            // departure can be proven on this path.
+                            exit_proven: false,
+                        };
                         status.owner = None;
                         status.worker = None;
                     });
@@ -1453,13 +1513,17 @@ impl Service {
             self.readback_required
                 .store(needs_operation_readback, Ordering::Release);
             self.update_status(|status| {
-                status.lifecycle = if attempt.exit.success() && !restart_needed {
+                status.lifecycle = if attempt.exit.success()
+                    && !restart_needed
+                    && attempt.family_departure_proven
+                {
                     LifecycleState::Completed {
                         exit_code: attempt.exit.code(),
                     }
                 } else {
                     LifecycleState::ProcessExited {
                         exit_code: attempt.exit.code(),
+                        exit_proven: attempt.family_departure_proven,
                     }
                 };
                 status.owner = Some(helper_identity.clone());
@@ -1663,6 +1727,12 @@ impl Service {
         drop(file);
         sync_directory(&self.state_dir)?;
 
+        if !hash_file_sha256(&executable)?.eq_ignore_ascii_case(expected_hash.as_str()) {
+            return Err(Error::new(
+                "MODULE_ARTIFACT_MISMATCH",
+                "selected adapter executable changed before its helper launch",
+            ));
+        }
         let mut command = Command::new(&self.owner_executable.path);
         command
             .arg(&plan_path)
@@ -1754,17 +1824,17 @@ impl Service {
         let mut worker_last_live_at = None::<Instant>;
 
         loop {
-            if owner_record.is_none() {
-                if let Some((owner, token)) = read_owner_receipt_optional(&owner_path)? {
-                    if !owner_matches_worker(&owner["process"], helper_identity) {
-                        return Err(Error::new(
-                            "MODULE_OWNER_IDENTITY_MISMATCH",
-                            "owner.json does not identify the exact spawned module-owner helper",
-                        ));
-                    }
-                    owner_record = Some(owner);
-                    owner_token = Some(token);
+            if owner_record.is_none()
+                && let Some((owner, token)) = read_owner_receipt_optional(&owner_path)?
+            {
+                if !owner_matches_worker(&owner["process"], helper_identity) {
+                    return Err(Error::new(
+                        "MODULE_OWNER_IDENTITY_MISMATCH",
+                        "owner.json does not identify the exact spawned module-owner helper",
+                    ));
                 }
+                owner_record = Some(owner);
+                owner_token = Some(token);
             }
             if worker_record.is_none() {
                 worker_record = read_json_receipt_optional(&worker_path, OWNER_RECORD_LIMIT)?;
@@ -1789,17 +1859,17 @@ impl Service {
 
             if let Some(exit) = helper.try_wait()? {
                 // Close the receipt race after observing the exact helper exit.
-                if owner_record.is_none() {
-                    if let Some((owner, token)) = read_owner_receipt_optional(&owner_path)? {
-                        if !owner_matches_worker(&owner["process"], helper_identity) {
-                            return Err(Error::new(
-                                "MODULE_OWNER_IDENTITY_MISMATCH",
-                                "owner.json does not identify the exact spawned module-owner helper",
-                            ));
-                        }
-                        owner_record = Some(owner);
-                        owner_token = Some(token);
+                if owner_record.is_none()
+                    && let Some((owner, token)) = read_owner_receipt_optional(&owner_path)?
+                {
+                    if !owner_matches_worker(&owner["process"], helper_identity) {
+                        return Err(Error::new(
+                            "MODULE_OWNER_IDENTITY_MISMATCH",
+                            "owner.json does not identify the exact spawned module-owner helper",
+                        ));
                     }
+                    owner_record = Some(owner);
+                    owner_token = Some(token);
                 }
                 if worker_record.is_none() {
                     worker_record = read_json_receipt_optional(&worker_path, OWNER_RECORD_LIMIT)?;
@@ -1838,6 +1908,7 @@ impl Service {
                         exit,
                         worker: None,
                         safe_to_replace: false,
+                        family_departure_proven: false,
                         failure_code: Some("MODULE_LAUNCH_RESULT_MISSING".to_owned()),
                         failure_stage: None,
                         effect_certainty: ModuleEffectCertainty::Unknown,
@@ -1880,6 +1951,9 @@ impl Service {
                         exit,
                         worker: Some(worker),
                         safe_to_replace: true,
+                        // This is the only path with an exact worker receipt;
+                        // departed_empty has already succeeded above.
+                        family_departure_proven: true,
                         failure_code: Some("MODULE_EXITED".to_owned()),
                         failure_stage: None,
                         effect_certainty: ModuleEffectCertainty::Unknown,
@@ -1906,6 +1980,8 @@ impl Service {
                     exit,
                     worker: None,
                     safe_to_replace: true,
+                    // Certified pre-spawn means no adapter family existed.
+                    family_departure_proven: false,
                     failure_code: Some(failure_code),
                     failure_stage: Some(failure_stage),
                     effect_certainty: ModuleEffectCertainty::NotStarted,
@@ -2209,90 +2285,88 @@ impl Service {
             return Ok(());
         }
         if let (Some(helper), Some((owner, _))) = (attempted_helper.as_ref(), prior_owner.as_ref())
+            && !owner_matches_worker(&owner["process"], helper)
         {
-            if !owner_matches_worker(&owner["process"], helper) {
-                return Err(Error::new(
-                    "MODULE_OWNER_IDENTITY_MISMATCH",
-                    "persisted owner.json does not match the exact helper launch intent",
-                ));
-            }
+            return Err(Error::new(
+                "MODULE_OWNER_IDENTITY_MISMATCH",
+                "persisted owner.json does not match the exact helper launch intent",
+            ));
         }
 
         let mut prior_start_proved = attempt.is_none();
         loop {
-            if let Some(helper) = attempted_helper.as_ref() {
-                if process_identity_is_live(helper)? {
-                    let attached_worker = match prior_owner.as_ref() {
-                        Some((owner, _)) => match read_json_receipt_optional(
-                            &self.state_dir.join("worker.json"),
-                            OWNER_RECORD_LIMIT,
-                        )? {
-                            Some(receipt) => self.validate_worker_receipt(
-                                &receipt,
-                                attempt_boot_id.as_deref().ok_or_else(|| {
-                                    Error::new(
-                                        "MODULE_LAUNCH_INTENT_INVALID",
-                                        "live helper launch intent omitted its boot ID",
-                                    )
-                                })?,
-                                owner,
-                            )?,
-                            None => None,
-                        },
+            if let Some(helper) = attempted_helper.as_ref()
+                && process_identity_is_live(helper)?
+            {
+                let attached_worker = match prior_owner.as_ref() {
+                    Some((owner, _)) => match read_json_receipt_optional(
+                        &self.state_dir.join("worker.json"),
+                        OWNER_RECORD_LIMIT,
+                    )? {
+                        Some(receipt) => self.validate_worker_receipt(
+                            &receipt,
+                            attempt_boot_id.as_deref().ok_or_else(|| {
+                                Error::new(
+                                    "MODULE_LAUNCH_INTENT_INVALID",
+                                    "live helper launch intent omitted its boot ID",
+                                )
+                            })?,
+                            owner,
+                        )?,
                         None => None,
-                    };
-                    let boot_id = attempt_boot_id.clone();
-                    let prior_status = self.current_status();
-                    let confirmed_boot = match (
-                        &prior_status.lifecycle,
-                        prior_status.worker.as_ref(),
-                        attached_worker.as_ref(),
-                        boot_id.as_deref(),
-                    ) {
-                        (
-                            LifecycleState::ProcessRunning {
-                                boot_id: current_boot,
-                            },
-                            Some(previous),
-                            Some(current_worker),
-                            Some(attempt_boot),
-                        ) if current_boot == attempt_boot
-                            && previous.pid == current_worker.pid
-                            && previous.birth == current_worker.birth =>
-                        {
-                            Some(attempt_boot.to_owned())
+                    },
+                    None => None,
+                };
+                let boot_id = attempt_boot_id.clone();
+                let prior_status = self.current_status();
+                let confirmed_boot = match (
+                    &prior_status.lifecycle,
+                    prior_status.worker.as_ref(),
+                    attached_worker.as_ref(),
+                    boot_id.as_deref(),
+                ) {
+                    (
+                        LifecycleState::ProcessRunning {
+                            boot_id: current_boot,
+                        },
+                        Some(previous),
+                        Some(current_worker),
+                        Some(attempt_boot),
+                    ) if current_boot == attempt_boot
+                        && previous.pid == current_worker.pid
+                        && previous.birth == current_worker.birth =>
+                    {
+                        Some(attempt_boot.to_owned())
+                    }
+                    _ => None,
+                };
+                self.update_status(|status| {
+                    status.lifecycle = if let Some(confirmed_boot) = confirmed_boot.as_ref() {
+                        LifecycleState::ProcessRunning {
+                            boot_id: confirmed_boot.clone(),
                         }
-                        _ => None,
+                    } else {
+                        LifecycleState::OwnerGroupRetained {
+                            owner_pid: helper.pid,
+                        }
                     };
-                    self.update_status(|status| {
-                        status.lifecycle = if let Some(confirmed_boot) = confirmed_boot.as_ref() {
-                            LifecycleState::ProcessRunning {
-                                boot_id: confirmed_boot.clone(),
-                            }
-                        } else {
-                            LifecycleState::OwnerGroupRetained {
-                                owner_pid: helper.pid,
-                            }
-                        };
-                        status.owner = Some(helper.clone());
-                        status.worker = attached_worker.clone();
-                        status.worker_boot_id = boot_id.clone();
-                    });
-                    time::sleep(OWNER_DRAIN_POLL).await;
-                    continue;
-                }
+                    status.owner = Some(helper.clone());
+                    status.worker = attached_worker.clone();
+                    status.worker_boot_id = boot_id.clone();
+                });
+                time::sleep(OWNER_DRAIN_POLL).await;
+                continue;
             }
             if prior_owner.is_none() {
                 prior_owner = read_owner_receipt_optional(&owner_path)?;
                 if let (Some(helper), Some((owner, _))) =
                     (attempted_helper.as_ref(), prior_owner.as_ref())
+                    && !owner_matches_worker(&owner["process"], helper)
                 {
-                    if !owner_matches_worker(&owner["process"], helper) {
-                        return Err(Error::new(
-                            "MODULE_OWNER_IDENTITY_MISMATCH",
-                            "persisted owner.json does not match the exact helper launch intent",
-                        ));
-                    }
+                    return Err(Error::new(
+                        "MODULE_OWNER_IDENTITY_MISMATCH",
+                        "persisted owner.json does not match the exact helper launch intent",
+                    ));
                 }
             }
             let Some((owner, token)) = prior_owner.as_ref() else {
@@ -2893,16 +2967,6 @@ fn sync_directory(path: &Path) -> Result<()> {
     #[cfg(not(unix))]
     let _ = path;
     Ok(())
-}
-
-async fn wait_for_child(child: &mut Child) -> Result<ExitStatus> {
-    loop {
-        match child.wait().await {
-            Ok(status) => return Ok(status),
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(error.into()),
-        }
-    }
 }
 
 fn is_unresolved(state: &str) -> bool {

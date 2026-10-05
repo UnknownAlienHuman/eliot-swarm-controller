@@ -185,9 +185,6 @@ async fn run() -> Result<()> {
                     }
                     Err(error) => {
                         session.shutdown_and_drain(&mut controller, true).await?;
-                        native_live = false;
-                        dispatch_closed = true;
-                        native = Some(session);
                         return Err(error);
                     }
                 }
@@ -214,7 +211,7 @@ async fn run() -> Result<()> {
                     flush_reports(&mut host, &mut controller, &mut dirty, native_live).await?;
                     continue;
                 };
-                if let Err(_) = session.membership_guard.verify() {
+                if session.membership_guard.verify().is_err() {
                     controller.reject_command(&command, "NATIVE_OWNER_MEMBERSHIP_UNVERIFIED")?;
                     dirty = true;
                     flush_reports(&mut host, &mut controller, &mut dirty, native_live).await?;
@@ -246,8 +243,6 @@ async fn run() -> Result<()> {
                             }
                             Err(error) => {
                                 session.shutdown_and_drain(&mut controller, true).await?;
-                                native_live = false;
-                                dispatch_closed = true;
                                 return Err(error);
                             }
                         }
@@ -503,7 +498,7 @@ impl HostSession {
         native_live: bool,
     ) -> Result<VerifiedModuleHello> {
         let root_id = controller.and_then(Controller::native_root_id);
-        let native_scope = root_id.map(|_| self.native_scope_key.as_str());
+        let native_scope = root_id.map(|_| self.native_scope_key.clone());
         let native_ready = native_live && root_id.is_some();
         let mut last_error = None;
         for attempt in 0..MAX_HOST_ATTEMPTS {
@@ -529,13 +524,13 @@ impl HostSession {
                 .hello(
                     native_ready,
                     root_id,
-                    native_scope,
+                    native_scope.as_deref(),
                     self.owner.clone_for_reconnect(),
                 )
                 .await
             {
                 Ok(hello) => {
-                    self.accept_hello(&hello.response, root_id, native_scope)?;
+                    self.accept_hello(&hello.response, root_id, native_scope.as_deref())?;
                     self.recovery_required = hello
                         .response
                         .get("recovery_required")
@@ -1002,13 +997,12 @@ impl NativeSession {
                 let _ = stdout_wait.await;
             }
         }
-        if let Some(mut stderr_wait) = self.stderr_wait.take() {
-            if time::timeout(Duration::from_millis(250), &mut stderr_wait)
+        if let Some(mut stderr_wait) = self.stderr_wait.take()
+            && time::timeout(Duration::from_millis(250), &mut stderr_wait)
                 .await
                 .is_err()
-            {
-                stderr_wait.abort();
-            }
+        {
+            stderr_wait.abort();
         }
     }
 
@@ -1228,6 +1222,7 @@ async fn drain_ready_native(
                 *dirty = true;
                 return Ok(());
             }
+            Err(mpsc::error::TryRecvError::Empty) => return Ok(()),
         }
     }
 }

@@ -5,10 +5,7 @@
 //! certainty is produced only by the helper's exact pre-spawn receipt after
 //! whole-family departure has been proven.
 
-use crate::{
-    LifecycleState, ServiceScope, SupervisorStatus,
-    error::{Error, Result},
-};
+use crate::{Error, LifecycleState, Result, ServiceScope, SupervisorStatus};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -20,6 +17,7 @@ pub enum ModuleSupervisorPhase {
     Ready,
     RestartBackoff,
     Exited,
+    ExitedProven,
     OwnerRetained,
     IdentityUnknown,
     Completed,
@@ -130,18 +128,17 @@ impl ModuleSupervisorObservation {
             .last_failure
             .as_ref()
             .map(|failure| failure.code.clone());
-        if let Some(code) = error_code.as_deref() {
-            if code.len() > 128
+        if let Some(code) = error_code.as_deref()
+            && (code.len() > 128
                 || code.is_empty()
                 || !code
                     .bytes()
-                    .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
-            {
-                return Err(Error::new(
-                    "MODULE_OBSERVATION_INVALID",
-                    "module observation error code is outside its closed safe format",
-                ));
-            }
+                    .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_'))
+        {
+            return Err(Error::new(
+                "MODULE_OBSERVATION_INVALID",
+                "module observation error code is outside its closed safe format",
+            ));
         }
         Ok(Self {
             schema_version: 1,
@@ -154,7 +151,7 @@ impl ModuleSupervisorObservation {
             build_id: status.build_id.clone(),
             scope: status.scope.clone(),
             boot_id,
-            phase: ModuleSupervisorPhase::from(&status.lifecycle),
+            phase: ModuleSupervisorPhase::from_status(status),
             effect_certainty: status.effect_certainty,
             stage: status.failure_stage,
             error_code,
@@ -173,12 +170,32 @@ impl From<&LifecycleState> for ModuleSupervisorPhase {
             LifecycleState::Starting { .. } => Self::Starting,
             LifecycleState::ProcessRunning { .. } => Self::Ready,
             LifecycleState::RestartBackoff { .. } => Self::RestartBackoff,
-            LifecycleState::ProcessExited { .. } => Self::Exited,
+            LifecycleState::ProcessExited { exit_proven, .. } => {
+                if *exit_proven {
+                    Self::ExitedProven
+                } else {
+                    Self::Exited
+                }
+            }
             LifecycleState::OwnerGroupRetained { .. } => Self::OwnerRetained,
             LifecycleState::OwnerIdentityUnknown
             | LifecycleState::ProcessIdentityUnknown { .. } => Self::IdentityUnknown,
             LifecycleState::Completed { .. } => Self::Completed,
             LifecycleState::Isolated { .. } => Self::Isolated,
+        }
+    }
+}
+
+impl ModuleSupervisorPhase {
+    fn from_status(status: &SupervisorStatus) -> Self {
+        let phase = Self::from(&status.lifecycle);
+        if matches!(phase, Self::ExitedProven)
+            && (status.effect_certainty != ModuleEffectCertainty::Unknown
+                || status.failure_stage.is_some())
+        {
+            Self::Exited
+        } else {
+            phase
         }
     }
 }

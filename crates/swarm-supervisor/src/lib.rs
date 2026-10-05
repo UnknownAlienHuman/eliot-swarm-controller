@@ -11,12 +11,12 @@ pub mod observation;
 mod supervisor;
 
 pub use descriptor::{
-    ActivationPolicy, ArtifactIdentity, ArtifactSelector, BindingLaunchConfig, CapabilityId,
-    DescriptorCatalog, EnvironmentVariable, LaunchSpec, LaunchValue, LifecycleOwnership,
-    ModuleCatalog, ModuleDescriptor, ModuleId, ModuleOwnerExecutable, ProtectedRef,
-    ProtectedResolver, ProtectedResolverContext, ProtocolRange, ProtocolVersion,
-    ResolverMapDirectory, RestartPolicy, SchemaDescriptor, ServiceScope, Sha256Digest,
-    load_installed_descriptor,
+    ActivationPolicy, ArtifactIdentity, ArtifactSelector, BindingLaunchConfig,
+    BindingMapPublication, CapabilityId, DescriptorCatalog, EnvironmentVariable, LaunchSpec,
+    LaunchValue, LifecycleOwnership, ModuleCatalog, ModuleDescriptor, ModuleId,
+    ModuleOwnerExecutable, ProtectedRef, ProtectedResolver, ProtectedResolverContext,
+    ProtocolRange, ProtocolVersion, ResolverMapDirectory, RestartPolicy, SchemaDescriptor,
+    ServiceScope, Sha256Digest, load_installed_descriptor,
 };
 pub use module_link::module_contract_claim;
 pub use observation::{
@@ -24,8 +24,8 @@ pub use observation::{
 };
 pub use supervisor::{
     AdmissionState, DemandCause, DemandLease, FailureSummary, KernelFault, LifecycleState,
-    ModuleSupervisor, OperationReadback, OperationSnapshot, ProcessIdentity, RestartStatus,
-    SupervisorRegistry, SupervisorStatus,
+    ModuleDemandRequest, ModuleSupervisor, OperationReadback, OperationSnapshot, ProcessIdentity,
+    RestartStatus, SupervisorRegistry, SupervisorRegistryConfig, SupervisorStatus,
 };
 
 pub use swarm_contracts::error::{Error, Result};

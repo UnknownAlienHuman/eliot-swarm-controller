@@ -8,21 +8,16 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModuleRouteConfigMapper {
     /// Select the launch-config adapter by the exact retained descriptor
     /// schema. Descriptors without a launch config schema receive no extra
     /// process environment; their admitted options travel in RuntimeCommand.
+    #[default]
     DescriptorSchema,
     EmptyOnly,
     OpenCodeSevenField,
-}
-
-impl Default for ModuleRouteConfigMapper {
-    fn default() -> Self {
-        Self::DescriptorSchema
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -3252,7 +3252,7 @@ fn user_command_with_actor(
         }
         let target_id = model::text(&v["selector"], "input_operation_id")?;
         let session_id = model::text(&v["selector"], "session_id")?;
-        super::results::antigravity_status_snapshot(tx, id, generation, b, target_id, session_id)?;
+        super::results::antigravity_status_snapshot(tx, id, generation, &b, target_id, session_id)?;
     }
     if method == "agent.result" && crate::runtime::batch::is_sessionless_route(&b["route"]) {
         let target = operations::get_operation(tx, model::text(&v["selector"], "operation_id")?)?;

@@ -2337,11 +2337,11 @@ pub(super) fn open_for_launch_for_actor(
     if let Some(selected_descriptor) = selected_descriptor {
         if let Some(workspace_option) = selected_descriptor.workspace_option.as_ref() {
             inject_admitted_workspace(&mut route, workspace_option, &workspace_path)?;
-        } else if let Some(workspace_field) = route.workspace_option.as_deref() {
+        } else if let Some(workspace_field) = route.workspace_option.clone() {
             // Retained descriptors predate workspace_option. Their explicit,
             // already-validated route field remains sufficient for this exact
             // admitted path; selected legacy routes never infer by runtime.
-            inject_configured_workspace(&mut route, workspace_field, &workspace_path)?;
+            inject_configured_workspace(&mut route, &workspace_field, &workspace_path)?;
         } else {
             return Err(Error::new(
                 "CAPABILITY_GAP",

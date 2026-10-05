@@ -175,8 +175,8 @@ pub(crate) async fn serve_with_module_supervisor(
                             // its claim to the retained descriptor, and verified the
                             // existing owner boundary. Confirmation only clears the
                             // lifecycle's hello wait; it grants no Operation rights.
-                            if method=="module.hello" {
-                                if let (Some(supervisor),Ok(reply))=(&module_supervisor,&result) {
+                            if method=="module.hello"
+                                && let (Some(supervisor),Ok(reply))=(&module_supervisor,&result) {
                                     let negotiation=&reply["module_contract_negotiation"];
                                     if negotiation["status"]=="negotiated" {
                                         let identity=(
@@ -195,7 +195,6 @@ pub(crate) async fn serve_with_module_supervisor(
                                             }
                                         }
                                     }
-                                }
                             }
                             (id,result)
                         },

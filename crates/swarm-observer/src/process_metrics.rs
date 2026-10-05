@@ -621,7 +621,7 @@ fn bounded_json_len(value: &Value) -> usize {
 }
 
 #[cfg(windows)]
-fn identity_error(error: &swarm_contracts::error::Error) -> UnavailableReason {
+fn identity_error(error: swarm_contracts::error::Error) -> UnavailableReason {
     if error.code == "PROCESS_GONE" {
         UnavailableReason::ProcessExited
     } else if error.code == "PROCESS_PLATFORM_UNSUPPORTED" {
@@ -632,7 +632,7 @@ fn identity_error(error: &swarm_contracts::error::Error) -> UnavailableReason {
 }
 
 #[cfg(windows)]
-fn membership_error(error: &swarm_contracts::error::Error) -> UnavailableReason {
+fn membership_error(error: swarm_contracts::error::Error) -> UnavailableReason {
     if error.code == "PROCESS_GONE" {
         UnavailableReason::ProcessExited
     } else if error.code == "MODULE_MEMBERSHIP_UNSUPPORTED" {

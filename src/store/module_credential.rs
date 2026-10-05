@@ -421,15 +421,15 @@ fn register_scope(
 ) -> Result<bool> {
     let binding = super::operations::get_binding(tx, &scope.binding_id, scope.generation)?;
     verify_file_evidence(scope, evidence)?;
-    if let Some(expected) = &scope.expected_token_hash {
-        if expected != &evidence.token_hash {
-            return Err(scope_conflict());
-        }
+    if let Some(expected) = &scope.expected_token_hash
+        && expected != &evidence.token_hash
+    {
+        return Err(scope_conflict());
     }
-    if let Some(expected) = &scope.expected_file_sha256 {
-        if expected != &evidence.file_sha256 {
-            return Err(scope_conflict());
-        }
+    if let Some(expected) = &scope.expected_file_sha256
+        && expected != &evidence.file_sha256
+    {
+        return Err(scope_conflict());
     }
 
     let registration_key = format!("client:{}", scope.module_client_id);
@@ -547,10 +547,10 @@ fn prepare_private_credential(data_dir: &Path, scope: &ProvisionScope) -> Result
             token: format!("{}{}", model::new_id(), model::new_id()),
         };
         let bytes = serde_json::to_vec(&credential)?;
-        if let Err(error) = platform::write_private_new(&path, &bytes) {
-            if !path.try_exists()? {
-                return Err(error);
-            }
+        if let Err(error) = platform::write_private_new(&path, &bytes)
+            && !path.try_exists()?
+        {
+            return Err(error);
         }
     }
     let evidence = read_credential_at(&path, scope)?;

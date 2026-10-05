@@ -6,13 +6,14 @@
 
 use super::{
     inputs,
-    model::{self, ExecutorPin},
+    model::ExecutorPin,
     source,
     worker::{self, Completion, Work},
 };
 use crate::{
     artifacts::ArtifactFiles,
     error::{Error, Result},
+    model::{canonical, digest, now_ms},
     platform::process_group::{departed_empty, process_image_identity, spawned_identity},
 };
 use serde::{Deserialize, Serialize};
@@ -134,7 +135,7 @@ pub(crate) fn prepare_and_spawn(work: &Work, pin: &ExecutorPin) -> Result<Value>
     });
     write_private_once(
         &directory.join(BOOTSTRAP_FILE),
-        model::canonical(&bootstrap)?.as_bytes(),
+        canonical(&bootstrap)?.as_bytes(),
     )?;
 
     let log_path = directory.join("worker.stderr");
@@ -227,7 +228,7 @@ pub(crate) fn prepare_and_spawn(work: &Work, pin: &ExecutorPin) -> Result<Value>
             )
         });
     }
-    let launched_at = match model::now_ms() {
+    let launched_at = match now_ms() {
         Ok(value) => value,
         Err(error) => {
             let killed = child.kill().is_ok();
@@ -328,7 +329,7 @@ pub(crate) fn materialize_plan(
 
     let verified = source::verified_content(files, &work.data_dir, &work.candidate)?;
     let context = plan_context(work, &verified)?;
-    let (argv, expected_targets, executable) = if let Some(resolved) = &work.resolved_inputs {
+    let (argv, _expected_targets, executable) = if let Some(resolved) = &work.resolved_inputs {
         if work.input_fingerprint.as_deref() != resolved["input_fingerprint"].as_str()
             || resolved["candidate_content_sha256"] != verified.content_sha256
             || resolved["execution_workspace"]
@@ -370,10 +371,7 @@ pub(crate) fn materialize_plan(
     )?;
     let mut environment = inputs::effective_environment(&work.profile);
     let data_root = fs::canonicalize(&work.data_dir)?;
-    let target = data_root
-        .join("targets")
-        .join(work.profile.resource.to_ascii_lowercase());
-    worker::ensure_owned_directories(&data_root, &target)?;
+    let target = worker::resolve_target_directory(&data_root, &work.profile, &environment)?;
     environment.insert("CARGO_TARGET_DIR".into(), path_text(&target)?);
     environment.insert("SWARM_CANDIDATE_FILE".into(), path_text(&candidate_file)?);
     #[cfg(windows)]
@@ -418,7 +416,7 @@ pub(crate) fn materialize_plan(
             "timeout_ms": Value::Null
         }
     });
-    let bytes = model::canonical(&envelope)?.into_bytes();
+    let bytes = canonical(&envelope)?.into_bytes();
     if bytes.len() as u64 > MAX_PLAN_BYTES {
         return Err(Error::invalid(
             "resolved CheckRun plan exceeds its size bound",
@@ -430,14 +428,14 @@ pub(crate) fn materialize_plan(
         operation_id: work.operation_id.clone(),
         token: work.token.clone(),
         process: current_worker["process"].clone(),
-        plan_sha256: model::digest(&bytes),
+        plan_sha256: digest(&bytes),
         context,
-        materialized_at_ms: model::now_ms()?,
+        materialized_at_ms: now_ms()?,
     };
     write_private_once(&directory.join(PLAN_FILE), &bytes)?;
     write_private_once(
         &ready_path,
-        model::canonical(&serde_json::to_value(receipt)?)?.as_bytes(),
+        canonical(&serde_json::to_value(receipt)?)?.as_bytes(),
     )?;
     Ok(())
 }
@@ -780,7 +778,7 @@ fn build_completion(
         && let Some(coverage_gaps) = coverage["gaps"].as_array_mut()
     {
         coverage_gaps.extend(gaps.iter().filter(|gap| gap.is_string()).cloned());
-        coverage_gaps.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        coverage_gaps.sort_by(|left, right| left.as_str().cmp(&right.as_str()));
         coverage_gaps.dedup();
     }
     let state = if cancellation_applied {
@@ -828,10 +826,10 @@ fn build_completion(
             "truncated":record.metadata["truncated"],
             "capture_complete":record.metadata["capture_complete"]
         })).collect::<Vec<_>>(),
-        "started_at_ms":receipt.started_at_ms.unwrap_or(model::now_ms()?),
+        "started_at_ms":receipt.started_at_ms.unwrap_or(now_ms()?),
         "finished_at_ms":receipt.finished_at_ms
     });
-    let result_id = format!("check-{}", model::digest(work.operation_id.as_bytes()));
+    let result_id = format!("check-{}", digest(work.operation_id.as_bytes()));
     let (result, bytes) = ArtifactFiles::document(
         "check_result",
         &result_id,
@@ -869,7 +867,7 @@ fn expected_context(
     let profile_identity_sha256 = inputs::profile_identity_sha256(&work.profile)?;
     let null_scope_plan = Value::Null;
     let scope_plan = work.scope_plan.as_ref().unwrap_or(&null_scope_plan);
-    let scope_plan_sha256 = model::digest(model::canonical(scope_plan)?.as_bytes());
+    let scope_plan_sha256 = digest(canonical(scope_plan)?.as_bytes());
     if receipt.candidate_ref != work.candidate.artifact_id
         || receipt.candidate_content_sha256 != verified.content_sha256
         || receipt.input_fingerprint != work.input_fingerprint
@@ -991,7 +989,7 @@ fn add_stream_gaps(coverage: &mut Value, execution: &ExecutionEvidence) -> Resul
             gaps.push(json!(format!("{name}_capture_incomplete")));
         }
     }
-    gaps.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    gaps.sort_by(|left, right| left.as_str().cmp(&right.as_str()));
     gaps.dedup();
     Ok(())
 }
@@ -1115,17 +1113,15 @@ fn check_directory(work: &Work, create_job: bool) -> Result<PathBuf> {
         ));
     }
     let directory = checks.join(&work.check_id);
-    if create_job {
-        if let Err(error) = fs::create_dir(&directory) {
-            return Err(if error.kind() == std::io::ErrorKind::AlreadyExists {
-                Error::new(
-                    "CHECK_LAUNCH_UNKNOWN",
-                    "existing CheckRun directory requires reconciliation, not another executor",
-                )
-            } else {
-                error.into()
-            });
-        }
+    if create_job && let Err(error) = fs::create_dir(&directory) {
+        return Err(if error.kind() == std::io::ErrorKind::AlreadyExists {
+            Error::new(
+                "CHECK_LAUNCH_UNKNOWN",
+                "existing CheckRun directory requires reconciliation, not another executor",
+            )
+        } else {
+            error.into()
+        });
     }
     let metadata = fs::symlink_metadata(&directory)?;
     if is_link_or_reparse(&metadata) || !metadata.is_dir() {
@@ -1197,7 +1193,7 @@ fn plan_context(work: &Work, verified: &source::VerifiedSource) -> Result<PlanCo
         executable_path: path_text(&fs::canonicalize(executable)?)?,
         executable_sha256,
         profile_identity_sha256: inputs::profile_identity_sha256(&work.profile)?,
-        scope_plan_sha256: model::digest(model::canonical(scope_plan)?.as_bytes()),
+        scope_plan_sha256: digest(canonical(scope_plan)?.as_bytes()),
     })
 }
 

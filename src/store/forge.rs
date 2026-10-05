@@ -1461,15 +1461,19 @@ fn github_cli_executable() -> Result<PathBuf> {
     ))
 }
 
+pub(super) struct GitHubDescriptionWorkerRequest {
+    pub(super) operation_id: String,
+    pub(super) host: String,
+    pub(super) owner: String,
+    pub(super) repository: String,
+    pub(super) pull_request_number: i64,
+    pub(super) title: String,
+    pub(super) body: String,
+}
+
 fn create_github_description_worker_job(
     data_dir: &Path,
-    operation_id: &str,
-    host: &str,
-    owner: &str,
-    repository: &str,
-    pull_request_number: i64,
-    title: &str,
-    body: &str,
+    request: &GitHubDescriptionWorkerRequest,
 ) -> Result<NativeWorkerJob> {
     let data_dir = data_dir.canonicalize()?;
     let jobs_root = data_dir.join("forge-worker-runs");
@@ -1503,19 +1507,19 @@ fn create_github_description_worker_job(
         "schema_version":1,
         "kind":"github_pr_description",
         "job_id":job_id,
-        "operation_id":operation_id,
+        "operation_id":request.operation_id.as_str(),
         "owner_token":owner_token,
         "phase":"patch_once",
         "gh_executable":gh_executable,
         "gh_executable_sha256":gh_executable_sha256,
         "timeout_seconds":timeout_seconds,
         "max_output_bytes":max_output_bytes,
-        "host":host,
-        "owner":owner,
-        "repository":repository,
-        "pull_request_number":pull_request_number,
-        "title":title,
-        "body":body
+        "host":request.host.as_str(),
+        "owner":request.owner.as_str(),
+        "repository":request.repository.as_str(),
+        "pull_request_number":request.pull_request_number,
+        "title":request.title.as_str(),
+        "body":request.body.as_str()
     });
     let plan_bytes = serde_json::to_vec(&plan)?;
     if plan_bytes.len() > 1_048_576 {
@@ -1531,7 +1535,7 @@ fn create_github_description_worker_job(
         kind: "github_pr_description",
         phase_name: "patch_once",
         job_id,
-        operation_id: operation_id.to_owned(),
+        operation_id: request.operation_id.clone(),
         owner_token,
         plan_sha256,
         directory,
@@ -1685,14 +1689,17 @@ async fn wait_worker_owner(child: &mut TokioChild, job: &NativeWorkerJob) -> Res
                 .id()
                 .ok_or_else(|| Error::new("FORGE_WORKER_OWNER_INVALID", "worker PID is absent"))?;
             let expected = job.clone();
-            tokio::task::spawn_blocking(move || validate_worker_owner(&expected, pid, &owner))
-                .await
-                .map_err(|_| {
-                    Error::new(
-                        "FORGE_WORKER_OWNER_INVALID",
-                        "worker image identity check did not complete",
-                    )
-                })??;
+            let owner = tokio::task::spawn_blocking(move || -> Result<Value> {
+                validate_worker_owner(&expected, pid, &owner)?;
+                Ok(owner)
+            })
+            .await
+            .map_err(|_| {
+                Error::new(
+                    "FORGE_WORKER_OWNER_INVALID",
+                    "worker image identity check did not complete",
+                )
+            })??;
             return Ok(owner);
         }
         if child.try_wait()?.is_some() {
@@ -2575,6 +2582,7 @@ fn prepare_push(config: &ForgeConfig, work: &ForgeWork) -> Result<String> {
     Ok(push_url)
 }
 
+#[cfg(test)]
 fn restart_readback_outcome(intent: &PublicationIntent, readback: RefReadback) -> ForgeOutcome {
     if readback.matches_intent(intent) {
         ForgeOutcome::Applied {
@@ -3828,34 +3836,11 @@ impl super::Store {
 
     pub(super) async fn prepare_github_description_worker(
         &self,
-        operation_id: &str,
-        host: &str,
-        owner: &str,
-        repository: &str,
-        pull_request_number: i64,
-        title: &str,
-        body: &str,
+        request: GitHubDescriptionWorkerRequest,
     ) -> Result<GitHubDescriptionWorkerRun> {
         let data_dir = self.data_dir.clone();
-        let operation_id = operation_id.to_owned();
-        let host = host.to_owned();
-        let owner = owner.to_owned();
-        let repository = repository.to_owned();
-        let title = title.to_owned();
-        let body = body.to_owned();
         let job = self
-            .file_io(move |_| {
-                create_github_description_worker_job(
-                    &data_dir,
-                    &operation_id,
-                    &host,
-                    &owner,
-                    &repository,
-                    pull_request_number,
-                    &title,
-                    &body,
-                )
-            })
+            .file_io(move |_| create_github_description_worker_job(&data_dir, &request))
             .await?;
         let process_permit = self
             .artifact_io
@@ -3888,12 +3873,12 @@ impl super::Store {
             };
             let result = wait_forge_worker(worker.run, authorized).await;
             if let Err(error) = authorization_result {
-                if let Err(tree_error) = result {
-                    if tree_error.code == "FORGE_GIT_TREE_TERMINATION" {
-                        return Err(tree_error);
+                return match result {
+                    Err(tree_error) if tree_error.code == "FORGE_GIT_TREE_TERMINATION" => {
+                        Err(tree_error)
                     }
-                }
-                return Err(error);
+                    _ => Err(error),
+                };
             }
             result
         })

@@ -15,6 +15,7 @@ pub mod result;
 pub mod schema;
 
 pub use error::{Result, ScriptError};
+pub use event::{EventAction, EventRule};
 pub use swarm_bus::{EventMetadata, EventSelector, EventStatus};
 
 pub const MAX_INPUT_BYTES: usize = 256 * 1024;

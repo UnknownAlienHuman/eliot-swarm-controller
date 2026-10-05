@@ -254,11 +254,10 @@ impl StreamState {
         if let (Some(root), Some(carrier)) = (
             self.init.as_ref().map(|init| init.conversation_id.as_str()),
             payload.get("conversation_id").and_then(Value::as_str),
-        ) {
-            if carrier != root {
-                self.gaps = self.gaps.saturating_add(1);
-                return;
-            }
+        ) && carrier != root
+        {
+            self.gaps = self.gaps.saturating_add(1);
+            return;
         }
 
         if !self.steps.contains_key(&index) && self.steps.len() >= MAX_STEPS {
@@ -290,30 +289,30 @@ impl StreamState {
         let error = tool_info
             .and_then(|tool| tool.get("error"))
             .and_then(Value::as_object);
-        if step.tool_error_type.is_none() {
-            if let Some(error) = error {
-                let error_type = error
-                    .get("type")
+        if step.tool_error_type.is_none()
+            && let Some(error) = error
+        {
+            let error_type = error
+                .get("type")
+                .and_then(Value::as_str)
+                .map(|value| bounded_string(value, 128))
+                .unwrap_or_else(|| "unknown".to_owned());
+            step.tool_error_type = Some(error_type.clone());
+            let tool_name = step.tool_name.clone().or_else(|| {
+                tool_info
+                    .and_then(|tool| tool.get("name"))
                     .and_then(Value::as_str)
-                    .map(|value| bounded_string(value, 128))
-                    .unwrap_or_else(|| "unknown".to_owned());
-                step.tool_error_type = Some(error_type.clone());
-                let tool_name = step.tool_name.clone().or_else(|| {
-                    tool_info
-                        .and_then(|tool| tool.get("name"))
-                        .and_then(Value::as_str)
-                        .map(|value| bounded_string(value, 256))
-                });
-                if self.tool_errors.len() == MAX_TOOL_ERRORS {
-                    self.tool_errors.pop_front();
-                    self.gaps = self.gaps.saturating_add(1);
-                }
-                self.tool_errors.push_back(ToolError {
-                    step_index: index,
-                    tool_name,
-                    error_type,
-                });
+                    .map(|value| bounded_string(value, 256))
+            });
+            if self.tool_errors.len() == MAX_TOOL_ERRORS {
+                self.tool_errors.pop_front();
+                self.gaps = self.gaps.saturating_add(1);
             }
+            self.tool_errors.push_back(ToolError {
+                step_index: index,
+                tool_name,
+                error_type,
+            });
         }
         self.apply_children(index, payload.get("subagent_info"));
     }

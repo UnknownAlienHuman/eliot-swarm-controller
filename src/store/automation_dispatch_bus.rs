@@ -204,7 +204,7 @@ pub(crate) fn events_page(
                 "source_id":event.source_id,
                 "event_kind":event.event_kind,
                 "status":projection.status.map(crate::automation::event_rules::EventStatus::as_str),
-                "action":{"kind":"script_run","script_id":selected_script_id(&entry)?},
+                "action":{"kind":"script_run","script_id":selected_script_id(entry)?},
             }));
             if items.len() == limit {
                 stopped_before_scan_end = index + 1 < scanned.len();
@@ -259,7 +259,7 @@ pub(crate) fn admit_script_run_page(
             "current automation revision differs from the page snapshot",
         ));
     }
-    let script_id = selected_script_id(&entry)?;
+    let script_id = selected_script_id(entry)?;
     if expected_cursor < 0 || through_observation_id <= expected_cursor {
         return Err(Error::invalid(
             "bus page must advance strictly beyond its expected cursor",
@@ -271,7 +271,7 @@ pub(crate) fn admit_script_run_page(
         &entry.project_id,
         &entry.automation_id,
     )?;
-    let mut state = load_script_trigger_state(tx, &entry)?.ok_or_else(|| {
+    let mut state = load_script_trigger_state(tx, entry)?.ok_or_else(|| {
         Error::new(
             "BUS_CONSUMER_CURSOR_MISSING",
             "selected ScriptRun consumer has no durable cursor",
@@ -283,7 +283,7 @@ pub(crate) fn admit_script_run_page(
             "durable consumer cursor changed; read a fresh event page",
         ));
     }
-    revalidate_script_trigger_intents(tx, &entry, &mut state, app_config, now_ms)?;
+    revalidate_script_trigger_intents(tx, entry, &mut state, app_config, now_ms)?;
     if state.pending.len() >= MAX_PENDING_SUBJECTS {
         return Err(Error::new(
             "BUS_PENDING_CAPACITY",
@@ -348,17 +348,17 @@ pub(crate) fn admit_script_run_page(
                     && event.event_kind == LocalProducer::TaskSubmission.event_kind()
                 {
                     process_task_submission_script_trigger(
-                        tx, app_config, &entry, &mut state, event,
+                        tx, app_config, entry, &mut state, event,
                     )?;
                 } else {
-                    process_system_event_script_trigger(tx, app_config, &entry, &mut state, event)?;
+                    process_system_event_script_trigger(tx, app_config, entry, &mut state, event)?;
                 }
             }
             ScriptConsumerAuthority::ScopedModule(binding) => {
                 process_script_trigger_for_scoped_module(
                     tx,
                     app_config,
-                    &entry,
+                    entry,
                     &mut state,
                     event,
                     binding.owner_manager_id(),
@@ -810,7 +810,7 @@ pub(super) fn current_submission_scope_matches_for_owner(
         || task["current_attempt_id"] != attempt_id
         || attempt["task_id"] != task_id
         || attempt["task_revision"] != task_revision
-        || attempt["released_at_ms"].is_null() == false
+        || !attempt["released_at_ms"].is_null()
         || attempt["submission_ref"] != cause.id()
         || attempt["candidate_ref"] != document["candidate_ref"]
     {
@@ -929,6 +929,26 @@ pub(super) fn script_event_invocation_context_for_consumer(
         ));
     }
     authorization::require_registered_manager(db, owner_manager_id)?;
+    let module_lifecycle_fact =
+        if crate::store::module_supervisor_observation::is_lifecycle_event_source_kind(
+            &event.source_id,
+            &event.event_kind,
+        ) {
+            Some(
+                crate::store::module_supervisor_observation::verified_lifecycle_event(db, &event)?
+                    .ok_or_else(|| {
+                        Error::new(
+                            "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
+                            "module lifecycle event has no exact Store-certified binding scope",
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
+    if let Some(fact) = module_lifecycle_fact.as_ref() {
+        require_module_lifecycle_binding_source(db, entry, owner_manager_id, fact)?;
+    }
 
     let mut task_id = None;
     let mut task_revision = None;
@@ -973,7 +993,7 @@ pub(super) fn script_event_invocation_context_for_consumer(
                     || task["state"] != "open"
                     || task["current_attempt_id"] != operation_attempt
                     || task["revision"] != revision
-                    || attempt["released_at_ms"].is_null() == false
+                    || !attempt["released_at_ms"].is_null()
                     || !consumer_owner_has_current_attempt(
                         db,
                         owner_manager_id,
@@ -1037,8 +1057,8 @@ pub(super) fn script_event_invocation_context_for_consumer(
                 "selected HookCommit belongs to another project",
             ));
         }
-        match super::hooks::source_status(db, app_config, &fact.source_id)? {
-            super::hooks::HookSourceStatus::Current(source)
+        match crate::store::hooks::source_status(db, app_config, &fact.source_id)? {
+            crate::store::hooks::HookSourceStatus::Current(source)
                 if source.source_id == fact.source_id && source.project_id == entry.project_id =>
             {
                 project_id = fact.project_id;
@@ -1058,6 +1078,9 @@ pub(super) fn script_event_invocation_context_for_consumer(
     {
         project_id =
             super::hook_source_admin_project_scope(db, app_config, &entry.project_id, &event)?;
+    } else if module_lifecycle_fact.is_some() {
+        // The exact binding and Manager-owned agent.open source were checked
+        // above, independently of any optional Operation correlation.
     } else if event.source_id == "controller:host-lifecycle"
         && ((matches!(event.event_kind.as_str(), "host.exit" | "host.interrupted")
             && projection.occurrence_phase.as_deref() == Some("host_interruption_observed"))
@@ -1134,4 +1157,77 @@ pub(super) fn script_event_invocation_context_for_consumer(
         task_revision,
         attempt_id,
     })
+}
+
+fn require_module_lifecycle_binding_source(
+    db: &Connection,
+    entry: &AutomationEntry,
+    owner_manager_id: &str,
+    fact: &crate::store::module_supervisor_observation::VerifiedModuleLifecycleEvent,
+) -> Result<()> {
+    let mut statement = db.prepare(
+        "SELECT caller_id,task_id,attempt_id FROM operations \
+         WHERE method='agent.open' AND binding_id=?1 AND binding_generation=?2 \
+         ORDER BY created_at_ms,operation_id LIMIT 2",
+    )?;
+    let opens = statement
+        .query_map(params![fact.binding_id, fact.generation], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if opens.len() != 1 {
+        return Err(Error::new(
+            "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
+            "module lifecycle binding has no unique retained agent.open source",
+        ));
+    }
+    let (caller_id, task_id, attempt_id) = &opens[0];
+    if caller_id != owner_manager_id {
+        return Err(Error::new(
+            "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
+            "module lifecycle binding was opened by another Manager",
+        ));
+    }
+    match (task_id.as_deref(), attempt_id.as_deref()) {
+        (Some(task_id), Some(attempt_id)) => {
+            let task = super::tasks::get_task(db, task_id)?;
+            let attempt = super::tasks::get_attempt(db, attempt_id)?;
+            let revision = task["revision"].as_i64();
+            if task["project_id"] != entry.project_id
+                || task["state"] != "open"
+                || revision.is_none_or(|value| value <= 0)
+                || task["current_attempt_id"].as_str() != Some(attempt_id)
+                || attempt["task_id"].as_str() != Some(task_id)
+                || attempt["task_revision"].as_i64() != revision
+                || attempt["owner_id"].as_str() != Some(owner_manager_id)
+                || !attempt["released_at_ms"].is_null()
+            {
+                return Err(Error::new(
+                    "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
+                    "module lifecycle binding Task is outside the Manager's current project scope",
+                ));
+            }
+        }
+        (Some(task_id), None) => {
+            let task = super::tasks::get_task(db, task_id)?;
+            if task["project_id"] != entry.project_id || task["state"] != "open" {
+                return Err(Error::new(
+                    "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
+                    "module lifecycle binding Task is outside the Manager's current project scope",
+                ));
+            }
+        }
+        (None, Some(_)) => {
+            return Err(Error::new(
+                "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
+                "module lifecycle binding has an Attempt without its Task",
+            ));
+        }
+        (None, None) => {}
+    }
+    Ok(())
 }

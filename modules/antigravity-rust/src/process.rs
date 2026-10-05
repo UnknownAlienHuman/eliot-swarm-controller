@@ -98,14 +98,14 @@ impl VerifiedManagedOwner {
         adapter_image: Value,
         recovery_required: bool,
     ) -> Result<Self> {
-        let token = validate_owner_record(&record)?;
+        let token = validate_owner_record(&record)?.to_owned();
         if token != boot_id {
             return Err(Error::invalid("MANAGED_MODULE_OWNER_IDENTITY_INVALID"));
         }
         Ok(Self {
             _record: record,
             _adapter_image: adapter_image,
-            token: token.to_owned(),
+            token,
             native_launch_allowed: !recovery_required,
         })
     }

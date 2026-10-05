@@ -2062,21 +2062,38 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
     )
     OR (
         op.method = 'script.run'
+        AND op.task_id IS NOT NULL AND op.attempt_id IS NOT NULL
+        AND EXISTS (
+            SELECT 1 FROM script_runs AS run
+            JOIN meta AS link ON link.key='automation:v1:operation:' || op.operation_id
+            JOIN meta AS manager ON manager.key='client:' || :client
+            WHERE run.operation_id=op.operation_id
+              AND run.task_id=op.task_id AND run.attempt_id=op.attempt_id
+              AND run.task_revision IS NOT NULL AND run.task_revision > 0
+              AND json_extract(link.value_json,'$.record.operation_id')=op.operation_id
+              AND json_extract(link.value_json,'$.record.action')='script.run'
+              AND json_extract(link.value_json,'$.record.technical_requester_id')='eliot-internal-automation-v1'
+              AND json_extract(link.value_json,'$.record.effective_manager_id')=:client
+              AND json_extract(manager.value_json,'$.role')='manager'
+              AND COALESCE(json_extract(manager.value_json,'$.disabled'),0)=0
+        )
+    )
+    OR (
+        op.method = 'script.run'
         AND op.task_id IS NULL AND op.attempt_id IS NULL
         AND EXISTS (
             SELECT 1 FROM script_runs AS run
             JOIN meta AS link ON link.key='automation:v1:operation:' || op.operation_id
             JOIN meta AS manager ON manager.key='client:' || :client
-            JOIN meta AS current_gm ON current_gm.key='gm'
             WHERE run.operation_id=op.operation_id
               AND run.task_id IS NULL AND run.task_revision IS NULL AND run.attempt_id IS NULL
               AND json_extract(link.value_json,'$.record.operation_id')=op.operation_id
               AND json_extract(link.value_json,'$.record.action')='script.run'
+              AND json_extract(link.value_json,'$.record.technical_requester_id')='eliot-internal-automation-v1'
               AND json_extract(link.value_json,'$.record.cause.kind')='system_event'
               AND json_extract(link.value_json,'$.record.effective_manager_id')=:client
               AND json_extract(manager.value_json,'$.role')='manager'
               AND COALESCE(json_extract(manager.value_json,'$.disabled'),0)=0
-              AND json_extract(current_gm.value_json,'$.client_id')=:client
         )
     )
     OR (
@@ -2134,6 +2151,8 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
                     WHEN 'review.assign' THEN '$.on_behalf.effective_manager_id'
                     ELSE '$.automation_on_behalf.effective_manager_id' END)
                   = json_extract(link.value_json, '$.record.effective_manager_id')
+              AND NOT (op.method='message.send'
+                       AND json_extract(link.value_json,'$.record.cause.kind')='script_controller_effect')
               AND (
                   json_extract(link.value_json, '$.record.effective_manager_id') = :client
                   OR EXISTS (
@@ -2146,6 +2165,42 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
                         AND target.project_id=json_extract(link.value_json,'$.record.project_id')
                   )
               )
+        )
+    )
+    OR (
+        op.caller_id='eliot-internal-automation-v1'
+        AND op.method='message.send'
+        AND EXISTS (
+            SELECT 1 FROM meta AS link
+            JOIN meta AS manager ON manager.key='client:' || :client
+            LEFT JOIN meta AS current_gm ON current_gm.key='gm'
+            JOIN tasks AS target
+              ON target.task_id=json_extract(link.value_json,'$.record.cause.task_id')
+            JOIN attempts AS subject
+              ON subject.task_id=target.task_id
+             AND subject.attempt_id=json_extract(link.value_json,'$.record.cause.attempt_id')
+            WHERE link.key='automation:v1:operation:' || op.operation_id
+              AND json_extract(link.value_json,'$.record.operation_id')=op.operation_id
+              AND json_extract(link.value_json,'$.record.technical_requester_id')=op.caller_id
+              AND json_extract(link.value_json,'$.record.action')='message.send'
+              AND json_extract(link.value_json,'$.record.cause.kind')='script_controller_effect'
+              AND (json_extract(link.value_json,'$.record.effective_manager_id')=:client
+                   OR json_extract(current_gm.value_json,'$.client_id')=:client)
+              AND json_extract(op.effective_request_json,'$.automation_on_behalf.effective_manager_id')
+                  =json_extract(link.value_json,'$.record.effective_manager_id')
+              AND json_extract(op.effective_request_json,'$.script_invocation.grant')='task_owner_message'
+              AND json_extract(op.effective_request_json,'$.script_invocation.cause.kind')='script_invocation'
+              AND json_extract(op.effective_request_json,'$.script_invocation.cause.script_run_operation_id')
+                  =json_extract(link.value_json,'$.record.cause.script_run_operation_id')
+              AND json_extract(op.effective_request_json,'$.script_invocation.cause.script_run_id')
+                  =json_extract(link.value_json,'$.record.cause.script_run_id')
+              AND json_extract(op.effective_request_json,'$.script_invocation.cause.identity.task_id')=target.task_id
+              AND json_extract(op.effective_request_json,'$.script_invocation.cause.identity.task_revision')=subject.task_revision
+              AND json_extract(op.effective_request_json,'$.script_invocation.cause.identity.attempt_id')=subject.attempt_id
+              AND json_extract(link.value_json,'$.record.project_id')=target.project_id
+              AND subject.task_revision=json_extract(link.value_json,'$.record.cause.task_revision')
+              AND json_extract(manager.value_json,'$.role')='manager'
+              AND COALESCE(json_extract(manager.value_json,'$.disabled'),0)=0
         )
     )
     OR (
@@ -3112,8 +3167,7 @@ fn mcp_authorization(db: &Connection, p: &Principal, value: &Value) -> Result<Va
             allowed.extend(methods.into_iter().filter(|method| {
                 !participant_only_mutation(method)
                     && *method != "review.submit"
-                    && (gm_authority
-                        || !(method.starts_with("script.") || method.starts_with("hook.")))
+                    && (gm_authority || !method.starts_with("hook."))
                     && (gm_authority
                         || !matches!(
                             *method,
@@ -3524,6 +3578,31 @@ fn mutate_in_transaction(
     mutate_in_transaction_with_check_plan(tx, p, method, v, config, now, None)
 }
 
+/// Admit the single closed ScriptRun controller effect through the normal
+/// Operation, observation, capacity, and receipt path. Its Store-derived
+/// context is not a Principal and is revalidated before and after apply.
+fn mutate_script_effect_in_transaction(
+    tx: &Transaction<'_>,
+    admission: &scripts::ScriptEffectAdmission,
+    method: &str,
+    v: &Value,
+    config: &Config,
+    now: i64,
+) -> Result<Result<Value>> {
+    mutate_in_transaction_with_authority(
+        tx,
+        MutationAuthority::ScriptEffect(admission),
+        method,
+        v,
+        config,
+        now,
+        MutationPlan {
+            check_plan: None,
+            launch_operation_id: None,
+        },
+    )
+}
+
 pub(super) struct CronAdmission {
     pub(super) receipt: Result<Value>,
     pub(super) wake_check_worker: bool,
@@ -3727,6 +3806,7 @@ enum MutationAuthority<'a> {
     Launch(&'a launcher::LaunchActor),
     Cron(&'a crate::automation::authorization::CronExecutionContext),
     GoalProgression(&'a automation_goal_progression::GoalProgressionAdmission),
+    ScriptEffect(&'a scripts::ScriptEffectAdmission),
 }
 
 impl MutationAuthority<'_> {
@@ -3738,6 +3818,7 @@ impl MutationAuthority<'_> {
             Self::GoalProgression(_) => {
                 crate::automation::authorization::AUTOMATION_TECHNICAL_REQUESTER_ID
             }
+            Self::ScriptEffect(admission) => admission.technical_requester_id(),
         }
     }
 }
@@ -3798,6 +3879,18 @@ fn mutate_in_transaction_with_authority(
             ));
         }
         context.require_current_for_admission(tx, now)?;
+    }
+    if let MutationAuthority::ScriptEffect(admission) = &authority {
+        if method != "message.send"
+            || plan.check_plan.is_some()
+            || plan.launch_operation_id.is_some()
+        {
+            return Err(Error::new(
+                "FORBIDDEN",
+                "ScriptRun effect authority permits only its exact Task-owner message",
+            ));
+        }
+        admission.require_current(tx, config, method, v)?;
     }
     model::validate_mutation(method, v)?;
     let request_id = model::text(v, "client_request_id")?;
@@ -3864,6 +3957,12 @@ fn mutate_in_transaction_with_authority(
                         return Err(Error::new(
                             "FORBIDDEN",
                             "Goal progression cannot admit a launch child",
+                        ));
+                    }
+                    MutationAuthority::ScriptEffect(_) => {
+                        return Err(Error::new(
+                            "FORBIDDEN",
+                            "ScriptRun effect cannot admit a launch child",
                         ));
                     }
                 };
@@ -4028,8 +4127,15 @@ fn mutate_in_transaction_with_authority(
                 plan,
             },
         ),
+        MutationAuthority::ScriptEffect(admission) => {
+            apply_message_send(tx, admission.effective_manager_id(), v, &id)
+                .map(|value| (value, false))
+        }
     };
     let result = result.and_then(|(value, queued)| {
+        if let MutationAuthority::ScriptEffect(admission) = &authority {
+            admission.require_current(tx, config, method, v)?;
+        }
         if let Some(slot) = &direct_repair_slot
             && let MutationAuthority::Direct(principal) = &authority
         {
@@ -4825,65 +4931,83 @@ fn apply(
                 false,
             ))
         }
-        "message.send" => {
-            model::fields(
-                v,
-                &[
-                    "client_request_id",
-                    "recipient",
-                    "text",
-                    "in_reply_to",
-                    "in_reply_to_digest",
-                    "admission_deadline_ms",
-                    "delivery_deadline_ms",
-                    "reply_deadline_ms",
-                ],
-            )?;
-            let recipient = model::text(v, "recipient")?;
-            let body = model::text(v, "text")?;
-            let recipient_registration = meta(tx, &format!("client:{recipient}"))?
-                .ok_or_else(|| Error::new("NOT_FOUND", "recipient is not registered"))?;
-            let sender_registration = meta(tx, &format!("client:{}", p.client_id))?
-                .ok_or_else(|| Error::new("UNAUTHORIZED", "sender is not registered"))?;
-            let payload_digest = model::message_payload_digest(&p.client_id, recipient, body)?;
-            let mut reply_to = Value::Null;
-            if let Some(reply) = v.get("in_reply_to").and_then(Value::as_str) {
-                // A reply addresses the original delivery: by its own
-                // delivery_id when it carries one, otherwise by the
-                // historical operation id.
-                let prior = match find_delivery(tx, reply)? {
-                    Some(original) => original,
-                    None => operations::get_operation(tx, reply)?,
-                };
-                if !(prior["method"] == "message.send"
-                    || (prior["method"] == "task.request_changes"
-                        && prior["result"]["applied"] == true)
-                    || (prior["method"] == "task.invalidate_acceptance"
-                        && prior["result"]["message_id"] == reply))
-                    || prior["result"]["recipient"] != p.client_id
-                    || prior["result"]["sender"] != recipient
-                {
-                    return Err(Error::invalid(
-                        "reply does not match the sender and recipient of that message",
-                    ));
-                }
-                model::verify_payload_digest_claim(
-                    prior["result"]["payload_digest"].as_str(),
-                    v.get("in_reply_to_digest").and_then(Value::as_str),
-                )?;
-                reply_to = model::message_reply_reference(&prior["result"]);
-            }
-            Ok((
-                json!({"operation_id":id,"message_id":id,"delivery_id":model::new_id(),"sender":p.client_id,"recipient":recipient,"source_scope":model::message_scope(&sender_registration,&p.client_id),"target_scope":model::message_scope(&recipient_registration,recipient),"actor":model::message_actor(&sender_registration,&p.client_id),"payload_digest":payload_digest,"admission_deadline_ms":model::deadline(v,"admission_deadline_ms")?,"delivery_deadline_ms":model::deadline(v,"delivery_deadline_ms")?,"reply_deadline_ms":model::deadline(v,"reply_deadline_ms")?,"text":body,"in_reply_to":v.get("in_reply_to"),"reply_to":reply_to,"cancellation":Value::Null,"delivery":"durable_mailbox_only"}),
-                false,
-            ))
-        }
+        "message.send" => apply_message_send(tx, &p.client_id, v, id).map(|value| (value, false)),
         "message.cancel" => cancel_message(tx, p, v, id).map(|v| (v, false)),
         _ => Err(Error::new(
             "METHOD_NOT_FOUND",
             format!("{method} is not implemented; no native effect was attempted"),
         )),
     }
+}
+
+/// Shared message admission for direct callers and the one typed ScriptRun
+/// effect. The caller identity is selected only by the closed mutation actor;
+/// automatic effects provide it from their validated Store context.
+fn apply_message_send(tx: &Transaction<'_>, sender_id: &str, v: &Value, id: &str) -> Result<Value> {
+    model::fields(
+        v,
+        &[
+            "client_request_id",
+            "recipient",
+            "text",
+            "in_reply_to",
+            "in_reply_to_digest",
+            "admission_deadline_ms",
+            "delivery_deadline_ms",
+            "reply_deadline_ms",
+        ],
+    )?;
+    let recipient = model::text(v, "recipient")?;
+    let body = model::text(v, "text")?;
+    let recipient_registration = meta(tx, &format!("client:{recipient}"))?
+        .ok_or_else(|| Error::new("NOT_FOUND", "recipient is not registered"))?;
+    let sender_registration = meta(tx, &format!("client:{sender_id}"))?
+        .ok_or_else(|| Error::new("UNAUTHORIZED", "sender is not registered"))?;
+    let payload_digest = model::message_payload_digest(sender_id, recipient, body)?;
+    let mut reply_to = Value::Null;
+    if let Some(reply) = v.get("in_reply_to").and_then(Value::as_str) {
+        // A reply addresses the original delivery: by its own delivery_id
+        // when it carries one, otherwise by the historical operation id.
+        let prior = match find_delivery(tx, reply)? {
+            Some(original) => original,
+            None => operations::get_operation(tx, reply)?,
+        };
+        if !(prior["method"] == "message.send"
+            || (prior["method"] == "task.request_changes" && prior["result"]["applied"] == true)
+            || (prior["method"] == "task.invalidate_acceptance"
+                && prior["result"]["message_id"] == reply))
+            || prior["result"]["recipient"] != sender_id
+            || prior["result"]["sender"] != recipient
+        {
+            return Err(Error::invalid(
+                "reply does not match the sender and recipient of that message",
+            ));
+        }
+        model::verify_payload_digest_claim(
+            prior["result"]["payload_digest"].as_str(),
+            v.get("in_reply_to_digest").and_then(Value::as_str),
+        )?;
+        reply_to = model::message_reply_reference(&prior["result"]);
+    }
+    Ok(json!({
+        "operation_id":id,
+        "message_id":id,
+        "delivery_id":model::new_id(),
+        "sender":sender_id,
+        "recipient":recipient,
+        "source_scope":model::message_scope(&sender_registration,sender_id),
+        "target_scope":model::message_scope(&recipient_registration,recipient),
+        "actor":model::message_actor(&sender_registration,sender_id),
+        "payload_digest":payload_digest,
+        "admission_deadline_ms":model::deadline(v,"admission_deadline_ms")?,
+        "delivery_deadline_ms":model::deadline(v,"delivery_deadline_ms")?,
+        "reply_deadline_ms":model::deadline(v,"reply_deadline_ms")?,
+        "text":body,
+        "in_reply_to":v.get("in_reply_to"),
+        "reply_to":reply_to,
+        "cancellation":Value::Null,
+        "delivery":"durable_mailbox_only"
+    }))
 }
 
 /// Finds a settled mailbox delivery by its own delivery identity (R22).

@@ -169,6 +169,13 @@ and sends a native input once. Unknown effects use bounded readback rather
 than another send. Source/manifest consistency is recorded separately from
 the actual runtime result.
 
+`tools/qualification/Invoke-CoreFailureQualification.ps1` uses an explicitly
+pinned host and a fresh private DataRoot for lost-caller-ACK, request-conflict and
+optional HookSource deduplication checks. Its independent Manager readback must
+prove admission before graceful restart. It never treats a missing caller reply
+as a native-effect unknown outcome, injects a vendor effect, or stops another
+host. Source availability and AST validation do not establish a passing run.
+
 The checks executor is a separate optional process pin, not a module descriptor. Build package `swarm-checks` and configure its binary using `[checks.executor]`. Checks default disabled, and the executor pin defaults absent:
 
 ```toml

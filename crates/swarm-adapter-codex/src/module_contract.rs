@@ -21,7 +21,6 @@ pub(crate) struct ModuleRuntimeContext {
     pub state_dir: PathBuf,
     pub binding_id: String,
     pub generation: i64,
-    pub module_client_id: String,
     pub credential: Credential,
     pub claim: ModuleContractClaim,
 }
@@ -82,7 +81,6 @@ pub(crate) fn load_runtime_context() -> Result<ModuleRuntimeContext, AdapterErro
         state_dir,
         binding_id,
         generation,
-        module_client_id,
         credential,
         claim,
     })

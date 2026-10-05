@@ -40,6 +40,15 @@ Metadata/version probes have a 30-second command deadline and bounded stdout/std
 
 A build target is held under an exclusive lease for the duration of a run: no second check writes to the same target concurrently. An active worker holds its target, and so does a worker whose disposition is unknown — a live or unknown-disposition group retains only that target resource while unrelated resources continue (see Process ownership and recovery). The lease is released only after the worker's group is known to be empty or its disposition is otherwise established; requesting termination, observing elapsed time or finding a free lock does not by itself release it.
 
+For a `cargo_json` profile, trusted configuration can explicitly set uppercase
+`CARGO_TARGET_DIR` in `[checks.profiles.environment]` to an existing absolute,
+normalized directory. Both executors reject symlinks and Windows reparse points
+in that path; they do not create its parents. Its value is hashed in the effective
+input identity. An ambient or inherited `CARGO_TARGET_DIR` and a `--target-dir`
+argument remain rejected. Profiles sharing that directory must use the same
+`resource` value so their leases serialize writes to the cache. Without the
+explicit setting, CheckRunner keeps its existing DataRoot per-resource target.
+
 ## Baseline, reverse scope and reuse
 
 At Attempt claim, Store freezes the currently valid accepted candidate for the same project as the baseline. A missing or unproven baseline is not consumed and does not reject the run; it widens the plan to the configured whole-workspace command with an explicit reason. The baseline remains fixed for that Attempt even if another candidate is accepted later.

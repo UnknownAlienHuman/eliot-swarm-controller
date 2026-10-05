@@ -3,7 +3,10 @@
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{fs::File, io::Read, path::Path};
-use swarm_contracts::error::{Error, Result};
+use swarm_contracts::{
+    DeclaredServicePurpose,
+    error::{Error, Result},
+};
 
 const MAX_PROCESS_IMAGE_BYTES: u64 = 512 * 1024 * 1024;
 
@@ -261,11 +264,11 @@ mod os {
     pub struct Group {
         job: HANDLE,
         pub identity: Value,
-        module_owner: bool,
+        non_killing_owner: bool,
     }
     impl Group {
         pub fn enter(token: &str) -> Result<Self> {
-            Self::enter_owned(token, false)
+            Self::enter_owned(token, false, None)
         }
         /// Scripts share the transient Check Job lifecycle and its named-token
         /// recovery path; the purpose records the actual invocation owner.
@@ -275,13 +278,34 @@ mod os {
             Ok(group)
         }
         pub fn enter_module(token: &str) -> Result<Self> {
-            Self::enter_owned(token, true)
+            Self::enter_owned(token, true, None)
         }
-        fn enter_owned(token: &str, module: bool) -> Result<Self> {
+        /// Enter one non-killing OS Job for a closed declared service purpose.
+        pub fn enter_service(token: &str, purpose: DeclaredServicePurpose) -> Result<Self> {
+            Self::enter_owned(token, false, Some(purpose))
+        }
+        fn enter_owned(
+            token: &str,
+            module: bool,
+            service_purpose: Option<DeclaredServicePurpose>,
+        ) -> Result<Self> {
             // SAFETY: structures are initialized and handles are local to this worker.
             unsafe {
-                let purpose = if module { "Module" } else { "Check" };
-                let name = format!("Global\\EliotSwarm{purpose}-{token}");
+                let purpose_label = if module {
+                    "module"
+                } else if let Some(purpose) = service_purpose {
+                    purpose.as_str()
+                } else {
+                    "check"
+                };
+                let owner_name = if module {
+                    "Module".to_owned()
+                } else if let Some(purpose) = service_purpose {
+                    format!("Service-{}", purpose.owner_name_component())
+                } else {
+                    "Check".to_owned()
+                };
+                let name = format!("Global\\EliotSwarm{owner_name}-{token}");
                 let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
                 let job = CreateJobObjectW(ptr::null(), wide.as_ptr());
                 if job.is_null() {
@@ -295,7 +319,7 @@ mod os {
                     ));
                 }
                 let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-                info.BasicLimitInformation.LimitFlags = if module {
+                info.BasicLimitInformation.LimitFlags = if module || service_purpose.is_some() {
                     0
                 } else {
                     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
@@ -337,8 +361,8 @@ mod os {
                 }
                 Ok(Self {
                     job,
-                    identity: json!({"pid":std::process::id(),"creation_filetime":((creation.dwHighDateTime as u64)<<32)|creation.dwLowDateTime as u64,"scope":"windows_job","purpose":if module {"module"} else {"check"},"job_name":name,"disposition_source":"job_accounting"}),
-                    module_owner: module,
+                    identity: json!({"pid":std::process::id(),"creation_filetime":((creation.dwHighDateTime as u64)<<32)|creation.dwLowDateTime as u64,"scope":"windows_job","purpose":purpose_label,"job_name":name,"disposition_source":"job_accounting"}),
+                    non_killing_owner: module || service_purpose.is_some(),
                 })
             }
         }
@@ -393,10 +417,10 @@ mod os {
         /// Terminate only current members of this worker's Job, excluding the worker.
         /// Each process handle is checked against this exact Job, avoiding PID reuse.
         pub fn cancel_children(&self) -> Result<u64> {
-            if self.module_owner {
+            if self.non_killing_owner {
                 return Err(Error::new(
                     "MODULE_OWNER_NON_KILLING",
-                    "module process groups cannot terminate native children",
+                    "module and declared-service process groups cannot terminate children",
                 ));
             }
             let mut sent = 0;
@@ -525,12 +549,19 @@ mod os {
         }
     }
     pub fn departed_empty(identity: &Value, token: &str) -> Result<bool> {
-        let purpose = if identity["purpose"] == "module" {
-            "Module"
-        } else {
-            "Check"
+        let owner_name = match identity["purpose"].as_str() {
+            Some("module") => "Module".to_owned(),
+            Some("check" | "script") => "Check".to_owned(),
+            Some("bus_consumer") => "Service-BusConsumer".to_owned(),
+            Some("automation_scheduler") => "Service-AutomationScheduler".to_owned(),
+            _ => {
+                return Err(Error::new(
+                    "CHECK_RECOVERY_UNSUPPORTED",
+                    "process owner purpose is not supported",
+                ));
+            }
         };
-        let expected = format!("Global\\EliotSwarm{purpose}-{token}");
+        let expected = format!("Global\\EliotSwarm{owner_name}-{token}");
         if identity["scope"] != "windows_job" || identity["job_name"] != expected {
             return Err(Error::new(
                 "CHECK_RECOVERY_UNSUPPORTED",
@@ -675,7 +706,7 @@ mod os {
     pub struct Group {
         pgid: i32,
         pub identity: Value,
-        module_owner: bool,
+        non_killing_owner: bool,
     }
     fn stat(pid: u32) -> Result<(char, i32, String)> {
         let s = fs::read_to_string(format!("/proc/{pid}/stat")).map_err(|e| {
@@ -893,7 +924,7 @@ mod os {
     }
     impl Group {
         pub fn enter(token: &str) -> Result<Self> {
-            Self::enter_owned(token, false)
+            Self::enter_owned(token, false, None)
         }
         pub fn enter_script(token: &str) -> Result<Self> {
             let mut group = Self::enter(token)?;
@@ -901,9 +932,16 @@ mod os {
             Ok(group)
         }
         pub fn enter_module(token: &str) -> Result<Self> {
-            Self::enter_owned(token, true)
+            Self::enter_owned(token, true, None)
         }
-        fn enter_owned(_token: &str, module: bool) -> Result<Self> {
+        pub fn enter_service(token: &str, purpose: DeclaredServicePurpose) -> Result<Self> {
+            Self::enter_owned(token, false, Some(purpose))
+        }
+        fn enter_owned(
+            _token: &str,
+            module: bool,
+            service_purpose: Option<DeclaredServicePurpose>,
+        ) -> Result<Self> {
             // SAFETY: make only this worker a group leader before launching tools.
             if unsafe { libc::setpgid(0, 0) } != 0 {
                 return Err(std::io::Error::last_os_error().into());
@@ -911,10 +949,17 @@ mod os {
             let pid = std::process::id();
             let (_, pgid, start) = stat(pid)?;
             let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+            let purpose = if module {
+                "module"
+            } else if let Some(purpose) = service_purpose {
+                purpose.as_str()
+            } else {
+                "check"
+            };
             Ok(Self {
                 pgid,
-                identity: json!({"pid":pid,"pgid":pgid,"start_ticks":start,"boot_id":boot.trim(),"scope":"linux_process_group","purpose":if module {"module"} else {"check"},"disposition_source":"proc_group_members"}),
-                module_owner: module,
+                identity: json!({"pid":pid,"pgid":pgid,"start_ticks":start,"boot_id":boot.trim(),"scope":"linux_process_group","purpose":purpose,"disposition_source":"proc_group_members"}),
+                non_killing_owner: module || service_purpose.is_some(),
             })
         }
         pub fn children_empty(&self) -> Result<bool> {
@@ -938,10 +983,10 @@ mod os {
             Ok(true)
         }
         pub fn cancel_children(&self) -> Result<u64> {
-            if self.module_owner {
+            if self.non_killing_owner {
                 return Err(Error::new(
                     "MODULE_OWNER_NON_KILLING",
-                    "module process groups cannot terminate native children",
+                    "module and declared-service process groups cannot terminate children",
                 ));
             }
             use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -1010,7 +1055,12 @@ mod os {
         }
     }
     pub fn departed_empty(identity: &Value, _token: &str) -> Result<bool> {
-        if identity["scope"] != "linux_process_group" {
+        if identity["scope"] != "linux_process_group"
+            || !matches!(
+                identity["purpose"].as_str(),
+                Some("check" | "script" | "module" | "bus_consumer" | "automation_scheduler")
+            )
+        {
             return Err(Error::invalid("not a Linux check process group"));
         }
         let pid = u32::try_from(positive(identity, "pid")?)
@@ -1130,6 +1180,12 @@ mod os {
         }
         pub fn enter_module(token: &str) -> Result<Self> {
             Self::enter(token)
+        }
+        pub fn enter_service(_token: &str, _purpose: DeclaredServicePurpose) -> Result<Self> {
+            Err(Error::new(
+                "CHECK_PLATFORM_UNSUPPORTED",
+                "declared service process ownership is implemented for Windows and Linux",
+            ))
         }
         pub fn enter(_token: &str) -> Result<Self> {
             Err(Error::new(

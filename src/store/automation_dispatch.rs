@@ -971,7 +971,7 @@ fn process_system_event_script_projection(
         .iter()
         .any(|pending| pending.script_id == script_id && pending.cause["id"] == cause["id"]);
     if duplicate_pending {
-        if script_cancel_event_alias_seen(state, &event, &cause, &script_id) {
+        if script_cancel_event_alias_seen(state, event, &cause, &script_id) {
             // The generic Operation cancellation fact and its exact
             // ScriptRun-specific view share one phase/occurrence identity.
             // Preserve both explicitly selected routes while admitting only
@@ -1096,6 +1096,10 @@ fn script_cancel_event_alias_seen(
 /// the generic metadata-only Operation ACL path.
 fn event_requires_occurrence_projection(event: &crate::automation::intake::ObservedEvent) -> bool {
     !raw_safe_event_aliases(event).is_empty()
+        || super::module_supervisor_observation::is_lifecycle_event_source_kind(
+            &event.source_id,
+            &event.event_kind,
+        )
         || (event.source_id == "controller" && event.event_kind == "task.submission")
         || matches!(
             (event.source_id.as_str(), event.event_kind.as_str()),

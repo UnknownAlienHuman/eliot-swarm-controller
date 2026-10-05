@@ -355,6 +355,7 @@ fn builtin_nonsecret_environment(name: &str) -> bool {
             | "TMPDIR"
             | "RUSTUP_HOME"
             | "CARGO_HOME"
+            | "CARGO_TARGET_DIR"
     )
 }
 

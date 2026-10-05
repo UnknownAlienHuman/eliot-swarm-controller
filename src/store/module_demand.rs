@@ -97,7 +97,6 @@ pub(crate) struct ModuleDemandCursor {
 struct OperationRow {
     operation_id: String,
     method: String,
-    state: String,
     binding_id: String,
     generation: i64,
     created_at_ms: i64,
@@ -110,7 +109,7 @@ fn operation_candidates(
     let cursor_created_at = cursor.map_or(i64::MIN, |value| value.created_at_ms);
     let cursor_operation_id = cursor.map_or("", |value| value.operation_id.as_str());
     let mut statement = db.prepare(
-        "SELECT o.operation_id,o.method,o.state,o.binding_id,o.binding_generation,o.created_at_ms \
+        "SELECT o.operation_id,o.method,o.binding_id,o.binding_generation,o.created_at_ms \
          FROM operations AS o JOIN bindings AS b \
            ON b.binding_id=o.binding_id AND b.generation=o.binding_generation \
          WHERE b.released_at_ms IS NULL \
@@ -132,10 +131,9 @@ fn operation_candidates(
                 Ok(OperationRow {
                     operation_id: row.get(0)?,
                     method: row.get(1)?,
-                    state: row.get(2)?,
-                    binding_id: row.get(3)?,
-                    generation: row.get(4)?,
-                    created_at_ms: row.get(5)?,
+                    binding_id: row.get(2)?,
+                    generation: row.get(3)?,
+                    created_at_ms: row.get(4)?,
                 })
             },
         )?
@@ -147,7 +145,7 @@ fn operation_candidates(
     // between turns. Anchor its adapter demand to the original admitted
     // agent.open Operation; this starts only the adapter and never replays it.
     let mut statement = db.prepare(
-        "SELECT o.operation_id,o.method,o.state,o.binding_id,o.binding_generation,o.created_at_ms \
+        "SELECT o.operation_id,o.method,o.binding_id,o.binding_generation,o.created_at_ms \
          FROM operations AS o JOIN bindings AS b \
            ON b.binding_id=o.binding_id AND b.generation=o.binding_generation \
          WHERE b.released_at_ms IS NULL AND b.native_root_id IS NOT NULL \
@@ -167,10 +165,9 @@ fn operation_candidates(
                 Ok(OperationRow {
                     operation_id: row.get(0)?,
                     method: row.get(1)?,
-                    state: row.get(2)?,
-                    binding_id: row.get(3)?,
-                    generation: row.get(4)?,
-                    created_at_ms: row.get(5)?,
+                    binding_id: row.get(2)?,
+                    generation: row.get(3)?,
+                    created_at_ms: row.get(4)?,
                 })
             },
         )?
@@ -217,7 +214,7 @@ fn scoped_operation_readback(
          WHERE binding_id=?1 AND binding_generation=?2 \
          ORDER BY created_at_ms,operation_id LIMIT ?3",
     )?;
-    let mut rows = statement
+    let rows = statement
         .query_map(
             params![binding_id, generation, MAX_SCOPE_OPERATIONS as i64 + 1],
             |row| {

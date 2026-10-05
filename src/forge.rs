@@ -380,8 +380,6 @@ pub(crate) struct GitOutput {
     pub status: ExitStatus,
     pub stdout: Vec<u8>,
     pub stdout_truncated: bool,
-    pub stderr_digest: String,
-    pub stderr_bytes: u64,
     pub timed_out: bool,
 }
 
@@ -495,7 +493,7 @@ fn run_git_nonwindows(
         .ok_or_else(|| Error::new("FORGE_GIT_IO", "Git stderr pipe unavailable"))?;
     let out_cap = config.max_output_bytes;
     let stdout_reader = thread::spawn(move || drain_bounded(stdout, out_cap));
-    let stderr_reader = thread::spawn(move || drain_bounded(stderr, out_cap));
+    let stderr_reader = thread::spawn(move || drain_bounded(stderr, 0));
     let deadline = Instant::now() + Duration::from_secs(config.timeout_seconds);
     let mut timed_out = false;
     let status = loop {
@@ -523,7 +521,7 @@ fn run_git_nonwindows(
         .join()
         .map_err(|_| Error::new("FORGE_GIT_OUTPUT", "Git stdout reader failed"))?
         .map_err(|_| Error::new("FORGE_GIT_OUTPUT", "Git stdout could not be read"))?;
-    let stderr = stderr_reader
+    let _stderr = stderr_reader
         .join()
         .map_err(|_| Error::new("FORGE_GIT_OUTPUT", "Git stderr reader failed"))?
         .map_err(|_| Error::new("FORGE_GIT_OUTPUT", "Git stderr could not be read"))?;
@@ -531,8 +529,6 @@ fn run_git_nonwindows(
         status,
         stdout: stdout.bytes,
         stdout_truncated: stdout.truncated,
-        stderr_digest: crate::model::digest(&stderr.bytes),
-        stderr_bytes: stderr.total,
         timed_out,
     })
 }

@@ -142,19 +142,17 @@ async fn call_with_api_inner<A: GitHubPullRequestApi + ?Sized>(
         }
         Err(error) => return Err(error),
     };
-    if readback_only {
-        if let Err(error) = store.prior_native_worker_departed(&operation_id).await {
-            return record_unknown(
-                store,
-                &principal,
-                &operation_id,
-                &target,
-                &request,
-                "native_worker_process_tree_unconfirmed",
-                Some(&error),
-            )
-            .await;
-        }
+    if readback_only && let Err(error) = store.prior_native_worker_departed(&operation_id).await {
+        return record_unknown(
+            store,
+            &principal,
+            &operation_id,
+            &target,
+            &request,
+            "native_worker_process_tree_unconfirmed",
+            Some(&error),
+        )
+        .await;
     }
     let repository = RepositoryRef::new(&target.host, &target.owner, &target.repo)?;
     let initial = match read_remote(api, &repository, &target).await {
@@ -217,15 +215,15 @@ async fn call_with_api_inner<A: GitHubPullRequestApi + ?Sized>(
 
     let native_worker = if use_native_worker {
         match store
-            .prepare_github_description_worker(
-                &operation_id,
-                &target.host,
-                &target.owner,
-                &target.repo,
-                target.pull_request_number,
-                &request.title,
-                &request.body,
-            )
+            .prepare_github_description_worker(forge::GitHubDescriptionWorkerRequest {
+                operation_id: operation_id.clone(),
+                host: target.host.clone(),
+                owner: target.owner.clone(),
+                repository: target.repo.clone(),
+                pull_request_number: target.pull_request_number,
+                title: request.title.clone(),
+                body: request.body.clone(),
+            })
             .await
         {
             Ok(worker) => Some(worker),

@@ -1947,8 +1947,11 @@ pub(crate) fn require_current_connection(
     // authority. Project only bounded schema metadata from the authenticated
     // C8 readback; never retain request bodies or provider headers here.
     let session_context = project_session_context(&tools["session_context"], metadata)?;
-    let provider_request =
-        project_provider_request(&tools["provider_request"], metadata, &facts.options.model)?;
+    let provider_request = project_provider_request(
+        &tools["provider_request"],
+        metadata,
+        &serde_json::to_value(&facts.options.model)?,
+    )?;
     let session_context_digest = digest_json(&session_context)?;
     let provider_request_digest = digest_json(&provider_request)?;
 

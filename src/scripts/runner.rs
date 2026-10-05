@@ -630,6 +630,29 @@ pub fn completion(work: &Work, files: &ArtifactFiles) -> Result<Option<Completio
     Ok(Some(completion))
 }
 
+/// A validated terminal receipt is written only after interpreter output has
+/// been drained and the worker has disarmed its owned Group. Wait for that
+/// exact worker Group to leave before Store applies any declared effects.
+pub fn completion_family_departed(work: &Work, completion: &Completion) -> Result<bool> {
+    let dir = directory(&work.data_dir, &work.run_id)?;
+    let worker = read_json(&dir.join("worker.json"))?;
+    if worker["run_id"] != work.run_id
+        || worker["operation_id"] != work.operation_id
+        || worker["token"] != work.token
+        || worker["process"] != completion.process
+        || completion.run_id != work.run_id
+        || completion.operation_id != work.operation_id
+        || completion.token != work.token
+        || completion.process["purpose"] != "script"
+    {
+        return Err(Error::new(
+            "SCRIPT_WORKER_DAMAGED",
+            "terminal ScriptRun does not retain its exact worker process identity",
+        ));
+    }
+    departed_empty(&completion.process, &work.token)
+}
+
 fn output_matches(work: &Work, stream: &str, artifact: &ArtifactRecord) -> bool {
     let mut identity = Vec::with_capacity(work.run_id.len() + stream.len() + 1);
     identity.extend_from_slice(work.run_id.as_bytes());
@@ -705,6 +728,131 @@ pub fn worker_departed(work: &Work, launch: &Value) -> Result<bool> {
         return Err(Error::invalid("launch receipt is not a script process"));
     }
     departed_empty(process, &work.token)
+}
+
+/// Check departure from the process identity retained by Store at the ready
+/// acknowledgement. This path is used only when the mutable Work/receipt files
+/// can no longer be decoded; the identity, Operation, and run IDs come from
+/// the durable ScriptRun row, not those files.
+pub fn worker_family_departed_from_identity(
+    data_dir: &Path,
+    run_id: &str,
+    operation_id: &str,
+    worker_identity: &Value,
+) -> Result<bool> {
+    let _ = directory(data_dir, run_id)?;
+    let token = worker_identity["token"]
+        .as_str()
+        .filter(|token| !token.is_empty() && token.len() <= 128)
+        .ok_or_else(|| {
+            Error::new(
+                "SCRIPT_WORKER_IDENTITY_DAMAGED",
+                "retained ScriptRun worker identity has no valid token",
+            )
+        })?;
+    let process = &worker_identity["process"];
+    if run_id.is_empty()
+        || operation_id.is_empty()
+        || worker_identity["run_id"] != run_id
+        || worker_identity["operation_id"] != operation_id
+        || worker_identity["control_version"] != 1
+        || worker_identity["ready_at_ms"]
+            .as_i64()
+            .is_none_or(|time| time <= 0)
+        || process["purpose"] != "script"
+        || !matches!(
+            process["scope"].as_str(),
+            Some("windows_job" | "linux_process_group")
+        )
+    {
+        return Err(Error::new(
+            "SCRIPT_WORKER_IDENTITY_DAMAGED",
+            "retained ScriptRun worker identity does not match its exact run and Operation",
+        ));
+    }
+    departed_empty(process, token)
+}
+
+/// Prove that a pre-Go worker is gone before Store settles its run. This path
+/// intentionally requires the exact persisted launch receipt and absence of
+/// Go, interpreter-start, and plan markers; a missing launch receipt is not
+/// proof that the launcher failed before creating a process.
+pub fn prestart_worker_family_departed(
+    data_dir: &Path,
+    run_id: &str,
+    operation_id: &str,
+) -> Result<bool> {
+    let dir = directory(data_dir, run_id)?;
+    for marker in [
+        "go.json",
+        "started.json",
+        "execution-plan.json",
+        "execution-plan-ready.json",
+    ] {
+        if receipt_exists(&dir.join(marker))? {
+            return Ok(false);
+        }
+    }
+    let launch_path = dir.join("launch.json");
+    if !receipt_exists(&launch_path)? {
+        return Ok(false);
+    }
+    let launch = read_json(&launch_path)?;
+    let token = launch["token"]
+        .as_str()
+        .filter(|token| !token.is_empty() && token.len() <= 128)
+        .ok_or_else(|| Error::new("SCRIPT_LAUNCH_DAMAGED", "launch has no valid token"))?;
+    if launch["run_id"] != run_id || launch["operation_id"] != operation_id {
+        return Err(Error::new(
+            "SCRIPT_LAUNCH_DAMAGED",
+            "pre-start launch receipt identifies another run or Operation",
+        ));
+    }
+    if let Some(receipt) = launch.get("early_exit").filter(|value| !value.is_null()) {
+        let receipt: EarlyExitReceipt = serde_json::from_value(receipt.clone()).map_err(|_| {
+            Error::new(
+                "SCRIPT_LAUNCH_DAMAGED",
+                "early-exit receipt cannot be parsed",
+            )
+        })?;
+        if receipt.schema_version != 1
+            || receipt.state != EarlyExitState::ExitedBeforeWorkerIdentity
+            || receipt.run_id != run_id
+            || receipt.operation_id != operation_id
+            || receipt.token != token
+            || receipt.pid == 0
+            || launch["process"] != Value::Null
+        {
+            return Err(Error::new(
+                "SCRIPT_LAUNCH_DAMAGED",
+                "pre-start early-exit receipt differs from its run",
+            ));
+        }
+        if receipt_exists(&dir.join("worker.json"))?
+            || receipt_exists(&dir.join("completion.json"))?
+            || receipt_exists(&dir.join("terminal.json"))?
+        {
+            return Ok(false);
+        }
+        return Ok(true);
+    }
+    let process = &launch["process"];
+    if process["scope"] == "launcher_spawned_process" {
+        if process["purpose"] != "check" {
+            return Err(Error::new(
+                "SCRIPT_LAUNCH_DAMAGED",
+                "pre-start launch process has an unsupported purpose",
+            ));
+        }
+        return spawned_departed(process, token);
+    }
+    if process["purpose"] != "script" {
+        return Err(Error::new(
+            "SCRIPT_LAUNCH_DAMAGED",
+            "pre-start launch process is not an owned script worker",
+        ));
+    }
+    departed_empty(process, token)
 }
 
 pub fn run_worker(receipt_path: &Path) -> Result<()> {
@@ -1152,8 +1300,11 @@ fn finish_worker_error(
     error_code: String,
     state: &str,
 ) -> Result<()> {
-    let _ = group.cancel_children();
     while !group.children_empty()? {
+        // A member can spawn another exact-group child while the previous
+        // cancellation scan is in progress. Keep rescanning until the same
+        // group is empty, as the normal execution drain path does.
+        let _ = group.cancel_children();
         thread::sleep(POLL_INTERVAL);
     }
     group.disarm()?;

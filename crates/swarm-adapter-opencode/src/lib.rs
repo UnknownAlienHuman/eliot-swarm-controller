@@ -412,6 +412,7 @@ async fn queue_unknown_result(
         )
     })?;
     let mut unknown = unknown_from_intent(intent, &error.code)?;
+    attach_native_http_failure(&mut unknown.details, error);
     unknown.details["completion_condition"] = json!("input_status_unavailable");
     unknown.details["input_operation_id"] = json!(target.input_operation_id);
     unknown.details["target_module_receipt"] = json!(target.target_module_receipt);
@@ -603,7 +604,7 @@ async fn handle_send(
     // stack frame and the HTTP request body.
     journal.write_intent(&intent)?;
     let outcome = match native
-        .admit_input(command, options, root, &input, &prompt_text)
+        .admit_input(command, root, &input, &prompt_text)
         .await
     {
         Ok(()) => outcome(
@@ -944,7 +945,18 @@ fn outcome(
 }
 
 fn diagnostic(error: &Error) -> Value {
-    json!({"diagnostic_code":error.code})
+    let mut details = json!({"diagnostic_code":error.code});
+    attach_native_http_failure(&mut details, error);
+    details
+}
+
+fn attach_native_http_failure(details: &mut Value, error: &Error) {
+    if let Some(failure) = error.native_http_failure {
+        details["native_http_failure"] = json!({
+            "status":failure.status,
+            "kind":failure.kind
+        });
+    }
 }
 
 impl<'a> HostSession<'a> {
@@ -1021,13 +1033,13 @@ impl<'a> HostSession<'a> {
 
     async fn hello_retry(&self) -> Result<()> {
         let mut last_error = Error::new("HOST_UNAVAILABLE", "module hello was not acknowledged");
-        for attempt in 0..ACK_ATTEMPTS {
+        for (attempt, backoff_ms) in ACK_BACKOFF_MS.into_iter().enumerate() {
             match self.open_link().await {
                 Ok(_) => return Ok(()),
                 Err(error) => last_error = error,
             }
             if attempt + 1 < ACK_ATTEMPTS {
-                sleep(Duration::from_millis(ACK_BACKOFF_MS[attempt])).await;
+                sleep(Duration::from_millis(backoff_ms)).await;
             }
         }
         Err(Error::new(
@@ -1046,7 +1058,7 @@ impl<'a> HostSession<'a> {
 
     async fn call_recorded_retry(&self, method: &str, params: Value) -> Result<()> {
         let mut last_error = Error::new("HOST_ACK_SCHEMA", "host acknowledgement was not recorded");
-        for attempt in 0..ACK_ATTEMPTS {
+        for (attempt, backoff_ms) in ACK_BACKOFF_MS.into_iter().enumerate() {
             match self.call(method, params.clone()).await {
                 Ok(response) if response["recorded"] == true => return Ok(()),
                 Ok(_) => {
@@ -1058,7 +1070,7 @@ impl<'a> HostSession<'a> {
                 Err(error) => last_error = error,
             }
             if attempt + 1 < ACK_ATTEMPTS {
-                sleep(Duration::from_millis(ACK_BACKOFF_MS[attempt])).await;
+                sleep(Duration::from_millis(backoff_ms)).await;
             }
         }
         Err(Error::new(
@@ -1148,16 +1160,15 @@ fn remember_root_from_outcome(
         .as_str()
         .ok_or_else(|| Error::new("ADAPTER_OUTBOX", "outcome operation ID is missing"))?;
     let history = journal.load(operation_id)?;
-    if let Some(intent) = history.intent {
-        if intent.binding_id != config.binding_id
+    if let Some(intent) = history.intent
+        && (intent.binding_id != config.binding_id
             || intent.generation != config.generation
-            || intent.native_scope_key != scope
-        {
-            return Err(Error::new(
-                "NATIVE_IDENTITY_MISMATCH",
-                "outcome intent belongs to another binding",
-            ));
-        }
+            || intent.native_scope_key != scope)
+    {
+        return Err(Error::new(
+            "NATIVE_IDENTITY_MISMATCH",
+            "outcome intent belongs to another binding",
+        ));
     }
     journal.remember_native_root(&config.binding_id, config.generation, scope, root)
 }

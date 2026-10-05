@@ -2,6 +2,109 @@
 
 ## Current state
 
+### PR #25 controller effects and exact failure readback — 2026-10-05
+
+An automatic ScriptRun can apply the existing `task_owner_message` effect through
+the ordinary Store `message.send` transaction. Store derives a private admission
+from the retained run, enabled bundle grant, effective Manager and exact source
+Task/Attempt; the worker does not receive Manager credentials. The child Operation,
+mailbox delivery, causal attribution and parent completion commit together.
+Repeated completion readback returns the retained receipt without another effect.
+Admission still checks current scope; retained receipt visibility survives Task
+completion, Attempt release, later revisions and entry disable.
+Child-operation visibility now checks the exact retained invocation cause rather
+than generic Task/Attempt columns that `message.send` does not populate.
+
+Ordinary Managers now manage their own script catalogs without current-GM
+designation. Ownership is checked for validation, activation, direct runs,
+artifact access and retained-operation replay; listing filters before pagination.
+Manager MCP discovery advertises these existing script methods. Cross-owner
+access still requires the existing GM/Operator authority, and direct Task-bound
+runs still check the exact active Attempt owner. This is an implemented source
+policy; its new fixtures have not been executed in this batch.
+
+ScriptRun recovery now requires an exact retained process identity and whole-family
+departure before terminal settlement or effect application. Missing/corrupt work
+files use the durable identity. Pre-Go settlement also requires absence of Go,
+interpreter-start and plan markers. A live or unproven family remains visibly
+unknown and holds the affected run; recovery does not replay an effect.
+The worker error path repeats cancellation scans within its own process group
+until emptiness is proven, matching the normal drain path before settlement.
+
+Module observations now create `module.ready`, `module.start_failed` and
+`module.family_exited` facts in the same Store transaction. Family exit requires
+the same retained boot, a prior ready observation and the supervisor's typed
+exact-worker/whole-family departure proof. A plain exited state or IPC disconnect
+cannot create that fact. Automation intake and bus admission validate the source
+receipt and retained binding before advancing the cursor.
+The same transactional source also records nonterminal `module.recovery_blocked`,
+`module.identity_unknown` and `module.owner_retained` facts with a bounded error
+class. They do not imply family departure or Task completion.
+
+Codex adapter descriptor version 3 preserves the requested provider/model and
+reports finite attach/credential/RPC failures. After a durable send marker it
+uses exact user-item and linked-turn readback, including bounded turn pagination.
+Failed/interrupted turns expose a bounded failure class; missing or uncertain
+readback stays unknown without sending again. This attaches to the existing
+app-server and adds no API-key fallback or process restart.
+
+OpenCode input-status readback now follows the locked `@opencode/server` 2.0.7
+public projection, which omits `sessionID`. The exact session-scoped GET and
+retained input marker/digest remain mandatory; a present conflicting session
+is rejected. HTTP failures expose only a closed error-tag class and status,
+with at most 8 KiB examined and no response text retained. The public assistant
+projection has no input-parent identity, so asynchronous assistant/provider
+completion is still unqualified; timeline ordering is not treated as proof.
+
+The changed production libraries and binaries passed scoped Clippy with warnings
+denied for ten packages on 2026-10-05. The later four-file shared-cache change
+also passed the root library/binary gate; the other nine packages were unchanged.
+Native qualification and the new test fixtures remain pending. CI
+[37363042453](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37363042453)
+for `7917956` stopped on the four scripts import/type errors corrected below;
+its integration tests did not run. It does not qualify this newer source.
+
+### PR #25 compiler closure and core fault harness — 2026-10-05
+
+The first scoped local Clippy pass on clean `7917956` reached newly extracted
+packages and stopped on import/type errors in scripts, observer, supervisor and
+Antigravity. The source fixes missing public event exports and macro imports,
+descriptor ownership, metrics error conversion, Antigravity receipt borrowing
+and bounded page types. The supervisor cleanup callback now has an explicit
+boxed `Send` boundary for its recursive lifecycle replacement. No native work
+or permission behavior changes in these compiler corrections. The corrected
+source passed the scoped production compiler gate.
+
+Further scoped compiler passes corrected production root import, JSON type and
+ownership errors and strict warnings, including argument grouping, row type
+aliases and private-interface alignment. The corrected ten-package production
+Clippy pass completed successfully with warnings denied. Codex and Antigravity
+warning fixes are integrated. No full workspace build, native model call or test
+execution has been performed for this candidate.
+
+Cargo JSON check profiles can now explicitly configure an existing absolute
+`CARGO_TARGET_DIR`; both check executors use the same guarded resolver. The path
+must contain no symlink or Windows reparse point. Ambient inherited target paths
+remain rejected. The configured value participates in the existing hashed input
+identity. Profiles using one cache must select the same resource lease identity.
+Without this explicit configuration, the existing per-resource target remains.
+See [CheckRunner configuration](check-runner.md#resource-lease).
+
+The shared contracts also define closed `BusConsumer` and
+`AutomationScheduler` service purposes with an exact service ID and positive
+generation. Their process-owner primitive preserves non-killing ownership and
+checks the declared purpose during departure readback. The managed bus and
+scheduler Store/host integration remains a separate private candidate; adding
+this ABI does not start either service or grant application authority.
+
+`tools/qualification/Invoke-CoreFailureQualification.ps1` provides source for
+fresh private-host lost-caller-ACK, durable request-conflict and optional
+HookSource deduplication cases. A separate Manager must prove the exact admitted
+Task/Operation before graceful host restart and read the same IDs afterward.
+A lost caller ACK is not presented as a native-effect `outcome_unknown`.
+The harness has not been executed and does not prove optional-worker crash or
+uncertain external-effect recovery. No tests or model calls ran in this batch.
+
 ### PR #25 durable bus wiring and launch/install closure — 2026-10-05
 
 Authenticated Store and Manager MCP routes now expose bounded bus readback and

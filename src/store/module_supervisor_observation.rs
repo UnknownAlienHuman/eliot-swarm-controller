@@ -46,7 +46,7 @@ impl super::Store {
     }
 }
 
-struct ObservationCommit {
+pub(super) struct ObservationCommit {
     inserted: bool,
     diagnostic: Option<Record>,
 }
@@ -56,6 +56,70 @@ const MAX_UNKNOWN_OPERATION_COUNT: u64 = 1_000_000;
 const MAX_RECORD_BYTES: usize = 64 * 1024;
 const STREAM_PREFIX: &str = "controller:module-supervisor";
 const EVENT_KIND: &str = "module.supervisor_observation";
+const READY_EVENT_KIND: &str = "module.ready";
+const START_FAILURE_EVENT_KIND: &str = "module.start_failed";
+const FAMILY_EXIT_EVENT_KIND: &str = "module.family_exited";
+const RECOVERY_BLOCKED_EVENT_KIND: &str = "module.recovery_blocked";
+const IDENTITY_UNKNOWN_EVENT_KIND: &str = "module.identity_unknown";
+const OWNER_RETAINED_EVENT_KIND: &str = "module.owner_retained";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LifecycleTransition {
+    Ready,
+    CertifiedNotStarted,
+    FamilyExited,
+}
+
+impl LifecycleTransition {
+    fn event_kind(self) -> &'static str {
+        match self {
+            Self::Ready => READY_EVENT_KIND,
+            Self::CertifiedNotStarted => START_FAILURE_EVENT_KIND,
+            Self::FamilyExited => FAMILY_EXIT_EVENT_KIND,
+        }
+    }
+
+    fn occurrence_phase(self) -> &'static str {
+        match self {
+            Self::Ready => "module_ready",
+            Self::CertifiedNotStarted => "module_start_failure_not_started",
+            Self::FamilyExited => "module_family_exit",
+        }
+    }
+
+    fn proof(self) -> &'static str {
+        match self {
+            Self::Ready => "authenticated_module_hello",
+            Self::CertifiedNotStarted => "certified_pre_spawn_failure",
+            Self::FamilyExited => "proven_owner_family_departure",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NonterminalTransition {
+    RecoveryBlocked,
+    IdentityUnknown,
+    OwnerRetained,
+}
+
+impl NonterminalTransition {
+    fn event_kind(self) -> &'static str {
+        match self {
+            Self::RecoveryBlocked => RECOVERY_BLOCKED_EVENT_KIND,
+            Self::IdentityUnknown => IDENTITY_UNKNOWN_EVENT_KIND,
+            Self::OwnerRetained => OWNER_RETAINED_EVENT_KIND,
+        }
+    }
+
+    fn proof(self) -> &'static str {
+        match self {
+            Self::RecoveryBlocked => "scoped_recovery_block",
+            Self::IdentityUnknown => "process_identity_unproven",
+            Self::OwnerRetained => "owner_family_retained",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -86,6 +150,79 @@ struct ServiceScope {
     generation: u64,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModuleLifecycleTrigger {
+    schema_version: u16,
+    event_kind: String,
+    occurrence_phase: String,
+    occurrence_id: String,
+    proof: String,
+    module_id: String,
+    binding_id: String,
+    generation: i64,
+    operation_id: Option<String>,
+    boot_id: String,
+    event_id: String,
+    actor_instance_id: String,
+    sequence: u64,
+    phase: String,
+    effect_certainty: String,
+    stage: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModuleNonterminalTrigger {
+    schema_version: u16,
+    event_kind: String,
+    occurrence_phase: String,
+    occurrence_id: String,
+    proof: String,
+    module_id: String,
+    binding_id: String,
+    generation: i64,
+    operation_id: Option<String>,
+    boot_id: Option<String>,
+    event_id: String,
+    actor_instance_id: String,
+    sequence: u64,
+    phase: String,
+    effect_certainty: String,
+    stage: Option<String>,
+    error_code: Option<String>,
+    unknown_operation_count: usize,
+    unknown_operation_ids_truncated: bool,
+}
+
+pub(super) struct VerifiedModuleLifecycleEvent {
+    pub(super) binding_id: String,
+    pub(super) generation: i64,
+    occurrence_phase: String,
+    occurrence_id: String,
+    error_code: Option<String>,
+}
+
+type LifecycleOriginalRow = (
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+    i64,
+    i64,
+);
+
+type NonterminalOriginalRow = (
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+    i64,
+    i64,
+);
+
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum ModuleSupervisorPhase {
@@ -95,6 +232,7 @@ enum ModuleSupervisorPhase {
     Ready,
     RestartBackoff,
     Exited,
+    ExitedProven,
     OwnerRetained,
     IdentityUnknown,
     Completed,
@@ -110,6 +248,7 @@ impl ModuleSupervisorPhase {
             Self::Ready => "ready",
             Self::RestartBackoff => "restart_backoff",
             Self::Exited => "exited",
+            Self::ExitedProven => "exited_proven",
             Self::OwnerRetained => "owner_retained",
             Self::IdentityUnknown => "identity_unknown",
             Self::Completed => "completed",
@@ -248,6 +387,8 @@ pub(super) fn record(
             "module supervisor callback sequence is older than the retained binding readback",
         ));
     }
+    let transition = lifecycle_transition(current, observation);
+    let nonterminal = nonterminal_transition(observation);
     let diagnostic = diagnostic_for_transition(current, observation);
     validate_operation_ids(tx, observation, generation)?;
 
@@ -267,6 +408,26 @@ pub(super) fn record(
         ],
     )?;
 
+    if let Some(transition) = transition {
+        record_lifecycle_trigger(
+            tx,
+            &source_stream_id,
+            observation,
+            generation,
+            transition,
+            now_ms,
+        )?;
+    }
+    if let Some(transition) = nonterminal {
+        record_nonterminal_trigger(
+            tx,
+            &source_stream_id,
+            observation,
+            generation,
+            transition,
+            now_ms,
+        )?;
+    }
     let mut latest = payload;
     latest["recorded_at_ms"] = json!(now_ms);
     let updated = tx.execute(
@@ -288,6 +449,181 @@ pub(super) fn record(
         inserted: true,
         diagnostic,
     })
+}
+
+fn lifecycle_transition(
+    previous: &Value,
+    observation: &ModuleSupervisorObservation,
+) -> Option<LifecycleTransition> {
+    let boot_id = observation.boot_id.as_deref()?;
+    let same_boot = previous["schema_version"] == 1
+        && previous["binding_id"].as_str() == Some(observation.scope.binding_id.as_str())
+        && previous["generation"].as_u64() == Some(observation.scope.generation)
+        && previous["module_id"].as_str() == Some(observation.module_id.as_str())
+        && previous["artifact_id"].as_str() == Some(observation.artifact_id.as_str())
+        && previous["artifact_version"].as_str() == Some(observation.artifact_version.as_str())
+        && previous["boot_id"].as_str() == Some(boot_id);
+    let previous_phase = if same_boot {
+        previous["phase"].as_str()
+    } else {
+        None
+    };
+    if same_boot && previous_phase.is_none() {
+        return None;
+    }
+
+    match observation.phase {
+        ModuleSupervisorPhase::Ready if !same_boot || previous_phase == Some("starting") => {
+            Some(LifecycleTransition::Ready)
+        }
+        ModuleSupervisorPhase::Exited
+        | ModuleSupervisorPhase::RestartBackoff
+        | ModuleSupervisorPhase::Completed
+            if matches!(
+                observation.effect_certainty,
+                ModuleEffectCertainty::NotStarted
+            ) && observation
+                .stage
+                .is_some_and(ModuleFailureStage::proves_pre_spawn)
+                && previous_phase != Some("ready") =>
+        {
+            Some(LifecycleTransition::CertifiedNotStarted)
+        }
+        ModuleSupervisorPhase::ExitedProven
+            if same_boot
+                && previous_phase == Some("ready")
+                && matches!(observation.effect_certainty, ModuleEffectCertainty::Unknown)
+                && observation.stage.is_none() =>
+        {
+            Some(LifecycleTransition::FamilyExited)
+        }
+        ModuleSupervisorPhase::Completed
+            if same_boot
+                && previous_phase == Some("ready")
+                && matches!(observation.effect_certainty, ModuleEffectCertainty::Unknown)
+                && observation.stage.is_none() =>
+        {
+            Some(LifecycleTransition::FamilyExited)
+        }
+        _ => None,
+    }
+}
+
+/// Select exact nonterminal supervisor facts only. These events describe
+/// blocked recovery or uncertain identity/ownership; none claims process
+/// departure, native failure, or Task completion.
+fn nonterminal_transition(
+    observation: &ModuleSupervisorObservation,
+) -> Option<NonterminalTransition> {
+    match observation.phase {
+        ModuleSupervisorPhase::WaitingForKernel | ModuleSupervisorPhase::Isolated => {
+            Some(NonterminalTransition::RecoveryBlocked)
+        }
+        ModuleSupervisorPhase::Starting if observation.error_code.is_some() => {
+            Some(NonterminalTransition::RecoveryBlocked)
+        }
+        ModuleSupervisorPhase::IdentityUnknown => Some(NonterminalTransition::IdentityUnknown),
+        ModuleSupervisorPhase::OwnerRetained => Some(NonterminalTransition::OwnerRetained),
+        _ => None,
+    }
+}
+
+fn record_nonterminal_trigger(
+    tx: &Transaction<'_>,
+    source_stream_id: &str,
+    observation: &ModuleSupervisorObservation,
+    generation: i64,
+    transition: NonterminalTransition,
+    now_ms: i64,
+) -> Result<()> {
+    let event_kind = transition.event_kind();
+    let source_event_key = format!("nonterminal:{event_kind}:{}", observation.event_id);
+    let occurrence_id = nonterminal_occurrence_id(
+        &observation.scope.binding_id,
+        generation,
+        observation.boot_id.as_deref(),
+        &observation.event_id,
+        event_kind,
+    )?;
+    let operation_id = (observation.unknown_operation_count == 1
+        && observation.unknown_operation_ids.len() == 1
+        && !observation.unknown_operation_ids_truncated)
+        .then(|| observation.unknown_operation_ids[0].as_str());
+    let payload = json!({
+        "schema_version":1,
+        "event_kind":event_kind,
+        "occurrence_phase":"module_nonterminal_attention",
+        "occurrence_id":occurrence_id,
+        "proof":transition.proof(),
+        "module_id":observation.module_id,
+        "binding_id":observation.scope.binding_id,
+        "generation":generation,
+        "operation_id":operation_id,
+        "boot_id":observation.boot_id,
+        "event_id":observation.event_id,
+        "actor_instance_id":observation.actor_instance_id,
+        "sequence":observation.sequence,
+        "phase":observation.phase.as_str(),
+        "effect_certainty":observation.effect_certainty.as_str(),
+        "stage":observation.stage.map(ModuleFailureStage::as_str),
+        "error_code":observation.error_code,
+        "unknown_operation_count":observation.unknown_operation_count,
+        "unknown_operation_ids_truncated":observation.unknown_operation_ids_truncated,
+    });
+    let payload_json = model::canonical(&payload)?;
+    if payload_json.len() > 4096 {
+        return Err(invalid(
+            "module nonterminal trigger exceeds its record bound",
+        ));
+    }
+    let duplicate: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM observations \
+         WHERE source_stream_id=?1 AND source_event_key=?2)",
+        params![source_stream_id, source_event_key],
+        |row| row.get(0),
+    )?;
+    if duplicate {
+        return Err(Error::new(
+            "MODULE_NONTERMINAL_TRIGGER_CONFLICT",
+            "nonterminal trigger already exists without its matching supervisor callback",
+        ));
+    }
+    tx.execute(
+        "INSERT INTO observations(\
+             source_stream_id,source_event_key,binding_id,binding_generation,\
+             operation_id,kind,payload_json,recorded_at_ms\
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+        params![
+            source_stream_id,
+            source_event_key,
+            observation.scope.binding_id,
+            generation,
+            operation_id,
+            event_kind,
+            payload_json,
+            now_ms,
+        ],
+    )?;
+    Ok(())
+}
+
+fn nonterminal_occurrence_id(
+    binding_id: &str,
+    generation: i64,
+    boot_id: Option<&str>,
+    event_id: &str,
+    event_kind: &str,
+) -> Result<String> {
+    Ok(model::digest(
+        model::canonical(&json!({
+            "binding_id":binding_id,
+            "generation":generation,
+            "boot_id":boot_id,
+            "event_id":event_id,
+            "event_kind":event_kind,
+        }))?
+        .as_bytes(),
+    ))
 }
 
 /// Map only exact lifecycle transitions into the existing closed diagnostic
@@ -361,6 +697,653 @@ fn diagnostic_for_transition(
             .with_operation_id(operation_id)
             .with_module_boot_id(Some(boot_id)),
     )
+}
+
+fn record_lifecycle_trigger(
+    tx: &Transaction<'_>,
+    source_stream_id: &str,
+    observation: &ModuleSupervisorObservation,
+    generation: i64,
+    transition: LifecycleTransition,
+    now_ms: i64,
+) -> Result<()> {
+    let Some(boot_id) = observation.boot_id.as_deref() else {
+        return Ok(());
+    };
+    let event_kind = transition.event_kind();
+    let source_event_key = format!("lifecycle:{event_kind}:{}", observation.event_id);
+    let occurrence_id = lifecycle_occurrence_id(
+        &observation.scope.binding_id,
+        generation,
+        boot_id,
+        &observation.event_id,
+        event_kind,
+    )?;
+    let operation_id = (observation.unknown_operation_count == 1
+        && observation.unknown_operation_ids.len() == 1
+        && !observation.unknown_operation_ids_truncated)
+        .then(|| observation.unknown_operation_ids[0].as_str());
+    let payload = json!({
+        "schema_version":1,
+        "event_kind":event_kind,
+        "occurrence_phase":transition.occurrence_phase(),
+        "occurrence_id":occurrence_id,
+        "proof":transition.proof(),
+        "module_id":observation.module_id,
+        "binding_id":observation.scope.binding_id,
+        "generation":generation,
+        "operation_id":operation_id,
+        "boot_id":boot_id,
+        "event_id":observation.event_id,
+        "actor_instance_id":observation.actor_instance_id,
+        "sequence":observation.sequence,
+        "phase":observation.phase.as_str(),
+        "effect_certainty":observation.effect_certainty.as_str(),
+        "stage":observation.stage.map(ModuleFailureStage::as_str),
+    });
+    let payload_json = model::canonical(&payload)?;
+    if payload_json.len() > 4096 {
+        return Err(invalid("module lifecycle trigger exceeds its record bound"));
+    }
+    let duplicate: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM observations \
+         WHERE source_stream_id=?1 AND source_event_key=?2)",
+        params![source_stream_id, source_event_key],
+        |row| row.get(0),
+    )?;
+    if duplicate {
+        return Err(Error::new(
+            "MODULE_LIFECYCLE_TRIGGER_CONFLICT",
+            "lifecycle trigger already exists without its matching supervisor callback",
+        ));
+    }
+    tx.execute(
+        "INSERT INTO observations(\
+             source_stream_id,source_event_key,binding_id,binding_generation,\
+             operation_id,kind,payload_json,recorded_at_ms\
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+        params![
+            source_stream_id,
+            source_event_key,
+            observation.scope.binding_id,
+            generation,
+            operation_id,
+            event_kind,
+            payload_json,
+            now_ms,
+        ],
+    )?;
+    Ok(())
+}
+
+fn lifecycle_occurrence_id(
+    binding_id: &str,
+    generation: i64,
+    boot_id: &str,
+    event_id: &str,
+    event_kind: &str,
+) -> Result<String> {
+    Ok(model::digest(
+        model::canonical(&json!({
+            "binding_id":binding_id,
+            "generation":generation,
+            "boot_id":boot_id,
+            "event_id":event_id,
+            "event_kind":event_kind,
+        }))?
+        .as_bytes(),
+    ))
+}
+
+pub(super) fn is_lifecycle_event_source_kind(source_id: &str, event_kind: &str) -> bool {
+    source_id
+        .strip_prefix(STREAM_PREFIX)
+        .is_some_and(|tail| tail.starts_with(':'))
+        && matches!(
+            event_kind,
+            READY_EVENT_KIND
+                | START_FAILURE_EVENT_KIND
+                | FAMILY_EXIT_EVENT_KIND
+                | RECOVERY_BLOCKED_EVENT_KIND
+                | IDENTITY_UNKNOWN_EVENT_KIND
+                | OWNER_RETAINED_EVENT_KIND
+        )
+}
+
+pub(super) fn verified_lifecycle_event(
+    db: &rusqlite::Connection,
+    event: &crate::automation::intake::ObservedEvent,
+) -> Result<Option<VerifiedModuleLifecycleEvent>> {
+    if !is_lifecycle_event_source_kind(&event.source_id, &event.event_kind) {
+        return Ok(None);
+    }
+    if is_nonterminal_event_kind(&event.event_kind) {
+        return verified_nonterminal_event(db, event);
+    }
+    type TriggerRow = (
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        i64,
+        i64,
+    );
+    let row: Option<TriggerRow> = db
+        .query_row(
+            "SELECT CASE WHEN source_event_key IS NOT NULL \
+                         AND length(CAST(source_event_key AS BLOB))<=512 \
+                         THEN source_event_key END, binding_id,binding_generation,operation_id, \
+                    CASE WHEN length(CAST(payload_json AS BLOB))<=4096 \
+                         THEN payload_json END, recorded_at_ms, \
+                    length(CAST(payload_json AS BLOB)) \
+             FROM observations WHERE observation_id=?1 AND source_stream_id=?2 AND kind=?3",
+            params![event.observation_id, event.source_id, event.event_kind],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((source_event_key, binding_id, generation, operation_id, raw, recorded_at_ms, bytes)) =
+        row
+    else {
+        return Ok(None);
+    };
+    let (Some(source_event_key), Some(binding_id), Some(generation), operation_id, Some(raw)) =
+        (source_event_key, binding_id, generation, operation_id, raw)
+    else {
+        return Ok(None);
+    };
+    if event.recorded_at_ms != recorded_at_ms
+        || generation <= 0
+        || !(0..=4096).contains(&bytes)
+        || valid_token(&binding_id).is_err()
+        || event.source_id != format!("{STREAM_PREFIX}:{binding_id}:{generation}")
+    {
+        return Ok(None);
+    }
+    let value: Value = match serde_json::from_str(&raw) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    const TRIGGER_FIELDS: &[&str] = &[
+        "schema_version",
+        "event_kind",
+        "occurrence_phase",
+        "occurrence_id",
+        "proof",
+        "module_id",
+        "binding_id",
+        "generation",
+        "operation_id",
+        "boot_id",
+        "event_id",
+        "actor_instance_id",
+        "sequence",
+        "phase",
+        "effect_certainty",
+        "stage",
+    ];
+    let Some(object) = value.as_object() else {
+        return Ok(None);
+    };
+    if object.len() != TRIGGER_FIELDS.len()
+        || TRIGGER_FIELDS
+            .iter()
+            .any(|field| !object.contains_key(*field))
+    {
+        return Ok(None);
+    }
+    let fact: ModuleLifecycleTrigger = match serde_json::from_value(value) {
+        Ok(fact) => fact,
+        Err(_) => return Ok(None),
+    };
+    if fact.schema_version != 1
+        || fact.event_kind != event.event_kind
+        || fact.binding_id != binding_id
+        || fact.generation != generation
+        || fact.operation_id.as_deref() != operation_id.as_deref()
+        || fact
+            .operation_id
+            .as_deref()
+            .is_some_and(|id| valid_token(id).is_err())
+        || fact.occurrence_phase != occurrence_phase_for_kind(&event.event_kind).unwrap_or_default()
+        || fact.proof != proof_for_kind(&event.event_kind).unwrap_or_default()
+        || source_event_key != format!("lifecycle:{}:{}", event.event_kind, fact.event_id)
+        || fact.event_id.is_empty()
+        || fact.event_id.len() > 256
+        || fact.boot_id.is_empty()
+        || fact.boot_id.len() > 128
+        || fact.sequence == 0
+        || valid_token(&fact.actor_instance_id).is_err()
+        || valid_atom(&fact.module_id, false).is_err()
+        || fact.occurrence_id
+            != lifecycle_occurrence_id(
+                &fact.binding_id,
+                fact.generation,
+                &fact.boot_id,
+                &fact.event_id,
+                &fact.event_kind,
+            )?
+    {
+        return Ok(None);
+    }
+    let original: Option<LifecycleOriginalRow> = db
+        .query_row(
+            "SELECT source_event_key,binding_id,binding_generation,operation_id, \
+                    CASE WHEN length(CAST(payload_json AS BLOB))<=?5 THEN payload_json END, \
+                    recorded_at_ms,length(CAST(payload_json AS BLOB)) \
+             FROM observations WHERE source_stream_id=?1 AND source_event_key=?2 AND kind=?3 \
+               AND observation_id<?4",
+            params![
+                event.source_id,
+                fact.event_id,
+                EVENT_KIND,
+                event.observation_id,
+                MAX_RECORD_BYTES as i64,
+            ],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        Some(original_key),
+        Some(original_binding_id),
+        Some(original_generation),
+        None,
+        Some(original_raw),
+        original_recorded_at_ms,
+        original_bytes,
+    )) = original
+    else {
+        return Ok(None);
+    };
+    if original_key != fact.event_id
+        || original_binding_id != binding_id
+        || original_generation != generation
+        || original_recorded_at_ms != recorded_at_ms
+        || !(0..=MAX_RECORD_BYTES as i64).contains(&original_bytes)
+    {
+        return Ok(None);
+    }
+    let observation: ModuleSupervisorObservation = match serde_json::from_str(&original_raw) {
+        Ok(observation) => observation,
+        Err(_) => return Ok(None),
+    };
+    if validate_header(&observation).is_err()
+        || observation.event_id != fact.event_id
+        || observation.scope.binding_id != binding_id
+        || observation.scope.generation != generation as u64
+        || observation.boot_id.as_deref() != Some(fact.boot_id.as_str())
+        || observation.module_id != fact.module_id
+        || observation.actor_instance_id != fact.actor_instance_id
+        || observation.sequence != fact.sequence
+        || observation.phase.as_str() != fact.phase
+        || observation.effect_certainty.as_str() != fact.effect_certainty
+        || observation.stage.map(ModuleFailureStage::as_str) != fact.stage.as_deref()
+        || fact.operation_id.as_deref()
+            != (observation.unknown_operation_count == 1
+                && observation.unknown_operation_ids.len() == 1
+                && !observation.unknown_operation_ids_truncated)
+                .then(|| observation.unknown_operation_ids[0].as_str())
+        || !lifecycle_fact_matches_observation(&event.event_kind, &observation)
+    {
+        return Ok(None);
+    }
+    let binding = match super::operations::get_binding(db, &binding_id, generation) {
+        Ok(binding) => binding,
+        Err(_) => return Ok(None),
+    };
+    if validate_binding_identity(&binding, &observation).is_err() {
+        return Ok(None);
+    }
+    Ok(Some(VerifiedModuleLifecycleEvent {
+        binding_id,
+        generation,
+        occurrence_phase: fact.occurrence_phase,
+        occurrence_id: fact.occurrence_id,
+        error_code: None,
+    }))
+}
+
+fn is_nonterminal_event_kind(event_kind: &str) -> bool {
+    matches!(
+        event_kind,
+        RECOVERY_BLOCKED_EVENT_KIND | IDENTITY_UNKNOWN_EVENT_KIND | OWNER_RETAINED_EVENT_KIND
+    )
+}
+
+fn verified_nonterminal_event(
+    db: &rusqlite::Connection,
+    event: &crate::automation::intake::ObservedEvent,
+) -> Result<Option<VerifiedModuleLifecycleEvent>> {
+    type TriggerRow = (
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        i64,
+        i64,
+    );
+    let row: Option<TriggerRow> = db
+        .query_row(
+            "SELECT CASE WHEN source_event_key IS NOT NULL \
+                         AND length(CAST(source_event_key AS BLOB))<=512 \
+                         THEN source_event_key END, binding_id,binding_generation,operation_id, \
+                    CASE WHEN length(CAST(payload_json AS BLOB))<=4096 \
+                         THEN payload_json END, recorded_at_ms, \
+                    length(CAST(payload_json AS BLOB)) \
+             FROM observations WHERE observation_id=?1 AND source_stream_id=?2 AND kind=?3",
+            params![event.observation_id, event.source_id, event.event_kind],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((source_event_key, binding_id, generation, operation_id, raw, recorded_at_ms, bytes)) =
+        row
+    else {
+        return Ok(None);
+    };
+    let (Some(source_event_key), Some(binding_id), Some(generation), operation_id, Some(raw)) =
+        (source_event_key, binding_id, generation, operation_id, raw)
+    else {
+        return Ok(None);
+    };
+    if event.recorded_at_ms != recorded_at_ms
+        || generation <= 0
+        || !(0..=4096).contains(&bytes)
+        || valid_token(&binding_id).is_err()
+        || event.source_id != format!("{STREAM_PREFIX}:{binding_id}:{generation}")
+    {
+        return Ok(None);
+    }
+    let value: Value = match serde_json::from_str(&raw) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    const TRIGGER_FIELDS: &[&str] = &[
+        "schema_version",
+        "event_kind",
+        "occurrence_phase",
+        "occurrence_id",
+        "proof",
+        "module_id",
+        "binding_id",
+        "generation",
+        "operation_id",
+        "boot_id",
+        "event_id",
+        "actor_instance_id",
+        "sequence",
+        "phase",
+        "effect_certainty",
+        "stage",
+        "error_code",
+        "unknown_operation_count",
+        "unknown_operation_ids_truncated",
+    ];
+    let Some(object) = value.as_object() else {
+        return Ok(None);
+    };
+    if object.len() != TRIGGER_FIELDS.len()
+        || TRIGGER_FIELDS
+            .iter()
+            .any(|field| !object.contains_key(*field))
+    {
+        return Ok(None);
+    }
+    let fact: ModuleNonterminalTrigger = match serde_json::from_value(value) {
+        Ok(fact) => fact,
+        Err(_) => return Ok(None),
+    };
+    let expected_proof = match event.event_kind.as_str() {
+        RECOVERY_BLOCKED_EVENT_KIND => NonterminalTransition::RecoveryBlocked.proof(),
+        IDENTITY_UNKNOWN_EVENT_KIND => NonterminalTransition::IdentityUnknown.proof(),
+        OWNER_RETAINED_EVENT_KIND => NonterminalTransition::OwnerRetained.proof(),
+        _ => return Ok(None),
+    };
+    if fact.schema_version != 1
+        || fact.event_kind != event.event_kind
+        || fact.binding_id != binding_id
+        || fact.generation != generation
+        || fact.operation_id.as_deref() != operation_id.as_deref()
+        || fact
+            .operation_id
+            .as_deref()
+            .is_some_and(|id| valid_token(id).is_err())
+        || fact.occurrence_phase != "module_nonterminal_attention"
+        || fact.proof != expected_proof
+        || source_event_key != format!("nonterminal:{}:{}", event.event_kind, fact.event_id)
+        || fact.event_id.is_empty()
+        || fact.event_id.len() > 256
+        || fact
+            .boot_id
+            .as_deref()
+            .is_some_and(|id| valid_token(id).is_err())
+        || fact.sequence == 0
+        || valid_token(&fact.actor_instance_id).is_err()
+        || valid_atom(&fact.module_id, false).is_err()
+        || fact.error_code.as_deref().is_some_and(|code| {
+            code.is_empty()
+                || code.len() > 128
+                || !code
+                    .bytes()
+                    .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+        })
+        || fact.unknown_operation_count > MAX_UNKNOWN_OPERATION_COUNT as usize
+        || fact.occurrence_id
+            != nonterminal_occurrence_id(
+                &fact.binding_id,
+                fact.generation,
+                fact.boot_id.as_deref(),
+                &fact.event_id,
+                &fact.event_kind,
+            )?
+    {
+        return Ok(None);
+    }
+    let original: Option<NonterminalOriginalRow> = db
+        .query_row(
+            "SELECT source_event_key,binding_id,binding_generation,operation_id, \
+                    CASE WHEN length(CAST(payload_json AS BLOB))<=?5 THEN payload_json END, \
+                    recorded_at_ms,length(CAST(payload_json AS BLOB)) \
+             FROM observations WHERE source_stream_id=?1 AND source_event_key=?2 AND kind=?3 \
+               AND observation_id<?4",
+            params![
+                event.source_id,
+                fact.event_id,
+                EVENT_KIND,
+                event.observation_id,
+                MAX_RECORD_BYTES as i64,
+            ],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        Some(original_key),
+        Some(original_binding_id),
+        Some(original_generation),
+        None,
+        Some(original_raw),
+        original_recorded_at_ms,
+        original_bytes,
+    )) = original
+    else {
+        return Ok(None);
+    };
+    if original_key != fact.event_id
+        || original_binding_id != binding_id
+        || original_generation != generation
+        || original_recorded_at_ms != recorded_at_ms
+        || !(0..=MAX_RECORD_BYTES as i64).contains(&original_bytes)
+    {
+        return Ok(None);
+    }
+    let observation: ModuleSupervisorObservation = match serde_json::from_str(&original_raw) {
+        Ok(observation) => observation,
+        Err(_) => return Ok(None),
+    };
+    let expected_operation_id = (observation.unknown_operation_count == 1
+        && observation.unknown_operation_ids.len() == 1
+        && !observation.unknown_operation_ids_truncated)
+        .then(|| observation.unknown_operation_ids[0].as_str());
+    if validate_header(&observation).is_err()
+        || observation.event_id != fact.event_id
+        || observation.scope.binding_id != binding_id
+        || observation.scope.generation != generation as u64
+        || observation.boot_id != fact.boot_id
+        || observation.module_id != fact.module_id
+        || observation.actor_instance_id != fact.actor_instance_id
+        || observation.sequence != fact.sequence
+        || observation.phase.as_str() != fact.phase
+        || observation.effect_certainty.as_str() != fact.effect_certainty
+        || observation.stage.map(ModuleFailureStage::as_str) != fact.stage.as_deref()
+        || observation.error_code != fact.error_code
+        || expected_operation_id != fact.operation_id.as_deref()
+        || observation.unknown_operation_count != fact.unknown_operation_count
+        || observation.unknown_operation_ids_truncated != fact.unknown_operation_ids_truncated
+        || !nonterminal_fact_matches_observation(&event.event_kind, &observation)
+    {
+        return Ok(None);
+    }
+    let binding = match super::operations::get_binding(db, &binding_id, generation) {
+        Ok(binding) => binding,
+        Err(_) => return Ok(None),
+    };
+    if validate_binding_identity(&binding, &observation).is_err() {
+        return Ok(None);
+    }
+    Ok(Some(VerifiedModuleLifecycleEvent {
+        binding_id,
+        generation,
+        occurrence_phase: fact.occurrence_phase,
+        occurrence_id: fact.occurrence_id,
+        error_code: fact.error_code,
+    }))
+}
+
+pub(super) fn lifecycle_event_projection(
+    db: &rusqlite::Connection,
+    event: &crate::automation::intake::ObservedEvent,
+) -> Result<crate::automation::intake::SafeEventProjection> {
+    let Some(fact) = verified_lifecycle_event(db, event)? else {
+        return Ok(Default::default());
+    };
+    Ok(crate::automation::intake::SafeEventProjection {
+        occurrence_phase: Some(fact.occurrence_phase),
+        occurrence_id: Some(fact.occurrence_id),
+        error_code: fact.error_code,
+        ..Default::default()
+    })
+}
+
+fn occurrence_phase_for_kind(event_kind: &str) -> Option<&'static str> {
+    match event_kind {
+        READY_EVENT_KIND => Some(LifecycleTransition::Ready.occurrence_phase()),
+        START_FAILURE_EVENT_KIND => {
+            Some(LifecycleTransition::CertifiedNotStarted.occurrence_phase())
+        }
+        FAMILY_EXIT_EVENT_KIND => Some(LifecycleTransition::FamilyExited.occurrence_phase()),
+        _ => None,
+    }
+}
+
+fn proof_for_kind(event_kind: &str) -> Option<&'static str> {
+    match event_kind {
+        READY_EVENT_KIND => Some(LifecycleTransition::Ready.proof()),
+        START_FAILURE_EVENT_KIND => Some(LifecycleTransition::CertifiedNotStarted.proof()),
+        FAMILY_EXIT_EVENT_KIND => Some(LifecycleTransition::FamilyExited.proof()),
+        _ => None,
+    }
+}
+
+fn lifecycle_fact_matches_observation(
+    event_kind: &str,
+    observation: &ModuleSupervisorObservation,
+) -> bool {
+    match event_kind {
+        READY_EVENT_KIND => matches!(observation.phase, ModuleSupervisorPhase::Ready),
+        START_FAILURE_EVENT_KIND => {
+            matches!(
+                observation.phase,
+                ModuleSupervisorPhase::Exited
+                    | ModuleSupervisorPhase::RestartBackoff
+                    | ModuleSupervisorPhase::Completed
+            ) && matches!(
+                observation.effect_certainty,
+                ModuleEffectCertainty::NotStarted
+            ) && observation
+                .stage
+                .is_some_and(ModuleFailureStage::proves_pre_spawn)
+        }
+        FAMILY_EXIT_EVENT_KIND => {
+            matches!(
+                observation.phase,
+                ModuleSupervisorPhase::ExitedProven | ModuleSupervisorPhase::Completed
+            ) && matches!(observation.effect_certainty, ModuleEffectCertainty::Unknown)
+                && observation.stage.is_none()
+        }
+        _ => false,
+    }
+}
+
+fn nonterminal_fact_matches_observation(
+    event_kind: &str,
+    observation: &ModuleSupervisorObservation,
+) -> bool {
+    match event_kind {
+        RECOVERY_BLOCKED_EVENT_KIND => {
+            matches!(
+                observation.phase,
+                ModuleSupervisorPhase::WaitingForKernel | ModuleSupervisorPhase::Isolated
+            ) || (matches!(observation.phase, ModuleSupervisorPhase::Starting)
+                && observation.error_code.is_some())
+        }
+        IDENTITY_UNKNOWN_EVENT_KIND => {
+            matches!(observation.phase, ModuleSupervisorPhase::IdentityUnknown)
+        }
+        OWNER_RETAINED_EVENT_KIND => {
+            matches!(observation.phase, ModuleSupervisorPhase::OwnerRetained)
+        }
+        _ => false,
+    }
 }
 
 fn validate_header(observation: &ModuleSupervisorObservation) -> Result<()> {
@@ -610,7 +1593,8 @@ pub(super) fn public_projection(value: &Value) -> Value {
     let phase = match value["phase"].as_str() {
         Some(
             "waiting_for_demand" | "waiting_for_kernel" | "starting" | "ready" | "restart_backoff"
-            | "exited" | "owner_retained" | "identity_unknown" | "completed" | "isolated",
+            | "exited" | "exited_proven" | "owner_retained" | "identity_unknown" | "completed"
+            | "isolated",
         ) => value["phase"].as_str().unwrap_or_default(),
         _ => return Value::Null,
     };
@@ -733,6 +1717,7 @@ pub(super) fn manager_attention_item(
         "waiting_for_kernel"
             | "restart_backoff"
             | "exited"
+            | "exited_proven"
             | "owner_retained"
             | "identity_unknown"
             | "isolated"

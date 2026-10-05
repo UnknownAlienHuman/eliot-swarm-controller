@@ -709,6 +709,7 @@ fn into_swarm_checks_error(error: Error) -> swarm_contracts::Error {
         code: error.code,
         message: error.message,
         rejection_class: error.rejection_class,
+        native_http_failure: error.native_http_failure,
     }
 }
 
@@ -1245,7 +1246,7 @@ pub(super) fn ensure_owned_directories(root: &Path, directory: &Path) -> Result<
         };
         current.push(part);
         match fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            Ok(metadata) if is_link_or_reparse(&metadata) || !metadata.is_dir() => {
                 return Err(Error::new(
                     "CHECK_INPUTS_STALE",
                     "content-addressed CheckRunner directory is not a regular directory",
@@ -1259,6 +1260,89 @@ pub(super) fn ensure_owned_directories(root: &Path, directory: &Path) -> Result<
         }
     }
     Ok(())
+}
+
+/// Select the exact trusted Cargo target directory for a check. Explicit
+/// profile values must name an existing, canonicalizable directory whose path
+/// components contain no symlinks or reparse points. With no explicit profile
+/// value, retain the existing per-resource directory under the CheckRun data
+/// root and its owned-directory creation guard.
+pub(super) fn resolve_target_directory(
+    data_root: &Path,
+    profile: &CheckProfile,
+    environment: &BTreeMap<String, String>,
+) -> Result<PathBuf> {
+    if let Some(configured) = environment.get("CARGO_TARGET_DIR") {
+        return verify_existing_target_directory(Path::new(configured));
+    }
+
+    let target = data_root
+        .join("targets")
+        .join(profile.resource.to_ascii_lowercase());
+    ensure_owned_directories(data_root, &target)?;
+    fs::canonicalize(&target).map_err(|_| invalid_configured_target_directory())
+}
+
+fn verify_existing_target_directory(path: &Path) -> Result<PathBuf> {
+    if !path.is_absolute() {
+        return Err(invalid_configured_target_directory());
+    }
+
+    let mut current = PathBuf::new();
+    let mut saw_root = false;
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(_) => current.push(component.as_os_str()),
+            std::path::Component::RootDir => {
+                current.push(component.as_os_str());
+                saw_root = true;
+                verify_existing_target_component(&current)?;
+            }
+            std::path::Component::Normal(_) => {
+                if !saw_root {
+                    return Err(invalid_configured_target_directory());
+                }
+                current.push(component.as_os_str());
+                verify_existing_target_component(&current)?;
+            }
+            std::path::Component::CurDir | std::path::Component::ParentDir => {
+                return Err(invalid_configured_target_directory());
+            }
+        }
+    }
+    if !saw_root {
+        return Err(invalid_configured_target_directory());
+    }
+
+    let canonical = fs::canonicalize(path).map_err(|_| invalid_configured_target_directory())?;
+    verify_existing_target_component(&canonical)?;
+    Ok(canonical)
+}
+
+fn verify_existing_target_component(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| invalid_configured_target_directory())?;
+    if is_link_or_reparse(&metadata) || !metadata.is_dir() {
+        return Err(invalid_configured_target_directory());
+    }
+    Ok(())
+}
+
+fn invalid_configured_target_directory() -> Error {
+    Error::new(
+        "CHECK_INPUTS_STALE",
+        "Cargo target directory must be an existing absolute regular directory",
+    )
+}
+
+#[cfg(windows)]
+fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    metadata.file_type().is_symlink() || metadata.file_attributes() & 0x400 != 0
+}
+
+#[cfg(not(windows))]
+fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
 }
 
 pub(super) fn ensure_execution_inputs(
@@ -1587,10 +1671,7 @@ pub fn run(file: &Path) -> Result<()> {
                     )?;
                     let mut env = environment(&work.profile);
                     let data_root = fs::canonicalize(&work.data_dir)?;
-                    let target = data_root
-                        .join("targets")
-                        .join(work.profile.resource.to_lowercase());
-                    ensure_owned_directories(&data_root, &target)?;
+                    let target = resolve_target_directory(&data_root, &work.profile, &env)?;
                     env.insert(
                         "CARGO_TARGET_DIR".into(),
                         target.to_string_lossy().to_string(),

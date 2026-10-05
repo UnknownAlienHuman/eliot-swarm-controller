@@ -136,13 +136,8 @@ impl Client {
         self.usable = false;
         time::timeout(self.write_timeout, self.writer.send(line))
             .await
-            .map_err(|_| {
-                Error::new(
-                    "OUTCOME_UNKNOWN",
-                    "write timed out; preserve the logical request ID",
-                )
-            })?
-            .map_err(|error| Error::new("OUTCOME_UNKNOWN", error.to_string()))?;
+            .map_err(|_| unknown_write())?
+            .map_err(|_| unknown_write())?;
         let frame = time::timeout(Duration::from_secs(60), self.reader.next())
             .await
             .map_err(|_| {
@@ -185,6 +180,13 @@ fn unknown_response() -> Error {
     Error::new(
         "OUTCOME_UNKNOWN",
         "reply was malformed or could not be matched; preserve the logical request ID and inspect the original operation before retrying",
+    )
+}
+
+fn unknown_write() -> Error {
+    Error::new(
+        "OUTCOME_UNKNOWN",
+        "request write did not complete; delivery is uncertain; preserve the logical request ID and inspect the original operation before retrying",
     )
 }
 

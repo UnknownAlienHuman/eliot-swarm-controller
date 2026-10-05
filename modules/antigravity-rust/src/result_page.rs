@@ -107,7 +107,7 @@ pub fn build(command: &RuntimeCommand) -> Result<Value> {
 
     let diagnostic_code = checked_optional_code(&target["diagnostic_code"])?;
     let native_failure_status = checked_optional_failure(&target["native_failure_status"])?;
-    if native_failure_status.is_some() && target_outcome != "rejected" {
+    if !native_failure_status.is_null() && target_outcome != "rejected" {
         return Err(Error::new(
             "RESULT_PROVENANCE_INVALID",
             "native failure status is inconsistent with the terminal Operation",
@@ -155,10 +155,7 @@ pub fn build(command: &RuntimeCommand) -> Result<Value> {
             "requested status page range is outside the retained status document",
         ));
     }
-    let end = offset
-        .checked_add(requested_length)
-        .unwrap_or(u64::MAX)
-        .min(total);
+    let end = offset.saturating_add(requested_length).min(total);
     let start = usize::try_from(offset)
         .map_err(|_| Error::new("RESULT_RANGE_INVALID", "status page offset is too large"))?;
     let end = usize::try_from(end)
@@ -169,7 +166,7 @@ pub fn build(command: &RuntimeCommand) -> Result<Value> {
         "offset_bytes":offset,
         "byte_length":selected.len(),
         "total_bytes":total,
-        "eof":end == total,
+        "eof":end as u64 == total,
         "media_type":"application/json; charset=utf-8",
         "content_base64":encode_base64(selected),
         "page_sha256":sha256_hex(selected),
@@ -241,14 +238,14 @@ fn sha256_hex(bytes: &[u8]) -> String {
 fn encode_base64(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    let mut chunks = bytes.chunks_exact(3);
-    for chunk in &mut chunks {
+    let (chunks, remainder) = bytes.as_chunks::<3>();
+    for chunk in chunks {
         encoded.push(ALPHABET[(chunk[0] >> 2) as usize] as char);
         encoded.push(ALPHABET[(((chunk[0] & 0x03) << 4) | (chunk[1] >> 4)) as usize] as char);
         encoded.push(ALPHABET[(((chunk[1] & 0x0f) << 2) | (chunk[2] >> 6)) as usize] as char);
         encoded.push(ALPHABET[(chunk[2] & 0x3f) as usize] as char);
     }
-    match chunks.remainder() {
+    match remainder {
         [first] => {
             encoded.push(ALPHABET[(*first >> 2) as usize] as char);
             encoded.push(ALPHABET[(((*first) & 0x03) << 4) as usize] as char);
@@ -261,7 +258,7 @@ fn encode_base64(bytes: &[u8]) -> String {
             encoded.push('=');
         }
         [] => {}
-        _ => unreachable!("chunks_exact remainder has at most two bytes"),
+        _ => unreachable!("as_chunks remainder has at most two bytes"),
     }
     encoded
 }

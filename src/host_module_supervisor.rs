@@ -27,11 +27,11 @@ use swarm_contracts::{
     },
 };
 use swarm_supervisor::{
-    AdmissionState, BindingLaunchConfig, DemandCause, KernelFault, LaunchValue, ModuleDescriptor,
-    ModuleEffectCertainty, ModuleFailureStage, ModuleOwnerExecutable, ModuleSupervisorObservation,
-    ModuleSupervisorPhase, OperationReadback, OperationSnapshot, ProtectedResolverContext,
-    ResolverMapDirectory, ServiceScope, SupervisorRegistry, load_installed_descriptor,
-    module_contract_claim,
+    AdmissionState, BindingLaunchConfig, BindingMapPublication, DemandCause, KernelFault,
+    LaunchValue, ModuleDemandRequest, ModuleDescriptor, ModuleEffectCertainty, ModuleFailureStage,
+    ModuleOwnerExecutable, ModuleSupervisorObservation, ModuleSupervisorPhase, OperationReadback,
+    OperationSnapshot, ProtectedResolverContext, ResolverMapDirectory, ServiceScope,
+    SupervisorRegistry, SupervisorRegistryConfig, load_installed_descriptor, module_contract_claim,
 };
 use tokio::{sync::watch, task::JoinHandle, time};
 
@@ -337,6 +337,18 @@ struct RecoveryBlock {
     release_after_readback: bool,
 }
 
+#[derive(Default)]
+struct RecoveryEventState {
+    blocks: HashMap<ModuleScopeKey, RecoveryBlock>,
+    sequence: u64,
+    pending: VecDeque<ModuleSupervisorObservation>,
+}
+
+struct RecoveryEventQueue<'a> {
+    sequence: &'a mut u64,
+    pending: &'a mut VecDeque<ModuleSupervisorObservation>,
+}
+
 pub(crate) struct ModuleSupervisorHost {
     store: Store,
     registry: Arc<SupervisorRegistry>,
@@ -459,16 +471,16 @@ impl ModuleSupervisorHost {
             ResolverMapDirectory::new(config.resolver_root.clone()).map_err(module_error)?,
         );
         let registry = Arc::new(
-            SupervisorRegistry::new_with_admission(
+            SupervisorRegistry::new_with_admission(SupervisorRegistryConfig {
                 catalog,
-                config.state_root.clone(),
-                root.to_path_buf(),
+                state_root: config.state_root.clone(),
+                ipc_root: root.to_path_buf(),
                 supervisor_credential,
                 ipc,
-                config.owner_helper.clone(),
-                resolver.clone(),
+                owner_executable: config.owner_helper.clone(),
+                resolver: resolver.clone(),
                 admission,
-            )
+            })
             .map_err(module_error)?,
         );
         for descriptor in &descriptors {
@@ -503,16 +515,13 @@ impl ModuleSupervisorHost {
         let mut scan = time::interval(MODULE_SCAN_FALLBACK);
         scan.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
         let mut held = HashMap::<DemandKey, HeldDemand>::new();
-        let mut event_sequence = 0_u64;
-        let mut pending_events = VecDeque::<ModuleSupervisorObservation>::new();
+        let mut recovery_events = RecoveryEventState::default();
         // Callback events rejected for a missing/cross-scope Operation stay
         // available as bounded private evidence; only a sanitized, same-scope
         // status is sent back to Store.
         let mut quarantined_events = VecDeque::<ModuleSupervisorObservation>::new();
         let mut host_diagnostics = VecDeque::<String>::new();
         let mut last_status = HashMap::<(String, ServiceScope), String>::new();
-        let mut recovery_blocks = HashMap::<ModuleScopeKey, RecoveryBlock>::new();
-
         loop {
             if *stopping.borrow() {
                 return Ok(());
@@ -522,12 +531,7 @@ impl ModuleSupervisorHost {
                 AdmissionState::Closed { .. }
             ) {
                 match self
-                    .verify_recovery(
-                        &mut recovery_blocks,
-                        &mut event_sequence,
-                        &mut pending_events,
-                        &mut host_diagnostics,
-                    )
+                    .verify_recovery(&mut recovery_events, &mut host_diagnostics)
                     .await
                 {
                     Ok(()) => self.registry.reopen_durable_admission_after_recovery(),
@@ -542,21 +546,14 @@ impl ModuleSupervisorHost {
                         eprintln!("module recovery verification: {}", error.code);
                     }
                 }
-            } else if !recovery_blocks.is_empty() {
-                if let Err(error) = self
-                    .refresh_recovery_blocks(
-                        &mut recovery_blocks,
-                        &mut event_sequence,
-                        &mut pending_events,
-                    )
-                    .await
-                {
-                    if is_store_unavailable(&error) {
-                        self.registry
-                            .close_durable_admission(KernelFault::StoreUnavailable);
-                    }
-                    eprintln!("module scoped recovery readback: {}", error.code);
+            } else if !recovery_events.blocks.is_empty()
+                && let Err(error) = self.refresh_recovery_blocks(&mut recovery_events).await
+            {
+                if is_store_unavailable(&error) {
+                    self.registry
+                        .close_durable_admission(KernelFault::StoreUnavailable);
                 }
+                eprintln!("module scoped recovery readback: {}", error.code);
             }
 
             let scan_result = if matches!(
@@ -565,14 +562,8 @@ impl ModuleSupervisorHost {
             ) {
                 Ok(())
             } else {
-                self.reconcile_demands(
-                    &mut held,
-                    &mut recovery_blocks,
-                    &mut event_sequence,
-                    &mut pending_events,
-                    &mut host_diagnostics,
-                )
-                .await
+                self.reconcile_demands(&mut held, &mut recovery_events, &mut host_diagnostics)
+                    .await
             };
             if let Err(error) = scan_result {
                 if is_durable_journal_failure(&error) {
@@ -585,10 +576,8 @@ impl ModuleSupervisorHost {
                 eprintln!("module supervisor Store readback: {}", error.code);
             }
             self.collect_status_events(
-                &mut event_sequence,
                 &mut last_status,
-                &mut pending_events,
-                &mut recovery_blocks,
+                &mut recovery_events,
                 &mut quarantined_events,
             )
             .await;
@@ -629,9 +618,7 @@ impl ModuleSupervisorHost {
     /// scope so verified neighboring bindings can continue.
     async fn verify_recovery(
         &self,
-        recovery_blocks: &mut HashMap<ModuleScopeKey, RecoveryBlock>,
-        sequence: &mut u64,
-        pending: &mut VecDeque<ModuleSupervisorObservation>,
+        recovery_events: &mut RecoveryEventState,
         host_diagnostics: &mut VecDeque<String>,
     ) -> Result<()> {
         // This bounded Store transaction verifies the existing durable source
@@ -646,10 +633,8 @@ impl ModuleSupervisorHost {
             for blocked in &snapshot.blocked {
                 self.note_blocked_demand(
                     blocked,
-                    recovery_blocks,
+                    recovery_events,
                     &mut blocked_scopes,
-                    sequence,
-                    pending,
                     host_diagnostics,
                 )
                 .await?;
@@ -704,17 +689,18 @@ impl ModuleSupervisorHost {
                             Err(error) => Err(error),
                         };
                         match applied {
-                            Ok(()) => {
-                                self.clear_recovery_block(&key, recovery_blocks, sequence, pending)?
-                            }
+                            Ok(()) => self.clear_recovery_block(
+                                &key,
+                                &mut recovery_events.blocks,
+                                &mut recovery_events.sequence,
+                                &mut recovery_events.pending,
+                            )?,
                             Err(error) if is_store_unavailable(&error) => return Err(error),
                             Err(error) => self.set_recovery_block(
                                 &key,
                                 &demand.descriptor,
                                 &error.code,
-                                recovery_blocks,
-                                sequence,
-                                pending,
+                                recovery_events,
                             )?,
                         }
                     }
@@ -723,9 +709,7 @@ impl ModuleSupervisorHost {
                         &key,
                         &demand.descriptor,
                         &error.code,
-                        recovery_blocks,
-                        sequence,
-                        pending,
+                        recovery_events,
                     )?,
                 }
             }
@@ -741,13 +725,12 @@ impl ModuleSupervisorHost {
     /// does not close admission for healthy neighbors or start a process.
     async fn refresh_recovery_blocks(
         &self,
-        recovery_blocks: &mut HashMap<ModuleScopeKey, RecoveryBlock>,
-        sequence: &mut u64,
-        pending: &mut VecDeque<ModuleSupervisorObservation>,
+        recovery_events: &mut RecoveryEventState,
     ) -> Result<()> {
-        let keys = recovery_blocks.keys().cloned().collect::<Vec<_>>();
+        let keys = recovery_events.blocks.keys().cloned().collect::<Vec<_>>();
         for key in keys {
-            let Some((descriptor, release_after_readback)) = recovery_blocks
+            let Some((descriptor, release_after_readback)) = recovery_events
+                .blocks
                 .get(&key)
                 .map(|block| (block.descriptor.clone(), block.release_after_readback))
             else {
@@ -786,30 +769,27 @@ impl ModuleSupervisorHost {
                         Err(error) => Err(error),
                     };
                     match applied {
-                        Ok(()) if release_after_readback || !scope_still_needed => {
-                            self.clear_recovery_block(&key, recovery_blocks, sequence, pending)?
-                        }
+                        Ok(()) if release_after_readback || !scope_still_needed => self
+                            .clear_recovery_block(
+                                &key,
+                                &mut recovery_events.blocks,
+                                &mut recovery_events.sequence,
+                                &mut recovery_events.pending,
+                            )?,
                         Ok(()) => {}
                         Err(error) if is_store_unavailable(&error) => return Err(error),
                         Err(error) => self.set_recovery_block(
                             &key,
                             &descriptor,
                             &error.code,
-                            recovery_blocks,
-                            sequence,
-                            pending,
+                            recovery_events,
                         )?,
                     }
                 }
                 Err(error) if is_store_unavailable(&error) => return Err(error),
-                Err(error) => self.set_recovery_block(
-                    &key,
-                    &descriptor,
-                    &error.code,
-                    recovery_blocks,
-                    sequence,
-                    pending,
-                )?,
+                Err(error) => {
+                    self.set_recovery_block(&key, &descriptor, &error.code, recovery_events)?
+                }
             }
         }
         Ok(())
@@ -820,18 +800,14 @@ impl ModuleSupervisorHost {
         key: &ModuleScopeKey,
         descriptor: &ModuleDescriptor,
         error_code: &str,
-        recovery_blocks: &mut HashMap<ModuleScopeKey, RecoveryBlock>,
-        sequence: &mut u64,
-        pending: &mut VecDeque<ModuleSupervisorObservation>,
+        recovery_events: &mut RecoveryEventState,
     ) -> Result<()> {
         self.set_recovery_block_at_stage(
             key,
             descriptor,
             error_code,
             ModuleFailureStage::Store,
-            recovery_blocks,
-            sequence,
-            pending,
+            recovery_events,
         )
     }
 
@@ -841,20 +817,9 @@ impl ModuleSupervisorHost {
         descriptor: &ModuleDescriptor,
         error_code: &str,
         stage: ModuleFailureStage,
-        recovery_blocks: &mut HashMap<ModuleScopeKey, RecoveryBlock>,
-        sequence: &mut u64,
-        pending: &mut VecDeque<ModuleSupervisorObservation>,
+        recovery_events: &mut RecoveryEventState,
     ) -> Result<()> {
-        self.set_recovery_block_policy(
-            key,
-            descriptor,
-            error_code,
-            stage,
-            true,
-            recovery_blocks,
-            sequence,
-            pending,
-        )
+        self.set_recovery_block_policy(key, descriptor, error_code, stage, true, recovery_events)
     }
 
     fn set_persistent_recovery_block(
@@ -863,20 +828,9 @@ impl ModuleSupervisorHost {
         descriptor: &ModuleDescriptor,
         error_code: &str,
         stage: ModuleFailureStage,
-        recovery_blocks: &mut HashMap<ModuleScopeKey, RecoveryBlock>,
-        sequence: &mut u64,
-        pending: &mut VecDeque<ModuleSupervisorObservation>,
+        recovery_events: &mut RecoveryEventState,
     ) -> Result<()> {
-        self.set_recovery_block_policy(
-            key,
-            descriptor,
-            error_code,
-            stage,
-            false,
-            recovery_blocks,
-            sequence,
-            pending,
-        )
+        self.set_recovery_block_policy(key, descriptor, error_code, stage, false, recovery_events)
     }
 
     fn set_recovery_block_policy(
@@ -886,17 +840,15 @@ impl ModuleSupervisorHost {
         error_code: &str,
         stage: ModuleFailureStage,
         release_after_readback: bool,
-        recovery_blocks: &mut HashMap<ModuleScopeKey, RecoveryBlock>,
-        sequence: &mut u64,
-        pending: &mut VecDeque<ModuleSupervisorObservation>,
+        recovery_events: &mut RecoveryEventState,
     ) -> Result<()> {
         let safe_code = safe_observation_error_code(error_code);
-        let changed = recovery_blocks.get(key).is_none_or(|block| {
+        let changed = recovery_events.blocks.get(key).is_none_or(|block| {
             block.error_code != safe_code
                 || block.stage != stage
                 || block.release_after_readback != release_after_readback
         });
-        recovery_blocks.insert(
+        recovery_events.blocks.insert(
             key.clone(),
             RecoveryBlock {
                 descriptor: descriptor.clone(),
@@ -906,14 +858,17 @@ impl ModuleSupervisorHost {
             },
         );
         if changed {
+            let mut queue = RecoveryEventQueue {
+                sequence: &mut recovery_events.sequence,
+                pending: &mut recovery_events.pending,
+            };
             self.queue_recovery_observation(
                 key,
                 descriptor,
                 ModuleSupervisorPhase::Isolated,
                 Some(stage),
                 Some(safe_code),
-                sequence,
-                pending,
+                &mut queue,
             )?;
         }
         Ok(())
@@ -922,10 +877,8 @@ impl ModuleSupervisorHost {
     async fn note_blocked_demand(
         &self,
         blocked: &ModuleDemandBlock,
-        recovery_blocks: &mut HashMap<ModuleScopeKey, RecoveryBlock>,
+        recovery_events: &mut RecoveryEventState,
         reported: &mut HashSet<ModuleScopeKey>,
-        sequence: &mut u64,
-        pending: &mut VecDeque<ModuleSupervisorObservation>,
         host_diagnostics: &mut VecDeque<String>,
     ) -> Result<()> {
         let Some(descriptor) = blocked.descriptor.as_ref() else {
@@ -935,8 +888,11 @@ impl ModuleSupervisorHost {
             remember_host_diagnostic(
                 host_diagnostics,
                 format!(
-                    "demand_without_descriptor:{}:{}:{}",
-                    blocked.binding_id, blocked.generation, blocked.error_code
+                    "demand_without_descriptor:{}:{}:{}:{}",
+                    blocked.binding_id,
+                    blocked.generation,
+                    blocked.operation_id,
+                    blocked.error_code
                 ),
             );
             return Ok(());
@@ -969,35 +925,19 @@ impl ModuleSupervisorHost {
                     descriptor,
                     &error.code,
                     failure_stage_for(&error.code),
-                    recovery_blocks,
-                    sequence,
-                    pending,
+                    recovery_events,
                 )?;
                 return Err(error);
             }
             Err(error) => {
-                self.set_recovery_block(
-                    &key,
-                    descriptor,
-                    &error.code,
-                    recovery_blocks,
-                    sequence,
-                    pending,
-                )?;
+                self.set_recovery_block(&key, descriptor, &error.code, recovery_events)?;
                 return Ok(());
             }
         };
         let operations = match operation_readback_for_scope(&key.scope, &readback) {
             Ok(operations) => operations,
             Err(error) => {
-                self.set_recovery_block(
-                    &key,
-                    descriptor,
-                    &error.code,
-                    recovery_blocks,
-                    sequence,
-                    pending,
-                )?;
+                self.set_recovery_block(&key, descriptor, &error.code, recovery_events)?;
                 return Ok(());
             }
         };
@@ -1006,35 +946,24 @@ impl ModuleSupervisorHost {
             .status(&key.module_id, &key.scope)
             .await
             .is_some()
-        {
-            if let Err(error) = self
+            && let Err(error) = self
                 .registry
                 .apply_operation_readback(&key.module_id, &key.scope, operations)
                 .await
                 .map_err(module_error)
-            {
-                if is_store_unavailable(&error) {
-                    self.set_recovery_block_at_stage(
-                        &key,
-                        descriptor,
-                        &error.code,
-                        failure_stage_for(&error.code),
-                        recovery_blocks,
-                        sequence,
-                        pending,
-                    )?;
-                    return Err(error);
-                }
-                self.set_recovery_block(
+        {
+            if is_store_unavailable(&error) {
+                self.set_recovery_block_at_stage(
                     &key,
                     descriptor,
                     &error.code,
-                    recovery_blocks,
-                    sequence,
-                    pending,
+                    failure_stage_for(&error.code),
+                    recovery_events,
                 )?;
-                return Ok(());
+                return Err(error);
             }
+            self.set_recovery_block(&key, descriptor, &error.code, recovery_events)?;
+            return Ok(());
         }
         if !readback.native_identity_retained
             && !readback
@@ -1051,9 +980,7 @@ impl ModuleSupervisorHost {
             descriptor,
             &blocked.error_code,
             failure_stage_for(&blocked.error_code),
-            recovery_blocks,
-            sequence,
-            pending,
+            recovery_events,
         )
     }
 
@@ -1063,17 +990,16 @@ impl ModuleSupervisorHost {
         recovery_blocks: &mut HashMap<ModuleScopeKey, RecoveryBlock>,
         sequence: &mut u64,
         pending: &mut VecDeque<ModuleSupervisorObservation>,
-        host_diagnostics: &mut VecDeque<String>,
     ) -> Result<()> {
         if let Some(block) = recovery_blocks.remove(key) {
+            let mut queue = RecoveryEventQueue { sequence, pending };
             self.queue_recovery_observation(
                 key,
                 &block.descriptor,
                 ModuleSupervisorPhase::WaitingForDemand,
                 None,
                 None,
-                sequence,
-                pending,
+                &mut queue,
             )?;
         }
         Ok(())
@@ -1086,16 +1012,15 @@ impl ModuleSupervisorHost {
         phase: ModuleSupervisorPhase,
         stage: Option<ModuleFailureStage>,
         error_code: Option<&str>,
-        sequence: &mut u64,
-        pending: &mut VecDeque<ModuleSupervisorObservation>,
+        queue: &mut RecoveryEventQueue<'_>,
     ) -> Result<()> {
-        if pending.len() >= 1024 {
+        if queue.pending.len() >= 1024 {
             return Err(Error::new(
                 "MODULE_OBSERVATION_QUEUE_FULL",
                 "module recovery status queue is full",
             ));
         }
-        let next = sequence.checked_add(1).ok_or_else(|| {
+        let next = queue.sequence.checked_add(1).ok_or_else(|| {
             Error::new(
                 "MODULE_OBSERVATION_SEQUENCE_EXHAUSTED",
                 "module status sequence exhausted",
@@ -1121,17 +1046,15 @@ impl ModuleSupervisorHost {
             unknown_operation_count: 0,
             unknown_operation_ids_truncated: false,
         };
-        *sequence = next;
-        pending.push_back(event);
+        *queue.sequence = next;
+        queue.pending.push_back(event);
         Ok(())
     }
 
     async fn reconcile_demands(
         &self,
         held: &mut HashMap<DemandKey, HeldDemand>,
-        recovery_blocks: &mut HashMap<ModuleScopeKey, RecoveryBlock>,
-        sequence: &mut u64,
-        pending: &mut VecDeque<ModuleSupervisorObservation>,
+        recovery_events: &mut RecoveryEventState,
         host_diagnostics: &mut VecDeque<String>,
     ) -> Result<()> {
         let mut cursor = None::<ModuleDemandCursor>;
@@ -1142,10 +1065,8 @@ impl ModuleSupervisorHost {
             for blocked in snapshot.blocked {
                 self.note_blocked_demand(
                     &blocked,
-                    recovery_blocks,
+                    recovery_events,
                     &mut blocked_scopes,
-                    sequence,
-                    pending,
                     host_diagnostics,
                 )
                 .await?;
@@ -1170,7 +1091,7 @@ impl ModuleSupervisorHost {
                     module_id: demand.module_id.clone(),
                     scope: key.scope.clone(),
                 };
-                if recovery_blocks.contains_key(&scope_key) {
+                if recovery_events.blocks.contains_key(&scope_key) {
                     // Keep an existing lease alive, but do not start or
                     // refresh this scope while its per-scope failure is held.
                     continue;
@@ -1182,9 +1103,7 @@ impl ModuleSupervisorHost {
                             &demand.descriptor,
                             &error.code,
                             failure_stage_for(&error.code),
-                            recovery_blocks,
-                            sequence,
-                            pending,
+                            recovery_events,
                         )?;
                         if is_store_unavailable(&error) {
                             return Err(error);
@@ -1203,9 +1122,7 @@ impl ModuleSupervisorHost {
                                 &demand.descriptor,
                                 &error.code,
                                 failure_stage_for(&error.code),
-                                recovery_blocks,
-                                sequence,
-                                pending,
+                                recovery_events,
                             )?;
                         } else {
                             self.set_persistent_recovery_block(
@@ -1213,9 +1130,7 @@ impl ModuleSupervisorHost {
                                 &demand.descriptor,
                                 &error.code,
                                 failure_stage_for(&error.code),
-                                recovery_blocks,
-                                sequence,
-                                pending,
+                                recovery_events,
                             )?;
                         }
                         if is_store_unavailable(&error) {
@@ -1374,15 +1289,15 @@ impl ModuleSupervisorHost {
             protocol: HOST_MODULE_PROTOCOL,
         };
         self.resolver
-            .publish_binding_map(
-                &context,
-                &demand.descriptor,
-                &claim,
+            .publish_binding_map(BindingMapPublication {
+                context: &context,
+                descriptor: &demand.descriptor,
+                claim: &claim,
                 credential_ref,
-                &provisioned.credential_file,
-                &provisioned.credential_file_sha256,
-                &self.config.protected_files,
-            )
+                credential_file: &provisioned.credential_file,
+                credential_file_sha256: &provisioned.credential_file_sha256,
+                additional_files: &self.config.protected_files,
+            })
             .map_err(module_error)?;
         let ready = self
             .store
@@ -1413,18 +1328,18 @@ impl ModuleSupervisorHost {
             .map_err(|error| Error::new("MODULE_CAPABILITY_INVALID", error.to_string()))?]);
         let readback = operation_readback(demand)?;
         self.registry
-            .demand(
-                &selector,
-                ProtocolRange::exact(HOST_MODULE_PROTOCOL),
-                &required,
-                context.scope,
-                DemandCause::Operation {
+            .demand(ModuleDemandRequest {
+                selector,
+                host_protocol: ProtocolRange::exact(HOST_MODULE_PROTOCOL),
+                required_capabilities: required,
+                scope: context.scope,
+                cause: DemandCause::Operation {
                     operation_id: demand.operation_id.clone(),
                 },
                 launch_config,
-                ready.module_client_id,
-                Some(readback),
-            )
+                module_client_id: ready.module_client_id,
+                readback: Some(readback),
+            })
             .await
             .map_err(module_error)
     }
@@ -1446,10 +1361,8 @@ impl ModuleSupervisorHost {
 
     async fn collect_status_events(
         &self,
-        sequence: &mut u64,
         last_status: &mut HashMap<(String, ServiceScope), String>,
-        pending: &mut VecDeque<ModuleSupervisorObservation>,
-        recovery_blocks: &mut HashMap<ModuleScopeKey, RecoveryBlock>,
+        recovery_events: &mut RecoveryEventState,
         quarantined: &mut VecDeque<ModuleSupervisorObservation>,
     ) {
         for status in self.registry.statuses().await {
@@ -1459,11 +1372,11 @@ impl ModuleSupervisorHost {
                 Err(_) => continue,
             };
             if last_status.get(&key) != Some(&fingerprint) {
-                let Some(next) = sequence.checked_add(1) else {
+                let Some(next) = recovery_events.sequence.checked_add(1) else {
                     eprintln!("module status sequence exhausted");
                     continue;
                 };
-                if pending.len() >= 1024 {
+                if recovery_events.pending.len() >= 1024 {
                     eprintln!(
                         "module status callback queue is full; retaining latest Store status"
                     );
@@ -1472,22 +1385,22 @@ impl ModuleSupervisorHost {
                 if let Ok(value) =
                     ModuleSupervisorObservation::from_status(&status, &self.actor_instance_id, next)
                 {
-                    *sequence = next;
-                    pending.push_back(value);
+                    recovery_events.sequence = next;
+                    recovery_events.pending.push_back(value);
                     last_status.insert(key, fingerprint);
                 } else {
                     eprintln!("module status observation rejected");
                 }
             }
         }
-        while let Some(event) = pending.front().cloned() {
+        while let Some(event) = recovery_events.pending.front().cloned() {
             match self
                 .store
                 .record_module_supervisor_observation(event.clone())
                 .await
             {
                 Ok(()) => {
-                    pending.pop_front();
+                    recovery_events.pending.pop_front();
                 }
                 Err(error) => {
                     if is_store_unavailable(&error) {
@@ -1530,7 +1443,7 @@ impl ModuleSupervisorHost {
                                     .map_err(module_error)
                                 {
                                     Ok(()) => {
-                                        pending.pop_front();
+                                        recovery_events.pending.pop_front();
                                         last_status.remove(&(module_id, scope));
                                     }
                                     Err(readback_error) => {
@@ -1566,14 +1479,14 @@ impl ModuleSupervisorHost {
                             quarantined.pop_front();
                         }
                         quarantined.push_back(event.clone());
-                        pending.pop_front();
+                        recovery_events.pending.pop_front();
 
                         let scope_key = ModuleScopeKey {
                             module_id: event.module_id.clone(),
                             scope: event.scope.clone(),
                         };
                         if let Some(descriptor) = self.descriptor_for_observation(&event) {
-                            recovery_blocks.insert(
+                            recovery_events.blocks.insert(
                                 scope_key.clone(),
                                 RecoveryBlock {
                                     descriptor: descriptor.clone(),
@@ -1584,7 +1497,7 @@ impl ModuleSupervisorHost {
                             );
                         }
 
-                        let Some(next) = sequence.checked_add(1) else {
+                        let Some(next) = recovery_events.sequence.checked_add(1) else {
                             eprintln!("module status sequence exhausted after scope rejection");
                             break;
                         };
@@ -1603,8 +1516,8 @@ impl ModuleSupervisorHost {
                         isolated.unknown_operation_ids.clear();
                         isolated.unknown_operation_count = 0;
                         isolated.unknown_operation_ids_truncated = false;
-                        *sequence = next;
-                        pending.push_back(isolated);
+                        recovery_events.sequence = next;
+                        recovery_events.pending.push_back(isolated);
                         eprintln!(
                             "module status Operation scope rejected; quarantined event {} and held binding {}",
                             quarantined
@@ -1628,7 +1541,7 @@ impl ModuleSupervisorHost {
                             quarantined.pop_front();
                         }
                         quarantined.push_back(event.clone());
-                        pending.pop_front();
+                        recovery_events.pending.pop_front();
                         eprintln!(
                             "module status not delivered by Store ({}): {}",
                             error.code, event.event_id

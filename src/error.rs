@@ -1,5 +1,5 @@
 use serde::Serialize;
-pub use swarm_contracts::error::NativeRpcRejectionClass;
+pub use swarm_contracts::error::{NativeHttpFailure, NativeRpcRejectionClass};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -10,6 +10,8 @@ pub struct Error {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rejection_class: Option<NativeRpcRejectionClass>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_http_failure: Option<NativeHttpFailure>,
 }
 
 impl Error {
@@ -18,6 +20,7 @@ impl Error {
             code: code.into(),
             message: message.into(),
             rejection_class: None,
+            native_http_failure: None,
         }
     }
     pub fn with_rejection_class(mut self, rejection_class: NativeRpcRejectionClass) -> Self {
@@ -37,6 +40,7 @@ impl From<swarm_contracts::error::Error> for Error {
             code: value.code,
             message: value.message,
             rejection_class: value.rejection_class,
+            native_http_failure: value.native_http_failure,
         }
     }
 }

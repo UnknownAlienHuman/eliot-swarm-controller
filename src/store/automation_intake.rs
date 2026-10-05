@@ -1017,6 +1017,12 @@ pub(crate) fn safe_event_projection(
     event: &ObservedEvent,
 ) -> Result<crate::automation::intake::SafeEventProjection> {
     use crate::automation::event_rules::EventStatus;
+    if super::module_supervisor_observation::is_lifecycle_event_source_kind(
+        &event.source_id,
+        &event.event_kind,
+    ) {
+        return super::module_supervisor_observation::lifecycle_event_projection(db, event);
+    }
 
     if event.source_id == "controller:scripts" {
         return script_run_lifecycle_event_projection(db, event);

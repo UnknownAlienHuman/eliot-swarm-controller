@@ -72,7 +72,7 @@ pub(super) fn snapshot(db: &Connection, config: &Config) -> Result<LegacyWorkerD
             crate::runtime::opencode_v2::RUNTIME,
             crate::runtime::opencode_v2::ARTIFACT_ID
         ],
-        |row| row.get(0),
+        |row| row.get::<_, bool>(0),
     )?;
     demand.zed |= db.query_row(
         "SELECT EXISTS(SELECT 1 FROM bindings WHERE released_at_ms IS NULL \
@@ -81,7 +81,7 @@ pub(super) fn snapshot(db: &Connection, config: &Config) -> Result<LegacyWorkerD
             crate::runtime::zed::RUNTIME,
             crate::runtime::zed::ARTIFACT_ID
         ],
-        |row| row.get(0),
+        |row| row.get::<_, bool>(0),
     )?;
 
     demand.scheduler |= exists(

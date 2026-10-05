@@ -156,13 +156,31 @@ impl CheckConfig {
             let mut env = BTreeSet::new();
             for key in p.environment.keys().chain(&p.inherit_env) {
                 let upper = key.to_ascii_uppercase();
+                let explicit_cargo_target = upper == "CARGO_TARGET_DIR"
+                    && key == "CARGO_TARGET_DIR"
+                    && p.parser == Parser::CargoJson
+                    && p.environment.contains_key("CARGO_TARGET_DIR");
                 if key.is_empty()
                     || key.contains(['=', '\0'])
                     || !env.insert(upper.clone())
-                    || matches!(upper.as_str(), "CARGO_TARGET_DIR" | "SWARM_CANDIDATE_FILE")
+                    || upper == "SWARM_CANDIDATE_FILE"
+                    || (upper == "CARGO_TARGET_DIR" && !explicit_cargo_target)
                 {
                     return Err(Error::invalid(
                         "duplicate, reserved or invalid check environment key",
+                    ));
+                }
+            }
+            if let Some(target_dir) = p.environment.get("CARGO_TARGET_DIR") {
+                let target_path = PathBuf::from(target_dir);
+                if !target_path.is_absolute()
+                    || target_dir.chars().any(char::is_control)
+                    || target_path
+                        .components()
+                        .any(|component| matches!(component, std::path::Component::ParentDir))
+                {
+                    return Err(Error::invalid(
+                        "CARGO_TARGET_DIR must be an absolute normalized Cargo profile path",
                     ));
                 }
             }
@@ -177,7 +195,7 @@ impl CheckConfig {
                 if key.is_empty()
                     || key.contains(['=', '\0'])
                     || !fingerprint_env.insert(upper.clone())
-                    || matches!(upper.as_str(), "CARGO_TARGET_DIR" | "SWARM_CANDIDATE_FILE")
+                    || upper == "SWARM_CANDIDATE_FILE"
                     || !p
                         .environment
                         .keys()

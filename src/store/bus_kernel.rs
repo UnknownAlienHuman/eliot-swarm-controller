@@ -324,8 +324,8 @@ pub(crate) fn read(
     crate::store::automation_dispatch::bus_kernel::events_page(
         db,
         principal,
-        &project_id,
-        &consumer_id,
+        project_id,
+        consumer_id,
         after,
         limit,
         config,

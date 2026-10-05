@@ -40,6 +40,26 @@ impl NativeRpcRejectionClass {
     }
 }
 
+/// Closed, non-sensitive class decoded from a bounded OpenCode V2 HTTP error
+/// envelope. Native messages and resource identifiers are never retained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeHttpFailureKind {
+    InvalidRequest,
+    Unauthorized,
+    Conflict,
+    SessionNotFound,
+    MessageNotFound,
+    InternalServerError,
+    Unclassified,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct NativeHttpFailure {
+    pub status: u16,
+    pub kind: NativeHttpFailureKind,
+}
+
 #[derive(Debug, Clone, Serialize, thiserror::Error)]
 #[error("{code}: {message}")]
 pub struct Error {
@@ -47,6 +67,8 @@ pub struct Error {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rejection_class: Option<NativeRpcRejectionClass>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_http_failure: Option<NativeHttpFailure>,
 }
 
 impl Error {
@@ -55,11 +77,17 @@ impl Error {
             code: code.into(),
             message: message.into(),
             rejection_class: None,
+            native_http_failure: None,
         }
     }
 
     pub fn with_rejection_class(mut self, rejection_class: NativeRpcRejectionClass) -> Self {
         self.rejection_class = Some(rejection_class);
+        self
+    }
+
+    pub fn with_native_http_failure(mut self, failure: NativeHttpFailure) -> Self {
+        self.native_http_failure = Some(failure);
         self
     }
 

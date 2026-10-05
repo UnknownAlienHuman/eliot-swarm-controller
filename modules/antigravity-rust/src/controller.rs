@@ -183,13 +183,12 @@ impl Controller {
             .input
             .get("resume_conversation_id")
             .and_then(serde_json::Value::as_str)
+            && resume_id != init.conversation_id
         {
-            if resume_id != init.conversation_id {
-                return Err(swarm_contracts::error::Error::new(
-                    "NATIVE_RESUME_IDENTITY_MISMATCH",
-                    "native init did not identify the explicitly resumed conversation",
-                ));
-            }
+            return Err(swarm_contracts::error::Error::new(
+                "NATIVE_RESUME_IDENTITY_MISMATCH",
+                "native init did not identify the explicitly resumed conversation",
+            ));
         }
         self.native_root_id = Some(init.conversation_id.clone());
         self.pending_open = None;
@@ -292,10 +291,8 @@ impl Controller {
                 "a prior native turn has no terminal readback",
             ));
         }
-        let text =
-            prompt_for(command).map_err(|code| swarm_contracts::error::Error::invalid(code))?;
-        let line =
-            encode_user_line(&text).map_err(|code| swarm_contracts::error::Error::invalid(code))?;
+        let text = prompt_for(command).map_err(swarm_contracts::error::Error::invalid)?;
+        let line = encode_user_line(&text).map_err(swarm_contracts::error::Error::invalid)?;
         self.pending = Some(PendingPrompt {
             identity,
             conversation_id: conversation_id.to_owned(),
@@ -500,8 +497,8 @@ impl Controller {
     }
 
     fn identity_for(&self, command: &RuntimeCommand) -> Result<OperationIdentity> {
-        let identity = OperationIdentity::try_from(command)
-            .map_err(|code| swarm_contracts::error::Error::invalid(code))?;
+        let identity =
+            OperationIdentity::try_from(command).map_err(swarm_contracts::error::Error::invalid)?;
         if identity.binding_id != self.binding_id || identity.generation != self.generation {
             return Err(swarm_contracts::error::Error::new(
                 "BINDING_IDENTITY_MISMATCH",

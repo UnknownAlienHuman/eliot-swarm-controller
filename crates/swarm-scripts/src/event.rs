@@ -65,9 +65,11 @@ impl EventRule {
             ) if self.status.is_none() => {
                 ("controller", "task.submission", Some(EventStatus::Applied))
             }
-            (None, None, Some(source_id), Some(event_kind)) => {
-                (source_id, event_kind, parse_status(self.status.as_deref())?)
-            }
+            (None, None, Some(source_id), Some(event_kind)) => (
+                source_id.as_str(),
+                event_kind.as_str(),
+                parse_status(self.status.as_deref())?,
+            ),
             _ => return Err(ScriptError::new("INVALID_PARAMS")),
         };
         EventSelector::new(source_id, event_kind, status).map_err(Into::into)

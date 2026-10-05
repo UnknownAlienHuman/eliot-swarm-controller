@@ -8,7 +8,6 @@
 
 use super::{ForgeConfig, ForgeProject, GitOutput};
 use crate::error::{Error, Result};
-use sha2::{Digest, Sha256};
 use std::{
     cmp::Ordering,
     env,
@@ -151,8 +150,8 @@ fn run_process(
         drop(thread_handle);
 
         let deadline = Instant::now() + timeout;
-        let mut stdout = PipeReader::new(stdout_reader, output_cap, false);
-        let mut stderr = PipeReader::new(stderr_reader, output_cap, true);
+        let mut stdout = PipeReader::new(stdout_reader, output_cap);
+        let mut stderr = PipeReader::new(stderr_reader, 0);
         let mut timed_out = false;
         let exit_code = loop {
             stdout.drain_available()?;
@@ -180,8 +179,6 @@ fn run_process(
             status: std::process::ExitStatus::from_raw(exit_code),
             stdout: stdout.bytes,
             stdout_truncated,
-            stderr_digest: stderr.digest_hex(),
-            stderr_bytes: stderr.total,
             timed_out,
         })
     })();
@@ -692,20 +689,16 @@ struct PipeReader {
     total: u64,
     bytes: Vec<u8>,
     eof: bool,
-    hash_all_bytes: bool,
-    hasher: Sha256,
 }
 
 impl PipeReader {
-    fn new(handle: Handle, cap: usize, hash_all_bytes: bool) -> Self {
+    fn new(handle: Handle, cap: usize) -> Self {
         Self {
             handle,
             cap,
             total: 0,
             bytes: Vec::with_capacity(cap.min(8192)),
             eof: false,
-            hash_all_bytes,
-            hasher: Sha256::new(),
         }
     }
 
@@ -770,9 +763,6 @@ impl PipeReader {
             }
             drained_this_poll = drained_this_poll.saturating_add(read);
             self.total = self.total.saturating_add(read as u64);
-            if self.hash_all_bytes {
-                self.hasher.update(&buffer[..read as usize]);
-            }
             let retained = self.cap.saturating_sub(self.bytes.len()).min(read as usize);
             self.bytes.extend_from_slice(&buffer[..retained]);
         }
@@ -786,10 +776,6 @@ impl PipeReader {
                 return Ok(());
             }
         }
-    }
-
-    fn digest_hex(&self) -> String {
-        format!("{:x}", self.hasher.clone().finalize())
     }
 }
 

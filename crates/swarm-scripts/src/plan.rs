@@ -9,7 +9,7 @@ use crate::{
     },
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

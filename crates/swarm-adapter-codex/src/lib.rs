@@ -21,7 +21,6 @@ use swarm_contracts::{
     module_contract::ModuleContractClaim,
     runtime::{EffectOutcome, ModuleReceiptIdentity, RuntimeCommand, RuntimeOutcome},
 };
-use swarm_process::module_owner::{VerifiedModuleWorker, verify_current_adapter_from_env};
 use tokio::{net::TcpStream, time::timeout};
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async_with_config,
@@ -31,7 +30,7 @@ use url::Url;
 use uuid::Uuid;
 
 pub const ARTIFACT_ID: &str = "codex-rust-controller.1";
-pub const ARTIFACT_VERSION: &str = "2";
+pub const ARTIFACT_VERSION: &str = "3";
 pub const MODULE_ID: &str = "codex";
 const MAX_FRAME_BYTES: usize = 1_048_576;
 const MAX_HISTORY_PAGES: usize = 100;
@@ -135,6 +134,10 @@ struct OperationRecord {
     state: String,
     #[serde(default)]
     input_sha256: Option<String>,
+    #[serde(default)]
+    native_request_failure_code: Option<String>,
+    #[serde(default)]
+    native_rpc_error_code: Option<i64>,
     native_root_id: Option<String>,
     native_scope_key: Option<String>,
     requested_model_provider: Option<String>,
@@ -158,6 +161,8 @@ impl OperationRecord {
             kind: kind.into(),
             state: "native_effect_may_have_started".into(),
             input_sha256: None,
+            native_request_failure_code: None,
+            native_rpc_error_code: None,
             native_root_id: None,
             native_scope_key: None,
             requested_model_provider: None,
@@ -181,6 +186,8 @@ impl OperationRecord {
             kind,
             state: "terminal_acknowledged_compacted".into(),
             input_sha256: Some(input_sha256),
+            native_request_failure_code: None,
+            native_rpc_error_code: None,
             native_root_id: None,
             native_scope_key: None,
             requested_model_provider: None,
@@ -592,13 +599,15 @@ impl Journal {
         drop(file);
         if path.exists() || fs::rename(&temporary, &path).is_err() {
             let _ = fs::remove_file(&temporary);
-            if let Some(existing) = self.read_operation_tombstone(operation_id)? {
-                if existing.method == record.method
-                    && existing.kind == record.kind
-                    && existing.outcome == tombstone.outcome
-                {
-                    return Ok(());
-                }
+            if self
+                .read_operation_tombstone(operation_id)?
+                .is_some_and(|existing| {
+                    existing.method == record.method
+                        && existing.kind == record.kind
+                        && existing.outcome == tombstone.outcome
+                })
+            {
+                return Ok(());
             }
             return Err(AdapterError::Checkpoint);
         }
@@ -917,10 +926,118 @@ fn read_bounded_file(path: &Path, maximum_bytes: u64) -> Result<Vec<u8>, Adapter
 #[derive(Debug)]
 enum NativeError {
     Attach,
+    EndpointInvalid,
+    CredentialUnavailable,
+    IdentityUnverified,
+    HttpRejected(u16),
     Transport,
     Protocol,
-    Rejected,
+    Rejected { rpc_code: Option<i64> },
     UnsupportedServerRequest,
+}
+
+impl NativeError {
+    fn diagnostic_code(&self) -> &'static str {
+        match self {
+            Self::Attach => "NATIVE_ATTACH_UNAVAILABLE",
+            Self::EndpointInvalid => "NATIVE_ENDPOINT_INVALID",
+            Self::CredentialUnavailable => "NATIVE_AUTH_CREDENTIAL_UNAVAILABLE",
+            Self::IdentityUnverified => "NATIVE_SERVER_IDENTITY_UNVERIFIED",
+            Self::HttpRejected(401 | 403) => "NATIVE_AUTH_OR_ACCESS_UNAVAILABLE",
+            Self::HttpRejected(429) => "NATIVE_UPSTREAM_LIMITED",
+            Self::HttpRejected(404) => "NATIVE_ENDPOINT_UNAVAILABLE",
+            Self::HttpRejected(_) => "NATIVE_WEBSOCKET_HANDSHAKE_REJECTED",
+            Self::Transport => "NATIVE_TRANSPORT_UNAVAILABLE",
+            Self::Protocol => "NATIVE_PROTOCOL_INVALID",
+            Self::Rejected {
+                rpc_code: Some(-32602),
+            } => "NATIVE_RPC_INVALID_PARAMS",
+            Self::Rejected { .. } => "NATIVE_RPC_REQUEST_REJECTED",
+            Self::UnsupportedServerRequest => "NATIVE_SERVER_REQUEST_UNSUPPORTED",
+        }
+    }
+
+    fn rpc_code(&self) -> Option<i64> {
+        match self {
+            Self::Rejected { rpc_code } => *rpc_code,
+            _ => None,
+        }
+    }
+
+    fn http_status(&self) -> Option<u16> {
+        match self {
+            Self::HttpRejected(status) => Some(*status),
+            _ => None,
+        }
+    }
+}
+
+fn turn_error_diagnostic(turn: &Value) -> &'static str {
+    let info = &turn["error"]["codexErrorInfo"];
+    if let Some(code) = info.as_str() {
+        return match code {
+            "unauthorized" => "NATIVE_AUTH_UNAVAILABLE",
+            "usageLimitExceeded" => "NATIVE_USAGE_LIMIT_EXCEEDED",
+            "rateLimitExceeded" => "NATIVE_RATE_LIMIT_EXCEEDED",
+            "serverOverloaded" => "NATIVE_PROVIDER_OVERLOADED",
+            "badRequest" => "NATIVE_PROVIDER_REQUEST_REJECTED",
+            "internalServerError" => "NATIVE_PROVIDER_FAILED",
+            "contextWindowExceeded" => "NATIVE_CONTEXT_LIMIT_EXCEEDED",
+            "sessionBudgetExceeded" => "NATIVE_SESSION_BUDGET_EXCEEDED",
+            "flexUnavailable" => "NATIVE_PROVIDER_CAPACITY_UNAVAILABLE",
+            _ => "NATIVE_TURN_FAILED",
+        };
+    }
+    let Some(object) = info.as_object() else {
+        return "NATIVE_TURN_FAILED";
+    };
+    for key in [
+        "httpConnectionFailed",
+        "responseStreamConnectionFailed",
+        "responseStreamDisconnected",
+        "responseTooManyFailedAttempts",
+        "activeTurnNotSteerable",
+    ] {
+        if let Some(status) = object
+            .get(key)
+            .and_then(|value| value.get("httpStatusCode"))
+            .and_then(Value::as_u64)
+        {
+            return match status {
+                401 | 403 => "NATIVE_AUTH_OR_ACCESS_UNAVAILABLE",
+                404 => "NATIVE_UPSTREAM_ENDPOINT_UNAVAILABLE",
+                429 => "NATIVE_RATE_LIMIT_EXCEEDED",
+                500..=599 => "NATIVE_PROVIDER_UNAVAILABLE",
+                _ => "NATIVE_PROVIDER_REQUEST_FAILED",
+            };
+        }
+        if object.contains_key(key) {
+            return match key {
+                "activeTurnNotSteerable" => "NATIVE_TURN_NOT_STEERABLE",
+                "responseStreamDisconnected" => "NATIVE_PROVIDER_STREAM_INTERRUPTED",
+                "responseTooManyFailedAttempts" => "NATIVE_PROVIDER_RETRIES_EXHAUSTED",
+                _ => "NATIVE_PROVIDER_CONNECTION_FAILED",
+            };
+        }
+    }
+    "NATIVE_TURN_FAILED"
+}
+
+fn turn_error_http_status(turn: &Value) -> Option<u64> {
+    let info = &turn["error"]["codexErrorInfo"];
+    [
+        "httpConnectionFailed",
+        "responseStreamConnectionFailed",
+        "responseStreamDisconnected",
+        "responseTooManyFailedAttempts",
+    ]
+    .into_iter()
+    .filter_map(|key| {
+        info.get(key)
+            .and_then(|value| value.get("httpStatusCode"))
+            .and_then(Value::as_u64)
+    })
+    .find(|status| (100..=599).contains(status))
 }
 
 struct NativeClient {
@@ -931,13 +1048,20 @@ struct NativeClient {
 }
 
 impl NativeClient {
-    async fn attach(endpoint: &str, bearer: Option<&str>) -> Result<Self, NativeError> {
-        let parsed = Url::parse(endpoint).map_err(|_| NativeError::Attach)?;
+    async fn attach(
+        endpoint: &str,
+        bearer: Option<&str>,
+        credential_unavailable: bool,
+    ) -> Result<Self, NativeError> {
+        if credential_unavailable {
+            return Err(NativeError::CredentialUnavailable);
+        }
+        let parsed = Url::parse(endpoint).map_err(|_| NativeError::EndpointInvalid)?;
         if !matches!(parsed.scheme(), "ws" | "wss") || parsed.host_str().is_none() {
-            return Err(NativeError::Attach);
+            return Err(NativeError::EndpointInvalid);
         }
         if !parsed.username().is_empty() || parsed.password().is_some() {
-            return Err(NativeError::Attach);
+            return Err(NativeError::EndpointInvalid);
         }
         let mut safe = parsed.clone();
         let _ = safe.set_username("");
@@ -947,25 +1071,29 @@ impl NativeClient {
         let endpoint_identity = digest_hex(safe.as_str().as_bytes());
         let mut request = endpoint
             .into_client_request()
-            .map_err(|_| NativeError::Attach)?;
+            .map_err(|_| NativeError::EndpointInvalid)?;
         if let Some(token) = bearer {
             let value = format!("Bearer {token}")
                 .parse()
                 .map_err(|_| NativeError::Attach)?;
             request.headers_mut().insert(AUTHORIZATION, value);
         }
-        let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
-            max_message_size: Some(MAX_FRAME_BYTES),
-            max_frame_size: Some(MAX_FRAME_BYTES),
-            ..Default::default()
-        };
-        let (socket, _) = timeout(
+        let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+            .max_message_size(Some(MAX_FRAME_BYTES))
+            .max_frame_size(Some(MAX_FRAME_BYTES));
+        let connection = timeout(
             CONNECT_TIMEOUT,
             connect_async_with_config(request, Some(config), false),
         )
         .await
         .map_err(|_| NativeError::Attach)?
-        .map_err(|_| NativeError::Attach)?;
+        .map_err(|error| match error {
+            tokio_tungstenite::tungstenite::Error::Http(response) => {
+                NativeError::HttpRejected(response.status().as_u16())
+            }
+            _ => NativeError::Attach,
+        })?;
+        let (socket, _) = connection;
         let mut client = Self {
             socket,
             endpoint_identity,
@@ -1083,8 +1211,9 @@ impl NativeClient {
                 serde_json::from_str(text.as_str()).map_err(|_| NativeError::Protocol)?;
             if packet.get("id").and_then(Value::as_str) == Some(request_id) {
                 if let Some(error) = packet.get("error") {
-                    let _ = error;
-                    return Err(NativeError::Rejected);
+                    return Err(NativeError::Rejected {
+                        rpc_code: error.get("code").and_then(Value::as_i64),
+                    });
                 }
                 return packet.get("result").cloned().ok_or(NativeError::Protocol);
             }
@@ -1153,7 +1282,14 @@ struct HistoryMatch {
 enum HistoryRead {
     Complete(Vec<HistoryMatch>),
     Truncated,
-    Failed,
+    Failed(NativeError),
+}
+
+enum TurnRead {
+    Found(Value),
+    Missing,
+    Truncated,
+    Failed(NativeError),
 }
 
 impl NativeClient {
@@ -1180,10 +1316,10 @@ impl NativeClient {
             }
             let response = match self.request("thread/items/list", params).await {
                 Ok(response) => response,
-                Err(_) => return HistoryRead::Failed,
+                Err(error) => return HistoryRead::Failed(error),
             };
             let Some(data) = response.get("data").and_then(Value::as_array) else {
-                return HistoryRead::Failed;
+                return HistoryRead::Failed(NativeError::Protocol);
             };
             for entry in data {
                 let item = &entry["item"];
@@ -1191,21 +1327,21 @@ impl NativeClient {
                     continue;
                 }
                 let Some(item_id) = item["id"].as_str().filter(|s| !s.is_empty()) else {
-                    return HistoryRead::Failed;
+                    return HistoryRead::Failed(NativeError::Protocol);
                 };
                 let Some(turn_id) = entry["turnId"].as_str().filter(|s| !s.is_empty()) else {
-                    return HistoryRead::Failed;
+                    return HistoryRead::Failed(NativeError::Protocol);
                 };
                 let Some(parts) = item["content"].as_array() else {
-                    return HistoryRead::Failed;
+                    return HistoryRead::Failed(NativeError::Protocol);
                 };
                 let mut text = String::new();
                 for part in parts {
                     if part["type"] != "text" {
-                        return HistoryRead::Failed;
+                        return HistoryRead::Failed(NativeError::Protocol);
                     }
                     let Some(part_text) = part["text"].as_str() else {
-                        return HistoryRead::Failed;
+                        return HistoryRead::Failed(NativeError::Protocol);
                     };
                     text.push_str(part_text);
                 }
@@ -1224,10 +1360,65 @@ impl NativeClient {
                     return HistoryRead::Truncated;
                 }
                 Some(Value::String(next)) => cursor = Some(next.clone()),
-                Some(_) => return HistoryRead::Failed,
+                Some(_) => return HistoryRead::Failed(NativeError::Protocol),
             }
         }
         HistoryRead::Truncated
+    }
+
+    async fn read_turn(&mut self, thread_id: &str, turn_id: &str) -> TurnRead {
+        let mut cursor: Option<String> = None;
+        let mut seen = HashSet::new();
+        let mut found = None;
+        for _ in 0..MAX_HISTORY_PAGES {
+            let mut params = json!({
+                "threadId":thread_id,
+                "limit":PAGE_SIZE,
+                "sortDirection":"desc",
+            });
+            if let Some(value) = cursor.as_ref() {
+                params["cursor"] = json!(value);
+            }
+            let response = match self.request("thread/turns/list", params).await {
+                Ok(response) => response,
+                Err(error) => return TurnRead::Failed(error),
+            };
+            let Some(data) = response.get("data").and_then(Value::as_array) else {
+                return TurnRead::Failed(NativeError::Protocol);
+            };
+            for turn in data {
+                let Some(id) = turn
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                else {
+                    return TurnRead::Failed(NativeError::Protocol);
+                };
+                if turn.get("status").and_then(Value::as_str).is_none() {
+                    return TurnRead::Failed(NativeError::Protocol);
+                }
+                if id == turn_id {
+                    if found.is_some() {
+                        return TurnRead::Failed(NativeError::Protocol);
+                    }
+                    found = Some(turn.clone());
+                }
+            }
+            match response.get("nextCursor") {
+                None | Some(Value::Null) => {
+                    return found.map_or(TurnRead::Missing, TurnRead::Found);
+                }
+                Some(Value::String(next)) if next.is_empty() => {
+                    return found.map_or(TurnRead::Missing, TurnRead::Found);
+                }
+                Some(Value::String(next)) if !seen.insert(next.clone()) => {
+                    return TurnRead::Truncated;
+                }
+                Some(Value::String(next)) => cursor = Some(next.clone()),
+                Some(_) => return TurnRead::Failed(NativeError::Protocol),
+            }
+        }
+        TurnRead::Truncated
     }
 
     async fn active_turns(
@@ -1491,9 +1682,17 @@ fn unknown_send(
         "diagnostic_code": code,
         "native_replay": false,
         "native_input_readback": "unverified",
+        "native_request_failure_code": record.native_request_failure_code,
+        "native_rpc_error_code": record.native_rpc_error_code,
         "client_user_message_id": record.client_user_message_id,
         "prompt_sha256": record.prompt_sha256,
         "prompt_bytes": record.prompt_bytes,
+        "requested_model_provider": record.requested_model_provider,
+        "requested_model": record.requested_model,
+        "served_model": null,
+        "served_model_status": "unknown",
+        "billing_status": "unknown",
+        "fallback_used": false,
     });
     details["completion_condition"] = Value::Null;
     outcome(
@@ -1505,6 +1704,18 @@ fn unknown_send(
         None,
         details,
     )
+}
+
+fn unknown_send_after_exact_input(
+    record: &OperationRecord,
+    operation_id: &str,
+    code: &'static str,
+    turn_readback: &'static str,
+) -> RuntimeOutcome {
+    let mut unresolved = unknown_send(record, operation_id, code);
+    unresolved.details["native_input_readback"] = json!("verified");
+    unresolved.details["native_turn_readback"] = json!(turn_readback);
+    unresolved
 }
 
 async fn reconcile_send(
@@ -1525,8 +1736,10 @@ async fn reconcile_send(
         HistoryRead::Truncated => {
             return unknown_send(record, operation_id, "NATIVE_HISTORY_PAGE_LIMIT");
         }
-        HistoryRead::Failed => {
-            return unknown_send(record, operation_id, "NATIVE_HISTORY_READ_FAILED");
+        HistoryRead::Failed(error) => {
+            let mut unresolved = unknown_send(record, operation_id, error.diagnostic_code());
+            with_native_failure_details(&mut unresolved.details, &error, "history_readback");
+            return unresolved;
         }
     };
     if matches.is_empty() {
@@ -1551,14 +1764,83 @@ async fn reconcile_send(
             "NATIVE_ITEM_CONTENT_OR_IDENTITY_MISMATCH",
         );
     }
+    let turn = match native.read_turn(root, &matched.turn_id).await {
+        TurnRead::Found(turn) => turn,
+        TurnRead::Missing => {
+            return unknown_send_after_exact_input(
+                record,
+                operation_id,
+                "NATIVE_TURN_NOT_OBSERVED",
+                "not_observed",
+            );
+        }
+        TurnRead::Truncated => {
+            return unknown_send_after_exact_input(
+                record,
+                operation_id,
+                "NATIVE_TURN_PAGE_LIMIT",
+                "truncated",
+            );
+        }
+        TurnRead::Failed(error) => {
+            let mut unresolved = unknown_send_after_exact_input(
+                record,
+                operation_id,
+                error.diagnostic_code(),
+                "failed",
+            );
+            with_native_failure_details(&mut unresolved.details, &error, "turn_readback");
+            return unresolved;
+        }
+    };
+    if turn.get("id").and_then(Value::as_str) != Some(matched.turn_id.as_str()) {
+        return unknown_send_after_exact_input(
+            record,
+            operation_id,
+            "NATIVE_TURN_IDENTITY_MISMATCH",
+            "mismatch",
+        );
+    }
+    let Some(turn_status) = turn.get("status").and_then(Value::as_str) else {
+        return unknown_send_after_exact_input(
+            record,
+            operation_id,
+            "NATIVE_TURN_STATUS_UNAVAILABLE",
+            "invalid",
+        );
+    };
+    let status_is_completed = turn_status == "completed";
+    let status_is_in_progress = turn_status == "inProgress";
+    let status_is_failed = matches!(turn_status, "failed" | "interrupted");
+    if !status_is_completed && !status_is_in_progress && !status_is_failed {
+        return unknown_send_after_exact_input(
+            record,
+            operation_id,
+            "NATIVE_TURN_STATUS_UNRECOGNIZED",
+            "invalid",
+        );
+    }
+    if !status_is_failed && turn.get("error").is_some_and(|error| !error.is_null()) {
+        return unknown_send_after_exact_input(
+            record,
+            operation_id,
+            "NATIVE_TURN_STATUS_CONTRADICTORY",
+            "contradictory",
+        );
+    }
     let mut details = json!({
         "module_artifact_id": ARTIFACT_ID,
-        "completion_condition": "native_input_admitted",
+        "completion_condition": if status_is_completed { "native_turn_completed" } else { "native_input_admitted" },
         "native_input_readback": "verified",
+        "native_turn_readback": "verified",
+        "native_turn_status": turn_status,
+        "execution_complete": status_is_completed || status_is_failed,
         "client_user_message_id": client_id,
         "prompt_sha256": expected_digest,
         "prompt_bytes": expected_bytes,
         "native_replay": false,
+        "native_request_failure_code": record.native_request_failure_code,
+        "native_rpc_error_code": record.native_rpc_error_code,
         "requested_model_provider": record.requested_model_provider.as_deref(),
         "requested_model": record.requested_model.as_deref(),
         "effective_model_provider": record.requested_model_provider.as_deref(),
@@ -1569,9 +1851,34 @@ async fn reconcile_send(
         "billing_status": "unknown",
         "fallback_used": false,
     });
+    if status_is_failed {
+        let failure_code = turn_error_diagnostic(&turn);
+        details["diagnostic_code"] = json!(failure_code);
+        if let Some(status) = turn_error_http_status(&turn) {
+            details["native_provider_http_status"] = json!(status);
+        }
+        details["native_turn_failure_class"] = json!(if turn_status == "interrupted" {
+            "interrupted"
+        } else {
+            "failed"
+        });
+        return outcome(
+            operation_id,
+            EffectOutcome::Unknown,
+            Some(root),
+            record.native_scope_key.as_deref(),
+            Some(&matched.turn_id),
+            Some(&matched.item_id),
+            details,
+        );
+    }
     outcome(
         operation_id,
-        EffectOutcome::Applied,
+        if status_is_completed {
+            EffectOutcome::Applied
+        } else {
+            EffectOutcome::Accepted
+        },
         Some(root),
         record.native_scope_key.as_deref(),
         Some(&matched.turn_id),
@@ -1592,8 +1899,14 @@ async fn reconcile_open(
         record.requested_model.as_deref(),
         record.workspace_root.as_deref(),
     ) else {
-        let mut details =
-            json!({"diagnostic_code":"THREAD_START_OUTCOME_UNKNOWN","native_replay":false});
+        let mut details = json!({
+            "diagnostic_code": record.native_request_failure_code.as_deref().unwrap_or("THREAD_START_OUTCOME_UNKNOWN"),
+            "native_failure_code": record.native_request_failure_code,
+            "native_rpc_error_code": record.native_rpc_error_code,
+            "requested_model_provider": record.requested_model_provider.as_deref(),
+            "requested_model": record.requested_model.as_deref(),
+            "native_replay":false
+        });
         details["completion_condition"] = Value::Null;
         return outcome(
             operation_id,
@@ -1618,7 +1931,14 @@ async fn reconcile_open(
     }
     let thread = match native.read_thread(root).await {
         Ok(response) => response["thread"].clone(),
-        Err(_) => {
+        Err(error) => {
+            let mut details = json!({
+                "diagnostic_code": error.diagnostic_code(),
+                "native_replay": false,
+                "requested_model_provider": provider,
+                "requested_model": model,
+            });
+            with_native_failure_details(&mut details, &error, "thread_read_reconciliation");
             return outcome(
                 operation_id,
                 EffectOutcome::Unknown,
@@ -1626,7 +1946,7 @@ async fn reconcile_open(
                 Some(scope),
                 None,
                 None,
-                json!({"diagnostic_code":"THREAD_READ_FAILED","native_replay":false}),
+                details,
             );
         }
     };
@@ -1683,7 +2003,49 @@ async fn reconcile_open(
 fn rejected(command: &RuntimeCommand, code: &'static str, state: &Checkpoint) -> RuntimeOutcome {
     let mut details = base_details(state);
     details["diagnostic_code"] = json!(code);
+    details["pre_input_failure"] = json!(true);
     details["native_replay"] = json!(false);
+    outcome(
+        &command.operation_id,
+        EffectOutcome::Rejected,
+        state.native_root_id.as_deref(),
+        state.native_scope_key.as_deref(),
+        None,
+        None,
+        details,
+    )
+}
+
+fn with_native_failure_details(details: &mut Value, error: &NativeError, stage: &str) {
+    details["native_failure_stage"] = json!(stage);
+    details["native_failure_code"] = json!(error.diagnostic_code());
+    if let Some(status) = error.http_status() {
+        details["native_http_status"] = json!(status);
+    }
+    if let Some(code) = error.rpc_code() {
+        details["native_rpc_error_code"] = json!(code);
+    }
+}
+
+fn rejected_before_input(
+    command: &RuntimeCommand,
+    state: &Checkpoint,
+    error: &NativeError,
+    stage: &str,
+    requested_provider: Option<&str>,
+    requested_model: Option<&str>,
+) -> RuntimeOutcome {
+    let mut details = base_details(state);
+    if let Some(provider) = requested_provider {
+        details["requested_model_provider"] = json!(provider);
+    }
+    if let Some(model) = requested_model {
+        details["requested_model"] = json!(model);
+    }
+    details["diagnostic_code"] = json!(error.diagnostic_code());
+    details["pre_input_failure"] = json!(true);
+    details["native_replay"] = json!(false);
+    with_native_failure_details(&mut details, error, stage);
     outcome(
         &command.operation_id,
         EffectOutcome::Rejected,
@@ -1700,6 +2062,7 @@ async fn open_operation(
     journal: &mut Journal,
     endpoint: &str,
     token: Option<&str>,
+    credential_unavailable: bool,
 ) -> RuntimeOutcome {
     if command.native_root_id.is_some() {
         return rejected(command, "OPEN_ROOT_ALREADY_ASSIGNED", &journal.state);
@@ -1719,7 +2082,17 @@ async fn open_operation(
             });
         }
         let mut details = base_details(&journal.state);
-        details["diagnostic_code"] = json!("THREAD_START_OUTCOME_UNKNOWN");
+        details["diagnostic_code"] = json!(
+            previous
+                .native_request_failure_code
+                .as_deref()
+                .unwrap_or("THREAD_START_OUTCOME_UNKNOWN")
+        );
+        details["native_request_failure_code"] =
+            json!(previous.native_request_failure_code.as_deref());
+        details["native_rpc_error_code"] = json!(previous.native_rpc_error_code);
+        details["requested_model_provider"] = json!(previous.requested_model_provider.as_deref());
+        details["requested_model"] = json!(previous.requested_model.as_deref());
         details["native_replay"] = json!(false);
         return outcome(
             &command.operation_id,
@@ -1738,12 +2111,28 @@ async fn open_operation(
         Ok(route) => route,
         Err(code) => return rejected(command, code, &journal.state),
     };
-    let mut native = match NativeClient::attach(endpoint, token).await {
+    let mut native = match NativeClient::attach(endpoint, token, credential_unavailable).await {
         Ok(native) => native,
-        Err(_) => return rejected(command, "NATIVE_ATTACH_FAILED", &journal.state),
+        Err(error) => {
+            return rejected_before_input(
+                command,
+                &journal.state,
+                &error,
+                "app_server_attach",
+                Some(&provider),
+                Some(&model),
+            );
+        }
     };
     if !native.identity_is_known() {
-        return rejected(command, "NATIVE_SERVER_IDENTITY_UNVERIFIED", &journal.state);
+        return rejected_before_input(
+            command,
+            &journal.state,
+            &NativeError::IdentityUnverified,
+            "server_identity",
+            Some(&provider),
+            Some(&model),
+        );
     }
     let scope = native.scope_key();
     let mut record = OperationRecord::intent("agent.open", "open");
@@ -1777,19 +2166,34 @@ async fn open_operation(
             json!({"cwd":workspace,"modelProvider":provider,"model":model}),
         )
         .await;
-    let Ok(response) = response else {
-        let mut details = base_details(&journal.state);
-        details["diagnostic_code"] = json!("THREAD_START_OUTCOME_UNKNOWN");
-        details["native_replay"] = json!(false);
-        return outcome(
-            &command.operation_id,
-            EffectOutcome::Unknown,
-            None,
-            Some(&scope),
-            None,
-            None,
-            details,
-        );
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => {
+            if let Some(record) = journal.state.operations.get_mut(&command.operation_id) {
+                record.native_request_failure_code = Some(error.diagnostic_code().to_owned());
+                record.native_rpc_error_code = error.rpc_code();
+            }
+            let saved = journal.save().is_ok();
+            let mut details = base_details(&journal.state);
+            details["diagnostic_code"] = json!(if saved {
+                "THREAD_START_OUTCOME_UNKNOWN"
+            } else {
+                "CHECKPOINT_WRITE_FAILED"
+            });
+            details["native_replay"] = json!(false);
+            with_native_failure_details(&mut details, &error, "thread_start_after_effect_marker");
+            details["requested_model_provider"] = json!(provider);
+            details["requested_model"] = json!(model);
+            return outcome(
+                &command.operation_id,
+                EffectOutcome::Unknown,
+                None,
+                Some(&scope),
+                None,
+                None,
+                details,
+            );
+        }
     };
     let thread = &response["thread"];
     let thread_id = thread["id"].as_str().filter(|s| !s.is_empty());
@@ -1857,7 +2261,7 @@ async fn open_operation(
         return result;
     }
     details["completion_condition"] = json!("native_thread_opened");
-    let result = outcome(
+    outcome(
         &command.operation_id,
         EffectOutcome::Applied,
         Some(thread_id),
@@ -1865,8 +2269,7 @@ async fn open_operation(
         None,
         None,
         details,
-    );
-    result
+    )
 }
 
 async fn send_operation(
@@ -1874,6 +2277,7 @@ async fn send_operation(
     journal: &mut Journal,
     endpoint: &str,
     token: Option<&str>,
+    credential_unavailable: bool,
 ) -> RuntimeOutcome {
     if let Some(previous) = journal.state.operations.get(&command.operation_id) {
         if let Some(result) = &previous.outcome {
@@ -1888,8 +2292,18 @@ async fn send_operation(
                 "NATIVE_OPERATION_CONTEXT_CHANGED",
             );
         }
-        let Ok(mut native) = NativeClient::attach(endpoint, token).await else {
-            return unknown_send(previous, &command.operation_id, "NATIVE_CLIENT_UNAVAILABLE");
+        let mut native = match NativeClient::attach(endpoint, token, credential_unavailable).await {
+            Ok(native) => native,
+            Err(error) => {
+                let mut unresolved =
+                    unknown_send(previous, &command.operation_id, error.diagnostic_code());
+                with_native_failure_details(
+                    &mut unresolved.details,
+                    &error,
+                    "send_reconciliation_attach",
+                );
+                return unresolved;
+            }
         };
         if journal.state.native_scope_key.as_deref() != Some(native.scope_key().as_str()) {
             return unknown_send(previous, &command.operation_id, "NATIVE_SCOPE_CHANGED");
@@ -1935,10 +2349,29 @@ async fn send_operation(
     } else {
         None
     };
-    let mut native = match NativeClient::attach(endpoint, token).await {
+    let mut native = match NativeClient::attach(endpoint, token, credential_unavailable).await {
         Ok(native) => native,
-        Err(_) => return rejected(command, "NATIVE_ATTACH_FAILED", &journal.state),
+        Err(error) => {
+            return rejected_before_input(
+                command,
+                &journal.state,
+                &error,
+                "app_server_attach",
+                Some(&provider),
+                Some(&model),
+            );
+        }
     };
+    if !native.identity_is_known() {
+        return rejected_before_input(
+            command,
+            &journal.state,
+            &NativeError::IdentityUnverified,
+            "server_identity",
+            Some(&provider),
+            Some(&model),
+        );
+    }
     let scope = native.scope_key();
     if journal.state.native_scope_key.as_deref() != Some(scope.as_str())
         || !native.identity_is_known()
@@ -1947,7 +2380,16 @@ async fn send_operation(
     }
     let thread = match native.read_thread(&root).await {
         Ok(value) => value["thread"].clone(),
-        Err(_) => return rejected(command, "THREAD_READ_FAILED", &journal.state),
+        Err(error) => {
+            return rejected_before_input(
+                command,
+                &journal.state,
+                &error,
+                "thread_read_preflight",
+                Some(&provider),
+                Some(&model),
+            );
+        }
     };
     if thread["id"].as_str() != Some(root.as_str())
         || thread["modelProvider"].as_str() != Some(provider.as_str())
@@ -1959,7 +2401,16 @@ async fn send_operation(
     if steer {
         let (active, limited) = match native.active_turns(&root).await {
             Ok(result) => result,
-            Err(_) => return rejected(command, "ACTIVE_TURN_READ_FAILED", &journal.state),
+            Err(error) => {
+                return rejected_before_input(
+                    command,
+                    &journal.state,
+                    &error,
+                    "active_turns_preflight",
+                    Some(&provider),
+                    Some(&model),
+                );
+            }
         };
         if limited || active.len() != 1 || Some(active[0].0.as_str()) != expected_turn.as_deref() {
             return rejected(command, "EXPECTED_TURN_NOT_ACTIVE", &journal.state);
@@ -2032,29 +2483,36 @@ async fn send_operation(
                 )
             })
     };
-    if let Ok((Some(turn_id), turn_status)) = request {
-        if let Some(record) = journal.state.operations.get_mut(&command.operation_id) {
-            record.returned_turn_id = Some(turn_id);
-            record.returned_turn_status = turn_status;
+    match request {
+        Ok((Some(turn_id), turn_status)) => {
+            if let Some(record) = journal.state.operations.get_mut(&command.operation_id) {
+                record.returned_turn_id = Some(turn_id);
+                record.returned_turn_status = turn_status;
+            }
+            if journal.save().is_err() {
+                let record = journal
+                    .state
+                    .operations
+                    .get(&command.operation_id)
+                    .expect("saved send marker remains");
+                return unknown_send(record, &command.operation_id, "CHECKPOINT_WRITE_FAILED");
+            }
         }
-        if journal.save().is_err() {
-            let record = journal
-                .state
-                .operations
-                .get(&command.operation_id)
-                .expect("saved send marker remains");
-            return unknown_send(record, &command.operation_id, "CHECKPOINT_WRITE_FAILED");
+        Ok((None, _)) => {}
+        Err(error) => {
+            if let Some(record) = journal.state.operations.get_mut(&command.operation_id) {
+                record.native_request_failure_code = Some(error.diagnostic_code().to_owned());
+                record.native_rpc_error_code = error.rpc_code();
+            }
+            let _ = journal.save();
         }
     }
-    let result = {
-        let record = journal
-            .state
-            .operations
-            .get(&command.operation_id)
-            .expect("send marker persisted");
-        reconcile_send(&mut native, record, &command.operation_id).await
-    };
-    result
+    let record = journal
+        .state
+        .operations
+        .get(&command.operation_id)
+        .expect("send marker persisted");
+    reconcile_send(&mut native, record, &command.operation_id).await
 }
 
 async fn reconcile_operation(
@@ -2064,6 +2522,7 @@ async fn reconcile_operation(
     claim: &ModuleContractClaim,
     endpoint: &str,
     token: Option<&str>,
+    credential_unavailable: bool,
 ) -> Result<Vec<RuntimeOutcome>, AdapterError> {
     let Some(input_sha256) = command
         .input_sha256
@@ -2165,9 +2624,24 @@ async fn reconcile_operation(
     if target.kind == "send" && !prior_resolved {
         let mut reconciled = None;
         if target_context_matches {
-            if let Ok(mut native) = NativeClient::attach(endpoint, token).await {
-                if journal.state.native_scope_key.as_deref() == Some(native.scope_key().as_str()) {
+            match NativeClient::attach(endpoint, token, credential_unavailable).await {
+                Ok(mut native)
+                    if journal.state.native_scope_key.as_deref()
+                        == Some(native.scope_key().as_str()) =>
+                {
                     reconciled = Some(reconcile_send(&mut native, &target, target_id).await);
+                }
+                Ok(_) => {
+                    reconciled = Some(unknown_send(&target, target_id, "NATIVE_SCOPE_CHANGED"));
+                }
+                Err(error) => {
+                    let mut unresolved = unknown_send(&target, target_id, error.diagnostic_code());
+                    with_native_failure_details(
+                        &mut unresolved.details,
+                        &error,
+                        "send_reconciliation_attach",
+                    );
+                    reconciled = Some(unresolved);
                 }
             }
         }
@@ -2204,21 +2678,32 @@ async fn reconcile_operation(
     }
     if target.kind == "open" && !prior_resolved {
         if target.native_root_id.is_some() && target_context_matches {
-            let mut result = None;
-            if let Ok(mut native) = NativeClient::attach(endpoint, token).await {
-                result = Some(reconcile_open(&mut native, &target, target_id).await);
-            }
-            let mut value = result.unwrap_or_else(|| {
-                outcome(
-                    target_id,
-                    EffectOutcome::Unknown,
-                    target.native_root_id.as_deref(),
-                    target.native_scope_key.as_deref(),
-                    None,
-                    None,
-                    json!({"diagnostic_code":"NATIVE_CLIENT_UNAVAILABLE","native_replay":false}),
-                )
-            });
+            let mut value =
+                match NativeClient::attach(endpoint, token, credential_unavailable).await {
+                    Ok(mut native) => reconcile_open(&mut native, &target, target_id).await,
+                    Err(error) => {
+                        let mut details = json!({
+                            "diagnostic_code": error.diagnostic_code(),
+                            "native_replay": false,
+                            "requested_model_provider": target.requested_model_provider,
+                            "requested_model": target.requested_model,
+                        });
+                        with_native_failure_details(
+                            &mut details,
+                            &error,
+                            "thread_reconciliation_attach",
+                        );
+                        outcome(
+                            target_id,
+                            EffectOutcome::Unknown,
+                            target.native_root_id.as_deref(),
+                            target.native_scope_key.as_deref(),
+                            None,
+                            None,
+                            details,
+                        )
+                    }
+                };
             value.details["reconcile_operation_id"] = json!(command.operation_id.as_str());
             disposition = if matches!(value.outcome, EffectOutcome::Applied) {
                 String::from("native_thread_readback_verified")
@@ -2247,7 +2732,11 @@ async fn reconcile_operation(
                 None,
                 None,
                 json!({
-                    "diagnostic_code": if target_context_matches { "THREAD_START_OUTCOME_UNKNOWN" } else { "NATIVE_OPERATION_CONTEXT_CHANGED" },
+                    "diagnostic_code": if !target_context_matches { "NATIVE_OPERATION_CONTEXT_CHANGED" } else { target.native_request_failure_code.as_deref().unwrap_or("THREAD_START_OUTCOME_UNKNOWN") },
+                    "native_request_failure_code": target.native_request_failure_code.as_deref(),
+                    "native_rpc_error_code": target.native_rpc_error_code,
+                    "requested_model_provider": target.requested_model_provider.as_deref(),
+                    "requested_model": target.requested_model.as_deref(),
                     "native_replay":false
                 }),
             );
@@ -2312,6 +2801,7 @@ async fn handle_command(
     claim: &ModuleContractClaim,
     endpoint: &str,
     token: Option<&str>,
+    credential_unavailable: bool,
 ) -> Result<Vec<RuntimeOutcome>, AdapterError> {
     let Some(input_sha256) = command
         .input_sha256
@@ -2374,12 +2864,16 @@ async fn handle_command(
         };
         match command.method.as_str() {
             "agent.open" => {
-                let mut result = open_operation(&command, journal, endpoint, token).await;
+                let mut result =
+                    open_operation(&command, journal, endpoint, token, credential_unavailable)
+                        .await;
                 attach_command_receipt(&mut result, &command, claim)?;
                 vec![result]
             }
             "task.dispatch" | "agent.send" => {
-                let mut result = send_operation(&command, journal, endpoint, token).await;
+                let mut result =
+                    send_operation(&command, journal, endpoint, token, credential_unavailable)
+                        .await;
                 attach_command_receipt(&mut result, &command, claim)?;
                 vec![result]
             }
@@ -2391,6 +2885,7 @@ async fn handle_command(
                     claim,
                     endpoint,
                     token,
+                    credential_unavailable,
                 )
                 .await?
             }
@@ -2459,27 +2954,23 @@ pub async fn run(config: AdapterConfig) -> Result<(), AdapterError> {
     if !config.host_data_dir.is_absolute() {
         return Err(AdapterError::Configuration);
     }
-    let parsed_endpoint = Url::parse(&config.endpoint).map_err(|_| AdapterError::Configuration)?;
-    if !matches!(parsed_endpoint.scheme(), "ws" | "wss")
-        || parsed_endpoint.host_str().is_none()
-        || !parsed_endpoint.username().is_empty()
-        || parsed_endpoint.password().is_some()
-    {
-        return Err(AdapterError::Configuration);
-    }
     let context = module_contract::load_runtime_context()?;
     let mut journal = Journal::open(context.state_dir.clone(), context.worker.boot_id.clone())?;
     let ipc: IpcConfig =
         serde_json::from_value(config.ipc.clone()).map_err(|_| AdapterError::Configuration)?;
+    let mut credential_unavailable = false;
     let token = match config.token_env.as_deref() {
-        Some(name) if !name.trim().is_empty() => {
-            let value = env::var(name).map_err(|_| AdapterError::Configuration)?;
-            if value.trim().is_empty() {
-                return Err(AdapterError::Configuration);
+        Some(name) if !name.trim().is_empty() => match env::var(name) {
+            Ok(value) if !value.trim().is_empty() => Some(value),
+            _ => {
+                credential_unavailable = true;
+                None
             }
-            Some(value)
+        },
+        Some(_) => {
+            credential_unavailable = true;
+            None
         }
-        Some(_) => return Err(AdapterError::Configuration),
         None => None,
     };
     let endpoint = config.endpoint.clone();
@@ -2532,6 +3023,7 @@ pub async fn run(config: AdapterConfig) -> Result<(), AdapterError> {
                     &context.claim,
                     &endpoint,
                     token.as_deref(),
+                    credential_unavailable,
                 )
                 .await?;
                 for result in outcomes {

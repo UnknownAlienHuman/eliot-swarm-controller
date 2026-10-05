@@ -8,6 +8,7 @@ use futures_util::StreamExt;
 use reqwest::{Client, Method, Url, header};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::Digest;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
@@ -17,13 +18,14 @@ use std::{
     time::Duration,
 };
 use swarm_contracts::{
-    error::{Error, Result},
+    error::{Error, NativeHttpFailure, NativeHttpFailureKind, Result},
     module_contract::ModuleContractClaim,
     runtime::RuntimeCommand,
 };
 
 const MAX_NATIVE_BODY: usize = 4 * 1024 * 1024;
 const MAX_NATIVE_REQUEST: usize = 4 * 1024 * 1024;
+const MAX_NATIVE_ERROR_BODY: usize = 8 * 1024;
 const MAX_CONNECTION_FILE: usize = 64 * 1024;
 const MAX_LOG_BYTES: usize = 8 * 1024 * 1024;
 const MAX_LOG_EVENTS: usize = 8192;
@@ -227,7 +229,6 @@ impl NativeClient {
     pub async fn admit_input(
         &self,
         command: &RuntimeCommand,
-        options: &NativeOptions,
         root: &str,
         input_id: &str,
         prompt_text: &str,
@@ -424,9 +425,10 @@ impl NativeClient {
                 "native input-message response lacks data",
             )
         })?;
-        if message["sessionID"] != root
-            || !saved_message_matches(message, root, input, &intent.marker, intent)
-        {
+        // V2's PublicSessionMessage omits sessionID. The GET route is scoped
+        // to `root`; reject a sessionID only if the projection includes one
+        // and it disagrees with that route scope.
+        if !saved_message_matches(message, root, input, &intent.marker, intent) {
             return Err(Error::new(
                 "NATIVE_EVIDENCE_UNAVAILABLE",
                 "exact saved user input was not observed in its native session",
@@ -863,7 +865,9 @@ impl NativeClient {
             } else {
                 "NATIVE_READ_FAILED"
             };
-            return Err(Error::new(code, format!("HTTP {}", status.as_u16())));
+            let failure = read_native_http_failure(&mut response, status).await;
+            return Err(Error::new(code, format!("HTTP {}", status.as_u16()))
+                .with_native_http_failure(failure));
         }
         if response
             .content_length()
@@ -914,6 +918,48 @@ impl NativeClient {
 
     async fn post(&self, path: &str, body: Value) -> Result<Value> {
         self.request(Method::POST, path, &[], Some(&body)).await
+    }
+}
+
+async fn read_native_http_failure(
+    response: &mut reqwest::Response,
+    status: reqwest::StatusCode,
+) -> NativeHttpFailure {
+    let mut body = Vec::new();
+    let mut bounded = !response
+        .content_length()
+        .is_some_and(|length| length > MAX_NATIVE_ERROR_BODY as u64);
+    while bounded {
+        match response.chunk().await {
+            Ok(Some(chunk)) if body.len().saturating_add(chunk.len()) <= MAX_NATIVE_ERROR_BODY => {
+                body.extend_from_slice(&chunk);
+            }
+            Ok(Some(_)) | Err(_) => bounded = false,
+            Ok(None) => break,
+        }
+    }
+    NativeHttpFailure {
+        status: status.as_u16(),
+        kind: if bounded {
+            classify_native_http_failure(status, &body)
+        } else {
+            NativeHttpFailureKind::Unclassified
+        },
+    }
+}
+
+fn classify_native_http_failure(status: reqwest::StatusCode, body: &[u8]) -> NativeHttpFailureKind {
+    let tag = serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|value| value.get("_tag").and_then(Value::as_str).map(str::to_owned));
+    match (status.as_u16(), tag.as_deref()) {
+        (400, Some("InvalidRequestError")) => NativeHttpFailureKind::InvalidRequest,
+        (401, Some("UnauthorizedError")) => NativeHttpFailureKind::Unauthorized,
+        (404, Some("SessionNotFoundError")) => NativeHttpFailureKind::SessionNotFound,
+        (404, Some("MessageNotFoundError")) => NativeHttpFailureKind::MessageNotFound,
+        (409, Some("ConflictError")) => NativeHttpFailureKind::Conflict,
+        (500, Some("UnknownError")) => NativeHttpFailureKind::InternalServerError,
+        _ => NativeHttpFailureKind::Unclassified,
     }
 }
 
@@ -1247,7 +1293,7 @@ fn read_connection_record(path: &Path) -> Result<ConnectionRecord> {
             "connection record must be a bounded regular file",
         ));
     }
-    let mut file = File::open(path)
+    let file = File::open(path)
         .map_err(|_| Error::new("NATIVE_CONNECTION_FILE", "connection record cannot be read"))?;
     if !file
         .metadata()

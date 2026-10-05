@@ -139,15 +139,16 @@ pub(super) async fn run(store: Store, mut stopping: watch::Receiver<bool>) -> Re
                 .get_mut(&worker)
                 .expect("every legacy worker has one bounded slot");
             if worker.demanded(demand) {
-                if slot.task.is_none() && Instant::now() >= slot.retry_at {
-                    if let Err(error) = start_worker(&store, worker, slot).await {
-                        break 'run Err(error);
-                    }
-                }
-            } else if slot.task.is_some() {
-                if let Err(error) = stop_worker(&store, worker, slot).await {
+                if slot.task.is_none()
+                    && Instant::now() >= slot.retry_at
+                    && let Err(error) = start_worker(&store, worker, slot).await
+                {
                     break 'run Err(error);
                 }
+            } else if slot.task.is_some()
+                && let Err(error) = stop_worker(&store, worker, slot).await
+            {
+                break 'run Err(error);
             }
         }
 

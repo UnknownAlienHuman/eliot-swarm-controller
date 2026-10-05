@@ -35,6 +35,7 @@ type ScriptCompletionRow = (
     Option<String>,
     String,
     String,
+    Option<String>,
 );
 
 #[derive(Debug, Clone)]
@@ -51,7 +52,12 @@ struct PendingRun {
     operation_state: String,
     work_digest: String,
     sent_at_ms: Option<i64>,
+    started_at_ms: Option<i64>,
+    worker_identity_json: Option<String>,
 }
+
+const SCRIPT_WORKER_OBSERVATION_TIMEOUT_MS: i64 =
+    manifest::MAX_SCRIPT_DURATION_MS as i64 + STARTING_WORKER_TIMEOUT_MS;
 
 struct OperationRecord<'a> {
     method: &'a str,
@@ -82,11 +88,501 @@ struct RunnerObservation {
     has_go: bool,
 }
 
+struct ScriptEffectParentOperationRow {
+    caller_id: String,
+    method: String,
+    task_id: Option<String>,
+    attempt_id: Option<String>,
+    original_request_json: String,
+}
+
+struct ScriptEffectRunRow {
+    script_id: String,
+    revision: i64,
+    bundle_ref: String,
+    task_id: Option<String>,
+    task_revision: Option<i64>,
+    attempt_id: Option<String>,
+    spec_json: String,
+}
+
+struct ScriptEffectOperationRow {
+    method: String,
+    caller_id: String,
+    original_request_json: String,
+    effective_request_json: String,
+}
+
+struct ScriptTriggerStart<'a> {
+    operation_id: &'a str,
+    script_id: &'a str,
+    script_revision: i64,
+    task_id: Option<&'a str>,
+    task_revision: Option<i64>,
+    attempt_id: Option<&'a str>,
+    app_config: &'a Config,
+}
+
 #[derive(Debug, Clone)]
 struct ScriptRunTriggerGrant {
     entry: automation_config::AutomationEntry,
     cause: Value,
     context: automation_dispatch::script_trigger_authority::ScriptRunConsumerContext,
+}
+
+/// Store-derived permission to commit the one controller effect currently
+/// declared by the immutable script manifest. This is intentionally not a
+/// Principal: the technical caller remains the automation service, while the
+/// registered Manager, current entry, source and live Task/Attempt are
+/// revalidated at each Store boundary.
+#[derive(Debug, Clone)]
+pub(super) struct ScriptEffectAdmission {
+    context: automation_dispatch::script_trigger_authority::ScriptRunConsumerContext,
+    source_cause: Value,
+    parent_operation_id: String,
+    run_id: String,
+    script_id: String,
+    script_revision: i64,
+    task_id: String,
+    task_revision: i64,
+    attempt_id: String,
+    request_id: String,
+    recipient: String,
+    text: String,
+}
+
+struct ScriptEffectRunInput<'a> {
+    db: &'a Connection,
+    config: &'a Config,
+    caller_id: &'a str,
+    parent_operation_id: &'a str,
+    run_id: &'a str,
+    script_id: &'a str,
+    script_revision: i64,
+    task_id: &'a str,
+    task_revision: i64,
+    attempt_id: &'a str,
+    request_id: &'a str,
+    effect: &'a protocol::ScriptEffectRequest,
+    expected_manager_id: &'a str,
+}
+
+struct ScriptEffectLinkInput<'a> {
+    caller_id: &'a str,
+    effective_manager_id: &'a str,
+    request_id: &'a str,
+    effect_operation_id: &'a str,
+    request: &'a Value,
+    cause: &'a Value,
+    automatic_admission: Option<&'a ScriptEffectAdmission>,
+    now_ms: i64,
+}
+
+impl ScriptEffectAdmission {
+    fn from_run(input: ScriptEffectRunInput<'_>) -> Result<Self> {
+        let ScriptEffectRunInput {
+            db,
+            config,
+            caller_id,
+            parent_operation_id,
+            run_id,
+            script_id,
+            script_revision,
+            task_id,
+            task_revision,
+            attempt_id,
+            request_id,
+            effect,
+            expected_manager_id,
+        } = input;
+        if caller_id != authorization::AUTOMATION_TECHNICAL_REQUESTER_ID {
+            return Err(Error::new(
+                "SCRIPT_EFFECT_AUTHORITY_CHANGED",
+                "automatic effect did not retain the automation technical requester",
+            ));
+        }
+        let link = authorization::operation_link(db, parent_operation_id)?.ok_or_else(|| {
+            Error::new(
+                "AUTOMATION_LINK_CORRUPT",
+                "automatic ScriptRun effect has no retained owner attribution",
+            )
+        })?;
+        let context =
+            automation_dispatch::script_trigger_authority::ScriptRunConsumerContext::from_cause(
+                &link.cause,
+            )?;
+        if link.action != "script.run"
+            || link.technical_requester_id != caller_id
+            || link.effective_manager_id != expected_manager_id
+            || link.effective_manager_id != context.owner_manager_id()
+            || link.project_id != context.project_id()
+            || link.automation_id != context.automation_id()
+            || link.automation_revision != context.automation_revision()
+        {
+            return Err(Error::new(
+                "AUTOMATION_LINK_CORRUPT",
+                "automatic ScriptRun attribution differs from its typed consumer context",
+            ));
+        }
+        let entry = context.require_current_entry(db)?;
+        let source = context.require_current_source(db, config, &entry, &link.cause)?;
+        let (task, attempt) = context.require_live_subject(db, &source)?;
+        if source.task_id.as_deref() != Some(task_id)
+            || source.task_revision != Some(task_revision)
+            || source.attempt_id.as_deref() != Some(attempt_id)
+            || task.as_ref().and_then(|value| value["task_id"].as_str()) != Some(task_id)
+            || task.as_ref().and_then(|value| value["revision"].as_i64()) != Some(task_revision)
+            || attempt
+                .as_ref()
+                .and_then(|value| value["attempt_id"].as_str())
+                != Some(attempt_id)
+        {
+            return Err(Error::new(
+                "SCRIPT_SCOPE_CHANGED",
+                "automatic effect no longer has the exact current Manager-owned Task/Attempt",
+            ));
+        }
+        effect.validate()?;
+        if effect.effect != manifest::ScriptControllerEffect::TaskOwnerMessage {
+            return Err(Error::new(
+                "SCRIPT_EFFECT_UNSUPPORTED",
+                "script controller effect is not in the supported effect set",
+            ));
+        }
+        let recipient = attempt
+            .as_ref()
+            .and_then(|value| value["owner_id"].as_str())
+            .ok_or_else(|| {
+                Error::new(
+                    "SCRIPT_SCOPE_CHANGED",
+                    "current effect Attempt has no registered Task owner",
+                )
+            })?
+            .to_owned();
+        let admission = Self {
+            context,
+            source_cause: link.cause,
+            parent_operation_id: parent_operation_id.to_owned(),
+            run_id: run_id.to_owned(),
+            script_id: script_id.to_owned(),
+            script_revision,
+            task_id: task_id.to_owned(),
+            task_revision,
+            attempt_id: attempt_id.to_owned(),
+            request_id: request_id.to_owned(),
+            recipient,
+            text: effect.text.clone(),
+        };
+        let request = json!({
+            "client_request_id":admission.request_id,
+            "recipient":admission.recipient,
+            "text":admission.text,
+        });
+        admission.require_current(db, config, "message.send", &request)?;
+        Ok(admission)
+    }
+
+    pub(super) fn technical_requester_id(&self) -> &'static str {
+        authorization::AUTOMATION_TECHNICAL_REQUESTER_ID
+    }
+
+    pub(super) fn effective_manager_id(&self) -> &str {
+        self.context.owner_manager_id()
+    }
+
+    pub(super) fn automation_id(&self) -> &str {
+        self.context.automation_id()
+    }
+
+    pub(super) fn automation_revision(&self) -> i64 {
+        self.context.automation_revision()
+    }
+
+    pub(super) fn project_id(&self) -> &str {
+        self.context.project_id()
+    }
+
+    pub(super) fn require_current(
+        &self,
+        db: &Connection,
+        config: &Config,
+        method: &str,
+        params: &Value,
+    ) -> Result<()> {
+        if method != "message.send"
+            || params.as_object().is_none_or(|object| object.len() != 3)
+            || model::text(params, "client_request_id")? != self.request_id
+            || model::text(params, "recipient")? != self.recipient
+            || model::text(params, "text")? != self.text
+        {
+            return Err(Error::new(
+                "SCRIPT_EFFECT_AUTHORITY_CHANGED",
+                "automatic script effect differs from its closed admitted request",
+            ));
+        }
+        validate_script_effect_authority(
+            db,
+            config,
+            &self.context,
+            &self.source_cause,
+            &self.parent_operation_id,
+            &self.run_id,
+            &self.script_id,
+            self.script_revision,
+            &self.task_id,
+            self.task_revision,
+            &self.attempt_id,
+        )
+    }
+
+    fn link_cause(&self, request: &Value) -> Result<Value> {
+        Ok(json!({
+            "kind":"script_controller_effect",
+            "id":self.request_id,
+            "script_run_operation_id":self.parent_operation_id,
+            "script_run_id":self.run_id,
+            "script_id":self.script_id,
+            "script_revision":self.script_revision,
+            "effect":"task_owner_message",
+            "task_id":self.task_id,
+            "task_revision":self.task_revision,
+            "attempt_id":self.attempt_id,
+            "recipient":self.recipient,
+            "request_sha256":model::digest(model::canonical(request)?.as_bytes()),
+            "effective_manager_id":self.effective_manager_id(),
+        }))
+    }
+
+    fn retain_operation_link(
+        &self,
+        db: &Connection,
+        effect_operation_id: &str,
+        request: &Value,
+        now_ms: i64,
+    ) -> Result<Value> {
+        let cause = self.link_cause(request)?;
+        let link = authorization::OnBehalfOperationLink {
+            schema_version: 1,
+            operation_id: effect_operation_id.to_owned(),
+            technical_requester_id: self.technical_requester_id().to_owned(),
+            effective_manager_id: self.effective_manager_id().to_owned(),
+            automation_id: self.automation_id().to_owned(),
+            automation_revision: self.automation_revision(),
+            project_id: self.project_id().to_owned(),
+            action: "message.send".to_owned(),
+            cause,
+            linked_at_ms: now_ms,
+        };
+        let value = link.value()?;
+        let operation_key = automation_config::operation_link_key(effect_operation_id)?;
+        let entry_key = automation_config::entry_operation_key(
+            self.effective_manager_id(),
+            self.project_id(),
+            self.automation_id(),
+            effect_operation_id,
+        )?;
+        for (key, label) in [
+            (operation_key, "script effect operation link"),
+            (entry_key, "script effect entry index"),
+        ] {
+            match automation_config::read_record(db, &key, label)? {
+                Some(existing) if existing != value => {
+                    return Err(Error::new(
+                        "AUTOMATION_LINK_CORRUPT",
+                        "script effect link cannot replace another retained attribution",
+                    ));
+                }
+                Some(_) => {}
+                None => automation_config::write_record(db, &key, &value)?,
+            }
+        }
+        Ok(value)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_script_effect_authority(
+    db: &Connection,
+    config: &Config,
+    context: &automation_dispatch::script_trigger_authority::ScriptRunConsumerContext,
+    source_cause: &Value,
+    parent_operation_id: &str,
+    run_id: &str,
+    script_id: &str,
+    script_revision: i64,
+    task_id: &str,
+    task_revision: i64,
+    attempt_id: &str,
+) -> Result<()> {
+    let link = authorization::operation_link(db, parent_operation_id)?.ok_or_else(|| {
+        Error::new(
+            "AUTOMATION_LINK_CORRUPT",
+            "automatic ScriptRun effect has no retained owner attribution",
+        )
+    })?;
+    if link.operation_id != parent_operation_id
+        || link.action != "script.run"
+        || link.technical_requester_id != authorization::AUTOMATION_TECHNICAL_REQUESTER_ID
+        || link.effective_manager_id != context.owner_manager_id()
+        || link.project_id != context.project_id()
+        || link.automation_id != context.automation_id()
+        || link.automation_revision != context.automation_revision()
+        || &link.cause != source_cause
+    {
+        return Err(Error::new(
+            "AUTOMATION_LINK_CORRUPT",
+            "retained ScriptRun link differs from its typed effect authority",
+        ));
+    }
+    context.require_matches_cause(&link.cause)?;
+    let entry = context.require_current_entry(db)?;
+    let source = context.require_current_source(db, config, &entry, &link.cause)?;
+    let (task, attempt) = context.require_live_subject(db, &source)?;
+    if entry.owner_manager_id != context.owner_manager_id()
+        || entry.project_id != context.project_id()
+        || source.task_id.as_deref() != Some(task_id)
+        || source.task_revision != Some(task_revision)
+        || source.attempt_id.as_deref() != Some(attempt_id)
+        || task.as_ref().and_then(|value| value["task_id"].as_str()) != Some(task_id)
+        || task.as_ref().and_then(|value| value["revision"].as_i64()) != Some(task_revision)
+        || attempt
+            .as_ref()
+            .and_then(|value| value["attempt_id"].as_str())
+            != Some(attempt_id)
+    {
+        return Err(Error::new(
+            "SCRIPT_SCOPE_CHANGED",
+            "automatic effect no longer has the exact current Manager-owned Task/Attempt",
+        ));
+    }
+    let parent: Option<ScriptEffectParentOperationRow> = db
+        .query_row(
+            "SELECT o.caller_id,o.method,o.task_id,o.attempt_id,o.original_request_json \
+             FROM operations AS o WHERE o.operation_id=?1",
+            [parent_operation_id],
+            |row| {
+                Ok(ScriptEffectParentOperationRow {
+                    caller_id: row.get(0)?,
+                    method: row.get(1)?,
+                    task_id: row.get(2)?,
+                    attempt_id: row.get(3)?,
+                    original_request_json: row.get(4)?,
+                })
+            },
+        )
+        .optional()?;
+    let Some(ScriptEffectParentOperationRow {
+        caller_id: caller,
+        method,
+        task_id: operation_task,
+        attempt_id: operation_attempt,
+        original_request_json: original,
+    }) = parent
+    else {
+        return Err(Error::new(
+            "SCRIPT_RUN_DAMAGED",
+            "automatic effect parent Operation is missing",
+        ));
+    };
+    let original: Value = serde_json::from_str(&original).map_err(|_| {
+        Error::new(
+            "SCRIPT_RUN_DAMAGED",
+            "automatic effect parent request is not readable",
+        )
+    })?;
+    if caller != authorization::AUTOMATION_TECHNICAL_REQUESTER_ID
+        || method != "script.run"
+        || operation_task.as_deref() != Some(task_id)
+        || operation_attempt.as_deref() != Some(attempt_id)
+        || original["script_id"] != script_id
+        || original["expected_script_revision"] != script_revision
+        || original["attempt_id"] != attempt_id
+        || original["expected_task_revision"] != task_revision
+    {
+        return Err(Error::new(
+            "SCRIPT_RUN_DAMAGED",
+            "automatic effect parent Operation differs from its exact script and Task scope",
+        ));
+    }
+    let run: Option<ScriptEffectRunRow> = db
+        .query_row(
+            "SELECT script_id,revision,bundle_ref,task_id,task_revision,attempt_id,spec_json \
+             FROM script_runs WHERE operation_id=?1 AND run_id=?2",
+            params![parent_operation_id, run_id],
+            |row| {
+                Ok(ScriptEffectRunRow {
+                    script_id: row.get(0)?,
+                    revision: row.get(1)?,
+                    bundle_ref: row.get(2)?,
+                    task_id: row.get(3)?,
+                    task_revision: row.get(4)?,
+                    attempt_id: row.get(5)?,
+                    spec_json: row.get(6)?,
+                })
+            },
+        )
+        .optional()?;
+    let Some(ScriptEffectRunRow {
+        script_id: run_script,
+        revision: run_revision,
+        bundle_ref,
+        task_id: run_task,
+        task_revision: run_task_revision,
+        attempt_id: run_attempt,
+        spec_json,
+    }) = run
+    else {
+        return Err(Error::new(
+            "SCRIPT_RUN_DAMAGED",
+            "automatic effect has no exact retained ScriptRun row",
+        ));
+    };
+    if run_script != script_id
+        || run_revision != script_revision
+        || run_task.as_deref() != Some(task_id)
+        || run_task_revision != Some(task_revision)
+        || run_attempt.as_deref() != Some(attempt_id)
+    {
+        return Err(Error::new(
+            "SCRIPT_RUN_DAMAGED",
+            "retained ScriptRun row differs from its exact effect scope",
+        ));
+    }
+    let spec: Value = serde_json::from_str(&spec_json).map_err(|_| {
+        Error::new(
+            "SCRIPT_RUN_DAMAGED",
+            "retained ScriptRun grant is unreadable",
+        )
+    })?;
+    let capabilities: Vec<manifest::ScriptControllerEffect> = serde_json::from_value(
+        spec.get("capabilities")
+            .cloned()
+            .unwrap_or_else(|| json!([])),
+    )
+    .map_err(|_| Error::new("SCRIPT_RUN_DAMAGED", "retained ScriptRun grant is invalid"))?;
+    let bundle_record = registry::bundle_record(db, script_id, script_revision)?;
+    if bundle_record.artifact_id != bundle_ref
+        || artifact_controller_effects(&bundle_record.metadata)? != capabilities
+        || !capabilities.contains(&manifest::ScriptControllerEffect::TaskOwnerMessage)
+    {
+        return Err(Error::new(
+            "SCRIPT_RUN_DAMAGED",
+            "automatic effect is outside the exact immutable script manifest grant",
+        ));
+    }
+    let owner: String = db.query_row(
+        "SELECT owner_id FROM scripts WHERE script_id=?1",
+        [script_id],
+        |row| row.get(0),
+    )?;
+    let (active_revision, _) = script_head(db, script_id)?;
+    if owner != context.owner_manager_id() || active_revision != Some(script_revision) {
+        return Err(Error::new(
+            "SCRIPT_REVISION_NOT_ACTIVE",
+            "the current Manager must still own and actively grant this script revision",
+        ));
+    }
+    Ok(())
 }
 
 struct ScriptTriggerAdmissionFailure {
@@ -390,7 +886,7 @@ impl Store {
         let revision = request.revision;
         let snapshot = self
             .run(move |db| {
-                require_script_authority(db, &principal)?;
+                require_script_scope(db, &principal, &id)?;
                 revision_snapshot(db, &id, revision)
             })
             .await?;
@@ -424,7 +920,7 @@ impl Store {
         let principal_for_snapshot = principal.clone();
         let snapshot = self
             .run(move |db| {
-                require_script_authority(db, &principal_for_snapshot)?;
+                require_script_scope(db, &principal_for_snapshot, &id)?;
                 revision_snapshot(db, &id, revision)
             })
             .await?;
@@ -441,7 +937,7 @@ impl Store {
         let value = self
             .run(move |db| {
                 let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                let current = require_script_authority(&tx, &p)?;
+                let current = require_script_scope(&tx, &p, &script_id)?;
                 if let Some(receipt) =
                     replay_tx(&tx, &caller, "script.activate", &request_id, &request_json)?
                 {
@@ -767,7 +1263,7 @@ impl Store {
                     let direct_principal = principal_for_snapshot.as_ref().ok_or_else(|| {
                         Error::new("UNAUTHORIZED", "manual ScriptRun has no direct caller")
                     })?;
-                    let current = require_script_authority(db, direct_principal)?;
+                    let current = require_script_scope(db, direct_principal, &script_id)?;
                     require_optional_run_scope(
                         db,
                         &current,
@@ -800,12 +1296,6 @@ impl Store {
                 Ok((bundle, environment))
             })
             .await?;
-        if trigger.is_some() && task.is_some() && !bundle.controller_effects.is_empty() {
-            return Err(Error::new(
-                "SCRIPT_EFFECT_AUTHORITY_UNAVAILABLE",
-                "automatic ScriptRun cannot admit controller effects without a typed effect grant",
-            ));
-        }
         let operation_id = model::new_id();
         let run_id = model::new_id();
         let token = model::new_id();
@@ -881,7 +1371,7 @@ impl Store {
                 let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 let current = p
                     .as_ref()
-                    .map(|principal| require_script_authority(&tx, principal))
+                    .map(|principal| require_script_scope(&tx, principal, &script_id))
                     .transpose()?;
                 if let Some(receipt) = replay_tx(&tx, &operation_caller, "script.run", &request_id, &request_json)? {
                     if let Some(grant) = trigger_for_tx.as_ref() {
@@ -970,19 +1460,22 @@ impl Store {
                 }
                 let now = model::now_ms()?;
                 if !work_for_tx.invocation.controller_effects.is_empty() {
-                    if trigger_for_tx.is_some() {
-                        return Err(Error::new(
-                            "SCRIPT_EFFECT_AUTHORITY_UNAVAILABLE",
-                            "automatic ScriptRun cannot admit controller effects without a typed effect grant",
-                        ));
-                    }
-                    let direct_manager = current.as_ref().ok_or_else(|| {
-                        Error::new("UNAUTHORIZED", "manual ScriptRun has no direct caller")
-                    })?;
-                    if direct_manager.role != Role::Manager {
+                    let effect_manager_id = trigger_for_tx
+                        .as_ref()
+                        .map(|grant| grant.context.owner_manager_id())
+                        .or_else(|| current.as_ref().map(|principal| principal.client_id.as_str()))
+                        .ok_or_else(|| {
+                            Error::new(
+                                "UNAUTHORIZED",
+                                "script effect has no registered effective Manager",
+                            )
+                        })?;
+                    if trigger_for_tx.is_none()
+                        && current.as_ref().is_none_or(|manager| manager.role != Role::Manager)
+                    {
                         return Err(Error::new(
                             "FORBIDDEN",
-                            "script controller effects require the current direct Manager",
+                            "script controller effects require a Manager-owned script",
                         ));
                     }
                     let script_owner: String = tx.query_row(
@@ -990,10 +1483,10 @@ impl Store {
                         [&script_id],
                         |row| row.get(0),
                     )?;
-                    if script_owner != direct_manager.client_id {
+                    if script_owner != effect_manager_id {
                         return Err(Error::new(
                             "FORBIDDEN",
-                            "only the script-owning Manager may admit its controller effect grant",
+                            "only the Manager who owns this script revision may admit its controller effect grant",
                         ));
                     }
                 }
@@ -1107,7 +1600,7 @@ impl Store {
     async fn get_script(&self, principal: Principal, params: Value) -> Result<Value> {
         let request = protocol::GetRequest::parse(&params)?;
         self.run(move |db| {
-            require_script_authority(db, &principal)?;
+            require_script_scope(db, &principal, &request.script_id)?;
             registry::describe(db, &request.script_id, request.revision)
         })
         .await
@@ -1118,8 +1611,14 @@ impl Store {
         let after = request.after.unwrap_or(0);
         let limit = request.limit.unwrap_or(50);
         self.run(move |db| {
-            require_script_authority(db, &principal)?;
-            registry::list(db, after, limit)
+            let current = require_script_authority(db, &principal)?;
+            match gm::require_authority(db, &current) {
+                Ok(()) => registry::list(db, after, limit),
+                Err(error) if error.code == "FORBIDDEN" => {
+                    registry::list_owned(db, &current.client_id, after, limit)
+                }
+                Err(error) => Err(error),
+            }
         })
         .await
     }
@@ -1134,8 +1633,19 @@ impl Store {
         let caller = principal.client_id.clone();
         let request_id = model::text(params, "client_request_id")?.to_owned();
         let original = model::canonical(params)?;
+        let script_id = if method == "script.register" {
+            None
+        } else {
+            params
+                .get("script_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        };
         self.run(move |db| {
-            require_script_authority(db, &current)?;
+            let current = require_script_authority(db, &current)?;
+            if let Some(script_id) = script_id.as_deref() {
+                require_script_scope(db, &current, script_id)?;
+            }
             replay_tx(db, &caller, method, &request_id, &original)
         })
         .await
@@ -1179,22 +1689,7 @@ impl Store {
                 Ok(work) => work,
                 Err(error) => {
                     self.record_run_error(&pending, error.clone()).await?;
-                    let run_id = pending.run_id.clone();
-                    let data_dir = self.data_dir.clone();
-                    let terminal = self
-                        .file_io(move |_| runner::terminal_receipt_exists(&data_dir, &run_id))
-                        .await
-                        .unwrap_or(true);
-                    if terminal {
-                        let run_id = pending.run_id.clone();
-                        let code = error.code.clone();
-                        let data_dir = self.data_dir.clone();
-                        let started = self
-                            .file_io(move |_| runner::started_receipt_exists(&data_dir, &run_id))
-                            .await
-                            .unwrap_or(true);
-                        self.settle_incomplete(&pending, &code, started).await?;
-                    } else if pending.operation_state == "queued" {
+                    if pending.operation_state == "queued" {
                         self.fail_before_start(&pending, &error.code).await?;
                     } else if pending.operation_state == "sending" {
                         let data_dir = self.data_dir.clone();
@@ -1208,7 +1703,8 @@ impl Store {
                             .await
                             .unwrap_or(false);
                         if denied {
-                            self.fail_before_start(&pending, &error.code).await?;
+                            self.settle_prestart_failure_if_family_departed(&pending, &error.code)
+                                .await?;
                         } else {
                             self.mark_unknown(&pending, &error.code).await?;
                         }
@@ -1216,7 +1712,8 @@ impl Store {
                         pending.operation_state.as_str(),
                         "native_accepted" | "outcome_unknown"
                     ) {
-                        self.mark_unknown(&pending, &error.code).await?;
+                        self.settle_incomplete_if_worker_departed(&pending, &error.code)
+                            .await?;
                     }
                     continue;
                 }
@@ -1229,28 +1726,20 @@ impl Store {
                 Ok(observed) => observed,
                 Err(error) => {
                     self.record_run_error(&pending, error.clone()).await?;
-                    let run_id = pending.run_id.clone();
-                    let data_dir = self.data_dir.clone();
-                    let terminal = self
-                        .file_io(move |_| runner::terminal_receipt_exists(&data_dir, &run_id))
-                        .await
-                        .unwrap_or(true);
-                    if terminal {
-                        let run_id = pending.run_id.clone();
-                        let code = error.code.clone();
-                        let data_dir = self.data_dir.clone();
-                        let started = self
-                            .file_io(move |_| runner::started_receipt_exists(&data_dir, &run_id))
-                            .await
-                            .unwrap_or(true);
-                        self.settle_incomplete(&pending, &code, started).await?;
-                    } else if pending.operation_state == "queued" {
+                    if pending.operation_state == "queued" {
                         self.fail_before_start(&pending, &error.code).await?;
                     } else if pending.operation_state == "sending"
                         && !self.start_gate_exists(&work).await
                     {
                         self.deny_work(&work, &error.code).await?;
-                        self.fail_before_start(&pending, &error.code).await?;
+                        self.settle_prestart_failure_if_family_departed(&pending, &error.code)
+                            .await?;
+                    } else if matches!(
+                        pending.operation_state.as_str(),
+                        "native_accepted" | "outcome_unknown"
+                    ) {
+                        self.settle_incomplete_if_worker_departed(&pending, &error.code)
+                            .await?;
                     } else {
                         self.mark_unknown(&pending, &error.code).await?;
                     }
@@ -1258,6 +1747,33 @@ impl Store {
                 }
             };
             if let Some(completion) = observed.completion {
+                if !completion_matches_retained_worker(&pending, &completion) {
+                    let code = "SCRIPT_COMPLETION_DAMAGED";
+                    self.record_run_error(
+                        &pending,
+                        Error::new(
+                            code,
+                            "completion identity differs from the Store-retained worker identity",
+                        ),
+                    )
+                    .await?;
+                    self.settle_incomplete_if_worker_departed(&pending, code)
+                        .await?;
+                    continue;
+                }
+                if !observed.launch_departed {
+                    let code = "SCRIPT_COMPLETION_FAMILY_ACTIVE";
+                    self.record_run_error(
+                        &pending,
+                        Error::new(
+                            code,
+                            "validated ScriptRun completion is waiting for its exact worker Group to depart",
+                        ),
+                    )
+                    .await?;
+                    self.mark_unknown(&pending, code).await?;
+                    continue;
+                }
                 let execution_may_have_started =
                     observed.has_go || completion.started_at_ms.is_some();
                 let id = pending.run_id.clone();
@@ -1298,7 +1814,7 @@ impl Store {
                             if let Err(error) = launch {
                                 self.record_run_error(&pending, error.clone()).await?;
                                 self.deny_work(&start_work, &error.code).await?;
-                                self.fail_before_start(&pending, &error.code).await?;
+                                self.mark_unknown(&pending, &error.code).await?;
                             }
                         }
                         Ok(false) => {}
@@ -1323,10 +1839,8 @@ impl Store {
                                     self.record_run_error(&pending, error.clone()).await?;
                                     if !self.start_gate_exists(&work).await {
                                         self.deny_work(&work, &error.code).await?;
-                                        self.fail_before_start(&pending, &error.code).await?;
-                                    } else {
-                                        self.mark_unknown(&pending, &error.code).await?;
                                     }
+                                    self.mark_unknown(&pending, &error.code).await?;
                                 } else {
                                     self.changed.send_modify(|revision| {
                                         *revision = revision.wrapping_add(1)
@@ -1337,7 +1851,7 @@ impl Store {
                             Err(error) => {
                                 self.record_run_error(&pending, error.clone()).await?;
                                 self.deny_work(&work, &error.code).await?;
-                                self.fail_before_start(&pending, &error.code).await?;
+                                self.mark_unknown(&pending, &error.code).await?;
                             }
                         }
                     } else if observed.launch_departed {
@@ -1351,7 +1865,8 @@ impl Store {
                             self.mark_unknown(&pending, code).await?;
                         } else {
                             self.deny_work(&work, code).await?;
-                            self.fail_before_start(&pending, code).await?;
+                            self.settle_prestart_failure_if_family_departed(&pending, code)
+                                .await?;
                         }
                     } else if pending.sent_at_ms.is_some_and(|sent| {
                         model::now_ms()
@@ -1364,23 +1879,34 @@ impl Store {
                         )
                         .await?;
                         self.deny_work(&work, code).await?;
-                        self.fail_before_start(&pending, code).await?;
+                        self.settle_prestart_failure_if_family_departed(&pending, code)
+                            .await?;
                     }
                 }
-                "native_accepted"
+                "native_accepted" | "outcome_unknown"
                     if observed.launch_departed
-                        || (observed.ready.is_none() && observed.launch.is_none()) =>
+                        || (observed.ready.is_none() && observed.launch.is_none())
+                        || script_worker_observation_expired(&pending) =>
                 {
                     let code = "SCRIPT_OUTCOME_UNOBSERVED";
-                    self.record_run_error(
-                        &pending,
-                        Error::new(
-                            code,
-                            "started worker disappeared without a completion receipt",
-                        ),
-                    )
-                    .await?;
-                    self.mark_unknown(&pending, code).await?;
+                    let detail = if observed.launch_departed {
+                        "started worker departed without a completion receipt"
+                    } else if script_worker_observation_expired(&pending) {
+                        "ScriptRun exceeded its existing start-gate and execution observation bounds"
+                    } else {
+                        "started worker identity and launch record are both unavailable"
+                    };
+                    self.record_run_error(&pending, Error::new(code, detail))
+                        .await?;
+                    if pending.worker_identity_json.is_none() && !observed.has_go {
+                        self.settle_prestart_failure_if_family_departed(&pending, code)
+                            .await?;
+                    } else if observed.launch_departed {
+                        self.settle_incomplete_if_worker_departed(&pending, code)
+                            .await?;
+                    } else {
+                        self.mark_unknown(&pending, code).await?;
+                    }
                 }
                 _ => {}
             }
@@ -1433,7 +1959,91 @@ impl Store {
     async fn mark_unknown(&self, pending: &PendingRun, code: &str) -> Result<()> {
         let run_id = pending.run_id.clone();
         let code = code.to_owned();
-        self.run(move |db| mark_unknown(db, &run_id, &code)).await
+        self.run(move |db| mark_unknown(db, &run_id, &code)).await?;
+        if pending.operation_state != "outcome_unknown" {
+            self.changed
+                .send_modify(|revision| *revision = revision.wrapping_add(1));
+        }
+        Ok(())
+    }
+
+    async fn settle_prestart_failure_if_family_departed(
+        &self,
+        pending: &PendingRun,
+        code: &str,
+    ) -> Result<()> {
+        let data_dir = self.data_dir.clone();
+        let run_id = pending.run_id.clone();
+        let operation_id = pending.operation_id.clone();
+        let departed = self
+            .file_io(move |_| {
+                runner::prestart_worker_family_departed(&data_dir, &run_id, &operation_id)
+            })
+            .await;
+        match departed {
+            Ok(true) if pending.operation_state == "sending" => {
+                self.fail_before_start(pending, code).await
+            }
+            Ok(true) => self.settle_incomplete(pending, code, false).await,
+            Ok(false) => self.mark_unknown(pending, code).await,
+            Err(error) => {
+                self.record_run_error(pending, error.clone()).await?;
+                self.mark_unknown(pending, &error.code).await
+            }
+        }
+    }
+
+    async fn settle_incomplete_if_worker_departed(
+        &self,
+        pending: &PendingRun,
+        code: &str,
+    ) -> Result<()> {
+        let Some(identity_json) = pending.worker_identity_json.clone() else {
+            return self
+                .settle_prestart_failure_if_family_departed(pending, code)
+                .await;
+        };
+        let identity: Value = match serde_json::from_str(&identity_json) {
+            Ok(identity) => identity,
+            Err(_) => {
+                let error = Error::new(
+                    "SCRIPT_WORKER_IDENTITY_DAMAGED",
+                    "retained ScriptRun process identity cannot be parsed",
+                );
+                self.record_run_error(pending, error.clone()).await?;
+                self.settle_prestart_failure_if_family_departed(pending, &error.code)
+                    .await?;
+                return Ok(());
+            }
+        };
+        let data_dir = self.data_dir.clone();
+        let run_id = pending.run_id.clone();
+        let operation_id = pending.operation_id.clone();
+        let departed = self
+            .file_io(move |_| {
+                runner::worker_family_departed_from_identity(
+                    &data_dir,
+                    &run_id,
+                    &operation_id,
+                    &identity,
+                )
+            })
+            .await;
+        match departed {
+            Ok(true) => {
+                self.settle_incomplete(pending, code, true).await?;
+                Ok(())
+            }
+            Ok(false) => {
+                self.mark_unknown(pending, code).await?;
+                Ok(())
+            }
+            Err(error) => {
+                self.record_run_error(pending, error.clone()).await?;
+                self.mark_unknown(pending, &error.code).await?;
+                Ok(())
+            }
+        }
     }
 
     async fn record_run_error(&self, pending: &PendingRun, error: Error) -> Result<()> {
@@ -1449,10 +2059,40 @@ fn require_script_authority(db: &Connection, principal: &Principal) -> Result<Pr
     if !matches!(current.role, Role::Manager | Role::Operator) {
         return Err(Error::new(
             "FORBIDDEN",
-            "script methods require current GM or local Operator authority",
+            "script methods require Manager or local Operator authority",
         ));
     }
-    gm::require_authority(db, &current)?;
+    Ok(current)
+}
+
+/// Managers manage their own immutable script catalog independently of the
+/// current-GM designation. Cross-owner access remains a real GM/Operator
+/// capability, checked against the current principal on every call.
+fn require_script_scope(
+    db: &Connection,
+    principal: &Principal,
+    script_id: &str,
+) -> Result<Principal> {
+    let current = require_script_authority(db, principal)?;
+    let owner: Option<String> = db
+        .query_row(
+            "SELECT owner_id FROM scripts WHERE script_id=?1",
+            [script_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if current.role == Role::Manager {
+        if owner.as_deref() == Some(current.client_id.as_str()) {
+            return Ok(current);
+        }
+        // Unknown and foreign script IDs are indistinguishable to an
+        // ordinary Manager. A current GM retains the existing shared-catalog
+        // read path without making existence a side channel to other owners.
+        gm::require_authority(db, &current)?;
+    } else {
+        gm::require_authority(db, &current)?;
+    }
+    owner.ok_or_else(|| Error::new("NOT_FOUND", "script is not registered"))?;
     Ok(current)
 }
 
@@ -1491,7 +2131,7 @@ fn automatic_script_request_id(
 fn permanent_script_trigger_error(error: &Error) -> bool {
     matches!(
         error.code.as_str(),
-        "SCRIPT_SCHEMA_MISMATCH" | "INVALID_PARAMS" | "SCRIPT_EFFECT_AUTHORITY_UNAVAILABLE"
+        "SCRIPT_SCHEMA_MISMATCH" | "INVALID_PARAMS"
     ) || error.code.starts_with("SCRIPT_BUNDLE")
         || error.code.starts_with("SCRIPT_INPUT")
 }
@@ -1862,11 +2502,6 @@ pub(super) fn require_run_scope(
     expected_task_revision: i64,
 ) -> Result<(Value, Value)> {
     let current = require_script_authority(db, principal)?;
-    if current.role == Role::Manager {
-        gm::require_authority(db, &current)?;
-    } else {
-        current_principal(db, current.clone())?;
-    }
     let attempt = tasks::get_attempt(db, attempt_id)?;
     let task = tasks::get_task(db, model::text(&attempt, "task_id")?)?;
     if attempt["released_at_ms"] != Value::Null
@@ -1907,7 +2542,7 @@ fn require_optional_run_scope(
 
 fn pending_runs(db: &Connection) -> Result<Vec<PendingRun>> {
     let mut statement = db.prepare(
-        "SELECT r.run_id,r.operation_id,o.state,r.work_digest,o.sent_at_ms \
+        "SELECT r.run_id,r.operation_id,o.state,r.work_digest,o.sent_at_ms,r.started_at_ms,r.process_identity_json \
          FROM script_runs r JOIN operations o ON o.operation_id=r.operation_id \
          WHERE r.state IN ('queued','sending','running','reconciling','outcome_unknown') \
          ORDER BY r.created_at_ms,r.run_id LIMIT 64",
@@ -1920,19 +2555,49 @@ fn pending_runs(db: &Connection) -> Result<Vec<PendingRun>> {
                 operation_state: row.get(2)?,
                 work_digest: row.get(3)?,
                 sent_at_ms: row.get(4)?,
+                started_at_ms: row.get(5)?,
+                worker_identity_json: row.get(6)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(Into::into)
 }
 
+fn script_worker_observation_expired(pending: &PendingRun) -> bool {
+    pending.started_at_ms.is_some_and(|started| {
+        model::now_ms()
+            .is_ok_and(|now| now.saturating_sub(started) > SCRIPT_WORKER_OBSERVATION_TIMEOUT_MS)
+    })
+}
+
+fn completion_matches_retained_worker(
+    pending: &PendingRun,
+    completion: &runner::Completion,
+) -> bool {
+    let Some(identity_json) = pending.worker_identity_json.as_deref() else {
+        return completion.state == "failed"
+            && completion.started_at_ms.is_none()
+            && completion.controller_effects.is_empty()
+            && completion.run_id == pending.run_id
+            && completion.operation_id == pending.operation_id
+            && completion.process["purpose"] == "script";
+    };
+    serde_json::from_str::<Value>(identity_json).is_ok_and(|identity| {
+        identity["run_id"] == pending.run_id
+            && identity["operation_id"] == pending.operation_id
+            && identity["token"] == completion.token
+            && identity["process"] == completion.process
+    })
+}
+
 fn observe(work: &runner::Work, files: &ArtifactFiles) -> Result<RunnerObservation> {
     if let Some(completion) = runner::completion(work, files)? {
+        let launch_departed = runner::completion_family_departed(work, &completion)?;
         return Ok(RunnerObservation {
             completion: Some(completion),
             ready: None,
             launch: None,
-            launch_departed: false,
+            launch_departed,
             has_go: runner::has_start_gate(work)?,
         });
     }
@@ -1990,17 +2655,19 @@ fn begin_run(
         if caller == authorization::AUTOMATION_TECHNICAL_REQUESTER_ID {
             require_script_trigger_start(
                 &tx,
-                operation_id,
-                &script_id,
-                revision,
-                task_id.as_deref(),
-                task_revision,
-                attempt_id.as_deref(),
-                app_config,
+                ScriptTriggerStart {
+                    operation_id,
+                    script_id: &script_id,
+                    script_revision: revision,
+                    task_id: task_id.as_deref(),
+                    task_revision,
+                    attempt_id: attempt_id.as_deref(),
+                    app_config,
+                },
             )?;
         } else {
             let actor = registered_actor(&tx, &caller)?;
-            let current = require_script_authority(&tx, &actor)?;
+            let current = require_script_scope(&tx, &actor, &script_id)?;
             let (task, attempt) =
                 require_optional_run_scope(&tx, &current, attempt_id.as_deref(), task_revision)?;
             let scope_matches = match (task.as_ref(), attempt.as_ref()) {
@@ -2063,16 +2730,16 @@ fn registered_actor(db: &Connection, caller: &str) -> Result<Principal> {
     })
 }
 
-fn require_script_trigger_start(
-    db: &Connection,
-    operation_id: &str,
-    script_id: &str,
-    script_revision: i64,
-    task_id: Option<&str>,
-    task_revision: Option<i64>,
-    attempt_id: Option<&str>,
-    app_config: &Config,
-) -> Result<()> {
+fn require_script_trigger_start(db: &Connection, start: ScriptTriggerStart<'_>) -> Result<()> {
+    let ScriptTriggerStart {
+        operation_id,
+        script_id,
+        script_revision,
+        task_id,
+        task_revision,
+        attempt_id,
+        app_config,
+    } = start;
     let link = authorization::operation_link(db, operation_id)?.ok_or_else(|| {
         Error::new(
             "AUTOMATION_LINK_CORRUPT",
@@ -2173,13 +2840,15 @@ fn acknowledge_worker(
         )?;
         if let Err(error) = require_script_trigger_start(
             &tx,
-            &operation_id,
-            &script_scope.0,
-            script_scope.1,
-            scope.0.as_deref(),
-            scope.1,
-            scope.2.as_deref(),
-            app_config,
+            ScriptTriggerStart {
+                operation_id: &operation_id,
+                script_id: &script_scope.0,
+                script_revision: script_scope.1,
+                task_id: scope.0.as_deref(),
+                task_revision: scope.1,
+                attempt_id: scope.2.as_deref(),
+                app_config,
+            },
         ) {
             fail_before_start_tx(&tx, run_id, &error.code, model::now_ms()?)?;
             tx.commit()?;
@@ -2187,7 +2856,12 @@ fn acknowledge_worker(
         }
     } else {
         let actor = registered_actor(&tx, &caller)?;
-        let current = require_script_authority(&tx, &actor)?;
+        let script_id: String = tx.query_row(
+            "SELECT script_id FROM script_runs WHERE run_id=?1",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        let current = require_script_scope(&tx, &actor, &script_id)?;
         let (task, attempt) =
             require_optional_run_scope(&tx, &current, scope.2.as_deref(), scope.1)?;
         if task.as_ref().and_then(|task| task["task_id"].as_str()) != scope.0.as_deref()
@@ -2455,16 +3129,26 @@ fn mark_unknown(db: &mut Connection, run_id: &str, code: &str) -> Result<()> {
 }
 
 fn mark_unknown_tx(tx: &Transaction<'_>, run_id: &str, code: &str, now: i64) -> Result<()> {
-    let operation_id: Option<String> = tx
+    let operation: Option<(String, String, Option<String>)> = tx
         .query_row(
-            "SELECT operation_id FROM script_runs WHERE run_id=?1",
+            "SELECT r.operation_id,o.state,o.result_json FROM script_runs r JOIN operations o ON o.operation_id=r.operation_id WHERE r.run_id=?1",
             [run_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
-    let Some(operation_id) = operation_id else {
+    let Some((operation_id, operation_state, previous_result)) = operation else {
         return Ok(());
     };
+    if operation_state == "outcome_unknown"
+        && previous_result
+            .as_deref()
+            .and_then(|result| serde_json::from_str::<Value>(result).ok())
+            .is_some_and(|result| {
+                result["state"] == "outcome_unknown" && result["diagnostic_code"] == code
+            })
+    {
+        return Ok(());
+    }
     let result = json!({
         "operation_id":operation_id,
         "run_id":run_id,
@@ -2507,9 +3191,26 @@ fn finish(
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let row: Option<ScriptCompletionRow> = tx
         .query_row(
-            "SELECT r.operation_id,r.script_id,r.revision,r.task_id,r.task_revision,r.attempt_id,r.state,o.state,o.method,o.task_id,o.attempt_id,o.caller_id,r.spec_json FROM script_runs r JOIN operations o ON o.operation_id=r.operation_id WHERE r.run_id=?1",
+            "SELECT r.operation_id,r.script_id,r.revision,r.task_id,r.task_revision,r.attempt_id,r.state,o.state,o.method,o.task_id,o.attempt_id,o.caller_id,r.spec_json,r.process_identity_json FROM script_runs r JOIN operations o ON o.operation_id=r.operation_id WHERE r.run_id=?1",
             [run_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?, row.get(10)?, row.get(11)?, row.get(12)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
+                    row.get(13)?,
+                ))
+            },
         )
         .optional()?;
     let Some((
@@ -2526,6 +3227,7 @@ fn finish(
         operation_attempt_id,
         caller_id,
         spec_json,
+        process_identity_json,
     )) = row
     else {
         return Err(Error::new("NOT_FOUND", "script run is not registered"));
@@ -2562,6 +3264,45 @@ fn finish(
     if run_state == "cancelled" && operation_state == "cancelled" {
         tx.commit()?;
         return Ok(());
+    }
+    if completion.process["purpose"] != "script" {
+        return Err(Error::new(
+            "SCRIPT_COMPLETION_DAMAGED",
+            "script completion process identity has another purpose",
+        ));
+    }
+    match process_identity_json
+        .as_deref()
+        .map(|identity| {
+            serde_json::from_str::<Value>(identity).map_err(|_| {
+                Error::new(
+                    "SCRIPT_WORKER_IDENTITY_DAMAGED",
+                    "retained ScriptRun process identity cannot be parsed",
+                )
+            })
+        })
+        .transpose()?
+    {
+        Some(identity)
+            if identity["run_id"] == run_id
+                && identity["operation_id"] == operation_id
+                && identity["token"] == completion.token
+                && identity["process"] == completion.process => {}
+        Some(_) => {
+            return Err(Error::new(
+                "SCRIPT_COMPLETION_DAMAGED",
+                "script completion differs from its Store-retained worker identity",
+            ));
+        }
+        None if completion.state == "failed"
+            && completion.started_at_ms.is_none()
+            && completion.controller_effects.is_empty() => {}
+        None => {
+            return Err(Error::new(
+                "SCRIPT_COMPLETION_DAMAGED",
+                "started ScriptRun completion has no Store-retained worker identity",
+            ));
+        }
     }
     if matches!(run_state.as_str(), "completed" | "failed" | "incomplete") {
         let result_ref: Option<String> = tx.query_row(
@@ -2666,27 +3407,30 @@ fn finish(
             "effect invocation does not match its exact retained Manager/cause scope",
         ));
     }
-    if !completion.controller_effects.is_empty() {
-        let effective_manager_id = if caller_id == authorization::AUTOMATION_TECHNICAL_REQUESTER_ID
-        {
-            authorization::operation_link(&tx, &operation_id)?
-                .filter(|link| link.action == "script.run")
-                .map(|link| link.effective_manager_id)
-                .ok_or_else(|| {
-                    Error::new(
-                        "AUTOMATION_LINK_CORRUPT",
-                        "automatic ScriptRun effect has no validated owner attribution",
-                    )
-                })?
-        } else {
-            registered_actor(&tx, &caller_id)?.client_id
-        };
-        if spec["invocation"]["effective_manager_id"] != effective_manager_id {
-            return Err(Error::new(
-                "SCRIPT_COMPLETION_DAMAGED",
-                "effect invocation Manager differs from the retained effective Manager",
-            ));
-        }
+    let effective_manager_id = if !completion.controller_effects.is_empty()
+        && caller_id == authorization::AUTOMATION_TECHNICAL_REQUESTER_ID
+    {
+        authorization::operation_link(&tx, &operation_id)?
+            .filter(|link| link.action == "script.run")
+            .map(|link| link.effective_manager_id)
+            .ok_or_else(|| {
+                Error::new(
+                    "AUTOMATION_LINK_CORRUPT",
+                    "automatic ScriptRun effect has no validated owner attribution",
+                )
+            })?
+    } else if !completion.controller_effects.is_empty() {
+        registered_actor(&tx, &caller_id)?.client_id
+    } else {
+        caller_id.clone()
+    };
+    if !completion.controller_effects.is_empty()
+        && spec["invocation"]["effective_manager_id"] != effective_manager_id
+    {
+        return Err(Error::new(
+            "SCRIPT_COMPLETION_DAMAGED",
+            "effect invocation Manager differs from the retained effective Manager",
+        ));
     }
     let artifacts = [&completion.result, &completion.stdout, &completion.stderr];
     for artifact in artifacts {
@@ -2708,6 +3452,7 @@ fn finish(
                 apply_controller_effect(
                     &tx,
                     &caller_id,
+                    &effective_manager_id,
                     &operation_id,
                     run_id,
                     &script_id,
@@ -2768,6 +3513,7 @@ fn finish(
 fn apply_controller_effect(
     tx: &Transaction<'_>,
     caller_id: &str,
+    effective_manager_id: &str,
     operation_id: &str,
     run_id: &str,
     script_id: &str,
@@ -2783,80 +3529,127 @@ fn apply_controller_effect(
     match effect.effect {
         manifest::ScriptControllerEffect::TaskOwnerMessage => {}
     }
-    let actor = match (|| -> Result<(Principal, Value)> {
-        if caller_id == authorization::AUTOMATION_TECHNICAL_REQUESTER_ID {
-            return Err(Error::new(
-                "SCRIPT_EFFECT_AUTHORITY_UNAVAILABLE",
-                "automatic ScriptRun controller effects require a separate typed effect admission",
-            ));
-        }
-        let actor = registered_actor(tx, caller_id)?;
-        if actor.role != Role::Manager {
-            return Err(Error::new(
-                "FORBIDDEN",
-                "script controller effects require the admitting Manager",
-            ));
-        }
-        let current = require_script_authority(tx, &actor)?;
-        let (task, attempt) = require_run_scope(tx, &current, attempt_id, task_revision)?;
-        if model::text(&task, "task_id")? != task_id
-            || task["revision"] != task_revision
-            || attempt["attempt_id"] != attempt_id
-        {
-            return Err(Error::new(
-                "SCRIPT_SCOPE_CHANGED",
-                "script invocation no longer identifies the same Task and Attempt",
-            ));
-        }
-        let owner_id: String = tx.query_row(
-            "SELECT owner_id FROM scripts WHERE script_id=?1",
-            [script_id],
-            |row| row.get(0),
-        )?;
-        if owner_id != current.client_id {
-            return Err(Error::new(
-                "FORBIDDEN",
-                "only the Manager who owns this script revision may use its effect grant",
-            ));
-        }
-        let (active_revision, _) = script_head(tx, script_id)?;
-        if active_revision != Some(script_revision) {
-            return Err(Error::new(
-                "SCRIPT_REVISION_NOT_ACTIVE",
-                "script effect requires the same revision to remain active",
-            ));
-        }
-        Ok((actor, attempt))
-    })() {
-        Ok(actor) => actor,
-        Err(error) if error.code != "STORE_ERROR" => {
-            return Ok(controller_effect_rejection(
-                effect,
-                caller_id,
-                operation_id,
-                run_id,
-                script_id,
-                script_revision,
-                task_id,
-                task_revision,
-                attempt_id,
-                &error,
-            ));
-        }
-        Err(error) => return Err(error),
-    };
-    let (actor, attempt) = actor;
-    let recipient = model::text(&attempt, "owner_id")?.to_owned();
     let request_id = script_effect_request_id(operation_id, run_id, effect)?;
+    let automatic_admission = if caller_id == authorization::AUTOMATION_TECHNICAL_REQUESTER_ID {
+        match ScriptEffectAdmission::from_run(ScriptEffectRunInput {
+            db: tx,
+            config,
+            caller_id,
+            parent_operation_id: operation_id,
+            run_id,
+            script_id,
+            script_revision,
+            task_id,
+            task_revision,
+            attempt_id,
+            request_id: &request_id,
+            effect,
+            expected_manager_id: effective_manager_id,
+        }) {
+            Ok(admission) => Some(admission),
+            Err(error) if error.code != "STORE_ERROR" => {
+                return Ok(controller_effect_rejection(
+                    effect,
+                    effective_manager_id,
+                    operation_id,
+                    run_id,
+                    script_id,
+                    script_revision,
+                    task_id,
+                    task_revision,
+                    attempt_id,
+                    &error,
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+    } else {
+        None
+    };
+    let direct_actor = if automatic_admission.is_none() {
+        match (|| -> Result<(Principal, Value)> {
+            let actor = registered_actor(tx, caller_id)?;
+            if actor.role != Role::Manager {
+                return Err(Error::new(
+                    "FORBIDDEN",
+                    "script controller effects require the admitting Manager",
+                ));
+            }
+            let current = require_script_authority(tx, &actor)?;
+            let (task, attempt) = require_run_scope(tx, &current, attempt_id, task_revision)?;
+            if model::text(&task, "task_id")? != task_id
+                || task["revision"] != task_revision
+                || attempt["attempt_id"] != attempt_id
+            {
+                return Err(Error::new(
+                    "SCRIPT_SCOPE_CHANGED",
+                    "script invocation no longer identifies the same Task and Attempt",
+                ));
+            }
+            let owner_id: String = tx.query_row(
+                "SELECT owner_id FROM scripts WHERE script_id=?1",
+                [script_id],
+                |row| row.get(0),
+            )?;
+            if owner_id != current.client_id {
+                return Err(Error::new(
+                    "FORBIDDEN",
+                    "only the Manager who owns this script revision may use its effect grant",
+                ));
+            }
+            let (active_revision, _) = script_head(tx, script_id)?;
+            if active_revision != Some(script_revision) {
+                return Err(Error::new(
+                    "SCRIPT_REVISION_NOT_ACTIVE",
+                    "script effect requires the same revision to remain active",
+                ));
+            }
+            Ok((actor, attempt))
+        })() {
+            Ok(actor) => Some(actor),
+            Err(error) if error.code != "STORE_ERROR" => {
+                return Ok(controller_effect_rejection(
+                    effect,
+                    effective_manager_id,
+                    operation_id,
+                    run_id,
+                    script_id,
+                    script_revision,
+                    task_id,
+                    task_revision,
+                    attempt_id,
+                    &error,
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+    } else {
+        None
+    };
+    let recipient = automatic_admission
+        .as_ref()
+        .map(|admission| admission.recipient.clone())
+        .or_else(|| {
+            direct_actor
+                .as_ref()
+                .and_then(|(_, attempt)| attempt["owner_id"].as_str().map(str::to_owned))
+        })
+        .ok_or_else(|| {
+            Error::new(
+                "SCRIPT_SCOPE_CHANGED",
+                "controller effect has no current Task owner recipient",
+            )
+        })?;
     let request_exists: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM operations WHERE caller_id=?1 AND client_request_id=?2)",
-        params![caller_id, request_id],
+        "SELECT EXISTS(SELECT 1 FROM operations WHERE caller_id=?1 AND client_request_id=?3) \
+         OR EXISTS(SELECT 1 FROM operations WHERE caller_id=?2 AND client_request_id=?3)",
+        params![caller_id, effective_manager_id, request_id],
         |row| row.get(0),
     )?;
     if request_exists {
         return Ok(controller_effect_rejection(
             effect,
-            caller_id,
+            effective_manager_id,
             operation_id,
             run_id,
             script_id,
@@ -2875,21 +3668,44 @@ fn apply_controller_effect(
         "recipient":recipient,
         "text":effect.text,
     });
-    let action = super::mutate_in_transaction(tx, &actor, "message.send", &request, config, now)?;
+    let action = match automatic_admission.as_ref() {
+        Some(admission) => super::mutate_script_effect_in_transaction(
+            tx,
+            admission,
+            "message.send",
+            &request,
+            config,
+            now,
+        ),
+        None => {
+            let (actor, _) = direct_actor.as_ref().ok_or_else(|| {
+                Error::new(
+                    "SCRIPT_EFFECT_DAMAGED",
+                    "direct script effect lost its authenticated Manager",
+                )
+            })?;
+            super::mutate_in_transaction(tx, actor, "message.send", &request, config, now)
+        }
+    };
     let (action_value, action_error) = match action {
-        Ok(value) => (Some(value), None),
+        Ok(Ok(value)) => (Some(value), None),
+        Ok(Err(error)) => (None, Some(error)),
         Err(error) if error.code != "STORE_ERROR" => (None, Some(error)),
         Err(error) => return Err(error),
     };
+    let action_caller_id = automatic_admission
+        .as_ref()
+        .map(ScriptEffectAdmission::technical_requester_id)
+        .unwrap_or(caller_id);
     let action_operation_id: Option<String> = tx
         .query_row(
             "SELECT operation_id FROM operations WHERE caller_id=?1 AND client_request_id=?2 AND method='message.send'",
-            params![caller_id, request_id],
+            params![action_caller_id, request_id],
             |row| row.get(0),
         )
         .optional()?;
     let cause = script_effect_cause(
-        caller_id,
+        effective_manager_id,
         operation_id,
         run_id,
         script_id,
@@ -2901,11 +3717,16 @@ fn apply_controller_effect(
     if let Some(effect_operation_id) = action_operation_id.as_deref() {
         retain_script_effect_link(
             tx,
-            caller_id,
-            &request_id,
-            effect_operation_id,
-            &request,
-            &cause,
+            ScriptEffectLinkInput {
+                caller_id: action_caller_id,
+                effective_manager_id,
+                request_id: &request_id,
+                effect_operation_id,
+                request: &request,
+                cause: &cause,
+                automatic_admission: automatic_admission.as_ref(),
+                now_ms: now,
+            },
         )?;
     }
     match (action_value, action_error) {
@@ -2934,7 +3755,7 @@ fn apply_controller_effect(
 #[allow(clippy::too_many_arguments)]
 fn controller_effect_rejection(
     effect: &protocol::ScriptEffectRequest,
-    caller_id: &str,
+    effective_manager_id: &str,
     operation_id: &str,
     run_id: &str,
     script_id: &str,
@@ -2949,7 +3770,7 @@ fn controller_effect_rejection(
         "status":"rejected",
         "operation_id":Value::Null,
         "error":{"code":error.code,"message":error.message},
-        "cause":script_effect_cause(caller_id,operation_id,run_id,script_id,script_revision,task_id,task_revision,attempt_id),
+        "cause":script_effect_cause(effective_manager_id,operation_id,run_id,script_id,script_revision,task_id,task_revision,attempt_id),
     })
 }
 
@@ -2992,22 +3813,38 @@ fn script_effect_request_id(
     ))
 }
 
-fn retain_script_effect_link(
-    tx: &Transaction<'_>,
-    caller_id: &str,
-    request_id: &str,
-    effect_operation_id: &str,
-    request: &Value,
-    cause: &Value,
-) -> Result<()> {
-    let row: Option<(String, String, String, String)> = tx
+fn retain_script_effect_link(tx: &Transaction<'_>, input: ScriptEffectLinkInput<'_>) -> Result<()> {
+    let ScriptEffectLinkInput {
+        caller_id,
+        effective_manager_id,
+        request_id,
+        effect_operation_id,
+        request,
+        cause,
+        automatic_admission,
+        now_ms,
+    } = input;
+    let row: Option<ScriptEffectOperationRow> = tx
         .query_row(
             "SELECT method,caller_id,original_request_json,effective_request_json FROM operations WHERE operation_id=?1",
             [effect_operation_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok(ScriptEffectOperationRow {
+                    method: row.get(0)?,
+                    caller_id: row.get(1)?,
+                    original_request_json: row.get(2)?,
+                    effective_request_json: row.get(3)?,
+                })
+            },
         )
         .optional()?;
-    let Some((method, caller, original, effective)) = row else {
+    let Some(ScriptEffectOperationRow {
+        method,
+        caller_id: caller,
+        original_request_json: original,
+        effective_request_json: effective,
+    }) = row
+    else {
         return Err(Error::new(
             "SCRIPT_EFFECT_DAMAGED",
             "effect Operation disappeared before its script link was retained",
@@ -3028,11 +3865,33 @@ fn retain_script_effect_link(
         "schema_version":1,
         "operation_id":effect_operation_id,
         "technical_requester_id":caller_id,
-        "effective_manager_id":caller_id,
+        "effective_manager_id":effective_manager_id,
         "action":"message.send",
         "grant":"task_owner_message",
         "cause":cause,
     });
+    if let Some(admission) = automatic_admission {
+        if caller_id != admission.technical_requester_id()
+            || effective_manager_id != admission.effective_manager_id()
+        {
+            return Err(Error::new(
+                "SCRIPT_EFFECT_DAMAGED",
+                "automatic effect linkage differs from its typed caller identity",
+            ));
+        }
+        let automation_link =
+            admission.retain_operation_link(tx, effect_operation_id, request, now_ms)?;
+        if effective
+            .get("automation_on_behalf")
+            .is_some_and(|prior| prior != &automation_link)
+        {
+            return Err(Error::new(
+                "SCRIPT_EFFECT_DAMAGED",
+                "effect Operation already has different on-behalf attribution",
+            ));
+        }
+        effective["automation_on_behalf"] = automation_link;
+    }
     if let Some(prior) = effective.get("script_invocation") {
         if prior != &link {
             return Err(Error::new(
@@ -3041,7 +3900,12 @@ fn retain_script_effect_link(
             ));
         }
     } else {
-        effective["script_invocation"] = link;
+        effective["script_invocation"] = link.clone();
+    }
+    // Automatic effects add the automation link even if a compatible exact
+    // invocation link was retained by an earlier recovery step. Persist both
+    // fields together so readers never observe half of the child provenance.
+    if automatic_admission.is_some() || effective.get("script_invocation") == Some(&link) {
         tx.execute(
             "UPDATE operations SET effective_request_json=?2 WHERE operation_id=?1 AND caller_id=?3 AND client_request_id=?4",
             params![effect_operation_id, model::canonical(&effective)?, caller_id, request_id],
@@ -3270,6 +4134,45 @@ mod controller_effect_tests {
             db,
             config: Config::default(),
         }
+    }
+
+    #[test]
+    fn owning_manager_keeps_script_and_attempt_scope_after_gm_handover() {
+        let mut fixture = fixture(Vec::new());
+        fixture
+            .db
+            .execute(
+                "UPDATE attempts SET owner_id=?1 WHERE attempt_id=?2",
+                params![MANAGER_ID, ATTEMPT_ID],
+            )
+            .unwrap();
+        super::super::set_meta(
+            &fixture.db,
+            "gm",
+            &json!({"client_id":NEXT_MANAGER_ID,"binding_id":null,"binding_generation":null,"epoch":2}),
+        )
+        .unwrap();
+        let manager = Principal {
+            link_id: "fixture-link".to_owned(),
+            client_id: MANAGER_ID.to_owned(),
+            role: Role::Manager,
+        };
+
+        super::require_script_scope(&fixture.db, &manager, SCRIPT_ID)
+            .expect("the registered owner manages its script without the GM designation");
+        let (task, attempt) = super::require_run_scope(&fixture.db, &manager, ATTEMPT_ID, 1)
+            .expect("the exact unreleased Attempt remains controllable by its owner");
+        assert_eq!(task["task_id"], TASK_ID);
+        assert_eq!(attempt["attempt_id"], ATTEMPT_ID);
+
+        let foreign_manager = Principal {
+            link_id: "foreign-fixture-link".to_owned(),
+            client_id: TASK_OWNER_ID.to_owned(),
+            role: Role::Manager,
+        };
+        let error = super::require_script_scope(&fixture.db, &foreign_manager, SCRIPT_ID)
+            .expect_err("a non-owner Manager without GM authority cannot manage the script");
+        assert_eq!(error.code, "FORBIDDEN");
     }
 
     fn effect_completion(effect: protocol::ScriptEffectRequest) -> runner::Completion {
@@ -3960,6 +4863,7 @@ pub(super) fn authorize_artifact_read(
                         "script bundle is not linked to a retained revision",
                     )
                 })?;
+            require_script_scope(db, principal, &script_id)?;
             let linked = registry::bundle_record(db, &script_id, revision)?;
             if linked.kind != artifact.kind
                 || linked.artifact_id != artifact.artifact_id
@@ -4001,6 +4905,12 @@ pub(super) fn authorize_artifact_read(
                     "script artifact has no retained run",
                 ));
             };
+            let script_id: String = db.query_row(
+                "SELECT script_id FROM script_runs WHERE run_id=?1",
+                [run_id],
+                |row| row.get(0),
+            )?;
+            require_script_scope(db, principal, &script_id)?;
             if stored.run_id != run_id
                 || stored.operation_id != operation_id
                 || stored.method != "script.run"
@@ -4112,6 +5022,34 @@ mod script_trigger_admission_isolation_tests {
             })
             .await
             .expect("authenticate Manager")
+    }
+
+    async fn register_named_manager(
+        store: &Store,
+        operator: &Principal,
+        client_id: &str,
+    ) -> Principal {
+        let token = format!("script-trigger-isolation-{}", model::new_id());
+        store
+            .call(
+                operator.clone(),
+                "client.register".into(),
+                json!({
+                    "client_request_id":format!("register-{client_id}"),
+                    "client_id":client_id,
+                    "role":"manager",
+                    "token_hash":model::digest(token.as_bytes()),
+                }),
+            )
+            .await
+            .expect("register scoped Manager");
+        store
+            .authenticate(Credential {
+                client_id: client_id.to_owned(),
+                token,
+            })
+            .await
+            .expect("authenticate scoped Manager")
     }
 
     fn powershell_path() -> PathBuf {
@@ -4256,6 +5194,118 @@ mod script_trigger_admission_isolation_tests {
             )
             .await
             .expect("read manager-scoped ScriptRun explanation")
+    }
+
+    #[tokio::test]
+    async fn ordinary_manager_script_api_is_owner_scoped_without_gm() {
+        let (owner, directory, operator) = start_store().await;
+        let manager = register_manager(&owner.store, &operator).await;
+        let foreign = register_named_manager(
+            &owner.store,
+            &operator,
+            "script-trigger-isolation-foreign-owner",
+        )
+        .await;
+        register_active_script(&owner.store, &manager, "manager_owned_script").await;
+        register_active_script(&owner.store, &foreign, "foreign_owned_script").await;
+
+        let authorization = owner
+            .store
+            .call(manager.clone(), "mcp.authorization".into(), json!({}))
+            .await
+            .expect("ordinary Manager receives Store-authorized MCP discovery");
+        let allowed = authorization["allowed_methods"]
+            .as_array()
+            .expect("MCP authorization returns a method list");
+        for method in [
+            "script.register",
+            "script.validate",
+            "script.activate",
+            "script.run",
+            "script.get",
+            "script.list",
+        ] {
+            assert!(
+                allowed
+                    .iter()
+                    .any(|candidate| candidate.as_str() == Some(method)),
+                "owner Manager should discover {method} without current-GM authority: {authorization}"
+            );
+        }
+
+        let own_script = owner
+            .store
+            .call(
+                manager.clone(),
+                "script.get".into(),
+                json!({"script_id":"manager_owned_script"}),
+            )
+            .await
+            .expect("own script remains readable without the GM designation");
+        assert_eq!(own_script["owner_id"], manager.client_id);
+
+        let own_list = owner
+            .store
+            .call(manager.clone(), "script.list".into(), json!({}))
+            .await
+            .expect("Manager receives its filtered catalog");
+        assert_eq!(own_list["items"].as_array().unwrap().len(), 1);
+        assert_eq!(own_list["items"][0]["script_id"], "manager_owned_script");
+
+        let foreign_get = owner
+            .store
+            .call(
+                manager.clone(),
+                "script.get".into(),
+                json!({"script_id":"foreign_owned_script"}),
+            )
+            .await
+            .expect_err("a Manager cannot read another owner's script");
+        assert_eq!(foreign_get.code, "FORBIDDEN");
+        let unknown_get = owner
+            .store
+            .call(
+                manager.clone(),
+                "script.get".into(),
+                json!({"script_id":"not_registered_for_this_manager"}),
+            )
+            .await
+            .expect_err("an ordinary Manager cannot probe unknown script IDs");
+        assert_eq!(unknown_get.code, "FORBIDDEN");
+        let foreign_activate = owner
+            .store
+            .call(
+                manager.clone(),
+                "script.activate".into(),
+                json!({
+                    "client_request_id":"manager-cannot-activate-foreign-script",
+                    "script_id":"foreign_owned_script",
+                    "revision":1,
+                }),
+            )
+            .await
+            .expect_err("a Manager cannot activate another owner's script");
+        assert_eq!(foreign_activate.code, "FORBIDDEN");
+        let foreign_run = owner
+            .store
+            .call(
+                manager,
+                "script.run".into(),
+                json!({
+                    "client_request_id":"manager-cannot-run-foreign-script",
+                    "script_id":"foreign_owned_script",
+                    "expected_script_revision":1,
+                    "attempt_id":"nonexistent-attempt",
+                    "expected_task_revision":1,
+                    "input":{},
+                }),
+            )
+            .await
+            .expect_err("a Manager cannot run another owner's script");
+        assert_eq!(foreign_run.code, "FORBIDDEN");
+
+        owner.close().await.expect("close temporary Store");
+        std::fs::remove_dir_all(directory).expect("remove owned temporary Store directory");
     }
 
     enum Damage {

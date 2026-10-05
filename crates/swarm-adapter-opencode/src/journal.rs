@@ -558,15 +558,15 @@ impl Journal {
             let bytes = read_limited(&path, RECORD_LIMIT)?;
             let item: PendingItem = serde_json::from_slice(&bytes)
                 .map_err(|_| Error::new("ADAPTER_OUTBOX", "outbox item is invalid"))?;
-            if item.kind == "outcome" && item.payload["native_scope_key"] == scope {
-                if let Some(intent) = self.load(&item.key)?.intent
-                    && intent.binding_id == binding_id
-                    && intent.generation == generation
-                    && intent.native_scope_key == scope
-                    && let Some(root) = item.payload["native_root_id"].as_str()
-                {
-                    remember_one_root(&mut root_checkpoint, root.into())?;
-                }
+            if item.kind == "outcome"
+                && item.payload["native_scope_key"] == scope
+                && let Some(intent) = self.load(&item.key)?.intent
+                && intent.binding_id == binding_id
+                && intent.generation == generation
+                && intent.native_scope_key == scope
+                && let Some(root) = item.payload["native_root_id"].as_str()
+            {
+                remember_one_root(&mut root_checkpoint, root.into())?;
             }
         }
         let entries = fs::read_dir(&self.operations)
@@ -932,7 +932,7 @@ fn expected_root_id(binding_id: &str, generation: i64) -> String {
 }
 
 fn read_limited(path: &Path, limit: usize) -> Result<Vec<u8>> {
-    let mut file = File::open(path)
+    let file = File::open(path)
         .map_err(|_| Error::new("ADAPTER_STATE", "private state file cannot be read"))?;
     let mut bytes = Vec::new();
     file.take((limit + 1) as u64)
