@@ -11,7 +11,21 @@ use serde_json::{Value, json};
 const CURRENT: &str = "host:lifecycle:v1";
 const LAST_EXIT: &str = "host:last-exit:v1";
 const LATEST_FAILURE: &str = "host:latest-failure:v1";
+const OPTIONAL_WORKER_HEALTH: &str = "host:optional-workers:v1";
 const SUPERVISORS: &[&str] = &[
+    "legacy-workers",
+    "checks",
+    "scripts",
+    "opencode",
+    "zed",
+    "scheduler",
+    "automation",
+    "launcher",
+    "native-mcp",
+    "native-mcp-tools",
+    "forge",
+];
+const OPTIONAL_WORKERS: &[&str] = &[
     "checks",
     "scripts",
     "opencode",
@@ -284,6 +298,13 @@ pub(super) fn start(tx: &Transaction<'_>, now: i64) -> Result<()> {
             started_at_ms: now,
             updated_at_ms: now
         }),
+    )?;
+    // Previous host tasks may have been interrupted before their shutdown
+    // receipt. Never expose their last `running` state as current readiness.
+    set_meta(
+        tx,
+        OPTIONAL_WORKER_HEALTH,
+        &json!({"schema_version":1,"workers":{}}),
     )
 }
 
@@ -299,6 +320,114 @@ pub(super) fn ready(tx: &Transaction<'_>, now: i64) -> Result<()> {
     current.state = State::Running;
     current.updated_at_ms = now;
     set_meta(tx, CURRENT, &json!(current))
+}
+
+/// Retain the latest bounded state for the ten optional legacy workers. The
+/// Store status reader exposes this through the existing `host.status` path.
+/// Error details, process output, and route/native payloads are never stored.
+pub(super) fn update_optional_worker(
+    tx: &Transaction<'_>,
+    name: &str,
+    state: &str,
+    consecutive_failures: u32,
+    error_code: Option<&str>,
+    retry_in_ms: Option<u64>,
+    now: i64,
+) -> Result<()> {
+    if !OPTIONAL_WORKERS.contains(&name)
+        || !matches!(state, "dormant" | "running" | "retry_wait" | "isolated")
+        || consecutive_failures > 32
+        || retry_in_ms.is_some_and(|delay| delay > 60_000)
+        || error_code.is_some_and(|code| {
+            code.is_empty()
+                || code.len() > 64
+                || !code
+                    .bytes()
+                    .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+        })
+        || (state == "retry_wait" && (error_code.is_none() || retry_in_ms.is_none()))
+        || (state == "isolated" && (error_code.is_none() || retry_in_ms.is_none()))
+    {
+        return Err(Error::new(
+            "HOST_LIFECYCLE_INVALID",
+            "optional worker health receipt is invalid",
+        ));
+    }
+    let mut health = optional_worker_health(tx)?;
+    let workers = health
+        .get_mut("workers")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| {
+            Error::new(
+                "HOST_LIFECYCLE_INVALID",
+                "optional worker health map is invalid",
+            )
+        })?;
+    let retry_after_ms =
+        retry_in_ms.map(|delay| now.saturating_add(i64::try_from(delay).unwrap_or(i64::MAX)));
+    workers.insert(
+        name.to_owned(),
+        json!({
+            "state":state,
+            "consecutive_failures":consecutive_failures,
+            "last_error_code":error_code,
+            "retry_after_ms":retry_after_ms,
+            "updated_at_ms":now
+        }),
+    );
+    set_meta(tx, OPTIONAL_WORKER_HEALTH, &health)
+}
+
+fn optional_worker_health(db: &Connection) -> Result<Value> {
+    let Some(value) = meta(db, OPTIONAL_WORKER_HEALTH)? else {
+        return Ok(json!({"schema_version":1,"workers":{}}));
+    };
+    let workers = value
+        .get("workers")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            Error::new(
+                "HOST_LIFECYCLE_INVALID",
+                "optional worker health map is invalid",
+            )
+        })?;
+    if value["schema_version"] != 1 || workers.len() > OPTIONAL_WORKERS.len() {
+        return Err(Error::new(
+            "HOST_LIFECYCLE_INVALID",
+            "optional worker health version or capacity is invalid",
+        ));
+    }
+    for (name, receipt) in workers {
+        let state = receipt["state"].as_str().unwrap_or_default();
+        let failures = receipt["consecutive_failures"].as_u64();
+        let updated_at_ms = receipt["updated_at_ms"].as_i64();
+        let retry_after_ms = receipt["retry_after_ms"].as_i64();
+        let code = receipt["last_error_code"].as_str();
+        if !OPTIONAL_WORKERS.contains(&name.as_str())
+            || !matches!(state, "dormant" | "running" | "retry_wait" | "isolated")
+            || failures.is_none_or(|value| value > 32)
+            || updated_at_ms.is_none_or(|value| value < 0)
+            || retry_after_ms.is_some_and(|value| {
+                let updated_at_ms = updated_at_ms.unwrap_or(0);
+                value < updated_at_ms || value.saturating_sub(updated_at_ms) > 60_000
+            })
+            || code.is_some_and(|value| {
+                value.is_empty()
+                    || value.len() > 64
+                    || !value.bytes().all(|byte| {
+                        byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_'
+                    })
+            })
+            || (matches!(state, "retry_wait" | "isolated")
+                && (code.is_none() || retry_after_ms.is_none()))
+        {
+            return Err(Error::new(
+                "HOST_LIFECYCLE_INVALID",
+                "optional worker health entry is invalid",
+            ));
+        }
+    }
+    Ok(value)
 }
 
 pub(super) fn finish(
@@ -446,11 +575,15 @@ pub(super) fn status(db: &Connection) -> Result<Value> {
     let current = status_value(load(db).map(|value| value.map(|record| json!(record))))?;
     let last_exit = status_value(exit_receipt(db, LAST_EXIT))?;
     let latest_failure = status_value(exit_receipt(db, LATEST_FAILURE))?;
-    Ok(
-        json!({"current":current,"last_exit":last_exit,"latest_failure":latest_failure,
+    let optional_workers = optional_worker_health(db)?;
+    Ok(json!({
+        "current":current,
+        "last_exit":last_exit,
+        "latest_failure":latest_failure,
+        "optional_workers":optional_workers["workers"],
         "failure_history":"retained; a later graceful exit does not acknowledge or erase an earlier failure",
-        "required_readback":"operation.get before retrying admitted work"}),
-    )
+        "required_readback":"operation.get before retrying admitted work"
+    }))
 }
 
 #[cfg(test)]

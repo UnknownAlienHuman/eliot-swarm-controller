@@ -102,6 +102,13 @@ Call `module.route.select` with that object. Use the exact values and revision r
 Build `swarm-forge-worker` from a clean, committed checkout with
 `tools/ci/build-module-package.ps1 -Package swarm-forge-worker -Profile release`,
 supplying the existing shared `-TargetDir` and an explicit package `-OutputDir`.
+
+Local Cargo recipes also require an explicit shared target outside the checkout.
+Pass its absolute path as the recipe's `TARGET` argument, or set
+`CARGO_TARGET_DIR` for that invocation. The scoped `Verify` and manual `FullRust`
+entrypoints validate `-TargetDir` (or the same environment variable) before
+compiling. Both Clippy and tests use that one cache; neither stage allocates a
+separate default `target` for each checkout.
 The output contains `bin/swarm-forge-worker.exe` and `build-manifest.json`.
 
 Pass that absolute executable path and the chosen host executable to
@@ -113,7 +120,54 @@ Identical installed bytes are a no-op; different bytes are not overwritten.
 It does not configure or launch either process. The unsigned build manifest
 provides consistency evidence; it is not a signature.
 
+## Build and install the standalone ScriptRun worker
+
+Build package `swarm-script-worker` with the existing module package builder,
+using the same external shared Cargo target directory and a new explicit output
+directory. Pass its `bin/swarm-script-worker.exe` to
+`tools/modules/Install-ScriptWorker.ps1 -PackageExecutable <absolute-worker.exe>
+-InstallDirectory <existing-absolute-directory>`. Use `-WhatIf` to preview.
+The installer verifies the exact release package, clean source manifest, length
+and image digest. Identical installed bytes are a no-op; different bytes are
+not overwritten. It returns the absolute path and digest without editing config.
+
+Configure the returned values explicitly:
+
+```toml
+[scripts.executor]
+executable = 'C:\ELIOT\artifacts\swarm-script-worker.exe'
+sha256 = '<64-lowercase-hex-digest-returned-by-installer>'
+artifact_id = 'swarm-script-worker.1'
+version = '0.1.0'
+```
+
+The pin defaults absent. New receipts retain a selected pin; older receipts
+keep their admitted backend. The standalone worker starts after Store admission,
+reports readiness and waits for Store Go before launching the interpreter.
+It cannot apply controller effects. An invalid selected image cannot fall back.
+
+## Package the host with source provenance
+
+`tools/ci/Build-SwarmHostProvenance.ps1 -TargetDir <existing-shared-target>
+-OutputDir <new-package-directory>` manually builds only the release host package
+through the existing builder. It emits `bin/swarm.exe` and the source/build/image
+manifest used to bind a qualification run to an exact artifact. Normal source
+pushes do not invoke this release entrypoint. The caller supplies the existing
+shared target directory; no separate worker or worktree build cache is required.
+
 ## Optional checks and local observer
+
+The manual `module-package.yml` workflow offers eleven actual executable
+packages. Select one package and profile; `eliot-swarm-controller` requires
+`release`. All choices use one runner shared target directory and produce one
+package manifest. Library-only supervisor is not an executable selection.
+For current-source native qualification, use
+`tools/qualification/New-NativeQualification.ps1` with explicit host/module
+build-manifest and image hashes, installed descriptor and private configuration.
+The harness uses a fresh DataRoot, protects unrelated/current Codex processes
+and sends a native input once. Unknown effects use bounded readback rather
+than another send. Source/manifest consistency is recorded separately from
+the actual runtime result.
 
 The checks executor is a separate optional process pin, not a module descriptor. Build package `swarm-checks` and configure its binary using `[checks.executor]`. Checks default disabled, and the executor pin defaults absent:
 

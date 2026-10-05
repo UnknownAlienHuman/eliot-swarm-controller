@@ -3,7 +3,7 @@ use serde_json::Value;
 use swarm_contracts::runtime::{ModuleReceiptIdentity, RuntimeCommand};
 
 pub const ARTIFACT_ID: &str = "eliot-antigravity.rust-headless.1";
-pub const ARTIFACT_VERSION: &str = "2";
+pub const ARTIFACT_VERSION: &str = "3";
 pub const REQUIRED_MODEL_ID: &str = "gemini-3.8-flash-high";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,6 +75,25 @@ impl TryFrom<&RuntimeCommand> for OperationIdentity {
                 .as_deref()
                 .filter(|digest| crate::module_receipt::is_lower_sha256(digest))
                 .ok_or("MISSING_RECONCILE_TARGET_DIGEST")?
+                .to_owned();
+            (Some(target_operation_id), Some(target_input_sha256))
+        } else if command.method == "agent.result" {
+            if command.input["selector"]["kind"] != "antigravity_status" {
+                return Err("UNSUPPORTED_RESULT_SELECTOR");
+            }
+            let target_operation_id = command
+                .input
+                .get("selector")
+                .and_then(|selector| selector.get("input_operation_id"))
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or("RESULT_TARGET_OPERATION_ID_REQUIRED")?
+                .to_owned();
+            let target_input_sha256 = command
+                .target_input_sha256
+                .as_deref()
+                .filter(|digest| crate::module_receipt::is_lower_sha256(digest))
+                .ok_or("MISSING_RESULT_TARGET_DIGEST")?
                 .to_owned();
             (Some(target_operation_id), Some(target_input_sha256))
         } else {

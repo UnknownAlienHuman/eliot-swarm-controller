@@ -23,6 +23,17 @@ const RECEIPT_STORAGE_PREFIX: &str = "automation:v1:intake:receipt:";
 const HOOK_COMMIT_INDEX_PREFIX: &str = "automation:v1:intake:hook_commit:";
 
 type ScriptTerminalProjectionRow = (String, String, String, Option<String>);
+type ScriptLifecycleProjectionRow = (
+    String,
+    String,
+    String,
+    String,
+    i64,
+    String,
+    Option<String>,
+    Option<i64>,
+    Option<String>,
+);
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -447,7 +458,7 @@ fn script_terminal_event_projection(
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?;
-    let Some((source_event_key, _run_id, run_state, outcome)) = row else {
+    let Some((source_event_key, run_id, run_state, outcome)) = row else {
         return Ok(Default::default());
     };
     if source_event_key != format!("terminal:{operation_id}") {
@@ -486,6 +497,215 @@ fn script_terminal_event_projection(
         status: Some(status),
         occurrence_phase: Some(occurrence_phase),
         occurrence_id: Some(occurrence_id),
+        script_run_id: Some(run_id),
+        ..Default::default()
+    })
+}
+
+/// Project ScriptRun admission and lifecycle facts from the exact durable
+/// Operation/Run pair. The event payload is validated in place and never
+/// copied into the script invocation.
+fn script_run_lifecycle_event_projection(
+    db: &Connection,
+    event: &ObservedEvent,
+) -> Result<crate::automation::intake::SafeEventProjection> {
+    use crate::automation::event_rules::EventStatus;
+
+    if event.source_id != "controller:scripts" {
+        return Ok(Default::default());
+    }
+    let Some(operation_id) = event.operation_id.as_deref().filter(|id| !id.is_empty()) else {
+        return Ok(Default::default());
+    };
+    let (phase, status, error_code, row): (
+        &str,
+        Option<EventStatus>,
+        Option<&str>,
+        Option<ScriptLifecycleProjectionRow>,
+    ) = match event.event_kind.as_str() {
+        "script.run" => (
+            "script_run_queued",
+            None,
+            None,
+            db.query_row(
+                "SELECT o.source_event_key,o.payload_json,r.run_id,r.script_id,r.revision,\
+                 r.bundle_ref,r.task_id,r.task_revision,r.attempt_id \
+                 FROM observations AS o \
+                 JOIN operations AS op ON op.operation_id=o.operation_id \
+                 JOIN script_runs AS r ON r.operation_id=op.operation_id \
+                 WHERE o.observation_id=?1 AND o.source_stream_id='controller:scripts' \
+                   AND o.kind='script.run' AND o.operation_id=?2 \
+                   AND o.source_event_key='admitted:' || op.operation_id \
+                   AND op.method='script.run' AND op.created_at_ms=o.recorded_at_ms \
+                   AND r.created_at_ms=o.recorded_at_ms \
+                   AND op.task_id IS r.task_id AND op.attempt_id IS r.attempt_id \
+                   AND ((r.task_id IS NULL AND r.task_revision IS NULL AND r.attempt_id IS NULL) \
+                     OR (r.task_id IS NOT NULL AND r.task_revision>0 AND r.attempt_id IS NOT NULL)) \
+                   AND length(o.payload_json)<=?3 AND json_valid(o.payload_json)",
+                params![event.observation_id, operation_id, MAX_SCRIPT_TERMINAL_EVENT_BYTES],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                    ))
+                },
+            )
+            .optional()?,
+        ),
+        "script.started" => (
+            "script_run_started",
+            None,
+            None,
+            db.query_row(
+                "SELECT o.source_event_key,o.payload_json,r.run_id,r.script_id,r.revision,\
+                 r.bundle_ref,r.task_id,r.task_revision,r.attempt_id \
+                 FROM observations AS o \
+                 JOIN operations AS op ON op.operation_id=o.operation_id \
+                 JOIN script_runs AS r ON r.operation_id=op.operation_id \
+                 WHERE o.observation_id=?1 AND o.source_stream_id='controller:scripts' \
+                   AND o.kind='script.started' AND o.operation_id=?2 \
+                   AND o.source_event_key='operation:' || op.operation_id || ':script_run_started' \
+                   AND op.method='script.run' AND r.started_at_ms=o.recorded_at_ms \
+                   AND op.task_id IS r.task_id AND op.attempt_id IS r.attempt_id \
+                   AND ((r.task_id IS NULL AND r.task_revision IS NULL AND r.attempt_id IS NULL) \
+                     OR (r.task_id IS NOT NULL AND r.task_revision>0 AND r.attempt_id IS NOT NULL)) \
+                   AND length(o.payload_json)<=?3 AND json_valid(o.payload_json)",
+                params![event.observation_id, operation_id, MAX_SCRIPT_TERMINAL_EVENT_BYTES],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                    ))
+                },
+            )
+            .optional()?,
+        ),
+        "script.cancelled" => (
+            "operation_cancelled",
+            Some(EventStatus::Cancelled),
+            Some("OPERATION_CANCELLED"),
+            db.query_row(
+                "SELECT o.source_event_key,o.payload_json,r.run_id,r.script_id,r.revision,\
+                 r.bundle_ref,r.task_id,r.task_revision,r.attempt_id \
+                 FROM observations AS o \
+                 JOIN operations AS op ON op.operation_id=o.operation_id \
+                 JOIN script_runs AS r ON r.operation_id=op.operation_id \
+                 WHERE o.observation_id=?1 AND o.source_stream_id='controller:scripts' \
+                   AND o.kind='script.cancelled' AND o.operation_id=?2 \
+                   AND o.source_event_key='operation:' || op.operation_id || ':operation_cancelled' \
+                   AND op.method='script.run' AND op.state='cancelled' \
+                   AND op.settled_at_ms=o.recorded_at_ms \
+                   AND r.state='cancelled' AND r.finished_at_ms=o.recorded_at_ms \
+                   AND op.task_id IS r.task_id AND op.attempt_id IS r.attempt_id \
+                   AND ((r.task_id IS NULL AND r.task_revision IS NULL AND r.attempt_id IS NULL) \
+                     OR (r.task_id IS NOT NULL AND r.task_revision>0 AND r.attempt_id IS NOT NULL)) \
+                   AND length(o.payload_json)<=?3 AND json_valid(o.payload_json)",
+                params![event.observation_id, operation_id, MAX_SCRIPT_TERMINAL_EVENT_BYTES],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                    ))
+                },
+            )
+            .optional()?,
+        ),
+        _ => return script_terminal_event_projection(db, event),
+    };
+    let Some((
+        source_event_key,
+        payload_json,
+        run_id,
+        script_id,
+        revision,
+        bundle_ref,
+        task_id,
+        task_revision,
+        attempt_id,
+    )) = row
+    else {
+        return Ok(Default::default());
+    };
+    let expected_key = match event.event_kind.as_str() {
+        "script.run" => format!("admitted:{operation_id}"),
+        "script.started" => format!("operation:{operation_id}:script_run_started"),
+        "script.cancelled" => format!("operation:{operation_id}:operation_cancelled"),
+        _ => return Ok(Default::default()),
+    };
+    if source_event_key != expected_key {
+        return Ok(Default::default());
+    }
+    let payload: Value = match serde_json::from_str(&payload_json) {
+        Ok(payload) => payload,
+        Err(_) => return Ok(Default::default()),
+    };
+    let expected_occurrence_id = format!("operation:{operation_id}:{phase}");
+    let exact_identity = match event.event_kind.as_str() {
+        "script.run" => {
+            payload["operation_id"] == operation_id
+                && payload["run_id"] == run_id
+                && payload["script_id"] == script_id
+                && payload["revision"] == revision
+                && payload["bundle_ref"] == bundle_ref
+                && payload["task_id"] == json!(task_id)
+                && payload["task_revision"] == json!(task_revision)
+                && payload["attempt_id"] == json!(attempt_id)
+                && payload["state"] == "queued"
+        }
+        "script.started" => {
+            payload
+                == json!({
+                    "schema_version":1,
+                    "phase":"script_run_started",
+                    "occurrence_id":expected_occurrence_id,
+                    "operation_id":operation_id,
+                    "run_id":run_id,
+                })
+        }
+        "script.cancelled" => {
+            payload
+                == json!({
+                    "schema_version":1,
+                    "phase":"operation_cancelled",
+                    "occurrence_id":expected_occurrence_id,
+                    "status":"cancelled",
+                    "error_code":"OPERATION_CANCELLED",
+                    "operation_id":operation_id,
+                    "run_id":run_id,
+                })
+        }
+        _ => false,
+    };
+    if !exact_identity || !valid_occurrence_identity(&expected_occurrence_id) {
+        return Ok(Default::default());
+    }
+    Ok(crate::automation::intake::SafeEventProjection {
+        status,
+        error_code: error_code.map(ToOwned::to_owned),
+        occurrence_phase: Some(phase.to_owned()),
+        occurrence_id: Some(expected_occurrence_id),
+        script_run_id: Some(run_id),
         ..Default::default()
     })
 }
@@ -799,7 +1019,7 @@ pub(crate) fn safe_event_projection(
     use crate::automation::event_rules::EventStatus;
 
     if event.source_id == "controller:scripts" {
-        return script_terminal_event_projection(db, event);
+        return script_run_lifecycle_event_projection(db, event);
     }
     if event.source_id == "controller:host-lifecycle"
         && matches!(event.event_kind.as_str(), "host.exit" | "host.failed")
@@ -938,11 +1158,31 @@ pub(crate) fn safe_event_projection(
     {
         return Ok(Default::default());
     }
+    let script_run_id = if event.source_id == "controller:operations"
+        && event.event_kind == "operation.cancelled"
+    {
+        let Some(operation_id) = event.operation_id.as_deref() else {
+            return Ok(Default::default());
+        };
+        db.query_row(
+            "SELECT r.run_id FROM operations AS op \
+             JOIN script_runs AS r ON r.operation_id=op.operation_id \
+             WHERE op.operation_id=?1 AND op.method='script.run' AND op.state='cancelled' \
+               AND op.settled_at_ms=?2 AND r.state='cancelled' AND r.finished_at_ms=?2 \
+               AND op.task_id IS r.task_id AND op.attempt_id IS r.attempt_id",
+            params![operation_id, event.recorded_at_ms],
+            |row| row.get(0),
+        )
+        .optional()?
+    } else {
+        None
+    };
     Ok(crate::automation::intake::SafeEventProjection {
         status: Some(expected_status),
         error_code,
         occurrence_phase: Some(expected_phase.to_owned()),
         occurrence_id: occurrence_id.map(ToOwned::to_owned),
+        script_run_id,
         ..Default::default()
     })
 }
@@ -1106,6 +1346,7 @@ fn native_mcp_failure_projection(
         failed_supervisor: Some(supervisor.to_owned()),
         occurrence_phase: Some("native_mcp_failure".to_owned()),
         occurrence_id: occurrence_id.map(ToOwned::to_owned),
+        ..Default::default()
     })
 }
 

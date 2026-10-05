@@ -2,6 +2,71 @@
 
 ## Current state
 
+### PR #25 durable bus wiring and launch/install closure — 2026-10-05
+
+Authenticated Store and Manager MCP routes now expose bounded bus readback and
+admission. A Module consumer has only its enrolled page/admit rights; its
+credential is not a Manager bearer. The existing O1 scanner remains active and
+shares the cursor and pending-intent journal with the dispatcher. Admission
+rereads source scope and records the cursor/action transition in one transaction.
+The typed ScriptRun continuation revalidates its owning Manager, enabled entry
+and source Task/Attempt. Ordinary owning-Manager bus operations do not require
+current-GM authority. Managed dispatcher liveness and automatic controller
+effects remain in progress.
+
+Ten legacy host reconcilers now run under one demand coordinator. Disabled,
+dormant workers do not start. Exact built-in OpenCode selection excludes the
+standalone module route. Top-level worker failures and panics receive bounded
+retry/isolation status through `host.status.optional_workers`; Store/kernel
+failure remains fatal. Shutdown signals workers and awaits active work.
+ScriptRun start and queued cancellation now create exact transactional facts
+with Run/Operation/Task scope and cancellation-alias deduplication.
+
+An owning Manager can select its own configured MCP profile for a native launch
+with an explicitly valid Participant surface. The issuer creates a fresh scoped
+Participant credential; it does not copy Manager groups or manual tools. Existing
+Participant and AssignedReviewer selection remains supported.
+
+Supervisor diagnostics now emit only after a new durable observation commits.
+Retries emit nothing. Correlation includes the retained binding generation;
+diagnostic schema 2 preserves observer read compatibility for schema 1. Uncertain
+ownership does not become a proven stop. Diagnostics remain separate from the
+transactional event journal and Task authority.
+
+The enabled observer can publish an exact private host-image receipt while the
+Store holds its DataRoot lock. Receipt failure is nonfatal. Metrics can use this
+receipt by default; shutdown removes only the matching receipt before Store
+close. The adapter installer now validates the optional descriptor workspace
+contract, fixing rejection of the new templates. Script worker installation and
+manual host source-provenance packaging are available through the existing
+shared target/build-manifest path; neither installer changes configuration.
+The manual workflow exposes eleven actual package/bin pairs, including the
+auto-discovered `swarm-checks` binary, and builds one selected package only.
+Local Cargo recipes and scoped/full verification now require an explicit shared
+target path. The manual full workflow uses one external runner target for both
+Clippy and tests, preventing checkout-local build-cache duplication.
+
+Antigravity descriptor version 3 adds bounded `agent.result` readback for the
+exact retained target Operation. Store verifies the target digest, binding,
+generation, session and result-page bytes. The native CLI does not provide a
+proven assistant response identity; this page exposes status/failure only and
+keeps execution and Task completion unknown. Existing installed versions remain
+retained. The source adds no Cargo dependency and still needs native qualification.
+
+Forge and GitHub PR recovery can perform exact remote readback after validating
+the retained plan and proving whole-family departure even if the private worker
+result is absent or malformed. Wrong-scope evidence blocks readback with a
+durable reason. Unknown native writes are never replayed. The source-only
+`tools/qualification/New-NativeQualification.ps1` harness verifies explicit
+image/manifest pins and trusted descriptors before a fresh Manager workflow;
+its presence does not establish a successful qualification run.
+
+CI [37356657538](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37356657538)
+for `410c327` passed formatting, documentation and tooling checks, then stopped
+on one strict Clippy `map_or` diagnostic in `swarm-bus`. This update fixes that
+diagnostic and adds the source wiring above. Its compiler and native acceptance
+remain pending; no local full build, provider call or Codex restart was performed.
+
 ### PR #25 Forge, ScriptRun and explicit native readback — 2026-10-05
 
 Forge Git/GitHub effects now use a separate one-shot `swarm-forge-worker`

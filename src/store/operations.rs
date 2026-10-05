@@ -3258,6 +3258,9 @@ pub(super) fn cancel(
     if count != 1 {
         return Err(Error::conflict("operation changed before cancellation"));
     }
+    if o["method"] == "script.run" {
+        super::scripts::record_operation_cancelled_tx(tx, target, now)?;
+    }
     super::capacity::sync_operation(tx, target, now)?;
     if let Some(attempt_id) = o["attempt_id"].as_str() {
         super::capacity::sync_attempt(tx, attempt_id, now)?;

@@ -814,8 +814,13 @@ fn next_internal(
     }
     let input_status_result =
         method == "agent.result" && input["selector"]["kind"] == "input_status";
-    let target_input_sha256 = if method == "agent.reconcile" || input_status_result {
-        let target_id = if input_status_result {
+    let antigravity_status_result =
+        method == "agent.result" && input["selector"]["kind"] == "antigravity_status";
+    let target_input_sha256 = if method == "agent.reconcile"
+        || input_status_result
+        || antigravity_status_result
+    {
+        let target_id = if input_status_result || antigravity_status_result {
             model::text(&input["selector"], "input_operation_id")?
         } else {
             model::text(&input, "operation_id")?
@@ -837,16 +842,32 @@ fn next_internal(
                 "input_status must name an exact dispatch or send Operation",
             ));
         }
-        let raw: String = tx.query_row(
-            "SELECT original_request_json FROM operations WHERE operation_id=?1 AND binding_id=?2 AND binding_generation=?3",
-            params![target_id, id, generation],
-            |row| row.get(0),
-        ).optional()?.ok_or_else(|| Error::new(
-            "FORBIDDEN",
-            "readback target is not an operation on this binding generation",
-        ))?;
-        let target_request: Value = serde_json::from_str(&raw)?;
-        Some(model::digest(model::canonical(&target_request)?.as_bytes()))
+        if antigravity_status_result {
+            if b["route"]["runtime"] != "antigravity" {
+                return Err(Error::new(
+                    "RESULT_TARGET_SCOPE_INVALID",
+                    "Antigravity status is unavailable for this runtime",
+                ));
+            }
+            let session_id = model::text(&input["selector"], "session_id")?;
+            let snapshot = super::results::antigravity_status_snapshot(
+                &tx, &id, generation, &b, target_id, session_id,
+            )?;
+            let digest = model::text(&snapshot, "target_input_sha256")?.to_owned();
+            input["target_operation_status"] = snapshot;
+            Some(digest)
+        } else {
+            let raw: String = tx.query_row(
+                "SELECT original_request_json FROM operations WHERE operation_id=?1 AND binding_id=?2 AND binding_generation=?3",
+                params![target_id, id, generation],
+                |row| row.get(0),
+            ).optional()?.ok_or_else(|| Error::new(
+                "FORBIDDEN",
+                "readback target is not an operation on this binding generation",
+            ))?;
+            let target_request: Value = serde_json::from_str(&raw)?;
+            Some(model::digest(model::canonical(&target_request)?.as_bytes()))
+        }
     } else {
         None
     };
@@ -3214,6 +3235,24 @@ fn user_command_with_actor(
     }
     if method == "agent.result" && v["selector"].as_object().is_none_or(|o| o.is_empty()) {
         return Err(Error::invalid("result selector object required"));
+    }
+    if method == "agent.result"
+        && b["route"]["runtime"] == "antigravity"
+        && b["observation"]["module_contract_selector"].is_object()
+    {
+        model::fields(
+            &v["selector"],
+            &["kind", "input_operation_id", "session_id"],
+        )?;
+        if v["selector"]["kind"] != "antigravity_status" {
+            return Err(Error::new(
+                "RESULT_SELECTOR_UNSUPPORTED",
+                "strict Antigravity supports only bounded Operation status pages",
+            ));
+        }
+        let target_id = model::text(&v["selector"], "input_operation_id")?;
+        let session_id = model::text(&v["selector"], "session_id")?;
+        super::results::antigravity_status_snapshot(tx, id, generation, b, target_id, session_id)?;
     }
     if method == "agent.result" && crate::runtime::batch::is_sessionless_route(&b["route"]) {
         let target = operations::get_operation(tx, model::text(&v["selector"], "operation_id")?)?;

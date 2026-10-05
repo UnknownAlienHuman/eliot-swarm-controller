@@ -12,6 +12,7 @@ mod automation_publication;
 pub(crate) mod automation_repair;
 mod automation_transfer;
 pub(crate) mod automation_work_dispatch;
+pub(crate) mod bus_kernel;
 #[cfg(test)]
 mod c33_restart_diagnosis_fixture;
 #[cfg(test)]
@@ -39,12 +40,14 @@ mod launcher_mcp_tools;
 mod launcher_native_mcp;
 mod launcher_owned_service;
 mod launcher_participant;
+mod legacy_worker_demand;
 mod message_batch;
 #[cfg(test)]
 mod module_bridge_recovery_tests;
 mod module_credential;
 pub(crate) use module_credential::ProvisionedModuleCredential;
 pub(crate) mod module_demand;
+pub(crate) use legacy_worker_demand::LegacyWorkerDemand;
 mod module_handshake;
 mod module_supervisor_observation;
 mod native_mcp;
@@ -261,6 +264,45 @@ impl Store {
     ) -> Result<module_demand::ModuleDemandSnapshot> {
         self.run(move |db| module_demand::pending(db, cursor.as_ref()))
             .await
+    }
+
+    /// One bounded demand snapshot for all legacy host reconcilers. The
+    /// listener and Store remain live while disabled workers stay unspawned.
+    pub(crate) fn subscribe_legacy_worker_demand_changes(&self) -> watch::Receiver<u64> {
+        self.changed.subscribe()
+    }
+
+    pub(crate) async fn legacy_worker_demand_snapshot(&self) -> Result<LegacyWorkerDemand> {
+        let config = self.config.clone();
+        self.run(move |db| legacy_worker_demand::snapshot(db, &config))
+            .await
+    }
+
+    /// Persist only a fixed worker name/state/error code. `host.status` exposes
+    /// this bounded readback; a failed Store write is never reported delivered.
+    pub(crate) async fn record_legacy_worker_status(
+        &self,
+        name: &'static str,
+        state: &'static str,
+        consecutive_failures: u32,
+        error_code: Option<String>,
+        retry_in_ms: Option<u64>,
+    ) -> Result<()> {
+        self.run(move |db| {
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            host_lifecycle::update_optional_worker(
+                &tx,
+                name,
+                state,
+                consecutive_failures,
+                error_code.as_deref(),
+                retry_in_ms,
+                model::now_ms()?,
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
     }
 
     /// Trusted status readback before releasing a stale scope's final demand lease.
@@ -1014,6 +1056,7 @@ impl Store {
                 | "agent.recover"
                 | "host.mode"
                 | "module.outcome"
+                | "bus.consumer.admit"
                 | "automation.config.apply"
                 | "automation.config.transfer"
                 | "review.assign"
@@ -1034,9 +1077,13 @@ impl Store {
                     return match method.as_str() {
                         "module.outcome" => runtime::outcome(db, &principal, &params),
                         "module.observe" => runtime::observe(db, &principal, &params),
+                        "bus.events.page" => {
+                            bus_kernel::read(db, &principal, &method, &params, &config)
+                        }
+                        "bus.consumer.admit" => mutate(db, &principal, &method, &params, &config),
                         _ => Err(Error::new(
                             "FORBIDDEN",
-                            "module credentials serve only their native binding",
+                            "module credentials serve only their explicitly scoped methods",
                         )),
                     };
                 }
@@ -1267,6 +1314,24 @@ impl Store {
                 return Err(Error::new(
                     "RESULT_PROVENANCE_INVALID",
                     "input status bytes do not match the validated source metadata",
+                ));
+            }
+        } else if metadata["selector"]["kind"] == "antigravity_status" {
+            let status_bytes = results::antigravity_status_page_bytes(&metadata)?;
+            let offset = usize::try_from(page.offset_bytes)
+                .map_err(|_| Error::invalid("result offset is too large"))?;
+            let length = usize::try_from(page.byte_length)
+                .map_err(|_| Error::invalid("result length is too large"))?;
+            let end = offset
+                .checked_add(length)
+                .ok_or_else(|| Error::invalid("result byte range overflow"))?;
+            if page.total_bytes != status_bytes.len() as u64
+                || end > status_bytes.len()
+                || bytes.as_slice() != &status_bytes[offset..end]
+            {
+                return Err(Error::new(
+                    "RESULT_PROVENANCE_INVALID",
+                    "Antigravity status bytes do not match the validated Operation receipt",
                 ));
             }
         }
@@ -1872,6 +1937,7 @@ fn is_read(method: &str) -> bool {
             | "coordination.contract_card.list"
             | "coordination.inbox"
             | "coordination.watch.list"
+            | "bus.events.page"
             | "review.get"
             | "review.list"
             | "swarm.review.context"
@@ -3034,11 +3100,11 @@ fn mcp_authorization(db: &Connection, p: &Principal, value: &Value) -> Result<Va
         }
         Role::Operator => {
             require_local_operator(db, &p.client_id)?;
-            allowed.extend(
-                methods.into_iter().filter(|method| {
-                    !participant_only_mutation(method) && *method != "review.submit"
-                }),
-            );
+            allowed.extend(methods.into_iter().filter(|method| {
+                !participant_only_mutation(method)
+                    && *method != "review.submit"
+                    && !method.starts_with("bus.")
+            }));
         }
         Role::Manager => {
             let gm_authority = gm::require_authority(db, p).is_ok();
@@ -3083,6 +3149,7 @@ fn mcp_authorization(db: &Connection, p: &Principal, value: &Value) -> Result<Va
                 && !method.starts_with("script.")
                 && !method.starts_with("goal.")
                 && !method.starts_with("hook.")
+                && !method.starts_with("bus.")
                 && !method.starts_with("github.")
         })),
         Role::Module | Role::Scheduler | Role::HookSource => {
@@ -3129,6 +3196,7 @@ fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config
         | "coordination.contract_card.list"
         | "coordination.inbox" => coordination::read(db, p, method, v),
         "coordination.watch.list" => coordination_watch::read(db, p, v),
+        "bus.events.page" => bus_kernel::read(db, p, method, v, config),
         "review.get" | "review.list" | "swarm.review.context" => reviews::read(db, p, method, v),
         "automation.config.get" => automation::get(db, p, v),
         "automation.config.preview" => automation::preview(db, p, v),
@@ -4601,6 +4669,9 @@ fn apply(
         "swarm.launch" => launcher::launch(tx, p, v, config, id, now),
         "coordination.watch.create" | "coordination.watch.cancel" => {
             coordination_watch::apply(tx, p, method, v, id, now)
+        }
+        "bus.consumer.register" | "bus.consumer.revoke" | "bus.consumer.admit" => {
+            bus_kernel::apply(tx, p, method, v, id, config, now)
         }
         "coordination.participant.register"
         | "coordination.participant.disable"

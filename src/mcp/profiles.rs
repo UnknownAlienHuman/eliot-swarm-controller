@@ -142,6 +142,8 @@ pub(super) fn allows_method(profile: McpToolProfile, method: &str) -> bool {
                 | "automation.config.apply"
                 | "automation.config.transfer"
                 | "automation.config.explain"
+                | "bus.events.page"
+                | "bus.consumer.admit"
                 | "schedule.run_now"
                 | "hook.source.get"
                 | "hook.source.revoke"

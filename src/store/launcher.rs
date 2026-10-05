@@ -2728,6 +2728,7 @@ fn launch_route_projection(
 fn launch_mcp_profile_projection(
     db: &Connection,
     config: &Config,
+    actor: &LaunchActor,
     request: &launcher::LaunchPreviewRequest,
     hard_blocks: &mut Vec<&'static str>,
 ) -> Result<Value> {
@@ -2740,26 +2741,28 @@ fn launch_mcp_profile_projection(
         }));
     };
     let role = profile.tool_profile;
-    let narrow_role = matches!(
-        role,
-        McpToolProfile::Participant | McpToolProfile::AssignedReviewer
-    );
-    if !narrow_role {
+    let manager_translation = role == McpToolProfile::Manager
+        && actor.role() == Role::Manager
+        && profile.expected_client_id == actor.effective_manager_id();
+    let launch_participant = role == McpToolProfile::Participant || manager_translation;
+    let assigned_reviewer = role == McpToolProfile::AssignedReviewer;
+    if !launch_participant && !assigned_reviewer {
         hard_blocks.push("mcp_profile_is_not_a_narrow_assignment_role");
     }
-    if role == McpToolProfile::AssignedReviewer && request.purpose != "review" {
+    if assigned_reviewer && request.purpose != "review" {
         hard_blocks.push("assigned_reviewer_profile_requires_review_purpose");
     }
-    if role == McpToolProfile::Participant && request.purpose == "review" {
+    if launch_participant && request.purpose == "review" {
         hard_blocks.push("review_purpose_requires_assigned_reviewer_profile");
     }
 
-    // Ordinary work profiles are templates. Their expected identity becomes
-    // the freshly issued, exact assignment identity in a private profile;
-    // requiring that future Participant now would prevent initial launch.
-    let identity_state = if role == McpToolProfile::Participant {
+    // An exact Manager profile can select launch work, but never supplies the
+    // native role surface. The fresh Participant receives only the explicitly
+    // requested Participant surface, with no inherited Manager groups or
+    // manual methods.
+    let identity_state = if launch_participant {
         "assignment_template"
-    } else {
+    } else if assigned_reviewer {
         let identity = meta(db, &format!("client:{}", profile.expected_client_id))?;
         let state = match identity.as_ref() {
             None => "not_registered",
@@ -2771,20 +2774,38 @@ fn launch_mcp_profile_projection(
             hard_blocks.push("configured_mcp_identity_is_not_an_enabled_participant");
         }
         state
+    } else {
+        "not_applicable"
     };
 
-    if profile
-        .surface
-        .as_deref()
-        .is_some_and(|configured| configured != request.mcp_surface)
+    if !manager_translation
+        && profile
+            .surface
+            .as_deref()
+            .is_some_and(|configured| configured != request.mcp_surface)
     {
         hard_blocks.push("requested_mcp_surface_differs_from_configured_profile_surface");
     }
+    let target_role = if manager_translation {
+        McpToolProfile::Participant
+    } else {
+        role
+    };
+    let target_groups = if manager_translation {
+        &[][..]
+    } else {
+        profile.deferred_groups.as_slice()
+    };
+    let target_manual_tools = if manager_translation {
+        &[][..]
+    } else {
+        profile.manual_tools.as_slice()
+    };
     let surface = match crate::mcp::launch_profile_surface(
-        role,
+        target_role,
         &request.mcp_surface,
-        &profile.deferred_groups,
-        &profile.manual_tools,
+        target_groups,
+        target_manual_tools,
     ) {
         Ok(surface) => surface,
         Err(error) if error.code == "INVALID_PARAMS" => {
@@ -2792,7 +2813,7 @@ fn launch_mcp_profile_projection(
             json!({
                 "status":"invalid_for_profile",
                 "profile_name":request.mcp_profile,
-                "hard_profile":role,
+                "hard_profile":target_role,
                 "surface":request.mcp_surface,
             })
         }
@@ -2801,9 +2822,9 @@ fn launch_mcp_profile_projection(
     Ok(json!({
         "status":if surface["surface_id"].is_string() {"validated_against_static_catalog"} else {"invalid_for_profile"},
         "profile_name":request.mcp_profile,
-        "hard_profile":role,
+        "hard_profile":target_role,
         "identity":{"status":identity_state,"role":"participant"},
-        "credential_issuance":if role == McpToolProfile::Participant {"required_per_launch"} else {"existing_review_assignment_required"},
+        "credential_issuance":if launch_participant {"required_per_launch"} else {"existing_review_assignment_required"},
         "surface":request.mcp_surface,
         "surface_facts":surface,
         "runtime_loaded":"unknown",
@@ -4820,7 +4841,7 @@ fn launch_preview_inner(
     }
 
     let route = launch_route_projection(config, &request, &mut hard_blocks, &mut gaps);
-    let mcp_profile = launch_mcp_profile_projection(db, config, &request, &mut hard_blocks)?;
+    let mcp_profile = launch_mcp_profile_projection(db, config, actor, &request, &mut hard_blocks)?;
     let baseline = workspace_baseline_projection(db, &row, spec.as_ref())?;
     if baseline["status"] == "unverifiable" {
         hard_blocks.push("pinned_baseline_commit_not_proven");

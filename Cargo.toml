@@ -31,6 +31,7 @@ reqwest = { version = "=0.13.5", default-features = false, features = ["json", "
 rmcp = { version = "=3.5.0", default-features = false, features = ["server", "transport-io", "transport-streamable-http-server"] }
 rusqlite = { version = "=0.40.2", features = ["bundled"] }
 swarm-client = { path = "crates/swarm-client" }
+swarm-bus = { path = "crates/swarm-bus" }
 swarm-contracts = { path = "crates/swarm-contracts" }
 swarm-kernel = { path = "crates/swarm-kernel" }
 swarm-process = { path = "crates/swarm-process" }

@@ -10,6 +10,7 @@ pub mod ipc;
 pub mod launch;
 pub mod module_receipt;
 pub mod process;
+pub mod result_page;
 pub mod stderr;
 pub mod stream;
 pub mod wire;

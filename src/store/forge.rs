@@ -131,6 +131,29 @@ struct NativeWorkerRun {
     _process_permit: tokio::sync::OwnedSemaphorePermit,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerResultStatus {
+    Present,
+    Missing,
+    Malformed,
+}
+
+impl WorkerResultStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Present => "present",
+            Self::Missing => "missing",
+            Self::Malformed => "malformed",
+        }
+    }
+}
+
+enum RetainedWorkerFile {
+    Missing,
+    OverLimit,
+    Bytes(Vec<u8>),
+}
+
 #[derive(Debug, Clone)]
 struct ForgeWork {
     intent: PublicationIntent,
@@ -1226,7 +1249,7 @@ fn dispatch_authorized(
         "owner":owner_record
     });
     let changed = db.execute(
-        "UPDATE operations SET result_json=json_set(COALESCE(result_json,'{}'),'$.publication_may_have_started',json('true'),'$.native_worker',json(?2)),updated_at_ms=?3 WHERE operation_id=?1 AND method='forge.publish_ref' AND state='sending'",
+        "UPDATE operations SET result_json=json_remove(json_set(COALESCE(result_json,'{}'),'$.publication_may_have_started',json('true'),'$.native_worker',json(?2)),'$.native_worker_result','$.native_worker_recovery'),updated_at_ms=?3 WHERE operation_id=?1 AND method='forge.publish_ref' AND state='sending'",
         params![
             &work.intent.operation_id,
             model::canonical(&worker_receipt)?,
@@ -1522,6 +1545,59 @@ fn create_github_description_worker_job(
     })
 }
 
+fn read_worker_bytes(path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
+    reject_forge_link(path)?;
+    let file = fs::File::open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > max_bytes {
+        return Err(Error::new(
+            "FORGE_WORKER_EVIDENCE_INVALID",
+            "retained Forge worker evidence exceeds its bounded envelope",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(max_bytes + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(Error::new(
+            "FORGE_WORKER_EVIDENCE_INVALID",
+            "retained Forge worker evidence exceeds its bounded envelope",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn read_worker_bytes_optional(path: &Path, max_bytes: u64) -> Result<RetainedWorkerFile> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(RetainedWorkerFile::Missing);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    reject_forge_link(path)?;
+    if !metadata.is_file() {
+        return Err(Error::new(
+            "FORGE_WORKER_EVIDENCE_INVALID",
+            "retained Forge worker result is not a regular private file",
+        ));
+    }
+    if metadata.len() > max_bytes {
+        return Ok(RetainedWorkerFile::OverLimit);
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    match fs::File::open(path) {
+        Ok(file) => file.take(max_bytes + 1).read_to_end(&mut bytes)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(RetainedWorkerFile::Missing);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if bytes.len() as u64 > max_bytes {
+        return Ok(RetainedWorkerFile::OverLimit);
+    }
+    Ok(RetainedWorkerFile::Bytes(bytes))
+}
+
 fn read_worker_json(path: &Path, max_bytes: u64) -> Result<Value> {
     reject_forge_link(path)?;
     let file = fs::File::open(path)?;
@@ -1803,11 +1879,32 @@ fn valid_worker_uuid(value: &str) -> bool {
             .all(|(index, byte)| [8, 13, 18, 23].contains(&index) || byte.is_ascii_hexdigit())
 }
 
-fn validate_github_worker_readback_receipt(
+fn validate_worker_result_scope(operation: &Value, receipt: &Value, result: &Value) -> Result<()> {
+    for (field, expected) in [
+        ("kind", &receipt["kind"]),
+        ("job_id", &receipt["job_id"]),
+        ("operation_id", &operation["operation_id"]),
+        ("owner_token", &receipt["owner_token"]),
+        ("plan_sha256", &receipt["plan_sha256"]),
+        ("phase", &receipt["phase"]),
+    ] {
+        if let Some(actual) = result.get(field)
+            && actual != expected
+        {
+            return Err(Error::new(
+                "FORGE_WORKER_RESULT_SCOPE_MISMATCH",
+                "retained worker result identifies a different operation or process owner",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn classify_worker_result(
     operation: &Value,
     receipt: &Value,
-    result: &Value,
-) -> Result<()> {
+    retained: RetainedWorkerFile,
+) -> Result<WorkerResultStatus> {
     const RESULT_FIELDS: [&str; 17] = [
         "schema_version",
         "kind",
@@ -1827,16 +1924,38 @@ fn validate_github_worker_readback_receipt(
         "process_tree_empty",
         "process_tree_unconfirmed",
     ];
-    let fields = result.as_object().ok_or_else(|| {
-        Error::new(
-            "FORGE_GIT_TREE_TERMINATION",
-            "retained GitHub worker result is invalid",
-        )
-    })?;
+    let stored = operation["result"].get("native_worker_result");
+    if let Some(stored_result) = stored
+        && stored_result.is_object()
+    {
+        validate_worker_result_scope(operation, receipt, stored_result)?;
+    } else if stored.is_some() {
+        return Ok(WorkerResultStatus::Malformed);
+    }
+    let bytes = match retained {
+        RetainedWorkerFile::Missing => return Ok(WorkerResultStatus::Missing),
+        RetainedWorkerFile::OverLimit => return Ok(WorkerResultStatus::Malformed),
+        RetainedWorkerFile::Bytes(bytes) => bytes,
+    };
+    let result: Value = match serde_json::from_slice(&bytes) {
+        Ok(result) => result,
+        Err(_) => return Ok(WorkerResultStatus::Malformed),
+    };
+    let Some(fields) = result.as_object() else {
+        return Ok(WorkerResultStatus::Malformed);
+    };
+    validate_worker_result_scope(operation, receipt, &result)?;
+    if let Some(stored_result) = stored
+        && stored_result.is_object()
+        && model::canonical(stored_result)? != model::canonical(&result)?
+    {
+        return Ok(WorkerResultStatus::Malformed);
+    }
+    let kind = receipt["kind"].as_str().unwrap_or_default();
     let reason = result.get("reason").and_then(Value::as_str).unwrap_or("");
     let authorized = result.get("authorized").and_then(Value::as_bool);
-    let authorized_outcome_valid = match authorized {
-        Some(true) => {
+    let outcome_valid = match (kind, authorized) {
+        ("github_pr_description", Some(true)) => {
             result["outcome"] == "unknown"
                 && matches!(
                     reason,
@@ -1848,27 +1967,53 @@ fn validate_github_worker_readback_receipt(
                         | "github_cli_image_changed"
                 )
         }
-        Some(false) => {
+        ("github_pr_description", Some(false)) => {
             (result["outcome"] == "not_authorized" && reason == "authorization_denied")
                 || (result["outcome"] == "unknown" && reason == "authorization_not_received")
         }
-        None => false,
+        ("forge_publish", Some(true)) => {
+            matches!(
+                result["outcome"].as_str(),
+                Some("applied" | "failed" | "unknown")
+            )
+        }
+        ("forge_publish", Some(false)) => {
+            (result["outcome"] == "not_authorized" && reason == "authorization_denied")
+                || (result["outcome"] == "unknown" && reason == "authorization_not_received")
+        }
+        _ => false,
+    };
+    let ref_valid = match kind {
+        "github_pr_description" => result["remote_ref"].is_null(),
+        "forge_publish" => {
+            result["remote_ref"].is_null() || worker_ref_readback(&result["remote_ref"]).is_some()
+        }
+        _ => false,
+    };
+    let phase_valid = match kind {
+        "github_pr_description" => receipt["phase"] == "patch_once",
+        "forge_publish" => matches!(
+            receipt["phase"].as_str(),
+            Some("push_once" | "readback_only")
+        ),
+        _ => false,
     };
     let result_matches = fields.len() == RESULT_FIELDS.len()
         && RESULT_FIELDS
             .iter()
             .all(|field| fields.contains_key(*field))
         && result["schema_version"] == 1
-        && result["kind"] == "github_pr_description"
+        && result["kind"] == receipt["kind"]
         && result["job_id"] == receipt["job_id"]
         && result["operation_id"] == operation["operation_id"]
         && result["owner_token"] == receipt["owner_token"]
         && result["plan_sha256"] == receipt["plan_sha256"]
-        && result["phase"] == "patch_once"
-        && authorized_outcome_valid
-        && result["remote_ref"].is_null()
-        && result["process_tree_empty"] == true
-        && result["process_tree_unconfirmed"] == false
+        && result["phase"] == receipt["phase"]
+        && phase_valid
+        && outcome_valid
+        && ref_valid
+        && result["process_tree_empty"].is_boolean()
+        && result["process_tree_unconfirmed"].is_boolean()
         && result["timed_out"].is_boolean()
         && (result["stderr_sha256"].is_null()
             || result["stderr_sha256"]
@@ -1876,19 +2021,109 @@ fn validate_github_worker_readback_receipt(
                 .is_some_and(valid_worker_digest))
         && (result["stderr_bytes"].is_null() || result["stderr_bytes"].is_u64())
         && (result["push_exit_code"].is_null() || result["push_exit_code"].is_i64());
-    if !result_matches {
-        return Err(Error::new(
-            "FORGE_GIT_TREE_TERMINATION",
-            "retained GitHub worker result does not prove exact completed process ownership",
-        ));
+    if result_matches {
+        Ok(WorkerResultStatus::Present)
+    } else {
+        Ok(WorkerResultStatus::Malformed)
     }
-    if let Some(stored_result) = operation["result"].get("native_worker_result")
-        && model::canonical(stored_result)? != model::canonical(result)?
-    {
-        return Err(Error::new(
-            "FORGE_GIT_TREE_TERMINATION",
-            "retained GitHub worker result differs from its manager readback",
-        ));
+}
+
+fn worker_plan_scope_error() -> Error {
+    Error::new(
+        "FORGE_WORKER_PLAN_SCOPE_MISMATCH",
+        "retained worker plan does not match its durable operation and worker receipt",
+    )
+}
+
+fn validate_forge_worker_plan(
+    db: &Connection,
+    operation: &Value,
+    receipt: &Value,
+    plan: &Value,
+) -> Result<()> {
+    const PLAN_FIELDS: [&str; 12] = [
+        "schema_version",
+        "kind",
+        "job_id",
+        "operation_id",
+        "owner_token",
+        "phase",
+        "intent",
+        "git_executable",
+        "timeout_seconds",
+        "max_output_bytes",
+        "project",
+        "push_endpoint",
+    ];
+    const PROJECT_FIELDS: [&str; 5] = [
+        "canonical_repository",
+        "repository_path",
+        "remote_name",
+        "policy_revision",
+        "target_refs",
+    ];
+    let fields = plan.as_object().ok_or_else(worker_plan_scope_error)?;
+    let project_fields = plan["project"]
+        .as_object()
+        .ok_or_else(worker_plan_scope_error)?;
+    let operation_id = operation["operation_id"]
+        .as_str()
+        .ok_or_else(worker_plan_scope_error)?;
+    let intent = saved_intent(db, operation_id).map_err(|_| worker_plan_scope_error())?;
+    let expected_intent = serde_json::to_value(&intent).map_err(|_| worker_plan_scope_error())?;
+    let intent_matches = match (
+        model::canonical(&plan["intent"]),
+        model::canonical(&expected_intent),
+    ) {
+        (Ok(actual), Ok(expected)) => actual == expected,
+        _ => false,
+    };
+    let expected_phase = receipt["phase"]
+        .as_str()
+        .ok_or_else(worker_plan_scope_error)?;
+    let target_refs = plan["project"]["target_refs"]
+        .as_array()
+        .ok_or_else(worker_plan_scope_error)?;
+    let phase_endpoint_valid = match expected_phase {
+        "push_once" => plan["push_endpoint"].as_str().is_some(),
+        "readback_only" => plan["push_endpoint"].is_null(),
+        _ => false,
+    };
+    let plan_matches = operation["method"] == "forge.publish_ref"
+        && matches!(
+            operation["state"].as_str(),
+            Some("sending" | "outcome_unknown")
+        )
+        && fields.len() == PLAN_FIELDS.len()
+        && PLAN_FIELDS.iter().all(|field| fields.contains_key(*field))
+        && project_fields.len() == PROJECT_FIELDS.len()
+        && PROJECT_FIELDS
+            .iter()
+            .all(|field| project_fields.contains_key(*field))
+        && plan["schema_version"] == 1
+        && plan["kind"] == "forge_publish"
+        && plan["job_id"] == receipt["job_id"]
+        && plan["operation_id"] == operation_id
+        && plan["owner_token"] == receipt["owner_token"]
+        && plan["phase"] == receipt["phase"]
+        && intent_matches
+        && plan["git_executable"]
+            .as_str()
+            .is_some_and(|path| Path::new(path).is_absolute())
+        && (1..=900).contains(&plan["timeout_seconds"].as_u64().unwrap_or_default())
+        && (1..=256 * 1024).contains(&plan["max_output_bytes"].as_u64().unwrap_or_default())
+        && plan["project"]["canonical_repository"] == intent.canonical_repository
+        && plan["project"]["remote_name"] == intent.remote_name
+        && plan["project"]["policy_revision"] == intent.policy_revision
+        && plan["project"]["repository_path"]
+            .as_str()
+            .is_some_and(|path| Path::new(path).is_absolute())
+        && target_refs
+            .iter()
+            .any(|target_ref| target_ref == &Value::String(intent.target_ref.clone()))
+        && phase_endpoint_valid;
+    if !plan_matches {
+        return Err(worker_plan_scope_error());
     }
     Ok(())
 }
@@ -2485,6 +2720,9 @@ fn finish(db: &mut Connection, id: &str, outcome: ForgeOutcome) -> Result<()> {
         json!(publication_may_have_started(&operation["result"]));
     if let Some(worker_receipt) = operation["result"].get("native_worker") {
         result["native_worker"] = worker_receipt.clone();
+    }
+    if let Some(recovery) = operation["result"].get("native_worker_recovery") {
+        result["native_worker_recovery"] = recovery.clone();
     }
     preserve_process_tree_hold(&operation["result"], &mut result, &mut state);
     if state == "settled" && !matches!(outcome, ForgeOutcome::Coalesced { .. }) {
@@ -3751,13 +3989,17 @@ impl super::Store {
         let outcome = if work.mode == WorkMode::ReadbackOnly {
             match self.prior_native_worker_departed(&id).await {
                 Ok(()) => self.run_forge_worker(&work, None).await,
-                Err(_) => ForgeOutcome::Unknown {
-                    reason: "git_process_tree_unconfirmed",
+                Err(error) => ForgeOutcome::Unknown {
+                    reason: if error.code == "FORGE_GIT_TREE_TERMINATION" {
+                        "git_process_tree_unconfirmed"
+                    } else {
+                        "worker_recovery_evidence_invalid"
+                    },
                     readback: None,
                     timed_out: false,
-                    stderr_digest: None,
+                    stderr_digest: Some(model::digest(error.code.as_bytes())),
                     stderr_bytes: None,
-                    process_tree_unconfirmed: true,
+                    process_tree_unconfirmed: error.code == "FORGE_GIT_TREE_TERMINATION",
                 },
             }
         } else {
@@ -3913,6 +4155,17 @@ impl super::Store {
     }
 
     pub(super) async fn prior_native_worker_departed(&self, operation_id: &str) -> Result<()> {
+        match self.prior_native_worker_departed_inner(operation_id).await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.record_native_worker_recovery_block(operation_id, &error)
+                    .await?;
+                Err(error)
+            }
+        }
+    }
+
+    async fn prior_native_worker_departed_inner(&self, operation_id: &str) -> Result<()> {
         let id = operation_id.to_owned();
         let operation = self
             .run(move |db| operations::get_operation(db, &id))
@@ -3932,6 +4185,18 @@ impl super::Store {
             .get("owner")
             .filter(|owner| {
                 receipt_fields.len() == 8
+                    && [
+                        "version",
+                        "kind",
+                        "job_id",
+                        "operation_id",
+                        "phase",
+                        "owner_token",
+                        "plan_sha256",
+                        "owner",
+                    ]
+                    .iter()
+                    .all(|field| receipt_fields.contains_key(*field))
                     && receipt["version"] == 1
                     && matches!(
                         receipt.get("kind").and_then(Value::as_str),
@@ -3951,6 +4216,12 @@ impl super::Store {
                         .get("plan_sha256")
                         .and_then(Value::as_str)
                         .is_some_and(valid_worker_digest)
+                    && owner.as_object().is_some_and(|fields| {
+                        fields.len() == 3
+                            && fields.contains_key("version")
+                            && fields.contains_key("token")
+                            && fields.contains_key("process")
+                    })
                     && owner["version"] == 1
                     && owner["token"] == owner_token
                     && owner["process"]["purpose"] == "module"
@@ -3962,45 +4233,260 @@ impl super::Store {
                 "previous Forge worker process family remains active",
             ));
         }
-        if receipt["kind"] == "github_pr_description" {
-            if receipt
-                .get("process_tree_unconfirmed")
-                .and_then(Value::as_bool)
-                == Some(true)
-            {
-                return Err(Error::new(
-                    "FORGE_GIT_TREE_TERMINATION",
-                    "previous GitHub worker recorded an unconfirmed process family",
-                ));
+        let job_id = receipt["job_id"]
+            .as_str()
+            .ok_or_else(|| Error::new("FORGE_GIT_TREE_TERMINATION", "worker job ID is absent"))?
+            .to_owned();
+        let data_dir = self.data_dir.clone();
+        let owner_directory = job_id;
+        let (plan_bytes, result_file) = self
+            .file_io(move |_| {
+                let data_dir = data_dir.canonicalize().map_err(|_| {
+                    Error::new(
+                        "FORGE_WORKER_EVIDENCE_UNAVAILABLE",
+                        "retained worker evidence is unavailable",
+                    )
+                })?;
+                let jobs_root = data_dir.join("forge-worker-runs");
+                reject_forge_link(&jobs_root).map_err(|_| {
+                    Error::new(
+                        "FORGE_WORKER_EVIDENCE_INVALID",
+                        "retained worker evidence path is invalid",
+                    )
+                })?;
+                let jobs_root = jobs_root.canonicalize().map_err(|_| {
+                    Error::new(
+                        "FORGE_WORKER_EVIDENCE_UNAVAILABLE",
+                        "retained worker evidence is unavailable",
+                    )
+                })?;
+                let job_directory = jobs_root.join(owner_directory);
+                reject_forge_link(&job_directory).map_err(|_| {
+                    Error::new(
+                        "FORGE_WORKER_EVIDENCE_INVALID",
+                        "retained worker evidence path is invalid",
+                    )
+                })?;
+                let job_directory = job_directory.canonicalize().map_err(|_| {
+                    Error::new(
+                        "FORGE_WORKER_EVIDENCE_UNAVAILABLE",
+                        "retained worker evidence is unavailable",
+                    )
+                })?;
+                if !job_directory.starts_with(&jobs_root) {
+                    return Err(Error::new(
+                        "FORGE_WORKER_EVIDENCE_INVALID",
+                        "retained worker evidence escaped its private state root",
+                    ));
+                }
+                let plan_bytes = read_worker_bytes(&job_directory.join("plan.json"), 1_048_576)
+                    .map_err(|_| {
+                        Error::new(
+                            "FORGE_WORKER_EVIDENCE_UNAVAILABLE",
+                            "retained worker plan is unavailable",
+                        )
+                    })?;
+                let result_file =
+                    read_worker_bytes_optional(&job_directory.join("result.json"), 262_144)
+                        .map_err(|_| {
+                            Error::new(
+                                "FORGE_WORKER_EVIDENCE_INVALID",
+                                "retained worker result file is invalid",
+                            )
+                        })?;
+                Ok((plan_bytes, result_file))
+            })
+            .await?;
+        let retained_plan_digest = model::digest(&plan_bytes);
+        if receipt["plan_sha256"].as_str() != Some(retained_plan_digest.as_str()) {
+            return Err(worker_plan_scope_error());
+        }
+        let plan: Value = serde_json::from_slice(&plan_bytes).map_err(|_| {
+            Error::new(
+                "FORGE_WORKER_PLAN_SCOPE_MISMATCH",
+                "retained worker plan is not valid JSON",
+            )
+        })?;
+        match receipt["kind"].as_str() {
+            Some("forge_publish") => {
+                let operation = operation.clone();
+                let receipt = receipt.clone();
+                self.run(move |db| validate_forge_worker_plan(db, &operation, &receipt, &plan))
+                    .await?;
             }
-            let job_id = receipt["job_id"]
-                .as_str()
-                .ok_or_else(|| Error::invalid("GitHub worker job ID is absent"))?
-                .to_owned();
-            let data_dir = self.data_dir.clone();
-            let owner_directory = job_id;
-            let result = self
-                .file_io(move |_| {
-                    let data_dir = data_dir.canonicalize()?;
-                    let jobs_root = data_dir.join("forge-worker-runs");
-                    reject_forge_link(&jobs_root)?;
-                    let jobs_root = jobs_root.canonicalize()?;
-                    let job_directory = jobs_root.join(owner_directory);
-                    reject_forge_link(&job_directory)?;
-                    let job_directory = job_directory.canonicalize()?;
-                    if !job_directory.starts_with(&jobs_root) {
-                        return Err(Error::new(
-                            "FORGE_GIT_TREE_TERMINATION",
-                            "GitHub worker result path escaped its private state root",
-                        ));
-                    }
-                    let result_path = job_directory.join("result.json");
-                    read_worker_json(&result_path, 262_144)
+            Some("github_pr_description") => {
+                let operation = operation.clone();
+                let receipt = receipt.clone();
+                self.run(move |db| {
+                    super::github_pr_effects::validate_retained_worker_plan(
+                        db, &operation, &receipt, &plan,
+                    )
                 })
                 .await?;
-            validate_github_worker_readback_receipt(&operation, receipt, &result)?;
+            }
+            _ => return Err(worker_plan_scope_error()),
         }
+        let result_status = classify_worker_result(&operation, receipt, result_file)?;
+        self.record_native_worker_recovery_ready(operation_id, receipt, result_status)
+            .await?;
         Ok(())
+    }
+
+    async fn record_native_worker_recovery_ready(
+        &self,
+        operation_id: &str,
+        receipt: &Value,
+        result_status: WorkerResultStatus,
+    ) -> Result<()> {
+        let operation_id = operation_id.to_owned();
+        let receipt = receipt.clone();
+        self.run(move |db| {
+            let now = model::now_ms()?;
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let operation = operations::get_operation(&tx, &operation_id)?;
+            if !matches!(
+                operation["state"].as_str(),
+                Some("sending" | "outcome_unknown")
+            ) || model::canonical(&operation["result"]["native_worker"])?
+                != model::canonical(&receipt)?
+            {
+                return Err(Error::new(
+                    "FORGE_WORKER_RECEIPT_CHANGED",
+                    "the retained worker receipt changed during recovery",
+                ));
+            }
+            let mut result = operation["result"].clone();
+            result["native_worker_recovery"] = json!({
+                "schema_version":1,
+                "status":"readback_permitted",
+                "job_id":receipt["job_id"],
+                "plan_sha256":receipt["plan_sha256"],
+                "process_family":"departed_empty",
+                "worker_result":result_status.as_str(),
+                "recorded_at_ms":now
+            });
+            result["process_tree_unconfirmed"] = json!(false);
+            result["process_tree_status"] = json!("departed_empty");
+            if result["reason"] == "process_tree_unconfirmed" {
+                result["reason"] = json!("exact_remote_readback_required");
+            }
+            if result["publication"] == "operator_intervention_required" {
+                result["publication"] = json!("requires_readback");
+            }
+            if let Some(fields) = result.as_object_mut() {
+                fields.remove("process_tree_cleanup");
+                fields.remove("resolution");
+            }
+            match receipt["kind"].as_str() {
+                Some("forge_publish") => {
+                    result["publication_may_have_started"] = json!(true);
+                }
+                Some("github_pr_description") => {
+                    result["write_attempted"] = json!(true);
+                    result["readback"] = json!("unknown");
+                }
+                _ => return Err(worker_plan_scope_error()),
+            }
+            let changed = tx.execute(
+                "UPDATE operations SET result_json=?2,updated_at_ms=?3 WHERE operation_id=?1 AND state IN ('sending','outcome_unknown')",
+                params![operation_id, model::canonical(&result)?, now],
+            )?;
+            if changed != 1 {
+                return Err(Error::conflict(
+                    "the operation changed while retaining native worker recovery",
+                ));
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn record_native_worker_recovery_block(
+        &self,
+        operation_id: &str,
+        error: &Error,
+    ) -> Result<()> {
+        let operation_id = operation_id.to_owned();
+        let process_family_departed = matches!(
+            error.code.as_str(),
+            "FORGE_WORKER_PLAN_SCOPE_MISMATCH"
+                | "FORGE_WORKER_RESULT_SCOPE_MISMATCH"
+                | "FORGE_WORKER_EVIDENCE_UNAVAILABLE"
+                | "FORGE_WORKER_EVIDENCE_INVALID"
+        );
+        let tree_unconfirmed = !process_family_departed;
+        let reason_code = match error.code.as_str() {
+            "FORGE_WORKER_PLAN_SCOPE_MISMATCH" => "worker_plan_scope_mismatch",
+            "FORGE_WORKER_RESULT_SCOPE_MISMATCH" => "worker_result_scope_mismatch",
+            "FORGE_WORKER_RECEIPT_CHANGED" => "worker_receipt_changed",
+            "FORGE_WORKER_EVIDENCE_UNAVAILABLE" => "worker_evidence_unavailable",
+            "FORGE_WORKER_EVIDENCE_INVALID" => "worker_evidence_invalid",
+            "FORGE_GIT_TREE_TERMINATION" => "owner_or_process_family_unconfirmed",
+            _ => "recovery_evidence_unavailable",
+        };
+        self.run(move |db| {
+            let now = model::now_ms()?;
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let operation = operations::get_operation(&tx, &operation_id)?;
+            if !matches!(
+                operation["method"].as_str(),
+                Some("forge.publish_ref" | "github.pull_request.update_description")
+            ) || !matches!(
+                operation["state"].as_str(),
+                Some("sending" | "outcome_unknown")
+            ) {
+                return Err(Error::conflict(
+                    "the retained native worker Operation is no longer recovery-blocked",
+                ));
+            }
+            let mut result = operation["result"].clone();
+            result["native_worker_recovery"] = json!({
+                "schema_version":1,
+                "status":"blocked",
+                "reason_code":reason_code,
+                "process_family":if tree_unconfirmed { "unconfirmed" } else { "departed_empty" },
+                "retryable":tree_unconfirmed || reason_code == "worker_evidence_unavailable",
+                "recorded_at_ms":now
+            });
+            result["outcome"] = json!("unknown");
+            result["reason"] = json!("native_worker_recovery_blocked");
+            result["current_state_read_method"] = json!("operation.get");
+            result["process_tree_unconfirmed"] = json!(tree_unconfirmed);
+            result["process_tree_status"] = json!(if tree_unconfirmed {
+                "unconfirmed"
+            } else {
+                "departed_empty"
+            });
+            if tree_unconfirmed {
+                result["process_tree_cleanup"] = json!("native_worker_recovery_blocked");
+                result["resolution"] = json!("manual_operator_intervention_required");
+            } else if let Some(fields) = result.as_object_mut() {
+                fields.remove("process_tree_cleanup");
+                fields.remove("resolution");
+            }
+            if operation["method"] == "forge.publish_ref" {
+                result["publication_may_have_started"] = json!(true);
+                result["publication"] = json!("operator_intervention_required");
+            } else {
+                result["write_attempted"] = json!(true);
+                result["readback"] = json!("unknown");
+            }
+            let changed = tx.execute(
+                "UPDATE operations SET state=?2,result_json=?3,settled_at_ms=NULL,updated_at_ms=?4 WHERE operation_id=?1 AND state IN ('sending','outcome_unknown')",
+                params![operation_id, "outcome_unknown", model::canonical(&result)?, now],
+            )?;
+            if changed != 1 {
+                return Err(Error::conflict(
+                    "the operation changed while retaining its recovery block",
+                ));
+            }
+            super::capacity::sync_operation(&tx, &operation_id, now)?;
+            super::record_operation_failure_event(&tx, &operation_id, "outcome_unknown", now)?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
     }
 
     async fn forge_file_io<T: Send + 'static>(

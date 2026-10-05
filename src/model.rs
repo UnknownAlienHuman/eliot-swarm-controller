@@ -545,6 +545,10 @@ pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
             crate::coordination::watch::validate_mutation(method, params)?;
             return Ok(());
         }
+        "bus.consumer.register" | "bus.consumer.revoke" | "bus.consumer.admit" => {
+            crate::store::bus_kernel::validate_mutation(method, params)?;
+            return Ok(());
+        }
         "coordination.participant.register"
         | "coordination.participant.disable"
         | "coordination.work_card.publish"

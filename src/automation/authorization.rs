@@ -1291,6 +1291,14 @@ pub(crate) fn script_run_causes_semantically_match(left: &Value, right: &Value) 
         let same_scope = ["task_id", "task_revision", "attempt_id"]
             .iter()
             .all(|key| left[*key] == right[*key]);
+        let same_script_run = match (
+            left["script_run_id"].as_str(),
+            right["script_run_id"].as_str(),
+        ) {
+            (Some(left), Some(right)) => left == right,
+            // Older retained causes predate the optional exact Run reference.
+            _ => true,
+        };
         return left["id"].as_str().is_some_and(|id| !id.is_empty())
             && right["id"].as_str().is_some_and(|id| !id.is_empty())
             && left["id"] == right["id"]
@@ -1301,7 +1309,8 @@ pub(crate) fn script_run_causes_semantically_match(left: &Value, right: &Value) 
             && left["failed_supervisor"] == right["failed_supervisor"]
             && left["operation_id"] == right["operation_id"]
             && same_occurrence
-            && same_scope;
+            && same_scope
+            && same_script_run;
     }
     const KEYS: &[&str] = &[
         "kind",

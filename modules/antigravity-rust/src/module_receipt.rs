@@ -101,6 +101,48 @@ pub fn for_reconcile_target(command: &RuntimeCommand) -> Result<ModuleReceiptIde
     for_operation(command, target_id, digest)
 }
 
+pub fn for_result_target(command: &RuntimeCommand) -> Result<ModuleReceiptIdentity> {
+    if command.method != "agent.result" || command.input["selector"]["kind"] != "antigravity_status"
+    {
+        return Err(Error::new(
+            "MODULE_RECEIPT_TARGET_INVALID",
+            "target receipt is only valid for Antigravity Operation status pages",
+        ));
+    }
+    let target_id = command.input["selector"]["input_operation_id"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            Error::new(
+                "MODULE_RECEIPT_TARGET_INVALID",
+                "status target Operation is missing",
+            )
+        })?;
+    let digest = command.target_input_sha256.as_deref().ok_or_else(|| {
+        Error::new(
+            "MODULE_RECEIPT_TARGET_DIGEST_MISSING",
+            "Store omitted the exact status target Operation digest",
+        )
+    })?;
+    let status = &command.input["target_operation_status"];
+    if status["operation_id"].as_str() != Some(target_id)
+        || status["target_input_sha256"].as_str() != Some(digest)
+    {
+        return Err(Error::new(
+            "MODULE_RECEIPT_TARGET_INVALID",
+            "Store status snapshot differs from the exact target identity",
+        ));
+    }
+    let identity = for_operation(command, target_id, digest)?;
+    if status["module_receipt"] != serde_json::to_value(&identity)? {
+        return Err(Error::new(
+            "MODULE_RECEIPT_TARGET_INVALID",
+            "Store status snapshot receipt differs from the exact target identity",
+        ));
+    }
+    Ok(identity)
+}
+
 pub fn attach_to_outcome(value: &mut Value, identity: &ModuleReceiptIdentity) -> Result<()> {
     let details = value
         .get_mut("details")

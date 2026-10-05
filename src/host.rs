@@ -12,6 +12,8 @@ use tokio::{
     task::{Id, JoinSet},
 };
 
+mod legacy_optional_workers;
+
 pub async fn run(config: Config) -> Result<()> {
     run_until(config, async {
         tokio::signal::ctrl_c().await.map_err(Into::into)
@@ -75,6 +77,7 @@ async fn run_until(
     let credential = bootstrap_credential(&root.path)
         .map_err(|error| startup_error("credential_bootstrap", error))?;
     let root_path = root.path.clone();
+    let mut observer_config_valid = false;
     let observer = config.observability.enabled.then(|| {
         let live_config = config
             .observability
@@ -90,7 +93,8 @@ async fn run_until(
             retention_bytes: config.observability.retention_bytes,
             retention_days: config.observability.retention_days,
         };
-        let recorder = if recorder_config.validate().is_ok() {
+        observer_config_valid = recorder_config.validate().is_ok();
+        let recorder = if observer_config_valid {
             swarm_observer::host::HostRecorder::new_with_live_config(recorder_config, live_config)
         } else {
             swarm_observer::host::HostRecorder::disabled_for_invalid_config(recorder_config)
@@ -108,6 +112,17 @@ async fn run_until(
         StoreOwner::start_with_line_observer(root, config.clone(), credential, line_observer)
             .await
             .map_err(|error| startup_error("store_start", error))?;
+    let mut host_image_receipt = if observer_config_valid {
+        match swarm_observer::host_image_receipt::HostImageReceipt::publish(&root_path) {
+            Ok(receipt) => Some(receipt),
+            Err(error) => {
+                eprintln!("observer host image receipt: {}", error.code);
+                None
+            }
+        }
+    } else {
+        None
+    };
     let ipc_config = Arc::new(config.ipc.clone());
     let startup: Result<ipc::Listener> = async {
         owner.store.record_host_start().await?;
@@ -129,6 +144,7 @@ async fn run_until(
             }
             let producer_drained = owner.store.drain_diagnostics(Duration::from_secs(5)).await;
             let producer_stats = owner.store.diagnostic_stats();
+            cleanup_host_image_receipt(&mut host_image_receipt);
             if let Err(close_error) = owner.close().await {
                 eprintln!("host startup Store close: {}", close_error.code);
             }
@@ -160,86 +176,13 @@ async fn run_until(
     // A JoinError contains the task ID but no output label; retain only each
     // fixed supervisor name so a panic can be attributed without its payload.
     let mut supervisor_names: HashMap<Id, &'static str> = HashMap::new();
-    let store = owner.store.clone();
-    let stop = stopping.clone();
+    let legacy_store = owner.store.clone();
+    let legacy_stop = stopping.clone();
     spawn_supervisor(
         &mut supervisors,
         &mut supervisor_names,
-        "checks",
-        async move {
-            store.supervise_checks(stop).await;
-            Ok(())
-        },
-    );
-    let store = owner.store.clone();
-    let stop = stopping.clone();
-    spawn_supervisor(
-        &mut supervisors,
-        &mut supervisor_names,
-        "scripts",
-        async move { store.supervise_scripts(stop).await },
-    );
-    let store = owner.store.clone();
-    let stop = stopping.clone();
-    spawn_supervisor(
-        &mut supervisors,
-        &mut supervisor_names,
-        "opencode",
-        async move { store.supervise_opencode(stop).await },
-    );
-    let store = owner.store.clone();
-    let stop = stopping.clone();
-    spawn_supervisor(&mut supervisors, &mut supervisor_names, "zed", async move {
-        store.supervise_zed(stop).await;
-        Ok(())
-    });
-    let store = owner.store.clone();
-    let stop = stopping.clone();
-    spawn_supervisor(
-        &mut supervisors,
-        &mut supervisor_names,
-        "scheduler",
-        async move { crate::scheduler::run(store, stop).await },
-    );
-    let store = owner.store.clone();
-    let stop = stopping.clone();
-    spawn_supervisor(
-        &mut supervisors,
-        &mut supervisor_names,
-        "automation",
-        async move { supervise_automation(store, stop).await },
-    );
-    let store = owner.store.clone();
-    let stop = stopping.clone();
-    spawn_supervisor(
-        &mut supervisors,
-        &mut supervisor_names,
-        "launcher",
-        async move { supervise_launcher(store, stop).await },
-    );
-    let store = owner.store.clone();
-    let stop = stopping.clone();
-    spawn_supervisor(
-        &mut supervisors,
-        &mut supervisor_names,
-        "native-mcp",
-        async move { supervise_native_mcp(store, stop).await },
-    );
-    let store = owner.store.clone();
-    let stop = stopping.clone();
-    spawn_supervisor(
-        &mut supervisors,
-        &mut supervisor_names,
-        "native-mcp-tools",
-        async move { supervise_native_mcp_tools(store, stop).await },
-    );
-    let store = owner.store.clone();
-    let stop = stopping.clone();
-    spawn_supervisor(
-        &mut supervisors,
-        &mut supervisor_names,
-        "forge",
-        async move { supervise_forge(store, stop).await },
+        "legacy-workers",
+        async move { legacy_optional_workers::run(legacy_store, legacy_stop).await },
     );
     let semaphore = Arc::new(Semaphore::new(config.ipc.max_connections));
     let mut connections = JoinSet::new();
@@ -329,6 +272,7 @@ async fn run_until(
     }
     let producer_drained = owner.store.drain_diagnostics(Duration::from_secs(5)).await;
     let producer_stats = owner.store.diagnostic_stats();
+    cleanup_host_image_receipt(&mut host_image_receipt);
     if let Err(error) = owner.close().await
         && exit.is_ok()
     {
@@ -336,6 +280,16 @@ async fn run_until(
     }
     report_observer_shutdown(&observer, Some(producer_stats), producer_drained);
     exit
+}
+
+fn cleanup_host_image_receipt(
+    receipt: &mut Option<swarm_observer::host_image_receipt::HostImageReceipt>,
+) {
+    if let Some(receipt) = receipt.take()
+        && let Err(error) = receipt.cleanup_under_store_lock()
+    {
+        eprintln!("observer host image receipt cleanup: {}", error.code);
+    }
 }
 
 fn report_observer_shutdown(

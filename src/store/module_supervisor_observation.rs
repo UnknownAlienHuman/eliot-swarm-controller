@@ -13,6 +13,7 @@ use crate::{
 use rusqlite::{OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use swarm_telemetry::{Code, Kind, Phase, Record, Severity};
 
 impl super::Store {
     /// Retain a bounded host-only status transition from the dedicated module
@@ -23,20 +24,31 @@ impl super::Store {
         observation: T,
     ) -> Result<()> {
         let observation = parse(observation)?;
-        let inserted = self
+        let committed = self
             .run(move |db| {
                 let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-                let inserted = record(&tx, &observation, model::now_ms()?)?;
+                let committed = record(&tx, &observation, model::now_ms()?)?;
                 tx.commit()?;
-                Ok(inserted)
+                Ok(committed)
             })
             .await?;
-        if inserted {
+        if committed.inserted {
             self.changed
                 .send_modify(|revision| *revision = revision.wrapping_add(1));
+            if let Some(diagnostic) = committed.diagnostic {
+                // Diagnostics are explicitly lossy. Store commit failures
+                // still return above, and recorder loss cannot revise a
+                // durable observation or its operation authority.
+                let _ = self.telemetry.emit(diagnostic);
+            }
         }
         Ok(())
     }
+}
+
+struct ObservationCommit {
+    inserted: bool,
+    diagnostic: Option<Record>,
 }
 
 const MAX_OBSERVATION_IDS: usize = 256;
@@ -175,13 +187,13 @@ pub(super) fn parse<T: Serialize>(value: T) -> Result<ModuleSupervisorObservatio
 }
 
 /// Append an immutable transition and update the binding's safe latest
-/// readback in one Store transaction. `Ok(true)` means a new event was
-/// recorded; an exact callback retry returns `Ok(false)`.
+/// readback in one Store transaction. Exact callback retries return an
+/// `ObservationCommit` with `inserted: false` and no diagnostic candidate.
 pub(super) fn record(
     tx: &Transaction<'_>,
     observation: &ModuleSupervisorObservation,
     now_ms: i64,
-) -> Result<bool> {
+) -> Result<ObservationCommit> {
     validate_header(observation)?;
     let generation = i64::try_from(observation.scope.generation)
         .map_err(|_| invalid("module supervisor generation exceeds the Store range"))?;
@@ -214,7 +226,10 @@ pub(super) fn record(
             && old_generation == Some(generation)
             && old_kind == EVENT_KIND
         {
-            return Ok(false);
+            return Ok(ObservationCommit {
+                inserted: false,
+                diagnostic: None,
+            });
         }
         return Err(Error::new(
             "MODULE_OBSERVATION_CONFLICT",
@@ -233,6 +248,7 @@ pub(super) fn record(
             "module supervisor callback sequence is older than the retained binding readback",
         ));
     }
+    let diagnostic = diagnostic_for_transition(current, observation);
     validate_operation_ids(tx, observation, generation)?;
 
     tx.execute(
@@ -268,7 +284,83 @@ pub(super) fn record(
             "module supervisor binding disappeared during event recording",
         ));
     }
-    Ok(true)
+    Ok(ObservationCommit {
+        inserted: true,
+        diagnostic,
+    })
+}
+
+/// Map only exact lifecycle transitions into the existing closed diagnostic
+/// vocabulary. Status is not an event acknowledgement: it becomes visible
+/// only after the enclosing Store transaction commits.
+fn diagnostic_for_transition(
+    previous: &Value,
+    observation: &ModuleSupervisorObservation,
+) -> Option<Record> {
+    let boot_id = observation.boot_id.as_deref()?;
+    let same_boot = previous["schema_version"] == 1
+        && previous["binding_id"].as_str() == Some(observation.scope.binding_id.as_str())
+        && previous["generation"].as_u64() == Some(observation.scope.generation)
+        && previous["module_id"].as_str() == Some(observation.module_id.as_str())
+        && previous["artifact_id"].as_str() == Some(observation.artifact_id.as_str())
+        && previous["artifact_version"].as_str() == Some(observation.artifact_version.as_str())
+        && previous["boot_id"].as_str() == Some(boot_id);
+    let previous_phase = if same_boot {
+        previous["phase"].as_str()
+    } else {
+        None
+    };
+    if same_boot && previous_phase.is_none() {
+        return None;
+    }
+
+    let (severity, kind, phase, code) = match observation.phase {
+        ModuleSupervisorPhase::Ready if !same_boot || previous_phase == Some("starting") => (
+            Severity::Info,
+            Kind::ModuleStarted,
+            Phase::ModuleStart,
+            None,
+        ),
+        ModuleSupervisorPhase::Exited
+        | ModuleSupervisorPhase::RestartBackoff
+        | ModuleSupervisorPhase::Completed
+            if matches!(
+                observation.effect_certainty,
+                ModuleEffectCertainty::NotStarted
+            ) && observation
+                .stage
+                .is_some_and(ModuleFailureStage::proves_pre_spawn)
+                && previous_phase != Some("ready") =>
+        {
+            (
+                Severity::Error,
+                Kind::ModuleStopped,
+                Phase::ModuleStart,
+                Some(Code::ModuleStartFailed),
+            )
+        }
+        ModuleSupervisorPhase::Exited | ModuleSupervisorPhase::RestartBackoff
+            if same_boot && previous_phase == Some("ready") =>
+        {
+            (Severity::Warn, Kind::ModuleStopped, Phase::ModuleExit, None)
+        }
+        ModuleSupervisorPhase::Completed if same_boot && previous_phase == Some("ready") => {
+            (Severity::Info, Kind::ModuleStopped, Phase::ModuleExit, None)
+        }
+        _ => return None,
+    };
+    let operation_id = (observation.unknown_operation_count == 1
+        && observation.unknown_operation_ids.len() == 1
+        && !observation.unknown_operation_ids_truncated)
+        .then(|| observation.unknown_operation_ids[0].as_str());
+    Some(
+        Record::new(severity, kind, phase)
+            .with_code(code)
+            .with_binding_id(Some(&observation.scope.binding_id))
+            .with_binding_generation(Some(observation.scope.generation))
+            .with_operation_id(operation_id)
+            .with_module_boot_id(Some(boot_id)),
+    )
 }
 
 fn validate_header(observation: &ModuleSupervisorObservation) -> Result<()> {

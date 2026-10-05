@@ -884,9 +884,24 @@ async fn run(cli: Cli) -> Result<()> {
             None => None,
             _ => return Err(Error::invalid("unsupported observer child role")),
         };
+        let default_host_identity = if host_identity.is_none()
+            && module_owner.is_none()
+            && module_worker.is_none()
+            && child_role.is_none()
+            && config.observability.enabled
+        {
+            std::fs::canonicalize(&config.storage.data_dir)
+                .ok()
+                .map(|root| swarm_observer::host_image_receipt::default_path(&root))
+        } else {
+            None
+        };
+        let selected_host_identity = host_identity
+            .as_deref()
+            .or(default_host_identity.as_deref());
         let report = swarm_observer::metrics_cli::run_explicit_metrics(
             config.observability.enabled,
-            host_identity.as_deref(),
+            selected_host_identity,
             module_owner.as_deref(),
             module_worker.as_deref(),
             child_role,

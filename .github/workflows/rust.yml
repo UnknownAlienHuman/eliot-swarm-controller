@@ -243,7 +243,11 @@ jobs:
       - name: Format, lint, and test all owned workspace packages from metadata
         shell: pwsh
         run: |
-          & pwsh -NoProfile -File tools/ci/package-scope.ps1 -Stage FullRust
+          $sharedTargetDir = Join-Path $env:RUNNER_TEMP 'eliot-full-rust-shared-target'
+          if (-not (Test-Path -LiteralPath $sharedTargetDir -PathType Container)) {
+            [void][IO.Directory]::CreateDirectory($sharedTargetDir)
+          }
+          & pwsh -NoProfile -File tools/ci/package-scope.ps1 -Stage FullRust -TargetDir $sharedTargetDir
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Verify Atlas donor snapshot
         shell: python

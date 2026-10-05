@@ -169,7 +169,7 @@ impl EventSelector {
             && self.event_kind == event.event_kind
             && self
                 .status
-                .map_or(true, |expected| event.status == Some(expected))
+                .is_none_or(|expected| event.status == Some(expected))
     }
 }
 

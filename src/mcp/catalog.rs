@@ -1878,6 +1878,47 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
         "Bounded script metadata only; never lists filesystem files or starts an invocation."
     ),
     entry!(
+        "bus.events.page",
+        Scripts,
+        MANAGER_ONLY_AUDIENCES,
+        Searchable,
+        "Read safe event headers selected by one enabled ScriptRun consumer.",
+        "Use the existing durable Manager-owned cursor as the read position; this page does not acknowledge or advance it.",
+        &["bus", "events", "page", "script trigger", "cursor"],
+        &[
+            "project_id",
+            "consumer_id",
+            "optional after_observation_id/limit"
+        ],
+        "Bounded safe metadata only; event payloads and source keys remain private."
+    ),
+    entry!(
+        "bus.consumer.admit",
+        Scripts,
+        MANAGER_ONLY_AUDIENCES,
+        ManualOnly,
+        "Atomically retain exact ScriptRun pending intents and advance the existing consumer cursor.",
+        "Read a fresh bus.events.page and pass its exact automation revision, cursor cut, and canonical occurrence/action projection.",
+        &[
+            "bus",
+            "consumer",
+            "admit",
+            "script run",
+            "cursor",
+            "idempotency"
+        ],
+        &[
+            "project_id",
+            "consumer_id",
+            "automation_revision",
+            "expected_cursor",
+            "through_observation_id",
+            "occurrences",
+            "client_request_id"
+        ],
+        "Existing cursor plus pending intent share this Store transaction; normal script.run Operation admission remains the later continuation."
+    ),
+    entry!(
         "github.source.inspect",
         GitHub,
         GM_AUDIENCES,

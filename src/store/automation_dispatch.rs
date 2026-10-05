@@ -19,6 +19,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
+#[path = "automation_dispatch_bus.rs"]
+pub(crate) mod bus_kernel;
+#[path = "script_trigger_authority.rs"]
+pub(crate) mod script_trigger_authority;
+
 const DISPATCH_SCHEMA_VERSION: u32 = 1;
 const MAX_PENDING_SUBJECTS: usize = 128;
 const SCRIPT_TRIGGER_STATE_VERSION: u32 = 1;
@@ -105,6 +110,8 @@ struct PendingScriptTrigger {
     script_id: String,
     automation_revision: i64,
     observation_id: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    consumer_context: Option<script_trigger_authority::ScriptRunConsumerContext>,
     held: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     held_reason: Option<String>,
@@ -118,6 +125,7 @@ pub(crate) struct ScriptTriggerIntent {
     pub(crate) automation_revision: i64,
     pub(crate) script_id: String,
     pub(crate) cause: Value,
+    pub(crate) consumer_context: Option<script_trigger_authority::ScriptRunConsumerContext>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -787,16 +795,17 @@ fn process_task_submission_script_trigger(
         }
         Ok(cause) => cause,
     };
+    let projection = script_event_projection_with_alias(tx, event, None)?;
+    let bus_route_matches = bus_kernel::route_script_run_event(entry, event, projection.status)?;
     if let Some(cause) = applied_cause.as_ref()
+        && bus_route_matches
         && entry.accepts_task_submission_script_run_event(&receipt, cause)
     {
-        let projection = script_event_projection_with_alias(tx, event, None)?;
         mark_observed_script_selectors(state, entry, event, projection.status)?;
         queue_applied_submission_script_trigger(tx, entry, state, cause.clone())?;
         return Ok(());
     }
-    let projection = script_event_projection_with_alias(tx, event, None)?;
-    if entry.accepts_script_run_event(&event.source_id, &event.event_kind, projection.status) {
+    if bus_route_matches {
         process_system_event_script_trigger(tx, app_config, entry, state, event)?;
     } else {
         remember_script_trigger_recent(
@@ -866,11 +875,14 @@ fn queue_applied_submission_script_trigger(
             }),
         );
     } else {
+        let consumer_context =
+            script_trigger_authority::ScriptRunConsumerContext::from_entry(entry)?;
         state.pending.push(PendingScriptTrigger {
             cause: cause.as_json(),
             script_id,
             automation_revision: entry.revision,
             observation_id,
+            consumer_context: Some(consumer_context),
             held: false,
             held_reason: None,
         });
@@ -942,8 +954,7 @@ fn process_system_event_script_projection(
         );
         return Ok(());
     }
-    let route_matches =
-        entry.accepts_script_run_event(&event.source_id, &event.event_kind, projection.status);
+    let route_matches = bus_kernel::route_script_run_event(entry, event, projection.status)?;
     if !route_matches {
         remember_script_trigger_recent(
             state,
@@ -960,6 +971,13 @@ fn process_system_event_script_projection(
         .iter()
         .any(|pending| pending.script_id == script_id && pending.cause["id"] == cause["id"]);
     if duplicate_pending {
+        if script_cancel_event_alias_seen(state, &event, &cause, &script_id) {
+            // The generic Operation cancellation fact and its exact
+            // ScriptRun-specific view share one phase/occurrence identity.
+            // Preserve both explicitly selected routes while admitting only
+            // one semantic trigger.
+            mark_observed_script_selectors(state, entry, event, projection.status)?;
+        }
         if event.source_id == "controller:host-lifecycle"
             && matches!(event.event_kind.as_str(), "host.exit" | "host.failed")
             && state.pending.iter().any(|pending| {
@@ -983,7 +1001,8 @@ fn process_system_event_script_projection(
         return Ok(());
     }
 
-    match script_event_invocation_context(tx, app_config, entry, &cause) {
+    let consumer_context = script_trigger_authority::ScriptRunConsumerContext::from_entry(entry)?;
+    match consumer_context.require_current_source(tx, app_config, entry, &cause) {
         Ok(context) => {
             mark_observed_script_selectors(state, entry, event, projection.status)?;
             attach_event_task_scope(&mut cause, &context)?;
@@ -1032,6 +1051,44 @@ fn process_system_event_script_projection(
     Ok(())
 }
 
+fn script_cancel_event_alias_seen(
+    state: &ScriptTriggerState,
+    event: &crate::automation::intake::ObservedEvent,
+    cause: &Value,
+    script_id: &str,
+) -> bool {
+    let Some(operation_id) = cause["operation_id"].as_str().filter(|id| !id.is_empty()) else {
+        return false;
+    };
+    if cause["occurrence_phase"] != "operation_cancelled"
+        || cause["occurrence_id"] != format!("operation:{operation_id}:operation_cancelled")
+        || cause["status"] != "cancelled"
+        || cause["script_run_id"].as_str().is_none_or(str::is_empty)
+    {
+        return false;
+    }
+    let counterpart = match (event.source_id.as_str(), event.event_kind.as_str()) {
+        ("controller:operations", "operation.cancelled") => {
+            ("controller:scripts", "script.cancelled")
+        }
+        ("controller:scripts", "script.cancelled") => {
+            ("controller:operations", "operation.cancelled")
+        }
+        _ => return false,
+    };
+    state.pending.iter().any(|pending| {
+        pending.script_id == script_id
+            && pending.cause["id"] == cause["id"]
+            && pending.cause["operation_id"].as_str() == Some(operation_id)
+            && pending.cause["occurrence_phase"] == "operation_cancelled"
+            && pending.cause["occurrence_id"] == cause["occurrence_id"]
+            && pending.cause["status"] == "cancelled"
+            && pending.cause["script_run_id"] == cause["script_run_id"]
+            && pending.cause["source_id"] == counterpart.0
+            && pending.cause["event_kind"] == counterpart.1
+    })
+}
+
 /// Known typed event families and legacy views of normalized occurrences must
 /// never degrade to observation-ID-only causes. Doing so would make a broken
 /// safe projection either match a statusless selector or lose raw/normalized
@@ -1054,7 +1111,12 @@ fn event_requires_occurrence_projection(event: &crate::automation::intake::Obser
                 )
                 | (
                     "controller:scripts",
-                    "script.completed" | "script.failed" | "script.incomplete"
+                    "script.run"
+                        | "script.started"
+                        | "script.cancelled"
+                        | "script.completed"
+                        | "script.failed"
+                        | "script.incomplete"
                 )
                 | (
                     "controller:operations",
@@ -1142,6 +1204,9 @@ fn queue_system_event_script_trigger(
         script_id,
         automation_revision: entry.revision,
         observation_id,
+        consumer_context: Some(
+            script_trigger_authority::ScriptRunConsumerContext::from_entry(entry)?,
+        ),
         held: held_reason.is_some(),
         held_reason: held_reason.map(str::to_owned),
     });
@@ -1275,6 +1340,9 @@ fn system_event_cause(
     }
     if let Some(failed_supervisor) = projection.failed_supervisor.as_deref() {
         cause["failed_supervisor"] = json!(failed_supervisor);
+    }
+    if let Some(script_run_id) = projection.script_run_id.as_deref() {
+        cause["script_run_id"] = json!(script_run_id);
     }
     Ok(cause)
 }
@@ -1598,6 +1666,9 @@ pub(crate) fn validate_retained_script_event_cause(
         || cause["error_code"].as_str() != projection.error_code.as_deref()
         || cause["failure_category"].as_str() != projection.failure_category.as_deref()
         || cause["failed_supervisor"].as_str() != projection.failed_supervisor.as_deref()
+        || cause
+            .get("script_run_id")
+            .is_some_and(|value| value.as_str() != projection.script_run_id.as_deref())
     {
         return Err(Error::new(
             "AUTOMATION_LINK_CORRUPT",
@@ -1770,10 +1841,9 @@ pub(crate) fn validate_retained_script_event_cause(
     Ok(input)
 }
 
-/// Re-read the exact observation and current source/Task rights immediately
-/// before ordinary script admission or an unstarted Operation's start gate.
-/// Event payloads are never returned; only the bounded metadata projection is
-/// constructed after source authorization succeeds.
+/// Legacy GM-scoped fixture helper. Production ScriptRun dispatch uses the
+/// persisted owner-scoped consumer context above instead.
+#[cfg(test)]
 pub(crate) fn script_event_invocation_context(
     db: &Connection,
     app_config: &Config,
@@ -1825,6 +1895,9 @@ pub(crate) fn script_event_invocation_context(
         || cause["error_code"].as_str() != projection.error_code.as_deref()
         || cause["failure_category"].as_str() != projection.failure_category.as_deref()
         || cause["failed_supervisor"].as_str() != projection.failed_supervisor.as_deref()
+        || cause
+            .get("script_run_id")
+            .is_some_and(|value| value.as_str() != projection.script_run_id.as_deref())
         || !entry.accepts_script_run_event(&event.source_id, &event.event_kind, projection.status)
     {
         return Err(Error::new(
@@ -1851,6 +1924,9 @@ pub(crate) fn script_event_invocation_context(
         || cause["error_code"].as_str() != projection.error_code.as_deref()
         || cause["failure_category"].as_str() != projection.failure_category.as_deref()
         || cause["failed_supervisor"].as_str() != projection.failed_supervisor.as_deref()
+        || cause
+            .get("script_run_id")
+            .is_some_and(|value| value.as_str() != projection.script_run_id.as_deref())
     {
         return Err(Error::new(
             "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
@@ -2352,6 +2428,7 @@ pub(crate) fn pending_script_triggers(
                 automation_revision: pending.automation_revision,
                 script_id: pending.script_id.clone(),
                 cause: pending.cause.clone(),
+                consumer_context: pending.consumer_context.clone(),
             });
             if intents.len() >= limit {
                 return Ok(intents);
@@ -4183,6 +4260,8 @@ fn revalidate_script_trigger_intents(
                 pending.held = false;
                 pending.held_reason = None;
                 pending.automation_revision = entry.revision;
+                pending.consumer_context =
+                    Some(script_trigger_authority::ScriptRunConsumerContext::from_entry(entry)?);
                 recent.push(json!({
                     "observation_id":pending.observation_id,
                     "submission_ref":pending.cause["id"],
@@ -4309,22 +4388,18 @@ fn script_trigger_block_reason(
     {
         return Ok(Some("script_owner_target_changed".to_owned()));
     }
+    let context = match pending.consumer_context.as_ref() {
+        Some(context) => context.clone(),
+        None => script_trigger_authority::ScriptRunConsumerContext::from_entry(entry)?,
+    };
+    if context.require_entry_match(entry).is_err() {
+        return Ok(Some("script_action_or_route_not_selected".to_owned()));
+    }
     if let Err(error) = authorization::require_registered_manager(tx, &entry.owner_manager_id) {
         if error.code == "FORBIDDEN" {
             return Ok(Some(
                 "current_manager_not_registered_or_disabled".to_owned(),
             ));
-        }
-        return Err(error);
-    }
-    let principal = Principal {
-        link_id: "internal-script-trigger-revalidation".to_owned(),
-        client_id: entry.owner_manager_id.clone(),
-        role: Role::Manager,
-    };
-    if let Err(error) = super::gm::require_authority(tx, &principal) {
-        if error.code == "FORBIDDEN" {
-            return Ok(Some("current_manager_authority_unavailable".to_owned()));
         }
         return Err(error);
     }
@@ -4343,80 +4418,18 @@ fn script_trigger_block_reason(
     if active_revision.is_none() {
         return Ok(Some("script_revision_not_active".to_owned()));
     }
-
-    if pending.cause["kind"] == "system_event" {
-        return match script_event_invocation_context(tx, app_config, entry, &pending.cause) {
-            Ok(_) => Ok(None),
-            Err(error) if script_event_revalidation_error(&error) => Ok(Some(format!(
-                "system_event_{}",
-                error.code.to_ascii_lowercase()
-            ))),
-            Err(error) => Err(error),
-        };
+    match context.require_current_source(tx, app_config, entry, &pending.cause) {
+        Ok(_) => Ok(None),
+        Err(error) if script_event_revalidation_error(&error) => Ok(Some(format!(
+            "system_event_{}",
+            error.code.to_ascii_lowercase()
+        ))),
+        Err(error) if script_trigger_revalidation_error(&error) => Ok(Some(format!(
+            "submission_{}",
+            error.code.to_ascii_lowercase()
+        ))),
+        Err(error) => Err(error),
     }
-
-    let submission_ref = model::text(&pending.cause, "id")?;
-    let document = match submissions::document(tx, submission_ref) {
-        Ok(document) => document,
-        Err(error) if script_trigger_revalidation_error(&error) => {
-            return Ok(Some(format!(
-                "submission_{}",
-                error.code.to_ascii_lowercase()
-            )));
-        }
-        Err(error) => return Err(error),
-    };
-    if document["operation_id"] != pending.cause["operation_id"] {
-        return Ok(Some("submission_operation_changed".to_owned()));
-    }
-    let task_id = model::text(&document, "task_id")?;
-    let task_revision = model::positive(&document, "task_revision")?;
-    let attempt_id = model::text(&document, "attempt_id")?;
-    let task = match tasks::get_task(tx, task_id) {
-        Ok(task) => task,
-        Err(error) if script_trigger_revalidation_error(&error) => {
-            return Ok(Some(format!(
-                "task_attempt_{}",
-                error.code.to_ascii_lowercase()
-            )));
-        }
-        Err(error) => return Err(error),
-    };
-    let attempt = match tasks::get_attempt(tx, attempt_id) {
-        Ok(attempt) => attempt,
-        Err(error) if script_trigger_revalidation_error(&error) => {
-            return Ok(Some(format!(
-                "task_attempt_{}",
-                error.code.to_ascii_lowercase()
-            )));
-        }
-        Err(error) => return Err(error),
-    };
-    if document["candidate_ref"] != attempt["candidate_ref"]
-        || document["task_id"] != task["task_id"]
-        || document["task_revision"] != task["revision"]
-        || document["attempt_id"] != attempt["attempt_id"]
-        || task["project_id"] != entry.project_id
-        || task["state"] != "open"
-        || task["current_attempt_id"] != attempt_id
-        || task["revision"] != task_revision
-        || attempt["task_revision"] != task_revision
-        || !attempt["released_at_ms"].is_null()
-    {
-        return Ok(Some(
-            "task_attempt_is_no_longer_exact_current_scope".to_owned(),
-        ));
-    }
-    if let Err(error) = super::gm::require_attempt_control(tx, &principal, &attempt) {
-        if script_trigger_revalidation_error(&error) {
-            return Ok(Some(format!(
-                "task_attempt_{}",
-                error.code.to_ascii_lowercase()
-            )));
-        }
-        return Err(error);
-    }
-    Ok(None)
 }
 
 fn script_trigger_revalidation_error(error: &Error) -> bool {
@@ -4531,6 +4544,15 @@ fn validate_script_trigger_state(state: &ScriptTriggerState) -> Result<()> {
             pending.automation_revision <= 0
                 || pending.observation_id <= 0
                 || pending.script_id.is_empty()
+                || pending.consumer_context.as_ref().is_some_and(|context| {
+                    !context.matches_pending_identity(
+                        &state.owner_manager_id,
+                        &state.project_id,
+                        &state.automation_id,
+                        pending.automation_revision,
+                        &pending.script_id,
+                    )
+                })
                 || !valid_pending_script_trigger_cause(pending)
         })
     {

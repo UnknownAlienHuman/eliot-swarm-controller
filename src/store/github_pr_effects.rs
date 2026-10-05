@@ -17,6 +17,7 @@ use crate::{
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::{Value, json};
+use std::path::Path;
 
 const METHOD: &str = "github.pull_request.update_description";
 const RECONCILE_METHOD: &str = "github.pull_request.reconcile_description";
@@ -95,8 +96,8 @@ async fn call_with_api_inner<A: GitHubPullRequestApi + ?Sized>(
             .is_err()
         {
             return Err(Error::new(
-                "GITHUB_PR_UPDATE_IN_PROGRESS",
-                "the authorized GitHub worker may still be active; inspect the retained Operation",
+                "GITHUB_PR_UPDATE_RECOVERY_BLOCKED",
+                "the retained Operation is durably unknown; inspect it before requesting another readback",
             ));
         }
         mark_sending_unknown(store, &principal, &operation_id).await?;
@@ -854,6 +855,111 @@ fn resolve_retained_target(
     target_from_publication(db, request, intent, task_id)
 }
 
+pub(super) fn validate_retained_worker_plan(
+    db: &Connection,
+    operation: &Value,
+    receipt: &Value,
+    plan: &Value,
+) -> Result<()> {
+    const PLAN_FIELDS: [&str; 16] = [
+        "schema_version",
+        "kind",
+        "job_id",
+        "operation_id",
+        "owner_token",
+        "phase",
+        "gh_executable",
+        "gh_executable_sha256",
+        "timeout_seconds",
+        "max_output_bytes",
+        "host",
+        "owner",
+        "repository",
+        "pull_request_number",
+        "title",
+        "body",
+    ];
+    let invalid = || {
+        Error::new(
+            "FORGE_WORKER_PLAN_SCOPE_MISMATCH",
+            "retained GitHub worker plan does not match its durable PR Operation",
+        )
+    };
+    let fields = plan.as_object().ok_or_else(invalid)?;
+    let operation_id = operation["operation_id"].as_str().ok_or_else(invalid)?;
+    if operation["method"] != METHOD
+        || !matches!(
+            operation["state"].as_str(),
+            Some("sending" | "outcome_unknown")
+        )
+        || fields.len() != PLAN_FIELDS.len()
+        || !PLAN_FIELDS.iter().all(|field| fields.contains_key(*field))
+    {
+        return Err(invalid());
+    }
+    let request = PullRequestDescriptionUpdateRequest::parse(
+        &stored_original_request(db, operation_id).map_err(|_| invalid())?,
+    )
+    .map_err(|_| invalid())?;
+    if stored_client_request_id(db, operation_id).map_err(|_| invalid())?
+        != request.client_request_id
+    {
+        return Err(invalid());
+    }
+    let target = resolve_retained_target(db, &request).map_err(|_| invalid())?;
+    let result = &operation["result"];
+    if operation["task_id"] != target.task_id
+        || operation["attempt_id"] != target.attempt_id
+        || result["operation_id"] != operation_id
+        || result["publication_operation_id"] != target.publication_operation_id
+        || result["project_id"] != target.project_id
+        || result["source_id"] != target.source_id
+        || result["task_id"] != target.task_id
+        || result["attempt_id"] != target.attempt_id
+        || result["repository_id"] != target.repository_id
+        || result["pull_request_id"] != target.pull_request_id
+        || result["pull_request_number"] != target.pull_request_number
+        || result["head_sha"] != target.head_sha
+        || result["target_ref"] != target.target_ref
+        || result["base_ref"] != target.base_ref
+    {
+        return Err(invalid());
+    }
+    let slot: Option<(String, String)> = db
+        .query_row(
+            "SELECT operation_id,head_sha FROM github_pr_effect_slots WHERE repository_id=?1 AND pull_request_id=?2",
+            params![target.repository_id, target.pull_request_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|_| invalid())?;
+    if !matches!(slot.as_ref(), Some((slot_operation, slot_head)) if slot_operation == operation_id && slot_head == &target.head_sha)
+        || plan["schema_version"] != 1
+        || plan["kind"] != "github_pr_description"
+        || plan["job_id"] != receipt["job_id"]
+        || plan["operation_id"] != operation_id
+        || plan["owner_token"] != receipt["owner_token"]
+        || plan["phase"] != "patch_once"
+        || plan["gh_executable"]
+            .as_str()
+            .is_none_or(|path| !Path::new(path).is_absolute())
+        || !plan["gh_executable_sha256"]
+            .as_str()
+            .is_some_and(valid_worker_digest)
+        || !(1..=45).contains(&plan["timeout_seconds"].as_u64().unwrap_or_default())
+        || !(1..=4 * 1024 * 1024).contains(&plan["max_output_bytes"].as_u64().unwrap_or_default())
+        || plan["host"] != target.host
+        || plan["owner"] != target.owner
+        || plan["repository"] != target.repo
+        || plan["pull_request_number"] != target.pull_request_number
+        || plan["title"] != request.title
+        || plan["body"] != request.body
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
 fn target_from_publication(
     db: &Connection,
     request: &PullRequestDescriptionUpdateRequest,
@@ -1558,7 +1664,11 @@ async fn persist(
                     "the retained Operation does not belong to the current caller",
                 ));
             }
-            for field in ["native_worker", "native_worker_result"] {
+            for field in [
+                "native_worker",
+                "native_worker_result",
+                "native_worker_recovery",
+            ] {
                 if let Some(value) = operation["result"].get(field) {
                     result[field] = value.clone();
                 }

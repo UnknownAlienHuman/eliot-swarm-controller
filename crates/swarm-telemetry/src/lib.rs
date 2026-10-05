@@ -220,6 +220,7 @@ pub struct Record {
     client_id: Option<KnownId>,
     link_id: Option<KnownId>,
     binding_id: Option<KnownId>,
+    binding_generation: Option<u64>,
     operation_id: Option<KnownId>,
     module_boot_id: Option<KnownId>,
 }
@@ -234,6 +235,7 @@ impl Record {
             client_id: None,
             link_id: None,
             binding_id: None,
+            binding_generation: None,
             operation_id: None,
             module_boot_id: None,
         }
@@ -255,6 +257,11 @@ impl Record {
         self.binding_id = value.and_then(KnownId::from_known);
         self
     }
+    pub fn with_binding_generation(mut self, value: Option<u64>) -> Self {
+        self.binding_generation =
+            value.filter(|generation| *generation > 0 && *generation <= i64::MAX as u64);
+        self
+    }
     pub fn with_operation_id(mut self, value: Option<&str>) -> Self {
         self.operation_id = value.and_then(KnownId::from_known);
         self
@@ -267,6 +274,8 @@ impl Record {
 
 #[derive(Serialize)]
 struct WireRecord<'a> {
+    // Schema 2 adds the optional retained binding generation. The observer
+    // still decodes the exact schema-1 shape for already-written records.
     schema_version: u8,
     // Identifies emission attempts, including dropped ones. Concurrent sends
     // can reach the writer in another order; this is not a journal cursor.
@@ -284,6 +293,8 @@ struct WireRecord<'a> {
     link_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     binding_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    binding_generation: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     operation_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -364,7 +375,7 @@ impl Producer {
         }
         let sequence = next_sequence(&self.inner.next_sequence);
         let wire = WireRecord {
-            schema_version: 1,
+            schema_version: 2,
             sequence,
             occurred_at_unix_ms: unix_time_ms(),
             severity: record.severity,
@@ -374,6 +385,7 @@ impl Producer {
             client_id: record.client_id.as_ref().map(|id| id.0.as_str()),
             link_id: record.link_id.as_ref().map(|id| id.0.as_str()),
             binding_id: record.binding_id.as_ref().map(|id| id.0.as_str()),
+            binding_generation: record.binding_generation,
             operation_id: record.operation_id.as_ref().map(|id| id.0.as_str()),
             module_boot_id: record.module_boot_id.as_ref().map(|id| id.0.as_str()),
         };

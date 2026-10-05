@@ -468,6 +468,17 @@ static TOOLS: &[(bool, ToolSpec)] = &[
         ],
         &["project_id", "automation_id"],
     ),
+    read(
+        "bus.events.page",
+        "Read a bounded, non-acknowledging page of safe event metadata selected by one enabled ScriptRun consumer owned by the authenticated Manager.",
+        &[
+            f("project_id", S),
+            f("consumer_id", S),
+            f("after_observation_id", I),
+            f("limit", I),
+        ],
+        &["project_id", "consumer_id"],
+    ),
     read("host.status", "Controller status snapshot.", &[], &[]),
     read(
         "route.list",
@@ -777,6 +788,26 @@ static TOOLS: &[(bool, ToolSpec)] = &[
         "Apply a revision-checked Manager-owned automation plan. Preview first and pass its digest when available; activation does not start a model turn.",
         &[f("project_id", S), f("changes", A), f("preview_digest", SN)],
         &["project_id", "changes"],
+    ),
+    mutation(
+        "bus.consumer.admit",
+        "Compare the current Manager-owned ScriptRun cursor, revalidate one bounded exact event page and its canonical ScriptRun actions, retain pending intents, and advance the existing cursor in the same Store transaction. The existing ScriptRun continuation admits script.run later.",
+        &[
+            f("project_id", S),
+            f("consumer_id", S),
+            f("automation_revision", I),
+            f("expected_cursor", I),
+            f("through_observation_id", I),
+            f("occurrences", A),
+        ],
+        &[
+            "project_id",
+            "consumer_id",
+            "automation_revision",
+            "expected_cursor",
+            "through_observation_id",
+            "occurrences",
+        ],
     ),
     mutation(
         "schedule.run_now",
@@ -1729,6 +1760,39 @@ fn refine_input_schema(method: &str, schema: &mut Value) {
         }
         "coordination.watch.cancel" => {
             properties["watch_id"] = json!({"type":"string","minLength":1,"maxLength":128});
+        }
+        "bus.events.page" => {
+            for field in ["project_id", "consumer_id"] {
+                properties[field] =
+                    json!({"type":"string","minLength":1,"maxLength":128,"pattern":"^\\S+$"});
+            }
+            properties["after_observation_id"] =
+                json!({"type":"integer","minimum":0,"maximum":9223372036854775807_i64});
+            properties["limit"] = json!({"type":"integer","minimum":1,"maximum":32});
+        }
+        "bus.consumer.admit" => {
+            properties["client_request_id"]["minLength"] = json!(1);
+            properties["client_request_id"]["maxLength"] = json!(128);
+            properties["client_request_id"]["pattern"] = json!("^\\S+$");
+            for field in ["project_id", "consumer_id"] {
+                properties[field] =
+                    json!({"type":"string","minLength":1,"maxLength":128,"pattern":"^\\S+$"});
+            }
+            for field in ["automation_revision", "through_observation_id"] {
+                properties[field] =
+                    json!({"type":"integer","minimum":1,"maximum":9223372036854775807_i64});
+            }
+            properties["expected_cursor"] =
+                json!({"type":"integer","minimum":0,"maximum":9223372036854775807_i64});
+            properties["occurrences"] = json!({
+                "type":"array","maxItems":32,"items":{"type":"object","properties":{
+                    "observation_id":{"type":"integer","minimum":1,"maximum":9223372036854775807_i64},
+                    "source_id":{"type":"string","minLength":1,"maxLength":256,"pattern":"^[A-Za-z0-9._:/@-]+$"},
+                    "event_kind":{"type":"string","minLength":1,"maxLength":256,"pattern":"^[A-Za-z0-9._:/@-]+$"},
+                    "status":{"type":["string","null"],"enum":["applied","completed","failed","incomplete","cancelled","rejected","sent","answered","invalidated","unknown",null]},
+                    "action":{"type":"object","properties":{"kind":{"const":"script_run"},"script_id":{"type":"string","minLength":1,"maxLength":64,"pattern":"^[A-Za-z0-9._-]+$"}},"required":["kind","script_id"],"additionalProperties":false}
+                },"required":["observation_id","source_id","event_kind","status","action"],"additionalProperties":false}
+            });
         }
         "hook.source.get" => {
             properties["source_id"] =
@@ -3455,6 +3519,7 @@ mod tests {
             "automation.config.get",
             "automation.config.preview",
             "automation.config.explain",
+            "bus.events.page",
             "host.mode",
             "module.route.select",
             "client.register",
@@ -3502,6 +3567,7 @@ mod tests {
             "review.assign",
             "review.submit",
             "automation.config.apply",
+            "bus.consumer.admit",
             "automation.config.transfer",
             "schedule.run_now",
             "hook.source.get",
@@ -3534,11 +3600,11 @@ mod tests {
         .into_iter()
         .collect();
         assert_eq!(methods, expected);
-        assert_eq!(TOOLS.len(), 122);
-        assert_eq!(TOOLS.iter().filter(|(read_only, _)| *read_only).count(), 55);
+        assert_eq!(TOOLS.len(), 124);
+        assert_eq!(TOOLS.iter().filter(|(read_only, _)| *read_only).count(), 56);
         assert_eq!(
             TOOLS.iter().filter(|(read_only, _)| !*read_only).count(),
-            67
+            68
         );
     }
 

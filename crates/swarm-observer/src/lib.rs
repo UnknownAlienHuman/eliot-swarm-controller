@@ -8,6 +8,7 @@
 
 pub mod follow;
 pub mod host;
+pub mod host_image_receipt;
 pub mod live_config;
 pub mod metrics_cli;
 pub mod process_metrics;
@@ -42,8 +43,8 @@ const MAX_SEGMENT_BYTES: u64 = 1_073_741_824;
 const MAX_RETENTION_BYTES: u64 = 8_589_934_592;
 const MAX_RETENTION_DAYS: u64 = 3650;
 
-/// Exact wire shape emitted by `swarm-telemetry`. Unknown fields are rejected
-/// so the observer cannot silently claim coverage for a newer schema.
+/// Exact wire shapes emitted by `swarm-telemetry` schemas 1 and 2. Unknown
+/// fields are rejected so the observer cannot silently claim newer coverage.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DiagnosticRecord {
@@ -62,6 +63,10 @@ pub struct DiagnosticRecord {
     pub link_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub binding_id: Option<String>,
+    /// Exact retained Store generation for binding-scoped module records.
+    /// Missing remains valid for schema-1 records and non-binding schema-2 records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding_generation: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub operation_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -81,10 +86,16 @@ pub fn decode_line(line: &[u8]) -> Result<DiagnosticRecord> {
             "diagnostic line is not the supported metadata schema",
         )
     })?;
-    if record.schema_version != 1 {
+    if !matches!(record.schema_version, 1 | 2) {
         return Err(Error::new(
             "OBSERVER_SCHEMA_UNSUPPORTED",
             "diagnostic schema version is unsupported",
+        ));
+    }
+    if record.schema_version == 1 && record.binding_generation.is_some() {
+        return Err(Error::new(
+            "OBSERVER_SCHEMA_UNSUPPORTED",
+            "diagnostic schema-1 record contains a schema-2 field",
         ));
     }
     validate_record(&record)?;
@@ -92,6 +103,14 @@ pub fn decode_line(line: &[u8]) -> Result<DiagnosticRecord> {
 }
 
 fn validate_record(record: &DiagnosticRecord) -> Result<()> {
+    if record.binding_generation.is_some_and(|generation| {
+        generation == 0 || generation > i64::MAX as u64 || record.binding_id.is_none()
+    }) {
+        return Err(Error::new(
+            "OBSERVER_RECORD_INVALID",
+            "diagnostic binding generation is outside the Store range",
+        ));
+    }
     if !matches!(
         record.severity.as_str(),
         "error" | "warn" | "info" | "debug" | "trace"
@@ -156,6 +175,17 @@ fn validate_record(record: &DiagnosticRecord) -> Result<()> {
                 "diagnostic identity is outside the bounded metadata vocabulary",
             ));
         }
+    }
+    if record.schema_version == 2
+        && matches!(record.kind.as_str(), "module_started" | "module_stopped")
+        && (record.binding_id.is_none()
+            || record.binding_generation.is_none()
+            || record.module_boot_id.is_none())
+    {
+        return Err(Error::new(
+            "OBSERVER_RECORD_INVALID",
+            "schema-2 module diagnostics require exact binding, generation, and boot identities",
+        ));
     }
     Ok(())
 }

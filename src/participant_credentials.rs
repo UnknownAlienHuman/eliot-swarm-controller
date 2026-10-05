@@ -209,7 +209,7 @@ pub(crate) async fn issue_for_launch(
         ));
     }
     validate_request(&request)?;
-    let source_profile = selected_participant_profile(config, &request)?;
+    let source_profile = selected_participant_profile(config, &actor, &request)?;
 
     let identity = launch_identity(&actor, &request);
     let identity_digest = model::digest(model::canonical(&identity)?.as_bytes());
@@ -239,7 +239,7 @@ pub(crate) async fn issue_for_launch(
     let assignment_directory = fs::canonicalize(&assignment_directory)?;
 
     let profile_config =
-        scoped_profile_config(config, &request, source_profile, &client_id, &data_root)?;
+        scoped_profile_config(config, &request, &source_profile, &client_id, &data_root)?;
     let profile_bytes = profile_config.into_bytes()?;
     let credential_path = assignment_directory.join(CREDENTIAL_FILE);
     let profile_config_path = assignment_directory.join(PROFILE_FILE);
@@ -474,39 +474,80 @@ fn validate_text(value: &str, field: &str, max: usize, no_whitespace: bool) -> R
     Ok(())
 }
 
-fn selected_participant_profile<'a>(
-    config: &'a Config,
+fn selected_participant_profile(
+    config: &Config,
+    actor: &LaunchActor,
     request: &IssueRequest,
-) -> Result<&'a McpProfileConfig> {
+) -> Result<McpProfileConfig> {
+    launch_participant_profile_template(
+        config,
+        actor,
+        &request.mcp_profile,
+        &request.mcp_surface,
+    )?
+    .ok_or_else(|| {
+        Error::new(
+            "FORBIDDEN",
+            "launch profile is not an exact Participant template or the current Manager's profile",
+        )
+    })
+}
+
+/// Resolve the launch selector to a Participant-only template. An explicitly
+/// configured Participant profile keeps its own declared Participant surface.
+/// A Manager may instead select its own configured Manager profile as an
+/// identity anchor; that profile's broader groups and manual methods are never
+/// copied into the native Participant configuration.
+pub(crate) fn launch_participant_profile_template(
+    config: &Config,
+    actor: &LaunchActor,
+    profile_name: &str,
+    surface_name: &str,
+) -> Result<Option<McpProfileConfig>> {
     config.mcp.validate()?;
     let profile = config
         .mcp
         .profiles
-        .get(&request.mcp_profile)
+        .get(profile_name)
         .ok_or_else(|| Error::new("CONFIG_ERROR", "MCP profile is not configured"))?;
-    if profile.tool_profile != McpToolProfile::Participant {
-        return Err(Error::new(
-            "FORBIDDEN",
-            "assignment credential issuance requires the configured Participant hard profile",
-        ));
+    match profile.tool_profile {
+        McpToolProfile::Participant => {
+            if profile
+                .surface
+                .as_deref()
+                .is_some_and(|surface| surface != surface_name)
+            {
+                return Err(Error::new(
+                    "CONFIG_ERROR",
+                    "requested MCP surface differs from the configured Participant profile",
+                ));
+            }
+            mcp::launch_profile_surface(
+                profile.tool_profile,
+                surface_name,
+                &profile.deferred_groups,
+                &profile.manual_tools,
+            )?;
+            Ok(Some(profile.clone()))
+        }
+        McpToolProfile::Manager
+            if actor.role() == Role::Manager
+                && profile.expected_client_id == actor.effective_manager_id() =>
+        {
+            // The requested surface is validated against the Participant
+            // hard role. Nothing from the Manager profile's groups or manual
+            // methods crosses this translation boundary.
+            mcp::launch_profile_surface(McpToolProfile::Participant, surface_name, &[], &[])?;
+            Ok(Some(McpProfileConfig {
+                tool_profile: McpToolProfile::Participant,
+                expected_client_id: actor.effective_manager_id().to_owned(),
+                surface: Some(surface_name.to_owned()),
+                deferred_groups: Vec::new(),
+                manual_tools: Vec::new(),
+            }))
+        }
+        _ => Ok(None),
     }
-    if profile
-        .surface
-        .as_deref()
-        .is_some_and(|surface| surface != request.mcp_surface)
-    {
-        return Err(Error::new(
-            "CONFIG_ERROR",
-            "requested MCP surface differs from the configured Participant profile",
-        ));
-    }
-    mcp::launch_profile_surface(
-        profile.tool_profile,
-        &request.mcp_surface,
-        &profile.deferred_groups,
-        &profile.manual_tools,
-    )?;
-    Ok(profile)
 }
 
 fn scoped_profile_config(

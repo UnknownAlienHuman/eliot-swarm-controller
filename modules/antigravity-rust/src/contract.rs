@@ -35,8 +35,9 @@ pub fn template() -> Result<ModuleContractTemplate> {
     };
     let capabilities = [
         "agent.open",
-        "agent.refresh",
         "agent.reconcile",
+        "agent.refresh",
+        "agent.result",
         "agent.send/next_turn",
         "task.dispatch",
     ]

@@ -143,7 +143,8 @@ pub(crate) struct ObservedEvent {
 
 /// Closed metadata projection for producer facts whose payload contract has
 /// been explicitly normalized. This never contains source keys, raw payload,
-/// binding identity, or artifact/content references.
+/// binding identity, or artifact/content references. ScriptRun facts may add
+/// their exact one-to-one Run ID to preserve the Operation/Run cause chain.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct SafeEventProjection {
     pub(crate) status: Option<super::event_rules::EventStatus>,
@@ -152,4 +153,5 @@ pub(crate) struct SafeEventProjection {
     pub(crate) failed_supervisor: Option<String>,
     pub(crate) occurrence_phase: Option<String>,
     pub(crate) occurrence_id: Option<String>,
+    pub(crate) script_run_id: Option<String>,
 }

@@ -194,13 +194,68 @@ function Assert-SchemaDescriptor {
     }
 }
 
+function Assert-WorkspaceOption {
+    param([Parameter(Mandatory = $true)] [object] $Value)
+
+    Assert-OnlyKeys -Value $Value -Allowed @(
+        'schema_version', 'native_options_pointer', 'semantics'
+    ) -Name 'workspace_option'
+    foreach ($field in @('schema_version', 'native_options_pointer', 'semantics')) {
+        if (-not $Value.Contains($field)) { throw "workspace_option.$field is required." }
+    }
+    [void] (Get-ValidatedInteger -Value $Value.schema_version -Field 'workspace_option.schema_version' -Minimum 1 -Maximum 1)
+    if ($Value.semantics -isnot [string] -or
+        $Value.semantics -cne 'replace_with_admitted_absolute_workspace') {
+        throw 'Unsupported workspace_option semantics.'
+    }
+
+    $pointer = $Value.native_options_pointer
+    if ($pointer -isnot [string] -or
+        [System.Text.Encoding]::UTF8.GetByteCount($pointer) -gt 1024 -or
+        -not $pointer.StartsWith('/', [StringComparison]::Ordinal)) {
+        throw 'workspace_option.native_options_pointer must be a bounded absolute JSON Pointer.'
+    }
+    $segments = $pointer.Substring(1).Split([char] '/')
+    if ($segments.Length -lt 1 -or $segments.Length -gt 8) {
+        throw 'workspace_option.native_options_pointer must contain one to eight segments.'
+    }
+    foreach ($segment in $segments) {
+        if ([string]::IsNullOrEmpty($segment) -or
+            [System.Text.Encoding]::UTF8.GetByteCount($segment) -gt 128) {
+            throw 'workspace_option.native_options_pointer contains an empty or oversized segment.'
+        }
+        $decoded = [System.Text.StringBuilder]::new()
+        for ($index = 0; $index -lt $segment.Length; $index++) {
+            $character = $segment[$index]
+            if ($character -eq [char] '~') {
+                if (($index + 1) -ge $segment.Length) {
+                    throw 'workspace_option.native_options_pointer contains an invalid JSON Pointer escape.'
+                }
+                $index++
+                switch ($segment[$index]) {
+                    '0' { [void] $decoded.Append([char] '~') }
+                    '1' { [void] $decoded.Append([char] '/') }
+                    default { throw 'workspace_option.native_options_pointer contains an invalid JSON Pointer escape.' }
+                }
+            }
+            else { [void] $decoded.Append($character) }
+        }
+        $decodedText = $decoded.ToString()
+        if ([string]::IsNullOrEmpty($decodedText) -or
+            [System.Text.Encoding]::UTF8.GetByteCount($decodedText) -gt 128 -or
+            @($decodedText.ToCharArray() | Where-Object { [char]::IsControl($_) }).Count -gt 0) {
+            throw 'workspace_option.native_options_pointer contains an invalid decoded object key.'
+        }
+    }
+}
+
 function Assert-DescriptorTemplate {
     param([System.Collections.IDictionary] $Descriptor)
 
     Assert-OnlyKeys -Value $Descriptor -Allowed @(
         'schema_version', 'module_id', 'artifact', 'launch', 'config_schema',
         'command_schemas', 'event_schemas', 'protocol', 'capabilities',
-        'lifecycle', 'activation', 'enabled', 'restart'
+        'lifecycle', 'activation', 'enabled', 'restart', 'workspace_option'
     ) -Name 'descriptor'
 
     foreach ($required in @('module_id', 'artifact', 'launch', 'protocol', 'lifecycle', 'activation', 'enabled')) {
@@ -303,6 +358,10 @@ function Assert-DescriptorTemplate {
     if ($Descriptor.capabilities -isnot [array] -or $Descriptor.capabilities.Count -gt 256) {
         throw 'capabilities must be an array of at most 256 entries.'
     }
+    if ($Descriptor.Contains('workspace_option') -and $null -ne $Descriptor.workspace_option) {
+        Assert-WorkspaceOption -Value $Descriptor.workspace_option
+    }
+
     foreach ($capability in $Descriptor.capabilities) {
         Assert-TextValue -Value $capability -Pattern '\A[A-Za-z0-9._:/@-]{1,128}\z' -Field 'capabilities[]'
     }

@@ -1,5 +1,12 @@
 set windows-shell := ["pwsh.exe", "-NoProfile", "-Command"]
 
+# All compiling recipes share an explicit external Cargo cache. An empty value
+# fails before Cargo can allocate a checkout-local default target.
+shared_target := env_var_or_default("CARGO_TARGET_DIR", "")
+
+_shared-target TARGET:
+    pwsh -NoProfile -File tools/ci/package-scope.ps1 -Stage ValidateTarget -TargetDir "{{TARGET}}"
+
 default:
     @just --list
 
@@ -8,8 +15,8 @@ metadata:
 
 # Scoped developer gate: format and strict Clippy only for changed packages
 # plus their actual local reverse dependencies. BASE and HEAD are full commit SHAs.
-verify BASE HEAD:
-    pwsh -NoProfile -File tools/ci/package-scope.ps1 -Stage Verify -BaseSha "{{BASE}}" -HeadSha "{{HEAD}}"
+verify BASE HEAD TARGET=shared_target:
+    pwsh -NoProfile -File tools/ci/package-scope.ps1 -Stage Verify -BaseSha "{{BASE}}" -HeadSha "{{HEAD}}" -TargetDir "{{TARGET}}"
 
 fmt:
     cargo fmt -p eliot-swarm-controller -- --check
@@ -17,20 +24,20 @@ fmt:
 fmt-package package:
     cargo fmt --package "{{package}}" -- --check
 
-check:
-    cargo check --locked --lib --bins
+check TARGET=shared_target: (_shared-target TARGET)
+    cargo check --locked --lib --bins --target-dir "{{TARGET}}"
 
-clippy:
-    cargo clippy --locked --lib --bins --no-deps -- -D warnings
+clippy TARGET=shared_target: (_shared-target TARGET)
+    cargo clippy --locked --lib --bins --no-deps --target-dir "{{TARGET}}" -- -D warnings
 
-clippy-package package:
-    cargo clippy --locked --package "{{package}}" --lib --bins --no-deps -- -D warnings
+clippy-package package TARGET=shared_target: (_shared-target TARGET)
+    cargo clippy --locked --package "{{package}}" --lib --bins --no-deps --target-dir "{{TARGET}}" -- -D warnings
 
-test:
-    cargo test --locked -p eliot-swarm-controller --lib --bins
+test TARGET=shared_target: (_shared-target TARGET)
+    cargo test --locked -p eliot-swarm-controller --lib --bins --target-dir "{{TARGET}}"
 
-test-target package target:
-    cargo test --locked --package "{{package}}" --test "{{target}}"
+test-target package target TARGET=shared_target: (_shared-target TARGET)
+    cargo test --locked --package "{{package}}" --test "{{target}}" --target-dir "{{TARGET}}"
 
 # These fixtures exercise native contracts; they never call a real model.
 bridge-fixtures:
@@ -50,11 +57,11 @@ codex-fixtures:
 opencode-fixtures:
     node modules/opencode/selftest.mjs
 
-build:
-    cargo build --locked --release --bin swarm
+build TARGET=shared_target: (_shared-target TARGET)
+    cargo build --locked --release --bin swarm --target-dir "{{TARGET}}"
 
-full-rust:
-    pwsh -NoProfile -File tools/ci/package-scope.ps1 -Stage FullRust
+full-rust TARGET=shared_target:
+    pwsh -NoProfile -File tools/ci/package-scope.ps1 -Stage FullRust -TargetDir "{{TARGET}}"
 
 # Explicit full local qualification; scoped PR checks do not call this recipe.
-verify-full: full-rust bridge-fixtures codex-fixtures opencode-fixtures build
+verify-full TARGET=shared_target: (full-rust TARGET) bridge-fixtures codex-fixtures opencode-fixtures (build TARGET)

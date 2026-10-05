@@ -3,8 +3,20 @@ on:
   workflow_dispatch:
     inputs:
       package:
-        description: Exact approved Cargo package name; it must already be a workspace member with owned binary targets.
-        type: string
+        description: Select one exact approved package and its single binary target; host package is release-only.
+        type: choice
+        options:
+          - swarm-adapter-codex
+          - swarm-adapter-command
+          - swarm-antigravity-adapter
+          - swarm-adapter-opencode
+          - swarm-process
+          - swarm-script-worker
+          - swarm-observer
+          - swarm-checks
+          - swarm-forge-worker
+          - swarm-bus
+          - eliot-swarm-controller
         required: true
       profile:
         description: Workspace build profile for the selected package.
@@ -43,17 +55,36 @@ jobs:
           MODULE_PACKAGE: ${{ inputs.package }}
           MODULE_PROFILE: ${{ inputs.profile }}
         run: |
+          $modulePackages = @(
+            'swarm-adapter-codex', 'swarm-adapter-command',
+            'swarm-antigravity-adapter', 'swarm-adapter-opencode',
+            'swarm-process', 'swarm-script-worker', 'swarm-observer',
+            'swarm-checks', 'swarm-forge-worker', 'swarm-bus'
+          )
+          $hostPackage = 'eliot-swarm-controller'
+          if ($env:MODULE_PACKAGE -cnotin ($modulePackages + $hostPackage)) {
+            throw 'Choose exactly one package from the declared workflow input list.'
+          }
           $sharedTargetDir = Join-Path $env:RUNNER_TEMP 'eliot-module-shared-target'
           $artifactDir = Join-Path $env:RUNNER_TEMP 'eliot-module-package'
-          $buildArgs = @(
-            '-NoProfile',
-            '-File', 'tools/ci/build-module-package.ps1',
-            '-Package', $env:MODULE_PACKAGE,
-            '-Profile', $env:MODULE_PROFILE,
-            '-TargetDir', $sharedTargetDir,
-            '-OutputDir', $artifactDir
-          )
-          & pwsh @buildArgs
+          if (-not (Test-Path -LiteralPath $sharedTargetDir -PathType Container)) {
+            [void][IO.Directory]::CreateDirectory($sharedTargetDir)
+          }
+          if (Test-Path -LiteralPath $artifactDir) {
+            throw 'The selected package output directory must be fresh.'
+          }
+          if ($env:MODULE_PACKAGE -ceq $hostPackage) {
+            if ($env:MODULE_PROFILE -cne 'release') {
+              throw 'The host provenance package is release-only.'
+            }
+            & pwsh -NoProfile -File 'tools/ci/Build-SwarmHostProvenance.ps1' `
+              -TargetDir $sharedTargetDir -OutputDir $artifactDir
+          }
+          else {
+            & pwsh -NoProfile -File 'tools/ci/build-module-package.ps1' `
+              -Package $env:MODULE_PACKAGE -Profile $env:MODULE_PROFILE `
+              -TargetDir $sharedTargetDir -OutputDir $artifactDir
+          }
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:

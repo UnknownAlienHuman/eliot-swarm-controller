@@ -1,10 +1,11 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('Classify', 'Resolve', 'ValidateDocs', 'ValidateTooling', 'Verify', 'FullRust')]
+    [ValidateSet('Classify', 'Resolve', 'ValidateDocs', 'ValidateTooling', 'ValidateTarget', 'Verify', 'FullRust')]
     [string] $Stage,
     [string] $BaseSha,
-    [string] $HeadSha
+    [string] $HeadSha,
+    [string] $TargetDir
 )
 
 Set-StrictMode -Version Latest
@@ -180,6 +181,27 @@ function Test-PathWithin([string] $Path, [string] $Directory) {
     return -not $relative.StartsWith("..$([IO.Path]::DirectorySeparatorChar)", $script:PathComparison)
 }
 
+function Resolve-ExternalBuildTargetDir([string] $Path) {
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        $Path = $env:CARGO_TARGET_DIR
+    }
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not [IO.Path]::IsPathFullyQualified($Path)) {
+        throw 'Cargo build stages require one explicit absolute shared TargetDir or CARGO_TARGET_DIR.'
+    }
+    $target = [IO.Path]::GetFullPath($Path).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    if ((Test-PathWithin $target $script:RepoRoot) -or (Test-PathWithin $script:RepoRoot $target)) {
+        throw 'The shared Cargo TargetDir must be outside and disjoint from the source checkout.'
+    }
+    if (Test-Path -LiteralPath $target -PathType Leaf) { throw 'The shared Cargo TargetDir names a file.' }
+    if (-not (Test-Path -LiteralPath $target -PathType Container)) {
+        [void][IO.Directory]::CreateDirectory($target)
+    }
+    $item = Get-Item -LiteralPath $target -Force
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw 'The shared Cargo TargetDir cannot itself be a reparse point.'
+    }
+    return $target
+}
 function Get-LocalPackageGraph {
     Push-Location $script:RepoRoot
     try {
@@ -427,7 +449,7 @@ function Resolve-PackageScope($Changes, $Classification) {
     }
 }
 
-function Invoke-ScopedCargoChecks($Scope) {
+function Invoke-ScopedCargoChecks($Scope, [string] $TargetDir) {
     if ($Scope.FormatPackages.Count -gt 0) {
         $formatArgs = @('fmt', '--check')
         foreach ($package in $Scope.FormatPackages) { $formatArgs += @('--package', $package) }
@@ -437,7 +459,8 @@ function Invoke-ScopedCargoChecks($Scope) {
         if ($LASTEXITCODE -ne 0) { throw "cargo fmt failed with exit code $LASTEXITCODE." }
     }
     if ($Scope.ClippyPackages.Count -gt 0) {
-        $clippyArgs = @('clippy', '--locked', '--lib', '--bins', '--no-deps')
+        if ([string]::IsNullOrWhiteSpace($TargetDir)) { throw 'Scoped Cargo checks require an explicit shared TargetDir.' }
+        $clippyArgs = @('clippy', '--locked', '--lib', '--bins', '--no-deps', '--target-dir', $TargetDir)
         foreach ($package in $Scope.ClippyPackages) { $clippyArgs += @('--package', $package) }
         $clippyArgs += @('--', '-D', 'warnings')
         Write-Host "cargo $($clippyArgs -join ' ')"
@@ -446,7 +469,7 @@ function Invoke-ScopedCargoChecks($Scope) {
     }
 }
 
-function Invoke-FullOwnedRustChecks {
+function Invoke-FullOwnedRustChecks([string] $TargetDir) {
     $graph = Get-LocalPackageGraph
     $mixedTargets = @($graph.Entries | Where-Object { $_.VendorTargetCount -gt 0 -and $_.OwnedTargetCount -gt 0 })
     if ($mixedTargets.Count -gt 0) {
@@ -481,7 +504,8 @@ function Invoke-FullOwnedRustChecks {
     if ($LASTEXITCODE -ne 0) { throw "Full owned-package cargo fmt failed with exit code $LASTEXITCODE." }
 
     if ($clippySpecs.Count -gt 0) {
-        $clippyArgs = @('clippy', '--locked', '--lib', '--bins', '--no-deps')
+        if ([string]::IsNullOrWhiteSpace($TargetDir)) { throw 'Scoped Cargo checks require an explicit shared TargetDir.' }
+        $clippyArgs = @('clippy', '--locked', '--lib', '--bins', '--no-deps', '--target-dir', $TargetDir)
         foreach ($package in $clippySpecs) { $clippyArgs += @('--package', $package) }
         $clippyArgs += @('--', '-D', 'warnings')
         Write-Host "cargo $($clippyArgs -join ' ')"
@@ -489,7 +513,7 @@ function Invoke-FullOwnedRustChecks {
         if ($LASTEXITCODE -ne 0) { throw "Full owned-package cargo clippy failed with exit code $LASTEXITCODE." }
     }
 
-    $testArgs = @('test', '--locked')
+    $testArgs = @('test', '--locked', '--target-dir', $TargetDir)
     foreach ($package in $testSpecs) { $testArgs += @('--package', $package) }
     Write-Host "cargo $($testArgs -join ' ')"
     & cargo @testArgs
@@ -586,8 +610,14 @@ function Invoke-ToolingValidation($Changes) {
     }
 }
 
+if ($Stage -eq 'ValidateTarget') {
+    [void](Resolve-ExternalBuildTargetDir $TargetDir)
+    return
+}
+
 if ($Stage -eq 'FullRust') {
-    Invoke-FullOwnedRustChecks
+    $buildTargetDir = Resolve-ExternalBuildTargetDir $TargetDir
+    Invoke-FullOwnedRustChecks $buildTargetDir
     return
 }
 
@@ -633,7 +663,8 @@ switch ($Stage) {
         if ($classification.ToolingChanged) { Invoke-ToolingValidation $changes }
         if ($classification.RustChanged) {
             $scope = Resolve-PackageScope $changes $classification
-            Invoke-ScopedCargoChecks $scope
+            $buildTargetDir = Resolve-ExternalBuildTargetDir $TargetDir
+            Invoke-ScopedCargoChecks $scope $buildTargetDir
         }
         Write-Host 'Scoped verification completed; full/native/release gates remain explicit.'
     }

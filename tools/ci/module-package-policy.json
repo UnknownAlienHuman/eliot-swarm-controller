@@ -7,10 +7,11 @@
     "swarm-antigravity-adapter",
     "swarm-adapter-opencode",
     "swarm-process",
+    "swarm-script-worker",
     "swarm-observer",
     "swarm-checks",
-    "swarm-forge",
     "swarm-forge-worker",
-    "swarm-bus"
+    "swarm-bus",
+    "eliot-swarm-controller"
   ]
 }

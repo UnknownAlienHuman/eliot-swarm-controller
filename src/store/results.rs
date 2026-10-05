@@ -9,6 +9,176 @@ use crate::{
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};
 
+/// Build a bounded status projection from a terminal Operation already
+/// recorded by the same strict Antigravity binding. This is Store-side
+/// provenance only; it deliberately contains no native response body or
+/// inferred Task/execution-completion fact.
+pub(super) fn antigravity_status_snapshot(
+    db: &Connection,
+    binding_id: &str,
+    generation: i64,
+    binding: &Value,
+    target_operation_id: &str,
+    session_id: &str,
+) -> Result<Value> {
+    if binding["route"]["runtime"] != "antigravity"
+        || binding["native_root_id"].as_str() != Some(session_id)
+        || binding["observation"]["module_contract_selector"].is_null()
+    {
+        return Err(Error::new(
+            "RESULT_TARGET_SCOPE_INVALID",
+            "Antigravity status requires the exact selected binding session",
+        ));
+    }
+    let target = operations::get_operation(db, target_operation_id)?;
+    if target["binding_id"] != binding_id
+        || target["binding_generation"] != generation
+        || !matches!(
+            target["method"].as_str(),
+            Some("task.dispatch" | "agent.send")
+        )
+        || !matches!(target["state"].as_str(), Some("settled" | "rejected"))
+    {
+        return Err(Error::new(
+            "RESULT_TARGET_NOT_TERMINAL",
+            "status target must be a terminal dispatch or send on this binding generation",
+        ));
+    }
+
+    let raw: Option<String> = db
+        .query_row(
+            "SELECT original_request_json FROM operations WHERE operation_id=?1 AND binding_id=?2 AND binding_generation=?3",
+            params![target_operation_id, binding_id, generation],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let raw = raw.ok_or_else(|| {
+        Error::new(
+            "RESULT_TARGET_SCOPE_INVALID",
+            "status target is absent from this binding generation",
+        )
+    })?;
+    let request: Value = serde_json::from_str(&raw)?;
+    let target_input_sha256 = model::digest(model::canonical(&request)?.as_bytes());
+
+    let outcome: RuntimeOutcome =
+        serde_json::from_value(target["result"].clone()).map_err(|_| {
+            Error::new(
+                "RESULT_TARGET_RECEIPT_INVALID",
+                "terminal status target has no typed module outcome",
+            )
+        })?;
+    let outcome_matches_state = matches!(
+        (target["state"].as_str(), &outcome.outcome),
+        (Some("settled"), EffectOutcome::Applied) | (Some("rejected"), EffectOutcome::Rejected)
+    );
+    if outcome.operation_id != target_operation_id
+        || !outcome_matches_state
+        || outcome.native_root_id.as_deref() != Some(session_id)
+        || outcome.native_scope_key.as_deref() != binding["native_scope_key"].as_str()
+    {
+        return Err(Error::new(
+            "RESULT_TARGET_RECEIPT_INVALID",
+            "terminal status target differs from the retained native binding receipt",
+        ));
+    }
+    let target_module_receipt = super::runtime::validate_module_receipt_for_operation(
+        db, binding_id, generation, binding, &outcome,
+    )?;
+
+    let diagnostic_code = target["result"]["details"]["diagnostic_code"]
+        .as_str()
+        .filter(|value| safe_diagnostic_code(value))
+        .map(str::to_owned);
+    let native_failure_status = antigravity_native_failure_status(
+        &target["result"],
+        target_operation_id,
+        session_id,
+        &outcome.outcome,
+    );
+
+    Ok(json!({
+        "operation_id":target_operation_id,
+        "method":target["method"],
+        "operation_state":target["state"],
+        "operation_outcome":target["result"]["outcome"],
+        "diagnostic_code":diagnostic_code,
+        "native_failure_status":native_failure_status,
+        "target_input_sha256":target_input_sha256,
+        "module_receipt":target_module_receipt,
+    }))
+}
+
+fn antigravity_native_failure_status(
+    result: &Value,
+    operation_id: &str,
+    session_id: &str,
+    outcome: &EffectOutcome,
+) -> Option<&'static str> {
+    if !matches!(outcome, EffectOutcome::Rejected)
+        || result["details"]["completion_condition"] != "native_terminal_result_observed"
+    {
+        return None;
+    }
+    let reference = &result["details"]["local_execution_ref"];
+    let status = result["details"]["turn_status"].as_str()?;
+    if !matches!(status, "ERROR" | "CANCELED" | "INTERRUPTED")
+        || reference["input_operation_id"].as_str() != Some(operation_id)
+        || reference["native_conversation_id"].as_str() != Some(session_id)
+        || reference["status"].as_str() != Some(status)
+        || reference["bridge_boot_id"]
+            .as_str()
+            .is_none_or(str::is_empty)
+        || reference["result_ordinal"]
+            .as_u64()
+            .is_none_or(|ordinal| ordinal == 0)
+        || reference["response_sha256"]
+            .as_str()
+            .is_none_or(|digest| !valid_sha256(digest))
+    {
+        return None;
+    }
+    Some(match status {
+        "ERROR" => "ERROR",
+        "CANCELED" => "CANCELED",
+        "INTERRUPTED" => "INTERRUPTED",
+        _ => return None,
+    })
+}
+
+fn safe_diagnostic_code(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+pub(super) fn antigravity_status_page_bytes(metadata: &Value) -> Result<Vec<u8>> {
+    let source = &metadata["source"];
+    Ok(serde_json::to_vec(&json!({
+        "schema_version":1,
+        "operation_id":source["input_operation_id"],
+        "method":source["target_method"],
+        "operation_state":source["target_operation_state"],
+        "operation_outcome":source["target_operation_outcome"],
+        "diagnostic_code":source["target_diagnostic_code"],
+        "native_failure_status":source["native_failure_status"],
+        "native_session_id":source["native_session_id"],
+        "native_response_identity":"unavailable",
+        "execution_complete":false,
+        "task_completion":"unknown",
+        "native_replay":false,
+    }))?)
+}
+
 pub(super) fn prepare(
     db: &Connection,
     p: &Principal,
@@ -84,8 +254,99 @@ pub(super) fn prepare(
         context["target_method"] = target["method"].clone();
         context["target_input_sha256"] = json!(target_input_sha256);
         validate_input_status_source(db, &id, generation, &b, &request, source, &context)?;
+    } else if request["selector"]["kind"] == "antigravity_status" {
+        model::fields(
+            &request["selector"],
+            &["kind", "input_operation_id", "session_id"],
+        )?;
+        let target_id = model::text(&request["selector"], "input_operation_id")?;
+        let session_id = model::text(&request["selector"], "session_id")?;
+        let target_status =
+            antigravity_status_snapshot(db, &id, generation, &b, target_id, session_id)?;
+        context["result_input_sha256"] =
+            json!(model::digest(model::canonical(&request)?.as_bytes()));
+        context["target_operation_id"] = json!(target_id);
+        context["target_method"] = target_status["method"].clone();
+        context["target_input_sha256"] = target_status["target_input_sha256"].clone();
+        context["target_operation_status"] = target_status.clone();
+        context["native_session_id"] = json!(session_id);
+        validate_antigravity_status_source(db, &id, generation, &b, source, &context)?;
     }
     Ok(context)
+}
+
+fn validate_antigravity_status_source(
+    db: &Connection,
+    binding_id: &str,
+    generation: i64,
+    binding: &Value,
+    source: &Value,
+    context: &Value,
+) -> Result<()> {
+    model::fields(
+        source,
+        &[
+            "kind",
+            "result_operation_id",
+            "result_input_sha256",
+            "result_module_receipt",
+            "input_operation_id",
+            "target_method",
+            "target_input_sha256",
+            "target_module_receipt",
+            "target_operation_state",
+            "target_operation_outcome",
+            "target_diagnostic_code",
+            "native_failure_status",
+            "native_session_id",
+            "evidence",
+            "native_response_identity",
+            "execution_complete",
+            "task_completion",
+            "native_replay",
+        ],
+    )?;
+    let target = &context["target_operation_status"];
+    if source["kind"] != "antigravity_status"
+        || source["result_operation_id"] != context["operation_id"]
+        || source["result_input_sha256"] != context["result_input_sha256"]
+        || source["input_operation_id"] != context["target_operation_id"]
+        || source["target_method"] != context["target_method"]
+        || source["target_input_sha256"] != context["target_input_sha256"]
+        || source["target_module_receipt"] != target["module_receipt"]
+        || source["target_operation_state"] != target["operation_state"]
+        || source["target_operation_outcome"] != target["operation_outcome"]
+        || source["target_diagnostic_code"] != target["diagnostic_code"]
+        || source["native_failure_status"] != target["native_failure_status"]
+        || source["native_session_id"] != binding["native_root_id"]
+        || source["evidence"] != "store_retained_module_operation_receipt"
+        || source["native_response_identity"] != "unavailable"
+        || source["execution_complete"] != false
+        || source["task_completion"] != "unknown"
+        || source["native_replay"] != false
+    {
+        return Err(Error::new(
+            "RESULT_PROVENANCE_INVALID",
+            "Antigravity status page differs from the exact retained Operation receipt",
+        ));
+    }
+    let result_outcome = RuntimeOutcome {
+        operation_id: model::text(context, "operation_id")?.to_owned(),
+        outcome: EffectOutcome::Unknown,
+        native_scope_key: binding["native_scope_key"].as_str().map(str::to_owned),
+        native_root_id: binding["native_root_id"].as_str().map(str::to_owned),
+        turn_id: None,
+        native_input_id: None,
+        details: json!({"module_receipt":source["result_module_receipt"]}),
+    };
+    super::runtime::validate_module_receipt_for_operation(
+        db,
+        binding_id,
+        generation,
+        binding,
+        &result_outcome,
+    )?;
+    Ok(())
 }
 
 fn validate_input_status_source(
@@ -207,6 +468,15 @@ pub(super) fn record(
             "target_operation_id",
             "target_method",
             "target_input_sha256",
+        ]);
+    } else if artifact.metadata["selector"]["kind"] == "antigravity_status" {
+        context_keys.extend([
+            "result_input_sha256",
+            "target_operation_id",
+            "target_method",
+            "target_input_sha256",
+            "target_operation_status",
+            "native_session_id",
         ]);
     }
     for key in context_keys {

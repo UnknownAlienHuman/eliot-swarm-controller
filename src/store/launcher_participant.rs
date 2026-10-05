@@ -7,7 +7,7 @@
 
 use super::launcher::LaunchActor;
 use crate::{
-    config::{Config, McpToolProfile},
+    config::Config,
     error::{Error, Result},
     launcher::LaunchRequest,
     model,
@@ -234,29 +234,19 @@ fn validated_scope(
     let request = &manifest["request"];
     let mcp_profile = model::text(request, "mcp_profile")?.to_owned();
     let mcp_surface = model::text(request, "mcp_surface")?.to_owned();
-    config.mcp.validate()?;
-    let profile = config
-        .mcp
-        .profiles
-        .get(&mcp_profile)
-        .ok_or_else(|| Error::new("CONFIG_ERROR", "launch MCP profile is not configured"))?;
-    if profile.tool_profile != McpToolProfile::Participant
-        || profile
-            .surface
-            .as_deref()
-            .is_some_and(|surface| surface != mcp_surface)
+    if crate::participant_credentials::launch_participant_profile_template(
+        config,
+        actor,
+        &mcp_profile,
+        &mcp_surface,
+    )?
+    .is_none()
     {
         return Err(Error::new(
             "FORBIDDEN",
-            "launch issuance requires the exact configured Participant profile and surface",
+            "launch issuance requires an exact Participant template or the current Manager's profile",
         ));
     }
-    crate::mcp::launch_profile_surface(
-        profile.tool_profile,
-        &mcp_surface,
-        &profile.deferred_groups,
-        &profile.manual_tools,
-    )?;
 
     let native_session_id = exact_native_session_id(&attempt, &binding);
     Ok(LaunchIssuanceScope {
