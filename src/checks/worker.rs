@@ -10,7 +10,7 @@ use crate::{
     artifacts::{ArtifactFiles, ArtifactRecord},
     error::{Error, Result},
     model,
-    platform::process_group::{Group, departed_empty, spawned_departed, spawned_identity},
+    platform::process_group::{departed_empty, spawned_departed, spawned_identity},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -21,6 +21,10 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     time::Duration,
+};
+use swarm_checks::{
+    CheckControl, CheckExecution, CheckIdentity, MAX_CAPTURE_BYTES_PER_STREAM, OwnedCheckProcess,
+    ResolvedCheckPlan, StartDecision, Termination,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -260,6 +264,114 @@ pub fn deliver_cancel(work: &Work) -> Result<()> {
         &json!({"check_id":work.check_id,"token":work.token,"request":request}),
     )
 }
+
+/// Read and validate the executor's one-shot process-group diagnostic. The
+/// token and full process identity stay in the private Store update envelope;
+/// only the fixed, sanitized `public` projection reaches `check.get`.
+pub fn process_diagnostic(work: &Work) -> Result<Option<Value>> {
+    let Some(expected_worker) = &work.expected_worker else {
+        // The Store has not durably accepted this process owner yet.
+        return Ok(None);
+    };
+    let dir = directory(&work.data_dir, &work.check_id)?;
+    let identity = read_value(&dir.join("worker.json"))?;
+    if &identity != expected_worker
+        || identity["token"] != work.token
+        || identity["control_version"] != 2
+    {
+        return Err(Error::conflict(
+            "process diagnostic worker differs from the accepted CheckRun owner",
+        ));
+    }
+    let mut selected: Option<(u8, &'static str, &'static str, u64, i64)> = None;
+    let mut control_read_unknown = false;
+    for (filename, expected_code, priority, cause) in [
+        (
+            "drain.json",
+            "CHECK_PROCESS_DRAIN_PENDING",
+            1,
+            "drain_pending",
+        ),
+        (
+            "control.json",
+            "CHECK_CONTROL_READ_UNKNOWN",
+            2,
+            "control_read_error",
+        ),
+        (
+            "observation.json",
+            "CHECK_PROCESS_OBSERVATION_UNKNOWN",
+            3,
+            "observation_error",
+        ),
+    ] {
+        let path = dir.join(filename);
+        if !path.try_exists()? {
+            continue;
+        }
+        let diagnostic = read_value(&path)?;
+        if diagnostic["version"] != 1
+            || diagnostic["check_id"] != work.check_id
+            || diagnostic["operation_id"] != work.operation_id
+            || diagnostic["token"] != work.token
+            || diagnostic["process"] != identity["process"]
+            || diagnostic["code"] != expected_code
+        {
+            return Err(Error::conflict(
+                "process diagnostic differs from the accepted CheckRun owner",
+            ));
+        }
+        if filename == "control.json" {
+            control_read_unknown = true;
+        }
+        let elapsed_ms = diagnostic["elapsed_ms"]
+            .as_u64()
+            .ok_or_else(|| Error::invalid("process diagnostic elapsed time is invalid"))?;
+        let observed_at_ms = diagnostic["observed_at_ms"]
+            .as_i64()
+            .filter(|value| *value >= 0)
+            .ok_or_else(|| Error::invalid("process diagnostic timestamp is invalid"))?;
+        if selected
+            .as_ref()
+            .is_none_or(|(existing, ..)| priority > *existing)
+        {
+            selected = Some((priority, expected_code, cause, elapsed_ms, observed_at_ms));
+        }
+    }
+    let Some((_, code, cause, elapsed_ms, observed_at_ms)) = selected else {
+        return Ok(None);
+    };
+    let message = match cause {
+        "observation_error" => {
+            "the owned process group could not be observed as empty; the resource remains held"
+        }
+        "control_read_error" => {
+            "the CheckRun cancellation receipt could not be read while its process group remains held"
+        }
+        "drain_pending" => {
+            "the owned process group remains active after the drain grace period; the resource remains held"
+        }
+        _ => return Err(Error::invalid("process diagnostic cause is invalid")),
+    };
+    Ok(Some(json!({
+        "version": 1,
+        "check_id": work.check_id,
+        "operation_id": work.operation_id,
+        "token": work.token,
+        "process": identity["process"],
+        "public": {
+            "code": code,
+            "status": "unresolved",
+            "cause": cause,
+            "message": message,
+            "control_read_unknown": control_read_unknown,
+            "elapsed_ms": elapsed_ms,
+            "observed_at_ms": observed_at_ms,
+            "resolved_at_ms": Value::Null
+        }
+    })))
+}
+
 #[derive(Default)]
 struct Cancellation {
     request: Option<CancelRequest>,
@@ -279,16 +391,6 @@ impl Cancellation {
         }
         Ok(self.request.is_some())
     }
-    fn interrupt(&mut self, group: &Group) {
-        if self.request.is_none() {
-            return;
-        }
-        self.termination_attempted = true;
-        match group.cancel_children() {
-            Ok(sent) => self.signals_sent = self.signals_sent.saturating_add(sent),
-            Err(e) => self.last_error = Some(e),
-        }
-    }
     fn applied(&self) -> bool {
         self.skipped_start || self.termination_attempted
     }
@@ -296,6 +398,186 @@ impl Cancellation {
         self.request.as_ref().map(|r| json!({"operation_id":r.operation_id,"reason":r.reason,
             "disposition":if self.skipped_start {"cancelled_before_command"} else if self.termination_attempted {"cancel_attempted_group_empty"} else {"completed_before_termination"},
             "termination_requests":self.signals_sent,"last_error":self.last_error}))
+    }
+}
+
+/// Adapts the existing CheckRun identity/go/cancel files to the executor.
+/// It owns no Store handle and cannot broaden the admitted command or scope.
+struct HostCheckControl<'a> {
+    work: &'a Work,
+    dir: &'a Path,
+    cancellation: Cancellation,
+    identity: Option<Value>,
+    cancellation_observed: bool,
+    started_at_ms: Option<i64>,
+    drain_diagnostic: Option<Value>,
+    control_read_diagnostic: Option<Value>,
+    process_observation_diagnostic: Option<Value>,
+    drain_diagnostic_write_failed: bool,
+}
+
+impl<'a> HostCheckControl<'a> {
+    fn new(work: &'a Work, dir: &'a Path) -> Self {
+        Self {
+            work,
+            dir,
+            cancellation: Cancellation::default(),
+            identity: None,
+            cancellation_observed: false,
+            started_at_ms: None,
+            drain_diagnostic: None,
+            control_read_diagnostic: None,
+            process_observation_diagnostic: None,
+            drain_diagnostic_write_failed: false,
+        }
+    }
+
+    fn validate_owner(&self, owner: &OwnedCheckProcess) -> Result<()> {
+        if owner.check_id != self.work.check_id
+            || owner.operation_id != self.work.operation_id
+            || owner.token != self.work.token
+        {
+            return Err(Error::conflict(
+                "check process owner differs from the admitted CheckRun",
+            ));
+        }
+        Ok(())
+    }
+
+    fn record_execution(&mut self, execution: &CheckExecution) {
+        if execution.termination == Termination::CancelledBeforeStart {
+            self.cancellation.skipped_start = true;
+        }
+        if self.cancellation_observed {
+            self.cancellation.termination_attempted = true;
+            self.cancellation.signals_sent = self
+                .cancellation
+                .signals_sent
+                .saturating_add(execution.termination_requests);
+        }
+        if execution.termination_request_unconfirmed && self.cancellation_observed {
+            self.cancellation.last_error = Some(Error::new(
+                "CHECK_TERMINATION_UNCONFIRMED",
+                "one or more requests to stop this check process group were not confirmed",
+            ));
+        }
+    }
+
+    fn diagnostic_event(
+        &self,
+        owner: &OwnedCheckProcess,
+        code: &str,
+        elapsed: Duration,
+    ) -> Result<Value> {
+        Ok(json!({
+            "version": 1,
+            "check_id": owner.check_id,
+            "operation_id": owner.operation_id,
+            "token": owner.token,
+            "process": owner.process,
+            "code": code,
+            "elapsed_ms": elapsed.as_millis().min(u64::MAX as u128) as u64,
+            "observed_at_ms": model::now_ms()?
+        }))
+    }
+}
+
+impl CheckControl for HostCheckControl<'_> {
+    fn wait_for_start(&mut self, owner: &OwnedCheckProcess) -> Result<StartDecision> {
+        self.validate_owner(owner)?;
+        let identity = json!({
+            "token": owner.token,
+            "process": owner.process,
+            "ready_at_ms": model::now_ms().unwrap_or(0),
+            "control_version": 2
+        });
+        write_once(&self.dir.join("worker.json"), &identity)?;
+        self.identity = Some(identity);
+
+        loop {
+            if self.cancellation.read(self.work, self.dir)? {
+                self.cancellation.skipped_start = true;
+                return Ok(StartDecision::CancelBeforeStart);
+            }
+            let go = self.dir.join("go.json");
+            if go.try_exists()? {
+                if read_value(&go)?["token"] != self.work.token {
+                    return Err(Error::conflict("check start token mismatch"));
+                }
+                self.started_at_ms = Some(model::now_ms()?);
+                return Ok(StartDecision::Start);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn cancellation_requested(&mut self, owner: &OwnedCheckProcess) -> Result<bool> {
+        self.validate_owner(owner)?;
+        let requested = self.cancellation.read(self.work, self.dir)?;
+        self.cancellation_observed |= requested;
+        Ok(requested)
+    }
+
+    fn process_group_drain_pending(
+        &mut self,
+        owner: &OwnedCheckProcess,
+        elapsed: Duration,
+        observation_error: bool,
+        control_read_unknown: bool,
+    ) -> Result<()> {
+        self.validate_owner(owner)?;
+        let result = (|| -> Result<()> {
+            if observation_error {
+                if self.process_observation_diagnostic.is_none() {
+                    self.process_observation_diagnostic = Some(self.diagnostic_event(
+                        owner,
+                        "CHECK_PROCESS_OBSERVATION_UNKNOWN",
+                        elapsed,
+                    )?);
+                }
+                write_once(
+                    &self.dir.join("observation.json"),
+                    self.process_observation_diagnostic
+                        .as_ref()
+                        .ok_or_else(|| {
+                            Error::invalid("process observation diagnostic was not initialized")
+                        })?,
+                )?;
+            }
+            if control_read_unknown {
+                if self.control_read_diagnostic.is_none() {
+                    self.control_read_diagnostic = Some(self.diagnostic_event(
+                        owner,
+                        "CHECK_CONTROL_READ_UNKNOWN",
+                        elapsed,
+                    )?);
+                }
+                write_once(
+                    &self.dir.join("control.json"),
+                    self.control_read_diagnostic.as_ref().ok_or_else(|| {
+                        Error::invalid("control read diagnostic was not initialized")
+                    })?,
+                )?;
+            }
+            if !observation_error && !control_read_unknown {
+                if self.drain_diagnostic.is_none() {
+                    self.drain_diagnostic = Some(self.diagnostic_event(
+                        owner,
+                        "CHECK_PROCESS_DRAIN_PENDING",
+                        elapsed,
+                    )?);
+                }
+                write_once(
+                    &self.dir.join("drain.json"),
+                    self.drain_diagnostic
+                        .as_ref()
+                        .ok_or_else(|| Error::invalid("drain diagnostic was not initialized"))?,
+                )?;
+            }
+            Ok(())
+        })();
+        self.drain_diagnostic_write_failed = result.is_err();
+        result
     }
 }
 
@@ -589,6 +871,15 @@ fn validate_completion(work: &Work, files: &ArtifactFiles, c: Completion) -> Res
     Ok(c)
 }
 pub fn failure(work: &Work, files: &ArtifactFiles, error: Value) -> Result<Completion> {
+    failure_with_process(work, files, error, Value::Null)
+}
+
+fn failure_with_process(
+    work: &Work,
+    files: &ArtifactFiles,
+    error: Value,
+    process: Value,
+) -> Result<Completion> {
     let state = if error["code"] == "CHECK_CANCELLED" {
         "cancelled"
     } else {
@@ -598,7 +889,7 @@ pub fn failure(work: &Work, files: &ArtifactFiles, error: Value) -> Result<Compl
     let report = json!({"version":1,"check_id":work.check_id,"operation_id":work.operation_id,"candidate_ref":work.candidate.artifact_id,
         "input_fingerprint":work.input_fingerprint,"resolved_inputs":work.resolved_inputs,"scope_plan":work.scope_plan,
         "cache_reusable":work.resolved_inputs.as_ref().is_some_and(|inputs|inputs["cache_reusable"]==true),
-        "profile":inputs::profile_identity(&work.profile)? ,"state":state,"exit_code":null,"source_checkout_verified":false,"resource_released":true,"coverage":coverage,"error":error,"process":null,"outputs":[]});
+        "profile":inputs::profile_identity(&work.profile)? ,"state":state,"exit_code":null,"source_checkout_verified":false,"resource_released":true,"coverage":coverage,"error":error,"process":process,"outputs":[]});
     let id = format!("check-{}", model::digest(work.operation_id.as_bytes()));
     let (record, bytes) = ArtifactFiles::document(
         "check_result",
@@ -1088,160 +1379,218 @@ pub fn run(file: &Path) -> Result<()> {
             "a previous worker started; command will not be repeated",
         ));
     }
-    let group = match Group::enter(&work.token) {
-        Ok(g) => g,
-        Err(e) => {
-            failure(&work, &ArtifactFiles::new(&work.data_dir)?, json!(e))?;
-            return Ok(());
-        }
-    };
-    write_once(
-        &dir.join("worker.json"),
-        &waiting_identity(&group, &work.token),
-    )?;
-    let mut cancellation = Cancellation::default();
-    loop {
-        if cancellation.read(&work, &dir)? {
-            cancellation.skipped_start = true;
-            break;
-        }
-        let go = dir.join("go.json");
-        if go.try_exists()? {
-            if read_value(&go)?["token"] != work.token {
-                return Err(Error::conflict("check start token mismatch"));
-            }
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
+
     let files = ArtifactFiles::new(&work.data_dir)?;
+    let mut control = HostCheckControl::new(&work, &dir);
     let mut code = None;
     let mut outputs = Vec::new();
-    let started = model::now_ms()?;
+    let mut execution: Option<CheckExecution> = None;
     let mut source_verified = false;
+    let mut prepared: Option<(Vec<String>, PathBuf, source::SourceManifest, PathBuf)> = None;
+    let mut plan_setup_failed = false;
     let outcome = (|| -> Result<Value> {
-        if cancellation.skipped_start {
-            return Err(Error::new(
-                "CHECK_CANCELLED",
-                "cancelled before command execution",
-            ));
-        }
-        let verified = source::verified_content(&files, &work.data_dir, &work.candidate)?;
-        let (resolved_argv, expected_targets, program) = if let Some(resolved) =
-            &work.resolved_inputs
-        {
-            if work.input_fingerprint.as_deref() != resolved["input_fingerprint"].as_str() {
-                return Err(Error::new(
-                    "CHECK_INPUTS_STALE",
-                    "worker input fingerprint does not match its resolved plan",
-                ));
-            }
-            if resolved["candidate_content_sha256"] != verified.content_sha256
-                || resolved["execution_workspace"]
-                    != inputs::execution_workspace_identity(&work.profile, &verified)?
-            {
-                return Err(Error::new(
-                    "CHECK_INPUTS_STALE",
-                    "candidate content or stable workspace differs from its resolved plan",
-                ));
-            }
-            inputs::verify_runtime_environment(&work.profile, &verified, &resolved["environment"])?;
-            let argv: Vec<String> = serde_json::from_value(resolved["argv"].clone())
-                .map_err(|_| Error::new("CHECK_INPUTS_STALE", "resolved argv is invalid"))?;
-            let targets: Vec<String> = serde_json::from_value(resolved["expected_targets"].clone())
-                .map_err(|_| Error::new("CHECK_INPUTS_STALE", "resolved targets are invalid"))?;
-            (argv, targets, inputs::verify_executable(resolved)?)
-        } else {
-            let environment = environment(&work.profile);
-            let program = executable(&work.profile.executable, &environment)?;
-            (
-                work.profile.args.clone(),
-                work.profile.expected_targets.clone(),
-                program,
-            )
+        let identity = CheckIdentity {
+            check_id: work.check_id.clone(),
+            operation_id: work.operation_id.clone(),
+            token: work.token.clone(),
         };
-        let (source_dir, candidate_file, manifest) = ensure_execution_inputs(
-            &work.data_dir,
-            &files,
-            &work.candidate,
-            &verified,
-            &work.profile,
+        let executed = swarm_checks::execute_with_plan(
+            identity,
+            dir.clone(),
+            &mut control,
+            || {
+                let setup = (|| -> Result<_> {
+                    let verified =
+                        source::verified_content(&files, &work.data_dir, &work.candidate)?;
+                    let (resolved_argv, expected_targets, program) = if let Some(resolved) =
+                        &work.resolved_inputs
+                    {
+                        if work.input_fingerprint.as_deref()
+                            != resolved["input_fingerprint"].as_str()
+                        {
+                            return Err(Error::new(
+                                "CHECK_INPUTS_STALE",
+                                "worker input fingerprint does not match its resolved plan",
+                            ));
+                        }
+                        if resolved["candidate_content_sha256"] != verified.content_sha256
+                            || resolved["execution_workspace"]
+                                != inputs::execution_workspace_identity(&work.profile, &verified)?
+                        {
+                            return Err(Error::new(
+                                "CHECK_INPUTS_STALE",
+                                "candidate content or stable workspace differs from its resolved plan",
+                            ));
+                        }
+                        inputs::verify_runtime_environment(
+                            &work.profile,
+                            &verified,
+                            &resolved["environment"],
+                        )?;
+                        let argv: Vec<String> = serde_json::from_value(resolved["argv"].clone())
+                            .map_err(|_| {
+                                Error::new("CHECK_INPUTS_STALE", "resolved argv is invalid")
+                            })?;
+                        let targets: Vec<String> = serde_json::from_value(
+                            resolved["expected_targets"].clone(),
+                        )
+                        .map_err(|_| {
+                            Error::new("CHECK_INPUTS_STALE", "resolved targets are invalid")
+                        })?;
+                        (argv, targets, inputs::verify_executable(resolved)?)
+                    } else {
+                        let environment = environment(&work.profile);
+                        let program = executable(&work.profile.executable, &environment)?;
+                        (
+                            work.profile.args.clone(),
+                            work.profile.expected_targets.clone(),
+                            program,
+                        )
+                    };
+                    let (source_dir, candidate_file, manifest) = ensure_execution_inputs(
+                        &work.data_dir,
+                        &files,
+                        &work.candidate,
+                        &verified,
+                        &work.profile,
+                    )?;
+                    let mut env = environment(&work.profile);
+                    let data_root = fs::canonicalize(&work.data_dir)?;
+                    let target = data_root
+                        .join("targets")
+                        .join(work.profile.resource.to_lowercase());
+                    ensure_owned_directories(&data_root, &target)?;
+                    env.insert(
+                        "CARGO_TARGET_DIR".into(),
+                        target.to_string_lossy().to_string(),
+                    );
+                    env.insert(
+                        "SWARM_CANDIDATE_FILE".into(),
+                        candidate_file.to_string_lossy().to_string(),
+                    );
+                    #[cfg(windows)]
+                    if !program
+                        .extension()
+                        .and_then(|x| x.to_str())
+                        .is_some_and(|x| x.eq_ignore_ascii_case("exe"))
+                    {
+                        return Err(Error::invalid(
+                            "use a native executable, such as pwsh.exe, rather than a batch shim",
+                        ));
+                    }
+                    let plan = ResolvedCheckPlan {
+                        identity: CheckIdentity {
+                            check_id: work.check_id.clone(),
+                            operation_id: work.operation_id.clone(),
+                            token: work.token.clone(),
+                        },
+                        executable: program.clone(),
+                        argv: resolved_argv,
+                        working_directory: fs::canonicalize(&source_dir)?,
+                        environment: env,
+                        output_directory: fs::canonicalize(&dir)?,
+                        output_limit_bytes_per_stream: MAX_CAPTURE_BYTES_PER_STREAM,
+                        // The current trusted CheckProfile has no full-command timeout policy.
+                        timeout: None,
+                    };
+                    Ok((plan, expected_targets, source_dir, manifest, program))
+                })();
+                match setup {
+                    Ok((plan, expected_targets, source_dir, manifest, program)) => {
+                        prepared = Some((expected_targets, source_dir, manifest, program));
+                        Ok(plan)
+                    }
+                    Err(error) => {
+                        plan_setup_failed = true;
+                        Err(error)
+                    }
+                }
+            },
         )?;
-        let mut env = environment(&work.profile);
-        let data_root = fs::canonicalize(&work.data_dir)?;
-        let target = data_root
-            .join("targets")
-            .join(work.profile.resource.to_lowercase());
-        ensure_owned_directories(&data_root, &target)?;
-        env.insert(
-            "CARGO_TARGET_DIR".into(),
-            target.to_string_lossy().to_string(),
-        );
-        env.insert(
-            "SWARM_CANDIDATE_FILE".into(),
-            candidate_file.to_string_lossy().to_string(),
-        );
-        #[cfg(windows)]
-        if !program
-            .extension()
-            .and_then(|x| x.to_str())
-            .is_some_and(|x| x.eq_ignore_ascii_case("exe"))
-        {
-            return Err(Error::invalid(
-                "use a native executable, such as pwsh.exe, rather than a batch shim",
-            ));
-        }
-        let stdout = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(dir.join("stdout"))?;
-        let stderr = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(dir.join("stderr"))?;
-        let mut command = Command::new(&program);
-        command
-            .args(&resolved_argv)
-            .current_dir(&source_dir)
-            .env_clear()
-            .envs(&env)
-            .stdin(Stdio::null())
-            .stdout(stdout)
-            .stderr(stderr);
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(0x08000000);
-        }
-        if cancellation.read(&work, &dir)? {
-            cancellation.skipped_start = true;
+        control.record_execution(&executed);
+        code = executed.exit_code;
+        execution = Some(executed.clone());
+
+        if control.drain_diagnostic_write_failed {
             return Err(Error::new(
-                "CHECK_CANCELLED",
-                "cancelled before command execution",
+                "CHECK_PROCESS_DIAGNOSTIC_WRITE_FAILED",
+                "the CheckRun process-group diagnostic could not be persisted",
             ));
         }
-        let mut child = command.spawn()?;
-        write_once(
-            &dir.join("started.json"),
-            &json!({"pid":child.id(),"program":program,"started_at_ms":started,"token":work.token}),
-        )?;
-        loop {
-            if let Some(status) = child.try_wait()? {
-                code = status.code();
-                break;
-            }
-            if cancellation.read(&work, &dir)? {
-                cancellation.interrupt(&group);
-            }
-            std::thread::sleep(Duration::from_millis(100));
+
+        if let Some(pid) = executed.child_pid {
+            let started = control.started_at_ms.ok_or_else(|| {
+                Error::new(
+                    "CHECK_START_RECEIPT_MISSING",
+                    "the worker start acknowledgement has no timestamp",
+                )
+            })?;
+            let program = &prepared
+                .as_ref()
+                .ok_or_else(|| {
+                    Error::new(
+                        "CHECK_EXECUTION_PLAN_MISSING",
+                        "the spawned check has no resolved plan context",
+                    )
+                })?
+                .3;
+            write_once(
+                &dir.join("started.json"),
+                &json!({"pid":pid,"program":program,"started_at_ms":started,"token":work.token}),
+            )?;
         }
-        drop(command);
-        while !group.children_empty()? {
-            if cancellation.read(&work, &dir)? {
-                cancellation.interrupt(&group);
+
+        // A request noticed after process exit is retained without claiming it
+        // caused termination, matching the previous worker's late-read behavior.
+        control.cancellation.read(&work, &dir)?;
+
+        match executed.termination {
+            Termination::CancelledBeforeStart => {
+                return Err(Error::new(
+                    "CHECK_CANCELLED",
+                    "cancelled before command execution",
+                ));
             }
-            std::thread::sleep(Duration::from_millis(100));
+            Termination::ControlReadUnknownBeforeStart => {
+                return Err(Error::new(
+                    "CHECK_CONTROL_READ_UNKNOWN",
+                    "the check cancellation receipt could not be read before command execution",
+                ));
+            }
+            Termination::ProcessObservationUnknown => {
+                return Err(Error::new(
+                    "CHECK_PROCESS_OBSERVATION_UNKNOWN",
+                    "the check process exit could not be observed",
+                ));
+            }
+            Termination::TimedOut => {
+                return Err(Error::new(
+                    "CHECK_TIMEOUT_UNEXPECTED",
+                    "the check executor timed out without an admitted timeout policy",
+                ));
+            }
+            Termination::Exited | Termination::Cancelled => {}
         }
+        if executed.control_read_unknown {
+            return Err(Error::new(
+                "CHECK_CONTROL_READ_UNKNOWN",
+                "the check cancellation receipt could not be read while the process was active",
+            ));
+        }
+        if !executed.resource_released {
+            return Err(Error::new(
+                "CHECK_RESOURCE_RELEASE_UNKNOWN",
+                "the check executor did not confirm release of its process group",
+            ));
+        }
+
+        let (expected_targets, source_dir, manifest, _) = prepared.take().ok_or_else(|| {
+            Error::new(
+                "CHECK_EXECUTION_PLAN_MISSING",
+                "the check executor started without its resolved plan context",
+            )
+        })?;
+
         let empty_scope_plan = Value::Null;
         let mut coverage = if work.profile.parser == Parser::CargoJson {
             parse_cargo(
@@ -1253,6 +1602,24 @@ pub fn run(file: &Path) -> Result<()> {
         } else {
             json!({"requested":["process_exit"],"checked":["process_exit"],"gaps":[]})
         };
+        let gaps = coverage["gaps"]
+            .as_array_mut()
+            .ok_or_else(|| Error::invalid("coverage gaps missing"))?;
+        if executed.stdout.truncated {
+            gaps.push(json!("stdout_truncated"));
+        }
+        if !executed.stdout.capture_complete {
+            gaps.push(json!("stdout_capture_incomplete"));
+        }
+        if executed.stderr.truncated {
+            gaps.push(json!("stderr_truncated"));
+        }
+        if !executed.stderr.capture_complete {
+            gaps.push(json!("stderr_capture_incomplete"));
+        }
+        gaps.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        gaps.dedup();
+
         match source::verify_directory(&source_dir, &manifest) {
             Ok(()) => source_verified = true,
             Err(e) => {
@@ -1264,25 +1631,57 @@ pub fn run(file: &Path) -> Result<()> {
         }
         Ok(coverage)
     })();
-    // Do not publish terminal evidence until the entire owned group is done.
-    while !group.children_empty()? {
-        if cancellation.read(&work, &dir)? {
-            cancellation.interrupt(&group);
+
+    if execution.is_none() {
+        match outcome {
+            Err(error) if control.identity.is_none() || plan_setup_failed => {
+                let process = control
+                    .identity
+                    .as_ref()
+                    .map(|identity| identity["process"].clone())
+                    .unwrap_or(Value::Null);
+                failure_with_process(&work, &files, json!(error), process)?;
+                drop(lock);
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+            Ok(_) => {
+                return Err(Error::new(
+                    "CHECK_EXECUTION_RECEIPT_MISSING",
+                    "the check executor returned without process evidence",
+                ));
+            }
         }
-        std::thread::sleep(Duration::from_millis(100));
     }
-    // A late request cannot rewrite an already completed command's verdict.
-    cancellation.read(&work, &dir)?;
-    for stream in ["stdout", "stderr"] {
-        let p = dir.join(stream);
-        if p.try_exists()? {
+    let executed = execution.as_ref().ok_or_else(|| {
+        Error::new(
+            "CHECK_EXECUTION_RECEIPT_MISSING",
+            "the check executor returned without process evidence",
+        )
+    })?;
+    if !executed.resource_released {
+        return Err(Error::new(
+            "CHECK_RESOURCE_RELEASE_UNKNOWN",
+            "the check executor did not confirm release of its process group",
+        ));
+    }
+
+    for (stream, captured) in [("stdout", &executed.stdout), ("stderr", &executed.stderr)] {
+        if captured.path.try_exists()? {
             outputs.push(files.seal_file(
                 &format!("{}:{stream}", work.operation_id),
-                &p,
-                json!({"check_id":work.check_id,"stream":stream}),
+                &captured.path,
+                json!({
+                    "check_id":work.check_id,
+                    "stream":stream,
+                    "bytes_written":captured.bytes_written,
+                    "truncated":captured.truncated,
+                    "capture_complete":captured.capture_complete
+                }),
             )?);
         }
     }
+
     let (mut coverage, error) = match outcome {
         Ok(c) => (c, None),
         Err(e) => (
@@ -1297,9 +1696,10 @@ pub fn run(file: &Path) -> Result<()> {
         && let Some(coverage_gaps) = coverage["gaps"].as_array_mut()
     {
         coverage_gaps.extend(gaps.iter().filter(|gap| gap.is_string()).cloned());
-        coverage_gaps.sort_by(|a, b| a.as_str().cmp(&b.as_str()));
+        coverage_gaps.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         coverage_gaps.dedup();
     }
+    let cancellation = std::mem::take(&mut control.cancellation);
     let state = if cancellation.applied() {
         "cancelled"
     } else if error.is_some() {
@@ -1314,11 +1714,22 @@ pub fn run(file: &Path) -> Result<()> {
     } else {
         "passed"
     };
+    let process = execution
+        .as_ref()
+        .map(|result| result.process.clone())
+        .or_else(|| {
+            control
+                .identity
+                .as_ref()
+                .map(|identity| identity["process"].clone())
+        })
+        .unwrap_or(Value::Null);
+    let started = control.started_at_ms.unwrap_or(model::now_ms()?);
     let report = json!({"version":1,"check_id":work.check_id,"operation_id":work.operation_id,"candidate_ref":work.candidate.artifact_id,"candidate_sha256":work.candidate.content_digest,
         "input_fingerprint":work.input_fingerprint,"resolved_inputs":work.resolved_inputs,"scope_plan":work.scope_plan,
         "cache_reusable":work.resolved_inputs.as_ref().is_some_and(|inputs|inputs["cache_reusable"]==true),
-        "profile":inputs::profile_identity(&work.profile)? ,"cancellation":cancellation.evidence(),"worker_version":env!("CARGO_PKG_VERSION"),"process":group.identity,"state":state,"exit_code":code,"resource_released":true,"source_checkout_verified":source_verified,"coverage":coverage,"error":error,
-        "outputs":outputs.iter().map(|r|json!({"artifact_ref":r.artifact_id,"stream":r.metadata["stream"],"sha256":r.content_digest,"length":r.byte_length})).collect::<Vec<_>>(),"started_at_ms":started,"finished_at_ms":model::now_ms()?});
+        "profile":inputs::profile_identity(&work.profile)? ,"cancellation":cancellation.evidence(),"worker_version":env!("CARGO_PKG_VERSION"),"process":process,"state":state,"exit_code":code,"resource_released":executed.resource_released,"source_checkout_verified":source_verified,"coverage":coverage,"error":error,
+        "outputs":outputs.iter().map(|r|json!({"artifact_ref":r.artifact_id,"stream":r.metadata["stream"],"sha256":r.content_digest,"length":r.byte_length,"bytes_written":r.metadata["bytes_written"],"truncated":r.metadata["truncated"],"capture_complete":r.metadata["capture_complete"]})).collect::<Vec<_>>(),"started_at_ms":started,"finished_at_ms":model::now_ms()?});
     let id = format!("check-{}", model::digest(work.operation_id.as_bytes()));
     let (record, bytes) = ArtifactFiles::document(
         "check_result",
@@ -1333,23 +1744,17 @@ pub fn run(file: &Path) -> Result<()> {
         token: work.token,
         state: state.into(),
         exit_code: code,
-        resource_released: true,
+        resource_released: executed.resource_released,
         coverage,
         result: record,
         outputs,
         cancellation: cancellation.evidence(),
     };
     write_once(&dir.join("terminal.json"), &json!(completed))?;
-    group.disarm()?;
     write_once(&dir.join("completion.json"), &json!(completed))?;
     drop(lock);
     Ok(())
 }
-
-fn waiting_identity(group: &Group, token: &str) -> Value {
-    json!({"token":token,"process":group.identity,"ready_at_ms":model::now_ms().unwrap_or(0),"control_version":2})
-}
-
 #[cfg(test)]
 mod coverage_validation_tests {
     use super::*;

@@ -2,6 +2,33 @@
 
 ## Current state
 
+### PR #25 trusted module handshake and shared checks executor — 2026-10-05
+
+The Store now registers immutable module descriptors through a reserved local
+supervisor credential whose only method is `module.descriptor.register`.
+Manager catalog reads redact launch details. Ordinary Managers and the Operator
+can select an exact registered version for their own future bindings through
+`module.route.select`; selection uses stable caller identity and catalog revision,
+without a current-GM prerequisite. Existing bindings retain their exact selector.
+Typed hello compares the claim with that retained descriptor before and after
+OS-owner preflight. Descriptor capabilities grant no Store or native-effect rights.
+
+Shared runtime commands carry the canonical retained Operation request digest.
+Every outcome for a versioned binding must carry its own matching typed receipt,
+including a reconcile target's separate Operation digest. Legacy bindings retain
+their explicit unverified handshake and previous receipt behavior. Root still
+owns admission and domain handlers; standalone adapter registration, activation
+and generic recovery admission remain separate integration work.
+
+The existing CheckRun worker now consumes `swarm-checks`. It publishes its exact
+process owner and waits for Store's Go before resolving source inputs or launching
+the native command. Unknown process-group observation retains the resource;
+sanitized drain/control diagnostics reach authorized `check.get` readback. The
+current worker process remains host-owned; an independent checks executable is
+unfinished. Frozen source hashes, scoped formatting and metadata shape pass.
+The combined production compiler gate and live behavior remain unverified at
+this publication. No local build, test or native/model call was performed.
+
 ### PR #25 scoped module-owner launcher — 2026-10-05
 
 `swarm-process` now provides the independently built `swarm-module-owner`

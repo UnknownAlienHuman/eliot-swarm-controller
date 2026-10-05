@@ -47,6 +47,12 @@ pub(super) fn allows_method(profile: McpToolProfile, method: &str) -> bool {
         return true;
     }
 
+    if method == "module.catalog.get"
+        && matches!(profile, McpToolProfile::Manager | McpToolProfile::Gm)
+    {
+        return true;
+    }
+
     match profile {
         McpToolProfile::Observer => false,
         McpToolProfile::Reviewer => method == "task.request_changes",
@@ -94,7 +100,8 @@ pub(super) fn allows_method(profile: McpToolProfile, method: &str) -> bool {
         ),
         McpToolProfile::Manager => matches!(
             method,
-            "task.request_changes"
+            "module.route.select"
+                | "task.request_changes"
                 | "task.create"
                 | "task.revise"
                 | "task.claim"

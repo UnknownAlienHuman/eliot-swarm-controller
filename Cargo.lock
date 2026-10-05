@@ -398,6 +398,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "swarm-checks",
  "swarm-client",
  "swarm-contracts",
  "swarm-kernel",
@@ -1407,6 +1408,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "swarm-checks"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "swarm-client",
+ "swarm-contracts",
+ "swarm-process",
+ "uuid",
 ]
 
 [[package]]

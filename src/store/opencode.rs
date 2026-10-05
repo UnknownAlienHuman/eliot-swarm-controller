@@ -12,7 +12,7 @@ use crate::{
         opencode_v2::{self as oc, Options, Service},
     },
 };
-use rusqlite::{Connection, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -198,11 +198,27 @@ fn original(db: &Connection, p: &Principal, id: &str) -> Result<RuntimeCommand> 
         |r| r.get(0),
     )?;
     let mut input: Value = serde_json::from_str(&raw)?;
+    let input_sha256 = model::digest(model::canonical(&input)?.as_bytes());
     let method = model::text(&o, "method")?.to_owned();
     if method == "task.dispatch" {
         let a = tasks::get_attempt(db, model::text(&input, "attempt_id")?)?;
         input["task_snapshot"] = a["task_snapshot"].clone();
     }
+    let target_input_sha256 = if method == "agent.reconcile" {
+        let target_id = model::text(&input, "operation_id")?;
+        let target_raw: String = db.query_row(
+            "SELECT original_request_json FROM operations WHERE operation_id=?1 AND binding_id=?2 AND binding_generation=?3",
+            params![target_id, binding, generation],
+            |row| row.get(0),
+        ).optional()?.ok_or_else(|| Error::new(
+            "FORBIDDEN",
+            "reconcile target is not an operation on this binding generation",
+        ))?;
+        let target_request: Value = serde_json::from_str(&target_raw)?;
+        Some(model::digest(model::canonical(&target_request)?.as_bytes()))
+    } else {
+        None
+    };
     Ok(RuntimeCommand {
         operation_id: id.into(),
         method,
@@ -212,6 +228,8 @@ fn original(db: &Connection, p: &Principal, id: &str) -> Result<RuntimeCommand> 
         native_root_id: b["native_root_id"].as_str().map(str::to_owned),
         route: b["route"].clone(),
         input,
+        input_sha256: Some(input_sha256),
+        target_input_sha256,
     })
 }
 

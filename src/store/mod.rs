@@ -42,6 +42,7 @@ mod launcher_participant;
 mod message_batch;
 #[cfg(test)]
 mod module_bridge_recovery_tests;
+mod module_handshake;
 mod native_mcp;
 #[cfg(test)]
 mod o6_taskless_path_fixture;
@@ -115,6 +116,7 @@ pub struct Store {
 pub struct StoreOwner {
     thread: JoinHandle<()>,
     status_thread: JoinHandle<()>,
+    module_supervisor_credential: Credential,
     pub store: Store,
 }
 
@@ -134,6 +136,11 @@ impl StoreOwner {
     ) -> Result<Self> {
         let artifacts = ArtifactFiles::new(&root.path)?;
         let data_dir = root.path.clone();
+        let module_supervisor_credential = Credential {
+            client_id: model::INTERNAL_MODULE_SUPERVISOR_CLIENT_ID.to_owned(),
+            token: format!("{}{}", model::new_id(), model::new_id()),
+        };
+        let writer_supervisor_credential = module_supervisor_credential.clone();
         let writer_root = root.path.clone();
         let writer_lock = root.lock;
         let writer_config = config.clone();
@@ -146,7 +153,7 @@ impl StoreOwner {
             config.storage.queue_capacity,
             message_batch::MAX_BATCH_SIZE,
             writer_lock,
-            move || open_database(&writer_root, &credential),
+            move || open_database(&writer_root, &credential, &writer_supervisor_credential),
             |db, job: RunJob| job(db),
             move |db, batch| message_batch::process(db, batch, &writer_config),
         )?;
@@ -178,6 +185,7 @@ impl StoreOwner {
         Ok(Self {
             thread,
             status_thread,
+            module_supervisor_credential,
             store: Store {
                 tx,
                 status_reader,
@@ -194,10 +202,18 @@ impl StoreOwner {
         let StoreOwner {
             thread,
             status_thread,
+            module_supervisor_credential: _,
             store,
         } = self;
         drop(store);
         join_store_threads(status_thread, thread).await
+    }
+
+    /// Return this host's credential for the trusted local module supervisor.
+    /// Its only Store method is `module.descriptor.register`; do not pass it to
+    /// Managers or module adapters.
+    pub fn module_supervisor_credential(&self) -> Credential {
+        self.module_supervisor_credential.clone()
     }
 }
 async fn join_store_threads(
@@ -742,15 +758,28 @@ impl Store {
             if role == Role::Operator {
                 require_local_operator(db, &credential.client_id)?;
             }
-            Ok(Principal {
+            let principal = Principal {
                 link_id: model::new_id(),
                 client_id: credential.client_id,
                 role,
-            })
+            };
+            if principal.role == Role::ModuleSupervisor {
+                module_handshake::require_supervisor_scope(db, &principal)?;
+            }
+            Ok(principal)
         })
         .await
     }
     pub async fn call(&self, principal: Principal, method: String, params: Value) -> Result<Value> {
+        if principal.role == Role::ModuleSupervisor {
+            if method != "module.descriptor.register" {
+                return Err(Error::new(
+                    "FORBIDDEN",
+                    "module supervisor may register trusted descriptors only",
+                ));
+            }
+            return self.register_module_descriptor(principal, params).await;
+        }
         if principal.role == Role::HookSource
             && !matches!(method.as_str(), "hook.emit" | "hook.source.get")
         {
@@ -995,6 +1024,39 @@ impl Store {
             self.changed.send_modify(|n| *n = n.wrapping_add(1));
         }
         result
+    }
+
+    async fn register_module_descriptor(
+        &self,
+        principal: Principal,
+        params: Value,
+    ) -> Result<Value> {
+        model::fields(&params, &["descriptor"])?;
+        let descriptor: swarm_contracts::module_catalog::ModuleDescriptor =
+            serde_json::from_value(params["descriptor"].clone()).map_err(|_| {
+                Error::new(
+                    "MODULE_DESCRIPTOR_INVALID",
+                    "descriptor payload is malformed",
+                )
+            })?;
+        descriptor
+            .validate()
+            .map_err(|error| Error::new("MODULE_DESCRIPTOR_INVALID", error.to_string()))?;
+        let result = self
+            .run(move |db| {
+                let principal = current_principal(db, principal)?;
+                module_handshake::require_supervisor_scope(db, &principal)?;
+                let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let result = module_handshake::register_trusted_descriptor(&tx, descriptor)?;
+                tx.commit()?;
+                Ok(result)
+            })
+            .await?;
+        if result["registered"] == true {
+            self.changed
+                .send_modify(|revision| *revision = revision.wrapping_add(1));
+        }
+        Ok(result)
     }
 
     /// Hook issuance/ingress has a fixed repository scope. Setup acknowledges
@@ -1368,7 +1430,11 @@ fn current_principal(db: &Connection, principal: Principal) -> Result<Principal>
     if role == Role::Operator {
         require_local_operator(db, &principal.client_id)?;
     }
-    Ok(Principal { role, ..principal })
+    let principal = Principal { role, ..principal };
+    if principal.role == Role::ModuleSupervisor {
+        module_handshake::require_supervisor_scope(db, &principal)?;
+    }
+    Ok(principal)
 }
 
 fn require_local_operator(db: &Connection, client_id: &str) -> Result<()> {
@@ -1382,7 +1448,11 @@ fn require_local_operator(db: &Connection, client_id: &str) -> Result<()> {
     Ok(())
 }
 
-fn open_database(root: &Path, credential: &Credential) -> Result<Connection> {
+fn open_database(
+    root: &Path,
+    credential: &Credential,
+    module_supervisor_credential: &Credential,
+) -> Result<Connection> {
     let opened = swarm_store::open_writer(
         &root.join("swarm.db"),
         swarm_store::SchemaIdentity {
@@ -1391,7 +1461,7 @@ fn open_database(root: &Path, credential: &Credential) -> Result<Connection> {
             base_schema: SCHEMA,
         },
         swarm_store::WriterOptions::default(),
-        |tx, is_new| initialize_database(tx, is_new, credential),
+        |tx, is_new| initialize_database(tx, is_new, credential, module_supervisor_credential),
     );
     let (db, ()) = match opened {
         Ok(value) => value,
@@ -1401,7 +1471,12 @@ fn open_database(root: &Path, credential: &Credential) -> Result<Connection> {
     Ok(db)
 }
 
-fn initialize_database(tx: &Transaction<'_>, is_new: bool, credential: &Credential) -> Result<()> {
+fn initialize_database(
+    tx: &Transaction<'_>,
+    is_new: bool,
+    credential: &Credential,
+    module_supervisor_credential: &Credential,
+) -> Result<()> {
     if is_new {
         set_meta(tx, "controller_id", &json!(model::new_id()))?;
         set_meta(tx, "host_epoch", &json!(0))?;
@@ -1549,6 +1624,38 @@ fn initialize_database(tx: &Transaction<'_>, is_new: bool, credential: &Credenti
             ));
         }
     }
+    if module_supervisor_credential.client_id != model::INTERNAL_MODULE_SUPERVISOR_CLIENT_ID {
+        return Err(Error::new(
+            "INTERNAL_CLIENT_CONFLICT",
+            "reserved module supervisor credential has the wrong identity",
+        ));
+    }
+    let supervisor_key = format!("client:{}", model::INTERNAL_MODULE_SUPERVISOR_CLIENT_ID);
+    let supervisor_record = json!({
+        "role":"module_supervisor",
+        "token_hash":model::digest(module_supervisor_credential.token.as_bytes()),
+        "disabled":false,
+        "internal_only":false,
+        "module_scope":"descriptor_catalog",
+        "capabilities":["module.descriptor.register"],
+    });
+    match meta(tx, &supervisor_key)? {
+        None => set_meta(tx, &supervisor_key, &supervisor_record)?,
+        Some(existing)
+            if module_handshake::supervisor_scope_matches(
+                model::INTERNAL_MODULE_SUPERVISOR_CLIENT_ID,
+                &existing,
+            ) && existing["disabled"] != true =>
+        {
+            set_meta(tx, &supervisor_key, &supervisor_record)?;
+        }
+        Some(_) => {
+            return Err(Error::new(
+                "INTERNAL_CLIENT_CONFLICT",
+                "reserved module supervisor identity has incompatible scope",
+            ));
+        }
+    }
     let epoch = meta(tx, "host_epoch")?
         .and_then(|v| v.as_i64())
         .unwrap_or(0)
@@ -1690,6 +1797,7 @@ fn is_read(method: &str) -> bool {
             | "agent.state"
             | "agent.list"
             | "route.list"
+            | "module.catalog.get"
             | "report.delta"
             | "report.capacity"
             | "report.attention"
@@ -2857,6 +2965,7 @@ fn mcp_authorization(db: &Connection, p: &Principal, value: &Value) -> Result<Va
                 && !matches!(
                     *method,
                     "client.list"
+                        | "module.catalog.get"
                         | "swarm.context.get"
                         | "swarm.queue.get"
                         | "swarm.agent.inspect"
@@ -2879,6 +2988,12 @@ fn mcp_authorization(db: &Connection, p: &Principal, value: &Value) -> Result<Va
             return Err(Error::new(
                 "FORBIDDEN",
                 "this role has no MCP discovery surface",
+            ));
+        }
+        Role::ModuleSupervisor => {
+            return Err(Error::new(
+                "FORBIDDEN",
+                "module supervisor has no MCP discovery surface",
             ));
         }
     }
@@ -3021,6 +3136,7 @@ fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config
             model::fields(v, &[])?;
             Ok(json!({"routes":config.routes,"live_qualification":false}))
         }
+        "module.catalog.get" => module_handshake::read_catalog(p, v, db),
         "client.list" => {
             gm::require_authority(db, p)?;
             model::fields(v, &[])?;
@@ -4455,6 +4571,9 @@ fn apply(
             ))
         }
         "gm.handover" => gm::handover(tx, p, v, id).map(|v| (v, false)),
+        "module.route.select" => {
+            module_handshake::select_route(tx, p, v, config, id).map(|value| (value, false))
+        }
         "client.register" => {
             gm::require_authority(tx, p)?;
             model::fields(
@@ -4486,6 +4605,14 @@ fn apply(
                 return Err(Error::new(
                     "FORBIDDEN",
                     "hook credentials require repository-scoped source setup",
+                ));
+            }
+            if role == Role::ModuleSupervisor
+                || client == model::INTERNAL_MODULE_SUPERVISOR_CLIENT_ID
+            {
+                return Err(Error::new(
+                    "FORBIDDEN",
+                    "module supervisor identity is reserved for the local host",
                 ));
             }
             if role == Role::Scheduler || client == model::INTERNAL_SCHEDULER_CLIENT_ID {

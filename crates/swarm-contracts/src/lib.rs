@@ -3,6 +3,7 @@
 pub mod credential;
 pub mod error;
 pub mod module_catalog;
+pub mod module_contract;
 pub mod rpc;
 pub mod runtime;
 

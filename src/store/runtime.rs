@@ -117,6 +117,7 @@ fn batch_original(
         |row| row.get(0),
     )?;
     let mut input: Value = serde_json::from_str(&raw)?;
+    let input_sha256 = model::digest(model::canonical(&input)?.as_bytes());
     let method = model::text(&operation, "method")?.to_owned();
     if method == "task.dispatch" {
         let attempt = tasks::get_attempt(db, model::text(&input, "attempt_id")?)?;
@@ -131,6 +132,8 @@ fn batch_original(
         native_root_id: None,
         route: binding["route"].clone(),
         input,
+        input_sha256: Some(input_sha256),
+        target_input_sha256: None,
     })
 }
 
@@ -187,11 +190,18 @@ pub(super) fn register(db: &Connection, v: &Value, client_id: &str) -> Result<Va
 
 pub(super) fn hello_plan(db: &Connection, p: &Principal, v: &Value) -> Result<Value> {
     let (_, _, b) = scope(db, p, false)?;
+    let module_contract_negotiation = super::module_handshake::negotiate_hello(
+        db,
+        model::text(&b, "module_artifact_id")?,
+        b["observation"].get("module_contract_selector"),
+        v.get("module_contract"),
+    )?;
     let changed = b["observation"]["bridge_boot_id"]
         .as_str()
         .is_some_and(|old| Some(old) != v["boot_id"].as_str());
     Ok(json!({"old_boot":b["observation"]["bridge_boot_id"],
-        "owner":b["observation"]["managed_owner"],"changed":changed}))
+        "owner":b["observation"]["managed_owner"],"changed":changed,
+        "module_contract_negotiation":module_contract_negotiation}))
 }
 
 pub(super) fn hello(
@@ -205,6 +215,7 @@ pub(super) fn hello(
         &[
             "boot_id",
             "module_artifact_id",
+            "module_contract",
             "native_root_id",
             "native_scope_key",
             "native_ready",
@@ -219,6 +230,18 @@ pub(super) fn hello(
         return Err(Error::new(
             "ARTIFACT_MISMATCH",
             "module artifact differs from the reserved route",
+        ));
+    }
+    let module_contract_negotiation = super::module_handshake::negotiate_hello(
+        &tx,
+        model::text(&b, "module_artifact_id")?,
+        b["observation"].get("module_contract_selector"),
+        v.get("module_contract"),
+    )?;
+    if verified.get("module_contract_negotiation") != Some(&module_contract_negotiation) {
+        return Err(Error::new(
+            "STALE_MODULE_CONTRACT",
+            "trusted module descriptor changed during hello preflight",
         ));
     }
     let sessionless_batch = crate::runtime::batch::is_sessionless_route(&b["route"]);
@@ -310,7 +333,7 @@ pub(super) fn hello(
         false
     };
     tx.execute("UPDATE bindings SET state_json=json_set(state_json,'$.bridge_boot_id',?3,'$.module_link_id',?4,'$.connection','connected','$.connected_at_ms',?5),state=CASE WHEN state='reconciling' AND ?6 AND COALESCE(json_extract(state_json,'$.recovery_required'),0)=0 AND (native_root_id IS NOT NULL OR ?7 OR ?8) THEN 'ready' ELSE state END WHERE binding_id=?1 AND generation=?2", params![id,generation,boot,p.link_id,model::now_ms()?,v["native_ready"]==true,sessionless_batch,prepared_rootless_resume])?;
-    let result = json!({"binding_id":id,"generation":generation,"route":b["route"],"host_epoch":meta(&tx,"host_epoch")?,"native_root_id":b["native_root_id"],"native_scope_key":b["native_scope_key"],"recovery_required":(recovered && needs_recovery) || b["observation"]["recovery_required"]==true});
+    let result = json!({"binding_id":id,"generation":generation,"route":b["route"],"host_epoch":meta(&tx,"host_epoch")?,"native_root_id":b["native_root_id"],"native_scope_key":b["native_scope_key"],"recovery_required":(recovered && needs_recovery) || b["observation"]["recovery_required"]==true,"module_contract_negotiation":module_contract_negotiation});
     tx.commit()?;
     Ok(result)
 }
@@ -463,6 +486,7 @@ fn next_internal(
         }
     };
     let mut input: Value = serde_json::from_str(&raw)?;
+    let input_sha256 = model::digest(model::canonical(&input)?.as_bytes());
     let mut trusted_launch_dispatch_packet: Option<Value> = None;
     let guard = (|| -> Result<()> {
         let o = operations::get_operation(&tx, &op)?;
@@ -708,6 +732,21 @@ fn next_internal(
             input["target_command_method"] = target["method"].clone();
         }
     }
+    let target_input_sha256 = if method == "agent.reconcile" {
+        let target_id = model::text(&input, "operation_id")?;
+        let raw: String = tx.query_row(
+            "SELECT original_request_json FROM operations WHERE operation_id=?1 AND binding_id=?2 AND binding_generation=?3",
+            params![target_id, id, generation],
+            |row| row.get(0),
+        ).optional()?.ok_or_else(|| Error::new(
+            "FORBIDDEN",
+            "reconcile target is not an operation on this binding generation",
+        ))?;
+        let target_request: Value = serde_json::from_str(&raw)?;
+        Some(model::digest(model::canonical(&target_request)?.as_bytes()))
+    } else {
+        None
+    };
     let command = RuntimeCommand {
         operation_id: op,
         method,
@@ -717,6 +756,8 @@ fn next_internal(
         native_root_id: b["native_root_id"].as_str().map(str::to_owned),
         route: command_route,
         input,
+        input_sha256: Some(input_sha256),
+        target_input_sha256,
     };
     tx.commit()?; // Never return a command while SQLite can still roll back admission.
     Ok(json!({"command":command}))
@@ -908,6 +949,93 @@ fn validate_command_dispatch_receipt(
     Ok(())
 }
 
+/// Validate a typed module receipt against the exact immutable operation and
+/// the descriptor selected when its binding was admitted. Call this for each
+/// RuntimeOutcome independently, including a target outcome returned while an
+/// `agent.reconcile` operation is being settled.
+pub(super) fn validate_module_receipt_for_operation(
+    db: &Connection,
+    binding_id: &str,
+    binding_generation: i64,
+    binding: &Value,
+    outcome: &RuntimeOutcome,
+) -> Result<swarm_contracts::runtime::ModuleReceiptIdentity> {
+    let receipt_value = outcome
+        .details
+        .get("module_receipt")
+        .ok_or_else(|| Error::new("MODULE_RECEIPT_INVALID", "module receipt is missing"))?;
+    let receipt: swarm_contracts::runtime::ModuleReceiptIdentity =
+        serde_json::from_value(receipt_value.clone()).map_err(|_| {
+            Error::new(
+                "MODULE_RECEIPT_INVALID",
+                "module receipt has an invalid shape",
+            )
+        })?;
+    receipt.validate().map_err(|_| {
+        Error::new(
+            "MODULE_RECEIPT_INVALID",
+            "module receipt identity is invalid",
+        )
+    })?;
+
+    if receipt.binding_id != binding_id
+        || receipt.binding_generation != binding_generation
+        || receipt.operation_id != outcome.operation_id
+    {
+        return Err(Error::new(
+            "MODULE_RECEIPT_INVALID",
+            "module receipt names another binding or Operation",
+        ));
+    }
+
+    let artifact_id = model::text(binding, "module_artifact_id")?;
+    let selector = binding["observation"]
+        .get("module_contract_selector")
+        .ok_or_else(|| {
+            Error::new(
+                "MODULE_RECEIPT_INVALID",
+                "typed module receipt has no retained descriptor selector",
+            )
+        })?;
+    let retained =
+        super::module_handshake::retained_contract_identity(db, artifact_id, Some(selector))?
+            .ok_or_else(|| {
+                Error::new(
+                    "MODULE_RECEIPT_INVALID",
+                    "binding has no retained trusted module descriptor",
+                )
+            })?;
+    if receipt.module_id != retained.module_id
+        || receipt.artifact != retained.artifact
+        || receipt.protocol != retained.protocol
+    {
+        return Err(Error::new(
+            "MODULE_RECEIPT_INVALID",
+            "module receipt identity differs from the binding's retained descriptor",
+        ));
+    }
+
+    let original_request_json: String = db.query_row(
+        "SELECT original_request_json FROM operations WHERE operation_id=?1 AND binding_id=?2 AND binding_generation=?3",
+        params![outcome.operation_id.as_str(), binding_id, binding_generation],
+        |row| row.get(0),
+    )?;
+    let original_request: Value = serde_json::from_str(&original_request_json).map_err(|_| {
+        Error::new(
+            "MODULE_RECEIPT_INVALID",
+            "stored original Operation request is malformed",
+        )
+    })?;
+    let expected_input_sha256 = model::digest(model::canonical(&original_request)?.as_bytes());
+    if receipt.input_sha256 != expected_input_sha256 {
+        return Err(Error::new(
+            "MODULE_RECEIPT_INVALID",
+            "module receipt request digest differs from the stored original request",
+        ));
+    }
+    Ok(receipt)
+}
+
 pub(super) fn outcome_with_artifacts(
     db: &mut Connection,
     p: &Principal,
@@ -923,6 +1051,11 @@ pub(super) fn outcome_with_artifacts(
             "FORBIDDEN",
             "operation belongs to another binding",
         ));
+    }
+    // Versioned bindings require a typed receipt for every outcome. Legacy
+    // unversioned bindings retain their existing validators and wire contract.
+    if b["observation"].get("module_contract_selector").is_some() {
+        validate_module_receipt_for_operation(&tx, &id, generation, &b, &r)?;
     }
     let sessionless_batch = crate::runtime::batch::is_sessionless_route(&b["route"]);
     if b["route"]["runtime"] == crate::runtime::codex::RUNTIME

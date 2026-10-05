@@ -3,10 +3,12 @@
 mod client;
 mod config;
 mod endpoint;
+mod module_link;
 
 pub use client::Client;
 pub use config::IpcConfig;
 pub use endpoint::ipc_endpoint;
+pub use module_link::ModuleLink;
 
 use serde_json::Value;
 use std::path::Path;

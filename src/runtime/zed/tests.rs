@@ -347,6 +347,8 @@ exit 9
             native_root_id: None,
             route: route.clone(),
             input: input.clone(),
+            input_sha256: None,
+            target_input_sha256: None,
         };
         let instruction = crate::runtime::batch::instruction(&input).unwrap();
         let artifact_files = ArtifactFiles::new(&fixture.data_dir).unwrap();

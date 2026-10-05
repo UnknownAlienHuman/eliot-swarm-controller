@@ -163,10 +163,13 @@ pub enum Role {
     Participant,
     Observer,
     Module,
+    /// Host-issued, local supervisor identity with only descriptor registration authority.
+    ModuleSupervisor,
     /// In-process schedule admission only; never an authenticatable client.
     Scheduler,
 }
 pub const INTERNAL_SCHEDULER_CLIENT_ID: &str = "eliot-internal-scheduler-v1";
+pub const INTERNAL_MODULE_SUPERVISOR_CLIENT_ID: &str = "eliot-module-supervisor-v1";
 pub use swarm_contracts::credential::Credential;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Principal {
@@ -185,7 +188,7 @@ impl Principal {
     pub fn require_writer(&self) -> Result<()> {
         if matches!(
             self.role,
-            Role::HookSource | Role::Observer | Role::Participant
+            Role::HookSource | Role::Observer | Role::Participant | Role::ModuleSupervisor
         ) {
             return Err(Error::new(
                 "FORBIDDEN",
@@ -771,6 +774,14 @@ pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
             "generation",
             "operation_id",
         ],
+        "module.route.select" => &[
+            "client_request_id",
+            "route_alias",
+            "module_id",
+            "artifact_id",
+            "version",
+            "expected_catalog_revision",
+        ],
         "operation.cancel" => &["client_request_id", "operation_id", "reason"],
         "host.mode" => &["client_request_id", "new_work"],
         "gm.handover" => &[
@@ -834,6 +845,16 @@ pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
         }
         "task.request_changes" => {
             crate::submission::ChangeRequest::parse(params)?;
+        }
+        "module.route.select" => {
+            for field in ["route_alias", "module_id", "artifact_id", "version"] {
+                text(params, field)?;
+            }
+            if params["expected_catalog_revision"].as_u64().is_none() {
+                return Err(Error::invalid(
+                    "expected_catalog_revision must be a nonnegative integer",
+                ));
+            }
         }
         _ => {}
     }

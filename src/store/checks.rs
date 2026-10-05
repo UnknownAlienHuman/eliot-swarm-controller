@@ -1098,11 +1098,124 @@ pub(super) fn cancel(tx: &Transaction<'_>, p: &Principal, v: &Value, id: &str) -
 pub(super) fn describe(db: &Connection, v: &Value) -> Result<Value> {
     model::fields(v, &["check_id"])?;
     let id = model::text(v, "check_id")?;
-    let raw:Option<String>=db.query_row("SELECT json_object('check_id',check_id,'operation_id',operation_id,'attempt_id',attempt_id,'candidate_ref',candidate_ref,'cached_from',cached_from_check_id,'state',state,'resource_key',resource_key,'resource_claimed_at_ms',resource_claimed_at_ms,'resource_released_at_ms',resource_released_at_ms,'process',json(process_identity_json),'coverage',json(coverage_json),'result_ref',result_ref,'exit_code',exit_code,'profile_id',json_extract(spec_json,'$.profile_id'),'profile_revision',json_extract(spec_json,'$.profile_revision'),'cancel_request',json_extract(spec_json,'$.cancel_request'),'cancellation',json_extract(spec_json,'$.cancellation')) FROM check_runs WHERE check_id=?1",[id],|r|r.get(0)).optional()?;
+    let raw:Option<String>=db.query_row("SELECT json_object('check_id',check_id,'operation_id',operation_id,'attempt_id',attempt_id,'candidate_ref',candidate_ref,'cached_from',cached_from_check_id,'state',state,'resource_key',resource_key,'resource_claimed_at_ms',resource_claimed_at_ms,'resource_released_at_ms',resource_released_at_ms,'process',json(process_identity_json),'coverage',json(coverage_json),'result_ref',result_ref,'exit_code',exit_code,'profile_id',json_extract(spec_json,'$.profile_id'),'profile_revision',json_extract(spec_json,'$.profile_revision'),'cancel_request',json_extract(spec_json,'$.cancel_request'),'cancellation',json_extract(spec_json,'$.cancellation'),'process_diagnostic',json(json_extract(spec_json,'$.process_diagnostic.public'))) FROM check_runs WHERE check_id=?1",[id],|r|r.get(0)).optional()?;
     Ok(serde_json::from_str(&raw.ok_or_else(|| {
         Error::new("NOT_FOUND", "unknown CheckRun")
     })?)?)
 }
+fn record_process_diagnostic(db: &mut Connection, work: &Work, diagnostic: Value) -> Result<bool> {
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let row: Option<(String, String, Option<String>, String)> = tx
+        .query_row(
+            "SELECT operation_id,spec_json,process_identity_json,state FROM check_runs WHERE check_id=?1",
+            [&work.check_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((operation_id, spec_json, identity_json, state)) = row else {
+        return Ok(false);
+    };
+    if !matches!(state.as_str(), "running" | "reconciling") {
+        return Ok(false);
+    }
+    if operation_id != work.operation_id {
+        return Err(Error::conflict(
+            "process diagnostic CheckRun identity changed",
+        ));
+    }
+    let Some(expected_worker) = work.expected_worker.as_ref() else {
+        return Ok(false);
+    };
+    let Some(identity_json) = identity_json else {
+        return Ok(false);
+    };
+    let identity: Value = serde_json::from_str(&identity_json)?;
+    if &identity != expected_worker
+        || identity["token"] != work.token
+        || diagnostic["version"] != 1
+        || diagnostic["check_id"] != work.check_id
+        || diagnostic["operation_id"] != work.operation_id
+        || diagnostic["token"] != work.token
+        || diagnostic["process"] != identity["process"]
+    {
+        return Err(Error::conflict(
+            "process diagnostic differs from the current CheckRun process owner",
+        ));
+    }
+    let cause = diagnostic["public"]["cause"]
+        .as_str()
+        .ok_or_else(|| Error::invalid("process diagnostic cause is invalid"))?;
+    let (expected_code, expected_message) = match cause {
+        "observation_error" => (
+            "CHECK_PROCESS_OBSERVATION_UNKNOWN",
+            "the owned process group could not be observed as empty; the resource remains held",
+        ),
+        "control_read_error" => (
+            "CHECK_CONTROL_READ_UNKNOWN",
+            "the CheckRun cancellation receipt could not be read while its process group remains held",
+        ),
+        "drain_pending" => (
+            "CHECK_PROCESS_DRAIN_PENDING",
+            "the owned process group remains active after the drain grace period; the resource remains held",
+        ),
+        _ => return Err(Error::invalid("process diagnostic cause is invalid")),
+    };
+    if diagnostic["public"]["code"] != expected_code
+        || diagnostic["public"]["status"] != "unresolved"
+        || diagnostic["public"]["message"] != expected_message
+        || diagnostic["public"]["control_read_unknown"]
+            .as_bool()
+            .is_none()
+        || diagnostic["public"]["elapsed_ms"].as_u64().is_none()
+        || diagnostic["public"]["observed_at_ms"]
+            .as_i64()
+            .is_none_or(|value| value < 0)
+        || !diagnostic["public"]["resolved_at_ms"].is_null()
+    {
+        return Err(Error::invalid("process diagnostic projection is invalid"));
+    }
+    let spec: Value = serde_json::from_str(&spec_json)?;
+    if spec.get("token").and_then(Value::as_str) != Some(work.token.as_str()) {
+        return Err(Error::conflict(
+            "process diagnostic token differs from CheckRun",
+        ));
+    }
+    if let Some(existing) = spec.get("process_diagnostic") {
+        if existing["check_id"] != diagnostic["check_id"]
+            || existing["operation_id"] != diagnostic["operation_id"]
+            || existing["token"] != diagnostic["token"]
+            || existing["process"] != diagnostic["process"]
+        {
+            return Err(Error::conflict(
+                "retained CheckRun process diagnostic owner changed",
+            ));
+        }
+        let rank = |code: &Value| match code.as_str() {
+            Some("CHECK_PROCESS_DRAIN_PENDING") => 1,
+            Some("CHECK_CONTROL_READ_UNKNOWN") => 2,
+            Some("CHECK_PROCESS_OBSERVATION_UNKNOWN") => 3,
+            _ => 0,
+        };
+        let old_rank = rank(&existing["public"]["code"]);
+        let new_rank = rank(&diagnostic["public"]["code"]);
+        let old_control = existing["public"]["control_read_unknown"] == true;
+        let new_control = diagnostic["public"]["control_read_unknown"] == true;
+        if new_rank < old_rank || (new_rank == old_rank && (!new_control || old_control)) {
+            return Ok(false);
+        }
+    }
+    let diagnostic_json = model::canonical(&diagnostic)?;
+    let changed = tx.execute(
+        "UPDATE check_runs SET spec_json=json_set(spec_json,'$.process_diagnostic',json(?2)) WHERE check_id=?1 AND state IN ('running','reconciling') AND process_identity_json=?3",
+        params![work.check_id, diagnostic_json, identity_json],
+    )?;
+    if changed == 0 {
+        return Ok(false);
+    }
+    tx.commit()?;
+    Ok(true)
+}
+
 fn work(db: &Connection, id: &str, root: PathBuf) -> Result<Work> {
     let (op, raw, identity): (String, String, Option<String>) = db.query_row(
         "SELECT operation_id,spec_json,process_identity_json FROM check_runs WHERE check_id=?1",
@@ -1235,6 +1348,61 @@ fn ready(db: &mut Connection, w: &Work, identity: Value) -> Result<bool> {
     tx.commit()?;
     Ok(true)
 }
+fn resolve_process_diagnostic(tx: &Transaction<'_>, work: &Work, now: i64) -> Result<()> {
+    let row: Option<(String, String, Option<String>)> = tx
+        .query_row(
+            "SELECT operation_id,spec_json,process_identity_json FROM check_runs WHERE check_id=?1",
+            [&work.check_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((operation_id, spec_json, identity_json)) = row else {
+        return Err(Error::conflict("CheckRun disappeared before finish"));
+    };
+    if operation_id != work.operation_id {
+        return Err(Error::conflict("CheckRun operation changed before finish"));
+    }
+    let spec: Value = serde_json::from_str(&spec_json)?;
+    let Some(diagnostic) = spec.get("process_diagnostic") else {
+        return Ok(());
+    };
+    let Some(expected_worker) = work.expected_worker.as_ref() else {
+        return Err(Error::conflict(
+            "process diagnostic cannot resolve without an accepted process owner",
+        ));
+    };
+    let Some(identity_json) = identity_json else {
+        return Err(Error::conflict(
+            "process diagnostic cannot resolve without current process identity",
+        ));
+    };
+    let identity: Value = serde_json::from_str(&identity_json)?;
+    if &identity != expected_worker
+        || identity["token"] != work.token
+        || spec.get("token").and_then(Value::as_str) != Some(work.token.as_str())
+        || diagnostic["version"] != 1
+        || diagnostic["check_id"] != work.check_id
+        || diagnostic["operation_id"] != work.operation_id
+        || diagnostic["token"] != work.token
+        || diagnostic["process"] != identity["process"]
+    {
+        return Err(Error::conflict(
+            "process diagnostic does not match the current exact process proof",
+        ));
+    }
+    match diagnostic["public"]["status"].as_str() {
+        Some("unresolved") => {
+            tx.execute(
+                "UPDATE check_runs SET spec_json=json_set(spec_json,'$.process_diagnostic.public.status','resolved','$.process_diagnostic.public.resolved_at_ms',?2) WHERE check_id=?1 AND process_identity_json=?3",
+                params![work.check_id, now, identity_json],
+            )?;
+        }
+        Some("resolved") => {}
+        _ => return Err(Error::conflict("process diagnostic status is invalid")),
+    }
+    Ok(())
+}
+
 fn finish(db: &mut Connection, w: &Work, c: Completion) -> Result<()> {
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let status = describe(&tx, &json!({"check_id":w.check_id}))?;
@@ -1255,6 +1423,7 @@ fn finish(db: &mut Connection, w: &Work, c: Completion) -> Result<()> {
         artifact(&tx, out)?;
     }
     let now = model::now_ms()?;
+    resolve_process_diagnostic(&tx, w, now)?;
     tx.execute("UPDATE check_runs SET spec_json=json_set(spec_json,'$.cancellation',json(?2)) WHERE check_id=?1",params![w.check_id,model::canonical(&json!(c.cancellation))?])?;
     tx.execute("UPDATE check_runs SET state=?2,resource_released_at_ms=CASE WHEN resource_claimed_at_ms IS NOT NULL THEN ?3 ELSE NULL END,finished_at_ms=?3,exit_code=?4,result_ref=?5,coverage_json=?6 WHERE check_id=?1",params![w.check_id,c.state,now,c.exit_code,c.result.artifact_id,model::canonical(&c.coverage)?])?;
     let owner:String=tx.query_row("SELECT a.owner_id FROM attempts a JOIN check_runs c ON c.attempt_id=a.attempt_id WHERE c.check_id=?1",[&w.check_id],|r|r.get(0))?;
@@ -1271,6 +1440,25 @@ fn incident(db: &Connection, key: &str, error: Error) -> Result<()> {
     Ok(())
 }
 impl Store {
+    async fn record_check_process_diagnostic(&self, work: &Work) -> Result<()> {
+        let scan = work.clone();
+        let diagnostic = self
+            .file_io(move |_| worker::process_diagnostic(&scan))
+            .await?;
+        let Some(diagnostic) = diagnostic else {
+            return Ok(());
+        };
+        let update = work.clone();
+        if self
+            .run(move |db| record_process_diagnostic(db, &update, diagnostic))
+            .await?
+        {
+            self.changed
+                .send_modify(|revision| *revision = revision.wrapping_add(1));
+        }
+        Ok(())
+    }
+
     /// Startup readback of retained CheckRun evidence before schedule catch-up.
     /// It never launches a worker or repeats a command. Live workers remain
     /// under the normal supervisor, which owns their acknowledged go-ahead.
@@ -1278,11 +1466,13 @@ impl Store {
         let root = self.data_dir.clone();
         let items = self.run(move |db| pending(db, root)).await?;
         for work in items {
+            self.record_check_process_diagnostic(&work).await?;
             let scan = work.clone();
             if let Some(completion) = self
                 .file_io(move |files| worker::completion(&scan, &files))
                 .await?
             {
+                self.record_check_process_diagnostic(&work).await?;
                 self.run(move |db| finish(db, &work, completion)).await?;
                 self.changed
                     .send_modify(|revision| *revision = revision.wrapping_add(1));
@@ -1315,6 +1505,7 @@ impl Store {
                         .file_io(move |files| worker::recover(&scan, &files))
                         .await?
                     {
+                        self.record_check_process_diagnostic(&work).await?;
                         self.run(move |db| finish(db, &work, completion)).await?;
                         self.changed
                             .send_modify(|revision| *revision = revision.wrapping_add(1));
@@ -1368,6 +1559,7 @@ impl Store {
             if let Ok(items) = self.run(move |db| pending(db, root)).await {
                 for w in items {
                     let result = async {
+                        self.record_check_process_diagnostic(&w).await?;
                         if let Some(e) = w.preflight_error.clone() {
                             let failed = w.clone();
                             let c = self
@@ -1385,6 +1577,7 @@ impl Store {
                             .file_io(move |files| worker::completion(&scan, &files))
                             .await?;
                         if let Some(c) = complete {
+                            self.record_check_process_diagnostic(&w).await?;
                             let done = w.clone();
                             let result = self.run(move |db| finish(db, &done, c)).await;
                             if result.is_ok() {
@@ -1419,6 +1612,7 @@ impl Store {
                                 self.run(move |db| { db.execute("UPDATE check_runs SET state='reconciling' WHERE check_id=?1 AND state='running'",[id])?; Ok(()) }).await?;
                                 let scan = w.clone();
                                 if let Some(c) = self.file_io(move |files| worker::recover(&scan, &files)).await? {
+                                    self.record_check_process_diagnostic(&w).await?;
                                     let done = w.clone();
                                     let result = self.run(move |db| finish(db, &done, c)).await;
                                     if result.is_ok() {

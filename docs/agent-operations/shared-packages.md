@@ -6,8 +6,9 @@ having the new packages import the old controller library.
 
 | Package | Implementation | Local dependencies |
 |---|---|---|
-| `swarm-contracts` | Credential, JSON-RPC Request, runtime command/outcome, error classification and module catalog metadata | None |
-| `swarm-client` | Authenticated bounded sequential local IPC client and endpoint computation | `swarm-contracts` |
+| `swarm-contracts` | Credential, JSON-RPC Request, runtime command/outcome and receipt identity, error classification, module catalog and typed hello claim | None |
+| `swarm-client` | Authenticated bounded sequential local IPC client, endpoint computation and typed `ModuleLink` | `swarm-contracts` |
+| `swarm-checks` | Kernel-admitted bounded native check executor and authenticated CheckRun status readback | `swarm-client`, `swarm-contracts`, `swarm-process` |
 | `swarm-process` | OS process/group ownership, identity/departure checks, private files and scoped module-owner bootstrap | `swarm-contracts` |
 | `swarm-store` | SQLite connection opening, schema identity/digest and transaction primitives | None |
 | `swarm-kernel` | Single bounded writer actor, readiness and contiguous typed job batching | None |
@@ -32,8 +33,30 @@ protocol/capabilities. It reads no files and starts no process. Launch metadata
 keeps protected references for later trusted resolution; unknown prior launch
 evidence permits readback only. Metadata IDs are opaque, not filesystem path
 components: supervisors must encode or hash them, including Windows drive-like
-names. Exact `.` and `..` identifiers/versions are rejected. These contracts do
-not change the current Store handshake or prove an installed binary's identity.
+names. Exact `.` and `..` identifiers/versions are rejected. These contracts
+do not prove an installed binary's identity.
+
+The Store's trusted descriptor registry uses its existing writer and metadata
+table. A host-generated supervisor credential has a positive one-method scope
+for registration; it cannot use normal writer or Manager methods. Registration
+does not inspect or launch an executable. The trusted installer/supervisor must
+first establish the installed artifact's provenance.
+
+Managers select registered versions for their own future bindings. The stable
+caller and route identify a selection, with catalog-revision CAS; no current-GM
+session is required. Admission captures the selected immutable descriptor in the
+binding. `ModuleLink` supplies a typed claim that Store compares with that exact
+selector. An unselected legacy binding is explicitly unverified and cannot accept
+a self-asserted versioned claim. Negotiated capabilities remain compatibility
+metadata rather than effect authority.
+
+Runtime commands include the canonical original Operation request digest before
+dynamic enrichment. For selected bindings, one Store validator checks every
+outcome's `ModuleReceiptIdentity` against the retained descriptor and exact
+Operation/binding/generation. A reconcile target has its own receipt and digest,
+distinct from the reconcile Operation. This seam alone does not make a new
+adapter's methods reachable; adapter registration, admission and supervisor
+activation still need their real host integrations.
 
 The client retains the existing named-pipe/Unix-socket discovery convention,
 hello handshake and bounded request/reply exchange. Establishment retry happens
@@ -55,6 +78,16 @@ process group. Unknown OS reads return errors. It neither adopts nor starts a
 process and does not prove whole-family departure; the existing departure scan
 remains required before replacement. A worker cannot use this child API to
 validate itself as the owner.
+
+The existing CheckRun worker consumes `swarm-checks::execute_with_plan`: it
+publishes the same exact worker owner and waits for durable Store Go before
+kernel-side source resolution and command launch. Output capture is bounded and
+the pipes remain drained. Cancellation targets that check's group only. Process
+observation errors retain ownership until whole-family emptiness is known;
+the existing Store supervisor validates private diagnostics and projects fixed
+metadata through authorized `check.get`. Runtime diagnostics do not change the
+immutable check/cache input identity. This is an executor extraction inside the
+existing worker, not an independently deployed checks process.
 
 The `swarm-module-owner` binary accepts one absolute private plan and an explicit
 resolver map. Each invocation owns its own nonkilling group and OS lock, publishes
@@ -123,5 +156,7 @@ production Clippy on Windows and remote Ubuntu in
 This is compiler evidence for the helper source, not installed-process or
 native-family qualification. Its scoped gate ran no integration targets.
 Full tests, release packaging and native qualification remain pending.
-These six packages do not complete the Store/kernel, bus, supervisor or adapter
+The new handshake/receipt/checks batch has source hashes, formatting and metadata
+shape checks; its combined compiler gate remains pending at this publication.
+These seven packages do not complete the Store/kernel, bus, supervisor or adapter
 split. They create the shared boundary those modules can consume independently.

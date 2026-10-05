@@ -138,6 +138,8 @@ impl Fixture {
             },
             route: json!({"runtime":RUNTIME,"module_artifact_id":ARTIFACT_ID,"native_options":self.options}),
             input: json!({"text":"fixture instruction","delivery":"next_turn"}),
+            input_sha256: None,
+            target_input_sha256: None,
         }
     }
     pub(crate) fn posts(&self, path: &str) -> usize {
@@ -1471,6 +1473,8 @@ fn root_creation_and_input_scans_accept_native_omitted_parent_id_only() {
         route: json!({"runtime":RUNTIME,"module_artifact_id":ARTIFACT_ID,
         "native_options":{"model":model.clone()}}),
         input: json!({"text":text}),
+        input_sha256: None,
+        target_input_sha256: None,
     };
     let descriptor =
         NativeInputDescriptor::for_goal_activation(&command, text, marker.clone()).unwrap();
@@ -1516,6 +1520,8 @@ fn execution_scan_correlates_start_through_the_exact_input_only() {
         route: json!({"runtime":RUNTIME,"module_artifact_id":ARTIFACT_ID,
         "native_options":{"model":{"id":"fixture-model","providerID":"fixture-provider","variant":"explicit-variant"}}}),
         input: json!({"text":text}),
+        input_sha256: None,
+        target_input_sha256: None,
     };
     let descriptor = |operation: &str, text: &str| {
         let c = command(operation, text);
@@ -2078,6 +2084,8 @@ fn execution_and_session_failed_projections_keep_bounded_diagnostics() {
         route: json!({"runtime":RUNTIME,"module_artifact_id":ARTIFACT_ID,
         "native_options":{"model":{"id":"fixture-model","providerID":"fixture-provider","variant":"explicit-variant"}}}),
         input: json!({"text":text}),
+        input_sha256: None,
+        target_input_sha256: None,
     };
     let descriptor =
         NativeInputDescriptor::for_goal_activation(&command, text, marker.clone()).unwrap();

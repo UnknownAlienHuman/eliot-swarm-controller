@@ -294,6 +294,24 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
         "Configured routes only; no provider discovery."
     ),
     entry!(
+        "module.catalog.get",
+        Administration,
+        MANAGER_ONLY_AUDIENCES,
+        Searchable,
+        "Read locally registered module contract descriptors and route selections.",
+        "Use before selecting a module for a configured route or checking its exact advertised protocol schemas.",
+        &[
+            "module",
+            "descriptor",
+            "catalog",
+            "artifact",
+            "protocol",
+            "route"
+        ],
+        &["local module catalog"],
+        "Bounded metadata only; launch details and protected references are redacted, and no process is probed or started."
+    ),
+    entry!(
         "client.list",
         Administration,
         GM_AUDIENCES,
@@ -523,6 +541,24 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
         &["host", "admission", "enable", "disable", "pause"],
         &["operator authorization", "new_work value"],
         "One durable mode change."
+    ),
+    entry!(
+        "module.route.select",
+        Administration,
+        MANAGER_GM_AUDIENCES,
+        ManualOnly,
+        "Select one exact registered module descriptor for the caller's future bindings on a configured route.",
+        "Use after reading the trusted module catalog; the exact module, artifact, version and catalog revision are required.",
+        &["module", "artifact", "route", "select", "upgrade"],
+        &[
+            "authenticated Manager identity",
+            "route_alias",
+            "module_id",
+            "artifact_id",
+            "version",
+            "expected_catalog_revision"
+        ],
+        "One revision-checked selection for this Manager's new bindings only; other Managers and existing bindings keep their own retained descriptors."
     ),
     entry!(
         "client.register",

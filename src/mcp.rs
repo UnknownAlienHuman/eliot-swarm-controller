@@ -476,6 +476,12 @@ static TOOLS: &[(bool, ToolSpec)] = &[
         &[],
     ),
     read(
+        "module.catalog.get",
+        "Page locally registered module descriptors and your own exact future route selections. Launch paths, argv, working directories and protected references are redacted; this read never probes or starts a module.",
+        &[f("after", I), f("limit", I)],
+        &[],
+    ),
+    read(
         "client.list",
         "Registered clients (operator only).",
         &[],
@@ -799,6 +805,24 @@ static TOOLS: &[(bool, ToolSpec)] = &[
         "Enable or disable admission of new work on the host: new_work is the string \"enabled\" or \"disabled\".",
         &[f("new_work", S)],
         &["new_work"],
+    ),
+    mutation(
+        "module.route.select",
+        "Select one exact, already trusted module descriptor for your future bindings on a configured route. The selection is scoped to your authenticated Manager identity; it does not register or launch an artifact and does not change existing bindings or another Manager's route.",
+        &[
+            f("route_alias", S),
+            f("module_id", S),
+            f("artifact_id", S),
+            f("version", S),
+            f("expected_catalog_revision", I),
+        ],
+        &[
+            "route_alias",
+            "module_id",
+            "artifact_id",
+            "version",
+            "expected_catalog_revision",
+        ],
     ),
     mutation(
         "client.register",
@@ -1526,6 +1550,23 @@ fn refine_input_schema(method: &str, schema: &mut Value) {
     }
     let properties = &mut schema["properties"];
     match method {
+        "module.catalog.get" => {
+            properties["after"] =
+                json!({"type":"integer","minimum":0,"maximum":9223372036854775807_i64});
+            properties["limit"] = json!({"type":"integer","minimum":1,"maximum":8});
+        }
+        "module.route.select" => {
+            properties["route_alias"] =
+                json!({"type":"string","minLength":1,"maxLength":128,"pattern":"^\\S+$"});
+            properties["module_id"] = json!({"type":"string","minLength":1,"maxLength":128,"pattern":"^[A-Za-z0-9._:-]+$"});
+            properties["artifact_id"] = json!({"type":"string","minLength":1,"maxLength":128,"pattern":"^[A-Za-z0-9._-]+$"});
+            properties["version"] = json!({"type":"string","minLength":1,"maxLength":128,"pattern":"^[A-Za-z0-9.+_-]+$"});
+            properties["expected_catalog_revision"] =
+                json!({"type":"integer","minimum":0,"maximum":9223372036854775807_i64});
+            properties["client_request_id"]["minLength"] = json!(1);
+            properties["client_request_id"]["maxLength"] = json!(128);
+            properties["client_request_id"]["pattern"] = json!("^\\S+$");
+        }
         "schedule.run_now" => {
             properties["client_request_id"]["minLength"] = json!(1);
             properties["client_request_id"]["maxLength"] = json!(128);
@@ -3370,6 +3411,7 @@ mod tests {
             "swarm.tools.search",
             "host.status",
             "route.list",
+            "module.catalog.get",
             "client.list",
             "task.get",
             "task.list",
@@ -3414,6 +3456,7 @@ mod tests {
             "automation.config.preview",
             "automation.config.explain",
             "host.mode",
+            "module.route.select",
             "client.register",
             "source.capture",
             "check.run",
@@ -3491,11 +3534,11 @@ mod tests {
         .into_iter()
         .collect();
         assert_eq!(methods, expected);
-        assert_eq!(TOOLS.len(), 120);
-        assert_eq!(TOOLS.iter().filter(|(read_only, _)| *read_only).count(), 54);
+        assert_eq!(TOOLS.len(), 122);
+        assert_eq!(TOOLS.iter().filter(|(read_only, _)| *read_only).count(), 55);
         assert_eq!(
             TOOLS.iter().filter(|(read_only, _)| !*read_only).count(),
-            66
+            67
         );
     }
 

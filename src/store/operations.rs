@@ -2071,7 +2071,7 @@ pub(super) fn open(
     now: i64,
 ) -> Result<Value> {
     p.require_operator()?;
-    reserve_open(tx, v, config, id, now)
+    reserve_open(tx, &p.client_id, v, config, id, now)
 }
 
 /// The admitted launcher may be a direct authenticated Manager or a verified
@@ -2223,11 +2223,19 @@ pub(super) fn open_for_launch_for_actor(
         )
     })?;
     options.insert(workspace_field.into(), json!(workspace_path));
-    reserve_open_route(tx, model::text(v, "lane_id")?, &route, id, now)
+    reserve_open_route(
+        tx,
+        &effective_manager_id,
+        model::text(v, "lane_id")?,
+        &route,
+        id,
+        now,
+    )
 }
 
 fn reserve_open(
     tx: &Transaction<'_>,
+    owner_manager_id: &str,
     v: &Value,
     config: &Config,
     id: &str,
@@ -2236,11 +2244,12 @@ fn reserve_open(
     model::fields(v, &["client_request_id", "lane_id", "route"])?;
     let lane = model::text(v, "lane_id")?;
     let route = config.route(model::text(v, "route")?)?;
-    reserve_open_route(tx, lane, &route, id, now)
+    reserve_open_route(tx, owner_manager_id, lane, &route, id, now)
 }
 
 fn reserve_open_route(
     tx: &Transaction<'_>,
+    owner_manager_id: &str,
     lane: &str,
     route: &crate::config::Route,
     id: &str,
@@ -2261,7 +2270,22 @@ fn reserve_open_route(
     }
     let binding = model::new_id();
     let instance = model::new_id();
-    tx.execute("INSERT INTO bindings(binding_id,generation,lane_id,module_instance_id,module_artifact_id,state,route_json,state_json,created_at_ms) VALUES(?1,1,?2,?3,?4,'opening',?5,?6,?7)",params![binding,lane,instance,route.module_artifact_id,model::canonical(&json!(route))?,model::canonical(&json!({"execution":"not_observed","waiting_for":"runtime_adapter","family_completeness":"unknown"}))?,now])?;
+    let module_contract_selector = super::module_handshake::selection_for_new_binding(
+        tx,
+        owner_manager_id,
+        &route.alias,
+        &route.runtime,
+        &route.module_artifact_id,
+    )?;
+    let mut binding_state = json!({
+        "execution":"not_observed",
+        "waiting_for":"runtime_adapter",
+        "family_completeness":"unknown"
+    });
+    if let Some(selector) = module_contract_selector {
+        binding_state["module_contract_selector"] = selector;
+    }
+    tx.execute("INSERT INTO bindings(binding_id,generation,lane_id,module_instance_id,module_artifact_id,state,route_json,state_json,created_at_ms) VALUES(?1,1,?2,?3,?4,'opening',?5,?6,?7)",params![binding,lane,instance,route.module_artifact_id,model::canonical(&json!(route))?,model::canonical(&binding_state)?,now])?;
     tx.execute("UPDATE operations SET binding_id=?2,binding_generation=1,effective_request_json=?3 WHERE operation_id=?1",params![id,binding,model::canonical(&json!({"route":route,"module_instance_id":instance}))?])?;
     Ok(
         json!({"operation_id":id,"binding_id":binding,"generation":1,"state":"queued","native_admission":"not_observed","waiting_for":"runtime_adapter"}),
