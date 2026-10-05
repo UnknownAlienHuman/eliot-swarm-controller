@@ -1943,6 +1943,49 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
         &["operation_id", "client_request_id"],
         "One ordinary readback Operation; only exact repository, Issue and desired-label evidence settles the original Operation."
     ),
+    entry!(
+        "github.pull_request.update_description",
+        GitHub,
+        MANAGER_GM_AUDIENCES,
+        ManualOnly,
+        "Update the title and body of one open PR tied to an exactly applied accepted-candidate publication.",
+        "Use only after verifying the retained publication Operation and exact PR ID, number, repository, published head branch/SHA, and expected base branch.",
+        &[
+            "github",
+            "pull request",
+            "description",
+            "title",
+            "body",
+            "reconcile"
+        ],
+        &[
+            "publication_operation_id",
+            "pull_request_id",
+            "pull_request_number",
+            "base_ref",
+            "title",
+            "body"
+        ],
+        "One durable title/body PATCH; it cannot create, retarget, close, merge, or change draft state, and unknown writes are read back without resending."
+    ),
+    entry!(
+        "github.pull_request.reconcile_description",
+        GitHub,
+        MANAGER_GM_AUDIENCES,
+        ManualOnly,
+        "Read back one exact unknown PR description Operation and settle it only when the retained desired title and body are observed.",
+        "Use after an ambiguous update or restart. This current Operator/GM action performs GET-only reconciliation and never retries the PATCH.",
+        &[
+            "github",
+            "pull request",
+            "description",
+            "reconcile",
+            "readback",
+            "unknown operation"
+        ],
+        &["operation_id"],
+        "A separate durable reconciliation Operation; it preserves the original caller/request and settles the target only after exact repository, PR, head, base, title, and body readback."
+    ),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

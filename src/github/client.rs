@@ -7,7 +7,11 @@ use serde_json::Value;
 use std::os::windows::process::CommandExt;
 use std::{future::Future, pin::Pin};
 use std::{process::Stdio, time::Duration};
-use tokio::{io::AsyncReadExt, process::Command, time::timeout};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    process::Command,
+    time::timeout,
+};
 
 pub const ISSUE_PAGE_SIZE: u32 = 50;
 pub const MAX_ISSUE_PAGES_PER_POLL: u32 = 8;
@@ -85,6 +89,30 @@ pub trait GitHubLabelApi: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
 }
 
+/// Narrow transport contract for one exact title/body update. A successful
+/// HTTP response is not evidence of application; callers must read the PR
+/// back and compare its immutable identity and requested fields.
+pub trait GitHubPullRequestApi: Send + Sync {
+    fn repository<'a>(
+        &'a self,
+        repository: &'a RepositoryRef,
+    ) -> Pin<Box<dyn Future<Output = Result<RepositoryReadback>> + Send + 'a>>;
+
+    fn pull_request<'a>(
+        &'a self,
+        repository: &'a RepositoryRef,
+        number: i64,
+    ) -> Pin<Box<dyn Future<Output = Result<PullRequestReadback>> + Send + 'a>>;
+
+    fn update_description<'a>(
+        &'a self,
+        repository: &'a RepositoryRef,
+        number: i64,
+        title: &'a str,
+        body: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct IssueReadback {
     pub id: i64,
@@ -126,6 +154,13 @@ pub struct PullRequestRefReadback {
     pub sha: String,
     #[serde(default, rename = "ref")]
     pub ref_name: Option<String>,
+    #[serde(default)]
+    pub repo: Option<PullRequestRepositoryReadback>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PullRequestRepositoryReadback {
+    pub id: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -255,6 +290,39 @@ impl GhCli {
         Ok(readback)
     }
 
+    pub async fn update_pull_request_description(
+        &self,
+        repository: &RepositoryRef,
+        number: i64,
+        title: &str,
+        body: &str,
+    ) -> Result<()> {
+        if number <= 0
+            || title.trim().is_empty()
+            || title.len() > MAX_TEXT_FIELD_BYTES
+            || body.len() > MAX_TEXT_FIELD_BYTES
+        {
+            return Err(Error::invalid(
+                "pull-request description exceeds its bounds",
+            ));
+        }
+        let endpoint = format!("{}/pulls/{number}", repository.repo_path());
+        let payload = serde_json::to_vec(&serde_json::json!({"title":title,"body":body}))
+            .map_err(|_| Error::invalid("pull-request description could not be encoded"))?;
+        let arguments = vec![
+            "api".to_owned(),
+            endpoint,
+            "--hostname".to_owned(),
+            repository.host.clone(),
+            "--method".to_owned(),
+            "PATCH".to_owned(),
+            "--input".to_owned(),
+            "-".to_owned(),
+        ];
+        run_gh_api(&arguments, Some(&payload)).await?;
+        Ok(())
+    }
+
     async fn issue_labels(
         &self,
         repository: &RepositoryRef,
@@ -308,7 +376,7 @@ impl GhCli {
             arguments.push(format!("labels[]={label}"));
         }
         // This is one explicit effect invocation. Rust never retries it.
-        run_gh_api(&arguments).await?;
+        run_gh_api(&arguments, None).await?;
         Ok(())
     }
 
@@ -330,7 +398,7 @@ impl GhCli {
             arguments.push("--raw-field".to_owned());
             arguments.push(format!("{name}={value}"));
         }
-        let output = run_gh_api(&arguments).await?;
+        let output = run_gh_api(&arguments, None).await?;
         serde_json::from_slice(&output).map_err(|_| {
             Error::new(
                 "GITHUB_RESPONSE_INVALID",
@@ -364,6 +432,33 @@ impl GitHubLabelApi for GhCli {
         present: bool,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(GhCli::set_label(self, repository, number, label, present))
+    }
+}
+
+impl GitHubPullRequestApi for GhCli {
+    fn repository<'a>(
+        &'a self,
+        repository: &'a RepositoryRef,
+    ) -> Pin<Box<dyn Future<Output = Result<RepositoryReadback>> + Send + 'a>> {
+        Box::pin(GhCli::repository(self, repository))
+    }
+
+    fn pull_request<'a>(
+        &'a self,
+        repository: &'a RepositoryRef,
+        number: i64,
+    ) -> Pin<Box<dyn Future<Output = Result<PullRequestReadback>> + Send + 'a>> {
+        Box::pin(GhCli::pull_request(self, repository, number))
+    }
+
+    fn update_description<'a>(
+        &'a self,
+        repository: &'a RepositoryRef,
+        number: i64,
+        title: &'a str,
+        body: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(self.update_pull_request_description(repository, number, title, body))
     }
 }
 
@@ -409,11 +504,15 @@ fn validate_managed_label_name(label: &str) -> Result<()> {
     Ok(())
 }
 
-async fn run_gh_api(arguments: &[String]) -> Result<Vec<u8>> {
+async fn run_gh_api(arguments: &[String], input: Option<&[u8]>) -> Result<Vec<u8>> {
     let mut command = Command::new("gh");
     command
         .args(arguments)
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
@@ -427,6 +526,21 @@ async fn run_gh_api(arguments: &[String]) -> Result<Vec<u8>> {
         )
     })?;
     let result = timeout(GH_TIMEOUT, async {
+        if let Some(input) = input {
+            let mut stdin = child.stdin.take().ok_or_else(|| {
+                Error::new(
+                    "GITHUB_CLI_FAILED",
+                    "the GitHub CLI request pipe was unavailable",
+                )
+            })?;
+            stdin.write_all(input).await.map_err(|_| {
+                Error::new(
+                    "GITHUB_CLI_FAILED",
+                    "the GitHub CLI request body could not be sent",
+                )
+            })?;
+            drop(stdin);
+        }
         let mut stdout = child.stdout.take().ok_or_else(|| {
             Error::new(
                 "GITHUB_CLI_FAILED",

@@ -1426,6 +1426,32 @@ static TOOLS: &[(bool, ToolSpec)] = &[
         &[f("operation_id", S)],
         &["operation_id"],
     ),
+    mutation(
+        "github.pull_request.update_description",
+        "Update the title and body of one open PR only when its exact repository, published head SHA, and caller-selected base ref match retained readback.",
+        &[
+            f("publication_operation_id", S),
+            f("pull_request_id", I),
+            f("pull_request_number", I),
+            f("base_ref", S),
+            f("title", S),
+            f("body", S),
+        ],
+        &[
+            "publication_operation_id",
+            "pull_request_id",
+            "pull_request_number",
+            "base_ref",
+            "title",
+            "body",
+        ],
+    ),
+    mutation(
+        "github.pull_request.reconcile_description",
+        "Read back one exact unknown PR description Operation; this route performs GET-only reconciliation and cannot send or retry a PATCH.",
+        &[f("operation_id", S)],
+        &["operation_id"],
+    ),
 ];
 
 /// Canonical application methods advertised by MCP. The catalog search is a
@@ -1796,7 +1822,18 @@ fn refine_input_schema(method: &str, schema: &mut Value) {
             properties["label"] = json!({"type":"string","minLength":10,"maxLength":50,"pattern":"^eliot-[a-z0-9-]+$"});
             properties["present"] = json!({"type":"boolean"});
         }
-        "github.effect.reconcile_managed_label" => {
+        "github.pull_request.update_description" => {
+            properties["publication_operation_id"] =
+                json!({"type":"string","minLength":1,"maxLength":128,"pattern":"^\\S+$"});
+            for name in ["pull_request_id", "pull_request_number"] {
+                properties[name] =
+                    json!({"type":"integer","minimum":1,"maximum":9223372036854775807_i64});
+            }
+            properties["title"] = json!({"type":"string","minLength":1,"maxLength":262144});
+            properties["body"] = json!({"type":"string","maxLength":262144});
+            properties["base_ref"] = json!({"type":"string","minLength":11,"maxLength":512,"pattern":"^refs/heads/[^\\s]+$"});
+        }
+        "github.effect.reconcile_managed_label" | "github.pull_request.reconcile_description" => {
             properties["operation_id"] =
                 json!({"type":"string","minLength":1,"maxLength":128,"pattern":"^\\S+$"});
         }
@@ -3440,15 +3477,17 @@ mod tests {
             "github.work_pool.apply",
             "github.effect.managed_label",
             "github.effect.reconcile_managed_label",
+            "github.pull_request.update_description",
+            "github.pull_request.reconcile_description",
         ]
         .into_iter()
         .collect();
         assert_eq!(methods, expected);
-        assert_eq!(TOOLS.len(), 118);
+        assert_eq!(TOOLS.len(), 120);
         assert_eq!(TOOLS.iter().filter(|(read_only, _)| *read_only).count(), 54);
         assert_eq!(
             TOOLS.iter().filter(|(read_only, _)| !*read_only).count(),
-            64
+            66
         );
     }
 
@@ -3494,6 +3533,24 @@ mod tests {
         ] {
             assert!(output["properties"].get(field).is_some(), "{field}");
         }
+        let reconcile = find_tool("github_pull_request_reconcile_description").unwrap();
+        let schema = input_schema(&reconcile.1, reconcile.0, true);
+        assert_eq!(schema["additionalProperties"], json!(false));
+        assert!(
+            schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("operation_id"))
+        );
+        assert!(
+            schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("client_request_id"))
+        );
+        assert_eq!(schema["properties"]["operation_id"]["maxLength"], 128);
+        assert!(schema["properties"].get("title").is_none());
+        assert!(schema["properties"].get("body").is_none());
         let register = find_tool("script_register").unwrap();
         let schema = input_schema(&register.1, register.0, false);
         let grants = &schema["properties"]["bundle"]["properties"]["controller_effects"];

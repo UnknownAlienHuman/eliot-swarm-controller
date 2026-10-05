@@ -99,6 +99,65 @@ input remain unchanged; the new readback Operation adds its own provenance.
 An identical reconciliation request returns its retained receipt without
 another GET. Starting a new readback still checks current rights.
 
+## O4: exact PR description actions and recovery
+
+`github.pull_request.update_description` updates the title/body of one existing
+open, unmerged PR. It requires current direct GM or local Operator authority,
+an applied accepted-candidate `forge.publish_ref` Operation, and exact retained
+project/source/repository, PR ID/number, published head branch/SHA and base ref.
+The Manager and GM MCP profiles can explicitly load these manual-only methods;
+tool visibility does not grant GM authority.
+
+```json
+{
+  "client_request_id": "describe-published-candidate-17",
+  "publication_operation_id": "confirmed-publication-operation",
+  "pull_request_id": 12345,
+  "pull_request_number": 17,
+  "base_ref": "refs/heads/main",
+  "title": "Implement the accepted candidate",
+  "body": "The description for this exact published candidate."
+}
+```
+
+This admits a normal durable Operation. Before its single PATCH, the Store
+rechecks current authority and candidate scope. Title/body are UTF-8 strings
+bounded to 256 KiB each; title must contain non-whitespace text. The action
+does not create, retarget, merge, close or change draft state. A successful
+transport response alone does not prove application: exact PR readback must
+confirm both desired fields and immutable target identity.
+
+The desired-state slot belongs to `(repository_id, pull_request_id)` across
+head changes. An uncertain write retains that slot and cannot be replayed or
+bypassed by publishing a new head. A failed pre-write fence rejects only its
+exact still-queued Operation; cancellation or an already-started effect wins
+the state check. Current scoped GM can use `operation.cancel` for a predecessor's
+exact queued PR action even after its Task/Attempt becomes historical. Original
+caller/request identity stays intact; sending and unknown effects require
+readback rather than cancellation.
+
+`github.pull_request.reconcile_description` admits a separate GET-only
+recovery Operation:
+
+```json
+{
+  "client_request_id": "read-back-description-17",
+  "operation_id": "retained-unknown-description-operation"
+}
+```
+
+Current direct GM/Operator rights and ordinary Operation visibility are checked
+at admission and before GET. Desired fields and target provenance come from
+the retained original request/publication, not from this reconciliation input.
+Historical Task revisions or accepted-candidate selection changes do not block
+the read. Its final transaction rechecks the immutable Operation, publication,
+resource/slot and desired fields. An authorized GET that crosses a GM handover
+can still record its exact observed outcome; beginning another GET requires
+the new caller's current authority. Mismatch/unavailable readback preserves the
+original unknown outcome. Exact reconciliation replay returns the saved
+receipt without another GET. This method never sends another PATCH.
+
+
 ## O5: verified post-commit facts
 
 The repository-local hook calls `hook.emit` with only the setup-issued source

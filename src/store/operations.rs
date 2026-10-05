@@ -2636,6 +2636,27 @@ pub(super) fn cancel(
         if p.role == Role::Manager && o["state"] == "queued" {
             if o["caller_id"] == p.client_id {
                 p.owns(model::text(&o, "caller_id")?)?;
+            } else if o["method"] == "github.pull_request.update_description" {
+                // Cancelling an unsent effect is recovery of retained work,
+                // not control of the Task's current execution Attempt.
+                super::gm::require_authority(tx, p)?;
+                let task_id = model::text(&o, "task_id")?;
+                let attempt = tasks::get_attempt(tx, model::text(&o, "attempt_id")?)?;
+                let task = tasks::get_task(tx, task_id)?;
+                if attempt["task_id"] != task_id
+                    || !super::operation_visible_to(tx, p, target)?
+                    || !crate::automation::authorization::current_manager_has_task_scope(
+                        tx,
+                        p,
+                        task_id,
+                        model::text(&task, "project_id")?,
+                    )?
+                {
+                    return Err(Error::new(
+                        "FORBIDDEN",
+                        "queued PR cancellation requires current GM visibility and exact retained Task/Attempt scope",
+                    ));
+                }
             } else if let Some(attempt_id) = o["attempt_id"].as_str()
                 && manager_attempt_continuation_method(model::text(&o, "method")?)
             {

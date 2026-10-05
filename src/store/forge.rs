@@ -203,6 +203,74 @@ fn require_direct_write_authority(db: &Connection, client_id: &str) -> Result<i6
     current_gm_epoch(db)
 }
 
+/// Authorize the current actor to read back an already confirmed publication
+/// without requiring its accepted candidate to remain the Task's current
+/// revision. This is only for a separately retained unknown PR effect; it does
+/// not authorize a new publication or metadata write.
+pub(super) fn historical_applied_publication_context(
+    db: &Connection,
+    principal: &Principal,
+    operation_id: &str,
+) -> Result<(PublicationIntent, String)> {
+    let current = current_principal(db, principal.clone())?;
+    ForgeActor::Direct {
+        client_id: current.client_id.clone(),
+    }
+    .require_current_write_authority(db)?;
+
+    retained_applied_publication_record(db, operation_id)
+}
+
+/// Validate the immutable facts of a confirmed publication without performing
+/// a current-rights check. This is only for finalizing an already-authorized
+/// exact PR readback after its GET crossed a manager handover. It does not
+/// authorize a GET, retry, or new effect.
+pub(super) fn retained_applied_publication_record(
+    db: &Connection,
+    operation_id: &str,
+) -> Result<(PublicationIntent, String)> {
+    let operation = operations::get_operation(db, operation_id)?;
+    if operation["method"] != "forge.publish_ref"
+        || operation["state"] != "settled"
+        || operation["result"]["outcome"] != "applied"
+        || operation["result"]["publication"] != "confirmed_by_remote_readback"
+        || operation["result"]["acceptance_current_at_finish"] != true
+        || operation["result"]["remote_ref"]["present"] != true
+    {
+        return Err(Error::new(
+            "GITHUB_PR_PUBLICATION_REQUIRED",
+            "readback requires the exact retained, remotely confirmed publication",
+        ));
+    }
+
+    let saved = saved_intent(db, operation_id)?;
+    let request = request(db, operation_id)?;
+    let attempt = tasks::get_attempt(db, &saved.attempt_id)?;
+    let task_id = model::text(&attempt, "task_id")?.to_owned();
+    let task = tasks::get_task(db, &task_id)?;
+    if operation["task_id"] != task_id
+        || operation["attempt_id"] != saved.attempt_id
+        || task["project_id"] != saved.project_id
+        || saved.operation_id != operation_id
+        || saved.attempt_id != request.attempt_id
+        || saved.task_revision != request.expected_revision
+        || saved.submission_ref != request.submission_ref
+        || saved.accepted_operation_id != request.accepted_operation_id
+        || saved.candidate_ref != request.candidate_ref
+        || saved.policy_revision != request.expected_policy_revision
+        || saved.target_ref != request.target_ref
+        || saved.expected_old_ref != request.expected_old_ref
+        || saved.expected_create != request.expected_create
+        || operation["result"]["remote_ref"]["commit"] != saved.commit
+    {
+        return Err(Error::new(
+            "GITHUB_PR_PUBLICATION_STALE",
+            "the retained publication request, Task, Attempt, project, or confirmed commit is inconsistent",
+        ));
+    }
+    Ok((saved, task_id))
+}
+
 fn actor_for_operation(db: &Connection, id: &str, operation: &Value) -> Result<ForgeActor> {
     let caller_id = model::text(operation, "caller_id")?;
     let effective_raw: String = db.query_row(
@@ -669,6 +737,60 @@ fn request(db: &Connection, id: &str) -> Result<PublishRefRequest> {
         |row| row.get(0),
     )?;
     PublishRefRequest::parse(&serde_json::from_str(&raw)?)
+}
+
+/// Revalidate the exact current accepted candidate and current direct-write
+/// authority behind a retained successful publication before allowing a
+/// dependent PR effect. The publication's caller and GM epoch remain historical
+/// provenance; they do not grant or deny this new manual Operation.
+pub(super) fn applied_publication_context(
+    db: &Connection,
+    principal: &Principal,
+    operation_id: &str,
+    config: &Config,
+) -> Result<(PublicationIntent, String)> {
+    let current = current_principal(db, principal.clone())?;
+    let actor = ForgeActor::Direct {
+        client_id: current.client_id.clone(),
+    };
+    let operation = operations::get_operation(db, operation_id)?;
+    if operation["method"] != "forge.publish_ref"
+        || operation["state"] != "settled"
+        || operation["result"]["outcome"] != "applied"
+        || operation["result"]["publication"] != "confirmed_by_remote_readback"
+        || operation["result"]["acceptance_current_at_finish"] != true
+        || operation["result"]["remote_ref"]["present"] != true
+    {
+        return Err(Error::new(
+            "GITHUB_PR_PUBLICATION_REQUIRED",
+            "PR metadata updates require an exactly applied accepted-candidate publication",
+        ));
+    }
+
+    let saved = saved_intent(db, operation_id)?;
+    let request = request(db, operation_id)?;
+    let (mut current_intent, _, _) = accepted_candidate(db, &actor, &request, &config.forge)?;
+    current_intent.operation_id = operation_id.to_owned();
+    // accepted_candidate validates current operator/GM authority and the live
+    // Task, Attempt, acceptance, submission, candidate, project policy and
+    // repository. The retained epoch records who authorized the historical
+    // publication; normalize only this comparison field so a successor's
+    // current epoch does not invalidate the historical proof.
+    let mut comparable_intent = current_intent;
+    comparable_intent.admitted_gm_epoch = saved.admitted_gm_epoch;
+    let attempt = tasks::get_attempt(db, &saved.attempt_id)?;
+    let task_id = model::text(&attempt, "task_id")?.to_owned();
+    if comparable_intent != saved
+        || operation["task_id"] != task_id
+        || operation["attempt_id"] != saved.attempt_id
+        || operation["result"]["remote_ref"]["commit"] != saved.commit
+    {
+        return Err(Error::new(
+            "GITHUB_PR_PUBLICATION_STALE",
+            "the current accepted Task, policy, repository or published commit differs from the retained publication",
+        ));
+    }
+    Ok((saved, task_id))
 }
 
 fn settle_before_write(tx: &Transaction<'_>, id: &str, error: Error) -> Result<()> {

@@ -625,7 +625,9 @@ pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
         | "github.source.poll"
         | "github.work_pool.apply"
         | "github.effect.managed_label"
-        | "github.effect.reconcile_managed_label" => {
+        | "github.effect.reconcile_managed_label"
+        | "github.pull_request.update_description"
+        | "github.pull_request.reconcile_description" => {
             crate::github::protocol::validate_mutation(method, params)?;
             return Ok(());
         }

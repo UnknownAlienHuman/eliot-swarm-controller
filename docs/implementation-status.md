@@ -2,6 +2,36 @@
 
 ## Current state
 
+### PR description actions and successor recovery — 2026-10-04
+
+Two manual actions now use the ordinary Store Operation contract:
+`github.pull_request.update_description` and
+`github.pull_request.reconcile_description`. Updates require the current
+GM/Operator, an applied accepted-candidate publication and an exact PR target;
+recovery is GET-only. Unresolved effects own the repository/PR slot across head
+changes. Pre-write authority/candidate failure rejects only an exact queued
+Operation. Current scoped GM can cancel a predecessor's unsent PR action after
+Task revision without rewriting its original caller/request. Authenticated
+readback from an already-authorized GET survives GM handover.
+
+Formatting, strict production Clippy and library compilation passed gate
+`bc0ea0be-e525-4ea1-bdf0-740b1aced918`; its only remaining failure was an
+incorrect root test-filter path, before any test ran. The unchanged compiled
+binary then passed eight checks in `06e90512-93b4-49e0-9e5e-277a8f0c330f`.
+Its one Store scenario initially stopped on a missing fixture registration
+request ID. Root corrected the test helper and the fake preflight PR identity,
+preserving the real authorization and resource guards. The corrected scenario
+and debug build passed gate `4d5189e7-95df-4ae2-9d5f-ae6b4dce4f04` with all
+source pins unchanged. These are nine distinct focused checks. The fake
+transport tests do not execute Git publication or live GitHub writes.
+
+Full CI for the preceding managed-label revision `e679f55` passed on Windows
+and remote Ubuntu in run `37251900292`. Full CI for this PR-action revision is
+pending. Any-event script execution, its additive optional-scope migration,
+safe event producers and fair per-target Forge dispatch remain separate
+integration work. The complete program is **PARTIAL_PROGRESS**.
+
+
 ### Managed-label successor recovery — 2026-10-04
 
 `github.effect.reconcile_managed_label` creates a normal GM/Operator readback
@@ -21,9 +51,9 @@ the fake provider fixtures send no live GitHub write. Integration corrected
 an owned-ID capture and removed an unused production test-transport wrapper;
 the authorization and exact-resource guards remain in place.
 
-The full CI result below applies to the preceding kernel revision. Full CI for
-this label-recovery revision is pending. Generic script/event and nullable-scope
-schema overlays, PR description recovery and per-target Forge concurrency
+Full CI run `37251900292` passed on Windows and remote Ubuntu for published
+managed-label revision `e679f55ad31f13f61f03cf1bde58d9b24c9b138d`. Generic script/event and nullable-scope
+schema overlays and per-target Forge concurrency
 remain separate in-progress implementation; the complete program is
 **PARTIAL_PROGRESS**.
 
@@ -64,8 +94,8 @@ The owner clarified the universal transactional kernel and adapter contract in
 **any system event**, including events without Tasks, are required. The general
 selector, invocation context, additive migration and safe event producers are
 being implemented in private Luna overlays; the currently published
-submission/review rule is not full any-event script support. Exact PR-write and
-successor label recovery are also in progress. Linux/WSL and local models remain
+submission/review rule is not full any-event script support. The exact PR-write
+and successor label recovery batches are described above. Linux/WSL and local models remain
 deferred on the operator's computer.
 
 ### Native owned-service inventory and restart qualification — 2026-10-04

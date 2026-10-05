@@ -124,6 +124,22 @@ fn profile_tables_are_closed_and_keep_gm_authority_separate() {
             "{profile:?} must not expose the GM-only effect recovery method"
         );
     }
+    assert!(profiles::allows_method(
+        McpToolProfile::Manager,
+        "github.pull_request.update_description"
+    ));
+    assert!(profiles::allows_method(
+        McpToolProfile::Gm,
+        "github.pull_request.update_description"
+    ));
+    assert!(profiles::allows_method(
+        McpToolProfile::Manager,
+        "github.pull_request.reconcile_description"
+    ));
+    assert!(profiles::allows_method(
+        McpToolProfile::Gm,
+        "github.pull_request.reconcile_description"
+    ));
     for profile in [
         McpToolProfile::Observer,
         McpToolProfile::Reviewer,
@@ -133,6 +149,14 @@ fn profile_tables_are_closed_and_keep_gm_authority_separate() {
         assert!(
             !profiles::allows_method(profile, "github.effect.managed_label"),
             "{profile:?} must not expose a GitHub write effect"
+        );
+        assert!(
+            !profiles::allows_method(profile, "github.pull_request.update_description"),
+            "{profile:?} must not expose a GitHub pull-request write effect"
+        );
+        assert!(
+            !profiles::allows_method(profile, "github.pull_request.reconcile_description"),
+            "{profile:?} must not expose a GitHub pull-request reconciliation effect"
         );
     }
     assert!(profiles::allows_method(

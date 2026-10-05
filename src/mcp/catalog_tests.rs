@@ -5,6 +5,26 @@ use super::{
 use crate::config::McpToolProfile;
 
 #[test]
+fn published_pr_description_effect_is_manual_and_manager_scoped() {
+    let method = "github.pull_request.update_description";
+    let entry = super::metadata_for(method).expect("PR write effect is discoverable");
+    assert_eq!(entry.method, method);
+    assert_eq!(entry.load_tier, super::LoadTier::ManualOnly);
+    assert!(entry.audiences.contains(&super::ToolAudience::Manager));
+    assert!(entry.audiences.contains(&super::ToolAudience::GmOperator));
+}
+
+#[test]
+fn pr_description_readback_reconcile_is_manual_and_current_manager_scoped() {
+    let method = "github.pull_request.reconcile_description";
+    let entry = super::metadata_for(method).expect("PR readback reconciliation is discoverable");
+    assert_eq!(entry.method, method);
+    assert_eq!(entry.load_tier, super::LoadTier::ManualOnly);
+    assert!(entry.audiences.contains(&super::ToolAudience::Manager));
+    assert!(entry.audiences.contains(&super::ToolAudience::GmOperator));
+}
+
+#[test]
 fn scoped_filter_precedes_search_and_stales_existing_page_cursor() {
     let profile = McpToolProfile::Full;
     let surface = Surface::role_default(profile);

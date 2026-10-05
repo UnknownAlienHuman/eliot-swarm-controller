@@ -144,6 +144,104 @@ pub struct ManagedLabelRequest {
     pub present: bool,
 }
 
+/// A manually authorized title/body update tied to the exact accepted
+/// candidate already published by `forge.publish_ref`. This method cannot
+/// create, retarget, merge, close, or mark a pull request ready/draft.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PullRequestDescriptionUpdateRequest {
+    pub client_request_id: String,
+    pub publication_operation_id: String,
+    pub pull_request_id: i64,
+    pub pull_request_number: i64,
+    pub base_ref: String,
+    pub title: String,
+    pub body: String,
+}
+
+/// Read back the exact retained target of one ambiguous PR description update.
+/// This has no desired-state fields and can never authorize another PATCH.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PullRequestDescriptionReconcileRequest {
+    pub client_request_id: String,
+    pub operation_id: String,
+}
+
+impl PullRequestDescriptionReconcileRequest {
+    pub fn parse(value: &Value) -> Result<Self> {
+        model::fields(value, &["client_request_id", "operation_id"])?;
+        let request: Self = serde_json::from_value(value.clone())
+            .map_err(|_| Error::invalid("pull-request reconciliation request is invalid"))?;
+        if request.operation_id.trim().is_empty()
+            || request.operation_id.len() > 128
+            || request
+                .operation_id
+                .bytes()
+                .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+        {
+            return Err(Error::invalid(
+                "operation_id must be bounded printable text",
+            ));
+        }
+        Ok(request)
+    }
+}
+
+impl PullRequestDescriptionUpdateRequest {
+    pub fn parse(value: &Value) -> Result<Self> {
+        model::fields(
+            value,
+            &[
+                "client_request_id",
+                "publication_operation_id",
+                "pull_request_id",
+                "pull_request_number",
+                "base_ref",
+                "title",
+                "body",
+            ],
+        )?;
+        let request: Self = serde_json::from_value(value.clone())
+            .map_err(|_| Error::invalid("pull-request description request is invalid"))?;
+        if request.pull_request_id <= 0 || request.pull_request_number <= 0 {
+            return Err(Error::invalid(
+                "pull-request ID and number must be positive",
+            ));
+        }
+        if request.publication_operation_id.trim().is_empty()
+            || request.publication_operation_id.len() > 128
+            || request
+                .publication_operation_id
+                .chars()
+                .any(char::is_control)
+        {
+            return Err(Error::invalid(
+                "publication_operation_id must be bounded printable text",
+            ));
+        }
+        if request.base_ref.len() > 512 || !crate::forge::valid_branch_ref(&request.base_ref) {
+            return Err(Error::invalid(
+                "base_ref must be one bounded full refs/heads branch name",
+            ));
+        }
+        if request.title.trim().is_empty()
+            || request.title.len() > 256 * 1024
+            || request.body.len() > 256 * 1024
+            || request.title.chars().any(char::is_control)
+            || request
+                .body
+                .chars()
+                .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+        {
+            return Err(Error::invalid(
+                "title and body must fit the bounded GitHub text fields",
+            ));
+        }
+        Ok(request)
+    }
+}
+
 impl ManagedLabelRequest {
     pub fn parse(value: &Value) -> Result<Self> {
         model::fields(
@@ -262,6 +360,14 @@ pub fn validate_mutation(method: &str, value: &Value) -> Result<Value> {
         "github.effect.reconcile_managed_label" => {
             serde_json::to_value(ManagedLabelReconcileRequest::parse(value)?)
                 .map_err(|_| Error::invalid("managed-label reconciliation request is invalid"))
+        }
+        "github.pull_request.update_description" => {
+            serde_json::to_value(PullRequestDescriptionUpdateRequest::parse(value)?)
+                .map_err(|_| Error::invalid("pull-request description request is invalid"))
+        }
+        "github.pull_request.reconcile_description" => {
+            serde_json::to_value(PullRequestDescriptionReconcileRequest::parse(value)?)
+                .map_err(|_| Error::invalid("pull-request reconciliation request is invalid"))
         }
         _ => Err(Error::new("METHOD_NOT_FOUND", method)),
     }

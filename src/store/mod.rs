@@ -21,6 +21,7 @@ mod github;
 #[cfg(test)]
 mod github_effect_tests;
 mod github_effects;
+mod github_pr_effects;
 mod gm;
 mod goals;
 mod hooks;
@@ -80,6 +81,7 @@ const OWNED_SERVICE_SCHEMA: &str = include_str!("../../migrations/003_owned_serv
 const SCRIPT_SCHEMA: &str = include_str!("../../migrations/004_scripts.sql");
 const GITHUB_SCHEMA: &str = include_str!("../../migrations/006_github.sql");
 const GITHUB_EFFECTS_SCHEMA: &str = include_str!("../../migrations/007_github_label_effects.sql");
+const GITHUB_PR_EFFECTS_SCHEMA: &str = include_str!("../../migrations/008_github_pr_effects.sql");
 const APPLICATION_ID: i64 = 0x45534331;
 const LOCAL_OPERATOR_CLIENT_ID_KEY: &str = "local_operator_client_id";
 type RunJob = Box<dyn FnOnce(&mut Connection) + Send>;
@@ -693,6 +695,12 @@ impl Store {
             }
             if method == "github.effect.reconcile_managed_label" {
                 return github_effects::reconcile_call(self, principal, params).await;
+            }
+            if method == "github.pull_request.update_description" {
+                return github_pr_effects::call(self, principal, params).await;
+            }
+            if method == "github.pull_request.reconcile_description" {
+                return github_pr_effects::reconcile_call(self, principal, params).await;
             }
             return self.github_call(principal, method, params).await;
         }
@@ -1426,6 +1434,12 @@ fn open_database(root: &Path, credential: &Credential) -> Result<Connection> {
         GITHUB_EFFECTS_SCHEMA,
         &["github_label_effect_slots"],
     )?;
+    install_schema_extension(
+        &tx,
+        "schema_extension:github_pr_effects:v1",
+        GITHUB_PR_EFFECTS_SCHEMA,
+        &["github_pr_effect_slots"],
+    )?;
     let scheduler_key = format!("client:{}", model::INTERNAL_SCHEDULER_CLIENT_ID);
     match meta(&tx, &scheduler_key)? {
         None => set_meta(
@@ -1452,6 +1466,12 @@ fn open_database(root: &Path, credential: &Credential) -> Result<Connection> {
     tx.execute(
         "UPDATE operations SET state='outcome_unknown',result_json=CASE \
          WHEN method='github.effect.managed_label' AND state='sending' THEN \
+           json_set(COALESCE(result_json,'{}'), \
+             '$.outcome','outcome_unknown', \
+             '$.readback','required', \
+             '$.write_attempted',json('true'), \
+             '$.current_state_read_method','operation.get') \
+         WHEN method='github.pull_request.update_description' AND state='sending' THEN \
            json_set(COALESCE(result_json,'{}'), \
              '$.outcome','outcome_unknown', \
              '$.readback','required', \
@@ -3967,6 +3987,12 @@ fn apply(
     match method {
         "goal.create" | "goal.revise" | "goal.enable" | "goal.disable" | "goal.readback" => {
             goals::apply(tx, p, method, v, id, now)
+        }
+        "github.pull_request.update_description" => {
+            github_pr_effects::apply(tx, p, v, id, now, config)
+        }
+        "github.pull_request.reconcile_description" => {
+            github_pr_effects::apply_reconcile(tx, p, v, id, now)
         }
         "github.source.setup"
         | "github.source.poll"

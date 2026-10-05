@@ -159,6 +159,8 @@ pub(super) fn allows_method(profile: McpToolProfile, method: &str) -> bool {
                 | "swarm.launch"
                 | "swarm.overlap.check"
                 | "github.effect.managed_label"
+                | "github.pull_request.update_description"
+                | "github.pull_request.reconcile_description"
                 | "coordination.watch.create"
                 | "coordination.watch.list"
                 | "coordination.watch.cancel"
@@ -183,6 +185,8 @@ pub(super) fn allows_method(profile: McpToolProfile, method: &str) -> bool {
                         | "github.work_pool.apply"
                         | "github.effect.managed_label"
                         | "github.effect.reconcile_managed_label"
+                        | "github.pull_request.update_description"
+                        | "github.pull_request.reconcile_description"
                         | "gm.handover"
                 )
         }
