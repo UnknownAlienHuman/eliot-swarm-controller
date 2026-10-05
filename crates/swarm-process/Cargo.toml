@@ -10,6 +10,11 @@ description = "Small platform process ownership primitives for Eliot Swarm"
 serde_json = "=1.0.151"
 sha2 = "=0.10.9"
 swarm-contracts = { path = "../swarm-contracts" }
+uuid = { version = "=1.26.1", features = ["v4"] }
+
+[[bin]]
+name = "swarm-module-owner"
+path = "src/bin/swarm-module-owner.rs"
 
 [target.'cfg(windows)'.dependencies]
 [target.'cfg(windows)'.dependencies.windows-sys]

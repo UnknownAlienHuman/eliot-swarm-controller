@@ -5,6 +5,7 @@
 //! and recovery policy and persist the returned owner identity as-is.
 
 pub mod module_membership;
+pub mod module_owner;
 mod permissions;
 pub mod process_group;
 

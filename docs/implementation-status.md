@@ -2,6 +2,25 @@
 
 ## Current state
 
+### PR #25 scoped module-owner launcher — 2026-10-05
+
+`swarm-process` now provides the independently built `swarm-module-owner`
+bootstrap and typed adapter membership proof. A dedicated wrapper holds each
+module scope's nonkilling process group and lock, preserves the v1 owner record,
+publishes the distinct adapter image/boot/artifact receipt and waits for the
+entire native family. Explicit private plans use opaque protected references
+resolved to existing credential-file paths. An independent source review found
+ambient module credentials could be inherited; the wrapper now clears that
+namespace before supplying the exact selected scope.
+
+Before-spawn resolver/validation failures publish a scoped negative launch
+receipt after an empty-family check. Replacement still requires exact wrapper
+departure; absent or post-spawn proof remains unknown and cannot replay input.
+Source mapping and explicit formatting pass; the new scoped compiler gate is
+pending. Installation, live process ownership, dynamic registration and actual
+supervisor/adapter wiring remain unfinished. The current Codex process and
+installed launcher have not been replaced or restarted.
+
 ### PR #25 kernel writer actor — 2026-10-05
 
 The root Store now uses the independent `swarm-kernel` package for its single
@@ -15,8 +34,10 @@ Source review, explicit formatting and offline locked workspace metadata are
 the current checks. A missing function-signature delimiter in the draft was
 corrected before publication. CI for `8e056a9` compiled the shared actor but
 reported an ambiguous root callback type on both platforms; the callback now
-names its existing `RunJob` type explicitly. The corrected compiler gate is
-pending; the passing source `042d8b6` gate below predates the actor extraction. No local
+names its existing `RunJob` type explicitly. Corrected source `025282a` passed
+the scoped format and strict production Clippy gate on Windows and remote Ubuntu
+in [run 37322606976](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37322606976).
+Full tests, release and native qualification remain separate. No local
 compilation, tests, model calls or native process launches were performed.
 
 ### PR #25 Store primitives and module child identity — 2026-10-05

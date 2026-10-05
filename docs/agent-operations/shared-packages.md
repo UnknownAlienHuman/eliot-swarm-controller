@@ -8,7 +8,7 @@ having the new packages import the old controller library.
 |---|---|---|
 | `swarm-contracts` | Credential, JSON-RPC Request, runtime command/outcome, error classification and module catalog metadata | None |
 | `swarm-client` | Authenticated bounded sequential local IPC client and endpoint computation | `swarm-contracts` |
-| `swarm-process` | OS process/group ownership, identity/departure checks, private-file primitives | `swarm-contracts` |
+| `swarm-process` | OS process/group ownership, identity/departure checks, private files and scoped module-owner bootstrap | `swarm-contracts` |
 | `swarm-store` | SQLite connection opening, schema identity/digest and transaction primitives | None |
 | `swarm-kernel` | Single bounded writer actor, readiness and contiguous typed job batching | None |
 | `swarm-telemetry` | Bounded metadata producer, lazy stderr writer and local drop/failure counters | None |
@@ -56,6 +56,25 @@ process and does not prove whole-family departure; the existing departure scan
 remains required before replacement. A worker cannot use this child API to
 validate itself as the owner.
 
+The `swarm-module-owner` binary accepts one absolute private plan and an explicit
+resolver map. Each invocation owns its own nonkilling group and OS lock, publishes
+the existing v1 owner envelope and an exact distinct adapter image receipt, then
+retains ownership through direct-child exit and native-family drain. Its plan
+contains scope, artifact/version, boot identity and protected references; the
+resolver passes existing credential-file paths, without serializing token bytes
+or placing them in argv. Ambient module identity/credential environment is
+cleared before the selected scope is supplied. Explicit path metadata checks
+reject symlink/reparse components; they do not provide a same-user sandbox or
+an atomic filesystem-race guarantee.
+
+A resolver/launch-validation error before child spawn writes a boot/owner/scope
+bound `launch-result.json` with `not_started`, only after an empty-family check.
+The supervisor must still verify that exact wrapper/family departed before a
+replacement. A missing, stale or post-spawn result proves no absence of native
+effects and permits no input replay. This shared bootstrap is source integration;
+its installation, live OS behavior and supervisor/adapter activation remain
+separate work.
+
 The Store package opens its writer from the existing owner thread while that
 thread retains the DataRoot lock. Base schema initialization and the kernel's
 credential checks, extensions and restart reconciliation share one Immediate
@@ -95,7 +114,9 @@ source review pass. Current root source `042d8b6` passed scoped production
 Clippy on Windows and remote Ubuntu in
 [run 37318364299](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37318364299).
 Full tests, release packaging and native interoperability remain separate.
-The writer actor increment passes metadata and explicit formatting; its fresh
-scoped compiler gate and native qualification remain pending.
+The writer actor correction `025282a` also passed scoped format and strict
+production Clippy on Windows and remote Ubuntu in
+[run 37322606976](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37322606976).
+Full tests, release packaging and native qualification remain pending.
 These six packages do not complete the Store/kernel, bus, supervisor or adapter
 split. They create the shared boundary those modules can consume independently.
