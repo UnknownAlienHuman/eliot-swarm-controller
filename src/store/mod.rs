@@ -691,6 +691,9 @@ impl Store {
             if method == "github.effect.managed_label" {
                 return github_effects::call(self, principal, params).await;
             }
+            if method == "github.effect.reconcile_managed_label" {
+                return github_effects::reconcile_call(self, principal, params).await;
+            }
             return self.github_call(principal, method, params).await;
         }
         if matches!(
@@ -3968,7 +3971,10 @@ fn apply(
         "github.source.setup"
         | "github.source.poll"
         | "github.work_pool.apply"
-        | "github.effect.managed_label" => github::apply(tx, p, method, v, config, id, now),
+        | "github.effect.managed_label"
+        | "github.effect.reconcile_managed_label" => {
+            github::apply(tx, p, method, v, config, id, now)
+        }
         "hook.source.revoke" => hooks::revoke(
             tx,
             p,

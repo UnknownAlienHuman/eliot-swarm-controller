@@ -187,6 +187,40 @@ impl ManagedLabelRequest {
     }
 }
 
+/// One exact readback of a retained, unknown managed-label Operation. The
+/// requested label, desired state and source are derived from that original
+/// Operation; callers can identify only which unresolved receipt to inspect.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedLabelReconcileRequest {
+    pub client_request_id: String,
+    pub operation_id: String,
+}
+
+impl ManagedLabelReconcileRequest {
+    pub fn parse(value: &Value) -> Result<Self> {
+        model::fields(value, &["client_request_id", "operation_id"])?;
+        let request: Self = serde_json::from_value(value.clone())
+            .map_err(|_| Error::invalid("managed-label reconciliation request is invalid"))?;
+        for (field, value) in [
+            ("client_request_id", request.client_request_id.as_str()),
+            ("operation_id", request.operation_id.as_str()),
+        ] {
+            if value.trim().is_empty()
+                || value.len() > 128
+                || value
+                    .bytes()
+                    .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+            {
+                return Err(Error::invalid(format!(
+                    "{field} must be 1..=128 bytes without whitespace"
+                )));
+            }
+        }
+        Ok(request)
+    }
+}
+
 impl WorkPoolApplyRequest {
     pub fn parse(value: &Value) -> Result<Self> {
         model::fields(value, &["client_request_id", "source_id", "task_ids"])?;
@@ -225,6 +259,10 @@ pub fn validate_mutation(method: &str, value: &Value) -> Result<Value> {
             .map_err(|_| Error::invalid("GitHub work-pool request is invalid")),
         "github.effect.managed_label" => serde_json::to_value(ManagedLabelRequest::parse(value)?)
             .map_err(|_| Error::invalid("managed-label request is invalid")),
+        "github.effect.reconcile_managed_label" => {
+            serde_json::to_value(ManagedLabelReconcileRequest::parse(value)?)
+                .map_err(|_| Error::invalid("managed-label reconciliation request is invalid"))
+        }
         _ => Err(Error::new("METHOD_NOT_FOUND", method)),
     }
 }

@@ -2,6 +2,31 @@
 
 ## Current state
 
+### Managed-label successor recovery — 2026-10-04
+
+`github.effect.reconcile_managed_label` creates a normal GM/Operator readback
+Operation for an exact retained unknown label effect. It performs GET only;
+source, repository, Issue, label and the desired-state slot are verified before
+readback and again when its outcome is committed. The original actor and input
+remain unchanged. Historical Task revision/selection changes do not block the
+read; a handover during an already-authorized GET does not discard its exact
+observed result. Starting another GET checks the new caller's current rights.
+
+The restricted GM MCP profile exposes the method; other restricted profiles
+do not. Formatting, strict production Clippy, library compilation, both
+managed-label Store fixtures, the profile boundary, tool registry and closed
+schemas passed gate `5f973029-d45d-4192-95df-8b9100406880`. The debug build
+also passed with all 195 source pins unchanged. This is five focused checks;
+the fake provider fixtures send no live GitHub write. Integration corrected
+an owned-ID capture and removed an unused production test-transport wrapper;
+the authorization and exact-resource guards remain in place.
+
+The full CI result below applies to the preceding kernel revision. Full CI for
+this label-recovery revision is pending. Generic script/event and nullable-scope
+schema overlays, PR description recovery and per-target Forge concurrency
+remain separate in-progress implementation; the complete program is
+**PARTIAL_PROGRESS**.
+
 ### Kernel recovery and review-result watches — 2026-10-04
 
 The current integration adds `submission_reviewed` one-shot watches for the
@@ -29,8 +54,10 @@ new native provider execution.
 The Windows output-limit/deadline/descendant fixture passed separately in
 gate `79cd72e4-e94f-4909-8380-adad9b559664`. Its overflow source is now the
 already-built native CLI, avoiding unrelated PowerShell cold-start time while
-preserving product deadlines and cleanup assertions. Full CI for this revision
-is still pending. The complete program remains **PARTIAL_PROGRESS**.
+preserving product deadlines and cleanup assertions. Full CI run `37249166766`
+passed on Windows and remote Ubuntu for published revision
+`e9c02690b8b02a51e1d81d34a9af305c9560d5cb`. The complete program remains
+**PARTIAL_PROGRESS**.
 
 The owner clarified the universal transactional kernel and adapter contract in
 [Architecture](agent-operations/architecture.md). Manager-configured scripts on
@@ -40,6 +67,25 @@ being implemented in private Luna overlays; the currently published
 submission/review rule is not full any-event script support. Exact PR-write and
 successor label recovery are also in progress. Linux/WSL and local models remain
 deferred on the operator's computer.
+
+### Native owned-service inventory and restart qualification — 2026-10-04
+
+Fresh C32 run `2acba7ba-5f09-434f-b2bd-6daf9789c026` passed on published
+`e9c02690b8b02a51e1d81d34a9af305c9560d5cb`, with candidate SHA-256
+`C9C1A513A2BF70409662E90A851EEB02E37119F9667C1C5555AB15B3484CAAFE`.
+It observed nine native MCP tools and the exact challenge on an isolated
+OpenCode 2.0.7 service. Unknown hook statuses correctly produced sequence zero.
+Nine native-axis diagnostic readbacks matched the current Manager projection.
+The C8 post-effect failure branch had no matching failure and validated no
+failure readback; this run does not qualify that unobserved branch.
+
+Graceful shutdown and host restart verified the exact owned process, listener,
+runtime and connection had departed and the service did not respawn. The
+workspace lease remained held. All 533 tracked file pins, the candidate and
+installed launcher stayed unchanged; all 30 protected processes were preserved.
+The claim is consumed and must not be replayed. No Task dispatch or inference
+was requested; model consumption and provider-request hooks remain unknown.
+Hosted Bunny execution is therefore not established by this qualification.
 
 ### Five-module integration — 2026-10-04
 

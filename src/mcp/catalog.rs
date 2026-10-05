@@ -1932,6 +1932,17 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
         ],
         "One durable desired-state effect; unknown writes are read back and never resent."
     ),
+    entry!(
+        "github.effect.reconcile_managed_label",
+        GitHub,
+        GM_AUDIENCES,
+        ManualOnly,
+        "Read back one exact unknown managed-label Operation under current GM or Operator authority.",
+        "Use when an earlier label write is outcome-unknown; this method never sends a label write.",
+        &["github", "issue", "managed label", "readback", "reconcile"],
+        &["operation_id", "client_request_id"],
+        "One ordinary readback Operation; only exact repository, Issue and desired-label evidence settles the original Operation."
+    ),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

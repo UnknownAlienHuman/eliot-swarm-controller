@@ -108,6 +108,22 @@ fn profile_tables_are_closed_and_keep_gm_authority_separate() {
         McpToolProfile::Gm,
         "github.effect.managed_label"
     ));
+    assert!(profiles::allows_method(
+        McpToolProfile::Gm,
+        "github.effect.reconcile_managed_label"
+    ));
+    for profile in [
+        McpToolProfile::Manager,
+        McpToolProfile::Observer,
+        McpToolProfile::Reviewer,
+        McpToolProfile::Participant,
+        McpToolProfile::AssignedReviewer,
+    ] {
+        assert!(
+            !profiles::allows_method(profile, "github.effect.reconcile_managed_label"),
+            "{profile:?} must not expose the GM-only effect recovery method"
+        );
+    }
     for profile in [
         McpToolProfile::Observer,
         McpToolProfile::Reviewer,

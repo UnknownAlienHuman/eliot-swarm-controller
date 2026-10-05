@@ -75,6 +75,30 @@ that GitHub changed. Once a write may have started, recovery is exact Issue
 readback only. Do not resend an uncertain write. The effect uses the existing
 configured `gh` account and never sends a model request.
 
+`github.effect.reconcile_managed_label` exposes a separate manual recovery
+Operation in the GM MCP profile. The current GM or a local Operator must be
+authorized to see the retained unknown Operation:
+
+```json
+{
+  "client_request_id": "reconcile-label-17",
+  "operation_id": "retained-unknown-label-operation"
+}
+```
+
+It derives the original source, project, repository, Issue and desired label
+from that Operation and verifies its exact semantic slot. It performs GET
+readback only. A released/superseded Task or changed work-pool selection does
+not block this historical read. A mismatch or unavailable read leaves the
+original effect unknown; no second label write is sent.
+
+The final transaction checks the same immutable target, desired state and slot
+before recording the observation. A GM handover after the authorized GET starts
+does not discard its exact observed result. Original caller/request/effective
+input remain unchanged; the new readback Operation adds its own provenance.
+An identical reconciliation request returns its retained receipt without
+another GET. Starting a new readback still checks current rights.
+
 ## O5: verified post-commit facts
 
 The repository-local hook calls `hook.emit` with only the setup-issued source

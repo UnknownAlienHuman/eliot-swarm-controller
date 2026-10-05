@@ -1420,6 +1420,12 @@ static TOOLS: &[(bool, ToolSpec)] = &[
             "present",
         ],
     ),
+    mutation(
+        "github.effect.reconcile_managed_label",
+        "Read back one exact unknown Eliot-managed label Operation without sending a label write.",
+        &[f("operation_id", S)],
+        &["operation_id"],
+    ),
 ];
 
 /// Canonical application methods advertised by MCP. The catalog search is a
@@ -1789,6 +1795,10 @@ fn refine_input_schema(method: &str, schema: &mut Value) {
                 json!({"type":"integer","minimum":1,"maximum":9223372036854775807_i64});
             properties["label"] = json!({"type":"string","minLength":10,"maxLength":50,"pattern":"^eliot-[a-z0-9-]+$"});
             properties["present"] = json!({"type":"boolean"});
+        }
+        "github.effect.reconcile_managed_label" => {
+            properties["operation_id"] =
+                json!({"type":"string","minLength":1,"maxLength":128,"pattern":"^\\S+$"});
         }
         "swarm.launch.preview" | "swarm.launch" => {
             properties["task_id"] = json!({"type":"string","minLength":1,"maxLength":512});
@@ -3429,15 +3439,16 @@ mod tests {
             "github.work_pool.preview",
             "github.work_pool.apply",
             "github.effect.managed_label",
+            "github.effect.reconcile_managed_label",
         ]
         .into_iter()
         .collect();
         assert_eq!(methods, expected);
-        assert_eq!(TOOLS.len(), 117);
+        assert_eq!(TOOLS.len(), 118);
         assert_eq!(TOOLS.iter().filter(|(read_only, _)| *read_only).count(), 54);
         assert_eq!(
             TOOLS.iter().filter(|(read_only, _)| !*read_only).count(),
-            63
+            64
         );
     }
 

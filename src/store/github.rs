@@ -378,6 +378,9 @@ pub(super) fn apply(
         "github.effect.managed_label" => {
             super::github_effects::apply(tx, principal, value, operation_id, now)
         }
+        "github.effect.reconcile_managed_label" => {
+            super::github_effects::apply_reconcile(tx, principal, value, operation_id, now)
+        }
         _ => Err(Error::new("METHOD_NOT_FOUND", method)),
     }
 }

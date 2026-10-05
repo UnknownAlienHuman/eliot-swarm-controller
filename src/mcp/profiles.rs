@@ -182,6 +182,7 @@ pub(super) fn allows_method(profile: McpToolProfile, method: &str) -> bool {
                         | "github.work_pool.preview"
                         | "github.work_pool.apply"
                         | "github.effect.managed_label"
+                        | "github.effect.reconcile_managed_label"
                         | "gm.handover"
                 )
         }
