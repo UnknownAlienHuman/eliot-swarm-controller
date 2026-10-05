@@ -211,8 +211,8 @@ fn owned_probe_bounds_output_deadline_and_descendant_lifetime() {
             response_summary(&overflow)
         );
 
-        let powershell = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
-            .join("System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+        let system_root = PathBuf::from(std::env::var_os("SystemRoot").unwrap());
+        let powershell = system_root.join("System32\\WindowsPowerShell\\v1.0\\powershell.exe");
         if powershell.is_file() {
             let timeout = run_probe(
                 &powershell,
@@ -225,25 +225,27 @@ fn owned_probe_bounds_output_deadline_and_descendant_lifetime() {
                 "timeout response: {}",
                 response_summary(&timeout)
             );
-
-            let lingering_child = run_probe(
-                &powershell,
-                &[
-                    "-NoProfile",
-                    "-Command",
-                    "$null = Start-Process -FilePath $env:ComSpec -ArgumentList '/c','ping -n 30 127.0.0.1' -NoNewWindow -PassThru; exit 0",
-                ],
-                5_000,
-                64 * 1024,
-            );
-            assert!(
-                !lingering_child.success
-                    && lingering_child.group_empty
-                    && !lingering_child.output_limited
-                    && lingering_child.message.contains("descendants"),
-                "orphan response: {}",
-                response_summary(&lingering_child)
-            );
         }
+
+        // Use a native command processor for the parent so cold PowerShell
+        // startup cannot consume the probe deadline before orphan detection.
+        // The started ping process remains alive while the parent exits.
+        let command_prompt = system_root.join("System32\\cmd.exe");
+        let lingering_child = run_probe(
+            &command_prompt,
+            &["/d", "/c", "start /b ping.exe -n 30 127.0.0.1"],
+            5_000,
+            64 * 1024,
+        );
+        assert!(
+            !lingering_child.success
+                && !lingering_child.timed_out
+                && lingering_child.exit_code == Some(0)
+                && lingering_child.group_empty
+                && !lingering_child.output_limited
+                && lingering_child.message.contains("descendants"),
+            "orphan response: {}",
+            response_summary(&lingering_child)
+        );
     }
 }

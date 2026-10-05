@@ -1340,6 +1340,9 @@ async fn persist(
                 }
             }
             capacity::sync_operation(&tx, &operation_id, now)?;
+            if state == "outcome_unknown" {
+                super::record_operation_failure_event(&tx, &operation_id, state, now)?;
+            }
             if state != "outcome_unknown" {
                 let event_key = format!("{state}:{operation_id}");
                 tx.execute(

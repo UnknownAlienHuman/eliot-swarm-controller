@@ -1,5 +1,5 @@
-//! Direct, manager-authorized script bundles. Scripts are optional trusted-local
-//! work and have no controller API capability in this implementation.
+//! Manager-authorized script bundles and event-triggered invocations.
+//! Controller effects require the exact retained Task-scoped capability grant.
 
 pub mod manifest;
 pub mod protocol;

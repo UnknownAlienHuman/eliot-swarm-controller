@@ -229,6 +229,6 @@ pub(super) fn apply(
         "former_owner_revision":former.revision,
         "new_owner_revision":successor.revision,
         "gm_epoch":gm_epoch,
-        "state_ledgers_relocated":6
+        "state_ledgers_relocated":7
     }))
 }

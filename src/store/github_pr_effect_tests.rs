@@ -711,6 +711,22 @@ async fn successor_gm_reconciles_predecessor_unknown_pr_effect_readback_only() {
     assert_eq!(state.lock().await.writes, 1);
 
     // Admit a second PR update while the predecessor is current, but leave it
+    let uncertain_operation_id = first["operation_id"].as_str().unwrap().to_owned();
+    let unknown_fact = owner.store.run(move |db| {
+        db.query_row(
+            "SELECT observation_id,payload_json,recorded_at_ms FROM observations WHERE source_stream_id='controller:operations' AND kind='operation.outcome_unknown' AND operation_id=?1",
+            [&uncertain_operation_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?)),
+        ).map_err(Into::into)
+    }).await.unwrap();
+    let safe_unknown: Value = serde_json::from_str(&unknown_fact.1).unwrap();
+    assert_eq!(safe_unknown["status"], "unknown");
+    assert_eq!(safe_unknown["error_code"], "OUTCOME_UNKNOWN");
+    assert!(safe_unknown.get("requested_title").is_none());
+    assert!(safe_unknown.get("requested_body_digest").is_none());
+    assert!(safe_unknown.get("error").is_none());
+
+    // Admit a second PR update while the predecessor is current, but leave it
     // before any GitHub I/O. A later current GM may cancel this precisely
     // scoped queued Attempt Operation through ordinary operation.cancel.
     let queued_cancel_request = json!({
@@ -1198,6 +1214,20 @@ async fn successor_gm_reconciles_predecessor_unknown_pr_effect_readback_only() {
         .expect_err("forged publication identity is not admitted");
     assert_eq!(forged_error.code, "NOT_FOUND");
     assert_eq!(state.lock().await.writes, 1);
+    let preserved_unknown = owner.store.run(move |db| {
+        let count: i64 = db.query_row(
+            "SELECT count(*) FROM observations WHERE observation_id=?1 AND source_stream_id='controller:operations' AND kind='operation.outcome_unknown' AND payload_json=?2 AND recorded_at_ms=?3",
+            params![unknown_fact.0, unknown_fact.1, unknown_fact.2], |row| row.get(0),
+        )?;
+        let event = super::super::automation_intake::observed_event_by_id(db, unknown_fact.0)?.unwrap();
+        let projection = super::super::automation_intake::safe_event_projection(db, &event)?;
+        assert_eq!(projection.status, Some(crate::automation::event_rules::EventStatus::Unknown));
+        Ok(count)
+    }).await.unwrap();
+    assert_eq!(
+        preserved_unknown, 1,
+        "historical uncertainty fact survives exact recovery"
+    );
 }
 
 #[test]

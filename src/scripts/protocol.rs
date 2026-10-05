@@ -47,8 +47,10 @@ pub struct RunRequest {
     pub client_request_id: String,
     pub script_id: String,
     pub expected_script_revision: i64,
-    pub attempt_id: String,
-    pub expected_task_revision: i64,
+    #[serde(default)]
+    pub attempt_id: Option<String>,
+    #[serde(default)]
+    pub expected_task_revision: Option<i64>,
     pub input: Value,
 }
 
@@ -77,9 +79,12 @@ pub struct ScriptInvocation {
     pub run_id: String,
     pub script_id: String,
     pub script_revision: i64,
-    pub task_id: String,
-    pub task_revision: i64,
-    pub attempt_id: String,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub task_revision: Option<i64>,
+    #[serde(default)]
+    pub attempt_id: Option<String>,
     pub input: Value,
     /// Closed, immutable grants copied from this exact bundle revision.
     #[serde(default)]
@@ -194,12 +199,14 @@ impl RunRequest {
         model::text(value, "client_request_id")?;
         let request: Self = serde_json::from_value(value.clone())?;
         validate_script_id(&request.script_id)?;
-        if request.expected_script_revision <= 0
-            || request.expected_task_revision <= 0
-            || request.attempt_id.trim().is_empty()
-        {
+        let valid_task_scope = match (&request.attempt_id, request.expected_task_revision) {
+            (Some(attempt_id), Some(revision)) => !attempt_id.trim().is_empty() && revision > 0,
+            (None, None) => true,
+            _ => false,
+        };
+        if request.expected_script_revision <= 0 || !valid_task_scope {
             return Err(Error::invalid(
-                "script run requires positive expected revisions and an Attempt ID",
+                "script Task scope must provide both a nonempty Attempt ID and positive Task revision",
             ));
         }
         if model::canonical(&request.input)?.len() > MAX_INPUT_BYTES {

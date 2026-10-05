@@ -73,21 +73,60 @@ fn load(db: &Connection) -> Result<Option<Lifecycle>> {
         .transpose()
 }
 
-fn retain_exit(tx: &Transaction<'_>, receipt: &Exit) -> Result<()> {
+fn retain_exit(
+    tx: &Transaction<'_>,
+    receipt: &Exit,
+    interrupted_epochs: Option<(i64, i64)>,
+) -> Result<()> {
     let value = json!(receipt);
     set_meta(tx, LAST_EXIT, &value)?;
     if receipt.manager_action_required {
         set_meta(tx, LATEST_FAILURE, &value)?;
     }
-    let key = format!(
-        "{}:{}",
-        receipt.host_epoch.unwrap_or(0),
-        receipt.observed_at_ms
-    );
+    let mut observation = value.clone();
+    let key = if let Some((previous_epoch, current_epoch)) = interrupted_epochs {
+        if receipt.host_epoch != Some(previous_epoch)
+            || receipt.error_code.as_deref() != Some("HOST_INTERRUPTED")
+            || current_epoch <= previous_epoch
+        {
+            return Err(Error::new(
+                "HOST_LIFECYCLE_INVALID",
+                "interrupted host epoch pair is invalid",
+            ));
+        }
+        let occurrence_id = format!("host-interruption:{previous_epoch}:{current_epoch}");
+        observation["phase"] = json!("host_interruption_observed");
+        observation["occurrence_id"] = json!(occurrence_id);
+        observation["previous_host_epoch"] = json!(previous_epoch);
+        observation["current_host_epoch"] = json!(current_epoch);
+        format!("interrupted:{previous_epoch}:{current_epoch}")
+    } else {
+        format!(
+            "{}:{}",
+            receipt.host_epoch.unwrap_or(0),
+            receipt.observed_at_ms
+        )
+    };
     tx.execute(
         "INSERT INTO observations(source_stream_id,source_event_key,kind,payload_json,recorded_at_ms) VALUES('controller:host-lifecycle',?1,'host.exit',?2,?3)",
-        params![key, model::canonical(&value)?, receipt.observed_at_ms],
+        params![key, model::canonical(&observation)?, receipt.observed_at_ms],
     )?;
+    if let Some((previous_epoch, current_epoch)) = interrupted_epochs {
+        let occurrence_id = format!("host-interruption:{previous_epoch}:{current_epoch}");
+        super::insert_safe_system_event(
+            tx,
+            "controller:host-lifecycle",
+            &format!("interruption:{previous_epoch}:{current_epoch}"),
+            None,
+            "host.interrupted",
+            "host_interruption_observed",
+            "unknown",
+            Some(&occurrence_id),
+            Some((previous_epoch, current_epoch)),
+            Some("HOST_INTERRUPTED"),
+            receipt.observed_at_ms,
+        )?;
+    }
     Ok(())
 }
 
@@ -107,6 +146,7 @@ pub(super) fn start(tx: &Transaction<'_>, now: i64) -> Result<()> {
                     manager_action_required: true,
                     retry_authorized: false,
                 },
+                Some((previous.host_epoch, current_epoch)),
             )?;
         }
         Err(error) if error.code != "STORE_ERROR" && error.code != "STORE_CLOSED" => {
@@ -136,6 +176,7 @@ pub(super) fn start(tx: &Transaction<'_>, now: i64) -> Result<()> {
                     manager_action_required: true,
                     retry_authorized: false,
                 },
+                None,
             )?;
         }
         Err(error) => return Err(error),
@@ -209,6 +250,7 @@ pub(super) fn finish(tx: &Transaction<'_>, error_code: Option<&str>, now: i64) -
             error_code,
             retry_authorized: false,
         },
+        None,
     )?;
     set_meta(tx, CURRENT, &json!(current))
 }

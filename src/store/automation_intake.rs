@@ -147,6 +147,393 @@ pub(crate) fn parse_hook_commit_fact(
     )
 }
 
+/// Read one bounded page from the durable global observations sequence. This
+/// lane is deliberately metadata-only: the caller receives no source event
+/// key, binding identity, or payload. ScriptRun asks a typed projection only
+/// after an exact manager selector matches and current event visibility is
+/// established.
+pub(crate) fn observed_event_page(
+    db: &Connection,
+    after_observation_id: i64,
+    through_observation_id: i64,
+    limit: usize,
+) -> Result<Vec<ObservedEvent>> {
+    if after_observation_id < 0 || through_observation_id < after_observation_id {
+        return Err(Error::invalid("observed-event cursor range is invalid"));
+    }
+    let mut statement = db.prepare(
+        "SELECT observation_id,source_stream_id,kind,operation_id,recorded_at_ms \
+         FROM observations WHERE observation_id>?1 AND observation_id<=?2 \
+         ORDER BY observation_id LIMIT ?3",
+    )?;
+    statement
+        .query_map(
+            params![
+                after_observation_id,
+                through_observation_id,
+                limit.clamp(1, MAX_INTAKE_PAGE) as i64,
+            ],
+            |row| {
+                Ok(ObservedEvent {
+                    observation_id: row.get(0)?,
+                    source_id: row.get(1)?,
+                    event_kind: row.get(2)?,
+                    operation_id: row.get(3)?,
+                    recorded_at_ms: row.get(4)?,
+                })
+            },
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Read one exact observation by its durable O1 sequence identity. This
+/// remains metadata-only; callers must use an authorized adapter before
+/// projecting any event-specific fields.
+pub(crate) fn observed_event_by_id(
+    db: &Connection,
+    observation_id: i64,
+) -> Result<Option<ObservedEvent>> {
+    if observation_id <= 0 {
+        return Ok(None);
+    }
+    db.query_row(
+        "SELECT observation_id,source_stream_id,kind,operation_id,recorded_at_ms \
+         FROM observations WHERE observation_id=?1",
+        [observation_id],
+        |row| {
+            Ok(ObservedEvent {
+                observation_id: row.get(0)?,
+                source_id: row.get(1)?,
+                event_kind: row.get(2)?,
+                operation_id: row.get(3)?,
+                recorded_at_ms: row.get(4)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+pub(crate) fn observed_event_high_water(db: &Connection) -> Result<i64> {
+    Ok(db.query_row(
+        "SELECT COALESCE(MAX(observation_id),0) FROM observations",
+        [],
+        |row| row.get(0),
+    )?)
+}
+
+/// Read one receipt only after its exact source has been registered and the
+/// observation has been committed to that source's immutable O1 journal.
+/// This is used to retain the existing typed TaskSubmission contract while
+/// ScriptRun advances its separate global observation cursor.
+pub(crate) fn receipt_by_observation_id(
+    db: &Connection,
+    source_id: &str,
+    observation_id: i64,
+) -> Result<Option<EventReceipt>> {
+    if observation_id <= 0 {
+        return Ok(None);
+    }
+    let Some(registration) = load_registration(db, source_id)? else {
+        return Ok(None);
+    };
+    let Some(cursor) = load_cursor(db, source_id)? else {
+        return Ok(None);
+    };
+    if observation_id > cursor.observation_id {
+        return Ok(None);
+    }
+    let key = journal_key(source_id, observation_id);
+    let item = read_pending_journal(db, source_id, &registration, observation_id, &key)?;
+    Ok(match item {
+        IntakeItem::Receipt(receipt) => Some(receipt),
+        IntakeItem::Gap(_) => None,
+    })
+}
+
+/// Project the closed TaskSubmission outcome only after exact O1 journal
+/// readback. Submission bodies, candidate metadata, and event keys are never
+/// returned to the ScriptRun consumer.
+pub(crate) fn task_submission_projection_by_observation(
+    db: &Connection,
+    event: &ObservedEvent,
+) -> Result<crate::automation::intake::SafeEventProjection> {
+    if event.source_id != LocalProducer::TaskSubmission.stream_id()
+        || event.event_kind != LocalProducer::TaskSubmission.event_kind()
+    {
+        return Ok(Default::default());
+    }
+    let Some(receipt) = receipt_by_observation_id(
+        db,
+        LocalProducer::TaskSubmission.source_id(),
+        event.observation_id,
+    )?
+    else {
+        return Ok(Default::default());
+    };
+    if receipt.event_kind != event.event_kind
+        || receipt.operation_id.as_deref() != event.operation_id.as_deref()
+    {
+        return Ok(Default::default());
+    }
+    use crate::automation::event_rules::EventStatus;
+    let (status, status_name) = match receipt.payload["outcome"].as_str() {
+        Some("applied") => (EventStatus::Applied, "applied"),
+        Some("failed") => (EventStatus::Failed, "failed"),
+        Some("stale_submission_scope") => (EventStatus::Invalidated, "invalidated"),
+        _ => return Ok(Default::default()),
+    };
+    let operation_id = receipt.operation_id.as_deref().unwrap_or_default();
+    if operation_id.is_empty() {
+        return Ok(Default::default());
+    }
+    let occurrence_phase = format!("task_submission_{status_name}");
+    let occurrence_id = format!("operation:{operation_id}:{occurrence_phase}");
+    if !valid_occurrence_identity(&occurrence_id) {
+        return Ok(Default::default());
+    }
+    Ok(crate::automation::intake::SafeEventProjection {
+        status: Some(status),
+        occurrence_phase: Some(occurrence_phase),
+        occurrence_id: Some(occurrence_id),
+        ..Default::default()
+    })
+}
+
+/// Read the verified HookCommit identity associated with one exact durable
+/// observation. The caller must additionally check that the HookSource is
+/// still current and belongs to its configured project.
+pub(crate) fn hook_commit_fact_by_observation(
+    db: &Connection,
+    observation_id: i64,
+) -> Result<Option<crate::hooks::contract::HookCommitFact>> {
+    let row: Option<(Option<String>, String)> = db
+        .query_row(
+            "SELECT source_event_key,payload_json FROM observations \
+             WHERE observation_id=?1 AND source_stream_id=?2 AND kind=?3",
+            params![
+                observation_id,
+                LocalProducer::HookCommit.stream_id(),
+                LocalProducer::HookCommit.event_kind()
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((Some(source_event_key), payload_json)) = row else {
+        return Ok(None);
+    };
+    if !valid_event_key(&source_event_key) || payload_json.len() as i64 > MAX_INTAKE_PAYLOAD_BYTES {
+        return Ok(None);
+    }
+    let payload: Value = match serde_json::from_str(&payload_json) {
+        Ok(payload) => payload,
+        Err(_) => return Ok(None),
+    };
+    let Ok(fact) = validate_hook_commit_payload(
+        LocalProducer::HookCommit.source_id(),
+        LocalProducer::HookCommit.event_kind(),
+        &source_event_key,
+        &payload,
+    ) else {
+        return Ok(None);
+    };
+    let Some((receipt, indexed_fact)) =
+        hook_commit_by_identity(db, &fact.source_id, &fact.project_id, &fact.commit_oid)?
+    else {
+        return Ok(None);
+    };
+    if receipt.observation_id != observation_id || indexed_fact != fact {
+        return Ok(None);
+    }
+    Ok(Some(fact))
+}
+
+/// Read only producer-normalized status metadata for event kinds whose
+/// payload contract is explicitly safe. Unlisted event payloads are never
+/// parsed for selector matching.
+pub(crate) fn safe_event_projection(
+    db: &Connection,
+    event: &ObservedEvent,
+) -> Result<crate::automation::intake::SafeEventProjection> {
+    use crate::automation::event_rules::EventStatus;
+
+    let expected = match (event.source_id.as_str(), event.event_kind.as_str()) {
+        ("controller:messages", "message.sent" | "message.reply_sent") => {
+            Some((EventStatus::Sent, "message_send_committed"))
+        }
+        ("controller:coordination", "coordination.answer") => {
+            Some((EventStatus::Answered, "coordination_answered"))
+        }
+        ("controller:runtime", "native.operation.completed") => {
+            Some((EventStatus::Applied, "native_outcome_terminal"))
+        }
+        ("controller:runtime", "native.result.available") => {
+            Some((EventStatus::Completed, "native_result_page_recorded"))
+        }
+        ("controller:host-lifecycle", "host.interrupted") => {
+            Some((EventStatus::Unknown, "host_interruption_observed"))
+        }
+        ("controller:operations", "operation.rejected") => {
+            Some((EventStatus::Rejected, "operation_rejected"))
+        }
+        ("controller:operations", "operation.outcome_unknown") => {
+            Some((EventStatus::Unknown, "operation_outcome_unknown"))
+        }
+        _ => None,
+    };
+    let Some((expected_status, expected_phase)) = expected else {
+        return Ok(Default::default());
+    };
+    let raw: Option<String> = db
+        .query_row(
+            "SELECT payload_json FROM observations WHERE observation_id=?1 AND source_stream_id=?2 AND kind=?3",
+            params![event.observation_id, event.source_id, event.event_kind],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(raw) = raw else {
+        return Ok(Default::default());
+    };
+    let value: Value = match serde_json::from_str(&raw) {
+        Ok(value) => value,
+        Err(_) => return Ok(Default::default()),
+    };
+    let phase = value["phase"].as_str();
+    let occurrence_id = value["occurrence_id"].as_str();
+    if value["schema_version"] != 1
+        || phase != Some(expected_phase)
+        || occurrence_id.is_none_or(|identity| !valid_occurrence_identity(identity))
+    {
+        return Ok(Default::default());
+    }
+    let status = match value["status"].as_str() {
+        Some("applied") => EventStatus::Applied,
+        Some("completed") => EventStatus::Completed,
+        Some("failed") => EventStatus::Failed,
+        Some("incomplete") => EventStatus::Incomplete,
+        Some("cancelled") => EventStatus::Cancelled,
+        Some("rejected") => EventStatus::Rejected,
+        Some("sent") => EventStatus::Sent,
+        Some("answered") => EventStatus::Answered,
+        Some("invalidated") => EventStatus::Invalidated,
+        Some("unknown") => EventStatus::Unknown,
+        _ => return Ok(Default::default()),
+    };
+    let expected_status = match (event.event_kind.as_str(), status) {
+        ("native.operation.completed", EventStatus::Applied | EventStatus::Rejected) => status,
+        ("native.result.available", EventStatus::Completed | EventStatus::Incomplete) => status,
+        (_, observed) if observed == expected_status => expected_status,
+        _ => return Ok(Default::default()),
+    };
+    // This status is written only by the result producer after validating the
+    // exact ResultPage, including eof/range/length/digest. Its closed event DTO
+    // intentionally omits eof, artifact identity and digest; do not require or
+    // expose those fields here.
+    if event.event_kind == "native.result.available"
+        && !matches!(status, EventStatus::Completed | EventStatus::Incomplete)
+    {
+        return Ok(Default::default());
+    }
+    let expected_error_code = match (event.source_id.as_str(), event.event_kind.as_str()) {
+        ("controller:host-lifecycle", "host.interrupted") => Some("HOST_INTERRUPTED"),
+        ("controller:operations", "operation.rejected") => Some("OPERATION_REJECTED"),
+        ("controller:operations", "operation.outcome_unknown") => Some("OUTCOME_UNKNOWN"),
+        _ => None,
+    };
+    let error_code = match expected_error_code {
+        Some(code) if value["error_code"] == code => Some(code.to_owned()),
+        Some(_) => return Ok(Default::default()),
+        None => None,
+    };
+    if event.source_id == "controller:operations" && event.operation_id.is_none() {
+        return Ok(Default::default());
+    }
+    if event.event_kind == "host.interrupted" && error_code.is_none() {
+        return Ok(Default::default());
+    }
+    if event.event_kind == "host.interrupted"
+        && !host_occurrence_matches(&value, occurrence_id.unwrap_or_default())
+    {
+        return Ok(Default::default());
+    }
+    if let Some(operation_id) = event.operation_id.as_deref()
+        && occurrence_id != Some(format!("operation:{operation_id}:{expected_phase}").as_str())
+    {
+        return Ok(Default::default());
+    }
+    Ok(crate::automation::intake::SafeEventProjection {
+        status: Some(expected_status),
+        error_code,
+        occurrence_phase: Some(expected_phase.to_owned()),
+        occurrence_id: occurrence_id.map(ToOwned::to_owned),
+    })
+}
+
+/// Internal correlation for the legacy host-exit record. Its payload is read
+/// only to validate the epoch-pair identity and is never copied into a script
+/// input or trigger cause.
+pub(crate) fn host_exit_occurrence_projection(
+    db: &Connection,
+    event: &ObservedEvent,
+) -> Result<crate::automation::intake::SafeEventProjection> {
+    if event.source_id != "controller:host-lifecycle" || event.event_kind != "host.exit" {
+        return Ok(Default::default());
+    }
+    let raw: Option<String> = db
+        .query_row(
+            "SELECT payload_json FROM observations WHERE observation_id=?1 \
+             AND source_stream_id='controller:host-lifecycle' AND kind='host.exit'",
+            [event.observation_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(raw) = raw else {
+        return Ok(Default::default());
+    };
+    if raw.len() as i64 > MAX_INTAKE_PAYLOAD_BYTES {
+        return Ok(Default::default());
+    }
+    let value: Value = match serde_json::from_str(&raw) {
+        Ok(value) => value,
+        Err(_) => return Ok(Default::default()),
+    };
+    let phase = value["phase"].as_str();
+    let occurrence_id = value["occurrence_id"].as_str();
+    if phase != Some("host_interruption_observed")
+        || occurrence_id.is_none_or(|identity| !valid_occurrence_identity(identity))
+        || !host_occurrence_matches(&value, occurrence_id.unwrap_or_default())
+    {
+        return Ok(Default::default());
+    }
+    Ok(crate::automation::intake::SafeEventProjection {
+        occurrence_phase: phase.map(ToOwned::to_owned),
+        occurrence_id: occurrence_id.map(ToOwned::to_owned),
+        ..Default::default()
+    })
+}
+
+fn host_occurrence_matches(value: &Value, occurrence_id: &str) -> bool {
+    let Some(previous_epoch) = value["previous_host_epoch"].as_i64() else {
+        return false;
+    };
+    let Some(current_epoch) = value["current_host_epoch"].as_i64() else {
+        return false;
+    };
+    previous_epoch > 0
+        && current_epoch > 0
+        && previous_epoch != current_epoch
+        && occurrence_id == format!("host-interruption:{previous_epoch}:{current_epoch}")
+}
+
+fn valid_occurrence_identity(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._:-/@".contains(&byte))
+}
+
 /// Admit a closed, existing local Store producer and initialize its cursor.
 /// Registration and cursor initialization are written in the caller's Store
 /// transaction. `include_existing=false` records a high-water baseline and

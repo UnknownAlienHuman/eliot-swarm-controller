@@ -2,6 +2,56 @@
 
 ## Current state
 
+### Universal event routing and independent Forge targets — 2026-10-04
+
+Manager-configured ScriptRun rules now select any bounded exact source/kind
+through the shared durable observation reader. Optional supported status
+filters use safe adapter projections. There is no global kind whitelist or
+provider-specific runner. The normal host automation cycle drains retained
+pending causes into ordinary script Operations after its Store transaction
+commits; bundle preparation stays outside the database owner transaction.
+Current manager, script revision and source visibility are rechecked at
+admission and start. Cursors, semantic deduplication and pending history survive
+restart and explicit entry transfer.
+
+Migration 009 allows either an entirely absent Task/Attempt tuple or the real
+complete tuple in the existing script-run table. It preserves the immutable
+004 contract, rows, indexes and foreign keys. Every open checks live canonical
+DDL and SQLite metadata against the same-engine reference schema, with foreign
+keys explicitly enabled. Taskless runs receive zero controller-effect grants;
+direct manual calls still require exact Task/Attempt scope.
+
+Safe producers cover committed messages/replies, coordination answers, native
+terminal outcomes, validated result pages and detected host interruption.
+Raw/normalized aliases coalesce by phase and occurrence; two distinct phases
+of a consult remain distinct. Result-page EOF does not prove Task completion,
+and interruption does not identify its cause. Bounded immutable Operation
+failure events currently cover mutation admission rejection and PR-description
+uncertainty. Publishing them for every committed Operation failure/unknown
+transition remains an explicit implementation gap under Luna review.
+
+Forge serializes an exact repository/ref target while independent targets
+progress concurrently. Independent persisted keyset cursors for reconciliation
+and dispatch prevent one old held target from starving later targets.
+Readback-only recovery of uncertain writes remains unchanged.
+
+Formatting, strict production Clippy, library compilation and debug build
+passed final gate `2be0e438-a561-483f-9d9d-d683ed2cc412`, with all 203 source
+pins unchanged. Across retained focused gates, all 28 distinct library checks
+passed, including the real Store taskless event path, immutable failure facts,
+schema drift refusal, effect boundaries and Forge fairness/concurrency.
+Windows `check_probe` also passed once after replacing its cold PowerShell
+orphan parent with native cmd while retaining the deadline and descendant
+cleanup requirements. That is 29 distinct focused checks. The installed
+launcher and current Codex/OpenCodex processes were not replaced or restarted.
+
+Full CI for predecessor `3741c16` passed the complete Ubuntu pipeline and
+Windows library checks, then failed the Windows orphan fixture in run
+`37254527962`. The fixture correction has passed locally; full CI for this new
+batch is pending. Fresh hosted Bunny inference remains unqualified. Local
+Linux/WSL and local models remain deferred. The complete program is
+**PARTIAL_PROGRESS**.
+
 ### PR description actions and successor recovery — 2026-10-04
 
 Two manual actions now use the ordinary Store Operation contract:
@@ -26,10 +76,11 @@ source pins unchanged. These are nine distinct focused checks. The fake
 transport tests do not execute Git publication or live GitHub writes.
 
 Full CI for the preceding managed-label revision `e679f55` passed on Windows
-and remote Ubuntu in run `37251900292`. Full CI for this PR-action revision is
-pending. Any-event script execution, its additive optional-scope migration,
-safe event producers and fair per-target Forge dispatch remain separate
-integration work. The complete program is **PARTIAL_PROGRESS**.
+and remote Ubuntu in run `37251900292`. Full CI for this PR-action revision
+failed the Windows orphan fixture in run `37254527962`; the full Ubuntu
+pipeline and Windows library checks passed. The universal-event batch above
+includes a locally verified fixture correction. The complete program is
+**PARTIAL_PROGRESS**.
 
 
 ### Managed-label successor recovery — 2026-10-04

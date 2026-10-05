@@ -93,6 +93,21 @@ pub(crate) struct GoalProgressionSettings {
     pub(crate) goal_id: String,
 }
 
+/// One explicitly selected active script target for manager-selected durable
+/// event triggers. Revision is captured from the active script head only when
+/// the normal run admission is prepared.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ScriptRunSettings {
+    pub(crate) script_id: String,
+}
+
+impl ScriptRunSettings {
+    fn validate(&self) -> Result<()> {
+        crate::scripts::manifest::validate_script_id(&self.script_id)
+    }
+}
+
 impl GoalProgressionSettings {
     fn validate(&self) -> Result<()> {
         validate_name(
@@ -120,6 +135,8 @@ pub(crate) struct AutomationEntry {
     pub(crate) work_dispatch: Option<WorkDispatchLaunchSettings>,
     #[serde(default)]
     pub(crate) goal_progression: Option<GoalProgressionSettings>,
+    #[serde(default)]
+    pub(crate) script_run: Option<ScriptRunSettings>,
     #[serde(default)]
     pub(crate) publication: Option<PublicationSettings>,
     #[serde(default)]
@@ -156,6 +173,7 @@ impl AutomationEntry {
             steps: Vec::new(),
             work_dispatch: None,
             goal_progression: None,
+            script_run: None,
             publication: None,
             cron: None,
             hook_commit: None,
@@ -192,6 +210,21 @@ impl AutomationEntry {
                 "code":"goal_progression_settings_required",
                 "step":"goal_progression",
                 "reason":"select the exact existing shared Goal ID before enabling progression"
+            }));
+        }
+        if self.steps.contains(&AutomationStep::ScriptRun) && self.script_run.is_none() {
+            gaps.push(json!({
+                "code":"script_run_settings_required",
+                "step":"script_run",
+                "reason":"select one owned script id and at least one exact durable event source/kind rule"
+            }));
+        } else if self.steps.contains(&AutomationStep::ScriptRun)
+            && !self.script_run_event_rule_selected()
+        {
+            gaps.push(json!({
+                "code":"script_run_trigger_required",
+                "step":"script_run",
+                "reason":"select at least one exact source_id/event_kind ScriptRun rule; unknown future kinds remain idle until a safe event becomes visible"
             }));
         }
         if self.steps.contains(&AutomationStep::WorkDispatch) {
@@ -287,10 +320,30 @@ impl AutomationEntry {
             && self.scope.work_pool_id.is_none()
     }
 
+    pub(crate) fn script_run_ready(&self) -> bool {
+        self.enabled
+            && self.steps.contains(&AutomationStep::ScriptRun)
+            && self.script_run.is_some()
+            && self.script_run_event_rule_selected()
+            && self.scope.work_pool_id.is_none()
+    }
+
     pub(crate) fn task_submission_review_rule_selected(&self) -> bool {
-        self.event_rules
-            .as_ref()
-            .is_none_or(|rules| !rules.is_empty())
+        self.event_rules.as_ref().is_none_or(|rules| {
+            rules.iter().any(|rule| {
+                rule.action == super::event_rules::EventRuleAction::ReviewDispatch
+                    && rule.is_task_submission_applied()
+            })
+        })
+    }
+
+    pub(crate) fn script_run_event_rule_selected(&self) -> bool {
+        self.event_rules.as_ref().is_some_and(|rules| {
+            rules.iter().any(|rule| {
+                rule.action == super::event_rules::EventRuleAction::ScriptRun
+                    && rule.validate_shape().is_ok()
+            })
+        })
     }
 
     pub(crate) fn accepts_task_submission_review_event(
@@ -298,9 +351,46 @@ impl AutomationEntry {
         receipt: &EventReceipt,
         cause: &AutomationCause,
     ) -> bool {
-        self.event_rules
-            .as_ref()
-            .is_none_or(|rules| rules.iter().any(|rule| rule.matches(receipt, cause)))
+        self.event_rules.as_ref().is_none_or(|rules| {
+            rules.iter().any(|rule| {
+                rule.action == super::event_rules::EventRuleAction::ReviewDispatch
+                    && rule.matches_receipt(receipt, cause)
+            })
+        })
+    }
+
+    pub(crate) fn accepts_task_submission_script_run_event(
+        &self,
+        receipt: &EventReceipt,
+        cause: &AutomationCause,
+    ) -> bool {
+        self.event_rules.as_ref().is_some_and(|rules| {
+            rules.iter().any(|rule| {
+                rule.action == super::event_rules::EventRuleAction::ScriptRun
+                    && rule.matches_receipt(receipt, cause)
+            })
+        })
+    }
+
+    pub(crate) fn accepts_script_run_event(
+        &self,
+        source_id: &str,
+        event_kind: &str,
+        status: Option<super::event_rules::EventStatus>,
+    ) -> bool {
+        self.event_rules.as_ref().is_some_and(|rules| {
+            rules
+                .iter()
+                .any(|rule| rule.matches_safe_event(source_id, event_kind, status))
+        })
+    }
+
+    pub(crate) fn selects_script_run_source_kind(&self, source_id: &str, event_kind: &str) -> bool {
+        self.event_rules.as_ref().is_some_and(|rules| {
+            rules
+                .iter()
+                .any(|rule| rule.selects_script_run_source_kind(source_id, event_kind))
+        })
     }
 }
 
@@ -751,6 +841,7 @@ pub(crate) fn apply_patch(
             "scope" => patch_scope(&mut next.scope, value)?,
             "steps" => next.steps = parse_steps(value)?,
             "goal_progression" => patch_goal_progression(&mut next.goal_progression, value)?,
+            "script_run" => patch_script_run(&mut next.script_run, value)?,
             "work_dispatch" => patch_work_dispatch(&mut next.work_dispatch, value)?,
             "publication" => patch_publication(&mut next.publication, value)?,
             "cron" => patch_cron(&mut next.cron, value)?,
@@ -768,6 +859,18 @@ pub(crate) fn apply_patch(
         next.updated_at_ms = now_ms;
     }
     Ok(next)
+}
+
+fn patch_script_run(settings: &mut Option<ScriptRunSettings>, patch: &Value) -> Result<()> {
+    if patch.is_null() {
+        *settings = None;
+        return Ok(());
+    }
+    let parsed: ScriptRunSettings = serde_json::from_value(patch.clone())
+        .map_err(|_| Error::invalid("script_run requires exactly one script_id"))?;
+    parsed.validate()?;
+    *settings = Some(parsed);
+    Ok(())
 }
 
 fn patch_hook_commit(settings: &mut Option<HookCommitSettings>, patch: &Value) -> Result<()> {
@@ -1034,6 +1137,20 @@ pub(crate) fn validate_entry(entry: &AutomationEntry) -> Result<()> {
             )
         })?;
     }
+    if let Some(settings) = entry.script_run.as_ref() {
+        settings.validate().map_err(|_| {
+            Error::new(
+                "AUTOMATION_RECORD_INVALID",
+                "stored script_run settings do not identify one valid script",
+            )
+        })?;
+        if !entry.steps.contains(&AutomationStep::ScriptRun) {
+            return Err(Error::new(
+                "AUTOMATION_RECORD_INVALID",
+                "script_run settings require the script_run action",
+            ));
+        }
+    }
     if let Some(settings) = entry.work_dispatch.as_ref() {
         let value = serde_json::to_value(settings).map_err(|_| {
             Error::new(
@@ -1123,6 +1240,20 @@ pub(crate) fn dispatch_state_key(
     validate_automation_id(automation_id)?;
     Ok(format!(
         "automation:v1:dispatch:{}:{automation_id}",
+        scope_digest(owner, project)?
+    ))
+}
+
+/// Independent bounded applied-submission cursor for the ScriptRun action.
+/// It shares O1's registered intake but cannot rewind ReviewDispatch state.
+pub(crate) fn script_dispatch_state_key(
+    owner: &str,
+    project: &str,
+    automation_id: &str,
+) -> Result<String> {
+    validate_automation_id(automation_id)?;
+    Ok(format!(
+        "automation:v1:script_dispatch:{}:{automation_id}",
         scope_digest(owner, project)?
     ))
 }

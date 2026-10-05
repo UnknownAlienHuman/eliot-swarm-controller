@@ -128,3 +128,26 @@ pub(crate) struct PendingPage {
     pub(crate) next_after_observation_id: Option<i64>,
     pub(crate) items: Vec<IntakeItem>,
 }
+
+/// Metadata-only row identity used by the manager-configured ScriptRun event
+/// cursor. `observation_id` is the stable identity even for legacy events
+/// whose source event key is absent. Payload is deliberately excluded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ObservedEvent {
+    pub(crate) observation_id: i64,
+    pub(crate) source_id: String,
+    pub(crate) event_kind: String,
+    pub(crate) operation_id: Option<String>,
+    pub(crate) recorded_at_ms: i64,
+}
+
+/// Closed metadata projection for producer facts whose payload contract has
+/// been explicitly normalized. This never contains source keys, raw payload,
+/// binding identity, or artifact/content references.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct SafeEventProjection {
+    pub(crate) status: Option<super::event_rules::EventStatus>,
+    pub(crate) error_code: Option<String>,
+    pub(crate) occurrence_phase: Option<String>,
+    pub(crate) occurrence_id: Option<String>,
+}

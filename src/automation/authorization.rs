@@ -20,6 +20,39 @@ use std::collections::BTreeSet;
 
 pub(crate) const AUTOMATION_TECHNICAL_REQUESTER_ID: &str = "eliot-internal-automation-v1";
 
+type ScriptSubmissionRunLinkRow = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+    String,
+    String,
+    i64,
+    String,
+    Option<String>,
+    Option<i64>,
+    Option<String>,
+);
+
+type ScriptEventRunLinkRow = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+    String,
+    String,
+    i64,
+    String,
+    Option<String>,
+    Option<i64>,
+    Option<String>,
+    String,
+);
+
 #[derive(Debug, Clone)]
 pub(crate) struct ManagerExecutionContext {
     technical_requester_id: String,
@@ -842,6 +875,7 @@ pub(crate) enum AnyOnBehalfOperationLink {
     Publication(OnBehalfOperationLink),
     CronCheckRun(OnBehalfOperationLink),
     GoalProgression(OnBehalfOperationLink),
+    ScriptRun(OnBehalfOperationLink),
     WorkDispatch(crate::store::automation_work_dispatch::WorkDispatchOperationLink),
     Repair(Box<crate::store::automation_repair::RepairDispatchOperationLink>),
 }
@@ -1007,6 +1041,7 @@ impl AnyOnBehalfOperationLink {
             Self::Publication(link) => link.belongs_to(principal),
             Self::CronCheckRun(link) => link.belongs_to(principal),
             Self::GoalProgression(link) => link.belongs_to(principal),
+            Self::ScriptRun(link) => link.belongs_to(principal),
             Self::WorkDispatch(link) => link.belongs_to(principal),
             Self::Repair(link) => {
                 principal.role == Role::Manager && principal.client_id == link.effective_manager_id
@@ -1046,6 +1081,8 @@ pub(crate) fn operation_link(
         ("forge.publish_ref", Some("task.acceptance")) => "forge.publish_ref",
         ("check.run", Some("cron_occurrence")) => "check.run",
         ("agent.goal", Some("goal_progression")) => "agent.goal",
+        ("script.run", Some("applied_submission")) => "script.run",
+        ("script.run", Some("system_event")) => "script.run",
         _ => "",
     };
     if link.schema_version != 1
@@ -1088,8 +1125,505 @@ pub(crate) fn operation_link(
         validate_cron_check_run_link(db, &link)?;
     } else if link.action == "agent.goal" {
         crate::store::automation_goal_progression::validate_operation_link(db, &link)?;
+    } else if link.action == "script.run" {
+        validate_script_run_operation_link(db, &link)?;
     }
     Ok(Some(link))
+}
+
+/// Retain exact automation, submission, Task, Attempt, script and immutable
+/// revision attribution for the ordinary queued `script.run` Operation.
+pub(crate) fn save_script_run_operation_link(
+    db: &Connection,
+    operation_id: &str,
+    entry: &config::AutomationEntry,
+    cause: &Value,
+    now_ms: i64,
+) -> Result<Value> {
+    let selected_script = entry
+        .script_run
+        .as_ref()
+        .map(|settings| settings.script_id.as_str());
+    let cause_kind = cause["kind"].as_str().unwrap_or_default();
+    let cause_is_selected = match cause_kind {
+        "applied_submission" => cause["id"].as_str().is_some_and(|id| !id.is_empty()),
+        "system_event" => {
+            let status = super::event_rules::EventStatus::parse_optional(cause["status"].as_str())?;
+            cause["source_id"]
+                .as_str()
+                .zip(cause["event_kind"].as_str())
+                .is_some_and(|(source_id, event_kind)| {
+                    entry.accepts_script_run_event(source_id, event_kind, status)
+                })
+                && cause["observation_id"].as_i64().is_some_and(|id| id > 0)
+                && cause["recorded_at_ms"]
+                    .as_i64()
+                    .is_some_and(|time| time >= 0)
+                && cause["id"].as_str().is_some_and(|id| !id.is_empty())
+        }
+        _ => false,
+    };
+    if !entry.script_run_ready()
+        || !cause_is_selected
+        || cause["script_id"].as_str() != selected_script
+    {
+        return Err(Error::new(
+            "AUTOMATION_ACTION_CHANGED",
+            "ScriptRun trigger no longer admits this exact invocation",
+        ));
+    }
+    require_registered_manager(db, &entry.owner_manager_id)?;
+    let current = config::load_entry(
+        db,
+        &entry.owner_manager_id,
+        &entry.project_id,
+        &entry.automation_id,
+    )?
+    .ok_or_else(|| {
+        Error::new(
+            "AUTOMATION_ACTION_CHANGED",
+            "ScriptRun automation disappeared",
+        )
+    })?;
+    if current.revision != entry.revision
+        || !current.script_run_ready()
+        || current.script_run != entry.script_run
+        || current.event_rules != entry.event_rules
+    {
+        return Err(Error::new(
+            "AUTOMATION_ACTION_CHANGED",
+            "current automation no longer selects this ScriptRun target",
+        ));
+    }
+    let link = OnBehalfOperationLink {
+        schema_version: 1,
+        operation_id: operation_id.to_owned(),
+        technical_requester_id: AUTOMATION_TECHNICAL_REQUESTER_ID.to_owned(),
+        effective_manager_id: entry.owner_manager_id.clone(),
+        automation_id: entry.automation_id.clone(),
+        automation_revision: entry.revision,
+        project_id: entry.project_id.clone(),
+        action: "script.run".to_owned(),
+        cause: cause.clone(),
+        linked_at_ms: now_ms,
+    };
+    let value = link.value()?;
+    config::write_record(db, &config::operation_link_key(operation_id)?, &value)?;
+    config::write_record(
+        db,
+        &config::entry_operation_key(
+            &entry.owner_manager_id,
+            &entry.project_id,
+            &entry.automation_id,
+            operation_id,
+        )?,
+        &value,
+    )?;
+    Ok(json!({
+        "technical_requester_id":AUTOMATION_TECHNICAL_REQUESTER_ID,
+        "effective_manager_id":entry.owner_manager_id,
+        "automation_id":entry.automation_id,
+        "automation_revision":entry.revision,
+        "project_id":entry.project_id,
+        "action":"script.run",
+        "semantic_cause_kind":cause_kind,
+        "semantic_cause_id":cause["id"],
+        "cause":cause
+    }))
+}
+
+/// Stable semantic request identity shared by staging and normal `script.run`
+/// admission. Observation IDs are intentionally excluded so repeated intake
+/// receipts for the same applied submission cannot request a second run.
+pub(crate) fn script_run_request_id(
+    automation_id: &str,
+    task_id: &str,
+    task_revision: i64,
+    attempt_id: &str,
+    submission_ref: &str,
+    script_id: &str,
+) -> Result<String> {
+    let identity = json!({
+        "automation_id":automation_id,
+        "task_id":task_id,
+        "task_revision":task_revision,
+        "attempt_id":attempt_id,
+        "submission_ref":submission_ref,
+        "script_id":script_id,
+        "action":"script.run"
+    });
+    Ok(model::digest(model::canonical(&identity)?.as_bytes()))
+}
+
+/// Stable semantic request identity for one exact normalized occurrence (or
+/// metadata-only observation when no typed occurrence adapter exists).
+pub(crate) fn script_run_event_request_id(
+    automation_id: &str,
+    semantic_event_id: &str,
+    script_id: &str,
+) -> Result<String> {
+    let identity = json!({
+        "automation_id":automation_id,
+        "semantic_event_id":semantic_event_id,
+        "script_id":script_id,
+        "action":"script.run"
+    });
+    Ok(model::digest(model::canonical(&identity)?.as_bytes()))
+}
+
+pub(crate) fn script_run_causes_semantically_match(left: &Value, right: &Value) -> bool {
+    if left["kind"] == "system_event" || right["kind"] == "system_event" {
+        if left["kind"] != "system_event" || right["kind"] != "system_event" {
+            return false;
+        }
+        let same_occurrence = if left["occurrence_phase"].as_str().is_some()
+            && left["occurrence_id"].as_str().is_some()
+            && right["occurrence_phase"].as_str().is_some()
+            && right["occurrence_id"].as_str().is_some()
+        {
+            left["occurrence_phase"] == right["occurrence_phase"]
+                && left["occurrence_id"] == right["occurrence_id"]
+        } else {
+            left["observation_id"] == right["observation_id"]
+                && left["source_id"] == right["source_id"]
+                && left["event_kind"] == right["event_kind"]
+        };
+        let same_scope = ["task_id", "task_revision", "attempt_id"]
+            .iter()
+            .all(|key| left[*key] == right[*key]);
+        return left["id"].as_str().is_some_and(|id| !id.is_empty())
+            && right["id"].as_str().is_some_and(|id| !id.is_empty())
+            && left["id"] == right["id"]
+            && left["script_id"] == right["script_id"]
+            && left["status"] == right["status"]
+            && left["error_code"] == right["error_code"]
+            && left["operation_id"] == right["operation_id"]
+            && same_occurrence
+            && same_scope;
+    }
+    const KEYS: &[&str] = &[
+        "kind",
+        "operation_id",
+        "id",
+        "script_id",
+        "task_id",
+        "task_revision",
+        "attempt_id",
+        "candidate_ref",
+    ];
+    left["observation_id"].as_i64().is_some_and(|id| id > 0)
+        && right["observation_id"].as_i64().is_some_and(|id| id > 0)
+        && KEYS.iter().all(|key| left[*key] == right[*key])
+}
+
+fn validate_script_run_operation_link(db: &Connection, link: &OnBehalfOperationLink) -> Result<()> {
+    let corrupt = || {
+        Error::new(
+            "AUTOMATION_LINK_CORRUPT",
+            "ScriptRun link does not match its retained request and script run",
+        )
+    };
+    let cause = &link.cause;
+    if cause["kind"] == "system_event" {
+        return validate_script_event_run_operation_link(db, link);
+    }
+    let observation_id = cause["observation_id"]
+        .as_i64()
+        .filter(|value| *value > 0)
+        .ok_or_else(corrupt)?;
+    let operation_id = cause["operation_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(corrupt)?;
+    let submission_ref = cause["id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(corrupt)?;
+    let script_id = cause["script_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(corrupt)?;
+    let script_revision = cause["script_revision"]
+        .as_i64()
+        .filter(|value| *value > 0)
+        .ok_or_else(corrupt)?;
+    let task_id = cause["task_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(corrupt)?;
+    let task_revision = cause["task_revision"]
+        .as_i64()
+        .filter(|value| *value > 0)
+        .ok_or_else(corrupt)?;
+    let attempt_id = cause["attempt_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(corrupt)?;
+    let candidate_ref = cause["candidate_ref"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(corrupt)?;
+    if cause["kind"] != "applied_submission" || link.action != "script.run" {
+        return Err(corrupt());
+    }
+    let row: Option<ScriptSubmissionRunLinkRow> = db
+        .query_row(
+            "SELECT o.caller_id,o.method,o.task_id,o.attempt_id,o.client_request_id,\
+                o.original_request_json,o.effective_request_json,r.script_id,r.revision,\
+                r.bundle_ref,r.task_id,r.task_revision,r.attempt_id \
+         FROM operations o JOIN script_runs r ON r.operation_id=o.operation_id \
+         WHERE o.operation_id=?1",
+            [&link.operation_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        caller,
+        method,
+        operation_task,
+        operation_attempt,
+        request_id,
+        original_json,
+        effective_json,
+        stored_script,
+        stored_revision,
+        bundle_ref,
+        stored_task,
+        stored_task_revision,
+        stored_attempt,
+    )) = row
+    else {
+        return Err(corrupt());
+    };
+    let original: Value = serde_json::from_str(&original_json).map_err(|_| corrupt())?;
+    let effective: Value = serde_json::from_str(&effective_json).map_err(|_| corrupt())?;
+    let input = json!({
+        "kind":"task.submission.applied",
+        "submission_ref":submission_ref,
+        "operation_id":operation_id,
+        "task_id":task_id,
+        "task_revision":task_revision,
+        "attempt_id":attempt_id,
+        "candidate_ref":candidate_ref
+    });
+    let expected_request_id = model::digest(
+        model::canonical(&json!({
+            "automation_id":link.automation_id,
+            "task_id":task_id,
+            "task_revision":task_revision,
+            "attempt_id":attempt_id,
+            "submission_ref":submission_ref,
+            "script_id":script_id,
+            "action":"script.run"
+        }))?
+        .as_bytes(),
+    );
+    let expected_linkage = json!({
+        "technical_requester_id":AUTOMATION_TECHNICAL_REQUESTER_ID,
+        "effective_manager_id":link.effective_manager_id,
+        "automation_id":link.automation_id,
+        "automation_revision":link.automation_revision,
+        "project_id":link.project_id,
+        "action":"script.run",
+        "semantic_cause_kind":"applied_submission",
+        "semantic_cause_id":submission_ref,
+        "cause":cause
+    });
+    if caller != AUTOMATION_TECHNICAL_REQUESTER_ID
+        || method != "script.run"
+        || operation_task.as_deref() != Some(task_id)
+        || operation_attempt.as_deref() != Some(attempt_id)
+        || request_id != expected_request_id
+        || original["client_request_id"] != expected_request_id
+        || original["script_id"] != script_id
+        || original["expected_script_revision"] != script_revision
+        || original["attempt_id"] != attempt_id
+        || original["expected_task_revision"] != task_revision
+        || original["input"] != input
+        || effective["automation_on_behalf"] != expected_linkage
+        || effective["script_run"]["bundle_ref"] != bundle_ref
+        || stored_script != script_id
+        || stored_revision != script_revision
+        || stored_task.as_deref() != Some(task_id)
+        || stored_task_revision != Some(task_revision)
+        || stored_attempt.as_deref() != Some(attempt_id)
+        || cause["operation_id"] != operation_id
+        || observation_id <= 0
+    {
+        return Err(corrupt());
+    }
+    let task_project: Option<String> = db
+        .query_row(
+            "SELECT project_id FROM tasks WHERE task_id=?1",
+            [task_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if task_project.as_deref() != Some(link.project_id.as_str()) {
+        return Err(corrupt());
+    }
+    Ok(())
+}
+
+fn validate_script_event_run_operation_link(
+    db: &Connection,
+    link: &OnBehalfOperationLink,
+) -> Result<()> {
+    let corrupt = || {
+        Error::new(
+            "AUTOMATION_LINK_CORRUPT",
+            "ScriptRun event link does not match its retained request and invocation",
+        )
+    };
+    let cause = &link.cause;
+    let semantic_event_id = cause["id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .ok_or_else(corrupt)?;
+    let script_id = cause["script_id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .ok_or_else(corrupt)?;
+    let script_revision = cause["script_revision"]
+        .as_i64()
+        .filter(|revision| *revision > 0)
+        .ok_or_else(corrupt)?;
+    if link.action != "script.run" {
+        return Err(corrupt());
+    }
+    let expected_request_id =
+        script_run_event_request_id(&link.automation_id, semantic_event_id, script_id)?;
+    let input = crate::store::automation_dispatch::validate_retained_script_event_cause(
+        db,
+        &link.project_id,
+        cause,
+    )
+    .map_err(|_| corrupt())?;
+    let row: Option<ScriptEventRunLinkRow> = db
+        .query_row(
+            "SELECT o.caller_id,o.method,o.task_id,o.attempt_id,o.client_request_id,\
+                o.original_request_json,o.effective_request_json,r.script_id,r.revision,\
+                r.bundle_ref,r.task_id,r.task_revision,r.attempt_id,r.spec_json \
+         FROM operations o JOIN script_runs r ON r.operation_id=o.operation_id \
+         WHERE o.operation_id=?1",
+            [&link.operation_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
+                    row.get(13)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        caller,
+        method,
+        operation_task,
+        operation_attempt,
+        request_id,
+        original_json,
+        effective_json,
+        stored_script,
+        stored_revision,
+        bundle_ref,
+        stored_task,
+        stored_task_revision,
+        stored_attempt,
+        spec_json,
+    )) = row
+    else {
+        return Err(corrupt());
+    };
+    let original: Value = serde_json::from_str(&original_json).map_err(|_| corrupt())?;
+    let effective: Value = serde_json::from_str(&effective_json).map_err(|_| corrupt())?;
+    let spec: Value = serde_json::from_str(&spec_json).map_err(|_| corrupt())?;
+    let expected_linkage = json!({
+        "technical_requester_id":AUTOMATION_TECHNICAL_REQUESTER_ID,
+        "effective_manager_id":link.effective_manager_id,
+        "automation_id":link.automation_id,
+        "automation_revision":link.automation_revision,
+        "project_id":link.project_id,
+        "action":"script.run",
+        "semantic_cause_kind":"system_event",
+        "semantic_cause_id":semantic_event_id,
+        "cause":cause
+    });
+    let task_id = cause["task_id"].as_str();
+    let task_revision = cause["task_revision"].as_i64();
+    let attempt_id = cause["attempt_id"].as_str();
+    let task_scope_valid = match (task_id, task_revision, attempt_id) {
+        (None, None, None) => true,
+        (Some(task_id), Some(task_revision), Some(attempt_id)) => {
+            !task_id.is_empty() && task_revision > 0 && !attempt_id.is_empty()
+        }
+        _ => false,
+    };
+    let expected_capabilities = if task_id.is_some() {
+        spec["capabilities"].clone()
+    } else {
+        json!([])
+    };
+    if caller != AUTOMATION_TECHNICAL_REQUESTER_ID
+        || method != "script.run"
+        || operation_task.as_deref() != task_id
+        || operation_attempt.as_deref() != attempt_id
+        || request_id != expected_request_id
+        || original["client_request_id"] != expected_request_id
+        || original["script_id"] != script_id
+        || original["expected_script_revision"] != script_revision
+        || original["attempt_id"].as_str() != attempt_id
+        || original["expected_task_revision"].as_i64() != task_revision
+        || original["input"] != input
+        || effective["automation_on_behalf"] != expected_linkage
+        || effective["script_run"]["bundle_ref"] != bundle_ref
+        || stored_script != script_id
+        || stored_revision != script_revision
+        || stored_task.as_deref() != task_id
+        || stored_task_revision != task_revision
+        || stored_attempt.as_deref() != attempt_id
+        || spec["invocation"]["operation_id"] != link.operation_id
+        || spec["invocation"]["script_id"] != script_id
+        || spec["invocation"]["script_revision"] != script_revision
+        || spec["invocation"]["task_id"].as_str() != task_id
+        || spec["invocation"]["task_revision"].as_i64() != task_revision
+        || spec["invocation"]["attempt_id"].as_str() != attempt_id
+        || spec["invocation"]["effective_manager_id"] != link.effective_manager_id
+        || spec["automation_on_behalf"] != expected_linkage
+        || spec["capabilities"] != expected_capabilities
+        || !task_scope_valid
+        || task_id.is_none() && spec["capabilities"] != json!([])
+    {
+        return Err(corrupt());
+    }
+    Ok(())
 }
 
 fn validate_cron_check_run_link(db: &Connection, link: &OnBehalfOperationLink) -> Result<()> {
@@ -2259,6 +2793,16 @@ pub(crate) fn on_behalf_visible_to(
         return Ok(false);
     };
     if !link.belongs_to(principal) {
+        if matches!(
+            &link,
+            AnyOnBehalfOperationLink::ScriptRun(script_link)
+                if script_link.cause["kind"] == "system_event"
+                    && script_link.cause["task_id"].as_str().is_none()
+        ) {
+            // Event-only invocations carry no Task from which a successor
+            // Manager could derive a delegated scope.
+            return Ok(false);
+        }
         return current_gm_on_behalf_scope_visible_to(db, principal, &link);
     }
     match link {
@@ -2271,6 +2815,29 @@ pub(crate) fn on_behalf_visible_to(
                 )
             })?;
             current_manager_has_task_scope(db, principal, task_id, &link.project_id)
+        }
+        AnyOnBehalfOperationLink::ScriptRun(link) => {
+            if link.cause["kind"] == "system_event" && link.cause["task_id"].as_str().is_none() {
+                if !link.belongs_to(principal) || principal.role != Role::Manager {
+                    return Ok(false);
+                }
+                let current_manager: Option<String> = db
+                    .query_row(
+                        "SELECT json_extract(value_json,'$.client_id') FROM meta WHERE key='gm'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                Ok(current_manager.as_deref() == Some(principal.client_id.as_str()))
+            } else {
+                let task_id = link.cause["task_id"].as_str().ok_or_else(|| {
+                    Error::new(
+                        "AUTOMATION_LINK_CORRUPT",
+                        "Task-bound ScriptRun link has no exact Task identity",
+                    )
+                })?;
+                current_manager_has_task_scope(db, principal, task_id, &link.project_id)
+            }
         }
         AnyOnBehalfOperationLink::CronCheckRun(link) => {
             let task_id = link.cause["task_id"].as_str().ok_or_else(|| {
@@ -2402,6 +2969,15 @@ fn current_gm_on_behalf_scope_visible_to(
             })?;
             current_gm_has_task_project(db, task_id, &link.project_id)
         }
+        AnyOnBehalfOperationLink::ScriptRun(link) => {
+            let task_id = link.cause["task_id"].as_str().ok_or_else(|| {
+                Error::new(
+                    "AUTOMATION_LINK_CORRUPT",
+                    "ScriptRun link has no exact Task identity",
+                )
+            })?;
+            current_gm_has_task_project(db, task_id, &link.project_id)
+        }
         AnyOnBehalfOperationLink::Acceptance(link) => {
             let task_id = link.cause["identity"]["task_id"].as_str().ok_or_else(|| {
                 Error::new(
@@ -2474,6 +3050,9 @@ pub(crate) fn any_on_behalf_operation_link(
     let is_cron = review
         .as_ref()
         .is_some_and(|link| link.action == "check.run");
+    let is_script_run = review
+        .as_ref()
+        .is_some_and(|link| link.action == "script.run");
     let mut count = 0;
     if review.is_some() {
         count += 1;
@@ -2502,6 +3081,9 @@ pub(crate) fn any_on_behalf_operation_link(
         }
         (Some(link), None, None) if link.action == "agent.goal" => {
             Ok(Some(AnyOnBehalfOperationLink::GoalProgression(link)))
+        }
+        (Some(link), None, None) if link.action == "script.run" && is_script_run => {
+            Ok(Some(AnyOnBehalfOperationLink::ScriptRun(link)))
         }
         (Some(link), None, None) => Ok(Some(AnyOnBehalfOperationLink::Review(link))),
         (None, Some(link), None) => Ok(Some(AnyOnBehalfOperationLink::WorkDispatch(link))),
@@ -3183,6 +3765,14 @@ fn current_transfer_continuation_at_phase(
             link.automation_id.as_str(),
             link.action.as_str(),
         ),
+        AnyOnBehalfOperationLink::ScriptRun(link) => (
+            link.operation_id.as_str(),
+            link.effective_manager_id.as_str(),
+            link.automation_revision,
+            link.project_id.as_str(),
+            link.automation_id.as_str(),
+            link.action.as_str(),
+        ),
         AnyOnBehalfOperationLink::WorkDispatch(link) => (
             link.operation_id.as_str(),
             link.effective_manager_id.as_str(),
@@ -3355,6 +3945,7 @@ fn current_transfer_continuation_at_phase(
         AutomationStep::CheckRun => current_entry.check_run_ready(),
         AutomationStep::GithubProjection => false,
         AutomationStep::GoalProgression => false,
+        AutomationStep::ScriptRun => false,
     };
     if !ready {
         return Err(Error::new(

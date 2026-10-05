@@ -19,6 +19,7 @@ pub(crate) enum AutomationStep {
     CheckRun,
     GithubProjection,
     GoalProgression,
+    ScriptRun,
 }
 
 impl AutomationStep {
@@ -33,6 +34,7 @@ impl AutomationStep {
             Self::CheckRun => "check_run",
             Self::GithubProjection => "github_projection",
             Self::GoalProgression => "goal_progression",
+            Self::ScriptRun => "script_run",
         }
     }
 
@@ -47,6 +49,7 @@ impl AutomationStep {
             "check_run" => Ok(Self::CheckRun),
             "github_projection" => Ok(Self::GithubProjection),
             "goal_progression" => Ok(Self::GoalProgression),
+            "script_run" => Ok(Self::ScriptRun),
             _ => Err(Error::invalid(format!("unknown automation step: {value}"))),
         }
     }
@@ -62,6 +65,7 @@ impl AutomationStep {
                 | Self::Publication
                 | Self::CheckRun
                 | Self::GoalProgression
+                | Self::ScriptRun
         )
     }
 
@@ -159,6 +163,7 @@ pub(crate) fn supported_action_for(step: AutomationStep) -> Option<&'static str>
         AutomationStep::Publication => Some("forge.publish_ref"),
         AutomationStep::CheckRun => Some("check.run"),
         AutomationStep::GoalProgression => Some("agent.goal"),
+        AutomationStep::ScriptRun => Some("script.run"),
         _ => None,
     }
 }

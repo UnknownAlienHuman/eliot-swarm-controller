@@ -601,6 +601,12 @@ fn build_plan(
             && before
                 .as_ref()
                 .is_none_or(|prior| !prior.review_dispatch_ready());
+        let new_script_run_coverage = after.script_run_ready()
+            && before.as_ref().is_none_or(|prior| {
+                !prior.script_run_ready()
+                    || prior.script_run != after.script_run
+                    || prior.event_rules != after.event_rules
+            });
         let new_publication_coverage = after.publication_ready()
             && before.as_ref().is_none_or(|prior| {
                 !prior.publication_ready() || prior.publication != after.publication
@@ -614,6 +620,7 @@ fn build_plan(
                 || added_steps
                 || new_work_dispatch_coverage
                 || new_review_dispatch_coverage
+                || new_script_run_coverage
                 || new_publication_coverage
                 || new_cron_coverage);
         if change.include_existing && !new_coverage {

@@ -4,9 +4,10 @@
 //! Store handle, Manager credential, or controller API capability. Filesystem
 //! work runs outside SQLite; the database records the immutable admitted
 //! bundle, Task/Attempt, work receipt digest and Operation lifecycle.
-use super::{Store, current_principal, gm, meta, results, tasks};
+use super::{Store, automation_dispatch, current_principal, gm, meta, results, submissions, tasks};
 use crate::{
     artifacts::{ArtifactFiles, ArtifactRecord},
+    automation::{authorization, config as automation_config},
     config::Config,
     error::{Error, Result},
     model::{self, Principal, Role},
@@ -24,9 +25,9 @@ type ScriptCompletionRow = (
     String,
     String,
     i64,
-    String,
-    i64,
-    String,
+    Option<String>,
+    Option<i64>,
+    Option<String>,
     String,
     String,
     String,
@@ -80,6 +81,14 @@ struct RunnerObservation {
     launch_departed: bool,
     has_go: bool,
 }
+
+#[derive(Debug, Clone)]
+struct ScriptRunTriggerGrant {
+    entry: automation_config::AutomationEntry,
+    cause: Value,
+}
+
+type ScriptRunScopeRow = (String, i64, Option<String>, Option<i64>, Option<String>);
 
 impl Store {
     pub(super) async fn script_call(
@@ -473,10 +482,265 @@ impl Store {
         Ok(value)
     }
 
+    pub(crate) async fn reconcile_script_triggers_once(&self, limit: usize) -> Result<Value> {
+        let intents = self
+            .run(move |db| automation_dispatch::pending_script_triggers(db, limit))
+            .await?;
+        let mut outcomes = Vec::new();
+        for intent in intents {
+            match self.admit_script_trigger(intent.clone()).await {
+                Ok(value) => {
+                    let details = value.clone();
+                    let done = intent.clone();
+                    self.run(move |db| {
+                        automation_dispatch::finish_script_trigger(
+                            db,
+                            &done,
+                            "admitted",
+                            details,
+                            model::now_ms()?,
+                        )?;
+                        Ok(())
+                    })
+                    .await?;
+                    outcomes.push(json!({"submission_ref":intent.cause["id"],"script_id":intent.script_id,"state":"admitted","operation_id":value["operation_id"]}));
+                }
+                Err(error) if permanent_script_trigger_error(&error) => {
+                    let details = json!({"code":error.code,"message":error.message});
+                    let done = intent.clone();
+                    let projection = details.clone();
+                    self.run(move |db| {
+                        automation_dispatch::finish_script_trigger(
+                            db,
+                            &done,
+                            "rejected",
+                            projection,
+                            model::now_ms()?,
+                        )?;
+                        Ok(())
+                    })
+                    .await?;
+                    outcomes.push(json!({"submission_ref":intent.cause["id"],"script_id":intent.script_id,"state":"rejected","error":details}));
+                }
+                Err(error) if blocked_script_trigger_error(&error) => {
+                    let reason = error.code.clone();
+                    let details = json!({"code":error.code,"message":error.message});
+                    let blocked = intent.clone();
+                    let projection = details.clone();
+                    self.run(move |db| {
+                        automation_dispatch::hold_script_trigger(
+                            db,
+                            &blocked,
+                            &reason,
+                            projection,
+                            model::now_ms()?,
+                        )?;
+                        Ok(())
+                    })
+                    .await?;
+                    outcomes.push(json!({"submission_ref":intent.cause["id"],"script_id":intent.script_id,"state":"blocked_pending_revalidation","error":details}));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(json!({"considered":outcomes.len(),"outcomes":outcomes}))
+    }
+
+    async fn admit_script_trigger(
+        &self,
+        intent: automation_dispatch::ScriptTriggerIntent,
+    ) -> Result<Value> {
+        let intent_for_prepare = intent.clone();
+        let app_config = self.config.clone();
+        let (principal, params, grant) = self
+            .run(move |db| {
+                let entry = automation_config::load_entry(
+                    db,
+                    &intent_for_prepare.owner_manager_id,
+                    &intent_for_prepare.project_id,
+                    &intent_for_prepare.automation_id,
+                )?
+                .ok_or_else(|| {
+                    Error::new("AUTOMATION_ACTION_CHANGED", "ScriptRun automation disappeared")
+                })?;
+                automation_config::validate_entry(&entry)?;
+                if entry.revision != intent_for_prepare.automation_revision
+                    || !entry.script_run_ready()
+                    || entry
+                        .script_run
+                        .as_ref()
+                        .is_none_or(|settings| settings.script_id != intent_for_prepare.script_id)
+                {
+                    return Err(Error::new(
+                        "AUTOMATION_ACTION_CHANGED",
+                        "current automation no longer admits the staged ScriptRun intent",
+                    ));
+                }
+                authorization::require_registered_manager(db, &entry.owner_manager_id)?;
+                let principal = Principal {
+                    link_id: "internal-script-trigger".to_owned(),
+                    client_id: entry.owner_manager_id.clone(),
+                    role: Role::Manager,
+                };
+                let current = require_script_authority(db, &principal)?;
+                let script_owner: String = db.query_row(
+                    "SELECT owner_id FROM scripts WHERE script_id=?1",
+                    [&intent_for_prepare.script_id],
+                    |row| row.get(0),
+                ).optional()?.ok_or_else(|| Error::new("NOT_FOUND", "selected script was not found"))?;
+                if script_owner != entry.owner_manager_id {
+                    return Err(Error::new(
+                        "FORBIDDEN",
+                        "only the current automation Manager who owns the script may enable its trigger",
+                    ));
+                }
+                let (active_revision, _) = script_head(db, &intent_for_prepare.script_id)?;
+                let expected_script_revision = active_revision.ok_or_else(|| {
+                    Error::new(
+                        "SCRIPT_REVISION_NOT_ACTIVE",
+                        "selected script has no active immutable revision",
+                    )
+                })?;
+                let (params, cause) = match intent_for_prepare.cause["kind"].as_str() {
+                    Some("applied_submission") => {
+                        let submission_ref =
+                            model::text(&intent_for_prepare.cause, "id")?.to_owned();
+                        let event_operation_id =
+                            model::text(&intent_for_prepare.cause, "operation_id")?.to_owned();
+                        let observation_id =
+                            model::positive(&intent_for_prepare.cause, "observation_id")?;
+                        let document = submissions::document(db, &submission_ref)?;
+                        if document["operation_id"] != event_operation_id
+                            || document["outcome"] == "failed"
+                            || document["task_id"].as_str().is_none_or(str::is_empty)
+                            || document["attempt_id"].as_str().is_none_or(str::is_empty)
+                            || document["candidate_ref"].as_str().is_none_or(str::is_empty)
+                        {
+                            return Err(Error::new(
+                                "SUBMISSION_DAMAGED",
+                                "applied submission does not identify its exact Task and Attempt",
+                            ));
+                        }
+                        let task_id = model::text(&document, "task_id")?.to_owned();
+                        let task_revision = model::positive(&document, "task_revision")?;
+                        let attempt_id = model::text(&document, "attempt_id")?.to_owned();
+                        let candidate_ref = model::text(&document, "candidate_ref")?.to_owned();
+                        let (task, attempt) = require_run_scope(
+                            db,
+                            &current,
+                            &attempt_id,
+                            task_revision,
+                        )?;
+                        if model::text(&task, "task_id")? != task_id
+                            || task["project_id"] != entry.project_id
+                            || task["revision"] != task_revision
+                            || attempt["attempt_id"] != attempt_id
+                            || attempt["submission_ref"] != submission_ref
+                            || attempt["candidate_ref"] != candidate_ref
+                        {
+                            return Err(Error::new(
+                                "STALE_ATTEMPT",
+                                "applied submission is no longer the exact current Task/Attempt",
+                            ));
+                        }
+                        let input = json!({
+                            "kind":"task.submission.applied",
+                            "submission_ref":submission_ref,
+                            "operation_id":event_operation_id,
+                            "task_id":task_id,
+                            "task_revision":task_revision,
+                            "attempt_id":attempt_id,
+                            "candidate_ref":candidate_ref
+                        });
+                        let request_id = automatic_script_request_id(
+                            &entry.automation_id,
+                            &task_id,
+                            task_revision,
+                            &attempt_id,
+                            &submission_ref,
+                            &intent_for_prepare.script_id,
+                        )?;
+                        let params = json!({
+                            "client_request_id":request_id,
+                            "script_id":intent_for_prepare.script_id,
+                            "expected_script_revision":expected_script_revision,
+                            "attempt_id":attempt_id,
+                            "expected_task_revision":task_revision,
+                            "input":input
+                        });
+                        let cause = json!({
+                            "kind":"applied_submission",
+                            "observation_id":observation_id,
+                            "operation_id":event_operation_id,
+                            "id":submission_ref,
+                            "script_id":intent_for_prepare.script_id,
+                            "script_revision":expected_script_revision,
+                            "task_id":task_id,
+                            "task_revision":task_revision,
+                            "attempt_id":attempt_id,
+                            "candidate_ref":candidate_ref
+                        });
+                        (params, cause)
+                    }
+                    Some("system_event") => {
+                        let context = automation_dispatch::script_event_invocation_context(
+                            db,
+                            &app_config,
+                            &entry,
+                            &intent_for_prepare.cause,
+                        )?;
+                        let request_id = authorization::script_run_event_request_id(
+                            &entry.automation_id,
+                            model::text(&intent_for_prepare.cause, "id")?,
+                            &intent_for_prepare.script_id,
+                        )?;
+                        let params = json!({
+                            "client_request_id":request_id,
+                            "script_id":intent_for_prepare.script_id,
+                            "expected_script_revision":expected_script_revision,
+                            "attempt_id":context.attempt_id,
+                            "expected_task_revision":context.task_revision,
+                            "input":context.input
+                        });
+                        let mut cause = intent_for_prepare.cause.clone();
+                        cause["script_id"] = json!(intent_for_prepare.script_id);
+                        cause["script_revision"] = json!(expected_script_revision);
+                        (params, cause)
+                    }
+                    _ => {
+                        return Err(Error::new(
+                            "AUTOMATION_ACTION_CHANGED",
+                            "staged ScriptRun cause is unsupported",
+                        ));
+                    }
+                };
+                Ok((principal, params, ScriptRunTriggerGrant { entry, cause }))
+            })
+            .await?;
+        self.run_script_with_trigger(principal, params, Some(grant))
+            .await
+    }
+
     async fn run_script(&self, principal: Principal, params: Value) -> Result<Value> {
+        self.run_script_with_trigger(principal, params, None).await
+    }
+
+    async fn run_script_with_trigger(
+        &self,
+        principal: Principal,
+        params: Value,
+        trigger: Option<ScriptRunTriggerGrant>,
+    ) -> Result<Value> {
         let request = protocol::RunRequest::parse(&params)?;
         validate_client_request_id(&request.client_request_id)?;
-        if let Some(value) = self.replay(&principal, "script.run", &params).await? {
+        if trigger.is_none() && request.attempt_id.is_none() {
+            return Err(Error::invalid(
+                "manual script.run requires an exact Task Attempt and revision",
+            ));
+        }
+        if trigger.is_none()
+            && let Some(value) = self.replay(&principal, "script.run", &params).await?
+        {
             return Ok(value);
         }
         let script_id = request.script_id.clone();
@@ -484,11 +748,29 @@ impl Store {
         let attempt_id = request.attempt_id.clone();
         let expected_task_revision = request.expected_task_revision;
         let principal_for_snapshot = principal.clone();
+        let trigger_for_snapshot = trigger.clone();
+        let config_for_snapshot = self.config.clone();
         let snapshot = self
             .run(move |db| {
                 let current = require_script_authority(db, &principal_for_snapshot)?;
-                let (task, attempt) =
-                    require_run_scope(db, &current, &attempt_id, expected_task_revision)?;
+                let (task, attempt) = require_optional_run_scope(
+                    db,
+                    &current,
+                    attempt_id.as_deref(),
+                    expected_task_revision,
+                )?;
+                if let Some(grant) = trigger_for_snapshot.as_ref() {
+                    validate_script_trigger_current(
+                        db,
+                        &config_for_snapshot,
+                        &current,
+                        grant,
+                        &script_id,
+                        expected_revision,
+                        task.as_ref(),
+                        attempt.as_ref(),
+                    )?;
+                }
                 let (active, _) = script_head(db, &script_id)?;
                 if active != Some(expected_revision) {
                     return Err(Error::new(
@@ -517,17 +799,25 @@ impl Store {
         let operation_id = model::new_id();
         let run_id = model::new_id();
         let token = model::new_id();
+        let invocation_effects = if task.is_some() {
+            bundle.controller_effects.clone()
+        } else {
+            Vec::new()
+        };
         let invocation = protocol::ScriptInvocation {
             protocol_version: 1,
             operation_id: operation_id.clone(),
             run_id: run_id.clone(),
             script_id: request.script_id.clone(),
             script_revision: request.expected_script_revision,
-            task_id: model::text(&task, "task_id")?.to_owned(),
+            task_id: task
+                .as_ref()
+                .map(|task| model::text(task, "task_id").map(ToOwned::to_owned))
+                .transpose()?,
             task_revision: request.expected_task_revision,
             attempt_id: request.attempt_id.clone(),
             input: request.input.clone(),
-            controller_effects: bundle.controller_effects.clone(),
+            controller_effects: invocation_effects,
         };
         let work = runner::Work {
             run_id: run_id.clone(),
@@ -553,7 +843,14 @@ impl Store {
         }
         let request_json = model::canonical(&params)?;
         let caller = principal.client_id.clone();
+        let operation_caller = if trigger.is_some() {
+            authorization::AUTOMATION_TECHNICAL_REQUESTER_ID.to_owned()
+        } else {
+            caller.clone()
+        };
+        let trigger_for_tx = trigger;
         let p = principal.clone();
+        let config_for_tx = self.config.clone();
         let request_id = request.client_request_id;
         let script_id = request.script_id;
         let requested_revision = request.expected_script_revision;
@@ -568,16 +865,65 @@ impl Store {
             .run(move |db| {
                 let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 let current = require_script_authority(&tx, &p)?;
-                if let Some(receipt) = replay_tx(&tx, &caller, "script.run", &request_id, &request_json)? {
+                if let Some(receipt) = replay_tx(&tx, &operation_caller, "script.run", &request_id, &request_json)? {
+                    if let Some(grant) = trigger_for_tx.as_ref() {
+                        let old_operation_id: String = tx.query_row(
+                            "SELECT operation_id FROM operations WHERE caller_id=?1 AND client_request_id=?2",
+                            params![operation_caller, request_id],
+                            |row| row.get(0),
+                        )?;
+                        let link = authorization::operation_link(&tx, &old_operation_id)?
+                            .ok_or_else(|| Error::new("AUTOMATION_LINK_CORRUPT", "replayed triggered ScriptRun has no on-behalf link"))?;
+                        if link.action != "script.run"
+                            || link.effective_manager_id != grant.entry.owner_manager_id
+                            || link.project_id != grant.entry.project_id
+                            || link.automation_id != grant.entry.automation_id
+                            || !authorization::script_run_causes_semantically_match(
+                                &link.cause,
+                                &grant.cause,
+                            )
+                        {
+                            return Err(Error::new("REQUEST_ID_CONFLICT", "semantic ScriptRun request is retained under another automation cause"));
+                        }
+                    }
                     tx.commit()?;
                     return Ok(receipt);
                 }
-                let (current_task, current_attempt) =
-                    require_run_scope(&tx, &current, &attempt_id, expected_task_revision)?;
-                if current_task["task_id"] != stored_task["task_id"]
-                    || current_attempt["attempt_id"] != stored_attempt["attempt_id"]
-                {
+                let (current_task, current_attempt) = require_optional_run_scope(
+                    &tx,
+                    &current,
+                    attempt_id.as_deref(),
+                    expected_task_revision,
+                )?;
+                let scope_unchanged = match (
+                    current_task.as_ref(),
+                    current_attempt.as_ref(),
+                    stored_task.as_ref(),
+                    stored_attempt.as_ref(),
+                ) {
+                    (Some(current_task), Some(current_attempt), Some(stored_task), Some(stored_attempt)) => {
+                        current_task["task_id"] == stored_task["task_id"]
+                            && current_task["revision"] == stored_task["revision"]
+                            && current_attempt["attempt_id"] == stored_attempt["attempt_id"]
+                            && current_attempt["task_revision"] == stored_attempt["task_revision"]
+                    }
+                    (None, None, None, None) => true,
+                    _ => false,
+                };
+                if !scope_unchanged {
                     return Err(Error::new("SCRIPT_SCOPE_CHANGED", "Task or Attempt changed during run preparation"));
+                }
+                if let Some(grant) = trigger_for_tx.as_ref() {
+                    validate_script_trigger_current(
+                        &tx,
+                        &config_for_tx,
+                        &current,
+                        grant,
+                        &script_id,
+                        requested_revision,
+                        current_task.as_ref(),
+                        current_attempt.as_ref(),
+                    )?;
                 }
                 let (active, _) = script_head(&tx, &script_id)?;
                 if active != Some(requested_revision) {
@@ -590,11 +936,16 @@ impl Store {
                 {
                     return Err(Error::new("SCRIPT_REVISION_CHANGED", "retained script revision changed during run preparation"));
                 }
-                if work_for_tx.invocation.task_id != current_task["task_id"]
-                    || work_for_tx.invocation.task_revision != current_task["revision"]
-                    || work_for_tx.invocation.attempt_id != current_attempt["attempt_id"]
+                if work_for_tx.invocation.task_id.as_deref()
+                    != current_task.as_ref().and_then(|task| task["task_id"].as_str())
+                    || work_for_tx.invocation.task_revision
+                        != current_task.as_ref().and_then(|task| task["revision"].as_i64())
+                    || work_for_tx.invocation.attempt_id.as_deref()
+                        != current_attempt
+                            .as_ref()
+                            .and_then(|attempt| attempt["attempt_id"].as_str())
                 {
-                    return Err(Error::new("SCRIPT_SCOPE_CHANGED", "script invocation identity differs from the current Task"));
+                    return Err(Error::new("SCRIPT_SCOPE_CHANGED", "script invocation Task/Attempt identity differs from the current scope"));
                 }
                 let now = model::now_ms()?;
                 if !work_for_tx.invocation.controller_effects.is_empty()
@@ -624,30 +975,68 @@ impl Store {
                     "script_id":script_id,
                     "revision":requested_revision,
                     "bundle_ref":current_revision.record.artifact_id,
-                    "task_id":current_task["task_id"],
-                    "task_revision":current_task["revision"],
-                    "attempt_id":current_attempt["attempt_id"],
+                    "task_id":current_task.as_ref().and_then(|task| task.get("task_id")),
+                    "task_revision":current_task.as_ref().and_then(|task| task.get("revision")),
+                    "attempt_id":current_attempt.as_ref().and_then(|attempt| attempt.get("attempt_id")),
                     "state":"queued",
                     "admission":"durable_local",
                     "controller_effects":work_for_tx.invocation.controller_effects,
                 });
+                let mut effective = json!({
+                    "script_run":{"run_id":run_id,"bundle_ref":current_revision.record.artifact_id,"work_digest":digest_for_tx,"environment_sha256":work_for_tx.environment_sha256,"controller_effects":work_for_tx.invocation.controller_effects},
+                    "receipt":{"ok":true,"value":admitted},
+                });
+                let linkage = if let Some(grant) = trigger_for_tx.as_ref() {
+                    let linkage = authorization::save_script_run_operation_link(
+                        &tx,
+                        &operation_id,
+                        &grant.entry,
+                        &grant.cause,
+                        now,
+                    )?;
+                    effective["automation_on_behalf"] = linkage.clone();
+                    Some(linkage)
+                } else {
+                    None
+                };
                 tx.execute(
                     "INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,effective_request_json,task_id,attempt_id,state,result_json,due_at_ms,settled_at_ms,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,'script.run',?4,?5,?6,?7,'queued',?8,?9,NULL,?9,?9)",
                     params![
                         operation_id,
-                        current.client_id,
+                        operation_caller,
                         request_id,
                         request_json,
-                        model::canonical(&json!({
-                            "script_run":{"run_id":run_id,"bundle_ref":current_revision.record.artifact_id,"work_digest":digest_for_tx,"environment_sha256":work_for_tx.environment_sha256,"controller_effects":work_for_tx.invocation.controller_effects},
-                            "receipt":{"ok":true,"value":admitted},
-                        }))?,
-                        current_task["task_id"].as_str(),
-                        current_attempt["attempt_id"].as_str(),
+                        model::canonical(&effective)?,
+                        current_task
+                            .as_ref()
+                            .and_then(|task| task["task_id"].as_str()),
+                        current_attempt
+                            .as_ref()
+                            .and_then(|attempt| attempt["attempt_id"].as_str()),
                         model::canonical(&admitted)?,
                         now,
                     ],
                 )?;
+                let mut run_spec = json!({
+                    "environment_sha256":work_for_tx.environment_sha256,
+                    "input_sha256":model::digest(model::canonical(&work_for_tx.invocation.input)?.as_bytes()),
+                    "capabilities":work_for_tx.invocation.controller_effects,
+                    "invocation":{
+                        "operation_id":operation_id,
+                        "run_id":run_id,
+                        "script_id":script_id,
+                        "script_revision":requested_revision,
+                        "task_id":current_task.as_ref().and_then(|task| task.get("task_id")),
+                        "task_revision":current_task.as_ref().and_then(|task| task.get("revision")),
+                        "attempt_id":current_attempt.as_ref().and_then(|attempt| attempt.get("attempt_id")),
+                        "effective_manager_id":current.client_id,
+                        "cause":{"kind":"script.run","operation_id":operation_id,"run_id":run_id},
+                    },
+                    "trust":"trusted_local",
+                });
+                if let Some(linkage) = linkage {
+                    run_spec["automation_on_behalf"] = linkage;
+                }
                 tx.execute(
                     "INSERT INTO script_runs(run_id,operation_id,script_id,revision,bundle_ref,task_id,task_revision,attempt_id,work_digest,spec_json,state,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'queued',?11)",
                     params![
@@ -656,27 +1045,17 @@ impl Store {
                         script_id,
                         requested_revision,
                         current_revision.record.artifact_id,
-                        current_task["task_id"].as_str(),
-                        current_task["revision"].as_i64(),
-                        current_attempt["attempt_id"].as_str(),
+                        current_task
+                            .as_ref()
+                            .and_then(|task| task["task_id"].as_str()),
+                        current_task
+                            .as_ref()
+                            .and_then(|task| task["revision"].as_i64()),
+                        current_attempt
+                            .as_ref()
+                            .and_then(|attempt| attempt["attempt_id"].as_str()),
                         digest_for_tx,
-                        model::canonical(&json!({
-                            "environment_sha256":work_for_tx.environment_sha256,
-                            "input_sha256":model::digest(model::canonical(&work_for_tx.invocation.input)?.as_bytes()),
-                            "capabilities":work_for_tx.invocation.controller_effects,
-                            "invocation":{
-                                "operation_id":operation_id,
-                                "run_id":run_id,
-                                "script_id":script_id,
-                                "script_revision":requested_revision,
-                                "task_id":current_task["task_id"],
-                                "task_revision":current_task["revision"],
-                                "attempt_id":current_attempt["attempt_id"],
-                                "effective_manager_id":current.client_id,
-                                "cause":{"kind":"script.run","operation_id":operation_id,"run_id":run_id},
-                            },
-                            "trust":"trusted_local",
-                        }))?,
+                        model::canonical(&run_spec)?,
                         now,
                     ],
                 )?;
@@ -873,7 +1252,10 @@ impl Store {
                     let id = pending.run_id.clone();
                     let operation_id = pending.operation_id.clone();
                     let start_work = work.clone();
-                    let started = self.run(move |db| begin_run(db, &id, &operation_id)).await;
+                    let config = self.config.clone();
+                    let started = self
+                        .run(move |db| begin_run(db, &id, &operation_id, &config))
+                        .await;
                     match started {
                         Ok(true) => {
                             let spawn_work = start_work.clone();
@@ -896,8 +1278,9 @@ impl Store {
                 "sending" => {
                     if let Some(identity) = observed.ready {
                         let id = pending.run_id.clone();
+                        let config = self.config.clone();
                         let accepted = self
-                            .run(move |db| acknowledge_worker(db, &id, &identity))
+                            .run(move |db| acknowledge_worker(db, &id, &identity, &config))
                             .await;
                         match accepted {
                             Ok(true) => {
@@ -1050,6 +1433,183 @@ fn validate_client_request_id(id: &str) -> Result<()> {
     {
         return Err(Error::invalid(
             "client_request_id must be 1..=128 bytes without whitespace",
+        ));
+    }
+    Ok(())
+}
+
+fn automatic_script_request_id(
+    automation_id: &str,
+    task_id: &str,
+    task_revision: i64,
+    attempt_id: &str,
+    submission_ref: &str,
+    script_id: &str,
+) -> Result<String> {
+    authorization::script_run_request_id(
+        automation_id,
+        task_id,
+        task_revision,
+        attempt_id,
+        submission_ref,
+        script_id,
+    )
+}
+
+fn permanent_script_trigger_error(error: &Error) -> bool {
+    matches!(
+        error.code.as_str(),
+        "SCRIPT_SCHEMA_MISMATCH" | "INVALID_PARAMS"
+    ) || error.code.starts_with("SCRIPT_BUNDLE")
+        || error.code.starts_with("SCRIPT_INPUT")
+}
+
+fn blocked_script_trigger_error(error: &Error) -> bool {
+    matches!(
+        error.code.as_str(),
+        "AUTOMATION_ACTION_CHANGED"
+            | "FORBIDDEN"
+            | "UNAUTHORIZED"
+            | "NOT_FOUND"
+            | "SCRIPT_EVENT_SOURCE_UNAUTHORIZED"
+            | "SCRIPT_EVENT_SOURCE_REVOKED"
+            | "SCRIPT_REVISION_NOT_ACTIVE"
+            | "SCRIPT_REVISION_CHANGED"
+            | "STALE_ATTEMPT"
+            | "ATTEMPT_SCOPE_STALE"
+            | "SCRIPT_SCOPE_CHANGED"
+            | "SUBMISSION_DAMAGED"
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_script_trigger_current(
+    db: &Connection,
+    app_config: &Config,
+    principal: &Principal,
+    grant: &ScriptRunTriggerGrant,
+    script_id: &str,
+    script_revision: i64,
+    task: Option<&Value>,
+    attempt: Option<&Value>,
+) -> Result<()> {
+    let entry = automation_config::load_entry(
+        db,
+        &grant.entry.owner_manager_id,
+        &grant.entry.project_id,
+        &grant.entry.automation_id,
+    )?
+    .ok_or_else(|| {
+        Error::new(
+            "AUTOMATION_ACTION_CHANGED",
+            "ScriptRun automation disappeared",
+        )
+    })?;
+    if principal.role != Role::Manager
+        || principal.client_id != entry.owner_manager_id
+        || entry.revision != grant.entry.revision
+        || !entry.script_run_ready()
+        || entry
+            .script_run
+            .as_ref()
+            .is_none_or(|settings| settings.script_id != script_id)
+        || grant.cause["script_id"] != script_id
+        || grant.cause["script_revision"] != script_revision
+    {
+        return Err(Error::new(
+            "AUTOMATION_ACTION_CHANGED",
+            "current Manager or ScriptRun selection no longer matches the exact trigger",
+        ));
+    }
+    match grant.cause["kind"].as_str() {
+        Some("applied_submission") => {
+            let (Some(task), Some(attempt)) = (task, attempt) else {
+                return Err(Error::new(
+                    "SCRIPT_SCOPE_CHANGED",
+                    "applied submission requires its exact Task and Attempt",
+                ));
+            };
+            if grant.cause["task_id"] != task["task_id"]
+                || grant.cause["task_revision"] != task["revision"]
+                || grant.cause["attempt_id"] != attempt["attempt_id"]
+                || grant.cause["candidate_ref"] != attempt["candidate_ref"]
+                || task["project_id"] != entry.project_id
+                || attempt["submission_ref"] != grant.cause["id"]
+                || attempt["task_revision"] != grant.cause["task_revision"]
+            {
+                return Err(Error::new(
+                    "SCRIPT_SCOPE_CHANGED",
+                    "current Task/Attempt no longer matches the exact submission trigger",
+                ));
+            }
+            let submission_ref = model::text(&grant.cause, "id")?;
+            let document = submissions::document(db, submission_ref)?;
+            if document["operation_id"] != grant.cause["operation_id"]
+                || document["task_id"] != task["task_id"]
+                || document["task_revision"] != task["revision"]
+                || document["attempt_id"] != attempt["attempt_id"]
+                || document["candidate_ref"] != attempt["candidate_ref"]
+            {
+                return Err(Error::new(
+                    "SUBMISSION_DAMAGED",
+                    "retained applied submission no longer matches its exact Task and Attempt",
+                ));
+            }
+        }
+        Some("system_event") => {
+            let source_id = model::text(&grant.cause, "source_id")?;
+            let event_kind = model::text(&grant.cause, "event_kind")?;
+            let status = crate::automation::event_rules::EventStatus::parse_optional(
+                grant.cause["status"].as_str(),
+            )?;
+            if !entry.accepts_script_run_event(source_id, event_kind, status) {
+                return Err(Error::new(
+                    "AUTOMATION_ACTION_CHANGED",
+                    "current manager event selector no longer admits this occurrence",
+                ));
+            }
+            let context = automation_dispatch::script_event_invocation_context(
+                db,
+                app_config,
+                &entry,
+                &grant.cause,
+            )?;
+            if context.task_id.as_deref() != task.and_then(|value| value["task_id"].as_str())
+                || context.task_revision != task.and_then(|value| value["revision"].as_i64())
+                || context.attempt_id.as_deref()
+                    != attempt.and_then(|value| value["attempt_id"].as_str())
+            {
+                return Err(Error::new(
+                    "SCRIPT_SCOPE_CHANGED",
+                    "event Task/Attempt scope changed during ScriptRun admission",
+                ));
+            }
+        }
+        _ => {
+            return Err(Error::new(
+                "AUTOMATION_ACTION_CHANGED",
+                "ScriptRun cause is unsupported",
+            ));
+        }
+    }
+    let script_owner: Option<String> = db
+        .query_row(
+            "SELECT owner_id FROM scripts WHERE script_id=?1",
+            [script_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if script_owner.as_deref() != Some(entry.owner_manager_id.as_str()) {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "only the current automation Manager who owns this script may admit its trigger",
+        ));
+    }
+    let (active_revision, _) = script_head(db, script_id)?;
+    if active_revision != Some(script_revision) {
+        return Err(Error::new(
+            "SCRIPT_REVISION_NOT_ACTIVE",
+            "the exact script revision is no longer active",
         ));
     }
     Ok(())
@@ -1263,7 +1823,7 @@ fn artifact_controller_effects(metadata: &Value) -> Result<Vec<manifest::ScriptC
     })
 }
 
-fn require_run_scope(
+pub(super) fn require_run_scope(
     db: &Connection,
     principal: &Principal,
     attempt_id: &str,
@@ -1290,6 +1850,27 @@ fn require_run_scope(
     }
     gm::require_attempt_control(db, &current, &attempt)?;
     Ok((task, attempt))
+}
+
+fn require_optional_run_scope(
+    db: &Connection,
+    principal: &Principal,
+    attempt_id: Option<&str>,
+    expected_task_revision: Option<i64>,
+) -> Result<(Option<Value>, Option<Value>)> {
+    match (attempt_id, expected_task_revision) {
+        (Some(attempt_id), Some(task_revision)) => {
+            let (task, attempt) = require_run_scope(db, principal, attempt_id, task_revision)?;
+            Ok((Some(task), Some(attempt)))
+        }
+        (None, None) => {
+            require_script_authority(db, principal)?;
+            Ok((None, None))
+        }
+        _ => Err(Error::invalid(
+            "script Task scope must provide both an Attempt ID and Task revision",
+        )),
+    }
 }
 
 fn pending_runs(db: &Connection) -> Result<Vec<PendingRun>> {
@@ -1338,7 +1919,12 @@ fn observe(work: &runner::Work, files: &ArtifactFiles) -> Result<RunnerObservati
     })
 }
 
-fn begin_run(db: &mut Connection, run_id: &str, operation_id: &str) -> Result<bool> {
+fn begin_run(
+    db: &mut Connection,
+    run_id: &str,
+    operation_id: &str,
+    app_config: &Config,
+) -> Result<bool> {
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let state: Option<(String, String)> = tx
         .query_row(
@@ -1359,8 +1945,8 @@ fn begin_run(db: &mut Connection, run_id: &str, operation_id: &str) -> Result<bo
         [operation_id],
         |row| row.get(0),
     )?;
-    let actor = registered_actor(&tx, &caller)?;
-    let script_scope: Option<(String, i64, String, i64, String)> = tx
+    let actor = actor_for_script_operation(&tx, &caller, operation_id)?;
+    let script_scope: Option<ScriptRunScopeRow> = tx
         .query_row(
             "SELECT r.script_id,r.revision,r.task_id,r.task_revision,o.attempt_id FROM script_runs r JOIN operations o ON o.operation_id=r.operation_id WHERE r.run_id=?1",
             [run_id],
@@ -1371,15 +1957,35 @@ fn begin_run(db: &mut Connection, run_id: &str, operation_id: &str) -> Result<bo
         script_scope.ok_or_else(|| Error::new("NOT_FOUND", "script run is not registered"))?;
     let preflight = (|| -> Result<()> {
         require_script_authority(&tx, &actor)?;
-        let (task, attempt) = require_run_scope(&tx, &actor, &attempt_id, task_revision)?;
-        if task["task_id"] != task_id
-            || task["revision"] != task_revision
-            || attempt["attempt_id"] != attempt_id
-        {
+        let (task, attempt) =
+            require_optional_run_scope(&tx, &actor, attempt_id.as_deref(), task_revision)?;
+        let scope_matches = match (task.as_ref(), attempt.as_ref()) {
+            (Some(task), Some(attempt)) => {
+                task_id.as_deref() == task["task_id"].as_str()
+                    && task_revision == task["revision"].as_i64()
+                    && attempt_id.as_deref() == attempt["attempt_id"].as_str()
+            }
+            (None, None) => task_id.is_none() && task_revision.is_none() && attempt_id.is_none(),
+            _ => false,
+        };
+        if !scope_matches {
             return Err(Error::new(
                 "SCRIPT_SCOPE_CHANGED",
                 "queued script Task/Attempt scope changed",
             ));
+        }
+        if caller == authorization::AUTOMATION_TECHNICAL_REQUESTER_ID {
+            require_script_trigger_start(
+                &tx,
+                operation_id,
+                &actor,
+                &script_id,
+                revision,
+                task_id.as_deref(),
+                task_revision,
+                attempt_id.as_deref(),
+                app_config,
+            )?;
         }
         let (active, _) = script_head(&tx, &script_id)?;
         if active != Some(revision) {
@@ -1423,7 +2029,111 @@ fn registered_actor(db: &Connection, caller: &str) -> Result<Principal> {
     })
 }
 
-fn acknowledge_worker(db: &mut Connection, run_id: &str, identity: &Value) -> Result<bool> {
+fn actor_for_script_operation(
+    db: &Connection,
+    caller: &str,
+    operation_id: &str,
+) -> Result<Principal> {
+    if caller != authorization::AUTOMATION_TECHNICAL_REQUESTER_ID {
+        return registered_actor(db, caller);
+    }
+    let link = authorization::operation_link(db, operation_id)?.ok_or_else(|| {
+        Error::new(
+            "AUTOMATION_LINK_CORRUPT",
+            "automatic script Operation has no validated Manager attribution",
+        )
+    })?;
+    if link.action != "script.run" {
+        return Err(Error::new(
+            "AUTOMATION_LINK_CORRUPT",
+            "automatic script Operation has another action's attribution",
+        ));
+    }
+    authorization::require_registered_manager(db, &link.effective_manager_id)?;
+    Ok(Principal {
+        link_id: "internal-script-trigger-operation".to_owned(),
+        client_id: link.effective_manager_id,
+        role: Role::Manager,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn require_script_trigger_start(
+    db: &Connection,
+    operation_id: &str,
+    principal: &Principal,
+    script_id: &str,
+    script_revision: i64,
+    task_id: Option<&str>,
+    task_revision: Option<i64>,
+    attempt_id: Option<&str>,
+    app_config: &Config,
+) -> Result<()> {
+    let link = authorization::operation_link(db, operation_id)?.ok_or_else(|| {
+        Error::new(
+            "AUTOMATION_LINK_CORRUPT",
+            "queued ScriptRun has no validated trigger attribution",
+        )
+    })?;
+    if link.action != "script.run" || link.effective_manager_id != principal.client_id {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "queued ScriptRun attribution does not belong to its effective Manager",
+        ));
+    }
+    let entry = automation_config::load_entry(
+        db,
+        &link.effective_manager_id,
+        &link.project_id,
+        &link.automation_id,
+    )?
+    .ok_or_else(|| {
+        Error::new(
+            "AUTOMATION_ACTION_CHANGED",
+            "ScriptRun automation disappeared",
+        )
+    })?;
+    if entry.revision != link.automation_revision
+        || !entry.script_run_ready()
+        || entry
+            .script_run
+            .as_ref()
+            .is_none_or(|settings| settings.script_id != script_id)
+        || link.cause["script_id"] != script_id
+        || link.cause["script_revision"] != script_revision
+        || link.cause["task_id"].as_str() != task_id
+        || link.cause["task_revision"].as_i64() != task_revision
+        || link.cause["attempt_id"].as_str() != attempt_id
+    {
+        return Err(Error::new(
+            "AUTOMATION_ACTION_CHANGED",
+            "Manager disabled or changed this unstarted ScriptRun trigger",
+        ));
+    }
+    let current = require_script_authority(db, principal)?;
+    let (task, attempt) = require_optional_run_scope(db, &current, attempt_id, task_revision)?;
+    validate_script_trigger_current(
+        db,
+        app_config,
+        &current,
+        &ScriptRunTriggerGrant {
+            entry,
+            cause: link.cause,
+        },
+        script_id,
+        script_revision,
+        task.as_ref(),
+        attempt.as_ref(),
+    )?;
+    Ok(())
+}
+
+fn acknowledge_worker(
+    db: &mut Connection,
+    run_id: &str,
+    identity: &Value,
+    app_config: &Config,
+) -> Result<bool> {
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let row: Option<(String, String, Option<String>, String)> = tx
         .query_row(
@@ -1459,24 +2169,47 @@ fn acknowledge_worker(db: &mut Connection, run_id: &str, identity: &Value) -> Re
         tx.commit()?;
         return Ok(true);
     }
-    let actor = registered_actor(&tx, &caller)?;
-    let scope: (String, i64, String) = tx.query_row(
+    let actor = actor_for_script_operation(&tx, &caller, &operation_id)?;
+    let scope: (Option<String>, Option<i64>, Option<String>) = tx.query_row(
         "SELECT task_id,task_revision,attempt_id FROM script_runs WHERE run_id=?1",
         [run_id],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
     let current = require_script_authority(&tx, &actor)?;
-    require_run_scope(&tx, &current, &scope.2, scope.1)?;
-    let task_id: String = tx.query_row(
-        "SELECT task_id FROM script_runs WHERE run_id=?1",
-        [run_id],
-        |row| row.get(0),
-    )?;
-    if task_id != scope.0 {
+    let (task, attempt) = require_optional_run_scope(&tx, &current, scope.2.as_deref(), scope.1)?;
+    if task.as_ref().and_then(|task| task["task_id"].as_str()) != scope.0.as_deref()
+        || task.as_ref().and_then(|task| task["revision"].as_i64()) != scope.1
+        || attempt
+            .as_ref()
+            .and_then(|attempt| attempt["attempt_id"].as_str())
+            != scope.2.as_deref()
+    {
         return Err(Error::new(
             "SCRIPT_SCOPE_CHANGED",
-            "script Task changed before the start gate",
+            "script Task/Attempt changed before the start gate",
         ));
+    }
+    if caller == authorization::AUTOMATION_TECHNICAL_REQUESTER_ID {
+        let script_scope: (String, i64) = tx.query_row(
+            "SELECT script_id,revision FROM script_runs WHERE run_id=?1",
+            [run_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if let Err(error) = require_script_trigger_start(
+            &tx,
+            &operation_id,
+            &actor,
+            &script_scope.0,
+            script_scope.1,
+            scope.0.as_deref(),
+            scope.1,
+            scope.2.as_deref(),
+            app_config,
+        ) {
+            fail_before_start_tx(&tx, run_id, &error.code, model::now_ms()?)?;
+            tx.commit()?;
+            return Ok(false);
+        }
     }
     let now = model::now_ms()?;
     tx.execute(
@@ -1681,9 +2414,23 @@ fn finish(
     else {
         return Err(Error::new("NOT_FOUND", "script run is not registered"));
     };
+    let has_task_scope = match (&task_id, task_revision, &attempt_id) {
+        (Some(task_id), Some(task_revision), Some(attempt_id))
+            if !task_id.is_empty() && task_revision > 0 && !attempt_id.is_empty() =>
+        {
+            true
+        }
+        (None, None, None) => false,
+        _ => {
+            return Err(Error::new(
+                "SCRIPT_RUN_DAMAGED",
+                "script run Task/Attempt scope is partially populated",
+            ));
+        }
+    };
     if operation_method != "script.run"
-        || operation_task_id.as_deref() != Some(task_id.as_str())
-        || operation_attempt_id.as_deref() != Some(attempt_id.as_str())
+        || operation_task_id != task_id
+        || operation_attempt_id != attempt_id
     {
         return Err(Error::new(
             "SCRIPT_RUN_DAMAGED",
@@ -1760,10 +2507,15 @@ fn finish(
             "retained script invocation grant is invalid",
         )
     })?;
-    if artifact_controller_effects(&work_record.metadata)? != declared_effects {
+    let expected_effects = if has_task_scope {
+        artifact_controller_effects(&work_record.metadata)?
+    } else {
+        Vec::new()
+    };
+    if expected_effects != declared_effects {
         return Err(Error::new(
             "SCRIPT_RUN_DAMAGED",
-            "invocation grant differs from its immutable script revision",
+            "invocation effect grant differs from its immutable revision or Task scope",
         ));
     }
     if completion.controller_effects.len() > manifest::MAX_CONTROLLER_EFFECTS
@@ -1783,10 +2535,9 @@ fn finish(
             || spec["invocation"]["run_id"] != run_id
             || spec["invocation"]["script_id"] != script_id
             || spec["invocation"]["script_revision"] != revision
-            || spec["invocation"]["task_id"] != task_id
-            || spec["invocation"]["task_revision"] != task_revision
-            || spec["invocation"]["attempt_id"] != attempt_id
-            || spec["invocation"]["effective_manager_id"] != caller_id
+            || spec["invocation"]["task_id"].as_str() != task_id.as_deref()
+            || spec["invocation"]["task_revision"].as_i64() != task_revision
+            || spec["invocation"]["attempt_id"].as_str() != attempt_id.as_deref()
             || spec["invocation"]["cause"]
                 != json!({"kind":"script.run","operation_id":operation_id,"run_id":run_id}))
     {
@@ -1795,15 +2546,32 @@ fn finish(
             "effect invocation does not match its exact retained Manager/cause scope",
         ));
     }
+    if !completion.controller_effects.is_empty() {
+        let actor = actor_for_script_operation(&tx, &caller_id, &operation_id)?;
+        if spec["invocation"]["effective_manager_id"] != actor.client_id {
+            return Err(Error::new(
+                "SCRIPT_COMPLETION_DAMAGED",
+                "effect invocation Manager differs from the retained effective Manager",
+            ));
+        }
+    }
     let artifacts = [&completion.result, &completion.stdout, &completion.stderr];
     for artifact in artifacts {
         register_output_artifact(&tx, artifact, now)?;
     }
-    let controller_effects = if completion.state == "completed" {
+    let controller_effects = if completion.state == "completed" && has_task_scope {
         completion
             .controller_effects
             .iter()
             .map(|effect| {
+                let (Some(task_id), Some(task_revision), Some(attempt_id)) =
+                    (task_id.as_deref(), task_revision, attempt_id.as_deref())
+                else {
+                    return Err(Error::new(
+                        "SCRIPT_COMPLETION_DAMAGED",
+                        "Task-owner effect has no exact Task/Attempt scope",
+                    ));
+                };
                 apply_controller_effect(
                     &tx,
                     &caller_id,
@@ -1811,9 +2579,9 @@ fn finish(
                     run_id,
                     &script_id,
                     revision,
-                    &task_id,
+                    task_id,
                     task_revision,
-                    &attempt_id,
+                    attempt_id,
                     effect,
                     config,
                     now,
@@ -1882,7 +2650,7 @@ fn apply_controller_effect(
     match effect.effect {
         manifest::ScriptControllerEffect::TaskOwnerMessage => {}
     }
-    let actor = match registered_actor(tx, caller_id).and_then(|actor| {
+    let actor = match actor_for_script_operation(tx, caller_id, operation_id).and_then(|actor| {
         if actor.role != Role::Manager {
             return Err(Error::new(
                 "FORBIDDEN",
@@ -1905,7 +2673,7 @@ fn apply_controller_effect(
             [script_id],
             |row| row.get(0),
         )?;
-        if owner_id != caller_id {
+        if owner_id != current.client_id {
             return Err(Error::new(
                 "FORBIDDEN",
                 "only the Manager who owns this script revision may use its effect grant",

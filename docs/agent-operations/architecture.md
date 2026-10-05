@@ -1,6 +1,6 @@
 # Agent Operations — Rust Architecture and Execution Contracts
 
-Revision 6 · 2026-10-04 · source baseline `e060c2118a9fb2aa1731d85e0a70cca16a80a0a3`.
+Revision 7 · 2026-10-04 · source baseline `3741c1614f0afaa9cbae89cf75693063502f5f25`.
 
 [Configuration](configuration.md) owns editable settings; [Delivery](delivery.md) owns work transitions; [Donor map](donor-map.md) separates source evidence from proposals. These contracts are not implementation claims.
 

@@ -1,7 +1,7 @@
 //! Exact accepted-candidate publication through the configured native Git client.
 //! Admission is durable before a worker can run. Reconciliation only reads the
 //! exact remote ref; it never replays a push whose outcome is unknown.
-use super::{current_principal, gm, meta, operations, results, submissions, tasks};
+use super::{current_principal, gm, meta, operations, results, set_meta, submissions, tasks};
 use crate::{
     artifacts::ArtifactRecord,
     automation::{authorization::TransferContinuation, publication::PublicationContext},
@@ -16,23 +16,78 @@ use crate::{
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::{Value, json};
 use std::{
+    collections::HashMap,
     path::Path,
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, OnceLock, Weak},
 };
 
-static FORGE_WRITE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-static FORGE_PROCESS_SLOT: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+/// Physical ownership follows the durable publication resource, rather than
+/// the project or local remote alias.  `canonical_repository` is normalized
+/// when the intent is admitted and `target_ref` is retained verbatim.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ForgeTargetKey {
+    canonical_repository: String,
+    target_ref: String,
+}
 
-fn process_slot() -> Arc<tokio::sync::Semaphore> {
-    FORGE_PROCESS_SLOT
-        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
-        .clone()
+impl ForgeTargetKey {
+    fn from_intent(intent: &PublicationIntent) -> Result<Self> {
+        Ok(Self {
+            canonical_repository: crate::forge::canonical_repository(&intent.canonical_repository)?,
+            target_ref: intent.target_ref.clone(),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct ForgeTargetLane {
+    /// Held for the full durable begin -> native work -> finish sequence.
+    /// `OwnedMutexGuard` keeps same-target operations serialized even while
+    /// their short Store transactions yield to the runtime.
+    serial: Arc<tokio::sync::Mutex<()>>,
+    /// Captured by each blocking closure.  If its supervisor future is
+    /// dropped while the closure is draining, this permit remains held until
+    /// the closure exits, so the next same-target operation cannot read back
+    /// or start a second effect prematurely.
+    process: Arc<tokio::sync::Semaphore>,
+}
+
+struct ForgeTargetCoordinator {
+    lanes: Mutex<HashMap<ForgeTargetKey, Weak<ForgeTargetLane>>>,
+}
+
+static FORGE_TARGET_COORDINATOR: OnceLock<ForgeTargetCoordinator> = OnceLock::new();
+
+fn target_lane(key: &ForgeTargetKey) -> Arc<ForgeTargetLane> {
+    let coordinator = FORGE_TARGET_COORDINATOR.get_or_init(|| ForgeTargetCoordinator {
+        lanes: Mutex::new(HashMap::new()),
+    });
+    let mut lanes = coordinator
+        .lanes
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    lanes.retain(|_, lane| lane.strong_count() != 0);
+    if let Some(lane) = lanes.get(key).and_then(Weak::upgrade) {
+        return lane;
+    }
+    let lane = Arc::new(ForgeTargetLane {
+        serial: Arc::new(tokio::sync::Mutex::new(())),
+        process: Arc::new(tokio::sync::Semaphore::new(1)),
+    });
+    lanes.insert(key.clone(), Arc::downgrade(&lane));
+    lane
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkMode {
     PushOnce,
     ReadbackOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForgePass {
+    Reconcile,
+    Dispatch,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +105,7 @@ enum DispatchAuthorization {
 #[derive(Debug, Clone)]
 struct ForgeWork {
     intent: PublicationIntent,
+    lane: Arc<ForgeTargetLane>,
     project: ForgeProject,
     candidate: Option<ArtifactRecord>,
     mode: WorkMode,
@@ -872,8 +928,11 @@ fn work_from_saved(
     } else {
         None
     };
+    let target = ForgeTargetKey::from_intent(&intent)?;
+    let lane = target_lane(&target);
     Ok(ForgeWork {
         intent,
+        lane,
         project,
         candidate,
         mode,
@@ -2284,24 +2343,423 @@ mod tests {
         drop(db);
         std::fs::remove_dir_all(directory).unwrap();
     }
+
+    fn seed_fairness_operation(
+        db: &Connection,
+        operation_id: &str,
+        state: &str,
+        created_at_ms: i64,
+        target: Option<(&str, &str)>,
+    ) {
+        let effective = if let Some((repository, target_ref)) = target {
+            let saved = PublicationIntent {
+                operation_id: operation_id.to_owned(),
+                canonical_repository: repository.to_owned(),
+                target_ref: target_ref.to_owned(),
+                ..intent()
+            };
+            json!({"publication_intent":saved})
+        } else {
+            // Valid JSON with an invalid retained intent exercises the real
+            // selector's unroutable-row path without corrupting the Store.
+            json!({"publication_intent":{"operation_id":operation_id}})
+        };
+        db.execute(
+            "INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,effective_request_json,state,due_at_ms,created_at_ms,updated_at_ms) VALUES(?1,'operator',?2,'forge.publish_ref','{}',?3,?4,0,?5,?5)",
+            params![
+                operation_id,
+                format!("request-{operation_id}"),
+                model::canonical(&effective).unwrap(),
+                state,
+                created_at_ms,
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn real_pending_selection_rotates_held_targets_and_persists_each_phase_cursor() {
+        let directory =
+            std::env::temp_dir().join(format!("swarm-forge-fairness-{}", model::new_id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let database_path = directory.join("store.sqlite");
+        let mut db = Connection::open(&database_path).unwrap();
+        db.execute_batch(super::super::SCHEMA).unwrap();
+
+        seed_fairness_operation(
+            &db,
+            "held-a-oldest",
+            "outcome_unknown",
+            1,
+            Some(("github.com/owner/a", "refs/heads/main")),
+        );
+        seed_fairness_operation(
+            &db,
+            "held-a-next",
+            "outcome_unknown",
+            2,
+            Some(("github.com/owner/a", "refs/heads/main")),
+        );
+        seed_fairness_operation(
+            &db,
+            "later-b",
+            "outcome_unknown",
+            3,
+            Some(("github.com/owner/b", "refs/heads/main")),
+        );
+        seed_fairness_operation(
+            &db,
+            "queued-a",
+            "queued",
+            1,
+            Some(("github.com/owner/a", "refs/heads/main")),
+        );
+        seed_fairness_operation(
+            &db,
+            "queued-b",
+            "queued",
+            2,
+            Some(("github.com/owner/b", "refs/heads/main")),
+        );
+
+        let first_reconciliation = pending(&mut db, 1).unwrap();
+        assert_eq!(first_reconciliation.len(), 1);
+        assert_eq!(first_reconciliation[0].id, "held-a-oldest");
+        assert_eq!(
+            first_reconciliation[0].target.as_ref().unwrap().target_ref,
+            "refs/heads/main"
+        );
+        assert_eq!(
+            db.query_row::<String, _, _>(
+                "SELECT state FROM operations WHERE operation_id='held-a-oldest'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap(),
+            "outcome_unknown"
+        );
+
+        // The queue/reconcile cursors are independent. A first queue page
+        // starts at its own head even though reconciliation has advanced.
+        let first_dispatch = queued_pending(&mut db, 1).unwrap();
+        assert_eq!(first_dispatch[0].id, "queued-a");
+        drop(db);
+
+        // Reopening the actual Store database proves the cursor is durable.
+        let mut db = Connection::open(&database_path).unwrap();
+        let second_reconciliation = pending(&mut db, 1).unwrap();
+        assert_eq!(second_reconciliation[0].id, "later-b");
+        let second_dispatch = queued_pending(&mut db, 1).unwrap();
+        assert_eq!(second_dispatch[0].id, "queued-b");
+
+        // Once the rotation reaches the end it wraps. The held row remains
+        // unknown and retains the same target lane; the newer same-target row
+        // is not selected ahead of it.
+        let wrapped_reconciliation = pending(&mut db, 1).unwrap();
+        assert_eq!(wrapped_reconciliation[0].id, "held-a-oldest");
+        assert_eq!(
+            db.query_row::<String, _, _>(
+                "SELECT state FROM operations WHERE operation_id='held-a-oldest'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap(),
+            "outcome_unknown"
+        );
+        drop(db);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn malformed_intent_keeps_its_error_and_does_not_poison_the_next_page() {
+        let mut db = Connection::open_in_memory().unwrap();
+        db.execute_batch(super::super::SCHEMA).unwrap();
+        seed_fairness_operation(&db, "malformed-held", "outcome_unknown", 1, None);
+        seed_fairness_operation(
+            &db,
+            "valid-later",
+            "outcome_unknown",
+            2,
+            Some(("github.com/owner/z", "refs/heads/main")),
+        );
+
+        let malformed = pending(&mut db, 1).unwrap();
+        assert_eq!(malformed[0].id, "malformed-held");
+        assert!(malformed[0].target.is_none());
+        assert!(saved_intent(&db, "malformed-held").is_err());
+        assert_eq!(
+            db.query_row::<String, _, _>(
+                "SELECT state FROM operations WHERE operation_id='malformed-held'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap(),
+            "outcome_unknown"
+        );
+
+        let valid = pending(&mut db, 1).unwrap();
+        assert_eq!(valid[0].id, "valid-later");
+        assert!(valid[0].target.is_some());
+    }
 }
 
-fn pending(db: &Connection) -> Result<Vec<String>> {
-    let mut statement = db.prepare(
-        "SELECT operation_id FROM operations WHERE method='forge.publish_ref' AND state IN ('sending','outcome_unknown') ORDER BY created_at_ms,operation_id",
-    )?;
-    let rows = statement.query_map([], |row| row.get(0))?;
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(Into::into)
+#[derive(Debug, Clone)]
+struct ForgePendingOperation {
+    id: String,
+    target: Option<ForgeTargetKey>,
 }
 
-fn queued_pending(db: &Connection) -> Result<Vec<String>> {
-    let mut statement = db.prepare(
-        "SELECT operation_id FROM operations WHERE method='forge.publish_ref' AND state='queued' ORDER BY created_at_ms,operation_id",
+#[derive(Debug, Clone)]
+struct ForgePendingCursor {
+    route_valid: i64,
+    repository_key: String,
+    target_ref: String,
+    operation_id: String,
+}
+
+#[derive(Debug)]
+struct ForgePendingRow {
+    id: String,
+    route_valid: bool,
+    canonical_repository: String,
+    repository_key: String,
+    target_ref: String,
+}
+
+impl ForgePendingRow {
+    fn cursor(&self) -> ForgePendingCursor {
+        ForgePendingCursor {
+            route_valid: i64::from(self.route_valid),
+            repository_key: self.repository_key.clone(),
+            target_ref: self.target_ref.clone(),
+            operation_id: if self.route_valid {
+                String::new()
+            } else {
+                self.id.clone()
+            },
+        }
+    }
+}
+
+fn pending_cursor_key(reconciliation: bool) -> &'static str {
+    if reconciliation {
+        "forge:pending-cursor:v2:reconcile"
+    } else {
+        "forge:pending-cursor:v2:dispatch"
+    }
+}
+
+fn read_pending_cursor(db: &Connection, key: &str) -> Result<Option<ForgePendingCursor>> {
+    let raw = db
+        .query_row("SELECT value_json FROM meta WHERE key=?1", [key], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional()?;
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+        // This is rebuildable routing metadata. Corruption resets only this
+        // cursor; it does not alter or release any retained Operation.
+        return Ok(None);
+    };
+    let Some(route_valid) = value["route_valid"].as_i64() else {
+        return Ok(None);
+    };
+    let (Some(repository_key), Some(target_ref), Some(operation_id)) = (
+        value["repository_key"].as_str(),
+        value["target_ref"].as_str(),
+        value["operation_id"].as_str(),
+    ) else {
+        return Ok(None);
+    };
+    if !matches!(route_valid, 0 | 1)
+        || (route_valid == 0 && operation_id.is_empty())
+        || (route_valid == 1 && (repository_key.is_empty() || target_ref.is_empty()))
+    {
+        return Ok(None);
+    }
+    Ok(Some(ForgePendingCursor {
+        route_valid,
+        repository_key: repository_key.to_owned(),
+        target_ref: target_ref.to_owned(),
+        operation_id: operation_id.to_owned(),
+    }))
+}
+
+fn store_pending_cursor(db: &Connection, key: &str, cursor: &ForgePendingCursor) -> Result<()> {
+    set_meta(
+        db,
+        key,
+        &json!({
+            "route_valid":cursor.route_valid,
+            "repository_key":cursor.repository_key,
+            "target_ref":cursor.target_ref,
+            "operation_id":cursor.operation_id,
+        }),
+    )
+}
+
+#[derive(Clone, Copy)]
+enum CursorSlice {
+    After,
+    Through,
+}
+
+fn collect_pending_rows(mut rows: rusqlite::Rows<'_>) -> Result<Vec<ForgePendingRow>> {
+    let mut selected = Vec::new();
+    while let Some(row) = rows.next()? {
+        selected.push(ForgePendingRow {
+            id: row.get(0)?,
+            route_valid: row.get::<_, i64>(1)? == 1,
+            canonical_repository: row.get(2)?,
+            repository_key: row.get(3)?,
+            target_ref: row.get(4)?,
+        });
+    }
+    Ok(selected)
+}
+
+fn select_pending_rows(
+    db: &Connection,
+    reconciliation: bool,
+    cursor: Option<&ForgePendingCursor>,
+    slice: CursorSlice,
+    limit: usize,
+) -> Result<Vec<ForgePendingRow>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let state_filter = if reconciliation {
+        "state IN ('sending','outcome_unknown')"
+    } else {
+        "state='queued'"
+    };
+    let mut query = format!(
+        r#"
+WITH stored AS (
+    SELECT operation_id,created_at_ms,
+           CASE WHEN json_valid(effective_request_json)
+                THEN effective_request_json ELSE '{{}}' END AS effective_json
+    FROM operations
+    WHERE method='forge.publish_ref' AND {state_filter}
+), extracted AS (
+    SELECT operation_id,created_at_ms,
+           CASE WHEN json_type(effective_json,'$.publication_intent.canonical_repository')='text'
+                THEN json_extract(effective_json,'$.publication_intent.canonical_repository')
+                ELSE '' END AS canonical_repository,
+           CASE WHEN json_type(effective_json,'$.publication_intent.target_ref')='text'
+                THEN json_extract(effective_json,'$.publication_intent.target_ref')
+                ELSE '' END AS target_ref
+    FROM stored
+), routed AS (
+    SELECT operation_id,created_at_ms,canonical_repository,target_ref,
+           CASE WHEN canonical_repository<>'' AND target_ref<>'' THEN 1 ELSE 0 END AS route_valid,
+           CASE WHEN canonical_repository<>'' AND target_ref<>''
+                THEN lower(canonical_repository) ELSE '' END AS repository_key
+    FROM extracted
+), ranked AS (
+    SELECT operation_id,created_at_ms,canonical_repository,target_ref,route_valid,repository_key,
+           row_number() OVER (
+               PARTITION BY route_valid,
+                            CASE WHEN route_valid=1 THEN repository_key ELSE operation_id END,
+                            CASE WHEN route_valid=1 THEN target_ref ELSE operation_id END
+               ORDER BY created_at_ms,operation_id
+           ) AS target_rank
+    FROM routed
+)
+SELECT operation_id,route_valid,canonical_repository,repository_key,target_ref
+FROM ranked WHERE target_rank=1
+"#
+    );
+    if cursor.is_some() {
+        query.push_str(match slice {
+            CursorSlice::After => {
+                " AND (route_valid > ?1 OR (route_valid = ?1 AND ((route_valid = 1 AND (repository_key > ?2 OR (repository_key = ?2 AND target_ref > ?3))) OR (route_valid = 0 AND operation_id > ?4))))"
+            }
+            CursorSlice::Through => {
+                " AND (route_valid < ?1 OR (route_valid = ?1 AND ((route_valid = 1 AND (repository_key < ?2 OR (repository_key = ?2 AND target_ref <= ?3))) OR (route_valid = 0 AND operation_id <= ?4))))"
+            }
+        });
+        query.push_str(" ORDER BY route_valid,repository_key,target_ref,operation_id LIMIT ?5");
+    } else {
+        query.push_str(" ORDER BY route_valid,repository_key,target_ref,operation_id LIMIT ?1");
+    }
+    let mut statement = db.prepare(&query)?;
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    if let Some(cursor) = cursor {
+        collect_pending_rows(statement.query(params![
+            cursor.route_valid,
+            &cursor.repository_key,
+            &cursor.target_ref,
+            &cursor.operation_id,
+            limit,
+        ])?)
+    } else {
+        collect_pending_rows(statement.query([limit])?)
+    }
+}
+
+/// Select one oldest retained Operation per publication target in a bounded
+/// rotating keyset page. The queue-capacity bound remains routing
+/// backpressure, not a new Forge/model quota. Each phase owns its cursor in
+/// Store `meta`; cursor read, page selection, and cursor advance commit
+/// together before any worker starts. Unfinished Operations remain authoritative
+/// and return after wrap, including across host restart.
+fn pending_for_state(
+    db: &mut Connection,
+    reconciliation: bool,
+    limit: usize,
+) -> Result<Vec<ForgePendingOperation>> {
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let key = pending_cursor_key(reconciliation);
+    let cursor = read_pending_cursor(&tx, key)?;
+    let mut rows = select_pending_rows(
+        &tx,
+        reconciliation,
+        cursor.as_ref(),
+        CursorSlice::After,
+        limit,
     )?;
-    let rows = statement.query_map([], |row| row.get(0))?;
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(Into::into)
+    if let Some(cursor) = cursor.as_ref().filter(|_| rows.len() < limit) {
+        let remaining = limit - rows.len();
+        rows.extend(select_pending_rows(
+            &tx,
+            reconciliation,
+            Some(cursor),
+            CursorSlice::Through,
+            remaining,
+        )?);
+    }
+    if let Some(last) = rows.last() {
+        store_pending_cursor(&tx, key, &last.cursor())?;
+    }
+    let pending = rows
+        .into_iter()
+        .map(|row| {
+            let target = if row.route_valid {
+                crate::forge::canonical_repository(&row.canonical_repository)
+                    .ok()
+                    .map(|canonical_repository| ForgeTargetKey {
+                        canonical_repository,
+                        target_ref: row.target_ref,
+                    })
+            } else {
+                None
+            };
+            ForgePendingOperation { id: row.id, target }
+        })
+        .collect();
+    tx.commit()?;
+    Ok(pending)
+}
+
+fn pending(db: &mut Connection, limit: usize) -> Result<Vec<ForgePendingOperation>> {
+    pending_for_state(db, true, limit)
+}
+
+fn queued_pending(db: &mut Connection, limit: usize) -> Result<Vec<ForgePendingOperation>> {
+    pending_for_state(db, false, limit)
 }
 
 impl super::Store {
@@ -2330,49 +2788,102 @@ impl super::Store {
         Ok(receipt)
     }
 
-    /// A single host-owned lifecycle pass: reconcile every prior uncertain
-    /// write by exact-ref readback, then dispatch only durable `queued` work.
+    /// A single host-owned lifecycle pass: reconcile a bounded fair page of
+    /// prior uncertain writes by exact-ref readback, then dispatch a bounded
+    /// fair page of durable `queued` work.  Unrelated target lanes run on the
+    /// existing Tokio executor concurrently; each target remains serialized.
     /// Host shutdown must await this future rather than aborting it.
     pub(crate) async fn supervise_forge_once(&self) -> Result<()> {
-        let lock = FORGE_WRITE_LOCK.get_or_init(|| tokio::sync::Mutex::new(()));
-        let _guard = lock.lock().await;
-        self.reconcile_forge_locked().await?;
-        let queued = self.run(|db| queued_pending(db)).await?;
-        let config = self.config.clone();
-        for id in queued {
-            let local_config = config.clone();
-            let local_id = id.clone();
-            let work = self
-                .run(move |db| begin(db, &local_id, &local_config))
-                .await?;
-            if let Some(work) = work {
-                self.drive_forge(work).await;
-            }
+        let page_size = self.config.storage.queue_capacity;
+        let pending = self.run(move |db| pending(db, page_size)).await;
+        let reconcile_result = match pending {
+            Ok(pending) => self.run_forge_page(pending, ForgePass::Reconcile).await,
+            Err(error) => Err(error),
+        };
+        let queued = self.run(move |db| queued_pending(db, page_size)).await;
+        let dispatch_result = match queued {
+            Ok(queued) => self.run_forge_page(queued, ForgePass::Dispatch).await,
+            Err(error) => Err(error),
+        };
+        reconcile_result?;
+        dispatch_result?;
+        Ok(())
+    }
+
+    async fn run_forge_page(
+        &self,
+        operations: Vec<ForgePendingOperation>,
+        pass: ForgePass,
+    ) -> Result<()> {
+        // A dropped JoinHandle detaches its task, allowing an in-flight lane
+        // task to keep its serial guard and closure permit until native work
+        // drains.  The host normally awaits this page; detachment is only the
+        // cancellation-safe fallback.
+        let handles = operations
+            .into_iter()
+            .map(|operation| {
+                let store = self.clone();
+                tokio::spawn(async move { store.run_forge_operation(operation, pass).await })
+            })
+            .collect::<Vec<_>>();
+        for result in futures_util::future::join_all(handles).await {
+            let result = result.map_err(|error| {
+                Error::new(
+                    "FORGE_SUPERVISOR_TASK",
+                    format!("Forge target task failed: {error}"),
+                )
+            })?;
+            result?;
         }
         Ok(())
     }
 
-    async fn reconcile_forge_locked(&self) -> Result<()> {
-        // A cancelled supervisor future may leave its owned blocking Git
-        // closure draining. Its semaphore permit remains inside that closure.
-        // Wait for it before changing `sending` to unknown or reading the ref.
-        let slot = process_slot();
-        let process_guard = slot
-            .acquire_owned()
-            .await
-            .map_err(|_| Error::new("FORGE_PROCESS_CLOSED", "forge process slot stopped"))?;
-        drop(process_guard);
-        let pending = self.run(|db| pending(db)).await?;
+    async fn run_forge_operation(
+        &self,
+        operation: ForgePendingOperation,
+        pass: ForgePass,
+    ) -> Result<()> {
+        let Some(target) = operation.target else {
+            // Do not guess a lane for malformed retained intent. Read and
+            // return its established validation error without changing a
+            // `sending`/`outcome_unknown` Operation or releasing its hold.
+            let id = operation.id;
+            return match self
+                .run(move |db| {
+                    let saved = saved_intent(db, &id)?;
+                    ForgeTargetKey::from_intent(&saved).map(|_| ())
+                })
+                .await
+            {
+                Err(error) => Err(error),
+                Ok(()) => Err(Error::new(
+                    "FORGE_TARGET_UNROUTABLE",
+                    "retained Forge intent has no usable target lane",
+                )),
+            };
+        };
+        let lane = target_lane(&target);
+        let _serial = lane.serial.clone().lock_owned().await;
+        if pass == ForgePass::Reconcile {
+            // Prove that a prior same-target blocking closure has drained
+            // before changing `sending` to unknown or reading the ref.
+            let process_guard =
+                lane.process.clone().acquire_owned().await.map_err(|_| {
+                    Error::new("FORGE_PROCESS_CLOSED", "forge process slot stopped")
+                })?;
+            drop(process_guard);
+        }
+        let id = operation.id;
         let config = self.config.clone();
-        for id in pending {
-            let local_config = config.clone();
-            let local_id = id.clone();
-            let work = self
-                .run(move |db| begin_reconciliation_operation(db, &local_id, &local_config))
-                .await?;
-            if let Some(work) = work {
-                self.drive_forge(work).await;
+        let work = match pass {
+            ForgePass::Reconcile => {
+                self.run(move |db| begin_reconciliation_operation(db, &id, &config))
+                    .await?
             }
+            ForgePass::Dispatch => self.run(move |db| begin(db, &id, &config)).await?,
+        };
+        if let Some(work) = work {
+            self.drive_forge(work).await;
         }
         Ok(())
     }
@@ -2382,7 +2893,7 @@ impl super::Store {
         let outcome = if work.mode == WorkMode::ReadbackOnly {
             let config = self.config.forge.clone();
             let scan = work.clone();
-            self.forge_file_io(move |_| Ok(execute_readback(&config, &scan)))
+            self.forge_file_io(&work.lane, move |_| Ok(execute_readback(&config, &scan)))
                 .await
                 .unwrap_or_else(|error| ForgeOutcome::Unknown {
                     reason: if error.code == "FORGE_GIT_TREE_TERMINATION" {
@@ -2400,7 +2911,9 @@ impl super::Store {
             let config = self.config.forge.clone();
             let prep = work.clone();
             match self
-                .forge_file_io(move |files| prepare_candidate(&files, &config, &prep))
+                .forge_file_io(&work.lane, move |files| {
+                    prepare_candidate(&files, &config, &prep)
+                })
                 .await
             {
                 Err(error) => runner_error_outcome(error),
@@ -2408,7 +2921,7 @@ impl super::Store {
                     let config = self.config.forge.clone();
                     let preflight_work = work.clone();
                     match self
-                        .forge_file_io(move |_| prepare_push(&config, &preflight_work))
+                        .forge_file_io(&work.lane, move |_| prepare_push(&config, &preflight_work))
                         .await
                     {
                         Err(error) => runner_error_outcome(error),
@@ -2431,7 +2944,7 @@ impl super::Store {
                                     let config = self.config.forge.clone();
                                     let push_work = work.clone();
                                     let push_url = push_url.clone();
-                                    self.forge_file_io(move |_| {
+                                    self.forge_file_io(&work.lane, move |_| {
                                         Ok(execute_push(&config, &push_work, &push_url))
                                     })
                                     .await
@@ -2460,13 +2973,22 @@ impl super::Store {
 
     async fn forge_file_io<T: Send + 'static>(
         &self,
+        lane: &Arc<ForgeTargetLane>,
         f: impl FnOnce(crate::artifacts::ArtifactFiles) -> Result<T> + Send + 'static,
     ) -> Result<T> {
-        let permit = process_slot()
+        let lane = Arc::clone(lane);
+        let permit = lane
+            .process
+            .clone()
             .acquire_owned()
             .await
             .map_err(|_| Error::new("FORGE_PROCESS_CLOSED", "forge process slot stopped"))?;
         self.file_io(move |files| {
+            // Keep the lane itself alive with the closure as well as the
+            // keyed process permit.  A cancelled supervisor cannot cause a
+            // later lookup to create a fresh semaphore while this closure is
+            // still draining.
+            let _lane = lane;
             let _permit = permit;
             f(files)
         })

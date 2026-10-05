@@ -46,6 +46,9 @@ pub(super) fn record(
     p: &Principal,
     artifact: &ArtifactRecord,
 ) -> Result<Value> {
+    let eof = artifact.metadata["eof"]
+        .as_bool()
+        .ok_or_else(|| Error::invalid("validated result page metadata is missing its EOF flag"))?;
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let operation_id = model::text(&artifact.metadata, "operation_id")?;
     let context = prepare(&tx, p, operation_id)?;
@@ -85,8 +88,8 @@ pub(super) fn record(
     let details = json!({"completion_condition":"result_page_persisted","artifact_ref":artifact.artifact_id,
     "byte_length":artifact.byte_length,"page_sha256":artifact.content_digest,
     "source":artifact.metadata["source"],"offset_bytes":artifact.metadata["offset_bytes"],
-    "total_bytes":artifact.metadata["total_bytes"],"eof":artifact.metadata["eof"],
-    "next_offset_bytes":if artifact.metadata["eof"]==true {None} else {
+    "total_bytes":artifact.metadata["total_bytes"],"eof":eof,
+    "next_offset_bytes":if eof {None} else {
         artifact.metadata["offset_bytes"].as_u64().and_then(|n| n.checked_add(artifact.byte_length))
     }});
     let outcome = RuntimeOutcome {
@@ -102,6 +105,22 @@ pub(super) fn record(
     tx.execute("UPDATE operations SET state='settled',result_json=?2,settled_at_ms=?3,updated_at_ms=?3 WHERE operation_id=?1", params![operation_id,encoded,now])?;
     tx.execute("INSERT INTO observations(source_stream_id,source_event_key,binding_id,binding_generation,operation_id,kind,payload_json,recorded_at_ms) VALUES(?1,?2,?3,?4,?5,'runtime.result',?6,?7)",
         params![format!("module:{}",p.client_id),format!("result:{operation_id}"),context["binding_id"].as_str(),context["generation"].as_i64(),operation_id,encoded,now])?;
+    let page_status = if eof { "completed" } else { "incomplete" };
+    let phase = "native_result_page_recorded";
+    let occurrence_id = format!("operation:{operation_id}:{phase}");
+    super::insert_safe_system_event(
+        &tx,
+        "controller:runtime",
+        &format!("result-page:{operation_id}"),
+        Some(operation_id),
+        "native.result.available",
+        phase,
+        page_status,
+        Some(&occurrence_id),
+        None,
+        None,
+        now,
+    )?;
     tx.commit()?;
     Ok(json!({"recorded":true,"artifact_ref":artifact.artifact_id}))
 }

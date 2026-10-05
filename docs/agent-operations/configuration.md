@@ -439,6 +439,49 @@ transfer; starting them rechecks the current owner, settings, script and scope.
 See [Implementation Status](../implementation-status.md) for the delivered
 subset; this paragraph specifies the complete configuration requirement.
 
+### Generic system-event ScriptRun
+
+The manager configures exact `source_id` and `event_kind`, with an optional
+normalized status. The selector reads metadata rather than arbitrary payload
+fields. Provider/harness adapters translate native facts into this common
+event contract; cursor management, action admission and execution belong to
+the shared transactional kernel.
+
+For example, this automation patch selects committed message sends:
+
+~~~json
+{
+  "enabled": true,
+  "steps": ["script_run"],
+  "script_run": {"script_id": "on_message_sent"},
+  "event_rules": [
+    {
+      "source_id": "controller:messages",
+      "event_kind": "message.sent",
+      "status": "sent",
+      "action": "script_run"
+    }
+  ]
+}
+~~~
+
+Pass the patch through `automation.config.preview` and
+`automation.config.apply` for the selected project and entry. The script must
+have an active immutable revision owned by the authorized manager. Rules
+match only an authorized retained occurrence. A future source/kind can be
+configured before its adapter is available; a status filter waits for that
+adapter's supported safe projection. Raw and normalized views of the same
+phase/occurrence produce one invocation.
+
+The current normalized producers include message sends/replies, coordination
+answers, observed native terminal outcomes/result pages, and host interruption.
+`controller:operations` also provides `operation.rejected` / `rejected` /
+`OPERATION_REJECTED` for mutation admission rejection and
+`operation.outcome_unknown` / `unknown` / `OUTCOME_UNKNOWN` for PR-description
+uncertainty. These fixed error categories carry no detailed error text; read
+the exact authorized Operation for its retained diagnostic. Coverage of other
+Operation transitions is still being implemented; see Implementation Status.
+
 Goal tracking starts no work. Its selected progression uses one enabled manager entry and one actual continuation owner. Requested one-shot watches are available without recurring automation; a notice is not a task or approval-prompt answer.
 
 Keep #22's small eager cores. Config get/preview/apply/explain/transfer and detailed runtime, hook, script, schedule, Goal, review and forge methods are deferred groups. Schedule/rule/Goal editors update the same entry and enabled flag, not parallel records. Before exposing a new method, wire its real application handler and result reader.

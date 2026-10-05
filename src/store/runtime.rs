@@ -1429,6 +1429,27 @@ pub(super) fn outcome_with_artifacts(
         )?;
     }
     tx.execute("INSERT INTO observations(source_stream_id,source_event_key,binding_id,binding_generation,operation_id,kind,payload_json,recorded_at_ms) VALUES(?1,?2,?3,?4,?5,'runtime.outcome',?6,?7)",params![format!("module:{}",p.client_id),key,id,generation,r.operation_id,encoded,now])?;
+    if matches!(r.outcome, EffectOutcome::Applied | EffectOutcome::Rejected) {
+        let (status, phase) = match r.outcome {
+            EffectOutcome::Applied => ("applied", "native_outcome_terminal"),
+            EffectOutcome::Rejected => ("rejected", "native_outcome_terminal"),
+            EffectOutcome::Accepted | EffectOutcome::Unknown => unreachable!(),
+        };
+        let occurrence_id = format!("operation:{}:{}", r.operation_id, phase);
+        super::insert_safe_system_event(
+            &tx,
+            "controller:runtime",
+            &format!("terminal:{}", r.operation_id),
+            Some(&r.operation_id),
+            "native.operation.completed",
+            phase,
+            status,
+            Some(&occurrence_id),
+            None,
+            None,
+            now,
+        )?;
+    }
     super::capacity::note_outcome(&tx, &o, &r, now)?;
     super::capacity::sync_operation(&tx, &r.operation_id, now)?;
     if let Some(attempt_id) = o["attempt_id"].as_str() {

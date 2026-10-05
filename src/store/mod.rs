@@ -4,7 +4,7 @@ mod assembly;
 mod automation;
 mod automation_acceptance;
 mod automation_cron;
-mod automation_dispatch;
+pub(crate) mod automation_dispatch;
 mod automation_disposition;
 pub(crate) mod automation_goal_progression;
 mod automation_intake;
@@ -39,6 +39,8 @@ mod message_batch;
 #[cfg(test)]
 mod module_bridge_recovery_tests;
 mod native_mcp;
+#[cfg(test)]
+mod o6_taskless_path_fixture;
 mod opencode;
 mod operations;
 pub(crate) mod participant_credentials;
@@ -53,6 +55,9 @@ mod schedule_run_now;
 #[cfg(test)]
 mod schedule_run_now_tests;
 mod schedules;
+mod script_event_schema;
+#[cfg(test)]
+mod script_event_schema_fixture;
 mod scripts;
 mod status_reader;
 mod submissions;
@@ -490,7 +495,7 @@ impl Store {
 
     pub(crate) async fn reconcile_automations_once(&self) -> Result<Value> {
         let config = self.config.clone();
-        self.run(move |db| {
+        let mut result = self.run(move |db| {
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let now = model::now_ms()?;
             let review_dispatch = automation_dispatch::reconcile(&tx, &config, 16, 64, now)?;
@@ -508,7 +513,11 @@ impl Store {
             tx.commit()?;
             Ok(json!({"review_dispatch":review_dispatch,"work_dispatch":work_dispatch,"publication":publication,"goal_progression":goal_progression}))
         })
-        .await
+        .await?;
+        // Script bundle preparation performs file I/O after the durable
+        // event cursor and pending causes have committed.
+        result["script_run"] = self.reconcile_script_triggers_once(16).await?;
+        Ok(result)
     }
 
     /// Goal reminders use the same durable scheduler wake and transaction owner.
@@ -1416,6 +1425,7 @@ fn open_database(root: &Path, credential: &Credential) -> Result<Connection> {
         SCRIPT_SCHEMA,
         &["scripts", "script_revisions", "script_runs"],
     )?;
+    script_event_schema::install(&tx)?;
     install_schema_extension(
         &tx,
         "schema_extension:github:v1",
@@ -1698,6 +1708,25 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
             JOIN meta AS manager ON manager.key='client:' || :client
             JOIN meta AS current_gm ON current_gm.key='gm'
             WHERE run.operation_id=op.operation_id AND run.task_id=op.task_id AND run.attempt_id=op.attempt_id
+              AND json_extract(manager.value_json,'$.role')='manager'
+              AND COALESCE(json_extract(manager.value_json,'$.disabled'),0)=0
+              AND json_extract(current_gm.value_json,'$.client_id')=:client
+        )
+    )
+    OR (
+        op.method = 'script.run'
+        AND op.task_id IS NULL AND op.attempt_id IS NULL
+        AND EXISTS (
+            SELECT 1 FROM script_runs AS run
+            JOIN meta AS link ON link.key='automation:v1:operation:' || op.operation_id
+            JOIN meta AS manager ON manager.key='client:' || :client
+            JOIN meta AS current_gm ON current_gm.key='gm'
+            WHERE run.operation_id=op.operation_id
+              AND run.task_id IS NULL AND run.task_revision IS NULL AND run.attempt_id IS NULL
+              AND json_extract(link.value_json,'$.record.operation_id')=op.operation_id
+              AND json_extract(link.value_json,'$.record.action')='script.run'
+              AND json_extract(link.value_json,'$.record.cause.kind')='system_event'
+              AND json_extract(link.value_json,'$.record.effective_manager_id')=:client
               AND json_extract(manager.value_json,'$.role')='manager'
               AND COALESCE(json_extract(manager.value_json,'$.disabled'),0)=0
               AND json_extract(current_gm.value_json,'$.client_id')=:client
@@ -3682,16 +3711,251 @@ fn mutate_in_transaction_with_authority(
             // capacity; record that in the durable ledger (R23).
             capacity::sync_operation(tx, &id, now)?;
             tx.execute("INSERT INTO observations(source_stream_id,source_event_key,operation_id,kind,payload_json,recorded_at_ms) VALUES('controller',?1,?1,?2,?3,?4)",params![id,method,model::canonical(value)?,now])?;
+            record_safe_system_events(tx, method, &id, value, *queued, now)?;
             json!({"ok":true,"value":value})
         }
         Err(error) => {
             tx.execute_batch("ROLLBACK TO mutation_effect; RELEASE mutation_effect")?;
             tx.execute("UPDATE operations SET state='rejected',result_json=?2,settled_at_ms=?3 WHERE operation_id=?1",params![id,model::canonical(&json!(error))?,now])?;
+            record_operation_failure_event(tx, &id, "rejected", now)?;
             json!({"ok":false,"error":error})
         }
     };
     tx.execute("UPDATE operations SET effective_request_json=json_set(effective_request_json,'$.receipt',json(?2)) WHERE operation_id=?1",params![id,model::canonical(&receipt)?])?;
     Ok(result.map(|(v, _)| v))
+}
+fn record_safe_system_events(
+    tx: &Transaction<'_>,
+    method: &str,
+    operation_id: &str,
+    value: &Value,
+    queued: bool,
+    now: i64,
+) -> Result<()> {
+    if queued {
+        return Ok(());
+    }
+
+    let message_sent = matches!(method, "message.send" | "coordination.send")
+        || (method == "coordination.consult" && value["delivery_created"] == true);
+    if message_sent {
+        insert_safe_system_event(
+            tx,
+            "controller:messages",
+            &format!("sent:{operation_id}"),
+            Some(operation_id),
+            "message.sent",
+            "message_send_committed",
+            "sent",
+            Some(&format!("operation:{operation_id}:message_send_committed")),
+            None,
+            None,
+            now,
+        )?;
+    }
+    if method == "message.send" && value["reply_to"].is_object() {
+        insert_safe_system_event(
+            tx,
+            "controller:messages",
+            &format!("reply:{operation_id}"),
+            Some(operation_id),
+            "message.reply_sent",
+            "message_send_committed",
+            "sent",
+            Some(&format!("operation:{operation_id}:message_send_committed")),
+            None,
+            None,
+            now,
+        )?;
+    }
+    if method == "coordination.consult" && value["status"] == "answered_from_card" {
+        insert_safe_system_event(
+            tx,
+            "controller:coordination",
+            &format!("answer:{operation_id}"),
+            Some(operation_id),
+            "coordination.answer",
+            "coordination_answered",
+            "answered",
+            Some(&format!("operation:{operation_id}:coordination_answered")),
+            None,
+            None,
+            now,
+        )?;
+    }
+    Ok(())
+}
+
+/// Retain a closed failure fact in the same transaction as its Operation.
+/// The category is public metadata; detailed errors remain in operation.get.
+pub(super) fn record_operation_failure_event(
+    tx: &Transaction<'_>,
+    operation_id: &str,
+    state: &str,
+    now: i64,
+) -> Result<()> {
+    let (kind, phase, status, error_code) = match state {
+        "rejected" => (
+            "operation.rejected",
+            "operation_rejected",
+            "rejected",
+            "OPERATION_REJECTED",
+        ),
+        "outcome_unknown" => (
+            "operation.outcome_unknown",
+            "operation_outcome_unknown",
+            "unknown",
+            "OUTCOME_UNKNOWN",
+        ),
+        _ => {
+            return Err(Error::new(
+                "SYSTEM_EVENT_INVALID",
+                "invalid Operation failure state",
+            ));
+        }
+    };
+    let current: String = tx.query_row(
+        "SELECT state FROM operations WHERE operation_id=?1",
+        [operation_id],
+        |row| row.get(0),
+    )?;
+    if current != state {
+        return Err(Error::new(
+            "SYSTEM_EVENT_INVALID",
+            "Operation failure fact differs from retained state",
+        ));
+    }
+    let occurrence_id = format!("operation:{operation_id}:{phase}");
+    let payload = json!({
+        "schema_version":1, "phase":phase, "status":status,
+        "occurrence_id":occurrence_id, "error_code":error_code
+    });
+    // Repeated uncertain readbacks retain the first immutable failure fact.
+    tx.execute(
+        "INSERT OR IGNORE INTO observations(source_stream_id,source_event_key,operation_id,kind,payload_json,recorded_at_ms) VALUES('controller:operations',?1,?2,?3,?4,?5)",
+        rusqlite::params![occurrence_id, operation_id, kind, model::canonical(&payload)?, now],
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn insert_safe_system_event(
+    tx: &Transaction<'_>,
+    source_stream_id: &str,
+    source_event_key: &str,
+    operation_id: Option<&str>,
+    kind: &str,
+    phase: &str,
+    status: &str,
+    occurrence_id: Option<&str>,
+    host_epoch_pair: Option<(i64, i64)>,
+    error_code: Option<&str>,
+    recorded_at_ms: i64,
+) -> Result<()> {
+    let source_kind_phase_valid = matches!(
+        (source_stream_id, kind, phase),
+        (
+            "controller:messages",
+            "message.sent" | "message.reply_sent",
+            "message_send_committed"
+        ) | (
+            "controller:coordination",
+            "coordination.answer",
+            "coordination_answered"
+        ) | (
+            "controller:runtime",
+            "native.operation.completed",
+            "native_outcome_terminal"
+        ) | (
+            "controller:runtime",
+            "native.result.available",
+            "native_result_page_recorded"
+        ) | (
+            "controller:host-lifecycle",
+            "host.interrupted",
+            "host_interruption_observed"
+        )
+    );
+    let status_valid = match phase {
+        "message_send_committed" => status == "sent",
+        "coordination_answered" => status == "answered",
+        "native_outcome_terminal" => matches!(status, "applied" | "rejected"),
+        "native_result_page_recorded" => matches!(status, "completed" | "incomplete"),
+        "host_interruption_observed" => status == "unknown",
+        _ => false,
+    };
+    if !source_kind_phase_valid || !status_valid {
+        return Err(Error::new(
+            "SYSTEM_EVENT_INVALID",
+            "safe system event kind, phase, or status is invalid",
+        ));
+    }
+    if phase == "host_interruption_observed" {
+        let Some((previous_epoch, current_epoch)) = host_epoch_pair else {
+            return Err(Error::new(
+                "SYSTEM_EVENT_INVALID",
+                "host interruption is missing its persisted epoch pair",
+            ));
+        };
+        let expected_id = format!("host-interruption:{previous_epoch}:{current_epoch}");
+        if previous_epoch <= 0
+            || current_epoch <= previous_epoch
+            || operation_id.is_some()
+            || occurrence_id != Some(expected_id.as_str())
+            || error_code != Some("HOST_INTERRUPTED")
+        {
+            return Err(Error::new(
+                "SYSTEM_EVENT_INVALID",
+                "host interruption identity is invalid",
+            ));
+        }
+    } else {
+        let Some(operation_id) = operation_id else {
+            return Err(Error::new(
+                "SYSTEM_EVENT_INVALID",
+                "operation event is missing its Operation identity",
+            ));
+        };
+        let expected_id = format!("operation:{operation_id}:{phase}");
+        if occurrence_id != Some(expected_id.as_str())
+            || host_epoch_pair.is_some()
+            || error_code.is_some()
+        {
+            return Err(Error::new(
+                "SYSTEM_EVENT_INVALID",
+                "operation event identity is invalid",
+            ));
+        }
+    }
+
+    let mut payload = json!({
+        "schema_version":1,
+        "phase":phase,
+        "status":status,
+    });
+    if let Some(occurrence_id) = occurrence_id {
+        payload["occurrence_id"] = json!(occurrence_id);
+    }
+    if let Some((previous_epoch, current_epoch)) = host_epoch_pair {
+        payload["previous_host_epoch"] = json!(previous_epoch);
+        payload["current_host_epoch"] = json!(current_epoch);
+    }
+    if let Some(error_code) = error_code {
+        payload["error_code"] = json!(error_code);
+    }
+    tx.execute(
+        "INSERT INTO observations(source_stream_id,source_event_key,operation_id,kind,payload_json,recorded_at_ms) \
+         VALUES(?1,?2,?3,?4,?5,?6)",
+        rusqlite::params![
+            source_stream_id,
+            source_event_key,
+            operation_id,
+            kind,
+            model::canonical(&payload)?,
+            recorded_at_ms
+        ],
+    )?;
+    Ok(())
 }
 fn receipt_result(value: &Value) -> Result<Value> {
     if value["ok"] == true {
@@ -4304,3 +4568,5 @@ mod receipt_tests;
 mod runtime_admission_tests;
 #[cfg(test)]
 mod security_tests;
+#[cfg(test)]
+mod system_event_producer_tests;

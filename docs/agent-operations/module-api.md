@@ -183,12 +183,13 @@ suppresses output, so its error cannot undo Git's commit.
 
 ## O8: closed `event_rules` and hook-assisted joins
 
-The current typed event rule is exactly `task.submission` + `applied` +
-`review_dispatch`. The action must also appear in the selected `steps`; unknown
-rule fields/actions and duplicate rules are rejected. At most 16 rules are
-accepted. For old entries, `event_rules` absent or `null` preserves the legacy
-TaskSubmission-to-ReviewDispatch route. An explicit empty array means no event
-route:
+The closed typed event rules are `task.submission` + `applied` +
+`review_dispatch` and `task.submission` + `applied` + `script_run`. Each action
+must also appear in the selected `steps`; unknown rule fields/actions and
+duplicate rules are rejected. At most 16 rules are accepted. For old entries,
+`event_rules` absent or `null` preserves the legacy
+TaskSubmission-to-ReviewDispatch route. An explicit empty array means no
+automatic event route:
 
 ```json
 {
@@ -200,10 +201,12 @@ route:
 
 That entry will not automatically dispatch ReviewDispatch from a submission,
 and it will not use `hook_commit` to join a verified commit to an applied
-submission for ReviewDispatch. The `hook.emit` source remains authenticated;
-verified hook observations and TaskSubmission intake continue to be retained.
-Manual `review.assign` and other explicitly selected, independently authorized
-actions remain available. To turn on the typed route, select it explicitly:
+submission for ReviewDispatch. It also will not start the selected ScriptRun
+from a submission. The `hook.emit` source remains authenticated; verified hook
+observations and TaskSubmission intake continue to be retained. Manual
+`review.assign`, direct authorized `script.run`, and other independently
+authorized actions remain available. To turn on the typed review route,
+select it explicitly:
 
 ```json
 {
@@ -219,6 +222,28 @@ Where `hook_commit` is configured, the join still requires the exact selected
 source, verified full commit, matching project/repository registration, and an
 applied submission. It creates no review from a commit alone. See
 [automation configuration](configuration.md) and [hook routing](../hooks.md).
+
+To select the one supported submission-triggered script invocation, the entry
+must also name one script and select the matching closed rule:
+
+```json
+{
+  "enabled": true,
+  "steps": ["script_run"],
+  "script_run": {"script_id": "checked_bundle"},
+  "event_rules": [
+    {"source": "task.submission", "predicate": "applied", "action": "script_run"}
+  ]
+}
+```
+
+This uses the normal `script.run` admission path and one bounded O1 cursor
+independent of ReviewDispatch. The trigger must still match the current
+Manager, script owner and active immutable revision, and exact current
+Task/Attempt when the run reaches its start gate. Ownership transfer moves the
+cursor and exact pending causes atomically; unstarted causes remain held until
+the successor's current rights are revalidated. The trigger grants no reusable
+Manager credential and cannot edit another automation.
 
 ## O9: one Goal continuation for one completed terminal EventRef
 
