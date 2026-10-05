@@ -1,6 +1,6 @@
-use super::{Config, Error, Principal, Result, Role, model};
+use super::{Config, Error, Principal, Result, Role};
 use rusqlite::{Connection, TransactionBehavior};
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::{path::Path, path::PathBuf, sync::Arc, thread::JoinHandle};
 use tokio::sync::{mpsc, oneshot};
 
@@ -146,6 +146,7 @@ mod tests {
         platform::DataRoot,
     };
     use rusqlite::ErrorCode;
+    use serde_json::json;
     use serde_json::json;
     use std::{
         fs,
