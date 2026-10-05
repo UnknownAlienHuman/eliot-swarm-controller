@@ -87,8 +87,8 @@ use rusqlite::{
     Connection, OptionalExtension, Transaction, TransactionBehavior, named_params, params,
 };
 use serde_json::{Value, json};
-use std::{fs::File, path::Path, sync::Arc, thread::JoinHandle};
-use tokio::sync::{Semaphore, mpsc, oneshot, watch};
+use std::{path::Path, sync::Arc, thread::JoinHandle};
+use tokio::sync::{Semaphore, oneshot, watch};
 
 const SCHEMA: &str = include_str!("../../migrations/001_core.sql");
 const WORKSPACE_SCHEMA: &str = include_str!("../../migrations/002_workspace.sql");
@@ -100,13 +100,10 @@ const GITHUB_PR_EFFECTS_SCHEMA: &str = include_str!("../../migrations/008_github
 const APPLICATION_ID: i64 = 0x45534331;
 const LOCAL_OPERATOR_CLIENT_ID_KEY: &str = "local_operator_client_id";
 type RunJob = Box<dyn FnOnce(&mut Connection) + Send>;
-enum Job {
-    Run(RunJob),
-    MessageSend(message_batch::Request),
-}
+type Job = swarm_kernel::WriterJob<RunJob, message_batch::Request>;
 #[derive(Clone)]
 pub struct Store {
-    tx: mpsc::Sender<Job>,
+    tx: swarm_kernel::WriterSender<RunJob, message_batch::Request>,
     status_reader: status_reader::Sender,
     config: Arc<Config>,
     changed: watch::Sender<u64>,
@@ -137,54 +134,22 @@ impl StoreOwner {
     ) -> Result<Self> {
         let artifacts = ArtifactFiles::new(&root.path)?;
         let data_dir = root.path.clone();
-        let (tx, mut rx) = mpsc::channel::<Job>(config.storage.queue_capacity);
-        let (ready_tx, ready_rx) = oneshot::channel();
+        let writer_root = root.path.clone();
+        let writer_lock = root.lock;
         let writer_config = config.clone();
-        let thread = std::thread::Builder::new()
-            .name("swarm-store".into())
-            .spawn(move || {
-                let _lock: File = root.lock;
-                match open_database(&root.path, &credential) {
-                    Ok(mut db) => {
-                        if ready_tx.send(Ok(())).is_ok() {
-                            let mut pending = None;
-                            loop {
-                                let job = match pending.take() {
-                                    Some(job) => Some(job),
-                                    None => rx.blocking_recv(),
-                                };
-                                let Some(job) = job else { break };
-                                match job {
-                                    Job::Run(job) => job(&mut db),
-                                    Job::MessageSend(first) => {
-                                        let mut batch =
-                                            Vec::with_capacity(message_batch::MAX_BATCH_SIZE);
-                                        batch.push(first);
-                                        while batch.len() < message_batch::MAX_BATCH_SIZE {
-                                            match rx.try_recv() {
-                                                Ok(Job::MessageSend(request)) => {
-                                                    batch.push(request);
-                                                }
-                                                Ok(other) => {
-                                                    // Preserve the single queue's FIFO order:
-                                                    // a non-send job ends this batch and runs next.
-                                                    pending = Some(other);
-                                                    break;
-                                                }
-                                                Err(_) => break,
-                                            }
-                                        }
-                                        message_batch::process(&mut db, batch, &writer_config);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        let _ = ready_tx.send(Err(e));
-                    }
-                }
-            })?;
+        let swarm_kernel::WriterActor {
+            sender: tx,
+            thread,
+            ready: ready_rx,
+        } = swarm_kernel::spawn_writer_actor(
+            "swarm-store",
+            config.storage.queue_capacity,
+            message_batch::MAX_BATCH_SIZE,
+            writer_lock,
+            move || open_database(&writer_root, &credential),
+            |db, job| job(db),
+            move |db, batch| message_batch::process(db, batch, &writer_config),
+        )?;
         match ready_rx.await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
@@ -747,7 +712,7 @@ impl Store {
     ) -> Result<Value> {
         let (response, receive) = oneshot::channel();
         self.tx
-            .send(Job::MessageSend(message_batch::Request {
+            .send(Job::Batch(message_batch::Request {
                 principal,
                 method,
                 params,

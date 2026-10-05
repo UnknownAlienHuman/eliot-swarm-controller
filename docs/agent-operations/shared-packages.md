@@ -10,13 +10,22 @@ having the new packages import the old controller library.
 | `swarm-client` | Authenticated bounded sequential local IPC client and endpoint computation | `swarm-contracts` |
 | `swarm-process` | OS process/group ownership, identity/departure checks, private-file primitives | `swarm-contracts` |
 | `swarm-store` | SQLite connection opening, schema identity/digest and transaction primitives | None |
+| `swarm-kernel` | Single bounded writer actor, readiness and contiguous typed job batching | None |
 | `swarm-telemetry` | Bounded metadata producer, lazy stderr writer and local drop/failure counters | None |
 
-The host still owns authentication policy, the Store writer actor, domain transactions,
+The host still owns authentication policy, domain transactions,
 server IPC, dispatch and installed runtime selection. Compatibility paths in
 `config`, `model`, `runtime`, `ipc` and `platform` preserve existing host callers;
 they map the shared error to the host error once at the boundary. Shared
 contracts have no SQLite, native vendor DTO or process dependency.
+
+The root Store uses `swarm-kernel` for its existing single writer thread and
+bounded FIFO queue. The DataRoot lock stays on that thread through database
+initialization and shutdown. Readiness returns the original initializer error;
+only contiguous typed message jobs are batched, with the same limit and pending
+non-message job ordering. Root supplies database initialization and domain
+callbacks, response channels and close/join handling. No second writer, database
+or scheduling policy was added. Kernel domain extraction remains unfinished.
 
 The module catalog validates data and selects an exact artifact with compatible
 protocol/capabilities. It reads no files and starts no process. Launch metadata
@@ -86,5 +95,7 @@ source review pass. Current root source `042d8b6` passed scoped production
 Clippy on Windows and remote Ubuntu in
 [run 37318364299](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37318364299).
 Full tests, release packaging and native interoperability remain separate.
-These five packages do not complete the Store/kernel, bus, supervisor or adapter
+The writer actor increment passes metadata and explicit formatting; its fresh
+scoped compiler gate and native qualification remain pending.
+These six packages do not complete the Store/kernel, bus, supervisor or adapter
 split. They create the shared boundary those modules can consume independently.

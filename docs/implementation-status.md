@@ -2,6 +2,21 @@
 
 ## Current state
 
+### PR #25 kernel writer actor — 2026-10-05
+
+The root Store now uses the independent `swarm-kernel` package for its single
+bounded FIFO queue and `swarm-store` writer thread. The existing DataRoot lock,
+initializer readiness/error propagation, contiguous message batching and pending
+job ordering are preserved. Root still owns domain transactions, per-request
+responses, status-reader startup and close/join handling. This is the actor
+boundary of M2; kernel domain handlers and the process split remain unfinished.
+
+Source review, explicit formatting and offline locked workspace metadata are
+the current checks. A missing function-signature delimiter in the draft was
+corrected before publication. The compiler gate for this increment is pending;
+the passing source `042d8b6` gate below predates the actor extraction. No local
+compilation, tests, model calls or native process launches were performed.
+
 ### PR #25 Store primitives and module child identity — 2026-10-05
 
 The root now consumes `swarm-store` for SQLite opening, schema identity/digest
@@ -10,8 +25,9 @@ DataRoot lock; base initialization and all kernel bootstrap, extension and
 restart updates remain in one Immediate transaction. Root initializer errors,
 parsed JSON digest semantics and accepted empty-database identity cases are
 preserved. Status reads remain read-only/query-only with the existing principal
-policy. Store job ordering, MessageSend batching and domain admission remain
-host-owned; this is a staged storage extraction, not the complete kernel split.
+policy. At this checkpoint, Store job ordering and MessageSend batching were
+host-owned; their later actor extraction is recorded above. Domain admission
+remains host-owned. This is a staged storage extraction, not the complete kernel split.
 
 Shared contracts now include a data-only module catalog: exact artifact
 selection, protocol/capability compatibility, protected launch references and

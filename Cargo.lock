@@ -400,6 +400,7 @@ dependencies = [
  "sha2",
  "swarm-client",
  "swarm-contracts",
+ "swarm-kernel",
  "swarm-process",
  "swarm-store",
  "swarm-telemetry",
@@ -1429,6 +1430,13 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "swarm-kernel"
+version = "0.1.0"
+dependencies = [
+ "tokio",
 ]
 
 [[package]]

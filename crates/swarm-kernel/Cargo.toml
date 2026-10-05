@@ -1,0 +1,10 @@
+[package]
+name = "swarm-kernel"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+publish = false
+description = "Generic bounded writer actor primitives for the Swarm kernel"
+
+[dependencies]
+tokio = { version = "1", features = ["sync"] }
