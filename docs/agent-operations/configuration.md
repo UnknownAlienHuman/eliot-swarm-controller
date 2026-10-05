@@ -411,6 +411,19 @@ Disable stops new starts and separate follow-ups, not running agents, native Goa
 
 Revoked/deleted ownership blocks only new affected actions. Restored rights can make a still-enabled entry eligible; explicitly disabled entries stay disabled. `automation.config.transfer` is the explicit, atomic compare-and-swap path for moving one entry from `former_owner_manager_id` to the current GM. It retires the source entry, preserves cursors, pending slots and linked history, refuses a conflicting target, and leaves authority and historical actors unchanged. It is never a side effect of editing, last-editor identity, session silence, queue balancing or `gm.handover`; a GM handover does not automatically transfer automations or old epoch-fenced publication. Resolve an unknown transfer outcome through readback only.
 
+### Module disconnect behavior
+
+A disconnect atomically marks in-flight `sending`/`native_accepted`
+Operations on the exact binding generation `outcome_unknown` and record the
+binding as disconnected, reusing the existing durable unknown-Operation event.
+The current authorized manager receives bounded Operation readback. If an
+unresolved `agent.open` has no native root, only exact `agent.reconcile`
+readback for that Operation, generation, and supported route is allowed at
+admission and dispatch. Never replay the original input or infer verified owner
+departure from disconnect; the existing verified-departure path remains
+separate. This is core behavior and requires no configuration switch.
+
+
 ## 9. Dynamic runtime preferences
 
 `runtime.catalog` returns scoped installed/configured routes, actual model IDs/aliases, native options, capability evidence, trust, account-capacity grouping and freshness. Keep role, route, provider/billing, native options, MCP surface and OS identity separate.

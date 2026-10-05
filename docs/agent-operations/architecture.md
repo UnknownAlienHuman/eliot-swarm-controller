@@ -112,6 +112,23 @@ readback; it does not authorize another external challenge or action. Supervisor
 failure retains the fixed supervisor identity when available, including task
 join failures, without broadcasting a panic payload.
 
+### Module disconnect and unresolved-open readback
+
+When IPC closes a module link, the Store transaction changes
+in-flight `sending` and `native_accepted` Operations on that exact binding
+generation to `outcome_unknown` and marks the binding disconnected. This reuses
+migration `010`'s same-transaction `operation.outcome_unknown` event and exposes
+bounded readback through the existing current-manager Operation reader; it
+invents neither a result nor a cause.
+
+For an unresolved `agent.open` without a native root, permit only
+`agent.reconcile` for that exact Operation, binding generation, and supported
+route, checking the exception at admission and dispatch. This is readback, not
+input replay. Disconnect alone does not verify owner departure; only the
+existing replacement-boot plus verified-departure path may set
+`recovery_required`.
+
+
 Script triggers use this same bus: the manager may select any system event
 kind, including future kinds. Event visibility and the action's current rights
 are checked independently. A safe projection preserves occurrence/causal

@@ -2,6 +2,24 @@
 
 ## Current state
 
+### Module disconnect and rootless-open readback — 2026-10-05
+
+The Store implements a durable transition: when the exact module binding
+disconnects, move its in-flight
+`sending`/`native_accepted` Operations to `outcome_unknown` in the disconnect
+transaction, reusing migration `010`'s existing event and bounded
+current-manager Operation readback. For an unresolved rootless `agent.open`,
+permit only exact-route `agent.reconcile` tied to that Operation and binding
+generation at both admission and dispatch. This does not replay input, infer a
+result or cause, or claim owner departure; the existing replacement-boot and
+verified-departure path remains authoritative for that claim.
+
+The production source and documentation are integrated and passed independent
+source review. This increment has not been locally compiled or runtime-qualified;
+no new local build or test run was requested. The earlier full CI result for
+`db69c178` covers the preceding increment and does not qualify this change.
+
+
 ### Universal cancellation events and adapter diagnostics — 2026-10-05
 
 New Operation cancellations enter the shared durable event bus in the same

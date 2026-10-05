@@ -550,11 +550,17 @@ fn next_internal(
                     &tx, config, &id, generation, &op,
                 )?;
             }
-        } else if b["state"] != "ready" && !is_recovery_control(&method, &input, &b) {
-            return Err(Error::new(
-                "BINDING_NOT_READY",
-                "binding not ready before dispatch",
-            ));
+        } else {
+            let rootless_open_reconcile =
+                allows_rootless_open_reconcile(&tx, &method, &input, &b, &id, generation)?;
+            if b["state"] != "ready"
+                && !is_recovery_control(&method, &input, &b, rootless_open_reconcile)
+            {
+                return Err(Error::new(
+                    "BINDING_NOT_READY",
+                    "binding not ready before dispatch",
+                ));
+            }
         }
         if method != "agent.open" && repair_context.is_none() && caller["role"] != "operator" {
             let caller_id = model::text(&o, "caller_id")?;
@@ -1550,15 +1556,48 @@ pub(super) fn observe(db: &mut Connection, p: &Principal, v: &Value) -> Result<V
     Ok(json!({"recorded":true,"stale":false,"observation_id":observation_id}))
 }
 
-pub(super) fn disconnected(db: &Connection, p: &Principal) -> Result<()> {
+pub(super) fn disconnected(db: &mut Connection, p: &Principal) -> Result<bool> {
     if p.role != Role::Module {
-        return Ok(());
+        return Ok(false);
     }
     let Some(c) = meta(db, &format!("client:{}", p.client_id))? else {
-        return Ok(());
+        return Ok(false);
     };
-    db.execute("UPDATE bindings SET state=CASE WHEN state='ready' THEN 'reconciling' ELSE state END,state_json=json_set(state_json,'$.connection','disconnected') WHERE binding_id=?1 AND generation=?2 AND json_extract(state_json,'$.module_link_id')=?3 AND released_at_ms IS NULL",params![c["binding_id"].as_str(),c["binding_generation"].as_i64(),p.link_id])?;
-    Ok(())
+    let (Some(binding_id), Some(generation)) = (
+        c["binding_id"].as_str(),
+        c["binding_generation"].as_i64().filter(|value| *value > 0),
+    ) else {
+        return Ok(false);
+    };
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let binding = operations::get_binding(&tx, binding_id, generation)?;
+    if !binding["released_at_ms"].is_null() || binding["observation"]["module_link_id"] != p.link_id
+    {
+        return Ok(false);
+    }
+    let now = model::now_ms()?;
+    // The closed module link cannot deliver another outcome. Preserve a
+    // conservative unknown Operation state; migration 010 records the bounded
+    // operation.outcome_unknown fact in this same transaction.
+    let unknown = tx.execute(
+        "UPDATE operations SET state='outcome_unknown',updated_at_ms=?3 \
+         WHERE binding_id=?1 AND binding_generation=?2 \
+           AND state IN ('sending','native_accepted')",
+        params![binding_id, generation, now],
+    )?;
+    if unknown > 0 {
+        super::capacity::sync_binding(&tx, binding_id, generation, now)?;
+    }
+    let binding_changed = tx.execute(
+        "UPDATE bindings SET \
+             state=CASE WHEN state IN ('ready','opening') THEN 'reconciling' ELSE state END, \
+             state_json=json_set(state_json,'$.connection','disconnected') \
+         WHERE binding_id=?1 AND generation=?2 \
+           AND json_extract(state_json,'$.module_link_id')=?3 AND released_at_ms IS NULL",
+        params![binding_id, generation, p.link_id],
+    )?;
+    tx.commit()?;
+    Ok(unknown > 0 || binding_changed > 0)
 }
 
 fn ensure_batch_root(data_dir: &Path) -> Result<PathBuf> {
@@ -2435,25 +2474,58 @@ impl Store {
     }
 }
 
-fn is_recovery_control(method: &str, input: &Value, binding: &Value) -> bool {
-    binding["state"] == "reconciling"
-        && (if crate::runtime::batch::is_sessionless_route(&binding["route"]) {
-            matches!(method, "agent.refresh" | "agent.reconcile")
-                || (binding["route"]["runtime"] == crate::runtime::zed::RUNTIME
-                    && method == "agent.result")
-        } else {
-            binding["native_root_id"].is_string()
-                && (matches!(
-                    method,
-                    "agent.refresh"
-                        | "agent.reply"
-                        | "agent.background"
-                        | "agent.reconcile"
-                        | "agent.result"
-                        | "agent.recover"
-                ) || (method == "agent.goal"
-                    && matches!(input["action"].as_str(), Some("pause" | "clear"))))
-        })
+fn allows_rootless_open_reconcile(
+    db: &Connection,
+    method: &str,
+    input: &Value,
+    binding: &Value,
+    binding_id: &str,
+    generation: i64,
+) -> Result<bool> {
+    if method != "agent.reconcile"
+        || binding["state"] != "reconciling"
+        || binding["native_root_id"].is_string()
+    {
+        return Ok(false);
+    }
+    let target_id = model::text(input, "operation_id")?;
+    let target = operations::get_operation(db, target_id)?;
+    Ok(target["method"] == "agent.open"
+        && target["binding_id"] == binding_id
+        && target["binding_generation"] == generation
+        && matches!(
+            target["state"].as_str(),
+            Some("sending" | "native_accepted" | "outcome_unknown")
+        )
+        && operations::exact_module_recovery_contract(&binding["route"], "agent.open").is_some())
+}
+
+fn is_recovery_control(
+    method: &str,
+    input: &Value,
+    binding: &Value,
+    rootless_open_reconcile: bool,
+) -> bool {
+    if binding["state"] != "reconciling" {
+        return false;
+    }
+    if crate::runtime::batch::is_sessionless_route(&binding["route"]) {
+        return matches!(method, "agent.refresh" | "agent.reconcile")
+            || (binding["route"]["runtime"] == crate::runtime::zed::RUNTIME
+                && method == "agent.result");
+    }
+    rootless_open_reconcile
+        || (binding["native_root_id"].is_string()
+            && (matches!(
+                method,
+                "agent.refresh"
+                    | "agent.reply"
+                    | "agent.background"
+                    | "agent.reconcile"
+                    | "agent.result"
+                    | "agent.recover"
+            ) || (method == "agent.goal"
+                && matches!(input["action"].as_str(), Some("pause" | "clear")))))
 }
 
 pub(super) fn user_command(
@@ -2605,7 +2677,9 @@ fn user_command_with_actor(
     if crate::runtime::batch::is_sessionless_route(&b["route"]) {
         crate::runtime::batch::validate_command(&b["route"], method, v)?;
     }
-    if b["state"] != "ready" && !is_recovery_control(method, v, &b) {
+    let rootless_open_reconcile =
+        allows_rootless_open_reconcile(tx, method, v, &b, id, generation)?;
+    if b["state"] != "ready" && !is_recovery_control(method, v, &b, rootless_open_reconcile) {
         return Err(Error::new(
             "BINDING_NOT_READY",
             "native session is not ready",

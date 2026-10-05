@@ -1357,9 +1357,14 @@ impl Store {
             .await
     }
     pub async fn disconnected(&self, principal: Principal) {
-        let _ = self
+        let changed = self
             .run(move |db| runtime::disconnected(db, &principal))
-            .await;
+            .await
+            .unwrap_or(false);
+        if changed {
+            self.changed
+                .send_modify(|revision| *revision = revision.wrapping_add(1));
+        }
     }
 }
 fn current_principal(db: &Connection, principal: Principal) -> Result<Principal> {

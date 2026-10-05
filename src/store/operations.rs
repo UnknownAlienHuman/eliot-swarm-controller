@@ -46,8 +46,8 @@ pub(super) fn get_operation(db: &Connection, id: &str) -> Result<Value> {
 }
 
 /// Current-manager readback adds bounded startup, bridge-recovery,
-/// native-MCP and workspace-launch diagnostics. Other Operation readers keep
-/// the existing projection and visibility boundary.
+/// module-outcome, native-MCP and workspace-launch diagnostics. Other
+/// Operation readers keep the existing projection and visibility boundary.
 pub(super) fn get_operation_for_current_manager(
     db: &Connection,
     p: &Principal,
@@ -65,6 +65,9 @@ pub(super) fn get_operation_for_current_manager(
     }
     if current_manager && let Some(action) = module_bridge_recovery_action_for_operation(db, id)? {
         operation["module_recovery_action_required"] = action;
+    }
+    if current_manager && let Some(action) = module_outcome_readback_action_for_operation(db, id)? {
+        operation["module_outcome_readback_required"] = action;
     }
     if current_manager && let Some(readback) = native_mcp_readback_for_operation(db, id)? {
         operation["native_mcp_readback"] = readback;
@@ -293,6 +296,117 @@ fn module_bridge_recovery_action_for_operation(
         "next_step":"Read back this exact Operation before deciding whether any new input is appropriate.",
         "readback":{
             "method":"agent.reconcile",
+            "supported_on_exact_route":true,
+            "binding_id":binding_id,
+            "generation":generation,
+            "operation_id":operation_id,
+            "request_template":{
+                "binding_id":binding_id,
+                "generation":generation,
+                "operation_id":operation_id,
+            },
+            "fresh_client_request_id_required":true,
+            "native_replay":false,
+            "unresolved_outcome":"leave_the_original_operation_outcome_unknown_if_readback_cannot_resolve_it",
+            "adapter_boundary":readback_boundary,
+        },
+    })))
+}
+
+/// A disconnected module link makes an admitted Operation's remote effect
+/// uncertain before a replacement bridge has proved owner departure. Keep
+/// that distinction explicit while giving the current Manager an exact,
+/// readback-only reconciliation request for the retained Operation.
+fn module_outcome_readback_action_for_operation(
+    db: &Connection,
+    operation_id: &str,
+) -> Result<Option<Value>> {
+    let operation = get_operation(db, operation_id)?;
+    if operation["state"] != "outcome_unknown" {
+        return Ok(None);
+    }
+    let Some(binding_id) = public_token(&operation["binding_id"]) else {
+        return Ok(None);
+    };
+    let Some(generation) = operation["binding_generation"]
+        .as_i64()
+        .filter(|generation| *generation > 0)
+    else {
+        return Ok(None);
+    };
+    let Some(target_method) = operation["method"].as_str() else {
+        return Ok(None);
+    };
+    let binding = get_binding(db, binding_id, generation)?;
+    if binding["observation"]["recovery_required"] == true
+        || !binding["released_at_ms"].is_null()
+        || binding["module_artifact_id"] != binding["route"]["module_artifact_id"]
+    {
+        return Ok(None);
+    }
+    let Some((runtime, artifact_id, readback_boundary)) =
+        exact_module_recovery_contract(&binding["route"], target_method)
+    else {
+        return Ok(None);
+    };
+    let operation_id = public_token(&operation["operation_id"]);
+    let Some(operation_id) = operation_id else {
+        return Ok(None);
+    };
+    let connection = match binding["observation"]["connection"].as_str() {
+        Some("connected") => "connected",
+        Some("disconnected") => "disconnected",
+        _ => "unknown",
+    };
+    let binding_accepts_readback =
+        matches!(binding["state"].as_str(), Some("ready" | "reconciling"));
+    let available = connection == "connected" && binding_accepts_readback;
+    let boot_id = public_token(&binding["observation"]["bridge_boot_id"]);
+    let (readback_state, readback_availability, reason_code, next_step) = if available {
+        (
+            "readback_ready",
+            "available",
+            "OUTCOME_UNKNOWN",
+            "Read back this exact Operation; do not resend its original input.",
+        )
+    } else if connection == "disconnected" {
+        (
+            "readback_waiting_for_bridge",
+            "waiting_for_module_bridge",
+            "MODULE_BRIDGE_DISCONNECTED",
+            "Wait for this module bridge to reconnect, then read back this exact Operation; do not resend its original input.",
+        )
+    } else {
+        (
+            "readback_waiting_for_binding",
+            "waiting_for_binding_reconciliation",
+            "BINDING_NOT_READY",
+            "Wait for the binding to become ready for readback; do not resend this Operation's original input.",
+        )
+    };
+    Ok(Some(json!({
+        "schema_version":1,
+        "state":readback_state,
+        "operation_id":operation_id,
+        "operation_method":target_method,
+        "operation_state":"outcome_unknown",
+        "binding_id":binding_id,
+        "binding_generation":generation,
+        "runtime":runtime,
+        "module_artifact_id":artifact_id,
+        "bridge_observation":{
+            "connection":connection,
+            "boot_id":boot_id,
+            "owner_departure_verified":false,
+        },
+        "cause":"unknown",
+        "reason_code":reason_code,
+        "native_effect":"unknown",
+        "retry_authorized":false,
+        "next_step":next_step,
+        "readback":{
+            "method":"agent.reconcile",
+            "availability":readback_availability,
             "supported_on_exact_route":true,
             "binding_id":binding_id,
             "generation":generation,
