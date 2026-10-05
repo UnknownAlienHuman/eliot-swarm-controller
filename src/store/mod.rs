@@ -147,7 +147,7 @@ impl StoreOwner {
             message_batch::MAX_BATCH_SIZE,
             writer_lock,
             move || open_database(&writer_root, &credential),
-            |db, job| job(db),
+            |db, job: RunJob| job(db),
             move |db, batch| message_batch::process(db, batch, &writer_config),
         )?;
         match ready_rx.await {

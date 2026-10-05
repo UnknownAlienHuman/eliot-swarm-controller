@@ -13,8 +13,10 @@ boundary of M2; kernel domain handlers and the process split remain unfinished.
 
 Source review, explicit formatting and offline locked workspace metadata are
 the current checks. A missing function-signature delimiter in the draft was
-corrected before publication. The compiler gate for this increment is pending;
-the passing source `042d8b6` gate below predates the actor extraction. No local
+corrected before publication. CI for `8e056a9` compiled the shared actor but
+reported an ambiguous root callback type on both platforms; the callback now
+names its existing `RunJob` type explicitly. The corrected compiler gate is
+pending; the passing source `042d8b6` gate below predates the actor extraction. No local
 compilation, tests, model calls or native process launches were performed.
 
 ### PR #25 Store primitives and module child identity — 2026-10-05
