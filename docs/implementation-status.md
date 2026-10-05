@@ -27,8 +27,12 @@ membership observation do not prove whole-family departure.
 The preceding shared-package correction `43a9b78` passed strict production
 Clippy on remote Ubuntu in [run 37314690538](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37314690538).
 Windows reported an unused Linux-only helper; that helper is now compiled only
-for Linux. The current Store/membership source has metadata, formatting and
-source review evidence, with compilation and native qualification still pending.
+for Linux. Store extraction also left two production imports unused; their
+scope is corrected. Current source `042d8b6` passed the scoped production
+compiler/Clippy gate on Windows and remote Ubuntu in
+[run 37318364299](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37318364299).
+Metadata, formatting and source review also pass; native qualification remains
+pending. This gate did not run full tests or produce a release binary.
 M2 kernel extraction and M3–M6 remain open. No owner-machine Linux/WSL or local
 native/model execution was performed for this increment.
 

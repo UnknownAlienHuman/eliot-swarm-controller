@@ -81,7 +81,10 @@ benchmark. No `cargo clean` or repeated full workspace/release gate is required
 for a writer fragment. Shared changes also require checking actual reverse
 dependencies. See [the modularity program](modularity.md) for M2–M6 acceptance.
 
-Current verification: workspace/lock metadata and explicit package formatting
-pass; source review is separate from compilation and native interoperability.
+Current verification: workspace/lock metadata, explicit package formatting and
+source review pass. Current root source `042d8b6` passed scoped production
+Clippy on Windows and remote Ubuntu in
+[run 37318364299](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37318364299).
+Full tests, release packaging and native interoperability remain separate.
 These five packages do not complete the Store/kernel, bus, supervisor or adapter
 split. They create the shared boundary those modules can consume independently.
