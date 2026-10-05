@@ -193,12 +193,12 @@ pub async fn serve(
     }
     // Admitted application work drains even when the client stops reading/disconnects.
     while requests.join_next().await.is_some() {}
-    store.disconnected(principal).await;
+    let disconnect_result = store.disconnected(principal).await;
     drop(output);
     if !writer_task.is_finished() {
         let _ = writer_task.await;
     }
-    Ok(())
+    disconnect_result
 }
 
 /// Sequential local client. Reuses authentication/framing during a large export.

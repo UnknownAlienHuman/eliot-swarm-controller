@@ -1281,61 +1281,8 @@ async fn run(cli: Cli) -> Result<()> {
             ("gm.handover".into(), value)
         }
     };
-    let is_read = matches!(
-        method.as_str(),
-        "check.get"
-            | "check.profiles"
-            | "host.status"
-            | "doctor.inspect"
-            | "artifact.get"
-            | "artifact.read"
-            | "artifact.parts"
-            | "task.submission"
-            | "task.acceptance"
-            | "task.get"
-            | "task.list"
-            | "attempt.get"
-            | "operation.get"
-            | "operation.list"
-            | "agent.family"
-            | "agent.state"
-            | "agent.list"
-            | "route.list"
-            | "report.delta"
-            | "message.read"
-            | "client.list"
-            | "swarm.context.get"
-            | "coordination.participant.get"
-            | "coordination.participant.list"
-            | "coordination.peer.find"
-            | "coordination.work_card.get"
-            | "coordination.work_card.list"
-            | "coordination.contract_card.get"
-            | "coordination.contract_card.list"
-            | "coordination.inbox"
-            | "swarm.overlap.check"
-            | "review.get"
-            | "review.list"
-            | "swarm.review.context"
-            | "automation.config.get"
-            | "automation.config.preview"
-            | "automation.config.explain"
-            | "swarm.dashboard"
-            | "swarm.launch.preview"
-            | "swarm.queue.get"
-            | "swarm.agent.inspect"
-            | "swarm.exceptions.get"
-            | "coordination.watch.list"
-            | "hook.source.get"
-            | "goal.get"
-            | "goal.list"
-            | "script.validate"
-            | "script.get"
-            | "script.list"
-            | "github.source.inspect"
-            | "github.source.get"
-            | "github.work_pool.preview"
-    );
+    let is_read = eliot_swarm_controller::mcp::application_method_read_only(&method)
+        .unwrap_or(method == "doctor.inspect");
     let is_hook_emit = method == "hook.emit";
     if is_hook_emit && cli.request_id.is_some() {
         return Err(Error::invalid("--request-id is not accepted for hook emit"));

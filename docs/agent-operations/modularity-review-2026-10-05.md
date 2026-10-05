@@ -54,13 +54,16 @@ This contradicts normal Task planning in owner-decisions §5.1 and the manager
 MCP surface. `Principal::require_writer` is broader than a positive manager
 allowlist, so a global replacement with it is not the remedy.
 
-**Change:** one ordinary Operator/Manager admission policy, existing object-owner
-and revision checks, and no native-readiness requirement for Task planning.
+**Change:** one ordinary Operator/Manager admission policy, preserve the existing
+revision check, and add the missing guard against an ordinary Manager revising
+another Manager's unreleased Attempt. No native-readiness requirement for Task planning.
 Keep module/participant/hook/observer roles restricted and current-GM authority
 for genuinely GM-only actions. Define active foreign-Attempt revision behavior
 as in [Modular Runtime §4](modularity.md#4-less-authorization-ceremony-one-effective-policy).
 **Acceptance:** reproduce the table above after the fix; the manager-positive
 calls succeed, unauthorized-role and duplicate-request checks still behave correctly.
+An ordinary Manager's revision of a foreign unreleased Attempt is denied; its
+owner and the explicit current-GM/Operator path retain their documented rights.
 
 ### F2 — High: optional supervisor failure stops the host (source-confirmed)
 

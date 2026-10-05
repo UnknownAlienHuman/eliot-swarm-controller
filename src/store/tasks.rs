@@ -4,7 +4,7 @@ pub(super) mod task_sources;
 use super::{acceptance, meta, operations};
 use crate::{
     error::{Error, Result},
-    model::{self, Principal, StartOwner, TaskSpec},
+    model::{self, Principal, Role, StartOwner, TaskSpec},
     policy,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -66,6 +66,49 @@ fn spec(v: &Value) -> Result<TaskSpec> {
     s.validate()?;
     Ok(s)
 }
+
+/// Task creation and revision are local planning rights shared by Managers
+/// and the pinned local Operator. Do not use `require_writer`: it is a broad
+/// role filter, not this positive method policy.
+fn require_task_planner(principal: &Principal) -> Result<()> {
+    match &principal.role {
+        Role::Operator => principal.require_operator(),
+        Role::Manager => Ok(()),
+        _ => Err(Error::new(
+            "FORBIDDEN",
+            "task planning requires Manager or local Operator authority",
+        )),
+    }
+}
+
+/// A Manager may revise its own live assignment. Reassigning the specification
+/// beneath another Manager's unreleased Attempt is reserved to the current GM
+/// or local Operator; the Attempt snapshot itself remains immutable.
+fn authorize_foreign_live_attempt_revision(
+    tx: &Transaction<'_>,
+    principal: &Principal,
+    task: &Value,
+) -> Result<()> {
+    let Some(attempt_id) = task.get("current_attempt_id").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let attempt = get_attempt(tx, attempt_id)?;
+    if attempt["task_id"] != task["task_id"] || !attempt["released_at_ms"].is_null() {
+        return Err(Error::new(
+            "STORE_INVARIANT",
+            "current Task Attempt pointer is not an unreleased Attempt for this Task",
+        ));
+    }
+    if principal.role == Role::Operator {
+        return Ok(());
+    }
+    let owner_id = model::text(&attempt, "owner_id")?;
+    if principal.client_id != owner_id {
+        super::gm::require_authority(tx, principal)?;
+    }
+    Ok(())
+}
+
 pub(super) fn create(
     tx: &Transaction<'_>,
     p: &Principal,
@@ -73,7 +116,7 @@ pub(super) fn create(
     id: &str,
     now: i64,
 ) -> Result<Value> {
-    p.require_operator()?;
+    require_task_planner(p)?;
     model::fields(
         v,
         &["client_request_id", "project_id", "origin_key", "spec"],
@@ -114,7 +157,7 @@ pub(super) fn revise(
     id: &str,
     now: i64,
 ) -> Result<Value> {
-    p.require_operator()?;
+    require_task_planner(p)?;
     model::fields(
         v,
         &["client_request_id", "task_id", "expected_revision", "spec"],
@@ -126,6 +169,7 @@ pub(super) fn revise(
     if previous["revision"] != expected || previous["state"] == "archived" {
         return Err(Error::new("STALE_REVISION", "Task changed or is archived"));
     }
+    authorize_foreign_live_attempt_revision(tx, p, &previous)?;
     if s.dependencies.iter().any(|d| d.task_id == task_id) {
         return Err(Error::invalid("Task cannot depend on itself"));
     }

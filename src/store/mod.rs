@@ -1356,15 +1356,15 @@ impl Store {
         self.file_io(move |files| files.read(&record, offset, length as usize))
             .await
     }
-    pub async fn disconnected(&self, principal: Principal) {
+    pub async fn disconnected(&self, principal: Principal) -> Result<()> {
         let changed = self
             .run(move |db| runtime::disconnected(db, &principal))
-            .await
-            .unwrap_or(false);
+            .await?;
         if changed {
             self.changed
                 .send_modify(|revision| *revision = revision.wrapping_add(1));
         }
+        Ok(())
     }
 }
 fn current_principal(db: &Connection, principal: Principal) -> Result<Principal> {

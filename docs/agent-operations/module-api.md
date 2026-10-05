@@ -5,6 +5,39 @@ script grant, hook source or Goal record does not itself enable a background
 action. Automation remains manager-owned and must select an enabled entry and
 its typed step; see [automation configuration](configuration.md).
 
+## M1: ordinary Manager Task planning
+
+`task.create` and `task.revise` are local planning methods for an authenticated
+Manager or the pinned local Operator. A current GM already has the ordinary
+Manager role for creation and owner-scoped revision, so those calls do not
+require the Operator credential or a separate GM gate. The narrow foreign-live
+Attempt case below still requires current GM authority. The existing Manager
+and GM MCP profiles expose these methods; the Store policy remains authoritative
+for every caller.
+
+Create preserves the existing TaskSpec validation and origin-key deduplication.
+It starts no worker or native effect. Revision remains compare-and-swap on
+`expected_revision`, preserves the prior Attempt and its frozen Task snapshot,
+and clears current acceptance for the new revision. The current owner may
+revise its live Attempt's Task. A different Manager may revise a Task with an
+unreleased Attempt only while designated current GM; the local Operator may
+also do so. Observer, Participant, hook-source and Module identities remain
+denied. Task planning does not imply Task claim, execution, acceptance or
+publication.
+
+The Store derives the live scope from the Task's current unreleased-Attempt
+pointer and verifies that the Attempt still names this Task and has not been
+released, after the Task revision compare-and-swap check. A Manager who is
+neither that Attempt's owner nor the current GM is denied with `FORBIDDEN`;
+GM-profile tool visibility alone does not satisfy this check. No caller-supplied
+Attempt ID can widen the revision scope, and revision never transfers Attempt
+ownership.
+
+Negative acceptance: an ordinary Manager must receive `FORBIDDEN` when revising
+another Manager's Task while its authoritative Attempt remains unreleased.
+The current GM or local Operator may handle that same foreign scope only with
+the current Task revision; a stale revision remains rejected.
+
 ## O2: one passive notice for an exact reviewed submission
 
 `coordination.watch.create` accepts `watch_kind: "submission_reviewed"` with

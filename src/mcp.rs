@@ -1463,6 +1463,14 @@ pub(crate) fn registered_application_methods() -> Vec<&'static str> {
         .collect()
 }
 
+/// Read/mutation semantics from the same registry used to build tool schemas.
+/// This is parameter preparation metadata, not application authorization.
+pub fn application_method_read_only(method: &str) -> Option<bool> {
+    TOOLS.iter().find_map(|(read_only, spec)| {
+        (spec.method == method && spec.method != "swarm.tools.search").then_some(*read_only)
+    })
+}
+
 fn tool_name(method: &str) -> String {
     method.replace('.', "_")
 }

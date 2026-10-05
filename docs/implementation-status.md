@@ -2,6 +2,29 @@
 
 ## Current state
 
+### PR #25 M1 source: Manager planning and disconnect persistence — 2026-10-05
+
+The modular-runtime specification is merged in `5a35389`. Its first source
+slice admits authenticated Manager and Operator identities to `task.create`
+and `task.revise`. Revision keeps the existing Task compare-and-swap and
+validates the current unreleased Attempt. An ordinary foreign Manager is
+denied; its owner or the explicit current-GM/Operator path may proceed without
+transferring Attempt ownership or changing its frozen snapshot. Native readiness
+does not gate planning.
+
+`Store::disconnected` now returns its persistence error instead of coercing it
+to an unchanged result. IPC drains admitted requests and its response writer,
+then propagates that error to the connection owner. The committed-change wake,
+exact old-link protection and conservative unknown outcome remain intact.
+
+CLI read classification now uses the canonical application registry, fixing
+`report.capacity` and `report.attention` and avoiding a separate read-method
+list. Source review covers this classification and the Manager policy. This
+slice is not yet compiled or runtime-qualified; the small telemetry producer
+and M2 package extraction are still in progress. No local tests/builds were
+requested. Full independent packages, optional-worker isolation, configurable
+live monitoring and the complete hosted workflow remain unfinished.
+
 ### Module disconnect and rootless-open readback — 2026-10-05
 
 The Store implements a durable transition: when the exact module binding
@@ -14,10 +37,13 @@ generation at both admission and dispatch. This does not replay input, infer a
 result or cause, or claim owner departure; the existing replacement-boot and
 verified-departure path remains authoritative for that claim.
 
-The production source and documentation are integrated and passed independent
-source review. This increment has not been locally compiled or runtime-qualified;
-no new local build or test run was requested. The earlier full CI result for
-`db69c178` covers the preceding increment and does not qualify this change.
+The production source and documentation are published in `2aec51bb` and passed
+independent source review and complete Windows and remote Ubuntu CI in
+[run 37298710850](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37298710850).
+No local compilation or test run was requested for this increment. Its Windows
+release executable was retrieved from that exact CI run without rebuilding or
+replacing the installed launcher; native model/workflow qualification remains
+unestablished.
 
 
 ### Universal cancellation events and adapter diagnostics — 2026-10-05
@@ -42,8 +68,10 @@ passed; all 211 source pins remained unchanged. Offline gate
 `d1481ed4-e0d6-44ad-8c63-d0e082839c17` passed Command Code glue/bridge fixtures
 and both changed adapters' syntax, including native auth-error diagnostic
 readback. Antigravity's codec self-test also passed; it does not exercise the
-new stdin-error path. Fresh full CI and native qualification of this increment
-remain pending.
+new stdin-error path. Published `db69c178` passed complete Windows and remote
+Ubuntu CI in
+[run 37293756291](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37293756291).
+Full hosted native workflow qualification remains pending.
 
 Published baseline `821251f` passed complete Windows and remote Ubuntu CI in
 [run 37284559675](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37284559675).
