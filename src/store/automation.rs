@@ -323,6 +323,7 @@ pub(super) fn explain(db: &Connection, p: &Principal, value: &Value) -> Result<V
     let entry = config::load_entry(db, &owner_manager_id, project, automation_id)?
         .ok_or_else(|| Error::new("NOT_FOUND", "automation entry was not found in this scope"))?;
     let state = automation_dispatch::dispatch_state(db, &entry)?;
+    let script_run = automation_dispatch::script_trigger_state(db, &entry)?;
     let work_dispatch = automation_work_dispatch::dispatch_state(db, &entry)?;
     let disposition = review_disposition::disposition_state(db, &entry)?;
     let publication = automation_publication::state(db, &entry)?;
@@ -339,6 +340,7 @@ pub(super) fn explain(db: &Connection, p: &Principal, value: &Value) -> Result<V
         "transfer_lineage":transfer_lineage.iter().rev().collect::<Vec<_>>(),
         "retired_to":retired_to,
         "dispatch":state,
+        "script_run":script_run,
         "work_dispatch":work_dispatch,
         "review_disposition":disposition,
         "publication":publication,

@@ -42,6 +42,11 @@ mod native_mcp;
 #[cfg(test)]
 mod o6_taskless_path_fixture;
 mod opencode;
+#[cfg(test)]
+mod operation_failure_event_fixture;
+mod operation_failure_event_schema;
+#[cfg(test)]
+mod operation_failure_event_schema_fixture;
 mod operations;
 pub(crate) mod participant_credentials;
 mod prerequisites;
@@ -1426,6 +1431,7 @@ fn open_database(root: &Path, credential: &Credential) -> Result<Connection> {
         &["scripts", "script_revisions", "script_runs"],
     )?;
     script_event_schema::install(&tx)?;
+    operation_failure_event_schema::install(&tx)?;
     install_schema_extension(
         &tx,
         "schema_extension:github:v1",
@@ -2241,6 +2247,18 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
 fn timeline_visibility_sql() -> String {
     format!(
         r#"(
+            -- Normalized message lifecycle facts feed the automation bus;
+            -- the public timeline retains one raw mailbox delivery per send.
+            o.source_stream_id != 'controller:messages'
+            AND (
+                o.operation_id IS NULL
+                OR EXISTS (
+                    SELECT 1 FROM operations AS op
+                    WHERE op.operation_id = o.operation_id
+                      AND {OPERATION_VISIBILITY_SQL}
+                )
+            )
+            AND (
             (
                 :mailbox_only = 1
                 AND o.kind IN ('message.send', 'task.feedback', 'check.completed')
@@ -2276,6 +2294,7 @@ fn timeline_visibility_sql() -> String {
                         )
                     )
                 )
+            )
             )
         )"#
     )
@@ -3056,38 +3075,9 @@ fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config
             // silently skips a source row.
             let mut projected = Vec::with_capacity(rows.len());
             for (id, kind, raw, time, operation_id) in rows {
-                let internal_operation = if let Some(operation_id) = operation_id.as_deref() {
-                    db.query_row(
-                        "SELECT caller_id=?2 FROM operations WHERE operation_id=?1",
-                        params![
-                            operation_id,
-                            crate::automation::authorization::AUTOMATION_TECHNICAL_REQUESTER_ID
-                        ],
-                        |row| row.get::<_, bool>(0),
-                    )
-                    .optional()?
-                    .unwrap_or(false)
-                } else {
-                    false
-                };
-                if (internal_operation
-                    || kind.starts_with("coordination.")
-                    || kind.starts_with("review.")
-                    || kind.starts_with("automation.")
-                    || kind.starts_with("script.")
-                    || kind.starts_with("goal.")
-                    || kind.starts_with("hook.")
-                    || kind.starts_with("github.")
-                    || matches!(
-                        kind.as_str(),
-                        "task.request_changes"
-                            | "task.feedback"
-                            | "task.review_stale"
-                            | "check.run"
-                            | "check.cancel"
-                            | "check.completed"
-                    ))
-                    && let Some(operation_id) = operation_id.as_deref()
+                // The SQL predicate scopes every linked fact before paging;
+                // verify retained internal admission links before projecting it.
+                if let Some(operation_id) = operation_id.as_deref()
                     && !operation_visible_to(db, p, operation_id)?
                 {
                     return Err(Error::new(

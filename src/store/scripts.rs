@@ -88,6 +88,20 @@ struct ScriptRunTriggerGrant {
     cause: Value,
 }
 
+struct ScriptTriggerAdmissionFailure {
+    error: Error,
+    failed_script_revision: Option<i64>,
+}
+
+impl From<Error> for ScriptTriggerAdmissionFailure {
+    fn from(error: Error) -> Self {
+        Self {
+            error,
+            failed_script_revision: None,
+        }
+    }
+}
+
 type ScriptRunScopeRow = (String, i64, Option<String>, Option<i64>, Option<String>);
 
 impl Store {
@@ -505,8 +519,9 @@ impl Store {
                     .await?;
                     outcomes.push(json!({"submission_ref":intent.cause["id"],"script_id":intent.script_id,"state":"admitted","operation_id":value["operation_id"]}));
                 }
-                Err(error) if permanent_script_trigger_error(&error) => {
-                    let details = json!({"code":error.code,"message":error.message});
+                Err(failure) if permanent_script_trigger_error(&failure.error) => {
+                    let details =
+                        json!({"code":failure.error.code,"message":failure.error.message});
                     let done = intent.clone();
                     let projection = details.clone();
                     self.run(move |db| {
@@ -522,9 +537,18 @@ impl Store {
                     .await?;
                     outcomes.push(json!({"submission_ref":intent.cause["id"],"script_id":intent.script_id,"state":"rejected","error":details}));
                 }
-                Err(error) if blocked_script_trigger_error(&error) => {
-                    let reason = error.code.clone();
-                    let details = json!({"code":error.code,"message":error.message});
+                Err(failure)
+                    if blocked_script_trigger_error(&failure.error)
+                        && (failure.error.code != "SCRIPT_REGISTRY_DAMAGED"
+                            || failure.failed_script_revision.is_some()) =>
+                {
+                    let reason = failure.error.code.clone();
+                    let failed_script_revision = failure.failed_script_revision;
+                    let mut details =
+                        json!({"code":failure.error.code,"message":failure.error.message});
+                    if let Some(revision) = failed_script_revision {
+                        details["failed_script_revision"] = json!(revision);
+                    }
                     let blocked = intent.clone();
                     let projection = details.clone();
                     self.run(move |db| {
@@ -532,6 +556,7 @@ impl Store {
                             db,
                             &blocked,
                             &reason,
+                            failed_script_revision,
                             projection,
                             model::now_ms()?,
                         )?;
@@ -540,7 +565,7 @@ impl Store {
                     .await?;
                     outcomes.push(json!({"submission_ref":intent.cause["id"],"script_id":intent.script_id,"state":"blocked_pending_revalidation","error":details}));
                 }
-                Err(error) => return Err(error),
+                Err(failure) => return Err(failure.error),
             }
         }
         Ok(json!({"considered":outcomes.len(),"outcomes":outcomes}))
@@ -549,7 +574,7 @@ impl Store {
     async fn admit_script_trigger(
         &self,
         intent: automation_dispatch::ScriptTriggerIntent,
-    ) -> Result<Value> {
+    ) -> std::result::Result<Value, ScriptTriggerAdmissionFailure> {
         let intent_for_prepare = intent.clone();
         let app_config = self.config.clone();
         let (principal, params, grant) = self
@@ -717,8 +742,17 @@ impl Store {
                 Ok((principal, params, ScriptRunTriggerGrant { entry, cause }))
             })
             .await?;
+        let failed_script_revision = grant.cause["script_revision"].as_i64();
         self.run_script_with_trigger(principal, params, Some(grant))
             .await
+            .map_err(|error| ScriptTriggerAdmissionFailure {
+                failed_script_revision: if error.code == "SCRIPT_REGISTRY_DAMAGED" {
+                    failed_script_revision
+                } else {
+                    None
+                },
+                error,
+            })
     }
 
     async fn run_script(&self, principal: Principal, params: Value) -> Result<Value> {
@@ -1479,6 +1513,7 @@ fn blocked_script_trigger_error(error: &Error) -> bool {
             | "ATTEMPT_SCOPE_STALE"
             | "SCRIPT_SCOPE_CHANGED"
             | "SUBMISSION_DAMAGED"
+            | "SCRIPT_REGISTRY_DAMAGED"
     )
 }
 
@@ -1692,8 +1727,24 @@ fn script_head(db: &Connection, script_id: &str) -> Result<(Option<i64>, i64)> {
     .ok_or_else(|| Error::new("NOT_FOUND", "script is not registered"))
 }
 
+/// Called only while decoding a retained revision, never for caller input.
+fn script_revision_integrity_error(error: Error) -> Error {
+    if matches!(
+        error.code.as_str(),
+        "ARTIFACT_DAMAGED" | "SCRIPT_BUNDLE_DAMAGED" | "INVALID_PARAMS"
+    ) {
+        Error::new(
+            "SCRIPT_REGISTRY_DAMAGED",
+            "retained script bundle integrity or metadata is invalid",
+        )
+    } else {
+        error
+    }
+}
+
 fn revision_snapshot(db: &Connection, script_id: &str, revision: i64) -> Result<RevisionSnapshot> {
-    let record = registry::bundle_record(db, script_id, revision)?;
+    let record = registry::bundle_record(db, script_id, revision)
+        .map_err(script_revision_integrity_error)?;
     let (bundle_sha256, interpreter_json, validated_at_ms): (String, String, i64) = db.query_row(
         "SELECT bundle_sha256,interpreter_json,validated_at_ms FROM script_revisions WHERE script_id=?1 AND revision=?2",
         params![script_id, revision],
@@ -1727,6 +1778,23 @@ fn revision_snapshot(db: &Connection, script_id: &str, revision: i64) -> Result<
         interpreter,
         validated_at_ms,
     })
+}
+
+/// Check retained revision metadata for trigger revalidation without reading
+/// bundle files while the dispatcher owns its SQLite transaction.
+pub(super) fn script_trigger_revision_snapshot(
+    db: &Connection,
+    script_id: &str,
+    revision: i64,
+) -> Result<()> {
+    match revision_snapshot(db, script_id, revision) {
+        Ok(_) => Ok(()),
+        Err(error) if error.code == "NOT_FOUND" => Err(Error::new(
+            "SCRIPT_REGISTRY_DAMAGED",
+            "active script revision has no retained bundle",
+        )),
+        Err(error) => Err(error),
+    }
 }
 
 fn insert_revision(
@@ -1781,9 +1849,13 @@ fn verify_revision_files(
     record: &ArtifactRecord,
     expected_interpreter: &manifest::InterpreterIdentity,
 ) -> Result<manifest::ScriptBundle> {
-    let bytes = files.document_bytes(record)?;
-    let bundle = registry::parse_bundle(&bytes, record)?;
-    if bundle.controller_effects != artifact_controller_effects(&record.metadata)? {
+    let bytes = files
+        .document_bytes(record)
+        .map_err(script_revision_integrity_error)?;
+    let bundle = registry::parse_bundle(&bytes, record).map_err(script_revision_integrity_error)?;
+    if bundle.controller_effects
+        != artifact_controller_effects(&record.metadata).map_err(script_revision_integrity_error)?
+    {
         return Err(Error::new(
             "SCRIPT_REGISTRY_DAMAGED",
             "bundle controller effects differ from the retained revision metadata",
@@ -3541,4 +3613,489 @@ pub(super) fn authorize_artifact_read(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod script_trigger_admission_isolation_tests {
+    use crate::{
+        config::Config,
+        model::{self, Credential, Principal},
+        platform::{DataRoot, bootstrap_credential},
+        store::{Store, StoreOwner},
+    };
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use rusqlite::{TransactionBehavior, params};
+    use serde_json::{Value, json};
+    use std::{path::PathBuf, sync::Arc};
+
+    const OWNER_ID: &str = "script-trigger-isolation-owner";
+    const PROJECT_ID: &str = "script-trigger-isolation-project";
+    const DAMAGED_AUTOMATION_ID: &str = "a-script-trigger-isolation-damaged";
+    const HEALTHY_AUTOMATION_ID: &str = "b-script-trigger-isolation-healthy";
+    const DAMAGED_SCRIPT_ID: &str = "a_script_trigger_isolation_damaged";
+    const HEALTHY_SCRIPT_ID: &str = "b_script_trigger_isolation_healthy";
+
+    async fn start_store() -> (StoreOwner, PathBuf, Principal) {
+        let directory = std::env::temp_dir().join(format!(
+            "swarm-script-trigger-isolation-{}",
+            model::new_id()
+        ));
+        std::fs::create_dir_all(&directory).expect("create temporary Store directory");
+        let root = DataRoot::acquire(&directory).expect("acquire temporary Store root");
+        let credential = bootstrap_credential(&root.path).expect("create Operator credential");
+        let mut config = Config::default();
+        config.storage.data_dir = directory.clone();
+        let owner = StoreOwner::start(root, Arc::new(config), credential.clone())
+            .await
+            .expect("start Store");
+        let operator = owner
+            .store
+            .authenticate(credential)
+            .await
+            .expect("authenticate Operator");
+        (owner, directory, operator)
+    }
+
+    async fn register_manager(store: &Store, operator: &Principal) -> Principal {
+        let token = format!("script-trigger-isolation-{}", model::new_id());
+        store
+            .call(
+                operator.clone(),
+                "client.register".into(),
+                json!({
+                    "client_request_id":"script-trigger-isolation-register-manager",
+                    "client_id":OWNER_ID,
+                    "role":"manager",
+                    "token_hash":model::digest(token.as_bytes()),
+                }),
+            )
+            .await
+            .expect("register Manager");
+        store
+            .authenticate(Credential {
+                client_id: OWNER_ID.to_owned(),
+                token,
+            })
+            .await
+            .expect("authenticate Manager")
+    }
+
+    fn powershell_path() -> PathBuf {
+        let executable = if cfg!(windows) { "pwsh.exe" } else { "pwsh" };
+        std::env::var_os("PATH")
+            .into_iter()
+            .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+            .map(|directory| directory.join(executable))
+            .filter_map(|path| std::fs::canonicalize(path).ok())
+            .find(|path| {
+                std::fs::symlink_metadata(path)
+                    .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+            })
+            .expect("pwsh is needed only for retained bundle identity checks")
+    }
+
+    fn script_bundle(script_id: &str) -> Value {
+        json!({
+            "script_id":script_id,
+            "interpreter_kind":"powershell",
+            "interpreter_path":powershell_path(),
+            "entrypoint":"main.ps1",
+            "argv":[],
+            "trust":"trusted_local",
+            "inherit_environment":[],
+            "controller_effects":[],
+            "input_schema":{"type":"object","properties":{},"required":[],"additional_properties":true},
+            "result_schema":{"type":"null"},
+            "files":[{"path":"main.ps1","content_base64":STANDARD.encode(b"Write-Output {}")}],
+        })
+    }
+
+    async fn register_active_script(store: &Store, manager: &Principal, script_id: &str) {
+        let bundle = script_bundle(script_id);
+        store
+            .call(
+                manager.clone(),
+                "script.register".into(),
+                json!({
+                    "client_request_id":format!("register-{script_id}"),
+                    "bundle":bundle,
+                }),
+            )
+            .await
+            .expect("register bundle without executing it");
+        store
+            .call(
+                manager.clone(),
+                "script.activate".into(),
+                json!({
+                    "client_request_id":format!("activate-{script_id}"),
+                    "script_id":script_id,
+                    "revision":1,
+                }),
+            )
+            .await
+            .expect("activate immutable revision");
+    }
+
+    async fn configure_trigger(
+        store: &Store,
+        manager: &Principal,
+        automation_id: &str,
+        script_id: &str,
+    ) {
+        let changes = json!([{
+            "automation_id":automation_id,
+            "expected_revision":0,
+            "include_existing":false,
+            "patch":{
+                "enabled":true,
+                "steps":["script_run"],
+                "script_run":{"script_id":script_id},
+                "event_rules":[{
+                    "source_id":"controller:host-lifecycle",
+                    "event_kind":"host.interrupted",
+                    "status":"unknown",
+                    "action":"script_run",
+                }],
+            },
+        }]);
+        let preview = store
+            .call(
+                manager.clone(),
+                "automation.config.preview".into(),
+                json!({"project_id":PROJECT_ID,"changes":changes}),
+            )
+            .await
+            .expect("preview ScriptRun automation");
+        assert_eq!(preview["valid"], true, "{preview}");
+        store
+            .call(
+                manager.clone(),
+                "automation.config.apply".into(),
+                json!({
+                    "client_request_id":format!("apply-{automation_id}"),
+                    "project_id":PROJECT_ID,
+                    "changes":changes,
+                    "preview_digest":preview["plan_sha256"],
+                }),
+            )
+            .await
+            .expect("apply ScriptRun automation");
+    }
+
+    async fn record_interruption(store: &Store) {
+        store
+            .run(|db| {
+                let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                crate::store::set_meta(&tx, "host_epoch", &json!(2))?;
+                crate::store::set_meta(
+                    &tx,
+                    "host:lifecycle:v1",
+                    &json!({
+                        "schema_version":1,
+                        "host_epoch":1,
+                        "state":"running",
+                        "started_at_ms":1,
+                        "updated_at_ms":1,
+                    }),
+                )?;
+                tx.commit()?;
+                Ok(())
+            })
+            .await
+            .expect("seed prior running host receipt");
+        store
+            .record_host_start()
+            .await
+            .expect("record host restart");
+    }
+
+    async fn explain_trigger(store: &Store, manager: &Principal, automation_id: &str) -> Value {
+        store
+            .call(
+                manager.clone(),
+                "automation.config.explain".into(),
+                json!({
+                    "project_id":PROJECT_ID,
+                    "automation_id":automation_id,
+                }),
+            )
+            .await
+            .expect("read manager-scoped ScriptRun explanation")
+    }
+
+    enum Damage {
+        RevisionReceipt,
+        BundleBytes,
+        BundleJson,
+        ArtifactMetadata,
+    }
+
+    #[tokio::test]
+    async fn damaged_script_trigger_is_held_and_healthy_neighbor_is_admitted() {
+        assert_damaged_script_trigger_isolated(Damage::RevisionReceipt).await;
+    }
+
+    #[tokio::test]
+    async fn damaged_bundle_bytes_are_isolated_and_recover_on_new_revision() {
+        assert_damaged_script_trigger_isolated(Damage::BundleBytes).await;
+    }
+
+    #[tokio::test]
+    async fn malformed_retained_bundle_is_isolated_and_recoverable() {
+        assert_damaged_script_trigger_isolated(Damage::BundleJson).await;
+    }
+
+    #[tokio::test]
+    async fn invalid_artifact_metadata_is_isolated_and_recoverable() {
+        assert_damaged_script_trigger_isolated(Damage::ArtifactMetadata).await;
+    }
+
+    async fn assert_damaged_script_trigger_isolated(damage: Damage) {
+        // This fixture exercises Store admission only. The host's separate
+        // `supervise_scripts` worker is not started, so no interpreter launches.
+        let (owner, directory, operator) = start_store().await;
+        let manager = register_manager(&owner.store, &operator).await;
+        owner
+            .store
+            .call(
+                operator,
+                "gm.handover".into(),
+                json!({
+                    "client_request_id":"script-trigger-isolation-handover",
+                    "client_id":OWNER_ID,
+                }),
+            )
+            .await
+            .expect("designate fixture Manager");
+
+        register_active_script(&owner.store, &manager, DAMAGED_SCRIPT_ID).await;
+        register_active_script(&owner.store, &manager, HEALTHY_SCRIPT_ID).await;
+        configure_trigger(
+            &owner.store,
+            &manager,
+            DAMAGED_AUTOMATION_ID,
+            DAMAGED_SCRIPT_ID,
+        )
+        .await;
+        configure_trigger(
+            &owner.store,
+            &manager,
+            HEALTHY_AUTOMATION_ID,
+            HEALTHY_SCRIPT_ID,
+        )
+        .await;
+        owner
+            .store
+            .record_host_start()
+            .await
+            .expect("record host start");
+        owner
+            .store
+            .record_host_ready()
+            .await
+            .expect("record host ready");
+
+        let corrupt_script = DAMAGED_SCRIPT_ID.to_owned();
+        match damage {
+            Damage::RevisionReceipt | Damage::ArtifactMetadata => {
+                let metadata = matches!(damage, Damage::ArtifactMetadata);
+                let rows = owner.store.run(move |db| {
+                    if metadata {
+                        Ok(db.execute(
+                            // The schema rejects malformed JSON. A valid JSON
+                            // value with the wrong shape still represents a
+                            // reachable retained-metadata integrity failure.
+                            "UPDATE artifacts SET metadata_json='[]' WHERE artifact_id=(SELECT bundle_ref FROM script_revisions WHERE script_id=?1 AND revision=1)",
+                            [corrupt_script],
+                        )?)
+                    } else {
+                        Ok(db.execute(
+                            "UPDATE script_revisions SET bundle_sha256=?1 WHERE script_id=?2 AND revision=1",
+                            params!["0".repeat(64), corrupt_script],
+                        )?)
+                    }
+                }).await.expect("corrupt only the selected retained revision");
+                assert_eq!(rows, 1);
+            }
+            Damage::BundleBytes | Damage::BundleJson => {
+                let change_digest = matches!(damage, Damage::BundleJson);
+                let relative_path: String = owner.store.run(move |db| {
+                    let path = db.query_row(
+                        "SELECT a.relative_path FROM artifacts a JOIN script_revisions r ON r.bundle_ref=a.artifact_id WHERE r.script_id=?1 AND r.revision=1",
+                        [&corrupt_script], |row| row.get(0),
+                    )?;
+                    if change_digest {
+                        let digest = model::digest(b"{");
+                        db.execute("UPDATE artifacts SET byte_length=1,content_digest=?1,metadata_json=json_set(metadata_json,'$.bundle_sha256',?1) WHERE artifact_id=(SELECT bundle_ref FROM script_revisions WHERE script_id=?2 AND revision=1)", params![digest,corrupt_script])?;
+                        db.execute("UPDATE script_revisions SET bundle_sha256=?1 WHERE script_id=?2 AND revision=1",params![digest,corrupt_script])?;
+                    }
+                    Ok(path)
+                }).await.expect("read exact owned bundle identity");
+                let path = std::fs::canonicalize(directory.join(relative_path)).unwrap();
+                assert!(path.starts_with(std::fs::canonicalize(&directory).unwrap()));
+                std::fs::write(path, b"{").expect("corrupt only the owned fixture bundle");
+            }
+        }
+        record_interruption(&owner.store).await;
+
+        let pass = owner
+            .store
+            .reconcile_automations_once()
+            .await
+            .expect("one damaged trigger must not fail host reconciliation");
+        assert_eq!(pass["script_run"]["considered"], 2, "{pass}");
+        let outcomes = pass["script_run"]["outcomes"].as_array().unwrap();
+        let damaged_outcome = outcomes
+            .iter()
+            .find(|outcome| outcome["script_id"] == DAMAGED_SCRIPT_ID)
+            .expect("damaged trigger outcome");
+        assert_eq!(damaged_outcome["state"], "blocked_pending_revalidation");
+        assert_eq!(damaged_outcome["error"]["code"], "SCRIPT_REGISTRY_DAMAGED");
+        let healthy_outcome = outcomes
+            .iter()
+            .find(|outcome| outcome["script_id"] == HEALTHY_SCRIPT_ID)
+            .expect("unrelated healthy trigger outcome");
+        assert_eq!(healthy_outcome["state"], "admitted");
+        let healthy_operation_id = healthy_outcome["operation_id"].clone();
+
+        let damaged_state =
+            explain_trigger(&owner.store, &manager, DAMAGED_AUTOMATION_ID).await["script_run"]
+                .clone();
+        let pending = damaged_state["pending"].as_array().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0]["held"], true);
+        assert_eq!(
+            pending[0]["held_reason"],
+            "admission_revalidation:script_registry_damaged:revision:1"
+        );
+        let damaged_history = damaged_state["recent"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["script_id"] == DAMAGED_SCRIPT_ID)
+            .expect("persisted held history");
+        assert_eq!(
+            damaged_history["disposition"],
+            "blocked_pending_current_authorization"
+        );
+        assert_eq!(
+            damaged_history["details"]["code"],
+            "SCRIPT_REGISTRY_DAMAGED"
+        );
+
+        let healthy_state =
+            explain_trigger(&owner.store, &manager, HEALTHY_AUTOMATION_ID).await["script_run"]
+                .clone();
+        assert_eq!(healthy_state["pending"].as_array().unwrap().len(), 0);
+        let healthy_history = healthy_state["recent"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["script_id"] == HEALTHY_SCRIPT_ID)
+            .expect("persisted admitted history");
+        assert_eq!(healthy_history["disposition"], "admitted");
+        assert_eq!(
+            healthy_history["details"]["operation_id"],
+            healthy_operation_id
+        );
+        assert_eq!(damaged_history["details"]["failed_script_revision"], 1);
+
+        let damaged_id = DAMAGED_SCRIPT_ID.to_owned();
+        let healthy_id = HEALTHY_SCRIPT_ID.to_owned();
+        let (damaged_runs, healthy_runs) = owner
+            .store
+            .run(move |db| {
+                let damaged: i64 = db.query_row(
+                    "SELECT COUNT(*) FROM script_runs WHERE script_id=?1",
+                    [&damaged_id],
+                    |row| row.get(0),
+                )?;
+                let healthy: i64 = db.query_row(
+                    "SELECT COUNT(*) FROM script_runs WHERE script_id=?1",
+                    [&healthy_id],
+                    |row| row.get(0),
+                )?;
+                Ok((damaged, healthy))
+            })
+            .await
+            .expect("read admitted script runs");
+        assert_eq!(damaged_runs, 0);
+        assert_eq!(healthy_runs, 1);
+
+        let replay = owner
+            .store
+            .reconcile_automations_once()
+            .await
+            .expect("held trigger remains durably withheld");
+        assert_eq!(replay["script_run"]["considered"], 0, "{replay}");
+
+        owner
+            .store
+            .call(
+                manager.clone(),
+                "script.revise".into(),
+                json!({
+                    "client_request_id":"script-trigger-isolation-repair-revision",
+                    "script_id":DAMAGED_SCRIPT_ID,
+                    "expected_revision":1,
+                    "bundle":script_bundle(DAMAGED_SCRIPT_ID),
+                }),
+            )
+            .await
+            .expect("publish a replacement immutable revision");
+        owner
+            .store
+            .call(
+                manager.clone(),
+                "script.activate".into(),
+                json!({
+                    "client_request_id":"script-trigger-isolation-activate-repair-revision",
+                    "script_id":DAMAGED_SCRIPT_ID,
+                    "revision":2,
+                }),
+            )
+            .await
+            .expect("activate the repaired immutable revision");
+        let recovered = owner
+            .store
+            .reconcile_automations_once()
+            .await
+            .expect("a valid replacement revision releases the held trigger");
+        assert_eq!(recovered["script_run"]["considered"], 1, "{recovered}");
+        assert_eq!(recovered["script_run"]["outcomes"][0]["state"], "admitted");
+        assert_eq!(
+            recovered["script_run"]["outcomes"][0]["script_id"],
+            DAMAGED_SCRIPT_ID
+        );
+        let recovered_state = explain_trigger(&owner.store, &manager, DAMAGED_AUTOMATION_ID).await
+            ["script_run"]
+            .clone();
+        assert!(recovered_state["pending"].as_array().unwrap().is_empty());
+        assert!(
+            recovered_state["recent"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|event| {
+                    event["script_id"] == DAMAGED_SCRIPT_ID && event["disposition"] == "admitted"
+                })
+        );
+        let (admitted_runs, started_runs) = owner
+            .store
+            .run(|db| {
+                let counts = db.query_row(
+                    "SELECT COUNT(*),COUNT(started_at_ms) FROM script_runs",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )?;
+                Ok(counts)
+            })
+            .await
+            .expect("read queued runs without starting the script supervisor");
+        assert_eq!(admitted_runs, 2);
+        assert_eq!(started_runs, 0);
+        owner.close().await.expect("close temporary Store");
+        std::fs::remove_dir_all(directory).expect("remove owned temporary Store directory");
+    }
 }

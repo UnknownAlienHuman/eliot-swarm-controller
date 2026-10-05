@@ -386,10 +386,15 @@ fn configure_script_trigger_activation(
         &after.project_id,
         &after.automation_id,
     )?;
-    let mut state = match load_script_trigger_state(tx, after)? {
-        Some(state) => state,
-        None => empty_script_trigger_state(after, cut, now_ms),
-    };
+    let existing_state = load_script_trigger_state(tx, after)?;
+    // Do not create a new ScriptRun ledger for entries that have never selected
+    // ScriptRun. Existing disabled or removed-route ledgers still go through
+    // the lifecycle below and remain available for transfer/history.
+    if !had && !has && existing_state.is_none() {
+        return Ok(());
+    }
+    let mut state =
+        existing_state.unwrap_or_else(|| empty_script_trigger_state(after, cut, now_ms));
     if !has {
         for pending in &mut state.pending {
             pending.held = true;
@@ -572,6 +577,17 @@ pub(super) fn dispatch_state(db: &rusqlite::Connection, entry: &AutomationEntry)
         )
     })?;
     Ok(state_projection(&state))
+}
+
+/// Read the existing bounded journal without creating or advancing a cursor.
+pub(super) fn script_trigger_state(
+    db: &rusqlite::Connection,
+    entry: &AutomationEntry,
+) -> Result<Value> {
+    Ok(load_script_trigger_state(db, entry)?
+        .map(serde_json::to_value)
+        .transpose()?
+        .unwrap_or(Value::Null))
 }
 
 /// Shared-reconciler entry point. A bounded global keyset cursor prevents one
@@ -1219,7 +1235,18 @@ fn script_event_projections_with_alias(
     if direct.occurrence_phase.is_some() && direct.occurrence_id.is_some() {
         return Ok(vec![direct]);
     }
-    let aliases = raw_safe_event_aliases(event);
+    let aliases = match raw_runtime_outcome_kind(db, event)? {
+        Some(RawRuntimeOutcomeKind::Applied | RawRuntimeOutcomeKind::Rejected) => {
+            raw_safe_event_aliases(event)
+        }
+        Some(RawRuntimeOutcomeKind::Unknown) => vec![(
+            "controller:operations",
+            "operation.outcome_unknown",
+            "operation_outcome_unknown",
+        )],
+        Some(RawRuntimeOutcomeKind::Accepted | RawRuntimeOutcomeKind::Invalid) => Vec::new(),
+        None => raw_safe_event_aliases(event),
+    };
     let expected_occurrence =
         if event.source_id == "controller:host-lifecycle" && event.event_kind == "host.exit" {
             automation_intake::host_exit_occurrence_projection(db, event)?.occurrence_id
@@ -1373,6 +1400,60 @@ fn raw_safe_event_aliases(
         )],
         _ => Vec::new(),
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RawRuntimeOutcomeKind {
+    Accepted,
+    Applied,
+    Rejected,
+    Unknown,
+    Invalid,
+}
+
+/// Classify only the persisted closed RuntimeOutcome enum. Its details remain
+/// unread by the selector and are never included in the resulting cause.
+fn raw_runtime_outcome_kind(
+    db: &Connection,
+    event: &crate::automation::intake::ObservedEvent,
+) -> Result<Option<RawRuntimeOutcomeKind>> {
+    if !event.source_id.starts_with("module:") || event.event_kind != "runtime.outcome" {
+        return Ok(None);
+    }
+    let Some(operation_id) = event.operation_id.as_deref() else {
+        return Ok(Some(RawRuntimeOutcomeKind::Invalid));
+    };
+    let raw: Option<String> = db
+        .query_row(
+            "SELECT payload_json FROM observations \
+             WHERE observation_id=?1 AND source_stream_id=?2 AND kind=?3 AND operation_id=?4",
+            params![
+                event.observation_id,
+                event.source_id,
+                event.event_kind,
+                operation_id
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(raw) = raw else {
+        return Ok(Some(RawRuntimeOutcomeKind::Invalid));
+    };
+    let value: Value = match serde_json::from_str(&raw) {
+        Ok(value) => value,
+        Err(_) => return Ok(Some(RawRuntimeOutcomeKind::Invalid)),
+    };
+    if value["operation_id"].as_str() != Some(operation_id) {
+        return Ok(Some(RawRuntimeOutcomeKind::Invalid));
+    }
+    let outcome = match value["outcome"].as_str() {
+        Some("accepted") => RawRuntimeOutcomeKind::Accepted,
+        Some("applied") => RawRuntimeOutcomeKind::Applied,
+        Some("rejected") => RawRuntimeOutcomeKind::Rejected,
+        Some("unknown") => RawRuntimeOutcomeKind::Unknown,
+        _ => RawRuntimeOutcomeKind::Invalid,
+    };
+    Ok(Some(outcome))
 }
 
 pub(crate) struct ScriptEventInvocationContext {
@@ -2212,6 +2293,7 @@ pub(crate) fn hold_script_trigger(
     db: &rusqlite::Connection,
     intent: &ScriptTriggerIntent,
     reason: &str,
+    failed_script_revision: Option<i64>,
     details: Value,
     now_ms: i64,
 ) -> Result<()> {
@@ -2241,10 +2323,16 @@ pub(crate) fn hold_script_trigger(
         return Ok(());
     };
     pending.held = true;
-    pending.held_reason = Some(format!(
-        "admission_revalidation:{}",
-        reason.to_ascii_lowercase()
-    ));
+    pending.held_reason = Some(if reason == "SCRIPT_REGISTRY_DAMAGED" {
+        script_registry_hold_reason(failed_script_revision.ok_or_else(|| {
+            Error::new(
+                "SCRIPT_TRIGGER_REVISION_UNKNOWN",
+                "damaged script trigger has no captured revision identity",
+            )
+        })?)
+    } else {
+        format!("admission_revalidation:{}", reason.to_ascii_lowercase())
+    });
     remember_script_trigger_recent(
         &mut state,
         json!({
@@ -2358,7 +2446,7 @@ fn select_enabled_entry_keys_before(
         return Ok(Vec::new());
     }
     let mut statement = db.prepare(
-        "SELECT key FROM meta WHERE key LIKE ?1 AND key>?2 AND key<?3 \
+        "SELECT key FROM meta WHERE key LIKE ?1 AND key>?2 AND key<=?3 \
          AND json_extract(value_json,'$.record.enabled')=1 \
          AND EXISTS(SELECT 1 FROM json_each(value_json,'$.record.steps') AS step \
                     WHERE step.value IN ('review_dispatch','script_run')) \
@@ -3795,7 +3883,7 @@ pub(super) fn relocate_state(
     tx: &Transaction<'_>,
     former: &AutomationEntry,
     new: &AutomationEntry,
-) -> Result<()> {
+) -> Result<bool> {
     config::validate_entry(former)?;
     config::validate_entry(new)?;
     if former.owner_manager_id == new.owner_manager_id
@@ -3853,7 +3941,9 @@ pub(super) fn relocate_state(
         &new.project_id,
         &new.automation_id,
     )?;
-    if let Some(record) = config::read_record(tx, &script_source_key, "ScriptRun trigger cursor")? {
+    let script_record = config::read_record(tx, &script_source_key, "ScriptRun trigger cursor")?;
+    let script_journal_relocated = script_record.is_some();
+    if let Some(record) = script_record {
         let mut script_state: ScriptTriggerState =
             serde_json::from_value(record).map_err(|_| {
                 Error::new(
@@ -3946,7 +4036,7 @@ pub(super) fn relocate_state(
             ));
         }
     }
-    Ok(())
+    Ok(script_journal_relocated)
 }
 
 fn revalidate_script_trigger_intents(
@@ -4014,12 +4104,74 @@ fn script_trigger_hold_is_revalidatable(reason: Option<&str>) -> bool {
     })
 }
 
+const SCRIPT_REGISTRY_HOLD_PREFIX: &str =
+    "admission_revalidation:script_registry_damaged:revision:";
+
+fn script_registry_hold_reason(revision: i64) -> String {
+    format!("{SCRIPT_REGISTRY_HOLD_PREFIX}{revision}")
+}
+
+fn script_registry_hold_revision(reason: Option<&str>) -> Result<Option<i64>> {
+    let Some(revision) = reason.and_then(|reason| reason.strip_prefix(SCRIPT_REGISTRY_HOLD_PREFIX))
+    else {
+        return Ok(None);
+    };
+    let revision = revision
+        .parse::<i64>()
+        .ok()
+        .filter(|revision| *revision > 0)
+        .ok_or_else(|| {
+            Error::new(
+                "AUTOMATION_CURSOR_CORRUPT",
+                "held ScriptRun registry revision identity is invalid",
+            )
+        })?;
+    Ok(Some(revision))
+}
+
 fn script_trigger_block_reason(
     tx: &Transaction<'_>,
     entry: &AutomationEntry,
     pending: &PendingScriptTrigger,
     app_config: &Config,
 ) -> Result<Option<String>> {
+    let active_revision: Option<i64> = tx
+        .query_row(
+            "SELECT active_revision FROM scripts WHERE script_id=?1",
+            [&pending.script_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    if let Some(failed_revision) = script_registry_hold_revision(pending.held_reason.as_deref())? {
+        let Some(active_revision) = active_revision else {
+            return Ok(Some(script_registry_hold_reason(failed_revision)));
+        };
+        if active_revision == failed_revision {
+            match super::scripts::script_trigger_revision_snapshot(
+                tx,
+                &pending.script_id,
+                active_revision,
+            ) {
+                Ok(()) => return Ok(Some(script_registry_hold_reason(failed_revision))),
+                Err(error) if error.code == "SCRIPT_REGISTRY_DAMAGED" => {
+                    return Ok(Some(script_registry_hold_reason(failed_revision)));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        match super::scripts::script_trigger_revision_snapshot(
+            tx,
+            &pending.script_id,
+            active_revision,
+        ) {
+            Ok(()) => {}
+            Err(error) if error.code == "SCRIPT_REGISTRY_DAMAGED" => {
+                return Ok(Some(script_registry_hold_reason(active_revision)));
+            }
+            Err(error) => return Err(error),
+        }
+    }
     if !entry.script_run_ready() {
         return Ok(Some("script_action_or_route_not_selected".to_owned()));
     }
@@ -4061,14 +4213,6 @@ fn script_trigger_block_reason(
             "script_owner_does_not_match_current_manager".to_owned(),
         ));
     }
-    let active_revision: Option<i64> = tx
-        .query_row(
-            "SELECT active_revision FROM scripts WHERE script_id=?1",
-            [&pending.script_id],
-            |row| row.get(0),
-        )
-        .optional()?
-        .flatten();
     if active_revision.is_none() {
         return Ok(Some("script_revision_not_active".to_owned()));
     }
@@ -4659,6 +4803,130 @@ mod script_event_trigger_tests {
         assert_eq!(
             script_runs, 0,
             "event projection must not itself admit a run"
+        );
+    }
+
+    #[test]
+    fn raw_runtime_unknown_aliases_only_the_exact_operation_unknown_occurrence() {
+        let (mut db, _, _, _, _) = fixture();
+        let tx = db.transaction().unwrap();
+        let raw_unknown = insert_event(
+            &tx,
+            "module:runtime-fixture",
+            "outcome-unknown-raw",
+            "runtime.outcome",
+            json!({
+                "operation_id": OPERATION_ID,
+                "outcome": "unknown",
+                "details": {"private_native_detail":"must not escape"}
+            }),
+        );
+        let raw_applied = insert_event(
+            &tx,
+            "module:runtime-fixture",
+            "outcome-applied-raw",
+            "runtime.outcome",
+            json!({
+                "operation_id": OPERATION_ID,
+                "outcome": "applied",
+                "details": {"private_native_detail":"must not escape"}
+            }),
+        );
+        let raw_accepted = insert_event(
+            &tx,
+            "module:runtime-fixture",
+            "outcome-accepted-raw",
+            "runtime.outcome",
+            json!({
+                "operation_id": OPERATION_ID,
+                "outcome": "accepted",
+                "details": {"private_native_detail":"must not escape"}
+            }),
+        );
+        let operation_unknown = insert_event(
+            &tx,
+            "controller:operations",
+            &format!("operation:{OPERATION_ID}:operation_outcome_unknown"),
+            "operation.outcome_unknown",
+            json!({
+                "schema_version":1,
+                "phase":"operation_outcome_unknown",
+                "status":"unknown",
+                "occurrence_id":format!("operation:{OPERATION_ID}:operation_outcome_unknown"),
+                "error_code":"OUTCOME_UNKNOWN"
+            }),
+        );
+        let native_applied = insert_event(
+            &tx,
+            "controller:runtime",
+            &format!("terminal:{OPERATION_ID}"),
+            "native.operation.completed",
+            json!({
+                "schema_version":1,
+                "phase":"native_outcome_terminal",
+                "status":"applied",
+                "occurrence_id":format!("operation:{OPERATION_ID}:native_outcome_terminal")
+            }),
+        );
+        tx.commit().unwrap();
+
+        let observed = |observation_id| {
+            automation_intake::observed_event_by_id(&db, observation_id)
+                .unwrap()
+                .unwrap()
+        };
+        let unknown_event = observed(raw_unknown);
+        let unknown_projections = script_event_projections_with_alias(&db, &unknown_event).unwrap();
+        assert_eq!(unknown_projections.len(), 1);
+        assert_eq!(unknown_projections[0].status, Some(EventStatus::Unknown));
+        assert_eq!(
+            unknown_projections[0].error_code.as_deref(),
+            Some("OUTCOME_UNKNOWN")
+        );
+        assert_eq!(
+            unknown_projections[0].occurrence_phase.as_deref(),
+            Some("operation_outcome_unknown")
+        );
+        assert!(!format!("{:?}", unknown_projections[0]).contains("must not escape"));
+        assert_eq!(
+            unknown_projections[0].occurrence_id.as_deref(),
+            Some(format!("operation:{OPERATION_ID}:operation_outcome_unknown").as_str())
+        );
+        assert_eq!(
+            system_event_semantic_id(raw_unknown, &unknown_projections[0]).unwrap(),
+            system_event_semantic_id(
+                operation_unknown,
+                &automation_intake::safe_event_projection(&db, &observed(operation_unknown))
+                    .unwrap()
+            )
+            .unwrap()
+        );
+
+        let applied_event = observed(raw_applied);
+        let applied_projections = script_event_projections_with_alias(&db, &applied_event).unwrap();
+        assert_eq!(applied_projections.len(), 1);
+        assert_eq!(
+            applied_projections[0].occurrence_phase.as_deref(),
+            Some("native_outcome_terminal")
+        );
+        assert_eq!(
+            applied_projections[0].occurrence_id.as_deref(),
+            Some(format!("operation:{OPERATION_ID}:native_outcome_terminal").as_str())
+        );
+
+        let accepted_event = observed(raw_accepted);
+        assert!(
+            script_event_projections_with_alias(&db, &accepted_event)
+                .unwrap()
+                .is_empty()
+        );
+        assert_ne!(
+            unknown_projections[0].occurrence_phase.as_deref(),
+            automation_intake::safe_event_projection(&db, &observed(native_applied))
+                .unwrap()
+                .occurrence_phase
+                .as_deref(),
+            "unknown native outcome must never acquire the completion phase"
         );
     }
 }

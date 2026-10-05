@@ -184,8 +184,8 @@ mod tests {
         });
         let rejected = json!({
             "client_request_id":"rejected-request",
-            "recipient":"unknown",
-            "text":"domain rejection"
+            "recipient":"private-receiver-sentinel",
+            "text":"private-body-sentinel"
         });
         let following = json!({
             "client_request_id":"following-request",
@@ -206,12 +206,26 @@ mod tests {
 
         let first_reply = replies[0].as_ref().unwrap();
         assert_eq!(replies[1].as_ref().unwrap(), first_reply);
+        let first_operation_id = first_reply["operation_id"]
+            .as_str()
+            .expect("first send Operation")
+            .to_owned();
+        assert_eq!(
+            replies[1].as_ref().unwrap()["operation_id"].as_str(),
+            Some(first_operation_id.as_str()),
+            "an exact request replay returns the original receipt"
+        );
         assert_eq!(replies[2].as_ref().unwrap_err().code, "REQUEST_ID_CONFLICT");
         assert_eq!(replies[3].as_ref().unwrap_err().code, "NOT_FOUND");
         assert!(
             replies[4].is_ok(),
             "a later valid send survives item errors"
         );
+        let following_operation_id = replies[4].as_ref().unwrap()["operation_id"]
+            .as_str()
+            .expect("following send Operation")
+            .to_owned();
+        assert_ne!(first_operation_id, following_operation_id);
 
         let operations: i64 = db
             .query_row(
@@ -220,22 +234,115 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        let observations: i64 = db
-            .query_row("SELECT count(*) FROM observations", [], |row| row.get(0))
-            .unwrap();
-        let rejected_state: String = db
+        let (rejected_operation_id, rejected_state): (String, String) = db
             .query_row(
-                "SELECT state FROM operations WHERE caller_id='alice' AND client_request_id='rejected-request'",
+                "SELECT operation_id,state FROM operations WHERE caller_id='alice' AND client_request_id='rejected-request'",
                 [],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
+        let observations = {
+            let mut statement = db
+                .prepare(
+                    "SELECT source_stream_id,source_event_key,operation_id,kind,payload_json \
+                     FROM observations ORDER BY observation_id",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
         assert_eq!(operations, 3, "exact replay and conflict add no operation");
         assert_eq!(
-            observations, 2,
-            "only successful first admissions retain observations"
+            observations.len(),
+            5,
+            "two successful sends retain raw and normalized facts; rejection retains one safe fact"
         );
         assert_eq!(rejected_state, "rejected");
+
+        for operation_id in [&first_operation_id, &following_operation_id] {
+            let facts: Vec<_> = observations
+                .iter()
+                .filter(|fact| fact.2.as_str() == operation_id.as_str())
+                .collect();
+            assert_eq!(
+                facts.len(),
+                2,
+                "one raw and one normalized send fact per receipt"
+            );
+            let raw = facts
+                .iter()
+                .find(|fact| fact.0.as_str() == "controller")
+                .expect("raw Operation receipt fact");
+            assert_eq!(raw.1.as_str(), operation_id.as_str());
+            assert_eq!(raw.3, "message.send");
+            let normalized = facts
+                .iter()
+                .find(|fact| fact.0.as_str() == "controller:messages")
+                .expect("normalized message-sent fact");
+            assert_eq!(normalized.1, format!("sent:{operation_id}"));
+            assert_eq!(normalized.3, "message.sent");
+            let payload: serde_json::Value =
+                serde_json::from_str(&normalized.4).expect("normalized event JSON");
+            assert_eq!(
+                payload,
+                json!({
+                    "schema_version":1,
+                    "phase":"message_send_committed",
+                    "status":"sent",
+                    "occurrence_id":format!("operation:{operation_id}:message_send_committed"),
+                })
+            );
+        }
+
+        let rejected_facts: Vec<_> = observations
+            .iter()
+            .filter(|fact| fact.2.as_str() == rejected_operation_id.as_str())
+            .collect();
+        assert_eq!(
+            rejected_facts.len(),
+            1,
+            "one rejected receipt, one safe failure fact"
+        );
+        let rejected_fact = rejected_facts[0];
+        assert_eq!(rejected_fact.0, "controller:operations");
+        assert_eq!(
+            rejected_fact.1,
+            format!("operation:{rejected_operation_id}:operation_rejected")
+        );
+        assert_eq!(rejected_fact.3, "operation.rejected");
+        let rejected_payload: serde_json::Value =
+            serde_json::from_str(&rejected_fact.4).expect("rejected event JSON");
+        assert_eq!(
+            rejected_payload,
+            json!({
+                "schema_version":1,
+                "phase":"operation_rejected",
+                "status":"rejected",
+                "occurrence_id":format!("operation:{rejected_operation_id}:operation_rejected"),
+                "error_code":"OPERATION_REJECTED",
+            })
+        );
+        let rejected_payload_json = serde_json::to_string(&rejected_payload).unwrap();
+        assert!(!rejected_payload_json.contains("private-receiver-sentinel"));
+        assert!(!rejected_payload_json.contains("private-body-sentinel"));
+        assert!(
+            observations.iter().all(|fact| {
+                fact.2.as_str() != rejected_operation_id.as_str()
+                    || (fact.0.as_str() != "controller" && fact.0.as_str() != "controller:messages")
+            }),
+            "a rejected send has no successful raw or message-domain fact"
+        );
 
         db.execute_batch(
             "CREATE TRIGGER reject_message_observation BEFORE INSERT ON observations \
@@ -274,6 +381,10 @@ mod tests {
             operations_after_failure, 3,
             "failed batch rolls back all writes"
         );
-        assert_eq!(observations_after_failure, 2);
+        assert_eq!(
+            observations_after_failure,
+            observations.len() as i64,
+            "failed batch leaves the five previously committed phase facts unchanged"
+        );
     }
 }

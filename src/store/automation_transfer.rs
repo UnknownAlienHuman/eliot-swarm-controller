@@ -153,7 +153,7 @@ pub(super) fn apply(
 
     // The module-owned loaders validate each source ledger against the exact
     // source entry. All copies and deletions remain inside this Store txn.
-    automation_dispatch::relocate_state(tx, &former, &successor)?;
+    let script_journal_relocated = automation_dispatch::relocate_state(tx, &former, &successor)?;
     automation_work_dispatch::relocate_state(tx, &former, &successor)?;
     automation_publication::relocate_state(tx, &former, &successor)?;
     review_disposition::relocate_state(tx, &former, &successor)?;
@@ -229,6 +229,6 @@ pub(super) fn apply(
         "former_owner_revision":former.revision,
         "new_owner_revision":successor.revision,
         "gm_epoch":gm_epoch,
-        "state_ledgers_relocated":7
+        "state_ledgers_relocated":6 + usize::from(script_journal_relocated)
     }))
 }

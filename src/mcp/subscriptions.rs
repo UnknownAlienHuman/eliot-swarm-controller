@@ -18,8 +18,9 @@
 //! cursor space and a cursor from any notification resyncs through any
 //! of the exact reads:
 //!
-//! - `reports` — every committed observation (the `report.delta`
-//!   source itself): committed report transitions.
+//! - `reports` — every observation visible through `report.delta`:
+//!   scoped committed report transitions. Normalized message bus facts
+//!   do not duplicate the raw mailbox deliveries in this projection.
 //! - `mailbox` — the `message.read` predicate applied to the same
 //!   stream (kinds `message.send` / `task.feedback` /
 //!   `check.completed` whose committed payload is addressed to this
@@ -30,9 +31,10 @@
 //!   reference, and the full bytes stay readable via the exact reads.
 //! - `operations` — stream entries carrying an `operation_id`:
 //!   Operation admissions and their recorded outcomes, i.e. committed
-//!   Operation state transitions. An admission the store rejected
-//!   commits no stream entry, so it produces no notification — the
-//!   Operation row exists, but no committed fact does.
+//!   Operation state transitions. A rejected admission commits one
+//!   bounded failure fact with its Operation receipt. It is notified
+//!   only to clients authorized to read that Operation; an exact
+//!   request replay creates no additional fact or notification.
 //!
 //! Nothing is sourced from a volatile or native live stream, and a
 //! subscription never creates facts: it forwards reads of the durable

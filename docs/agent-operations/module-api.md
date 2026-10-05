@@ -181,9 +181,9 @@ exhausted, the foreground CLI reports the last bounded error and exits
 nonzero; no durable retry queue is created. The installed detached callback
 suppresses output, so its error cannot undo Git's commit.
 
-## O8: closed `event_rules` and hook-assisted joins
+## O8: event rules and hook-assisted joins
 
-The closed typed event rules are `task.submission` + `applied` +
+The legacy typed event rules are `task.submission` + `applied` +
 `review_dispatch` and `task.submission` + `applied` + `script_run`. Each action
 must also appear in the selected `steps`; unknown rule fields/actions and
 duplicate rules are rejected. At most 16 rules are accepted. For old entries,
@@ -223,7 +223,7 @@ source, verified full commit, matching project/repository registration, and an
 applied submission. It creates no review from a commit alone. See
 [automation configuration](configuration.md) and [hook routing](../hooks.md).
 
-To select the one supported submission-triggered script invocation, the entry
+To select the legacy submission-triggered script invocation, the entry
 must also name one script and select the matching closed rule:
 
 ```json
@@ -244,6 +244,23 @@ Task/Attempt when the run reaches its start gate. Ownership transfer moves the
 cursor and exact pending causes atomically; unstarted causes remain held until
 the successor's current rights are revalidated. The trigger grants no reusable
 Manager credential and cannot edit another automation.
+
+ScriptRun also accepts bounded exact `source_id`/`event_kind` selectors with
+an optional normalized `status`. Any committed event kind can select this
+action; an unknown future selector waits for an authorized matching fact.
+See [generic event configuration](configuration.md#generic-system-event-scriptrun).
+Provider adapters normalize metadata into the shared event contract, and the
+existing runner receives a bounded `system.event` input. Task scope is either
+the real complete Task/Attempt tuple or entirely absent; a taskless invocation
+receives no controller-effect grants.
+
+`automation.config.explain` returns the existing bounded ScriptRun journal in
+`script_run`, including exact pending causes, `held_reason` and recent error
+details. It returns `null` when the entry has never had that journal. Reading
+this field creates no journal and advances no cursor. The existing owner and
+current GM recovery visibility checks apply. A damaged active bundle holds
+only its entry; its exact failed revision remains readable while other entries
+progress. A valid replacement active revision can release the retained cause.
 
 ## O9: one Goal continuation for one completed terminal EventRef
 

@@ -474,13 +474,42 @@ adapter's supported safe projection. Raw and normalized views of the same
 phase/occurrence produce one invocation.
 
 The current normalized producers include message sends/replies, coordination
-answers, observed native terminal outcomes/result pages, and host interruption.
-`controller:operations` also provides `operation.rejected` / `rejected` /
-`OPERATION_REJECTED` for mutation admission rejection and
-`operation.outcome_unknown` / `unknown` / `OUTCOME_UNKNOWN` for PR-description
-uncertainty. These fixed error categories carry no detailed error text; read
-the exact authorized Operation for its retained diagnostic. Coverage of other
-Operation transitions is still being implemented; see Implementation Status.
+answers, observed native terminal outcomes/result pages, host interruption,
+and Operation terminal facts. Additive SQLite migration `010` installs
+`AFTER INSERT` and `AFTER UPDATE OF state` triggers: every Operation first
+persisted or transitioned as `rejected` or `outcome_unknown` creates one
+bounded `controller:operations` fact in the same transaction, regardless of
+which action or provider wrote it. Its stable occurrence identifies the
+Operation and phase. The closed projection contains only the phase, status and
+fixed error category; it never copies request/result bodies, arbitrary error
+text or credentials. The migration does not backfill historical Operations.
+
+Provider adapters may expose a safe alias of the same fact. In particular,
+only an exact raw `runtime.outcome` of `unknown` aliases the corresponding
+`operation.outcome_unknown` phase and occurrence; it is never labeled as a
+completed native operation. Applied and rejected native outcomes retain their
+existing terminal aliases, and accepted or invalid raw outcomes add no
+terminal projection. Exact phase/occurrence identity coalesces duplicate
+views.
+
+The normalized `controller:messages` lifecycle facts feed event selection;
+they do not create a second addressed mailbox delivery in `report.delta` or
+`message.read`. Operation-linked observations are filtered by the existing
+Operation ACL in SQL before pagination and their exact Operation links are
+revalidated after paging. A selected rule receives only its authorized safe
+metadata. Detailed diagnostics remain available through ordinary current-rights
+Operation reads, not as a broadcast event payload. A retained script error or
+hold can be inspected through `automation.config.explain` when its bounded
+existing journal is present; that same-owner/current-GM read returns `null`
+when absent and does not create a journal or advance a cursor. See
+[Implementation Status](../implementation-status.md) for the current
+qualification result.
+
+An integrity failure in one retained script revision holds only that entry.
+Its bounded history includes the captured revision and error category, while
+healthy entries continue. The same revision remains held across reconciliation
+and restart; a valid newly active revision permits ordinary revalidation.
+Underlying Store and I/O failures are still reported as supervisor errors.
 
 Goal tracking starts no work. Its selected progression uses one enabled manager entry and one actual continuation owner. Requested one-shot watches are available without recurring automation; a notice is not a task or approval-prompt answer.
 

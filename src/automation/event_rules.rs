@@ -9,7 +9,7 @@
 
 use super::{
     actions::{AutomationCause, AutomationStep},
-    intake::EventReceipt,
+    intake::{EventReceipt, LocalProducer},
 };
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -152,6 +152,9 @@ impl EventRule {
         let Some((source_id, event_kind)) = self.selected_source_kind() else {
             return false;
         };
+        let receipt_source_matches = source_id == LocalProducer::TaskSubmission.stream_id()
+            && event_kind == LocalProducer::TaskSubmission.event_kind()
+            && receipt.source_id == LocalProducer::TaskSubmission.source_id();
         if self.action != EventRuleAction::ReviewDispatch
             && self.action != EventRuleAction::ScriptRun
         {
@@ -167,7 +170,7 @@ impl EventRule {
         };
         let legacy_applied = self.predicate == Some(EventRulePredicate::Applied);
         (legacy_applied || self.status == Some(EventStatus::Applied))
-            && source_id == receipt.source_id
+            && receipt_source_matches
             && event_kind == receipt.event_kind
             && receipt.observation_id == *observation_id
             && receipt.operation_id.as_deref() == Some(operation_id.as_str())

@@ -756,18 +756,18 @@ async fn subscriptions_are_isolated_and_never_touch_operations() {
 }
 
 #[tokio::test]
-async fn rejected_admission_commits_no_fact_and_notifies_nothing() {
+async fn rejected_admission_notifies_one_safe_failure_fact_without_message_data() {
     let stack = start_stack().await;
     let facade = stack.facade(MAX_QUEUE_DEPTH, POLL_INTERVAL);
     let mut client = SubClient::connect(facade).await;
     let ack = client
         .request(
             SUBSCRIBE_METHOD,
-            json!({"categories": ["reports"], "after": 0}),
+            json!({"categories": ["reports", "operations"], "after": 0}),
         )
         .await
         .unwrap();
-    let _ = ack["subscription_id"].as_str().unwrap();
+    let subscription_id = ack["subscription_id"].as_str().unwrap().to_owned();
 
     // One valid commit proves the subscription is live.
     stack.create_task().await;
@@ -779,39 +779,91 @@ async fn rejected_admission_commits_no_fact_and_notifies_nothing() {
         .await
         .expect("the valid commit must be notified");
 
-    // A rejected admission: the Operation row exists (state
-    // rejected) but mutate() commits no stream entry for it -- so
-    // there is no committed fact to notify, and the subscription
-    // must stay silent even though something "happened".
-    let rejected = stack
-        .store_call(
-            "operation.cancel",
-            json!({
-                "operation_id": "missing",
-                "reason": "test",
-                "client_request_id": model::new_id(),
-            }),
-        )
-        .await;
-    assert!(rejected.is_err());
+    // A rejected message admission commits its durable Operation receipt
+    // and one closed failure fact. Replaying the same request returns the
+    // retained error without adding another fact.
+    let request = json!({
+        "client_request_id": "rejected-subscription-fixture",
+        "recipient": "private-receiver-sentinel",
+        "text": "private-body-sentinel",
+    });
+    for _ in 0..2 {
+        let rejected = stack
+            .store_call("message.send", request.clone())
+            .await
+            .expect_err("unregistered recipient must reject the request");
+        assert_eq!(rejected.code, "NOT_FOUND");
+    }
     let list = stack
         .store_call("operation.list", json!({"state": "rejected", "limit": 200}))
         .await
         .unwrap();
-    assert!(
-        list["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|entry| entry["method"] == "operation.cancel"),
-        "the rejected operation row exists"
-    );
+    let rejected_operation = list["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["method"] == "message.send")
+        .expect("the rejected message Operation row exists");
+    let operation_id = rejected_operation["operation_id"]
+        .as_str()
+        .expect("rejected message Operation identity")
+        .to_owned();
+    assert_eq!(rejected_operation["state"], "rejected");
+
+    let mut seen = Vec::new();
+    let notification = client
+        .until_notification(Duration::from_secs(10), &mut seen, |message| {
+            message["params"]["item"]["operation_id"] == json!(operation_id)
+                && message["params"]["item"]["kind"] == json!("operation.rejected")
+        })
+        .await
+        .expect("one committed rejection fact must be notified");
+    assert_eq!(notification["method"], json!(COMMITTED_NOTIFICATION));
+    let params = &notification["params"];
+    assert_eq!(params["subscription_id"], json!(subscription_id));
+    assert_eq!(params["categories"], json!(["reports", "operations"]));
+    let item = &params["item"];
+    assert_eq!(item["operation_id"], json!(operation_id));
+    assert_eq!(item["kind"], json!("operation.rejected"));
+    let expected_occurrence = format!("operation:{operation_id}:operation_rejected");
+    let expected_payload = json!({
+        "schema_version":1,
+        "phase":"operation_rejected",
+        "status":"rejected",
+        "occurrence_id":expected_occurrence,
+        "error_code":"OPERATION_REJECTED",
+    });
+    assert_eq!(item["payload"], expected_payload);
+    assert_eq!(item["payload"].as_object().unwrap().len(), 5);
+    assert_eq!(item.as_object().unwrap().len(), 5);
+    let notification_json = serde_json::to_string(&notification).unwrap();
+    assert!(!notification_json.contains("private-body-sentinel"));
+    assert!(!notification_json.contains("private-receiver-sentinel"));
+
+    let report = stack
+        .store_call("report.delta", json!({"after":0,"limit":200}))
+        .await
+        .unwrap();
+    let facts = report["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|fact| fact["operation_id"] == operation_id)
+        .collect::<Vec<_>>();
+    assert_eq!(facts.len(), 1, "replay retained exactly one safe fact");
+    assert_eq!(facts[0]["kind"], "operation.rejected");
+    let stored_payload = facts[0]["payload"].clone();
+    assert_eq!(stored_payload["occurrence_id"], expected_occurrence);
+    assert_eq!(stored_payload, expected_payload);
+    let stored_payload_json = serde_json::to_string(&stored_payload).unwrap();
+    assert!(!stored_payload_json.contains("private-body-sentinel"));
+    assert!(!stored_payload_json.contains("private-receiver-sentinel"));
     assert!(
         client
             .next_notification(Duration::from_millis(900))
             .await
             .is_none(),
-        "an uncommitted (rejected) event produces no notification"
+        "an exact rejection replay does not emit a duplicate notification"
     );
 
     client.close().await;

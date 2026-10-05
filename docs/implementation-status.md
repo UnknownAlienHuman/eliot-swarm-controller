@@ -2,7 +2,7 @@
 
 ## Current state
 
-### Universal event routing and independent Forge targets — 2026-10-04
+### Universal event routing and independent failure isolation — 2026-10-05
 
 Manager-configured ScriptRun rules now select any bounded exact source/kind
 through the shared durable observation reader. Optional supported status
@@ -25,32 +25,72 @@ Safe producers cover committed messages/replies, coordination answers, native
 terminal outcomes, validated result pages and detected host interruption.
 Raw/normalized aliases coalesce by phase and occurrence; two distinct phases
 of a consult remain distinct. Result-page EOF does not prove Task completion,
-and interruption does not identify its cause. Bounded immutable Operation
-failure events currently cover mutation admission rejection and PR-description
-uncertainty. Publishing them for every committed Operation failure/unknown
-transition remains an explicit implementation gap under Luna review.
+and interruption does not identify its cause.
+
+Additive SQLite migration `010` now captures every committed Operation insert
+or state transition into `rejected` or `outcome_unknown` with an
+`AFTER INSERT`/`AFTER UPDATE OF state` trigger in the same transaction. This
+applies across action/provider writers, uses one stable Operation-and-phase
+occurrence, and emits only a closed bounded phase/status/error-category DTO.
+It copies no request/result body, free-form error or credential and performs no
+historical backfill. The raw `runtime.outcome` adapter maps only exact
+`unknown` to the matching `operation.outcome_unknown` occurrence; it does not
+call unknown work completed. Existing applied/rejected aliases are preserved.
+
+The normalized event bus remains distinct from addressed mailbox delivery.
+`controller:messages` observations are excluded from `report.delta` and
+`message.read`, so a send still has one raw mailbox timeline entry. Other
+Operation-linked observations are SQL-filtered by the existing Operation ACL
+before pagination and their exact Operation link is revalidated afterward.
+Event rules see safe metadata only; retained diagnostics remain available to a
+currently authorized manager through scoped Operation reads.
 
 Forge serializes an exact repository/ref target while independent targets
 progress concurrently. Independent persisted keyset cursors for reconciliation
 and dispatch prevent one old held target from starving later targets.
 Readback-only recovery of uncertain writes remains unchanged.
 
-Formatting, strict production Clippy, library compilation and debug build
-passed final gate `2be0e438-a561-483f-9d9d-d683ed2cc412`, with all 203 source
-pins unchanged. Across retained focused gates, all 28 distinct library checks
-passed, including the real Store taskless event path, immutable failure facts,
-schema drift refusal, effect boundaries and Forge fairness/concurrency.
-Windows `check_probe` also passed once after replacing its cold PowerShell
-orphan parent with native cmd while retaining the deadline and descendant
-cleanup requirements. That is 29 distinct focused checks. The installed
-launcher and current Codex/OpenCodex processes were not replaced or restarted.
+Script admission now isolates a damaged retained revision per automation entry.
+Its exact revision and bounded error category are held in the existing durable
+journal while healthy entries continue. The same revision is not retried;
+activating a valid new revision permits ordinary admission revalidation.
+Retained bundle bytes, JSON and artifact metadata use this same path; unrelated
+Store and I/O failures still propagate. `automation.config.explain` exposes the
+existing `script_run` cursor, pending/history and held reason to its authorized
+manager without creating a journal or advancing a cursor.
+
+Legacy submission rules again match their registered source namespace and assign
+the real reviewer. Explicit automation transfer reports six core state ledger
+families and a seventh only when a ScriptRun journal was actually relocated.
+The generic keyset wrap includes its anchor once, so a released held entry can
+progress without losing a reconciliation cycle.
+
+The earlier focused gate `2be0e438-a561-483f-9d9d-d683ed2cc412` recorded
+formatting, strict production Clippy, library compilation and debug build as
+passing with 203 source pins unchanged. The retained focused gates recorded 28
+distinct library checks plus one Windows `check_probe` pass. These earlier
+results remain historical evidence; they do not qualify the current full-CI
+batch. The installed launcher and current Codex/OpenCodex processes were not
+replaced or restarted.
 
 Full CI for predecessor `3741c16` passed the complete Ubuntu pipeline and
 Windows library checks, then failed the Windows orphan fixture in run
-`37254527962`. The fixture correction has passed locally; full CI for this new
-batch is pending. Fresh hosted Bunny inference remains unqualified. Local
-Linux/WSL and local models remain deferred. The complete program is
-**PARTIAL_PROGRESS**.
+`37254527962`. The fixture correction passed its stated focused gate. The
+historical full CI run `37258458104` for `e4dfb9b` reports **FAIL 298/7 on both
+Windows and Ubuntu**. Its seven failures led to the Operation ACL, legacy rule,
+ledger-count and committed-event contract corrections above. One full local
+library pass recorded 310 passing cases and three failures; the affected checks
+then passed after the transfer count and keyset corrections. Three additional
+retained-bundle corruption cases cover bytes, JSON and valid JSON metadata of
+the wrong shape. The schema still rejects malformed metadata JSON.
+
+Final targeted gate `da68f2f4-121a-4075-829e-e47f80b3134b` records formatting,
+strict production Clippy, library compilation and the corrected metadata
+scenario passing. Debug build also passed with all 207 source pins unchanged;
+the installed launcher hash is unchanged. Fresh full CI is pending. The retained local
+gates are not a full-suite pass for this final snapshot. Fresh hosted Bunny inference remains
+unqualified. Local Linux/WSL and local models remain deferred. The complete
+program remains **PARTIAL_PROGRESS**.
 
 ### PR description actions and successor recovery — 2026-10-04
 

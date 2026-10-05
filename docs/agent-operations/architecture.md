@@ -1,6 +1,6 @@
 # Agent Operations — Rust Architecture and Execution Contracts
 
-Revision 7 · 2026-10-04 · source baseline `3741c1614f0afaa9cbae89cf75693063502f5f25`.
+Revision 9 · 2026-10-05 · source baseline `e4dfb9b642cfae4fdc84f37bc7dacf496c77a125`.
 
 [Configuration](configuration.md) owns editable settings; [Delivery](delivery.md) owns work transitions; [Donor map](donor-map.md) separates source evidence from proposals. These contracts are not implementation claims.
 
@@ -32,6 +32,26 @@ capability evidence where required, but keep scheduling, ownership, action
 deduplication and recovery in the shared kernel. An unsupported translation
 returns a bounded capability/error result through that same contract.
 
+Rejected and uncertain Operation outcomes are kernel facts, not a list of
+provider-specific failure callbacks. SQLite migration `010` captures an
+Operation inserted in `rejected` or `outcome_unknown`, and each transition into
+either state, in the same transaction as the state change. The normalized
+projection is a closed phase/status/error-category tuple keyed by the exact
+Operation and phase; it excludes request/result content and detailed error
+text, and it does not backfill old rows. Adapters may alias a verified raw
+outcome to that same phase and occurrence. A raw `runtime.outcome` of `unknown`
+aliases `operation.outcome_unknown`; it is not a completion event. Duplicate
+views of one phase collapse, while distinct phases remain separate facts.
+
+These normalized observations are the framework event bus. Addressed mailbox
+messages remain durable delivery to their recipient, with one raw mailbox
+delivery on the public timeline; message lifecycle observations do not repeat
+that delivery through `report.delta` or `message.read`. Operation-linked
+observations are scoped through the existing Operation ACL before paging and
+their exact link is checked again after paging. Event metadata does not expose
+the retained diagnostic: an authorized current manager obtains detail through
+the ordinary scoped Operation read path.
+
 ### 1.2 Transaction and load boundaries
 
 Admission, semantic reservation, committed event identity and the associated
@@ -41,12 +61,25 @@ the applicable identity and authority checks. An uncertain remote effect stays
 uncertain until exact readback; restarting a host or changing managers does not
 authorize a second effect or rewrite its original actor.
 
+For committed `rejected` and `outcome_unknown` state, the Store-level capture
+also commits in that transaction. A speculative exception is not an observed
+terminal fact, and opening the Store does not synthesize historical failure
+events. The bounded event is suitable for an enabled manager rule to select;
+diagnostic access still uses current scope and Operation read authorization.
+
 Notifications wake readers of committed records. They are not delivery
 authority. Bounded pages, fair dispatch, output limits and explicit backpressure
 must prevent a slow adapter or consumer from blocking unrelated subjects.
 Preserve exact held occurrences across restart and authorized ownership
 transfer. No in-memory-only handoff, global effect lock, per-provider workflow
 engine or inferred exactly-once remote execution is part of this contract.
+
+An entry-local admission integrity failure holds that entry's exact cause and
+revision in its existing durable journal while unrelated entries progress.
+The current manager can read the bounded reason and pending/history through
+`automation.config.explain`. A valid replacement revision can release the hold
+through ordinary revalidation; changing the manager does not discard the cause.
+Store-wide failures remain visible failures of the supervisor.
 
 Script triggers use this same bus: the manager may select any system event
 kind, including future kinds. Event visibility and the action's current rights
