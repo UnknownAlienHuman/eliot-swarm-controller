@@ -68,6 +68,7 @@ enum ToolsClaimOutcome {
 struct LaunchFacts {
     operation_id: String,
     identity_digest: String,
+    assignment: crate::native_mcp::AssignmentContext,
     participant_id: String,
     credential_ref: String,
     profile_config_ref: String,
@@ -1634,6 +1635,7 @@ fn load_launch_facts(db: &Connection, config: &Config, operation_id: &str) -> Re
     Ok(LaunchFacts {
         operation_id: snapshot.launch_operation_id().to_owned(),
         identity_digest: snapshot.identity_digest()?,
+        assignment: snapshot.assignment_context()?,
         participant_id: snapshot.participant_id().to_owned(),
         credential_ref: snapshot.credential_ref().to_owned(),
         profile_config_ref: snapshot.profile_config_ref().to_owned(),
@@ -1705,6 +1707,7 @@ pub(crate) fn require_current_connection(
     let facts = LaunchFacts {
         operation_id: snapshot.launch_operation_id().to_owned(),
         identity_digest: identity_digest.clone(),
+        assignment: assignment.clone(),
         participant_id: snapshot.participant_id().to_owned(),
         credential_ref: snapshot.credential_ref().to_owned(),
         profile_config_ref: snapshot.profile_config_ref().to_owned(),
@@ -2160,8 +2163,29 @@ fn claim_next_tools(tx: &Transaction<'_>, now: i64, config: &Config) -> Result<T
     let mut last_scanned: Option<String> = None;
     for operation_id in ids {
         last_scanned = Some(operation_id.clone());
+        let schedule_key = supervisor_key(&operation_id);
+        if let Some(schedule) = meta(tx, &schedule_key)? {
+            validate_tools_schedule(&schedule, &operation_id)?;
+            if schedule["state"] == "retry_wait" {
+                let deadline = schedule["next_retry_at_ms"]
+                    .as_i64()
+                    .ok_or_else(|| record_error("native MCP retry deadline is missing"))?;
+                if deadline > now {
+                    next_retry_at_ms =
+                        Some(next_retry_at_ms.map_or(deadline, |current| current.min(deadline)));
+                    continue;
+                }
+            }
+        }
         let facts = match load_launch_facts(tx, config, &operation_id) {
             Ok(facts) => facts,
+            Err(error) if error.code == "STALE_LAUNCH" => {
+                if let Some(deadline) = defer_stale_launch(tx, &operation_id, now)? {
+                    next_retry_at_ms =
+                        Some(next_retry_at_ms.map_or(deadline, |current| current.min(deadline)));
+                }
+                continue;
+            }
             Err(error) if is_stale_scope_code(&error.code) => {
                 let key = supervisor_key(&operation_id);
                 let mut marker = match meta(tx, &key)? {
@@ -2207,6 +2231,7 @@ fn claim_next_tools(tx: &Transaction<'_>, now: i64, config: &Config) -> Result<T
                 set_meta(tx, &schedule_key, &stale)?;
                 continue;
             }
+            validate_record(&record, &facts, &facts.assignment)?;
             if record["tools_readback"].is_object()
                 || record["install"]["state"] == "observed_after_unknown"
                 || record["challenge"]["state"] == "observed"
@@ -2227,6 +2252,7 @@ fn claim_next_tools(tx: &Transaction<'_>, now: i64, config: &Config) -> Result<T
                 terminal["next_retry_at_ms"] = Value::Null;
                 terminal["finished_at_ms"] = json!(now);
                 terminal["failure_attempts"] = json!(0);
+                terminal["last_error_code"] = Value::Null;
                 set_meta(tx, &schedule_key, &terminal)?;
                 continue;
             }
@@ -2298,6 +2324,77 @@ fn claim_next_tools(tx: &Transaction<'_>, now: i64, config: &Config) -> Result<T
     Ok(ToolsClaimOutcome::Idle(next_retry_at_ms))
 }
 
+fn defer_stale_launch(tx: &Transaction<'_>, operation_id: &str, now: i64) -> Result<Option<i64>> {
+    let schedule_key = supervisor_key(operation_id);
+    let record = meta(tx, &record_key(operation_id))?;
+    if let Some(record) = record.as_ref()
+        && !valid_public_c8_record(record, operation_id)
+    {
+        return Err(record_error(
+            "native MCP private intent identity is invalid during stale launch deferral",
+        ));
+    }
+
+    let mut schedule = match meta(tx, &schedule_key)? {
+        Some(schedule) => {
+            validate_tools_schedule(&schedule, operation_id)?;
+            schedule
+        }
+        None if record.is_some() => {
+            return Err(record_error(
+                "native MCP tools record has no matching supervisor marker",
+            ));
+        }
+        None => new_tools_schedule(operation_id, "", now),
+    };
+    let schedule_digest = schedule["launch_identity_digest"]
+        .as_str()
+        .ok_or_else(|| record_error("native MCP tools launch digest is missing"))?
+        .to_owned();
+    if !schedule_digest.is_empty() && !valid_prefixed_sha256(&schedule_digest) {
+        return Err(record_error("native MCP tools launch digest is invalid"));
+    }
+    let record_digest = record
+        .as_ref()
+        .and_then(|record| record["launch_identity_digest"].as_str())
+        .map(str::to_owned);
+    if record_digest
+        .as_deref()
+        .is_some_and(|digest| digest != schedule_digest)
+    {
+        return Err(record_error(
+            "native MCP tools record and supervisor launch digests differ",
+        ));
+    }
+
+    schedule["started_at_ms"] = Value::Null;
+    schedule["finished_at_ms"] = json!(now);
+    schedule["last_error_code"] = json!("STALE_LAUNCH");
+    let identity_digest =
+        record_digest.or_else(|| (!schedule_digest.is_empty()).then_some(schedule_digest));
+    let next_retry_at_ms = if let Some(identity_digest) = identity_digest {
+        let failures = schedule["failure_attempts"]
+            .as_i64()
+            .unwrap_or(0)
+            .saturating_add(1)
+            .max(1);
+        let deadline = now.saturating_add(tools_retry_delay_ms(failures));
+        schedule["state"] = json!("retry_wait");
+        schedule["launch_identity_digest"] = json!(identity_digest);
+        schedule["failure_attempts"] = json!(failures);
+        schedule["next_retry_at_ms"] = json!(deadline);
+        Some(deadline)
+    } else {
+        // Without an established launch digest there is no safe identity to
+        // retry against after startup reconciliation. Keep the hold visible.
+        schedule["state"] = json!("stale");
+        schedule["next_retry_at_ms"] = Value::Null;
+        None
+    };
+    set_meta(tx, &schedule_key, &schedule)?;
+    Ok(next_retry_at_ms)
+}
+
 fn new_tools_schedule(operation_id: &str, identity_digest: &str, now: i64) -> Value {
     json!({
         "schema_version":1,
@@ -2353,6 +2450,7 @@ fn is_stale_scope_code(code: &str) -> bool {
         code,
         "NATIVE_MCP_SCOPE_MISMATCH"
             | "NATIVE_MCP_STALE_ASSIGNMENT"
+            | "STALE_LAUNCH"
             | "STALE_PARTICIPANT"
             | "FORBIDDEN"
             | "UNAUTHORIZED"

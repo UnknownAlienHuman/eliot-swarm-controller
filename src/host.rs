@@ -5,10 +5,10 @@ use crate::{
     platform::{DataRoot, bootstrap_credential},
     store::{Store, StoreOwner},
 };
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 use tokio::{
     sync::{Semaphore, watch},
-    task::JoinSet,
+    task::{Id, JoinSet},
 };
 
 pub async fn run(config: Config) -> Result<()> {
@@ -52,6 +52,18 @@ pub async fn run_on_stdin_eof(config: Config) -> Result<()> {
     .await
 }
 
+fn spawn_supervisor<F>(
+    supervisors: &mut JoinSet<(&'static str, Result<()>)>,
+    names: &mut HashMap<Id, &'static str>,
+    name: &'static str,
+    run: F,
+) where
+    F: std::future::Future<Output = Result<()>> + Send + 'static,
+{
+    let id = supervisors.spawn(async move { (name, run.await) }).id();
+    names.insert(id, name);
+}
+
 async fn run_until(
     config: Config,
     foreground_stop: impl std::future::Future<Output = Result<()>>,
@@ -78,7 +90,10 @@ async fn run_until(
     let mut listener = match startup {
         Ok(listener) => listener,
         Err(error) => {
-            if let Err(receipt_error) = owner.store.record_host_exit(Some(error.code.clone())).await
+            if let Err(receipt_error) = owner
+                .store
+                .record_host_exit(Some(error.code.clone()), None)
+                .await
             {
                 eprintln!("host startup failure receipt: {}", receipt_error.code);
             }
@@ -90,58 +105,113 @@ async fn run_until(
     };
     let (shutdown, stopping) = watch::channel(false);
     let mut supervisors: JoinSet<(&'static str, Result<()>)> = JoinSet::new();
+    // A JoinError contains the task ID but no output label; retain only each
+    // fixed supervisor name so a panic can be attributed without its payload.
+    let mut supervisor_names: HashMap<Id, &'static str> = HashMap::new();
     let store = owner.store.clone();
     let stop = stopping.clone();
-    supervisors.spawn(async move {
-        store.supervise_checks(stop).await;
-        ("checks", Ok(()))
-    });
+    spawn_supervisor(
+        &mut supervisors,
+        &mut supervisor_names,
+        "checks",
+        async move {
+            store.supervise_checks(stop).await;
+            Ok(())
+        },
+    );
     let store = owner.store.clone();
     let stop = stopping.clone();
-    supervisors.spawn(async move { ("scripts", store.supervise_scripts(stop).await) });
+    spawn_supervisor(
+        &mut supervisors,
+        &mut supervisor_names,
+        "scripts",
+        async move { store.supervise_scripts(stop).await },
+    );
     let store = owner.store.clone();
     let stop = stopping.clone();
-    supervisors.spawn(async move { ("opencode", store.supervise_opencode(stop).await) });
+    spawn_supervisor(
+        &mut supervisors,
+        &mut supervisor_names,
+        "opencode",
+        async move { store.supervise_opencode(stop).await },
+    );
     let store = owner.store.clone();
     let stop = stopping.clone();
-    supervisors.spawn(async move {
+    spawn_supervisor(&mut supervisors, &mut supervisor_names, "zed", async move {
         store.supervise_zed(stop).await;
-        ("zed", Ok(()))
+        Ok(())
     });
     let store = owner.store.clone();
     let stop = stopping.clone();
-    supervisors.spawn(async move { ("scheduler", crate::scheduler::run(store, stop).await) });
+    spawn_supervisor(
+        &mut supervisors,
+        &mut supervisor_names,
+        "scheduler",
+        async move { crate::scheduler::run(store, stop).await },
+    );
     let store = owner.store.clone();
     let stop = stopping.clone();
-    supervisors.spawn(async move { ("automation", supervise_automation(store, stop).await) });
+    spawn_supervisor(
+        &mut supervisors,
+        &mut supervisor_names,
+        "automation",
+        async move { supervise_automation(store, stop).await },
+    );
     let store = owner.store.clone();
     let stop = stopping.clone();
-    supervisors.spawn(async move { ("launcher", supervise_launcher(store, stop).await) });
+    spawn_supervisor(
+        &mut supervisors,
+        &mut supervisor_names,
+        "launcher",
+        async move { supervise_launcher(store, stop).await },
+    );
     let store = owner.store.clone();
     let stop = stopping.clone();
-    supervisors.spawn(async move { ("native-mcp", supervise_native_mcp(store, stop).await) });
+    spawn_supervisor(
+        &mut supervisors,
+        &mut supervisor_names,
+        "native-mcp",
+        async move { supervise_native_mcp(store, stop).await },
+    );
     let store = owner.store.clone();
     let stop = stopping.clone();
-    supervisors.spawn(async move {
-        (
-            "native-mcp-tools",
-            supervise_native_mcp_tools(store, stop).await,
-        )
-    });
+    spawn_supervisor(
+        &mut supervisors,
+        &mut supervisor_names,
+        "native-mcp-tools",
+        async move { supervise_native_mcp_tools(store, stop).await },
+    );
     let store = owner.store.clone();
     let stop = stopping.clone();
-    supervisors.spawn(async move { ("forge", supervise_forge(store, stop).await) });
+    spawn_supervisor(
+        &mut supervisors,
+        &mut supervisor_names,
+        "forge",
+        async move { supervise_forge(store, stop).await },
+    );
     let semaphore = Arc::new(Semaphore::new(config.ipc.max_connections));
     let mut connections = JoinSet::new();
     eprintln!("swarm host ready: {}", listener.endpoint());
+    let mut failed_supervisor: Option<&'static str> = None;
     let mut exit = loop {
         tokio::select! {
             signal=&mut foreground_stop=>break signal,
-            Some(result)=supervisors.join_next()=>{
+            Some(result)=supervisors.join_next_with_id()=>{
                 break match result {
-                    Ok((name, Ok(()))) => Err(Error::new("SUPERVISOR_STOPPED", format!("{name} stopped before host shutdown"))),
-                    Ok((name, Err(error))) => Err(Error::new(error.code, format!("{name}: {}", error.message))),
-                    Err(error) => Err(Error::new("SUPERVISOR_FAILED", error.to_string())),
+                    Ok((id, (name, Ok(())))) => {
+                        let _ = supervisor_names.remove(&id);
+                        failed_supervisor = Some(name);
+                        Err(Error::new("SUPERVISOR_STOPPED", format!("{name} stopped before host shutdown")))
+                    }
+                    Ok((id, (name, Err(error)))) => {
+                        let _ = supervisor_names.remove(&id);
+                        failed_supervisor = Some(name);
+                        Err(Error::new(error.code, format!("{name}: {}", error.message)))
+                    }
+                    Err(error) => {
+                        failed_supervisor = supervisor_names.remove(&error.id());
+                        Err(Error::new("SUPERVISOR_FAILED", error.to_string()))
+                    }
                 };
             }
             Some(result)=connections.join_next(),if !connections.is_empty()=>{
@@ -163,22 +233,35 @@ async fn run_until(
     while connections.join_next().await.is_some() {}
     // Await host-owned workers. Dropping the IPC caller or beginning shutdown
     // must not detach or replay an already admitted external publication.
-    while let Some(result) = supervisors.join_next().await {
-        if let Ok((name, Err(error))) = result {
-            eprintln!("{name} supervisor: {}", error.code);
-            if exit.is_ok() {
-                exit = Err(error);
+    while let Some(result) = supervisors.join_next_with_id().await {
+        match result {
+            Ok((id, (_, Ok(())))) => {
+                let _ = supervisor_names.remove(&id);
             }
-        } else if let Err(error) = result {
-            eprintln!("supervisor join failed");
-            if exit.is_ok() {
-                exit = Err(Error::new("SUPERVISOR_FAILED", error.to_string()));
+            Ok((id, (name, Err(error)))) => {
+                let _ = supervisor_names.remove(&id);
+                eprintln!("{name} supervisor: {}", error.code);
+                if exit.is_ok() {
+                    failed_supervisor = Some(name);
+                    exit = Err(error);
+                }
+            }
+            Err(error) => {
+                let name = supervisor_names.remove(&error.id());
+                eprintln!("{} supervisor join failed", name.unwrap_or("unknown"));
+                if exit.is_ok() {
+                    failed_supervisor = name;
+                    exit = Err(Error::new("SUPERVISOR_FAILED", error.to_string()));
+                }
             }
         }
     }
     if let Err(error) = owner
         .store
-        .record_host_exit(exit.as_ref().err().map(|error| error.code.clone()))
+        .record_host_exit(
+            exit.as_ref().err().map(|error| error.code.clone()),
+            failed_supervisor,
+        )
         .await
     {
         eprintln!("host exit receipt: {}", error.code);

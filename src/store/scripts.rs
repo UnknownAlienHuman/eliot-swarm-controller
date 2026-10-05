@@ -3075,10 +3075,34 @@ mod controller_effect_tests {
     }
 
     fn fixture(grants: Vec<manifest::ScriptControllerEffect>) -> Fixture {
-        let db = Connection::open_in_memory().unwrap();
+        let mut db = Connection::open_in_memory().unwrap();
         db.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         db.execute_batch(super::super::SCHEMA).unwrap();
-        db.execute_batch(super::super::SCRIPT_SCHEMA).unwrap();
+        let schema_tx = db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        super::super::install_schema_extension(
+            &schema_tx,
+            "schema_extension:scripts:v1",
+            super::super::SCRIPT_SCHEMA,
+            &["scripts", "script_revisions", "script_runs"],
+        )
+        .unwrap();
+        super::super::script_event_schema::install(&schema_tx).unwrap();
+        super::super::install_schema_extension(
+            &schema_tx,
+            "schema_extension:github:v1",
+            super::super::GITHUB_SCHEMA,
+            &[
+                "github_sources",
+                "github_issue_items",
+                "github_issue_facts",
+                "github_work_pool_members",
+                "github_poll_leases",
+            ],
+        )
+        .unwrap();
+        schema_tx.commit().unwrap();
 
         for manager in [MANAGER_ID, NEXT_MANAGER_ID, TASK_OWNER_ID] {
             super::super::set_meta(
@@ -3502,6 +3526,348 @@ mod controller_effect_tests {
         assert_eq!(result["text"], manual_request["text"]);
         assert_eq!(result["recipient"], TASK_OWNER_ID);
         assert_eq!(result["message_id"], manual_operation_id);
+    }
+
+    fn insert_terminal_run(
+        fixture: &mut Fixture,
+        operation_id: &str,
+        run_id: &str,
+        operation_state: &str,
+        run_state: &str,
+        task_scope: Option<(&str, i64, &str)>,
+    ) {
+        let (task_id, task_revision, attempt_id) = match task_scope {
+            Some((task_id, task_revision, attempt_id)) => {
+                (Some(task_id), Some(task_revision), Some(attempt_id))
+            }
+            None => (None, None, None),
+        };
+        let request_id = format!("{operation_id}-request");
+        let bundle_ref = format!("script-{}", "d".repeat(64));
+        fixture.db.execute(
+            "INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,effective_request_json,task_id,attempt_id,state,due_at_ms,created_at_ms,updated_at_ms) \
+             VALUES(?1,?2,?3,'script.run','{}','{}',?4,?5,?6,1,1,1)",
+            params![operation_id, MANAGER_ID, request_id, task_id, attempt_id, operation_state],
+        ).unwrap();
+        fixture.db.execute(
+            "INSERT INTO script_runs(run_id,operation_id,script_id,revision,bundle_ref,task_id,task_revision,attempt_id,work_digest,spec_json,state,process_identity_json,started_at_ms,created_at_ms) \
+             VALUES(?1,?2,?3,1,?4,?5,?6,?7,?8,'{}',?9,CASE WHEN ?9='running' THEN '{}' ELSE NULL END,CASE WHEN ?9='running' THEN 1 ELSE NULL END,1)",
+            params![
+                run_id,
+                operation_id,
+                SCRIPT_ID,
+                bundle_ref,
+                task_id,
+                task_revision,
+                attempt_id,
+                "f".repeat(64),
+                run_state,
+            ],
+        ).unwrap();
+    }
+
+    fn terminal_event(
+        db: &Connection,
+        operation_id: &str,
+        event_kind: &str,
+    ) -> crate::automation::intake::ObservedEvent {
+        db.query_row(
+            "SELECT observation_id,source_stream_id,kind,operation_id,recorded_at_ms \
+             FROM observations WHERE source_stream_id='controller:scripts' \
+               AND operation_id=?1 AND kind=?2",
+            params![operation_id, event_kind],
+            |row| {
+                Ok(crate::automation::intake::ObservedEvent {
+                    observation_id: row.get(0)?,
+                    source_id: row.get(1)?,
+                    event_kind: row.get(2)?,
+                    operation_id: row.get(3)?,
+                    recorded_at_ms: row.get(4)?,
+                })
+            },
+        )
+        .unwrap()
+    }
+
+    fn assert_terminal_projection(
+        db: &Connection,
+        operation_id: &str,
+        event_kind: &str,
+        expected_status: crate::automation::event_rules::EventStatus,
+        expected_phase: &str,
+    ) -> crate::automation::intake::SafeEventProjection {
+        let event = terminal_event(db, operation_id, event_kind);
+        let projection =
+            super::super::automation_intake::safe_event_projection(db, &event).unwrap();
+        assert_eq!(projection.status, Some(expected_status));
+        assert_eq!(projection.error_code, None);
+        assert_eq!(projection.occurrence_phase.as_deref(), Some(expected_phase));
+        projection
+    }
+
+    fn terminal_callback(
+        run_id: &str,
+        operation_id: &str,
+        state: &str,
+        private_marker: &str,
+    ) -> runner::Completion {
+        let make_artifact = |kind: &str, artifact_id: String, metadata: Value| ArtifactRecord {
+            kind: kind.to_owned(),
+            relative_path: format!("artifacts/{artifact_id}.bin"),
+            artifact_id,
+            byte_length: 1,
+            content_digest: "9".repeat(64),
+            metadata,
+        };
+        let mut stdout_identity = run_id.as_bytes().to_vec();
+        stdout_identity.extend_from_slice(b":stdout");
+        let mut stderr_identity = run_id.as_bytes().to_vec();
+        stderr_identity.extend_from_slice(b":stderr");
+        let completed = state == "completed";
+        runner::Completion {
+            run_id: run_id.to_owned(),
+            operation_id: operation_id.to_owned(),
+            token: "fixture-terminal-token".to_owned(),
+            state: state.to_owned(),
+            started_at_ms: Some(1),
+            exit_code: if completed { Some(0) } else { Some(1) },
+            process: json!({"fixture":"actual_store_writer"}),
+            result: make_artifact(
+                "script_result",
+                format!("scriptresult-{}", model::digest(operation_id.as_bytes())),
+                json!({"run_id":run_id,"operation_id":operation_id,"script_id":SCRIPT_ID,"state":state}),
+            ),
+            stdout: make_artifact(
+                "script_output",
+                format!("scriptlog-{}", model::digest(&stdout_identity)),
+                json!({"run_id":run_id,"operation_id":operation_id,"stream":"stdout"}),
+            ),
+            stderr: make_artifact(
+                "script_output",
+                format!("scriptlog-{}", model::digest(&stderr_identity)),
+                json!({"run_id":run_id,"operation_id":operation_id,"stream":"stderr"}),
+            ),
+            result_value: completed.then(|| json!({"private":private_marker})),
+            controller_effects: Vec::new(),
+            error_code: match state {
+                "completed" => None,
+                "failed" => Some("SCRIPT_EXIT_NONZERO".to_owned()),
+                _ => Some("SCRIPT_CHILD_STARTED".to_owned()),
+            },
+        }
+    }
+
+    #[test]
+    fn terminal_script_writers_project_only_exact_bounded_state() {
+        use crate::automation::event_rules::EventStatus;
+
+        let mut fixture = fixture(Vec::new());
+        insert_terminal_run(
+            &mut fixture,
+            "script-terminal-taskless-failed-op",
+            "script-terminal-taskless-failed-run",
+            "queued",
+            "queued",
+            None,
+        );
+        insert_terminal_run(
+            &mut fixture,
+            "script-terminal-scoped-incomplete-op",
+            "script-terminal-scoped-incomplete-run",
+            "sending",
+            "sending",
+            Some((TASK_ID, 1, ATTEMPT_ID)),
+        );
+        insert_terminal_run(
+            &mut fixture,
+            "script-terminal-taskless-callback-failed-op",
+            "script-terminal-taskless-callback-failed-run",
+            "native_accepted",
+            "running",
+            None,
+        );
+        insert_terminal_run(
+            &mut fixture,
+            "script-terminal-scoped-callback-incomplete-op",
+            "script-terminal-scoped-callback-incomplete-run",
+            "native_accepted",
+            "running",
+            Some((TASK_ID, 1, ATTEMPT_ID)),
+        );
+
+        fail_before_start(
+            &mut fixture.db,
+            "script-terminal-taskless-failed-run",
+            "PRIVATE_FAILURE_DETAIL",
+        )
+        .unwrap();
+        settle_incomplete(
+            &mut fixture.db,
+            "script-terminal-scoped-incomplete-run",
+            "PRIVATE_INCOMPLETE_DETAIL",
+            true,
+        )
+        .unwrap();
+        finish(
+            &mut fixture.db,
+            RUN_ID,
+            terminal_callback(
+                RUN_ID,
+                OPERATION_ID,
+                "completed",
+                "script-terminal-result-marker",
+            ),
+            &fixture.config,
+        )
+        .unwrap();
+        finish(
+            &mut fixture.db,
+            "script-terminal-taskless-callback-failed-run",
+            terminal_callback(
+                "script-terminal-taskless-callback-failed-run",
+                "script-terminal-taskless-callback-failed-op",
+                "failed",
+                "script-terminal-failed-callback-marker",
+            ),
+            &fixture.config,
+        )
+        .unwrap();
+        finish(
+            &mut fixture.db,
+            "script-terminal-scoped-callback-incomplete-run",
+            terminal_callback(
+                "script-terminal-scoped-callback-incomplete-run",
+                "script-terminal-scoped-callback-incomplete-op",
+                "incomplete",
+                "script-terminal-incomplete-callback-marker",
+            ),
+            &fixture.config,
+        )
+        .unwrap();
+
+        let failure_projection = assert_terminal_projection(
+            &fixture.db,
+            "script-terminal-taskless-failed-op",
+            "script.failed",
+            EventStatus::Failed,
+            "script_run_failed",
+        );
+        let incomplete_projection = assert_terminal_projection(
+            &fixture.db,
+            "script-terminal-scoped-incomplete-op",
+            "script.incomplete",
+            EventStatus::Incomplete,
+            "script_run_incomplete",
+        );
+        let callback_failed_projection = assert_terminal_projection(
+            &fixture.db,
+            "script-terminal-taskless-callback-failed-op",
+            "script.completed",
+            EventStatus::Failed,
+            "script_run_failed",
+        );
+        let callback_incomplete_projection = assert_terminal_projection(
+            &fixture.db,
+            "script-terminal-scoped-callback-incomplete-op",
+            "script.completed",
+            EventStatus::Incomplete,
+            "script_run_incomplete",
+        );
+
+        let completed = terminal_event(&fixture.db, OPERATION_ID, "script.completed");
+        let completed_projection =
+            super::super::automation_intake::safe_event_projection(&fixture.db, &completed)
+                .unwrap();
+        assert_eq!(completed_projection.status, Some(EventStatus::Completed));
+        assert_eq!(completed_projection.error_code, None);
+        assert_eq!(
+            completed_projection.occurrence_id.as_deref(),
+            Some("operation:script-effect-run-operation:script_run_completed")
+        );
+        let projected = format!(
+            "{failure_projection:?}{incomplete_projection:?}{completed_projection:?}{callback_failed_projection:?}{callback_incomplete_projection:?}"
+        );
+        for private_value in [
+            "PRIVATE_FAILURE_DETAIL",
+            "PRIVATE_INCOMPLETE_DETAIL",
+            "script-terminal-result-marker",
+            "script-terminal-failed-callback-marker",
+            "script-terminal-incomplete-callback-marker",
+            "SCRIPT_EXIT_NONZERO",
+            "SCRIPT_CHILD_STARTED",
+        ] {
+            assert!(!projected.contains(private_value));
+        }
+
+        let wrong_event_link = crate::automation::intake::ObservedEvent {
+            operation_id: Some("script-terminal-taskless-failed-op".to_owned()),
+            ..completed.clone()
+        };
+        assert_eq!(
+            super::super::automation_intake::safe_event_projection(&fixture.db, &wrong_event_link)
+                .unwrap(),
+            Default::default()
+        );
+
+        fixture
+            .db
+            .execute(
+                "UPDATE observations SET operation_id=?1 WHERE observation_id=?2",
+                params![
+                    "script-terminal-taskless-failed-op",
+                    completed.observation_id
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            super::super::automation_intake::safe_event_projection(&fixture.db, &completed)
+                .unwrap(),
+            Default::default()
+        );
+        fixture
+            .db
+            .execute(
+                "UPDATE observations SET operation_id=?1 WHERE observation_id=?2",
+                params![OPERATION_ID, completed.observation_id],
+            )
+            .unwrap();
+        for wrong_outcome in [json!(true), json!(17)] {
+            let mut altered_result = operation_result(&fixture.db);
+            altered_result["outcome"] = wrong_outcome;
+            let altered_json = model::canonical(&altered_result).unwrap();
+            fixture
+                .db
+                .execute(
+                    "UPDATE operations SET result_json=?1 WHERE operation_id=?2",
+                    params![altered_json, OPERATION_ID],
+                )
+                .unwrap();
+            fixture
+                .db
+                .execute(
+                    "UPDATE observations SET payload_json=?1 WHERE observation_id=?2",
+                    params![altered_json, completed.observation_id],
+                )
+                .unwrap();
+            assert_eq!(
+                super::super::automation_intake::safe_event_projection(&fixture.db, &completed)
+                    .unwrap(),
+                Default::default(),
+                "a non-text outcome must fail closed without breaking intake"
+            );
+        }
+        fixture
+            .db
+            .execute(
+                "UPDATE operations SET result_json='{}' WHERE operation_id=?1",
+                [OPERATION_ID],
+            )
+            .unwrap();
+        assert_eq!(
+            super::super::automation_intake::safe_event_projection(&fixture.db, &completed)
+                .unwrap(),
+            Default::default()
+        );
     }
 }
 

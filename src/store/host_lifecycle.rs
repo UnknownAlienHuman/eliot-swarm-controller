@@ -11,6 +11,18 @@ use serde_json::{Value, json};
 const CURRENT: &str = "host:lifecycle:v1";
 const LAST_EXIT: &str = "host:last-exit:v1";
 const LATEST_FAILURE: &str = "host:latest-failure:v1";
+const SUPERVISORS: &[&str] = &[
+    "checks",
+    "scripts",
+    "opencode",
+    "zed",
+    "scheduler",
+    "automation",
+    "launcher",
+    "native-mcp",
+    "native-mcp-tools",
+    "forge",
+];
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -31,6 +43,37 @@ enum State {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum FailureCategory {
+    StartupFailure,
+    SupervisorStopped,
+    SupervisorFailed,
+    RuntimeFailure,
+}
+
+impl FailureCategory {
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::StartupFailure => "startup_failure",
+            Self::SupervisorStopped => "supervisor_stopped",
+            Self::SupervisorFailed => "supervisor_failed",
+            Self::RuntimeFailure => "runtime_failure",
+        }
+    }
+
+    fn valid_for(self, error_code: Option<&str>, has_supervisor: bool) -> bool {
+        match self {
+            Self::StartupFailure | Self::RuntimeFailure => {
+                !has_supervisor
+                    && !matches!(error_code, Some("SUPERVISOR_STOPPED" | "SUPERVISOR_FAILED"))
+            }
+            Self::SupervisorStopped => error_code == Some("SUPERVISOR_STOPPED"),
+            Self::SupervisorFailed => has_supervisor || error_code == Some("SUPERVISOR_FAILED"),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Exit {
@@ -38,8 +81,16 @@ struct Exit {
     host_epoch: Option<i64>,
     observed_at_ms: i64,
     error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    failed_supervisor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    failure_category: Option<FailureCategory>,
     manager_action_required: bool,
     retry_authorized: bool,
+}
+
+pub(super) fn is_known_supervisor(name: &str) -> bool {
+    SUPERVISORS.contains(&name)
 }
 
 fn epoch(db: &Connection) -> Result<i64> {
@@ -83,8 +134,7 @@ fn retain_exit(
     if receipt.manager_action_required {
         set_meta(tx, LATEST_FAILURE, &value)?;
     }
-    let mut observation = value.clone();
-    let key = if let Some((previous_epoch, current_epoch)) = interrupted_epochs {
+    let (observation, key) = if let Some((previous_epoch, current_epoch)) = interrupted_epochs {
         if receipt.host_epoch != Some(previous_epoch)
             || receipt.error_code.as_deref() != Some("HOST_INTERRUPTED")
             || current_epoch <= previous_epoch
@@ -95,16 +145,54 @@ fn retain_exit(
             ));
         }
         let occurrence_id = format!("host-interruption:{previous_epoch}:{current_epoch}");
+        let mut observation = value.clone();
         observation["phase"] = json!("host_interruption_observed");
         observation["occurrence_id"] = json!(occurrence_id);
         observation["previous_host_epoch"] = json!(previous_epoch);
         observation["current_host_epoch"] = json!(current_epoch);
-        format!("interrupted:{previous_epoch}:{current_epoch}")
+        (
+            observation,
+            format!("interrupted:{previous_epoch}:{current_epoch}"),
+        )
+    } else if let Some(host_epoch) = receipt.host_epoch {
+        let phase = "host_terminal_exit_observed";
+        let occurrence_id = format!("host-terminal-exit:{host_epoch}");
+        let status = if receipt.error_code.is_some() {
+            "failed"
+        } else {
+            "completed"
+        };
+        let mut observation = json!({
+            "schema_version":1,
+            "phase":phase,
+            "status":status,
+            "occurrence_id":occurrence_id,
+            "host_epoch":host_epoch
+        });
+        if let Some(category) = receipt.failure_category {
+            observation["failure_category"] = json!(category.as_str());
+        }
+        if let Some(name) = receipt.failed_supervisor.as_deref() {
+            observation["failed_supervisor"] = json!(name);
+        }
+        if let Some(category) = receipt.failure_category {
+            super::insert_safe_host_terminal_failure_event(
+                tx,
+                host_epoch,
+                category.as_str(),
+                receipt.failed_supervisor.as_deref(),
+                receipt.observed_at_ms,
+            )?;
+        }
+        (observation, format!("terminal:{host_epoch}"))
     } else {
-        format!(
-            "{}:{}",
-            receipt.host_epoch.unwrap_or(0),
-            receipt.observed_at_ms
+        (
+            value.clone(),
+            format!(
+                "{}:{}",
+                receipt.host_epoch.unwrap_or(0),
+                receipt.observed_at_ms
+            ),
         )
     };
     tx.execute(
@@ -143,6 +231,8 @@ pub(super) fn start(tx: &Transaction<'_>, now: i64) -> Result<()> {
                     host_epoch: Some(previous.host_epoch),
                     observed_at_ms: now,
                     error_code: Some("HOST_INTERRUPTED".into()),
+                    failed_supervisor: None,
+                    failure_category: None,
                     manager_action_required: true,
                     retry_authorized: false,
                 },
@@ -173,6 +263,8 @@ pub(super) fn start(tx: &Transaction<'_>, now: i64) -> Result<()> {
                     host_epoch: None,
                     observed_at_ms: now,
                     error_code: Some("HOST_LIFECYCLE_INVALID".into()),
+                    failed_supervisor: None,
+                    failure_category: None,
                     manager_action_required: true,
                     retry_authorized: false,
                 },
@@ -209,7 +301,12 @@ pub(super) fn ready(tx: &Transaction<'_>, now: i64) -> Result<()> {
     set_meta(tx, CURRENT, &json!(current))
 }
 
-pub(super) fn finish(tx: &Transaction<'_>, error_code: Option<&str>, now: i64) -> Result<()> {
+pub(super) fn finish(
+    tx: &Transaction<'_>,
+    error_code: Option<&str>,
+    failed_supervisor: Option<&str>,
+    now: i64,
+) -> Result<()> {
     let mut current = load(tx)?
         .ok_or_else(|| Error::new("HOST_LIFECYCLE_INVALID", "host startup receipt is missing"))?;
     if current.host_epoch != epoch(tx)?
@@ -234,6 +331,35 @@ pub(super) fn finish(tx: &Transaction<'_>, error_code: Option<&str>, now: i64) -
             "HOST_FAILED".to_owned()
         }
     });
+    let failed_supervisor = match failed_supervisor {
+        Some(name) if SUPERVISORS.contains(&name) && error_code.is_some() => Some(name.to_owned()),
+        Some(_) => {
+            return Err(Error::new(
+                "HOST_LIFECYCLE_INVALID",
+                "host supervisor receipt is invalid",
+            ));
+        }
+        None => None,
+    };
+    let failure_category = error_code.as_deref().map(|code| {
+        if code == "SUPERVISOR_STOPPED" {
+            FailureCategory::SupervisorStopped
+        } else if failed_supervisor.is_some() || code == "SUPERVISOR_FAILED" {
+            FailureCategory::SupervisorFailed
+        } else if current.state == State::Starting {
+            FailureCategory::StartupFailure
+        } else {
+            FailureCategory::RuntimeFailure
+        }
+    });
+    if failure_category.is_some_and(|category| {
+        !category.valid_for(error_code.as_deref(), failed_supervisor.is_some())
+    }) {
+        return Err(Error::new(
+            "HOST_LIFECYCLE_INVALID",
+            "host failure category is invalid",
+        ));
+    }
     current.state = if error_code.is_some() {
         State::Failed
     } else {
@@ -248,6 +374,8 @@ pub(super) fn finish(tx: &Transaction<'_>, error_code: Option<&str>, now: i64) -
             observed_at_ms: now,
             manager_action_required: error_code.is_some(),
             error_code,
+            failed_supervisor,
+            failure_category,
             retry_authorized: false,
         },
         None,
@@ -265,6 +393,19 @@ fn exit_receipt(db: &Connection, key: &str) -> Result<Option<Value>> {
                 || receipt.observed_at_ms < 0
                 || receipt.retry_authorized
                 || receipt.host_epoch.is_some_and(|epoch| epoch <= 0)
+                || receipt
+                    .failed_supervisor
+                    .as_deref()
+                    .is_some_and(|name| !is_known_supervisor(name))
+                || (receipt.failed_supervisor.is_some() && receipt.error_code.is_none())
+                || (receipt.failure_category.is_some() && receipt.error_code.is_none())
+                || receipt.failure_category.is_some_and(|category| {
+                    !category.valid_for(
+                        receipt.error_code.as_deref(),
+                        receipt.failed_supervisor.is_some(),
+                    )
+                })
+                || (receipt.failed_supervisor.is_some() && receipt.failure_category.is_none())
                 || receipt.error_code.as_ref().is_some_and(|code| {
                     code.is_empty()
                         || code.len() > 64

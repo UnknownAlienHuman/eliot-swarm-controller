@@ -1,6 +1,6 @@
 # Agent Operations — Rust Architecture and Execution Contracts
 
-Revision 9 · 2026-10-05 · source baseline `e4dfb9b642cfae4fdc84f37bc7dacf496c77a125`.
+Revision 10 · 2026-10-05 · source baseline `064315ea08b9f0c47c2b5393e2988311f3957213`.
 
 [Configuration](configuration.md) owns editable settings; [Delivery](delivery.md) owns work transitions; [Donor map](donor-map.md) separates source evidence from proposals. These contracts are not implementation claims.
 
@@ -31,6 +31,13 @@ back into common events and outcome facts. Preserve native identity and
 capability evidence where required, but keep scheduling, ownership, action
 deduplication and recovery in the shared kernel. An unsupported translation
 returns a bounded capability/error result through that same contract.
+
+Acceptance, execution, script completion and host termination are distinct
+occurrence phases. An accepted provider command must remain available to a
+statusless event rule without acquiring completed status. A completed ScriptRun
+or graceful host exit establishes only that subject's lifecycle result. Neither
+establishes Task completion. Native receipt details are not event-selector
+metadata; their size must not silently remove a valid occurrence from the bus.
 
 Rejected and uncertain Operation outcomes are kernel facts, not a list of
 provider-specific failure callbacks. SQLite migration `010` captures an
@@ -80,6 +87,14 @@ The current manager can read the bounded reason and pending/history through
 `automation.config.explain`. A valid replacement revision can release the hold
 through ordinary revalidation; changing the manager does not discard the cause.
 Store-wide failures remain visible failures of the supervisor.
+
+A restart may temporarily invalidate an adapter's current binding while its
+previous confirmed observations remain valid historical facts. Reconciliation
+must retain those facts, defer that entry with a readable bounded reason and
+continue unrelated entries. Restoring current authority permits ordinary
+readback; it does not authorize another external challenge or action. Supervisor
+failure retains the fixed supervisor identity when available, including task
+join failures, without broadcasting a panic payload.
 
 Script triggers use this same bus: the manager may select any system event
 kind, including future kinds. Event visibility and the action's current rights

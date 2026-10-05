@@ -17,8 +17,12 @@ const RECEIPT_SCHEMA_VERSION: u32 = 1;
 const JOURNAL_SCHEMA_VERSION: u32 = 1;
 const MAX_SOURCE_EVENT_KEY_BYTES: usize = 512;
 const MAX_INTAKE_PAYLOAD_BYTES: i64 = 48 * 1024;
+const MAX_SCRIPT_TERMINAL_EVENT_BYTES: i64 =
+    (crate::scripts::manifest::MAX_RESULT_BYTES + 128 * 1024) as i64;
 const RECEIPT_STORAGE_PREFIX: &str = "automation:v1:intake:receipt:";
 const HOOK_COMMIT_INDEX_PREFIX: &str = "automation:v1:intake:hook_commit:";
+
+type ScriptTerminalProjectionRow = (String, String, String, Option<String>);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -349,6 +353,188 @@ pub(crate) fn hook_commit_fact_by_observation(
     Ok(Some(fact))
 }
 
+/// Project the closed ScriptRun outcome only after exact source, Operation,
+/// result and run readback. Raw script content never enters the projection.
+fn script_terminal_event_projection(
+    db: &Connection,
+    event: &ObservedEvent,
+) -> Result<crate::automation::intake::SafeEventProjection> {
+    use crate::automation::event_rules::EventStatus;
+
+    if event.source_id != "controller:scripts"
+        || !matches!(
+            event.event_kind.as_str(),
+            "script.completed" | "script.failed" | "script.incomplete"
+        )
+    {
+        return Ok(Default::default());
+    }
+    let Some(operation_id) = event.operation_id.as_deref().filter(|id| !id.is_empty()) else {
+        return Ok(Default::default());
+    };
+    let row: Option<ScriptTerminalProjectionRow> = db
+        .query_row(
+            "SELECT o.source_event_key,r.run_id,r.state,\
+             CASE WHEN json_valid(o.payload_json) THEN \
+               CASE WHEN json_type(o.payload_json,'$.outcome')='text' \
+                 THEN json_extract(o.payload_json,'$.outcome') ELSE NULL END \
+             ELSE NULL END \
+             FROM observations AS o \
+             JOIN operations AS op ON op.operation_id=o.operation_id \
+             JOIN script_runs AS r ON r.operation_id=op.operation_id \
+             WHERE o.observation_id=?1 AND o.source_stream_id='controller:scripts' \
+               AND o.kind=?2 AND o.operation_id=?3 \
+               AND o.source_event_key='terminal:' || op.operation_id \
+               AND op.method='script.run' AND op.state='settled' \
+               AND op.result_json=o.payload_json \
+               AND length(o.payload_json)<=?4 AND length(op.result_json)<=?4 \
+               AND op.settled_at_ms=o.recorded_at_ms \
+               AND r.finished_at_ms=o.recorded_at_ms \
+               AND json_valid(o.payload_json) \
+               AND json_extract(o.payload_json,'$.operation_id')=op.operation_id \
+               AND json_extract(o.payload_json,'$.run_id')=r.run_id \
+               AND json_extract(o.payload_json,'$.state')=r.state \
+               AND op.task_id IS r.task_id AND op.attempt_id IS r.attempt_id \
+               AND ((r.task_id IS NULL AND r.task_revision IS NULL AND r.attempt_id IS NULL) \
+                 OR (r.task_id IS NOT NULL AND r.task_revision>0 AND r.attempt_id IS NOT NULL)) \
+               AND (?2!='script.failed' OR \
+                 json_type(o.payload_json,'$.execution_started')='false') \
+               AND (?2!='script.incomplete' OR \
+                 json_type(o.payload_json,'$.execution_may_have_started') IN ('true','false')) \
+               AND (?2!='script.completed' OR (\
+                 json_extract(o.payload_json,'$.result_ref') IS r.result_ref \
+                 AND json_extract(o.payload_json,'$.stdout_ref') IS r.stdout_ref \
+                 AND json_extract(o.payload_json,'$.stderr_ref') IS r.stderr_ref \
+                 AND json_extract(o.payload_json,'$.exit_code') IS r.exit_code))",
+            params![
+                event.observation_id,
+                event.event_kind,
+                operation_id,
+                MAX_SCRIPT_TERMINAL_EVENT_BYTES
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((source_event_key, _run_id, run_state, outcome)) = row else {
+        return Ok(Default::default());
+    };
+    if source_event_key != format!("terminal:{operation_id}") {
+        return Ok(Default::default());
+    }
+    // `script.completed` is the worker's terminal callback kind for all
+    // validated terminal states. Status describes only the retained script
+    // run state; it never implies Task completion.
+    let (status, phase) = match (event.event_kind.as_str(), run_state.as_str()) {
+        ("script.failed", "failed") | ("script.completed", "failed") => {
+            (EventStatus::Failed, "script_run_failed")
+        }
+        ("script.incomplete", "incomplete") | ("script.completed", "incomplete") => {
+            (EventStatus::Incomplete, "script_run_incomplete")
+        }
+        ("script.completed", "completed") => (EventStatus::Completed, "script_run_completed"),
+        _ => return Ok(Default::default()),
+    };
+    let outcome_matches = match status {
+        EventStatus::Completed => {
+            matches!(outcome.as_deref(), Some("applied" | "effects_incomplete"))
+        }
+        EventStatus::Failed => outcome.as_deref() == Some("failed"),
+        EventStatus::Incomplete => outcome.as_deref() == Some("incomplete"),
+        _ => false,
+    };
+    if !outcome_matches {
+        return Ok(Default::default());
+    }
+    let occurrence_phase = phase.to_owned();
+    let occurrence_id = format!("operation:{operation_id}:{occurrence_phase}");
+    if !valid_occurrence_identity(&occurrence_id) {
+        return Ok(Default::default());
+    }
+    Ok(crate::automation::intake::SafeEventProjection {
+        status: Some(status),
+        occurrence_phase: Some(occurrence_phase),
+        occurrence_id: Some(occurrence_id),
+        ..Default::default()
+    })
+}
+
+/// Admit only the closed RuntimeOutcome shape written by `runtime::outcome`.
+/// SQLite checks the exact linked observation and closed DTO fields in place;
+/// arbitrary `details` never leave SQLite or enter the returned projection.
+fn accepted_runtime_outcome_projection(
+    db: &Connection,
+    event: &ObservedEvent,
+) -> Result<Option<crate::automation::intake::SafeEventProjection>> {
+    let Some(operation_id) = event.operation_id.as_deref().filter(|id| !id.is_empty()) else {
+        return Ok(None);
+    };
+    if event.observation_id <= 0
+        || !event.source_id.starts_with("module:")
+        || event.event_kind != "runtime.outcome"
+    {
+        return Ok(None);
+    }
+
+    let accepted: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM observations AS o \
+             JOIN operations AS op ON op.operation_id=o.operation_id \
+             JOIN bindings AS b ON b.binding_id=o.binding_id AND b.generation=o.binding_generation \
+             WHERE o.observation_id=?1 AND o.source_stream_id=?2 AND o.kind=?3 \
+               AND o.operation_id=?4 AND o.source_event_key IS NOT NULL \
+               AND o.binding_id IS NOT NULL AND o.binding_generation>0 \
+               AND op.binding_id=o.binding_id AND op.binding_generation=o.binding_generation \
+               AND length(o.source_event_key)=length('outcome:' || op.operation_id || ':')+64 \
+               AND substr(o.source_event_key,1,length('outcome:' || op.operation_id || ':'))=\
+                   'outcome:' || op.operation_id || ':' \
+               AND substr(o.source_event_key,length('outcome:' || op.operation_id || ':')+1) \
+                   NOT GLOB '*[^0-9a-f]*' \
+               AND json_type(b.state_json,'$.module_client_id')='text' \
+               AND json_extract(b.state_json,'$.module_client_id')<>'' \
+               AND o.source_stream_id='module:' || json_extract(b.state_json,'$.module_client_id') \
+               AND json_type(o.payload_json)='object' \
+               AND json_type(o.payload_json,'$.operation_id')='text' \
+               AND json_extract(o.payload_json,'$.operation_id')=op.operation_id \
+               AND json_type(o.payload_json,'$.outcome')='text' \
+               AND json_extract(o.payload_json,'$.outcome')='accepted' \
+               AND json_type(o.payload_json,'$.details') IS NOT NULL \
+               AND COALESCE(json_type(o.payload_json,'$.native_scope_key') IN ('text','null'),1) \
+               AND COALESCE(json_type(o.payload_json,'$.native_root_id') IN ('text','null'),1) \
+               AND COALESCE(json_type(o.payload_json,'$.turn_id') IN ('text','null'),1) \
+               AND COALESCE(json_type(o.payload_json,'$.native_input_id') IN ('text','null'),1) \
+               AND NOT EXISTS (\
+                 SELECT 1 FROM json_each(o.payload_json) AS field \
+                 WHERE field.key NOT IN (\
+                   'operation_id','outcome','native_scope_key','native_root_id',\
+                   'turn_id','native_input_id','details')) \
+               AND (SELECT COUNT(*) FROM json_each(o.payload_json))=\
+                   (SELECT COUNT(DISTINCT field.key) FROM json_each(o.payload_json) AS field)\
+             )",
+        params![
+            event.observation_id,
+            event.source_id,
+            event.event_kind,
+            operation_id,
+        ],
+        |row| row.get(0),
+    )?;
+    if !accepted {
+        return Ok(None);
+    }
+
+    let occurrence_phase = "native_input_accepted";
+    let occurrence_id = format!("operation:{operation_id}:{occurrence_phase}");
+    if !valid_occurrence_identity(&occurrence_id) {
+        return Ok(None);
+    }
+    Ok(Some(crate::automation::intake::SafeEventProjection {
+        status: None,
+        error_code: None,
+        occurrence_phase: Some(occurrence_phase.to_owned()),
+        occurrence_id: Some(occurrence_id),
+        ..Default::default()
+    }))
+}
+
 /// Read only producer-normalized status metadata for event kinds whose
 /// payload contract is explicitly safe. Unlisted event payloads are never
 /// parsed for selector matching.
@@ -357,6 +543,18 @@ pub(crate) fn safe_event_projection(
     event: &ObservedEvent,
 ) -> Result<crate::automation::intake::SafeEventProjection> {
     use crate::automation::event_rules::EventStatus;
+
+    if event.source_id == "controller:scripts" {
+        return script_terminal_event_projection(db, event);
+    }
+    if event.source_id == "controller:host-lifecycle"
+        && matches!(event.event_kind.as_str(), "host.exit" | "host.failed")
+    {
+        return host_terminal_exit_projection(db, event);
+    }
+    if event.source_id.starts_with("module:") && event.event_kind == "runtime.outcome" {
+        return Ok(accepted_runtime_outcome_projection(db, event)?.unwrap_or_default());
+    }
 
     let expected = match (event.source_id.as_str(), event.event_kind.as_str()) {
         ("controller:messages", "message.sent" | "message.reply_sent") => {
@@ -467,6 +665,155 @@ pub(crate) fn safe_event_projection(
         error_code,
         occurrence_phase: Some(expected_phase.to_owned()),
         occurrence_id: occurrence_id.map(ToOwned::to_owned),
+        ..Default::default()
+    })
+}
+
+/// Project only the closed terminal lifecycle DTO written by `retain_exit`.
+/// Persisted error codes and receipt diagnostics never enter a ScriptRun
+/// cause or input.
+fn host_terminal_exit_projection(
+    db: &Connection,
+    event: &ObservedEvent,
+) -> Result<crate::automation::intake::SafeEventProjection> {
+    use crate::automation::event_rules::EventStatus;
+
+    if event.operation_id.is_some() {
+        return Ok(Default::default());
+    }
+    let row: Option<(String, String, i64)> = db
+        .query_row(
+            "SELECT source_event_key,payload_json,recorded_at_ms FROM observations \
+             WHERE observation_id=?1 AND source_stream_id='controller:host-lifecycle' \
+             AND kind=?2 AND operation_id IS NULL",
+            params![event.observation_id, event.event_kind],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((source_event_key, raw, recorded_at_ms)) = row else {
+        return Ok(Default::default());
+    };
+    if raw.len() as i64 > MAX_INTAKE_PAYLOAD_BYTES
+        || recorded_at_ms < 0
+        || event.recorded_at_ms != recorded_at_ms
+    {
+        return Ok(Default::default());
+    }
+    let value: Value = match serde_json::from_str(&raw) {
+        Ok(value) => value,
+        Err(_) => return Ok(Default::default()),
+    };
+    let Some(fields) = value.as_object() else {
+        return Ok(Default::default());
+    };
+    let status = match value["status"].as_str() {
+        Some("completed") if event.event_kind == "host.exit" => EventStatus::Completed,
+        Some("failed") => EventStatus::Failed,
+        _ => return Ok(Default::default()),
+    };
+    let host_epoch = value["host_epoch"].as_i64();
+    let occurrence_id = value["occurrence_id"].as_str();
+    if value["schema_version"] != 1
+        || value["phase"] != "host_terminal_exit_observed"
+        || host_epoch.is_none_or(|epoch| epoch <= 0)
+        || host_epoch.is_some_and(|epoch| {
+            source_event_key
+                != format!(
+                    "{}:{epoch}",
+                    if event.event_kind == "host.exit" {
+                        "terminal"
+                    } else {
+                        "failed"
+                    }
+                )
+        })
+        || occurrence_id
+            != host_epoch
+                .map(|epoch| format!("host-terminal-exit:{epoch}"))
+                .as_deref()
+        || !valid_occurrence_identity(occurrence_id.unwrap_or_default())
+    {
+        return Ok(Default::default());
+    }
+    let failure_category = value["failure_category"].as_str();
+    let failed_supervisor = value["failed_supervisor"].as_str();
+    let category_valid = match failure_category {
+        Some("startup_failure" | "runtime_failure") => failed_supervisor.is_none(),
+        Some("supervisor_stopped" | "supervisor_failed") => {
+            failed_supervisor.is_none_or(super::host_lifecycle::is_known_supervisor)
+        }
+        _ => false,
+    };
+    if (status == EventStatus::Completed
+        && (failure_category.is_some() || failed_supervisor.is_some()))
+        || (status == EventStatus::Failed && !category_valid)
+        || (event.event_kind == "host.failed" && status != EventStatus::Failed)
+    {
+        return Ok(Default::default());
+    }
+    let base_fields = [
+        "host_epoch",
+        "occurrence_id",
+        "phase",
+        "schema_version",
+        "status",
+    ];
+    let expected_field_count = if status == EventStatus::Completed {
+        base_fields.len()
+    } else if failed_supervisor.is_some() {
+        base_fields.len() + 2
+    } else {
+        base_fields.len() + 1
+    };
+    if fields.len() != expected_field_count
+        || fields.keys().any(|key| {
+            !base_fields.contains(&key.as_str())
+                && key != "failure_category"
+                && key != "failed_supervisor"
+        })
+    {
+        return Ok(Default::default());
+    }
+    let host_epoch = host_epoch.unwrap_or_default();
+    if status == EventStatus::Failed {
+        let (sibling_kind, sibling_key) = if event.event_kind == "host.exit" {
+            ("host.failed", format!("failed:{host_epoch}"))
+        } else {
+            ("host.exit", format!("terminal:{host_epoch}"))
+        };
+        let sibling: Option<(String, String, i64)> = db
+            .query_row(
+                "SELECT source_event_key,payload_json,recorded_at_ms FROM observations \
+                 WHERE source_stream_id='controller:host-lifecycle' AND kind=?1 \
+                 AND source_event_key=?2 AND operation_id IS NULL LIMIT 1",
+                params![sibling_kind, sibling_key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        if !sibling.is_some_and(|(key, payload, time)| {
+            key == sibling_key && payload == raw && time == recorded_at_ms
+        }) {
+            return Ok(Default::default());
+        }
+    } else {
+        let normalized_failure_exists: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM observations \
+             WHERE source_stream_id='controller:host-lifecycle' AND kind='host.failed' \
+             AND source_event_key=?1 AND operation_id IS NULL)",
+            [format!("failed:{host_epoch}")],
+            |row| row.get(0),
+        )?;
+        if normalized_failure_exists {
+            return Ok(Default::default());
+        }
+    }
+    Ok(crate::automation::intake::SafeEventProjection {
+        status: Some(status),
+        failure_category: failure_category.map(ToOwned::to_owned),
+        failed_supervisor: failed_supervisor.map(ToOwned::to_owned),
+        occurrence_phase: Some("host_terminal_exit_observed".to_owned()),
+        occurrence_id: occurrence_id.map(ToOwned::to_owned),
+        ..Default::default()
     })
 }
 

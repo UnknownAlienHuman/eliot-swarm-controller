@@ -1297,6 +1297,8 @@ pub(crate) fn script_run_causes_semantically_match(left: &Value, right: &Value) 
             && left["script_id"] == right["script_id"]
             && left["status"] == right["status"]
             && left["error_code"] == right["error_code"]
+            && left["failure_category"] == right["failure_category"]
+            && left["failed_supervisor"] == right["failed_supervisor"]
             && left["operation_id"] == right["operation_id"]
             && same_occurrence
             && same_scope;

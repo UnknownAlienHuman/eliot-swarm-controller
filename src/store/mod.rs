@@ -12,6 +12,8 @@ mod automation_publication;
 pub(crate) mod automation_repair;
 mod automation_transfer;
 pub(crate) mod automation_work_dispatch;
+#[cfg(test)]
+mod c33_restart_diagnosis_fixture;
 pub(crate) mod capacity;
 mod checks;
 mod coordination;
@@ -264,10 +266,19 @@ impl Store {
         .await
     }
 
-    pub(crate) async fn record_host_exit(&self, error_code: Option<String>) -> Result<()> {
+    pub(crate) async fn record_host_exit(
+        &self,
+        error_code: Option<String>,
+        failed_supervisor: Option<&'static str>,
+    ) -> Result<()> {
         self.run(move |db| {
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            host_lifecycle::finish(&tx, error_code.as_deref(), model::now_ms()?)?;
+            host_lifecycle::finish(
+                &tx,
+                error_code.as_deref(),
+                failed_supervisor,
+                model::now_ms()?,
+            )?;
             tx.commit()?;
             Ok(())
         })
@@ -3824,6 +3835,54 @@ pub(super) fn record_operation_failure_event(
     tx.execute(
         "INSERT OR IGNORE INTO observations(source_stream_id,source_event_key,operation_id,kind,payload_json,recorded_at_ms) VALUES('controller:operations',?1,?2,?3,?4,?5)",
         rusqlite::params![occurrence_id, operation_id, kind, model::canonical(&payload)?, now],
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn insert_safe_host_terminal_failure_event(
+    tx: &Transaction<'_>,
+    host_epoch: i64,
+    failure_category: &str,
+    failed_supervisor: Option<&str>,
+    recorded_at_ms: i64,
+) -> Result<()> {
+    let category_valid = match failure_category {
+        "startup_failure" | "runtime_failure" => failed_supervisor.is_none(),
+        "supervisor_stopped" | "supervisor_failed" => true,
+        _ => false,
+    };
+    if host_epoch <= 0
+        || recorded_at_ms < 0
+        || !category_valid
+        || failed_supervisor.is_some_and(|name| !host_lifecycle::is_known_supervisor(name))
+    {
+        return Err(Error::new(
+            "SYSTEM_EVENT_INVALID",
+            "host terminal failure identity or category is invalid",
+        ));
+    }
+    let phase = "host_terminal_exit_observed";
+    let occurrence_id = format!("host-terminal-exit:{host_epoch}");
+    let mut payload = json!({
+        "schema_version":1,
+        "phase":phase,
+        "status":"failed",
+        "occurrence_id":occurrence_id,
+        "host_epoch":host_epoch,
+        "failure_category":failure_category
+    });
+    if let Some(name) = failed_supervisor {
+        payload["failed_supervisor"] = json!(name);
+    }
+    tx.execute(
+        "INSERT OR IGNORE INTO observations(source_stream_id,source_event_key,operation_id,kind,payload_json,recorded_at_ms) \
+         VALUES('controller:host-lifecycle',?1,NULL,'host.failed',?2,?3)",
+        rusqlite::params![
+            format!("failed:{host_epoch}"),
+            model::canonical(&payload)?,
+            recorded_at_ms
+        ],
     )?;
     Ok(())
 }

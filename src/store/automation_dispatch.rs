@@ -955,11 +955,24 @@ fn process_system_event_script_projection(
         return Ok(());
     }
     let mut cause = system_event_cause(event, &projection, &script_id)?;
-    if state
+    let duplicate_pending = state
         .pending
         .iter()
-        .any(|pending| pending.script_id == script_id && pending.cause["id"] == cause["id"])
-    {
+        .any(|pending| pending.script_id == script_id && pending.cause["id"] == cause["id"]);
+    if duplicate_pending {
+        if event.source_id == "controller:host-lifecycle"
+            && matches!(event.event_kind.as_str(), "host.exit" | "host.failed")
+            && state.pending.iter().any(|pending| {
+                !pending.held
+                    && pending.script_id == script_id
+                    && pending.cause["id"] == cause["id"]
+            })
+        {
+            // The first view already passed the current-Manager source gate.
+            // Record the matching second selector before coalescing the shared
+            // host occurrence so Manager readback does not leave it pending.
+            mark_observed_script_selectors(state, entry, event, projection.status)?;
+        }
         remember_script_trigger_recent(
             state,
             json!({
@@ -1035,7 +1048,14 @@ fn event_requires_occurrence_projection(event: &crate::automation::intake::Obser
                     "controller:runtime",
                     "native.operation.completed" | "native.result.available"
                 )
-                | ("controller:host-lifecycle", "host.interrupted")
+                | (
+                    "controller:host-lifecycle",
+                    "host.exit" | "host.failed" | "host.interrupted"
+                )
+                | (
+                    "controller:scripts",
+                    "script.completed" | "script.failed" | "script.incomplete"
+                )
                 | (
                     "controller:operations",
                     "operation.rejected" | "operation.outcome_unknown"
@@ -1185,7 +1205,7 @@ fn system_event_cause(
     script_id: &str,
 ) -> Result<Value> {
     let semantic_id = system_event_semantic_id(event.observation_id, projection)?;
-    Ok(json!({
+    let mut cause = json!({
         "kind":"system_event",
         "id":semantic_id,
         "observation_id":event.observation_id,
@@ -1198,7 +1218,14 @@ fn system_event_cause(
         "occurrence_phase":projection.occurrence_phase,
         "occurrence_id":projection.occurrence_id,
         "script_id":script_id
-    }))
+    });
+    if let Some(failure_category) = projection.failure_category.as_deref() {
+        cause["failure_category"] = json!(failure_category);
+    }
+    if let Some(failed_supervisor) = projection.failed_supervisor.as_deref() {
+        cause["failed_supervisor"] = json!(failed_supervisor);
+    }
+    Ok(cause)
 }
 
 fn system_event_semantic_id(
@@ -1411,8 +1438,9 @@ enum RawRuntimeOutcomeKind {
     Invalid,
 }
 
-/// Classify only the persisted closed RuntimeOutcome enum. Its details remain
-/// unread by the selector and are never included in the resulting cause.
+/// Classify only the persisted RuntimeOutcome identity and enum fields.
+/// Arbitrary receipt details are neither fetched into Rust nor included in a
+/// resulting cause.
 fn raw_runtime_outcome_kind(
     db: &Connection,
     event: &crate::automation::intake::ObservedEvent,
@@ -1423,34 +1451,32 @@ fn raw_runtime_outcome_kind(
     let Some(operation_id) = event.operation_id.as_deref() else {
         return Ok(Some(RawRuntimeOutcomeKind::Invalid));
     };
-    let raw: Option<String> = db
+    let outcome: Option<Option<String>> = db
         .query_row(
-            "SELECT payload_json FROM observations \
+            "SELECT CASE WHEN json_type(payload_json)='object' \
+               AND json_type(payload_json,'$.operation_id')='text' \
+               AND json_extract(payload_json,'$.operation_id')=?4 \
+               AND json_type(payload_json,'$.outcome')='text' \
+             THEN json_extract(payload_json,'$.outcome') ELSE NULL END \
+             FROM observations \
              WHERE observation_id=?1 AND source_stream_id=?2 AND kind=?3 AND operation_id=?4",
             params![
                 event.observation_id,
                 event.source_id,
                 event.event_kind,
-                operation_id
+                operation_id,
             ],
             |row| row.get(0),
         )
         .optional()?;
-    let Some(raw) = raw else {
+    let Some(Some(outcome)) = outcome else {
         return Ok(Some(RawRuntimeOutcomeKind::Invalid));
     };
-    let value: Value = match serde_json::from_str(&raw) {
-        Ok(value) => value,
-        Err(_) => return Ok(Some(RawRuntimeOutcomeKind::Invalid)),
-    };
-    if value["operation_id"].as_str() != Some(operation_id) {
-        return Ok(Some(RawRuntimeOutcomeKind::Invalid));
-    }
-    let outcome = match value["outcome"].as_str() {
-        Some("accepted") => RawRuntimeOutcomeKind::Accepted,
-        Some("applied") => RawRuntimeOutcomeKind::Applied,
-        Some("rejected") => RawRuntimeOutcomeKind::Rejected,
-        Some("unknown") => RawRuntimeOutcomeKind::Unknown,
+    let outcome = match outcome.as_str() {
+        "accepted" => RawRuntimeOutcomeKind::Accepted,
+        "applied" => RawRuntimeOutcomeKind::Applied,
+        "rejected" => RawRuntimeOutcomeKind::Rejected,
+        "unknown" => RawRuntimeOutcomeKind::Unknown,
         _ => RawRuntimeOutcomeKind::Invalid,
     };
     Ok(Some(outcome))
@@ -1519,6 +1545,8 @@ pub(crate) fn validate_retained_script_event_cause(
                 .status
                 .map(crate::automation::event_rules::EventStatus::as_str)
         || cause["error_code"].as_str() != projection.error_code.as_deref()
+        || cause["failure_category"].as_str() != projection.failure_category.as_deref()
+        || cause["failed_supervisor"].as_str() != projection.failed_supervisor.as_deref()
     {
         return Err(Error::new(
             "AUTOMATION_LINK_CORRUPT",
@@ -1623,8 +1651,10 @@ pub(crate) fn validate_retained_script_event_cause(
             ));
         }
     } else if event.source_id != "controller:host-lifecycle"
-        || !matches!(event.event_kind.as_str(), "host.exit" | "host.interrupted")
-        || projection.occurrence_phase.as_deref() != Some("host_interruption_observed")
+        || !((matches!(event.event_kind.as_str(), "host.exit" | "host.interrupted")
+            && projection.occurrence_phase.as_deref() == Some("host_interruption_observed"))
+            || (matches!(event.event_kind.as_str(), "host.exit" | "host.failed")
+                && projection.occurrence_phase.as_deref() == Some("host_terminal_exit_observed")))
     {
         return Err(Error::new(
             "AUTOMATION_LINK_CORRUPT",
@@ -1649,6 +1679,12 @@ pub(crate) fn validate_retained_script_event_cause(
     }
     if let Some(error_code) = projection.error_code {
         input["error_code"] = json!(error_code);
+    }
+    if let Some(failure_category) = projection.failure_category {
+        input["failure_category"] = json!(failure_category);
+    }
+    if let Some(failed_supervisor) = projection.failed_supervisor {
+        input["failed_supervisor"] = json!(failed_supervisor);
     }
     if let Some(task_id) = task_id {
         input["task_id"] = json!(task_id);
@@ -1715,6 +1751,8 @@ pub(crate) fn script_event_invocation_context(
                 .status
                 .map(crate::automation::event_rules::EventStatus::as_str)
         || cause["error_code"].as_str() != projection.error_code.as_deref()
+        || cause["failure_category"].as_str() != projection.failure_category.as_deref()
+        || cause["failed_supervisor"].as_str() != projection.failed_supervisor.as_deref()
         || !entry.accepts_script_run_event(&event.source_id, &event.event_kind, projection.status)
     {
         return Err(Error::new(
@@ -1739,6 +1777,8 @@ pub(crate) fn script_event_invocation_context(
                 .status
                 .map(crate::automation::event_rules::EventStatus::as_str)
         || cause["error_code"].as_str() != projection.error_code.as_deref()
+        || cause["failure_category"].as_str() != projection.failure_category.as_deref()
+        || cause["failed_supervisor"].as_str() != projection.failed_supervisor.as_deref()
     {
         return Err(Error::new(
             "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
@@ -1873,8 +1913,10 @@ pub(crate) fn script_event_invocation_context(
             }
         }
     } else if event.source_id == "controller:host-lifecycle"
-        && matches!(event.event_kind.as_str(), "host.exit" | "host.interrupted")
-        && projection.occurrence_phase.as_deref() == Some("host_interruption_observed")
+        && ((matches!(event.event_kind.as_str(), "host.exit" | "host.interrupted")
+            && projection.occurrence_phase.as_deref() == Some("host_interruption_observed"))
+            || (matches!(event.event_kind.as_str(), "host.exit" | "host.failed")
+                && projection.occurrence_phase.as_deref() == Some("host_terminal_exit_observed")))
     {
         // The typed host lifecycle projection is global metadata visible to an
         // active Manager. It carries no Task, binding, or private payload.
@@ -1926,6 +1968,12 @@ pub(crate) fn script_event_invocation_context(
     }
     if let Some(error_code) = projection.error_code {
         input["error_code"] = json!(error_code);
+    }
+    if let Some(failure_category) = projection.failure_category {
+        input["failure_category"] = json!(failure_category);
+    }
+    if let Some(failed_supervisor) = projection.failed_supervisor {
+        input["failed_supervisor"] = json!(failed_supervisor);
     }
     if let Some(task_id) = task_id.as_deref() {
         input["task_id"] = json!(task_id);
@@ -4810,6 +4858,7 @@ mod script_event_trigger_tests {
     fn raw_runtime_unknown_aliases_only_the_exact_operation_unknown_occurrence() {
         let (mut db, _, _, _, _) = fixture();
         let tx = db.transaction().unwrap();
+        let oversized_unknown_detail = format!("PRIVATE_UNKNOWN_DETAIL:{}", "x".repeat(64 * 1024));
         let raw_unknown = insert_event(
             &tx,
             "module:runtime-fixture",
@@ -4818,7 +4867,10 @@ mod script_event_trigger_tests {
             json!({
                 "operation_id": OPERATION_ID,
                 "outcome": "unknown",
-                "details": {"private_native_detail":"must not escape"}
+                "details": {
+                    "private_native_detail":"must not escape",
+                    "oversized_private_detail":oversized_unknown_detail.as_str()
+                }
             }),
         );
         let raw_applied = insert_event(
@@ -4876,6 +4928,15 @@ mod script_event_trigger_tests {
                 .unwrap()
         };
         let unknown_event = observed(raw_unknown);
+        let oversized_unknown_receipts: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM observations WHERE observation_id=?1 \
+                 AND length(CAST(payload_json AS BLOB))>48*1024",
+                [raw_unknown],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(oversized_unknown_receipts, 1);
         let unknown_projections = script_event_projections_with_alias(&db, &unknown_event).unwrap();
         assert_eq!(unknown_projections.len(), 1);
         assert_eq!(unknown_projections[0].status, Some(EventStatus::Unknown));
@@ -4888,6 +4949,7 @@ mod script_event_trigger_tests {
             Some("operation_outcome_unknown")
         );
         assert!(!format!("{:?}", unknown_projections[0]).contains("must not escape"));
+        assert!(!format!("{:?}", unknown_projections[0]).contains(&oversized_unknown_detail));
         assert_eq!(
             unknown_projections[0].occurrence_id.as_deref(),
             Some(format!("operation:{OPERATION_ID}:operation_outcome_unknown").as_str())
@@ -4918,7 +4980,8 @@ mod script_event_trigger_tests {
         assert!(
             script_event_projections_with_alias(&db, &accepted_event)
                 .unwrap()
-                .is_empty()
+                .is_empty(),
+            "an unbound synthetic receipt cannot impersonate the accepted-writer projection"
         );
         assert_ne!(
             unknown_projections[0].occurrence_phase.as_deref(),
@@ -4928,5 +4991,322 @@ mod script_event_trigger_tests {
                 .as_deref(),
             "unknown native outcome must never acquire the completion phase"
         );
+    }
+
+    #[test]
+    fn accepted_runtime_outcome_is_statusless_safe_and_semantically_deduplicated() {
+        const MODULE_ID: &str = "accepted-event-module";
+        const MODULE_LINK_ID: &str = "accepted-event-link";
+        const BINDING_ID: &str = "accepted-event-binding";
+        const OTHER_BINDING_ID: &str = "accepted-event-other-binding";
+        const ACCEPTED_OPERATION_ID: &str = "accepted-native-operation";
+        const PRIVATE_DETAIL: &str = "PRIVATE_NATIVE_RECEIPT_DETAIL";
+        let oversized_private_detail =
+            format!("PRIVATE_LARGE_NATIVE_DETAIL:{}", "x".repeat(64 * 1024));
+
+        let mut db = Connection::open_in_memory().unwrap();
+        db.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        db.execute_batch(include_str!("../../migrations/001_core.sql"))
+            .unwrap();
+        db.execute_batch(super::super::WORKSPACE_SCHEMA).unwrap();
+        db.execute_batch(super::super::SCRIPT_SCHEMA).unwrap();
+        super::super::set_meta(
+            &db,
+            &format!("client:{MANAGER_ID}"),
+            &json!({"role":"manager","disabled":false}),
+        )
+        .unwrap();
+        super::super::set_meta(
+            &db,
+            "gm",
+            &json!({"client_id":MANAGER_ID,"binding_id":null,"binding_generation":null,"epoch":1}),
+        )
+        .unwrap();
+        super::super::set_meta(
+            &db,
+            &format!("client:{MODULE_ID}"),
+            &json!({
+                "role":"module",
+                "disabled":false,
+                "binding_id":BINDING_ID,
+                "binding_generation":1
+            }),
+        )
+        .unwrap();
+        let binding_state = json!({
+            "module_client_id":MODULE_ID,
+            "module_link_id":MODULE_LINK_ID
+        });
+        db.execute(
+            "INSERT INTO bindings(binding_id,generation,lane_id,module_instance_id,module_artifact_id,state,native_scope_key,native_root_id,route_json,state_json,created_at_ms) \
+             VALUES(?1,1,'accepted-event-lane','accepted-event-instance','accepted-event-artifact','ready',NULL,NULL,'{}',?2,1)",
+            params![BINDING_ID, model::canonical(&binding_state).unwrap()],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,effective_request_json,binding_id,binding_generation,state,native_refs_json,result_json,due_at_ms,settled_at_ms,created_at_ms,updated_at_ms) \
+             VALUES(?1,?2,'accepted-event-send','agent.send',?4,'{}',?3,1,'sending','{}',NULL,1,NULL,1,1)",
+            params![
+                ACCEPTED_OPERATION_ID,
+                MANAGER_ID,
+                BINDING_ID,
+                model::canonical(&json!({"text":"PRIVATE_INPUT_TEXT"})).unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let principal = Principal {
+            link_id: MODULE_LINK_ID.to_owned(),
+            client_id: MODULE_ID.to_owned(),
+            role: Role::Module,
+        };
+        for (index, receipt_detail) in ["first receipt", "second receipt"].iter().enumerate() {
+            super::super::runtime::outcome(
+                &mut db,
+                &principal,
+                &json!({
+                    "operation_id":ACCEPTED_OPERATION_ID,
+                    "outcome":"accepted",
+                    "native_scope_key":null,
+                    "native_root_id":null,
+                    "turn_id":null,
+                    "native_input_id":"PRIVATE_NATIVE_INPUT_ID",
+                    "details":{
+                        "private_native_detail":PRIVATE_DETAIL,
+                        "oversized_private_detail":if index == 0 { PRIVATE_DETAIL } else { oversized_private_detail.as_str() },
+                        "private_link_id":MODULE_LINK_ID,
+                        "receipt_note":receipt_detail
+                    }
+                }),
+            )
+            .unwrap();
+        }
+
+        let actual_ids = {
+            let mut statement = db
+                .prepare(
+                    "SELECT observation_id FROM observations \
+                     WHERE source_stream_id=?1 AND operation_id=?2 AND kind='runtime.outcome' \
+                     ORDER BY observation_id",
+                )
+                .unwrap();
+            statement
+                .query_map(
+                    params![format!("module:{MODULE_ID}"), ACCEPTED_OPERATION_ID],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(actual_ids.len(), 2, "distinct native receipts are retained");
+        let oversized_receipts: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM observations WHERE observation_id IN (?1,?2) \
+                 AND length(CAST(payload_json AS BLOB))>48*1024",
+                params![actual_ids[0], actual_ids[1]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            oversized_receipts, 1,
+            "one real writer receipt exceeds 48 KiB"
+        );
+
+        fn insert_raw_outcome(
+            tx: &Transaction<'_>,
+            source_id: &str,
+            binding_id: &str,
+            operation_id: &str,
+            embedded_operation_id: &str,
+            detail: &str,
+        ) -> i64 {
+            let payload = json!({
+                "operation_id":embedded_operation_id,
+                "outcome":"accepted",
+                "native_scope_key":null,
+                "native_root_id":null,
+                "turn_id":null,
+                "details":{"private_native_detail":detail}
+            });
+            let encoded = model::canonical(&payload).unwrap();
+            let event_key = format!(
+                "outcome:{operation_id}:{}",
+                model::digest(encoded.as_bytes())
+            );
+            tx.execute(
+                "INSERT INTO observations(source_stream_id,source_event_key,binding_id,binding_generation,operation_id,kind,payload_json,recorded_at_ms) \
+                 VALUES(?1,?2,?3,1,?4,'runtime.outcome',?5,2)",
+                params![source_id, event_key, binding_id, operation_id, encoded],
+            )
+            .unwrap();
+            tx.last_insert_rowid()
+        }
+
+        let (forged_source_id, forged_binding_id, forged_payload_id) = {
+            let tx = db.transaction().unwrap();
+            let other_binding_state = json!({
+                "module_client_id":MODULE_ID,
+                "module_link_id":"forged-binding-link"
+            });
+            tx.execute(
+                "INSERT INTO bindings(binding_id,generation,lane_id,module_instance_id,module_artifact_id,state,native_scope_key,native_root_id,route_json,state_json,created_at_ms) \
+                 VALUES(?1,1,'forged-event-lane','forged-event-instance','forged-event-artifact','ready',NULL,NULL,'{}',?2,1)",
+                params![OTHER_BINDING_ID, model::canonical(&other_binding_state).unwrap()],
+            )
+            .unwrap();
+            let source = insert_raw_outcome(
+                &tx,
+                "module:forged-source",
+                BINDING_ID,
+                ACCEPTED_OPERATION_ID,
+                ACCEPTED_OPERATION_ID,
+                "forged source",
+            );
+            let binding = insert_raw_outcome(
+                &tx,
+                &format!("module:{MODULE_ID}"),
+                OTHER_BINDING_ID,
+                ACCEPTED_OPERATION_ID,
+                ACCEPTED_OPERATION_ID,
+                "forged operation binding tuple",
+            );
+            let embedded = insert_raw_outcome(
+                &tx,
+                &format!("module:{MODULE_ID}"),
+                BINDING_ID,
+                ACCEPTED_OPERATION_ID,
+                "forged-embedded-operation",
+                "forged embedded operation identity",
+            );
+            tx.commit().unwrap();
+            (source, binding, embedded)
+        };
+
+        let actual_events = actual_ids
+            .iter()
+            .map(|id| {
+                automation_intake::observed_event_by_id(&db, *id)
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let actual_projections = actual_events
+            .iter()
+            .map(|event| script_event_projections_with_alias(&db, event).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(actual_projections.len(), 2);
+        for projections in &actual_projections {
+            assert_eq!(projections.len(), 1);
+            assert_eq!(projections[0].status, None);
+            assert_eq!(projections[0].error_code, None);
+            assert_eq!(
+                projections[0].occurrence_phase.as_deref(),
+                Some("native_input_accepted")
+            );
+            assert_eq!(
+                projections[0].occurrence_id.as_deref(),
+                Some(format!("operation:{ACCEPTED_OPERATION_ID}:native_input_accepted").as_str())
+            );
+            assert!(!format!("{:?}", projections[0]).contains(PRIVATE_DETAIL));
+            assert!(!format!("{:?}", projections[0]).contains(&oversized_private_detail));
+        }
+        assert_eq!(
+            system_event_semantic_id(actual_ids[0], &actual_projections[0][0]).unwrap(),
+            system_event_semantic_id(actual_ids[1], &actual_projections[1][0]).unwrap(),
+            "accepted receipts share one stable Operation phase identity"
+        );
+        let statusless_rule = selector("module:accepted-event-module", "runtime.outcome", None);
+        let completed_rule = selector(
+            "module:accepted-event-module",
+            "runtime.outcome",
+            Some(EventStatus::Completed),
+        );
+        assert!(statusless_rule.matches_safe_event(
+            &actual_events[0].source_id,
+            &actual_events[0].event_kind,
+            actual_projections[0][0].status
+        ));
+        assert!(!completed_rule.matches_safe_event(
+            &actual_events[0].source_id,
+            &actual_events[0].event_kind,
+            actual_projections[0][0].status
+        ));
+        let terminal_aliases: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM observations WHERE source_stream_id='controller:runtime' \
+                 AND operation_id=?1 AND kind='native.operation.completed'",
+                [ACCEPTED_OPERATION_ID],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(terminal_aliases, 0, "accepted is not a terminal completion");
+
+        for id in [forged_source_id, forged_binding_id, forged_payload_id] {
+            let event = automation_intake::observed_event_by_id(&db, id)
+                .unwrap()
+                .unwrap();
+            assert!(
+                script_event_projections_with_alias(&db, &event)
+                    .unwrap()
+                    .is_empty(),
+                "forged source, Operation/binding tuple, or embedded identity stays suppressed"
+            );
+        }
+
+        let mut entry = AutomationEntry::new(MANAGER_ID, PROJECT_ID, AUTOMATION_ID, 1);
+        entry.enabled = true;
+        entry.steps = vec![AutomationStep::ScriptRun];
+        entry.script_run = Some(ScriptRunSettings {
+            script_id: SCRIPT_ID.to_owned(),
+        });
+        entry.event_rules = Some(vec![statusless_rule]);
+        let mut state = empty_script_trigger_state(&entry, 0, 10);
+        let app_config = Config::default();
+        let tx = db.transaction().unwrap();
+        process_system_event_script_trigger(
+            &tx,
+            &app_config,
+            &entry,
+            &mut state,
+            &actual_events[0],
+        )
+        .unwrap();
+        assert_eq!(state.pending.len(), 1);
+        process_system_event_script_trigger(
+            &tx,
+            &app_config,
+            &entry,
+            &mut state,
+            &actual_events[1],
+        )
+        .unwrap();
+        assert_eq!(
+            state.pending.len(),
+            1,
+            "the second receipt coalesces by phase"
+        );
+        let cause = &state.pending[0].cause;
+        assert!(
+            cause["status"].is_null(),
+            "the common retained cause encodes an absent normalized status as null"
+        );
+        assert_eq!(cause["occurrence_phase"], "native_input_accepted");
+        assert_eq!(
+            cause["occurrence_id"],
+            format!("operation:{ACCEPTED_OPERATION_ID}:native_input_accepted")
+        );
+        assert!(cause.get("task_id").is_none());
+        assert!(cause.get("attempt_id").is_none());
+        let reread = script_event_invocation_context(&tx, &app_config, &entry, cause).unwrap();
+        assert_eq!(reread.input["operation_id"], ACCEPTED_OPERATION_ID);
+        assert!(reread.input.get("status").is_none());
+        assert!(reread.input.get("error_code").is_none());
+        assert!(reread.input.get("task_id").is_none());
+        let rendered = reread.input.to_string();
+        assert!(!rendered.contains(PRIVATE_DETAIL));
+        assert!(!rendered.contains("PRIVATE_NATIVE_INPUT_ID"));
+        assert!(!rendered.contains(MODULE_LINK_ID));
+        assert!(!rendered.contains("PRIVATE_INPUT_TEXT"));
     }
 }

@@ -1,6 +1,12 @@
 use super::*;
 use crate::platform::{DataRoot, bootstrap_credential};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use std::sync::Arc;
+
+const TERMINAL_EVENT_MANAGER_ID: &str = "host-terminal-event-manager";
+const TERMINAL_EVENT_PROJECT_ID: &str = "host-terminal-event-project";
+const TERMINAL_EVENT_AUTOMATION_ID: &str = "host-terminal-event-script-trigger";
+const TERMINAL_EVENT_SCRIPT_ID: &str = "host_terminal_event_script";
 
 async fn started_store() -> (StoreOwner, Principal, std::path::PathBuf) {
     let directory = std::env::temp_dir().join(format!("eliot-system-events-{}", model::new_id()));
@@ -49,6 +55,99 @@ async fn register_manager(store: &Store, operator: &Principal, client_id: &str) 
         })
         .await
         .expect("authenticate Manager")
+}
+
+fn powershell_path() -> std::path::PathBuf {
+    let executable = if cfg!(windows) { "pwsh.exe" } else { "pwsh" };
+    std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .map(|directory| directory.join(executable))
+        .filter_map(|path| std::fs::canonicalize(path).ok())
+        .find(|path| {
+            std::fs::symlink_metadata(path)
+                .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+        })
+        .expect("pwsh is needed only for registered bundle identity checks")
+}
+
+async fn register_terminal_event_script(store: &Store, manager: &Principal) {
+    let bundle = json!({
+        "script_id":TERMINAL_EVENT_SCRIPT_ID,
+        "interpreter_kind":"powershell",
+        "interpreter_path":powershell_path(),
+        "entrypoint":"main.ps1",
+        "argv":[],
+        "trust":"trusted_local",
+        "inherit_environment":[],
+        "controller_effects":[],
+        "input_schema":{"type":"object","properties":{},"required":[],"additional_properties":true},
+        "result_schema":{"type":"null"},
+        "files":[{"path":"main.ps1","content_base64":STANDARD.encode(b"Write-Output {}")}],
+    });
+    write(store, manager, "script.register", json!({"bundle":bundle}))
+        .await
+        .expect("register the script bundle without executing it");
+    write(
+        store,
+        manager,
+        "script.activate",
+        json!({"script_id":TERMINAL_EVENT_SCRIPT_ID,"revision":1}),
+    )
+    .await
+    .expect("activate the immutable script revision");
+}
+
+async fn configure_terminal_event_trigger(store: &Store, manager: &Principal) {
+    let changes = json!([{
+        "automation_id":TERMINAL_EVENT_AUTOMATION_ID,
+        "expected_revision":0,
+        "include_existing":false,
+        "patch":{
+            "enabled":true,
+            "steps":["script_run"],
+            "script_run":{"script_id":TERMINAL_EVENT_SCRIPT_ID},
+            "event_rules":[
+                {"source_id":"controller:host-lifecycle","event_kind":"host.exit","status":null,"action":"script_run"},
+                {"source_id":"controller:host-lifecycle","event_kind":"host.failed","status":null,"action":"script_run"}
+            ]
+        }
+    }]);
+    let preview = store
+        .call(
+            manager.clone(),
+            "automation.config.preview".to_owned(),
+            json!({"project_id":TERMINAL_EVENT_PROJECT_ID,"changes":changes}),
+        )
+        .await
+        .expect("preview host terminal ScriptRun selectors");
+    assert_eq!(preview["valid"], true, "{preview}");
+    write(
+        store,
+        manager,
+        "automation.config.apply",
+        json!({
+            "project_id":TERMINAL_EVENT_PROJECT_ID,
+            "changes":changes,
+            "preview_digest":preview["plan_sha256"]
+        }),
+    )
+    .await
+    .expect("apply host terminal ScriptRun selectors");
+}
+
+async fn explain_terminal_event_trigger(store: &Store, manager: &Principal) -> Value {
+    store
+        .call(
+            manager.clone(),
+            "automation.config.explain".to_owned(),
+            json!({
+                "project_id":TERMINAL_EVENT_PROJECT_ID,
+                "automation_id":TERMINAL_EVENT_AUTOMATION_ID
+            }),
+        )
+        .await
+        .expect("read current-Manager ScriptRun state and linked causes")
 }
 
 #[tokio::test]
@@ -450,4 +549,335 @@ fn assert_result_page_projection(eof: bool) {
 fn result_page_projection_keeps_eof_status_and_phase_on_the_exact_operation() {
     assert_result_page_projection(true);
     assert_result_page_projection(false);
+}
+
+#[tokio::test]
+async fn terminal_host_exit_is_a_safe_any_event_and_failure_views_share_one_script_cause() {
+    // This exercises the ordinary Store producer, committed observations,
+    // the current Manager's ScriptRun cursor, and its retained operation link.
+    // The separate script supervisor is not started, so no interpreter runs.
+    let (owner, operator, directory) = started_store().await;
+    let manager = register_manager(&owner.store, &operator, TERMINAL_EVENT_MANAGER_ID).await;
+    write(
+        &owner.store,
+        &operator,
+        "gm.handover",
+        json!({"client_id":TERMINAL_EVENT_MANAGER_ID}),
+    )
+    .await
+    .expect("designate the fixture Manager");
+    register_terminal_event_script(&owner.store, &manager).await;
+    configure_terminal_event_trigger(&owner.store, &manager).await;
+    owner
+        .store
+        .record_host_start()
+        .await
+        .expect("record initial host startup");
+    owner
+        .store
+        .record_host_ready()
+        .await
+        .expect("record ready host lifecycle");
+
+    let initial_epoch = owner
+        .store
+        .run(|db| {
+            Ok(crate::store::meta(db, "host_epoch")?
+                .and_then(|value| value.as_i64())
+                .unwrap_or_default())
+        })
+        .await
+        .expect("read current host epoch");
+    assert!(initial_epoch > 0);
+    owner
+        .store
+        .run(move |db| {
+            crate::store::set_meta(
+                db,
+                "host:last-exit:v1",
+                &json!({
+                    "schema_version":1,
+                    "host_epoch":initial_epoch,
+                    "observed_at_ms":1,
+                    "error_code":"HOST_INTERRUPTED",
+                    "manager_action_required":true,
+                    "retry_authorized":false,
+                }),
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("seed the original schema-version-1 exit shape");
+    let old_receipt = owner
+        .store
+        .call(
+            manager.clone(),
+            "swarm.exceptions.get".to_owned(),
+            json!({"after":0,"limit":32}),
+        )
+        .await
+        .expect("current Manager can read the old schema-version-1 receipt");
+    assert_eq!(
+        old_receipt["host_lifecycle"]["last_exit"]["error_code"],
+        "HOST_INTERRUPTED"
+    );
+    assert!(
+        old_receipt["host_lifecycle"]["last_exit"]
+            .get("failed_supervisor")
+            .is_none()
+    );
+    assert!(
+        old_receipt["host_lifecycle"]["last_exit"]
+            .get("failure_category")
+            .is_none()
+    );
+
+    owner
+        .store
+        .record_host_exit(Some("SUPERVISOR_FAILED".to_owned()), Some("scripts"))
+        .await
+        .expect("commit a named supervisor failure");
+    let failure_observations = owner
+        .store
+        .run(move |db| {
+            let mut statement = db.prepare(
+                "SELECT observation_id,kind,payload_json FROM observations \
+                 WHERE source_stream_id='controller:host-lifecycle' \
+                 AND source_event_key IN (?1,?2) ORDER BY observation_id",
+            )?;
+            let rows = statement
+                .query_map(
+                    rusqlite::params![
+                        format!("failed:{initial_epoch}"),
+                        format!("terminal:{initial_epoch}")
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut projected = Vec::with_capacity(rows.len());
+            for (observation_id, event_kind, raw) in rows {
+                let event = automation_intake::observed_event_by_id(db, observation_id)?
+                    .expect("committed host lifecycle observation");
+                let projection = automation_intake::safe_event_projection(db, &event)?;
+                projected.push(json!({
+                    "event_kind":event_kind,
+                    "raw":serde_json::from_str::<Value>(&raw)?,
+                    "status":projection.status.map(crate::automation::event_rules::EventStatus::as_str),
+                    "failure_category":projection.failure_category,
+                    "failed_supervisor":projection.failed_supervisor,
+                    "error_code":projection.error_code,
+                    "occurrence_phase":projection.occurrence_phase,
+                    "occurrence_id":projection.occurrence_id
+                }));
+            }
+            Ok(projected)
+        })
+        .await
+        .expect("read and project the committed terminal failure views");
+    assert_eq!(failure_observations.len(), 2, "{failure_observations:?}");
+    let raw_failure = failure_observations
+        .iter()
+        .find(|row| row["event_kind"] == "host.exit")
+        .expect("raw terminal host exit");
+    let normalized_failure = failure_observations
+        .iter()
+        .find(|row| row["event_kind"] == "host.failed")
+        .expect("normalized terminal host failure");
+    for row in [raw_failure, normalized_failure] {
+        assert_eq!(row["status"], "failed");
+        assert_eq!(row["failure_category"], "supervisor_failed");
+        assert_eq!(row["failed_supervisor"], "scripts");
+        assert_eq!(row["error_code"], Value::Null);
+        assert_eq!(row["occurrence_phase"], "host_terminal_exit_observed");
+        assert_eq!(
+            row["occurrence_id"],
+            format!("host-terminal-exit:{initial_epoch}")
+        );
+        assert!(row["raw"].get("error_code").is_none());
+        assert!(row["raw"].get("message").is_none());
+    }
+    assert_eq!(
+        raw_failure["occurrence_id"],
+        normalized_failure["occurrence_id"]
+    );
+
+    let failure_readback = owner
+        .store
+        .call(
+            manager.clone(),
+            "swarm.exceptions.get".to_owned(),
+            json!({"after":0,"limit":32}),
+        )
+        .await
+        .expect("read the terminal failure through the current Manager route");
+    let latest_failure = &failure_readback["host_lifecycle"]["latest_failure"];
+    assert_eq!(latest_failure["error_code"], "SUPERVISOR_FAILED");
+    assert_eq!(latest_failure["failure_category"], "supervisor_failed");
+    assert_eq!(latest_failure["failed_supervisor"], "scripts");
+
+    let failure_pass = owner
+        .store
+        .reconcile_automations_once()
+        .await
+        .expect("ordinary automation reconciliation admits the host failure");
+    assert_eq!(
+        failure_pass["script_run"]["considered"], 1,
+        "{failure_pass}"
+    );
+    assert_eq!(
+        failure_pass["script_run"]["outcomes"][0]["state"],
+        "admitted"
+    );
+    let failure_explanation = explain_terminal_event_trigger(&owner.store, &manager).await;
+    let failure_links = failure_explanation["linked_operation_history"]["items"]
+        .as_array()
+        .expect("manager-visible linked ScriptRun operation");
+    assert_eq!(failure_links.len(), 1, "{failure_explanation}");
+    let failure_cause = &failure_links[0]["cause"];
+    assert_eq!(failure_cause["event_kind"], "host.failed");
+    assert_eq!(failure_cause["status"], "failed");
+    assert_eq!(failure_cause["failure_category"], "supervisor_failed");
+    assert_eq!(failure_cause["failed_supervisor"], "scripts");
+    assert_eq!(failure_cause["occurrence_id"], raw_failure["occurrence_id"]);
+    assert!(failure_cause["error_code"].is_null());
+    let recent = failure_explanation["script_run"]["recent"]
+        .as_array()
+        .expect("manager-visible durable ScriptRun history");
+    assert!(
+        recent
+            .iter()
+            .any(|entry| entry["disposition"] == "coalesced")
+    );
+    assert!(
+        recent
+            .iter()
+            .any(|entry| entry["disposition"] == "admitted")
+    );
+
+    let next_epoch = initial_epoch + 1;
+    owner
+        .store
+        .run(move |db| {
+            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            crate::store::set_meta(&tx, "host_epoch", &json!(next_epoch))?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .expect("advance to a distinct host epoch for graceful completion");
+    owner
+        .store
+        .record_host_start()
+        .await
+        .expect("record next host epoch");
+    owner
+        .store
+        .record_host_ready()
+        .await
+        .expect("mark next host epoch ready");
+    owner
+        .store
+        .record_host_exit(None, None)
+        .await
+        .expect("commit an ordinary graceful host stop");
+    let completed_projection = owner
+        .store
+        .run(move |db| {
+            let observation_id: i64 = db.query_row(
+                "SELECT observation_id FROM observations WHERE source_stream_id='controller:host-lifecycle' \
+                 AND source_event_key=?1 AND kind='host.exit'",
+                [format!("terminal:{next_epoch}")],
+                |row| row.get(0),
+            )?;
+            let event = automation_intake::observed_event_by_id(db, observation_id)?
+                .expect("completed host exit observation");
+            Ok(automation_intake::safe_event_projection(db, &event)?)
+        })
+        .await
+        .expect("project a graceful terminal lifecycle observation");
+    assert_eq!(
+        completed_projection.status,
+        Some(crate::automation::event_rules::EventStatus::Completed)
+    );
+    assert_eq!(completed_projection.failure_category, None);
+    assert_eq!(completed_projection.failed_supervisor, None);
+    assert_eq!(
+        completed_projection.occurrence_phase.as_deref(),
+        Some("host_terminal_exit_observed")
+    );
+    assert_eq!(
+        completed_projection.occurrence_id.as_deref(),
+        Some(format!("host-terminal-exit:{next_epoch}").as_str())
+    );
+
+    let completion_pass = owner
+        .store
+        .reconcile_automations_once()
+        .await
+        .expect("ordinary automation reconciliation admits graceful host completion");
+    assert_eq!(
+        completion_pass["script_run"]["considered"], 1,
+        "{completion_pass}"
+    );
+    assert_eq!(
+        completion_pass["script_run"]["outcomes"][0]["state"],
+        "admitted"
+    );
+    let completion_explanation = explain_terminal_event_trigger(&owner.store, &manager).await;
+    let linked = completion_explanation["linked_operation_history"]["items"]
+        .as_array()
+        .expect("manager-visible completion ScriptRun");
+    assert_eq!(linked.len(), 2, "{completion_explanation}");
+    let completion_cause = linked
+        .iter()
+        .map(|link| &link["cause"])
+        .find(|cause| cause["event_kind"] == "host.exit" && cause["status"] == "completed")
+        .expect("completed host.exit cause");
+    assert_eq!(
+        completion_cause["occurrence_phase"],
+        "host_terminal_exit_observed"
+    );
+    assert_eq!(
+        completion_cause["occurrence_id"],
+        completed_projection.occurrence_id.clone().unwrap()
+    );
+    assert!(completion_cause["failure_category"].is_null());
+    assert!(completion_cause["failed_supervisor"].is_null());
+
+    let (runs, started) = owner
+        .store
+        .run(|db| {
+            db.query_row(
+                "SELECT COUNT(*),COUNT(started_at_ms) FROM script_runs WHERE script_id=?1",
+                [TERMINAL_EVENT_SCRIPT_ID],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .map_err(Into::into)
+        })
+        .await
+        .expect("confirm queued admission without interpreter execution");
+    assert_eq!(runs, 2);
+    assert_eq!(started, 0);
+
+    let preserved_failure = owner
+        .store
+        .call(
+            manager,
+            "swarm.exceptions.get".to_owned(),
+            json!({"after":0,"limit":32}),
+        )
+        .await
+        .expect("read persistent failure after graceful stop");
+    assert_eq!(
+        preserved_failure["host_lifecycle"]["latest_failure"]["failure_category"],
+        "supervisor_failed"
+    );
+    owner.close().await.expect("close temporary Store");
+    std::fs::remove_dir_all(directory).expect("remove temporary Store directory");
 }

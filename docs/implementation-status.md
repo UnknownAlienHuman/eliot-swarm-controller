@@ -2,6 +2,51 @@
 
 ## Current state
 
+### Terminal event adapters and restart isolation — 2026-10-05
+
+The common event path now distinguishes retained ScriptRun results, host
+termination and provider command acceptance. Script callbacks project the
+exact run's completed, failed or incomplete state after checking the linked
+Operation/result and optional Task tuple. The host writes graceful `host.exit`
+and failed `host.exit`/`host.failed` facts in the receipt transaction; failure
+views coalesce by host epoch and expose only a closed failure category and
+fixed supervisor name. Tokio task IDs preserve that name through join errors.
+Detected interruption remains a separate phase. None of these lifecycle
+results establishes Task completion.
+
+The accepted runtime adapter emits a statusless `native_input_accepted`
+projection after validating the historical observation/Operation/binding and
+module-owner tuple. SQLite reads the closed envelope fields without copying
+private details into Rust or selector input. A statusless rule matches; a
+completed filter does not. Large private details no longer remove legitimate
+Accepted or Unknown occurrences. The source key is format-checked and serves
+as identity, not authentication; its payload digest is not recomputed.
+
+Restart reconciliation now handles `STALE_LAUNCH` per queued launch. A coherent
+retained identity permits bounded retry; an unknown identity stays held.
+Waiting ticks preserve the stored deadline and counter, the scanner continues,
+and the historical C8 receipt is unchanged. Restored authority still requires
+the live snapshot and complete record validation before recognizing observed
+proof without a new challenge. Storage errors remain errors of the supervisor.
+
+Independent Luna source reviews passed. Gate
+`89e034d1-c2e3-424d-94e5-b4663090d33b` passed 15 affected checks; its new Accepted
+fixture required the existing script schema and then the shared JSON-null
+representation of an absent status. Those fixture corrections changed no
+production authorization or event semantics. Final gate
+`aee88ba5-b857-419c-ba3c-165217e79d9b` passed the corrected check, crate formatting,
+strict production Clippy, library compilation and debug build with all 208
+source pins unchanged. Together these are 16 distinct passing affected checks;
+the library compilation contains 320 checks. Fresh full CI is pending.
+
+The Store restart fixture proves continuation through two stale rows, stable
+retry state, retained proof bytes and SQLite error propagation. Fresh live
+ready recovery/no-replay remains C34; hosted Bunny inference remains C24.
+Native MCP retry/failure markers are currently readable through manager
+diagnostics; publishing those transitions as ordinary bus events remains the
+next adapter increment. The installed launcher is unchanged. Local Linux/WSL
+and local models remain deferred. The program remains **PARTIAL_PROGRESS**.
+
 ### Universal event routing and independent failure isolation — 2026-10-05
 
 Manager-configured ScriptRun rules now select any bounded exact source/kind
@@ -87,10 +132,23 @@ the wrong shape. The schema still rejects malformed metadata JSON.
 Final targeted gate `da68f2f4-121a-4075-829e-e47f80b3134b` records formatting,
 strict production Clippy, library compilation and the corrected metadata
 scenario passing. Debug build also passed with all 207 source pins unchanged;
-the installed launcher hash is unchanged. Fresh full CI is pending. The retained local
-gates are not a full-suite pass for this final snapshot. Fresh hosted Bunny inference remains
-unqualified. Local Linux/WSL and local models remain deferred. The complete
-program remains **PARTIAL_PROGRESS**.
+the installed launcher hash is unchanged. Full CI for `064315ea08b9f0c47c2b5393e2988311f3957213`
+passed both Windows and remote Ubuntu in
+[run 37263693234](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37263693234),
+including Rust tests, offline native adapter fixtures and release builds.
+
+The subsequent fresh Windows C33 native run
+`c86f1118-07bb-41ae-b938-19acac2e86c1` failed at `fresh_host_restart`.
+Its retained lifecycle receipt records `STALE_LAUNCH` at host epoch 2, 15 ms
+after startup. Migrations succeeded; the MCP tools selector then validated
+current pre-dispatch authority before inspecting retained observed proof.
+Startup had set the binding to `reconciling`, and the domain stale classifier
+did not include `STALE_LAUNCH`, so the entry error terminated its supervisor.
+The consumed C33 run remains retained. Source, candidate, installed launcher
+and protected processes were preserved; no inference or Task dispatch occurred.
+
+Fresh hosted Bunny inference remains unqualified. Local Linux/WSL and local
+models remain deferred. The complete program remains **PARTIAL_PROGRESS**.
 
 ### PR description actions and successor recovery — 2026-10-04
 

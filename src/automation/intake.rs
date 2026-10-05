@@ -148,6 +148,8 @@ pub(crate) struct ObservedEvent {
 pub(crate) struct SafeEventProjection {
     pub(crate) status: Option<super::event_rules::EventStatus>,
     pub(crate) error_code: Option<String>,
+    pub(crate) failure_category: Option<String>,
+    pub(crate) failed_supervisor: Option<String>,
     pub(crate) occurrence_phase: Option<String>,
     pub(crate) occurrence_id: Option<String>,
 }

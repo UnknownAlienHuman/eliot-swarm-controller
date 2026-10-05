@@ -254,6 +254,15 @@ existing runner receives a bounded `system.event` input. Task scope is either
 the real complete Task/Attempt tuple or entirely absent; a taskless invocation
 receives no controller-effect grants.
 
+Event phases preserve subject boundaries. A provider's
+`native_input_accepted` acknowledgement has no normalized status and can match
+a statusless rule; it cannot match a completed filter. Script terminal statuses
+describe the exact ScriptRun. `host_terminal_exit_observed` describes graceful
+or failed host termination; raw `host.exit` and normalized `host.failed` views
+coalesce by the same host epoch occurrence. The script receives only safe
+metadata, including a closed host failure category and fixed supervisor name
+when present. None of these observations establishes Task completion.
+
 `automation.config.explain` returns the existing bounded ScriptRun journal in
 `script_run`, including exact pending causes, `held_reason` and recent error
 details. It returns `null` when the entry has never had that journal. Reading

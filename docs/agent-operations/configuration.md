@@ -489,8 +489,25 @@ only an exact raw `runtime.outcome` of `unknown` aliases the corresponding
 `operation.outcome_unknown` phase and occurrence; it is never labeled as a
 completed native operation. Applied and rejected native outcomes retain their
 existing terminal aliases, and accepted or invalid raw outcomes add no
-terminal projection. Exact phase/occurrence identity coalesces duplicate
-views.
+terminal projection. A validated accepted acknowledgement has the distinct
+`native_input_accepted` phase and no normalized status: a rule without a status
+filter can select it, while a `completed` filter cannot. Private receipt details
+are not selector data, and their size does not impose a separate event filter.
+Exact phase/occurrence identity coalesces duplicate views.
+
+The `controller:scripts` adapter projects `script.completed`, `script.failed`
+and `script.incomplete` from the exact retained ScriptRun, Operation and result.
+Status describes the ScriptRun result, including callbacks carried under
+`script.completed`; it does not complete the associated Task.
+
+The `controller:host-lifecycle` adapter projects a graceful `host.exit` as
+completed host lifecycle and a failed exit as failed lifecycle. `host.failed`
+and the corresponding raw `host.exit` share `host_terminal_exit_observed` and
+the `host-terminal-exit:<epoch>` occurrence, so selecting both invokes the
+script once. Failure metadata contains a closed `failure_category` and, when
+known, the fixed `failed_supervisor` name. A later detected interruption remains
+a separate `host_interruption_observed` occurrence. Host lifecycle events are
+taskless and do not establish Task completion.
 
 The normalized `controller:messages` lifecycle facts feed event selection;
 they do not create a second addressed mailbox delivery in `report.delta` or
