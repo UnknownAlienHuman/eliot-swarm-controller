@@ -1060,6 +1060,7 @@ fn event_requires_occurrence_projection(event: &crate::automation::intake::Obser
                     "controller:operations",
                     "operation.rejected" | "operation.outcome_unknown"
                 )
+                | ("controller:native-mcp", "native.mcp.failure")
         )
 }
 

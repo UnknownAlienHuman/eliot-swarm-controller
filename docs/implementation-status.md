@@ -2,6 +2,49 @@
 
 ## Current state
 
+### Native failure events and readable integrity holds — 2026-10-05
+
+Native MCP retry and stale-hold writers now commit a closed
+`controller:native-mcp` / `native.mcp.failure` observation in the same
+transaction as their existing recovery marker. Ordinary configured event rules
+consume it through the common ScriptRun path. Stable occurrence keys prevent
+unchanged recovery ticks from duplicating the event. A retained launch remains
+a valid historical link after cancellation; a missing Operation omits an
+unlinkable fact, while a wrong method remains an integrity error. Existing
+current-manager and Operation visibility checks still govern invocation.
+
+Script admission holds a corrupt retained on-behalf link per entry while a
+healthy neighbor progresses. Authorized `automation.config.explain` remains
+readable: only its affected linked-operation projections become explicitly
+degraded and truncated, with a fixed integrity category and no unvalidated
+Operation IDs or causes. The retained held reason remains visible. Apply and
+execution keep their strict link checks; unrelated Store errors propagate.
+
+Workspace launch diagnostics retain the first available failure alongside the
+latest readback observation. Legacy rows seed that first record from the only
+remaining observation, without reconstructing lost history. Current-manager
+`operation.get` exposes their bounded codes and classifications for unknown
+workspace effects. Ordinary Operation readers retain their existing projection;
+the uncertain launch and lease are preserved without replay.
+
+Independent Luna source reviews passed. Gate
+`f41fab57-84f0-4b1e-a28a-2fe3e4b80afd` passed five affected Store checks and
+identified the unreadable explain result. After the production readback fix,
+gate `2680aa83-0ee4-48bf-b305-37e1c539114a` passed the corrected integrity check
+and healthy successor-manager history check. These are seven distinct passing
+affected checks. Crate formatting, strict production Clippy and compilation of
+all 325 library checks and the debug build passed. All 209 source pins were
+unchanged during the final gate. Fresh full CI remains pending; these Store
+checks do not establish native model use.
+
+The consumed C34 launch remains retained. A separate fresh offline Git
+reproducer with matching path lengths returned exit 128 and
+`fatal: '$GIT_DIR' too big`; it does not recover the lost first C34 error.
+Windows path admission, fresh C35 recovery and C24 v4 hosted Bunny inference
+remain unqualified. Hook setup/revoke event adapters and the complete O7
+workflow are being prepared separately. The installed launcher is unchanged;
+local Linux/WSL and local models remain deferred. **PARTIAL_PROGRESS**.
+
 ### Terminal event adapters and restart isolation — 2026-10-05
 
 The common event path now distinguishes retained ScriptRun results, host
@@ -37,11 +80,22 @@ production authorization or event semantics. Final gate
 `aee88ba5-b857-419c-ba3c-165217e79d9b` passed the corrected check, crate formatting,
 strict production Clippy, library compilation and debug build with all 208
 source pins unchanged. Together these are 16 distinct passing affected checks;
-the library compilation contains 320 checks. Fresh full CI is pending.
+the library compilation contains 320 checks. Complete CI for
+`485cb28624eab204645127646cbbf0358b77a221` passed on Windows and remote Ubuntu in
+[run 37269940554](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37269940554),
+including the Rust tests, offline adapter checks and release builds.
 
 The Store restart fixture proves continuation through two stale rows, stable
 retry state, retained proof bytes and SQLite error propagation. Fresh live
-ready recovery/no-replay remains C34; hosted Bunny inference remains C24.
+ready recovery/no-replay remains unqualified. Fresh C34 run
+`dca276b9-0622-4b34-b2bd-d9286de2ec28` stopped at `service_start` with
+`WORKSPACE_EFFECT_UNKNOWN_READBACK_REQUIRED`. Its retained launch and lease
+are `outcome_unknown`; the latest safe workspace diagnostic is
+`WORKSPACE_PATH`. No binding or owned service start was admitted, and no
+inference or Task dispatch occurred. Source, candidate, installed launcher
+and protected processes were preserved. The consumed attempt remains
+retained; its initial workspace failure is still under investigation.
+Hosted Bunny inference remains unqualified.
 Native MCP retry/failure markers are currently readable through manager
 diagnostics; publishing those transitions as ordinary bus events remains the
 next adapter increment. The installed launcher is unchanged. Local Linux/WSL

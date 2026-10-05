@@ -698,6 +698,15 @@ fn claim_next_readback(tx: &Transaction<'_>, now: i64, config: &Config) -> Resul
                 let next_retry_at_ms =
                     next_manifest["native_mcp_readback"]["next_retry_at_ms"].as_i64();
                 persist_manifest(tx, &row, &next_manifest, now)?;
+                insert_safe_failure_observation(
+                    tx,
+                    &operation_id,
+                    "native_mcp_readback",
+                    "readback_retry",
+                    attempt,
+                    &failure.code,
+                    now,
+                )?;
                 return Ok(ClaimOutcome::Deferred(json!({
                     "operation_id":operation_id,
                     "state":"retry_wait",
@@ -1257,6 +1266,15 @@ fn record_retry(
     next_manifest["native_mcp_readback"] = marker;
     next_manifest["native_mcp_latest_failure"] = latest_failure(failure, now);
     persist_manifest(tx, &row, &next_manifest, now)?;
+    insert_safe_failure_observation(
+        tx,
+        operation_id,
+        "native_mcp_readback",
+        "readback_retry",
+        claim.attempt,
+        &failure.code,
+        now,
+    )?;
     Ok(retry_summary(claim, now, next_retry_at_ms, "retry_wait"))
 }
 
@@ -1430,6 +1448,88 @@ fn latest_failure(failure: &ReadbackFailure, recorded_at_ms: i64) -> Value {
         "recorded_at_ms":recorded_at_ms,
         "category":failure.category,
     })
+}
+
+/// Retain one closed event beside the exact C7 retry-marker transition. The
+/// operation link and deterministic occurrence key let the common event
+/// reader revalidate scope without exposing artifact, credential, or native
+/// response details.
+pub(super) fn insert_safe_failure_observation(
+    tx: &Transaction<'_>,
+    operation_id: &str,
+    supervisor: &str,
+    failure_kind: &str,
+    attempt: i64,
+    code: &str,
+    recorded_at_ms: i64,
+) -> Result<()> {
+    let valid_kind = matches!(
+        (supervisor, failure_kind),
+        ("native_mcp_readback", "readback_retry")
+            | ("native_mcp_tools", "tools_retry" | "stale_launch_hold")
+    );
+    if !valid_kind || attempt <= 0 || recorded_at_ms < 0 {
+        return Err(Error::new(
+            "NATIVE_MCP_EVENT_INVALID",
+            "native MCP failure occurrence identity is invalid",
+        ));
+    }
+    let method: Option<String> = tx
+        .query_row(
+            // C8 can finish after the Manager cancels its queued launch while
+            // the bounded native call is in flight. The event is linked to
+            // the retained launch identity; its current state is revalidated
+            // by the common invocation path and must not abort this finish.
+            "SELECT method FROM operations WHERE operation_id=?1",
+            [operation_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(method) = method else {
+        // A missing retained Operation cannot support a linked observation;
+        // keep the valid retry/finish transition and omit the un-linkable fact.
+        return Ok(());
+    };
+    if method != "swarm.launch" {
+        return Err(Error::new(
+            "NATIVE_MCP_EVENT_INVALID",
+            "native MCP failure is not linked to the retained launch Operation",
+        ));
+    }
+
+    let code = safe_error_code(code);
+    let category = failure_category(&code);
+    let status = if code == "NATIVE_OUTCOME_UNKNOWN" {
+        "unknown"
+    } else {
+        "failed"
+    };
+    let operation_digest = model::digest(operation_id.as_bytes());
+    let occurrence_id = format!(
+        "operation:{operation_digest}:native_mcp_failure:{supervisor}:{failure_kind}:{attempt}"
+    );
+    let payload = json!({
+        "schema_version":1,
+        "phase":"native_mcp_failure",
+        "status":status,
+        "occurrence_id":occurrence_id,
+        "error_code":code,
+        "failure_category":category,
+        "failed_supervisor":supervisor,
+        "failure_kind":failure_kind,
+        "attempt":attempt,
+    });
+    tx.execute(
+        "INSERT OR IGNORE INTO observations(source_stream_id,source_event_key,operation_id,kind,payload_json,recorded_at_ms) \
+         VALUES('controller:native-mcp',?1,?2,'native.mcp.failure',?3,?4)",
+        params![
+            occurrence_id,
+            operation_id,
+            model::canonical(&payload)?,
+            recorded_at_ms,
+        ],
+    )?;
+    Ok(())
 }
 
 fn valid_opaque_ref(value: &str, prefix: &str) -> bool {

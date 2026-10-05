@@ -555,6 +555,9 @@ pub(crate) fn safe_event_projection(
     if event.source_id.starts_with("module:") && event.event_kind == "runtime.outcome" {
         return Ok(accepted_runtime_outcome_projection(db, event)?.unwrap_or_default());
     }
+    if event.source_id == "controller:native-mcp" && event.event_kind == "native.mcp.failure" {
+        return native_mcp_failure_projection(db, event);
+    }
 
     let expected = match (event.source_id.as_str(), event.event_kind.as_str()) {
         ("controller:messages", "message.sent" | "message.reply_sent") => {
@@ -666,6 +669,168 @@ pub(crate) fn safe_event_projection(
         occurrence_phase: Some(expected_phase.to_owned()),
         occurrence_id: occurrence_id.map(ToOwned::to_owned),
         ..Default::default()
+    })
+}
+
+/// Project the closed failure occurrence written in the same transaction as
+/// a native MCP retry/stale marker. Payload reads are byte-bounded in SQL, and
+/// the exact observation, source key, retained launch Operation, and event link
+/// are all revalidated before exposing selector metadata.
+fn native_mcp_failure_projection(
+    db: &Connection,
+    event: &ObservedEvent,
+) -> Result<crate::automation::intake::SafeEventProjection> {
+    use crate::automation::event_rules::EventStatus;
+
+    let Some(operation_id) = event.operation_id.as_deref() else {
+        return Ok(Default::default());
+    };
+    type NativeMcpFailureRow = (
+        Option<String>,
+        String,
+        Option<String>,
+        i64,
+        i64,
+        Option<String>,
+    );
+    let row: Option<NativeMcpFailureRow> = db
+        .query_row(
+            "SELECT CASE WHEN o.source_event_key IS NOT NULL \
+                         AND length(CAST(o.source_event_key AS BLOB))<=256 \
+                         THEN o.source_event_key END, \
+                    o.operation_id, \
+                    CASE WHEN length(CAST(o.payload_json AS BLOB))<=2048 \
+                         THEN o.payload_json END, \
+                    o.recorded_at_ms, length(CAST(o.payload_json AS BLOB)), op.method \
+             FROM observations AS o LEFT JOIN operations AS op \
+               ON op.operation_id=o.operation_id \
+             WHERE o.observation_id=?1 AND o.source_stream_id='controller:native-mcp' \
+               AND o.kind='native.mcp.failure' AND o.operation_id=?2",
+            params![event.observation_id, operation_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((source_event_key, linked_operation_id, raw, recorded_at_ms, payload_bytes, method)) =
+        row
+    else {
+        return Ok(Default::default());
+    };
+    if linked_operation_id != operation_id
+        || method.as_deref() != Some("swarm.launch")
+        || event.recorded_at_ms != recorded_at_ms
+        || recorded_at_ms < 0
+        || !(0..=2048).contains(&payload_bytes)
+    {
+        return Ok(Default::default());
+    }
+    let Some(raw) = raw else {
+        return Ok(Default::default());
+    };
+    let value: Value = match serde_json::from_str(&raw) {
+        Ok(value) => value,
+        Err(_) => return Ok(Default::default()),
+    };
+    let Some(object) = value.as_object() else {
+        return Ok(Default::default());
+    };
+    const FIELDS: &[&str] = &[
+        "schema_version",
+        "phase",
+        "status",
+        "occurrence_id",
+        "error_code",
+        "failure_category",
+        "failed_supervisor",
+        "failure_kind",
+        "attempt",
+    ];
+    if object.len() != FIELDS.len() || FIELDS.iter().any(|field| !object.contains_key(*field)) {
+        return Ok(Default::default());
+    }
+
+    let Some(attempt) = value["attempt"].as_i64().filter(|attempt| *attempt > 0) else {
+        return Ok(Default::default());
+    };
+    let Some(supervisor) = value["failed_supervisor"]
+        .as_str()
+        .filter(|supervisor| matches!(*supervisor, "native_mcp_readback" | "native_mcp_tools"))
+    else {
+        return Ok(Default::default());
+    };
+    let Some(failure_kind) = value["failure_kind"].as_str().filter(|failure_kind| {
+        matches!(
+            (supervisor, *failure_kind),
+            ("native_mcp_readback", "readback_retry")
+                | ("native_mcp_tools", "tools_retry" | "stale_launch_hold")
+        )
+    }) else {
+        return Ok(Default::default());
+    };
+    let Some(code) = value["error_code"].as_str().filter(|code| {
+        !code.is_empty()
+            && code.len() <= 64
+            && code.as_bytes().first().is_some_and(u8::is_ascii_uppercase)
+            && code
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+    }) else {
+        return Ok(Default::default());
+    };
+    let category = if code.starts_with("STALE")
+        || matches!(
+            code,
+            "FORBIDDEN" | "NATIVE_MCP_SCOPE_MISMATCH" | "NATIVE_MCP_WORKSPACE_LEASE_UNAVAILABLE"
+        ) {
+        "assignment_scope_unavailable"
+    } else {
+        match code {
+            "NATIVE_TRANSPORT" | "NATIVE_READ_FAILED" | "NATIVE_MCP_READBACK_TIMEOUT" => {
+                "native_service_unavailable"
+            }
+            "PRIVATE_ARTIFACT_REFERENCE" | "AUTH_ERROR" | "UNAUTHORIZED" => {
+                "scoped_artifact_or_credential_unavailable"
+            }
+            _ => "native_readback_incomplete",
+        }
+    };
+    let status = if code == "NATIVE_OUTCOME_UNKNOWN" {
+        EventStatus::Unknown
+    } else {
+        EventStatus::Failed
+    };
+    let status_name = status.as_str();
+    let operation_digest = model::digest(operation_id.as_bytes());
+    let expected_occurrence_id = format!(
+        "operation:{operation_digest}:native_mcp_failure:{supervisor}:{failure_kind}:{attempt}"
+    );
+    let occurrence_id = value["occurrence_id"].as_str();
+    if value["schema_version"].as_i64() != Some(1)
+        || value["phase"].as_str() != Some("native_mcp_failure")
+        || value["status"].as_str() != Some(status_name)
+        || value["failure_category"].as_str() != Some(category)
+        || occurrence_id != Some(expected_occurrence_id.as_str())
+        || !valid_occurrence_identity(occurrence_id.unwrap_or_default())
+        || source_event_key.as_deref() != occurrence_id
+    {
+        return Ok(Default::default());
+    }
+
+    Ok(crate::automation::intake::SafeEventProjection {
+        status: Some(status),
+        error_code: Some(code.to_owned()),
+        failure_category: Some(category.to_owned()),
+        failed_supervisor: Some(supervisor.to_owned()),
+        occurrence_phase: Some("native_mcp_failure".to_owned()),
+        occurrence_id: occurrence_id.map(ToOwned::to_owned),
     })
 }
 

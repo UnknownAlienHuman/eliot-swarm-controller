@@ -678,6 +678,7 @@ impl Store {
             let stale_error = error_code
                 .as_ref()
                 .is_some_and(|code| is_stale_scope_code(code));
+            let direct_error_code = error_code.clone();
             let result = match progress {
                 Some(value) => value,
                 None => json!({
@@ -688,6 +689,19 @@ impl Store {
             };
             let error_code =
                 error_code.or_else(|| result["last_error"]["code"].as_str().map(str::to_owned));
+            let current_record_error = result["last_error"]["recorded_at_ms"]
+                .as_i64()
+                .is_some_and(|recorded_at_ms| recorded_at_ms >= claim.started_at_ms)
+                .then(|| result["last_error"]["code"].as_str().map(str::to_owned))
+                .flatten();
+            let event_error_code = direct_error_code
+                .or(current_record_error)
+                .or_else(|| {
+                    (result["install_state"] == "outcome_unknown"
+                        || result["observer_state"] == "outcome_unknown")
+                        .then(|| "NATIVE_OUTCOME_UNKNOWN".to_owned())
+                })
+                .or_else(|| (!current).then(|| "STALE_LAUNCH".to_owned()));
 
             if !current || stale_error {
                 schedule["state"] = json!("stale");
@@ -699,6 +713,17 @@ impl Store {
                     .map_or(Value::Null, |code| json!(code));
                 schedule["finished_at_ms"] = json!(now);
                 set_meta(&tx, &key, &schedule)?;
+                if let Some(code) = event_error_code.as_deref() {
+                    launcher_native_mcp::insert_safe_failure_observation(
+                        &tx,
+                        &claim.operation_id,
+                        "native_mcp_tools",
+                        "tools_retry",
+                        claim.claim_generation,
+                        code,
+                        now,
+                    )?;
+                }
                 tx.commit()?;
                 return Ok(json!({
                     "state":"stale",
@@ -735,6 +760,17 @@ impl Store {
                 schedule["last_error_code"] = error_code.as_deref().map_or(Value::Null, |code| {
                     json!(safe_label(code).unwrap_or_else(|_| "NATIVE_MCP_ERROR".to_owned()))
                 });
+                if let Some(code) = event_error_code.as_deref() {
+                    launcher_native_mcp::insert_safe_failure_observation(
+                        &tx,
+                        &claim.operation_id,
+                        "native_mcp_tools",
+                        "tools_retry",
+                        claim.claim_generation,
+                        code,
+                        now,
+                    )?;
+                }
             } else {
                 // A successful phase transition is eligible on the next host
                 // tick. This advances install -> challenge -> read while each
@@ -2347,6 +2383,8 @@ fn defer_stale_launch(tx: &Transaction<'_>, operation_id: &str, now: i64) -> Res
         }
         None => new_tools_schedule(operation_id, "", now),
     };
+    let already_held_for_stale_launch =
+        schedule["state"] == "stale" && schedule["last_error_code"] == "STALE_LAUNCH";
     let schedule_digest = schedule["launch_identity_digest"]
         .as_str()
         .ok_or_else(|| record_error("native MCP tools launch digest is missing"))?
@@ -2372,12 +2410,19 @@ fn defer_stale_launch(tx: &Transaction<'_>, operation_id: &str, now: i64) -> Res
     schedule["last_error_code"] = json!("STALE_LAUNCH");
     let identity_digest =
         record_digest.or_else(|| (!schedule_digest.is_empty()).then_some(schedule_digest));
+    let has_identity_digest = identity_digest.is_some();
+    let mut event_attempt = schedule["failure_attempts"]
+        .as_i64()
+        .unwrap_or(0)
+        .saturating_add(1)
+        .max(1);
     let next_retry_at_ms = if let Some(identity_digest) = identity_digest {
         let failures = schedule["failure_attempts"]
             .as_i64()
             .unwrap_or(0)
             .saturating_add(1)
             .max(1);
+        event_attempt = failures;
         let deadline = now.saturating_add(tools_retry_delay_ms(failures));
         schedule["state"] = json!("retry_wait");
         schedule["launch_identity_digest"] = json!(identity_digest);
@@ -2392,6 +2437,20 @@ fn defer_stale_launch(tx: &Transaction<'_>, operation_id: &str, now: i64) -> Res
         None
     };
     set_meta(tx, &schedule_key, &schedule)?;
+    // A missing identity leaves a persistent stale hold. Emit its first
+    // durable occurrence only; subsequent supervisor ticks must not append
+    // another event for the same unchanged hold.
+    if has_identity_digest || !already_held_for_stale_launch {
+        launcher_native_mcp::insert_safe_failure_observation(
+            tx,
+            operation_id,
+            "native_mcp_tools",
+            "stale_launch_hold",
+            event_attempt,
+            "STALE_LAUNCH",
+            now,
+        )?;
+    }
     Ok(next_retry_at_ms)
 }
 
@@ -2876,4 +2935,256 @@ fn stale_scope() -> Error {
 
 fn record_error(message: &str) -> Error {
     Error::new("NATIVE_MCP_STORE", message)
+}
+
+#[cfg(test)]
+mod failure_event_tests {
+    use super::*;
+
+    const OPERATION_ID: &str = "native-mcp-stale-event-launch";
+
+    #[test]
+    fn stale_launch_hold_is_selectable_once_without_tick_duplicates() {
+        let mut db = Connection::open_in_memory().unwrap();
+        db.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        db.execute_batch(super::super::SCHEMA).unwrap();
+        db.execute(
+            "INSERT INTO operations(
+                 operation_id,caller_id,client_request_id,method,original_request_json,
+                 effective_request_json,state,due_at_ms,created_at_ms,updated_at_ms
+             ) VALUES(?1,'manager','native-mcp-stale-event-request','swarm.launch',
+                      '{}','{}','queued',1,1,1)",
+            [OPERATION_ID],
+        )
+        .unwrap();
+
+        let tx = db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert_eq!(defer_stale_launch(&tx, OPERATION_ID, 100).unwrap(), None);
+        tx.commit().unwrap();
+
+        let (observation_id, source_id, event_kind, operation_id, recorded_at_ms): (
+            i64,
+            String,
+            String,
+            String,
+            i64,
+        ) = db
+            .query_row(
+                "SELECT observation_id,source_stream_id,kind,operation_id,recorded_at_ms \
+                 FROM observations WHERE source_stream_id='controller:native-mcp' \
+                   AND kind='native.mcp.failure'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        let event = crate::automation::intake::ObservedEvent {
+            observation_id,
+            source_id: source_id.clone(),
+            event_kind: event_kind.clone(),
+            operation_id: Some(operation_id),
+            recorded_at_ms,
+        };
+        let projection =
+            super::super::automation_intake::safe_event_projection(&db, &event).unwrap();
+        assert_eq!(
+            projection.status,
+            Some(crate::automation::event_rules::EventStatus::Failed)
+        );
+        assert_eq!(projection.error_code.as_deref(), Some("STALE_LAUNCH"));
+        assert_eq!(
+            projection.failure_category.as_deref(),
+            Some("assignment_scope_unavailable")
+        );
+        let any_rule = crate::automation::event_rules::EventRule {
+            source: None,
+            predicate: None,
+            source_id: Some(source_id.clone()),
+            event_kind: Some(event_kind.clone()),
+            status: None,
+            action: crate::automation::event_rules::EventRuleAction::ScriptRun,
+        };
+        assert!(any_rule.matches_safe_event(&source_id, &event_kind, projection.status,));
+
+        let tx = db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert_eq!(defer_stale_launch(&tx, OPERATION_ID, 200).unwrap(), None);
+        tx.commit().unwrap();
+        let event_count: i64 = db
+            .query_row(
+                "SELECT count(*) FROM observations WHERE source_stream_id='controller:native-mcp' \
+                 AND kind='native.mcp.failure' AND operation_id=?1",
+                [OPERATION_ID],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(event_count, 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_c8_claim_finishes_stale_and_commits_one_failure_event() {
+        use crate::{
+            config::Config,
+            model::{self, Principal, Role},
+            platform::{DataRoot, bootstrap_credential},
+            store::StoreOwner,
+        };
+        use std::sync::Arc;
+
+        const CANCELLED_OPERATION: &str = "native-mcp-cancelled-c8-finish";
+        let directory =
+            std::env::temp_dir().join(format!("swarm-native-mcp-cancel-race-{}", model::new_id()));
+        std::fs::create_dir_all(&directory).expect("create temporary Store directory");
+        let root = DataRoot::acquire(&directory).expect("acquire temporary Store root");
+        let credential = bootstrap_credential(&root.path).expect("create local Store credential");
+        let mut config = Config::default();
+        config.storage.data_dir = directory.clone();
+        let owner = StoreOwner::start(root, Arc::new(config), credential)
+            .await
+            .expect("start local Store owner");
+
+        let actor = Principal {
+            link_id: "fixture-cancel-link".to_owned(),
+            client_id: "fixture-cancel-operator".to_owned(),
+            role: Role::Operator,
+        };
+        let identity_digest = format!("sha256:{}", model::digest(b"cancel-race-identity"));
+        let claim = ToolsClaim {
+            operation_id: CANCELLED_OPERATION.to_owned(),
+            claim_generation: 3,
+            started_at_ms: 10_000,
+            identity_digest: identity_digest.clone(),
+        };
+        let seed_claim = claim.clone();
+        let seed_actor = actor.clone();
+        owner
+            .store
+            .run(move |db| {
+                let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                tx.execute(
+                    "INSERT INTO operations(
+                         operation_id,caller_id,client_request_id,method,original_request_json,
+                         effective_request_json,state,due_at_ms,created_at_ms,updated_at_ms
+                     ) VALUES(?1,?2,'fixture-c8-cancel-request','swarm.launch',
+                              '{}',
+                              '{\"launch_manifest\":{\"state\":\"awaiting_native_mcp\",\"runtime\":{\"dispatch_permitted\":false},\"progress\":{\"task_dispatch\":\"not_started\"}}}',
+                              'queued',?3,?3,?3)",
+                    rusqlite::params![
+                        CANCELLED_OPERATION,
+                        seed_actor.client_id,
+                        seed_claim.started_at_ms
+                    ],
+                )?;
+                let mut schedule = new_tools_schedule(
+                    &seed_claim.operation_id,
+                    &seed_claim.identity_digest,
+                    seed_claim.started_at_ms,
+                );
+                schedule["state"] = json!("running");
+                schedule["claim_generation"] = json!(seed_claim.claim_generation);
+                schedule["started_at_ms"] = json!(seed_claim.started_at_ms);
+                schedule["next_retry_at_ms"] = Value::Null;
+                set_meta(&tx, &supervisor_key(&seed_claim.operation_id), &schedule)?;
+                tx.commit()?;
+                Ok(())
+            })
+            .await
+            .expect("seed queued launch and committed C8 claim");
+
+        let cancel_actor = actor.clone();
+        owner
+            .store
+            .run(move |db| {
+                let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                super::super::operations::cancel(
+                    &tx,
+                    &cancel_actor,
+                    &json!({
+                        "client_request_id":"fixture-cancel-request",
+                        "operation_id":CANCELLED_OPERATION,
+                        "reason":"cancelled while C8 work was in flight",
+                    }),
+                    "fixture-cancel-operation",
+                    15_000,
+                )?;
+                tx.commit()?;
+                Ok(())
+            })
+            .await
+            .expect("commit real queued-Operation cancellation");
+
+        let finished = owner
+            .store
+            .finish_tools_claim(
+                &claim,
+                None,
+                Some(json!({
+                    "state":"observed_partial",
+                    "install_state":"registered",
+                    "runtime_status":"connected",
+                    "observer_state":"not_started",
+                    "dispatch_permitted":false,
+                })),
+                20_000,
+            )
+            .await
+            .expect("canceled retained launch must not fail the C8 supervisor finish");
+        assert_eq!(finished["state"], "stale");
+        assert_eq!(finished["dispatch_permitted"], false);
+
+        let operation_id = CANCELLED_OPERATION.to_owned();
+        let schedule_key = supervisor_key(&operation_id);
+        let (operation_state, schedule_state, event_count, payload_json) = owner
+            .store
+            .run(move |db| {
+                let operation_state = db.query_row(
+                    "SELECT state FROM operations WHERE operation_id=?1",
+                    [&operation_id],
+                    |row| row.get::<_, String>(0),
+                )?;
+                let schedule_state = db.query_row(
+                    "SELECT json_extract(value_json,'$.state') FROM meta WHERE key=?1",
+                    [schedule_key],
+                    |row| row.get::<_, String>(0),
+                )?;
+                let (event_count, payload_json): (i64, Option<String>) = db.query_row(
+                    "SELECT count(*),min(payload_json) FROM observations \
+                     WHERE source_stream_id='controller:native-mcp' \
+                       AND kind='native.mcp.failure' AND operation_id=?1",
+                    [&operation_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                Ok((operation_state, schedule_state, event_count, payload_json))
+            })
+            .await
+            .expect("read committed C8 finish state and linked event");
+        assert_eq!(operation_state, "cancelled");
+        assert_eq!(schedule_state, "stale");
+        assert_eq!(event_count, 1);
+        let payload: Value = serde_json::from_str(
+            payload_json
+                .as_deref()
+                .expect("one safe failure observation payload"),
+        )
+        .expect("valid JSON payload");
+        assert_eq!(payload["phase"], "native_mcp_failure");
+        assert_eq!(payload["status"], "failed");
+        assert_eq!(payload["error_code"], "STALE_LAUNCH");
+        assert_eq!(payload["failed_supervisor"], "native_mcp_tools");
+        assert_eq!(payload["failure_kind"], "tools_retry");
+        assert_eq!(payload.as_object().map(serde_json::Map::len), Some(9));
+
+        owner.close().await.expect("close local Store owner");
+        std::fs::remove_dir_all(&directory).expect("remove exact fixture Store directory");
+    }
 }

@@ -1,6 +1,6 @@
 # Agent Operations — Rust Architecture and Execution Contracts
 
-Revision 10 · 2026-10-05 · source baseline `064315ea08b9f0c47c2b5393e2988311f3957213`.
+Revision 11 · 2026-10-05 · source baseline `485cb28624eab204645127646cbbf0358b77a221`.
 
 [Configuration](configuration.md) owns editable settings; [Delivery](delivery.md) owns work transitions; [Donor map](donor-map.md) separates source evidence from proposals. These contracts are not implementation claims.
 
@@ -103,6 +103,24 @@ identity without passing private message bodies or credentials to scripts.
 Legacy and normalized views of one occurrence must not produce duplicate
 actions. These are requirements; current implementation and qualification
 boundaries remain in [Implementation Status](../implementation-status.md).
+
+The native-MCP failure adapter is another ordinary ScriptRun event source. C7
+readback retries and C8 tools retries/stale-launch holds commit a bounded
+`controller:native-mcp` / `native.mcp.failure` fact beside the existing retry
+marker or schedule transition. The normalized status is `failed`, or `unknown`
+for an explicitly unknown native outcome. Its occurrence identifies the launch
+Operation, failure supervisor/kind, and attempt: a later attempt is a distinct
+fact, while a repeated unchanged stale hold without an established launch
+identity is emitted once. The persisted `retry_wait` deadline remains the
+scheduler's gate; selecting the event does not cause an immediate retry.
+
+These observations are historical facts, not continuing authority. Before an
+unstarted ScriptRun proceeds, the shared event path rechecks the exact retained
+projection, selected rule, current Manager/GM, linked Operation visibility, and
+current Task/Attempt scope when present. Safe event metadata can trigger the
+ordinary configured `script_run`; detailed diagnostics remain behind current
+Operation read rights. Failure or unknown status never establishes Task
+completion.
 
 ## 2. Same action handler for both callers
 

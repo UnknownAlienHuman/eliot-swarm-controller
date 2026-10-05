@@ -14,6 +14,8 @@ mod automation_transfer;
 pub(crate) mod automation_work_dispatch;
 #[cfg(test)]
 mod c33_restart_diagnosis_fixture;
+#[cfg(test)]
+mod c34_workspace_start_diagnosis_fixture;
 pub(crate) mod capacity;
 mod checks;
 mod coordination;
@@ -502,7 +504,39 @@ impl Store {
             } else {
                 "workspace_admission_rejected"
             };
-            set_meta(&tx, &format!("launcher:failure:{operation_id}"), &json!({"code":safe_code,"classification":failure,"observed_at_ms":now}))?;
+            let failure_key = format!("launcher:failure:{operation_id}");
+            let first_failure = match meta(&tx, &failure_key)? {
+                Some(previous) => {
+                    // Pre-change rows retain only their latest observation. Use
+                    // that as the first retained evidence; earlier history is
+                    // unavailable and is not reconstructed here.
+                    let retained = if previous["first_failure"].is_object() {
+                        &previous["first_failure"]
+                    } else {
+                        &previous
+                    };
+                    json!({
+                        "code":retained["code"].clone(),
+                        "classification":retained["classification"].clone(),
+                        "observed_at_ms":retained["observed_at_ms"].clone(),
+                    })
+                }
+                None => json!({
+                    "code":safe_code.clone(),
+                    "classification":failure,
+                    "observed_at_ms":now,
+                }),
+            };
+            set_meta(
+                &tx,
+                &failure_key,
+                &json!({
+                    "code":safe_code,
+                    "classification":failure,
+                    "observed_at_ms":now,
+                    "first_failure":first_failure,
+                }),
+            )?;
             launcher::fail_launch(&tx, &operation_id, failure, now)?;
             tx.commit()?;
             Ok(())

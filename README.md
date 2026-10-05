@@ -1,6 +1,6 @@
 # Eliot Swarm Controller
 
-Headless modular Rust controller for native coding-agent harnesses; a prototype for Eliot Memory OS's Agent Execution Fabric. One host, one SQLite database, local IPC. No UI, external broker or replacement model loop.
+Headless, provider-neutral transactional Rust framework for durable commands, Operations, events, actions and messages. Its current application orchestrates native coding-agent harnesses as a prototype for the Eliot Memory OS Agent Execution Fabric. Provider and harness adapters translate common commands into concrete native instructions/APIs, and native events and results back into shared contracts, through the existing `RuntimePort` boundary. The kernel owns shared scheduling and durable state transitions independently of provider. One host, one SQLite database, local IPC; no UI, external broker or replacement model loop.
 
 Eliot Memory OS is not yet connected on the owner machine. The standalone controller remains usable; the requested conditional `eliot_compile_packet_l3` integration and its verification requirements are recorded in [the integration contract](docs/eliot-memory-os-integration.md). This records a request, not an implemented or qualified packet capability.
 

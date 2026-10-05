@@ -272,6 +272,122 @@ fn invalid_scope_readback_persists_safe_code_and_stage_across_marker_update() {
 }
 
 #[test]
+fn committed_readback_failure_is_a_closed_any_event_and_rolls_back_with_its_marker() {
+    let mut db = invalid_scope_db();
+    let tx = db
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+    let outcome = claim_next_readback(&tx, 100, &Config::default()).unwrap();
+    let ClaimOutcome::Deferred(result) = outcome else {
+        panic!("invalid launch scope should defer readback");
+    };
+    assert_eq!(result["last_error_code"], "FORBIDDEN");
+    tx.commit().unwrap();
+
+    let (observation_id, source_id, source_event_key, operation_id, event_kind, recorded_at_ms, raw):
+        (i64, String, String, String, String, i64, String) = db
+        .query_row(
+            "SELECT observation_id,source_stream_id,source_event_key,operation_id,kind,recorded_at_ms,payload_json \
+             FROM observations WHERE source_stream_id='controller:native-mcp' AND kind='native.mcp.failure'",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(source_id, "controller:native-mcp");
+    assert_eq!(operation_id, LAUNCH_ID);
+    assert_eq!(event_kind, "native.mcp.failure");
+    assert_eq!(recorded_at_ms, 100);
+    let payload: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(payload["schema_version"], 1);
+    assert_eq!(payload["phase"], "native_mcp_failure");
+    assert_eq!(payload["status"], "failed");
+    assert_eq!(payload["error_code"], "FORBIDDEN");
+    assert_eq!(payload["failure_category"], "assignment_scope_unavailable");
+    assert_eq!(payload["failed_supervisor"], "native_mcp_readback");
+    assert_eq!(payload["failure_kind"], "readback_retry");
+    assert_eq!(payload["attempt"], 1);
+    assert_eq!(payload.as_object().unwrap().len(), 9);
+    assert_eq!(
+        Some(source_event_key.as_str()),
+        payload["occurrence_id"].as_str()
+    );
+
+    let event = crate::automation::intake::ObservedEvent {
+        observation_id,
+        source_id: source_id.clone(),
+        event_kind: event_kind.clone(),
+        operation_id: Some(operation_id),
+        recorded_at_ms,
+    };
+    let projection = super::super::automation_intake::safe_event_projection(&db, &event).unwrap();
+    assert_eq!(
+        projection.status,
+        Some(crate::automation::event_rules::EventStatus::Failed)
+    );
+    assert_eq!(projection.error_code.as_deref(), Some("FORBIDDEN"));
+    assert_eq!(
+        projection.failure_category.as_deref(),
+        Some("assignment_scope_unavailable")
+    );
+    assert_eq!(
+        projection.failed_supervisor.as_deref(),
+        Some("native_mcp_readback")
+    );
+    assert_eq!(
+        projection.occurrence_phase.as_deref(),
+        Some("native_mcp_failure")
+    );
+    let any_rule = crate::automation::event_rules::EventRule {
+        source: None,
+        predicate: None,
+        source_id: Some(source_id.clone()),
+        event_kind: Some(event_kind.clone()),
+        status: None,
+        action: crate::automation::event_rules::EventRuleAction::ScriptRun,
+    };
+    let completed_rule = crate::automation::event_rules::EventRule {
+        status: Some(crate::automation::event_rules::EventStatus::Completed),
+        ..any_rule.clone()
+    };
+    assert!(any_rule.matches_safe_event(&source_id, &event_kind, projection.status,));
+    assert!(!completed_rule.matches_safe_event(&source_id, &event_kind, projection.status,));
+
+    let mut rollback_db = invalid_scope_db();
+    rollback_db
+        .execute_batch(
+            "CREATE TRIGGER reject_native_mcp_failure BEFORE INSERT ON observations \
+             WHEN NEW.source_stream_id='controller:native-mcp' AND NEW.kind='native.mcp.failure' \
+             BEGIN SELECT RAISE(ABORT,'fixture event rejection'); END;",
+        )
+        .unwrap();
+    let tx = rollback_db
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+    assert!(claim_next_readback(&tx, 100, &Config::default()).is_err());
+    tx.rollback().unwrap();
+    assert!(retained_manifest(&rollback_db)["native_mcp_readback"].is_null());
+    let event_count: i64 = rollback_db
+        .query_row(
+            "SELECT count(*) FROM observations WHERE source_stream_id='controller:native-mcp' \
+             AND kind='native.mcp.failure'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(event_count, 0);
+}
+
+#[test]
 fn legacy_template_is_not_promoted_after_participant_registration_changes() {
     let mut db = changed_participant_registration_db();
     let tx = db

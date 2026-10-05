@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 
 const MAX_OWNED_SERVICE_START_FAILURE_BYTES: usize = 1024;
 const MAX_OWNED_SERVICE_DISPATCH_FAILURE_BYTES: usize = 1024;
+const MAX_WORKSPACE_LAUNCH_FAILURE_BYTES: usize = 1024;
 const MAX_MANAGER_ACTION_REQUIRED_ITEMS: i64 = 32;
 const MAX_PUBLIC_NATIVE_FAILURES: usize = 64;
 const START_FAILURE_V1_KEYS: [&str; 5] = [
@@ -44,9 +45,9 @@ pub(super) fn get_operation(db: &Connection, id: &str) -> Result<Value> {
     })?)?)
 }
 
-/// Current-manager readback adds bounded startup, bridge-recovery and
-/// native-MCP diagnostics. Other Operation readers keep the existing
-/// projection and visibility boundary.
+/// Current-manager readback adds bounded startup, bridge-recovery,
+/// native-MCP and workspace-launch diagnostics. Other Operation readers keep
+/// the existing projection and visibility boundary.
 pub(super) fn get_operation_for_current_manager(
     db: &Connection,
     p: &Principal,
@@ -74,10 +75,91 @@ pub(super) fn get_operation_for_current_manager(
     {
         operation["native_mcp_tools_readback"] = readback;
     }
+    if current_manager
+        && operation["method"] == "swarm.launch"
+        && let Some(readback) = workspace_launch_failure_readback_for_operation(db, id, &operation)?
+    {
+        operation["workspace_failure_readback"] = readback;
+    }
     if current_manager && let Some(issuance) = participant_issuance_failure_for_operation(db, id)? {
         operation["participant_issuance"] = issuance;
     }
     Ok(operation)
+}
+
+/// Project only closed failure facts for an unknown workspace effect. The
+/// existing operation visibility/current-Manager gate runs before this helper.
+fn workspace_launch_failure_readback_for_operation(
+    db: &Connection,
+    operation_id: &str,
+    operation: &Value,
+) -> Result<Option<Value>> {
+    if operation["state"] != "outcome_unknown"
+        || operation["result"]["failure"]["code"] != "workspace_effect_unknown"
+    {
+        return Ok(None);
+    }
+    let Some(retained) = meta(db, &format!("launcher:failure:{operation_id}"))? else {
+        return Ok(None);
+    };
+    if serde_json::to_vec(&retained)?.len() > MAX_WORKSPACE_LAUNCH_FAILURE_BYTES {
+        return Ok(Some(workspace_launch_failure_diagnostic_corrupt()));
+    }
+
+    let latest_code = retained["code"].as_str();
+    let latest_classification = retained["classification"].as_str();
+    let latest_observed_at_ms = retained["observed_at_ms"].as_i64();
+    let first = if retained.get("first_failure").is_some() {
+        &retained["first_failure"]
+    } else {
+        &retained
+    };
+    let first_code = first["code"].as_str();
+    let first_classification = first["classification"].as_str();
+    let first_observed_at_ms = first["observed_at_ms"].as_i64();
+    let safe_classification = |value: &str| {
+        matches!(
+            value,
+            "workspace_effect_unknown"
+                | "binding_effect_unknown"
+                | "workspace_stale_before_effect"
+                | "workspace_admission_rejected"
+        )
+    };
+    let valid = latest_code.is_some_and(safe_start_failure_error_code)
+        && latest_classification.is_some_and(safe_classification)
+        && latest_observed_at_ms.is_some_and(|value| value >= 0)
+        && first_code.is_some_and(safe_start_failure_error_code)
+        && first_classification.is_some_and(safe_classification)
+        && first_observed_at_ms
+            .is_some_and(|value| value >= 0 && Some(value) <= latest_observed_at_ms)
+        && latest_classification == Some("workspace_effect_unknown");
+    if !valid {
+        return Ok(Some(workspace_launch_failure_diagnostic_corrupt()));
+    }
+
+    Ok(Some(json!({
+        "schema_version":1,
+        "status":"readback_required",
+        "first_retained_failure":{
+            "code":first_code,
+            "classification":first_classification,
+            "observed_at_ms":first_observed_at_ms,
+        },
+        "latest_failure":{
+            "code":latest_code,
+            "classification":latest_classification,
+            "observed_at_ms":latest_observed_at_ms,
+        },
+    })))
+}
+
+fn workspace_launch_failure_diagnostic_corrupt() -> Value {
+    json!({
+        "schema_version":1,
+        "status":"unknown",
+        "code":"LAUNCH_FAILURE_DIAGNOSTIC_CORRUPT",
+    })
 }
 
 /// A verified module-owner departure can leave the original Operation unknown

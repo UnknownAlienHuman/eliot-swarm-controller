@@ -329,9 +329,17 @@ pub(super) fn explain(db: &Connection, p: &Principal, value: &Value) -> Result<V
     let publication = automation_publication::state(db, &entry)?;
     let cron = super::automation_cron::state(db, &entry)?;
     let goal_progression = super::automation_goal_progression::state(db, &entry)?;
-    let work = operation_impacts(db, &owner_manager_id, project, automation_id)?;
+    let work = match operation_impacts(db, &owner_manager_id, project, automation_id) {
+        Ok(work) => work,
+        Err(error) if error.code == "AUTOMATION_LINK_CORRUPT" => closed_operation_impacts(),
+        Err(error) => return Err(error),
+    };
     let operation_history =
-        linked_operation_history(db, &owner_manager_id, project, automation_id)?;
+        match linked_operation_history(db, &owner_manager_id, project, automation_id) {
+            Ok(history) => history,
+            Err(error) if error.code == "AUTOMATION_LINK_CORRUPT" => closed_operation_history(),
+            Err(error) => return Err(error),
+        };
     let transfer_lineage = config::transfer_lineage(db, &owner_manager_id, project, automation_id)?;
     let retired_to = config::transfer_from_source(db, &owner_manager_id, project, automation_id)?;
     Ok(json!({
@@ -349,6 +357,32 @@ pub(super) fn explain(db: &Connection, p: &Principal, value: &Value) -> Result<V
         "linked_operations":work,
         "linked_operation_history":operation_history
     }))
+}
+
+fn closed_operation_impacts() -> Value {
+    json!({
+        "unstarted":[],
+        "in_flight":[],
+        "uncertain":[],
+        "truncated":true,
+        "closed":{
+            "status":"degraded",
+            "error_code":"AUTOMATION_LINK_CORRUPT",
+            "category":"automation_link_corrupt"
+        }
+    })
+}
+
+fn closed_operation_history() -> Value {
+    json!({
+        "items":[],
+        "truncated":true,
+        "closed":{
+            "status":"degraded",
+            "error_code":"AUTOMATION_LINK_CORRUPT",
+            "category":"automation_link_corrupt"
+        }
+    })
 }
 
 fn linked_operation_history(

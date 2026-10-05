@@ -26,6 +26,14 @@ swarm.tools.search -> automation.config.get + runtime.catalog
 - `automation.config.apply` atomically applies the explicitly requested changes, including `enabled`, using caller-owned request identity and expected entry revisions.
 - `automation.config.explain` shows why an entry/action is waiting or running, on whose behalf, its source cause, retained inputs and next useful action. It calls no model.
 
+An invalid retained on-behalf link leaves the authorized entry explanation
+readable. Affected `linked_operations` or `linked_operation_history` collections
+are withheld with `truncated: true` and a `closed` marker containing
+`status: degraded`, `error_code: AUTOMATION_LINK_CORRUPT` and
+`category: automation_link_corrupt`. The held ScriptRun reason remains readable.
+An empty degraded collection is incomplete history. Apply and execution still
+require valid links, and unrelated Store failures remain errors.
+
 The discarded `automation.control.*` proposal has no compatibility aliases. `runtime.profile.get/list/preview/apply` edits model/executor preferences; owned profile changes may be included in one configuration transaction without a separate call per field.
 
 ### 2.1 Patch rules
@@ -508,6 +516,41 @@ script once. Failure metadata contains a closed `failure_category` and, when
 known, the fixed `failed_supervisor` name. A later detected interruption remains
 a separate `host_interruption_observed` occurrence. Host lifecycle events are
 taskless and do not establish Task completion.
+
+### Native MCP failure selector
+
+C7/C8 native-MCP readback failures use the ordinary generic ScriptRun source
+and kind `controller:native-mcp` / `native.mcp.failure`. Omit `status` to select
+both normalized `failed` and `unknown` facts. Set `status` to `failed` or
+`unknown` to select only that normalized state; these values describe the
+failure observation, not Task completion. For example, this enabled entry
+selects either kind of native-MCP readback failure through the common
+`script_run` action:
+
+~~~json
+{
+  "enabled": true,
+  "steps": ["script_run"],
+  "script_run": {"script_id": "on_native_mcp_failure"},
+  "event_rules": [
+    {
+      "source_id": "controller:native-mcp",
+      "event_kind": "native.mcp.failure",
+      "action": "script_run"
+    }
+  ]
+}
+~~~
+
+To narrow that selector, add `"status": "failed"` or `"status": "unknown"`.
+The event's safe projection contains the normalized status, bounded error code,
+closed failure category, fixed supervisor name, and occurrence identity. It does
+not forward native response text, credentials, artifact paths, or other private
+readback details. Review those diagnostics through the existing current-rights
+`operation.get` read. This is an ordinary generic event/action route: it adds no
+provider-specific runner or service. A launch event may be taskless; when Task
+scope exists, the usual exact Task/Attempt checks still apply, and the event
+never completes a Task.
 
 The normalized `controller:messages` lifecycle facts feed event selection;
 they do not create a second addressed mailbox delivery in `report.delta` or

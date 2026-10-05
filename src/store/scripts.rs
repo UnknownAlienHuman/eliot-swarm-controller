@@ -1502,6 +1502,7 @@ fn blocked_script_trigger_error(error: &Error) -> bool {
     matches!(
         error.code.as_str(),
         "AUTOMATION_ACTION_CHANGED"
+            | "AUTOMATION_LINK_CORRUPT"
             | "FORBIDDEN"
             | "UNAUTHORIZED"
             | "NOT_FOUND"
@@ -4200,6 +4201,220 @@ mod script_trigger_admission_isolation_tests {
     #[tokio::test]
     async fn damaged_script_trigger_is_held_and_healthy_neighbor_is_admitted() {
         assert_damaged_script_trigger_isolated(Damage::RevisionReceipt).await;
+    }
+
+    #[tokio::test]
+    async fn corrupt_retained_event_link_is_held_while_healthy_neighbor_is_admitted() {
+        let (owner, directory, operator) = start_store().await;
+        let manager = register_manager(&owner.store, &operator).await;
+        owner
+            .store
+            .call(
+                operator,
+                "gm.handover".into(),
+                json!({
+                    "client_request_id":"script-trigger-link-handover",
+                    "client_id":OWNER_ID,
+                }),
+            )
+            .await
+            .expect("designate fixture Manager");
+        register_active_script(&owner.store, &manager, DAMAGED_SCRIPT_ID).await;
+        register_active_script(&owner.store, &manager, HEALTHY_SCRIPT_ID).await;
+        configure_trigger(
+            &owner.store,
+            &manager,
+            DAMAGED_AUTOMATION_ID,
+            DAMAGED_SCRIPT_ID,
+        )
+        .await;
+        configure_trigger(
+            &owner.store,
+            &manager,
+            HEALTHY_AUTOMATION_ID,
+            HEALTHY_SCRIPT_ID,
+        )
+        .await;
+        owner
+            .store
+            .record_host_start()
+            .await
+            .expect("record host start");
+        owner
+            .store
+            .record_host_ready()
+            .await
+            .expect("record host ready");
+        record_interruption(&owner.store).await;
+
+        let config = Config::default();
+        owner
+            .store
+            .run(move |db| {
+                let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let staged = crate::store::automation_dispatch::reconcile(
+                    &tx,
+                    &config,
+                    16,
+                    64,
+                    model::now_ms()?,
+                )?;
+                tx.commit()?;
+                Ok(staged)
+            })
+            .await
+            .expect("commit both event causes before admission");
+
+        let pending = owner
+            .store
+            .run(|db| crate::store::automation_dispatch::pending_script_triggers(db, 16))
+            .await
+            .expect("read durable ScriptRun causes");
+        let damaged_intent = pending
+            .into_iter()
+            .find(|intent| intent.script_id == DAMAGED_SCRIPT_ID)
+            .expect("damaged event cause");
+        let admitted = owner
+            .store
+            .admit_script_trigger(damaged_intent)
+            .await
+            .unwrap_or_else(|failure| {
+                panic!(
+                    "seed admitted Operation before journal completion: {}",
+                    failure.error.code
+                )
+            });
+        let damaged_operation_id = admitted["operation_id"]
+            .as_str()
+            .expect("retained ScriptRun Operation ID")
+            .to_owned();
+        let link_key = crate::automation::config::operation_link_key(&damaged_operation_id)
+            .expect("build exact Operation-link key");
+        owner
+            .store
+            .run(move |db| {
+                let removed = db.execute("DELETE FROM meta WHERE key=?1", [&link_key])?;
+                assert_eq!(removed, 1);
+                Ok(())
+            })
+            .await
+            .expect("simulate link loss after Operation commit and before journal completion");
+
+        let pass = owner
+            .store
+            .reconcile_script_triggers_once(16)
+            .await
+            .expect("entry-local link corruption must not stop trigger reconciliation");
+        assert_eq!(pass["considered"], 2, "{pass}");
+        let outcomes = pass["outcomes"].as_array().expect("trigger outcomes");
+        let damaged = outcomes
+            .iter()
+            .find(|outcome| outcome["script_id"] == DAMAGED_SCRIPT_ID)
+            .expect("damaged trigger outcome");
+        assert_eq!(damaged["state"], "blocked_pending_revalidation");
+        assert_eq!(damaged["error"]["code"], "AUTOMATION_LINK_CORRUPT");
+        let healthy = outcomes
+            .iter()
+            .find(|outcome| outcome["script_id"] == HEALTHY_SCRIPT_ID)
+            .expect("healthy trigger outcome");
+        assert_eq!(healthy["state"], "admitted");
+        let healthy_operation_id = healthy["operation_id"]
+            .as_str()
+            .expect("healthy admitted Operation ID")
+            .to_owned();
+
+        let damaged_state =
+            explain_trigger(&owner.store, &manager, DAMAGED_AUTOMATION_ID).await["script_run"]
+                .clone();
+        assert_eq!(damaged_state["pending"].as_array().unwrap().len(), 1);
+        assert_eq!(damaged_state["pending"][0]["held"], true);
+        assert_eq!(
+            damaged_state["pending"][0]["held_reason"],
+            "admission_revalidation:automation_link_corrupt"
+        );
+        assert!(
+            damaged_state["recent"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| {
+                    item["script_id"] == DAMAGED_SCRIPT_ID
+                        && item["details"]["code"] == "AUTOMATION_LINK_CORRUPT"
+                })
+        );
+        let healthy_state =
+            explain_trigger(&owner.store, &manager, HEALTHY_AUTOMATION_ID).await["script_run"]
+                .clone();
+        assert!(healthy_state["pending"].as_array().unwrap().is_empty());
+
+        let damaged_explanation =
+            explain_trigger(&owner.store, &manager, DAMAGED_AUTOMATION_ID).await;
+        for projection in ["linked_operations", "linked_operation_history"] {
+            assert_eq!(
+                damaged_explanation[projection]["closed"]["status"],
+                "degraded"
+            );
+            assert_eq!(
+                damaged_explanation[projection]["closed"]["error_code"],
+                "AUTOMATION_LINK_CORRUPT"
+            );
+            assert_eq!(
+                damaged_explanation[projection]["closed"]["category"],
+                "automation_link_corrupt"
+            );
+            assert_eq!(damaged_explanation[projection]["truncated"], true);
+            assert_eq!(
+                damaged_explanation[projection]["closed"]
+                    .as_object()
+                    .unwrap()
+                    .len(),
+                3
+            );
+        }
+        assert!(
+            damaged_explanation["linked_operations"]["unstarted"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            damaged_explanation["linked_operation_history"]["items"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let explanation_json = serde_json::to_string(&damaged_explanation).unwrap();
+        assert!(!explanation_json.contains(&damaged_operation_id));
+
+        let (damaged_operation_ids, healthy_operation_ids, started_runs) = owner
+            .store
+            .run(|db| {
+                let mut damaged_statement = db.prepare(
+                    "SELECT operation_id FROM script_runs WHERE script_id=?1 ORDER BY run_id",
+                )?;
+                let damaged = damaged_statement
+                    .query_map([DAMAGED_SCRIPT_ID], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let mut healthy_statement = db.prepare(
+                    "SELECT operation_id FROM script_runs WHERE script_id=?1 ORDER BY run_id",
+                )?;
+                let healthy = healthy_statement
+                    .query_map([HEALTHY_SCRIPT_ID], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let started: i64 = db.query_row(
+                    "SELECT COUNT(*) FROM script_runs WHERE started_at_ms IS NOT NULL",
+                    [],
+                    |row| row.get(0),
+                )?;
+                Ok((damaged, healthy, started))
+            })
+            .await
+            .expect("read admitted runs without starting the script supervisor");
+        assert_eq!(damaged_operation_ids, vec![damaged_operation_id]);
+        assert_eq!(healthy_operation_ids, vec![healthy_operation_id]);
+        assert_eq!(started_runs, 0);
+        owner.close().await.expect("close temporary Store");
+        std::fs::remove_dir_all(directory).expect("remove owned temporary Store directory");
     }
 
     #[tokio::test]
