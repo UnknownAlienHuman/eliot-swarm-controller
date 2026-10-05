@@ -147,7 +147,6 @@ mod tests {
     };
     use rusqlite::ErrorCode;
     use serde_json::json;
-    use serde_json::json;
     use std::{
         fs,
         sync::{
