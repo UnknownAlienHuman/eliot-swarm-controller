@@ -338,6 +338,50 @@ pub fn process_diagnostic(work: &Work) -> Result<Option<Value>> {
             selected = Some((priority, expected_code, cause, elapsed_ms, observed_at_ms));
         }
     }
+    let mut output_capture_pending = None;
+    let capture_path = dir.join("output-capture.json");
+    if capture_path.try_exists()? {
+        let diagnostic = read_value(&capture_path)?;
+        if diagnostic["version"] != 1
+            || diagnostic["check_id"] != work.check_id
+            || diagnostic["operation_id"] != work.operation_id
+            || diagnostic["token"] != work.token
+            || diagnostic["process"] != identity["process"]
+            || diagnostic["code"] != "CHECK_OUTPUT_DRAIN_PENDING"
+        {
+            return Err(Error::conflict(
+                "output capture diagnostic differs from the accepted CheckRun owner",
+            ));
+        }
+        let stdout_pending = diagnostic["stdout_pending"]
+            .as_bool()
+            .ok_or_else(|| Error::invalid("stdout capture diagnostic is invalid"))?;
+        let stderr_pending = diagnostic["stderr_pending"]
+            .as_bool()
+            .ok_or_else(|| Error::invalid("stderr capture diagnostic is invalid"))?;
+        if !stdout_pending && !stderr_pending {
+            return Err(Error::invalid(
+                "output capture diagnostic has no pending reader",
+            ));
+        }
+        let elapsed_ms = diagnostic["elapsed_ms"]
+            .as_u64()
+            .ok_or_else(|| Error::invalid("output capture elapsed time is invalid"))?;
+        let observed_at_ms = diagnostic["observed_at_ms"]
+            .as_i64()
+            .filter(|value| *value >= 0)
+            .ok_or_else(|| Error::invalid("output capture timestamp is invalid"))?;
+        output_capture_pending = Some((stdout_pending, stderr_pending));
+        if selected.as_ref().is_none_or(|(existing, ..)| 4 > *existing) {
+            selected = Some((
+                4,
+                "CHECK_OUTPUT_DRAIN_PENDING",
+                "output_capture_pending",
+                elapsed_ms,
+                observed_at_ms,
+            ));
+        }
+    }
     let Some((_, code, cause, elapsed_ms, observed_at_ms)) = selected else {
         return Ok(None);
     };
@@ -351,24 +395,34 @@ pub fn process_diagnostic(work: &Work) -> Result<Option<Value>> {
         "drain_pending" => {
             "the owned process group remains active after the drain grace period; the resource remains held"
         }
+        "output_capture_pending" => {
+            "the owned process group is empty but output capture has not finished; the CheckRun remains unresolved"
+        }
         _ => return Err(Error::invalid("process diagnostic cause is invalid")),
     };
+    let mut public = json!({
+        "code": code,
+        "status": "unresolved",
+        "cause": cause,
+        "message": message,
+        "control_read_unknown": control_read_unknown,
+        "elapsed_ms": elapsed_ms,
+        "observed_at_ms": observed_at_ms,
+        "resolved_at_ms": Value::Null
+    });
+    if cause == "output_capture_pending" {
+        let (stdout_pending, stderr_pending) = output_capture_pending
+            .ok_or_else(|| Error::invalid("output capture status was not retained"))?;
+        public["stdout_pending"] = json!(stdout_pending);
+        public["stderr_pending"] = json!(stderr_pending);
+    }
     Ok(Some(json!({
         "version": 1,
         "check_id": work.check_id,
         "operation_id": work.operation_id,
         "token": work.token,
         "process": identity["process"],
-        "public": {
-            "code": code,
-            "status": "unresolved",
-            "cause": cause,
-            "message": message,
-            "control_read_unknown": control_read_unknown,
-            "elapsed_ms": elapsed_ms,
-            "observed_at_ms": observed_at_ms,
-            "resolved_at_ms": Value::Null
-        }
+        "public": public
     })))
 }
 
@@ -411,9 +465,11 @@ struct HostCheckControl<'a> {
     cancellation_observed: bool,
     started_at_ms: Option<i64>,
     drain_diagnostic: Option<Value>,
+    output_capture_diagnostic: Option<Value>,
     control_read_diagnostic: Option<Value>,
     process_observation_diagnostic: Option<Value>,
     drain_diagnostic_write_failed: bool,
+    output_capture_diagnostic_write_failed: bool,
 }
 
 impl<'a> HostCheckControl<'a> {
@@ -426,9 +482,11 @@ impl<'a> HostCheckControl<'a> {
             cancellation_observed: false,
             started_at_ms: None,
             drain_diagnostic: None,
+            output_capture_diagnostic: None,
             control_read_diagnostic: None,
             process_observation_diagnostic: None,
             drain_diagnostic_write_failed: false,
+            output_capture_diagnostic_write_failed: false,
         }
     }
 
@@ -483,39 +541,103 @@ impl<'a> HostCheckControl<'a> {
 }
 
 impl CheckControl for HostCheckControl<'_> {
-    fn wait_for_start(&mut self, owner: &OwnedCheckProcess) -> Result<StartDecision> {
-        self.validate_owner(owner)?;
+    fn wait_for_start(
+        &mut self,
+        owner: &OwnedCheckProcess,
+    ) -> swarm_contracts::Result<StartDecision> {
+        self.validate_owner(owner)
+            .map_err(into_swarm_checks_error)?;
         let identity = json!({
             "token": owner.token,
             "process": owner.process,
             "ready_at_ms": model::now_ms().unwrap_or(0),
             "control_version": 2
         });
-        write_once(&self.dir.join("worker.json"), &identity)?;
+        write_once(&self.dir.join("worker.json"), &identity).map_err(into_swarm_checks_error)?;
         self.identity = Some(identity);
 
         loop {
-            if self.cancellation.read(self.work, self.dir)? {
+            if self
+                .cancellation
+                .read(self.work, self.dir)
+                .map_err(into_swarm_checks_error)?
+            {
                 self.cancellation.skipped_start = true;
                 return Ok(StartDecision::CancelBeforeStart);
             }
             let go = self.dir.join("go.json");
             if go.try_exists()? {
-                if read_value(&go)?["token"] != self.work.token {
-                    return Err(Error::conflict("check start token mismatch"));
+                let go_receipt = read_value(&go).map_err(into_swarm_checks_error)?;
+                if go_receipt["token"] != self.work.token {
+                    return Err(into_swarm_checks_error(Error::conflict(
+                        "check start token mismatch",
+                    )));
                 }
-                self.started_at_ms = Some(model::now_ms()?);
+                self.started_at_ms = Some(model::now_ms().map_err(into_swarm_checks_error)?);
                 return Ok(StartDecision::Start);
             }
             std::thread::sleep(Duration::from_millis(100));
         }
     }
 
-    fn cancellation_requested(&mut self, owner: &OwnedCheckProcess) -> Result<bool> {
-        self.validate_owner(owner)?;
-        let requested = self.cancellation.read(self.work, self.dir)?;
+    fn cancellation_requested(
+        &mut self,
+        owner: &OwnedCheckProcess,
+    ) -> swarm_contracts::Result<bool> {
+        self.validate_owner(owner)
+            .map_err(into_swarm_checks_error)?;
+        let requested = self
+            .cancellation
+            .read(self.work, self.dir)
+            .map_err(into_swarm_checks_error)?;
         self.cancellation_observed |= requested;
         Ok(requested)
+    }
+
+    fn cancellation_requested_after_group_empty(
+        &mut self,
+        owner: &OwnedCheckProcess,
+    ) -> swarm_contracts::Result<bool> {
+        self.validate_owner(owner)
+            .map_err(into_swarm_checks_error)?;
+        // Retain a late request for the terminal receipt, but do not claim that
+        // it caused termination after the owned Group was already empty.
+        self.cancellation
+            .read(self.work, self.dir)
+            .map_err(into_swarm_checks_error)
+    }
+
+    fn output_capture_drain_pending(
+        &mut self,
+        owner: &OwnedCheckProcess,
+        elapsed: Duration,
+        stdout_pending: bool,
+        stderr_pending: bool,
+    ) -> swarm_contracts::Result<()> {
+        self.validate_owner(owner)
+            .map_err(into_swarm_checks_error)?;
+        if !stdout_pending && !stderr_pending {
+            return Err(into_swarm_checks_error(Error::invalid(
+                "output capture diagnostic requires an unfinished reader",
+            )));
+        }
+        let result = (|| -> Result<()> {
+            if self.output_capture_diagnostic.is_none() {
+                let mut diagnostic =
+                    self.diagnostic_event(owner, "CHECK_OUTPUT_DRAIN_PENDING", elapsed)?;
+                diagnostic["stdout_pending"] = json!(stdout_pending);
+                diagnostic["stderr_pending"] = json!(stderr_pending);
+                self.output_capture_diagnostic = Some(diagnostic);
+            }
+            write_once(
+                &self.dir.join("output-capture.json"),
+                self.output_capture_diagnostic.as_ref().ok_or_else(|| {
+                    Error::invalid("output capture diagnostic was not initialized")
+                })?,
+            )
+        })();
+        self.output_capture_diagnostic_write_failed = result.is_err();
+        result.map_err(into_swarm_checks_error)
     }
 
     fn process_group_drain_pending(
@@ -524,8 +646,9 @@ impl CheckControl for HostCheckControl<'_> {
         elapsed: Duration,
         observation_error: bool,
         control_read_unknown: bool,
-    ) -> Result<()> {
-        self.validate_owner(owner)?;
+    ) -> swarm_contracts::Result<()> {
+        self.validate_owner(owner)
+            .map_err(into_swarm_checks_error)?;
         let result = (|| -> Result<()> {
             if observation_error {
                 if self.process_observation_diagnostic.is_none() {
@@ -577,7 +700,15 @@ impl CheckControl for HostCheckControl<'_> {
             Ok(())
         })();
         self.drain_diagnostic_write_failed = result.is_err();
-        result
+        result.map_err(into_swarm_checks_error)
+    }
+}
+
+fn into_swarm_checks_error(error: Error) -> swarm_contracts::Error {
+    swarm_contracts::Error {
+        code: error.code,
+        message: error.message,
+        rejection_class: error.rejection_class,
     }
 }
 
@@ -1502,7 +1633,7 @@ pub fn run(file: &Path) -> Result<()> {
                     }
                     Err(error) => {
                         plan_setup_failed = true;
-                        Err(error)
+                        Err(into_swarm_checks_error(error))
                     }
                 }
             },
@@ -1515,6 +1646,12 @@ pub fn run(file: &Path) -> Result<()> {
             return Err(Error::new(
                 "CHECK_PROCESS_DIAGNOSTIC_WRITE_FAILED",
                 "the CheckRun process-group diagnostic could not be persisted",
+            ));
+        }
+        if control.output_capture_diagnostic_write_failed {
+            return Err(Error::new(
+                "CHECK_OUTPUT_DIAGNOSTIC_WRITE_FAILED",
+                "the CheckRun output-capture diagnostic could not be persisted",
             ));
         }
 
@@ -1617,7 +1754,7 @@ pub fn run(file: &Path) -> Result<()> {
         if !executed.stderr.capture_complete {
             gaps.push(json!("stderr_capture_incomplete"));
         }
-        gaps.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        gaps.sort_by(|left, right| left.as_str().cmp(&right.as_str()));
         gaps.dedup();
 
         match source::verify_directory(&source_dir, &manifest) {
@@ -1696,7 +1833,7 @@ pub fn run(file: &Path) -> Result<()> {
         && let Some(coverage_gaps) = coverage["gaps"].as_array_mut()
     {
         coverage_gaps.extend(gaps.iter().filter(|gap| gap.is_string()).cloned());
-        coverage_gaps.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        coverage_gaps.sort_by(|a, b| a.as_str().cmp(&b.as_str()));
         coverage_gaps.dedup();
     }
     let cancellation = std::mem::take(&mut control.cancellation);

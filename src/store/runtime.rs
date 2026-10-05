@@ -245,17 +245,60 @@ pub(super) fn hello(
         ));
     }
     let sessionless_batch = crate::runtime::batch::is_sessionless_route(&b["route"]);
-    if sessionless_batch
-        && (v
-            .get("native_root_id")
-            .is_some_and(|value| !value.is_null())
-            || v.get("native_scope_key")
-                .is_some_and(|value| !value.is_null()))
-    {
+    let requested_root = optional_identity_text(v, "native_root_id")?;
+    let requested_scope = optional_identity_text(v, "native_scope_key")?;
+    if requested_root.is_some() != requested_scope.is_some() {
+        return Err(Error::new(
+            "NATIVE_IDENTITY_MISMATCH",
+            "native root and scope must be supplied together",
+        ));
+    }
+    let retained_root = optional_identity_text(&b, "native_root_id")?;
+    let retained_scope = optional_identity_text(&b, "native_scope_key")?;
+    if retained_root.is_some() != retained_scope.is_some() {
+        return Err(Error::new(
+            "NATIVE_IDENTITY_MISMATCH",
+            "Store retained an incomplete native identity pair",
+        ));
+    }
+    if sessionless_batch && (requested_root.is_some() || retained_root.is_some()) {
         return Err(Error::new(
             "NATIVE_IDENTITY_MISMATCH",
             "sessionless batch bindings cannot claim a native root or scope",
         ));
+    }
+    match (
+        retained_root,
+        retained_scope,
+        requested_root,
+        requested_scope,
+    ) {
+        (
+            Some(retained_root),
+            Some(retained_scope),
+            Some(requested_root),
+            Some(requested_scope),
+        ) if retained_root != requested_root || retained_scope != requested_scope => {
+            return Err(Error::new(
+                "NATIVE_IDENTITY_MISMATCH",
+                "supplied native identity differs from the Store-owned pair",
+            ));
+        }
+        (None, None, Some(_), Some(_)) => {
+            return Err(Error::new(
+                "NATIVE_IDENTITY_MISMATCH",
+                "module hello cannot introduce a native identity that Store has not retained",
+            ));
+        }
+        (Some(_), Some(_), None, None)
+        | (Some(_), Some(_), Some(_), Some(_))
+        | (None, None, None, None) => {}
+        _ => {
+            return Err(Error::new(
+                "NATIVE_IDENTITY_MISMATCH",
+                "native root and scope must be complete identity pairs",
+            ));
+        }
     }
     let old_boot = b["observation"]["bridge_boot_id"].as_str();
     if verified["old_boot"] != b["observation"]["bridge_boot_id"]
@@ -287,15 +330,6 @@ pub(super) fn hello(
                 "previous module may own native work; a new bridge must not spawn a second executor",
             ));
         }
-    }
-    if !b["native_root_id"].is_null()
-        && (v.get("native_root_id") != b.get("native_root_id")
-            || v.get("native_scope_key") != b.get("native_scope_key"))
-    {
-        return Err(Error::new(
-            "NATIVE_IDENTITY_MISMATCH",
-            "reconnect must identify the previously owned native session",
-        ));
     }
     if recovered && v.get("managed_owner").is_none() && !sessionless_batch {
         return Err(Error::new(
@@ -336,6 +370,17 @@ pub(super) fn hello(
     let result = json!({"binding_id":id,"generation":generation,"route":b["route"],"host_epoch":meta(&tx,"host_epoch")?,"native_root_id":b["native_root_id"],"native_scope_key":b["native_scope_key"],"recovery_required":(recovered && needs_recovery) || b["observation"]["recovery_required"]==true,"module_contract_negotiation":module_contract_negotiation});
     tx.commit()?;
     Ok(result)
+}
+
+fn optional_identity_text<'a>(value: &'a Value, field: &str) -> Result<Option<&'a str>> {
+    match value.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if !value.trim().is_empty() => Ok(Some(value)),
+        _ => Err(Error::new(
+            "NATIVE_IDENTITY_MISMATCH",
+            "native identity fields must be nonempty strings or absent",
+        )),
+    }
 }
 
 pub(super) fn next(db: &mut Connection, p: &Principal) -> Result<Value> {
@@ -1227,6 +1272,7 @@ pub(super) fn outcome_with_artifacts(
     }
     let sessionless_batch = crate::runtime::batch::is_sessionless_route(&b["route"]);
     if b["route"]["runtime"] == crate::runtime::codex::RUNTIME
+        && b["observation"].get("module_contract_selector").is_none()
         && !crate::runtime::codex::is_controller_route(&b["route"])
         && matches!(r.outcome, EffectOutcome::Applied | EffectOutcome::Accepted)
         && matches!(

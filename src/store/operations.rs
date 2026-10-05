@@ -2279,17 +2279,25 @@ pub(super) fn open_for_launch_for_actor(
         ));
     }
     let mut route = config.route(model::text(v, "route")?)?.clone();
-    let workspace_field = match route.runtime.as_str() {
-        crate::runtime::opencode_v2::RUNTIME => "directory",
-        "zed" => "workdir",
-        "codex" | "command" | "claude" | "antigravity" | "muse" => "workspaceRoot",
-        _ => {
-            return Err(Error::new(
+    let workspace_field = route
+        .workspace_option
+        .as_deref()
+        .or_else(|| {
+            // Compatibility mapping for legacy built-in routes. New standalone
+            // artifacts declare their own exact field in the route contract.
+            match route.runtime.as_str() {
+                crate::runtime::opencode_v2::RUNTIME => Some("directory"),
+                "zed" => Some("workdir"),
+                "codex" | "command" | "claude" | "antigravity" | "muse" => Some("workspaceRoot"),
+                _ => None,
+            }
+        })
+        .ok_or_else(|| {
+            Error::new(
                 "CAPABILITY_GAP",
                 "runtime has no registered workspace-bound launch contract",
-            ));
-        }
-    };
+            )
+        })?;
     let options = route.native_options.as_object_mut().ok_or_else(|| {
         Error::new(
             "CONFIG_ERROR",

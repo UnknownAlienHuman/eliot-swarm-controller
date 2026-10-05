@@ -18,6 +18,7 @@ async fn start(fixture: &Fixture) -> (StoreOwner, Principal) {
     let mut config = Config::default();
     config.storage.data_dir = directory;
     config.routes.push(Route {
+        workspace_option: None,
         owned_service: None,
         alias: "fixture".into(),
         runtime: crate::runtime::opencode_v2::RUNTIME.into(),

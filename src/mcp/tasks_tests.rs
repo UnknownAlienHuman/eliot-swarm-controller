@@ -242,6 +242,7 @@ async fn start_stack() -> Stack {
     let mut cfg = Config::default();
     cfg.storage.data_dir = dir.clone();
     cfg.routes.push(Route {
+        workspace_option: None,
         owned_service: None,
         alias: "fixture".into(),
         runtime: "opencode_v2".into(),

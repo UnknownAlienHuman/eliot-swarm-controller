@@ -14,7 +14,7 @@ use crate::{
 use rusqlite::{Connection, Transaction};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use swarm_contracts::module_catalog::{
     ArtifactIdentity, ArtifactVersion, CapabilityId, ModuleCatalog, ModuleDescriptor, ModuleId,
     ProtocolVersion,
@@ -271,7 +271,7 @@ pub(super) fn selection_for_new_binding(
     db: &Connection,
     owner_manager_id: &str,
     route_alias: &str,
-    route_runtime: &str,
+    _route_runtime: &str,
     configured_artifact_id: &str,
 ) -> Result<Option<Value>> {
     let registry = load_registry(db)?;
@@ -286,12 +286,6 @@ pub(super) fn selection_for_new_binding(
         return Err(Error::new(
             "MODULE_ROUTE_STALE",
             "configured route artifact differs from its selected module descriptor",
-        ));
-    }
-    if selection.module_id.as_str() != route_runtime {
-        return Err(Error::new(
-            "MODULE_ROUTE_MODULE_MISMATCH",
-            "configured route runtime differs from its selected module descriptor",
         ));
     }
     Ok(Some(serde_json::to_value(selection)?))
@@ -345,12 +339,9 @@ pub(super) fn select_route(
             "selected artifact does not match the configured route artifact",
         ));
     }
-    if route.runtime != module_id.as_str() {
-        return Err(Error::new(
-            "MODULE_ROUTE_MODULE_MISMATCH",
-            "selected module differs from the configured route runtime",
-        ));
-    }
+    // `module_id` is the descriptor's opaque stable identity. `runtime` is
+    // the configured native harness label consumed by the adapter; the exact
+    // configured artifact ID below is their trusted route correlation.
     let registered = registry
         .descriptors
         .iter()
@@ -854,6 +845,7 @@ mod tests {
 
         let config = Config {
             routes: vec![Route {
+                workspace_option: None,
                 alias: "default".to_owned(),
                 runtime: first.module_id.to_string(),
                 module_artifact_id: first.artifact.artifact_id.to_string(),

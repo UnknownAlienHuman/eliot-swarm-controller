@@ -1158,8 +1158,20 @@ fn record_process_diagnostic(db: &mut Connection, work: &Work, diagnostic: Value
             "CHECK_PROCESS_DRAIN_PENDING",
             "the owned process group remains active after the drain grace period; the resource remains held",
         ),
+        "output_capture_pending" => (
+            "CHECK_OUTPUT_DRAIN_PENDING",
+            "the owned process group is empty but output capture has not finished; the CheckRun remains unresolved",
+        ),
         _ => return Err(Error::invalid("process diagnostic cause is invalid")),
     };
+    let output_capture_pending_valid = cause != "output_capture_pending"
+        || matches!(
+            (
+                diagnostic["public"]["stdout_pending"].as_bool(),
+                diagnostic["public"]["stderr_pending"].as_bool()
+            ),
+            (Some(true), _) | (_, Some(true))
+        );
     if diagnostic["public"]["code"] != expected_code
         || diagnostic["public"]["status"] != "unresolved"
         || diagnostic["public"]["message"] != expected_message
@@ -1171,6 +1183,7 @@ fn record_process_diagnostic(db: &mut Connection, work: &Work, diagnostic: Value
             .as_i64()
             .is_none_or(|value| value < 0)
         || !diagnostic["public"]["resolved_at_ms"].is_null()
+        || !output_capture_pending_valid
     {
         return Err(Error::invalid("process diagnostic projection is invalid"));
     }
@@ -1194,6 +1207,7 @@ fn record_process_diagnostic(db: &mut Connection, work: &Work, diagnostic: Value
             Some("CHECK_PROCESS_DRAIN_PENDING") => 1,
             Some("CHECK_CONTROL_READ_UNKNOWN") => 2,
             Some("CHECK_PROCESS_OBSERVATION_UNKNOWN") => 3,
+            Some("CHECK_OUTPUT_DRAIN_PENDING") => 4,
             _ => 0,
         };
         let old_rank = rank(&existing["public"]["code"]);

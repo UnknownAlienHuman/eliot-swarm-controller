@@ -50,6 +50,13 @@ selector. An unselected legacy binding is explicitly unverified and cannot accep
 a self-asserted versioned claim. Negotiated capabilities remain compatibility
 metadata rather than effect authority.
 
+Module IDs remain opaque identities. The configured runtime label is checked
+by the host's route contract, and selection binds its exact artifact to the
+trusted descriptor. The four standalone `.1` route contracts validate their
+native options and forward only the workspace already admitted by the host.
+A cold hello may omit both native identity fields and receives the retained
+Store-owned pair; a supplied pair must match it exactly.
+
 Runtime commands include the canonical original Operation request digest before
 dynamic enrichment. For selected bindings, one Store validator checks every
 outcome's `ModuleReceiptIdentity` against the retained descriptor and exact

@@ -97,6 +97,23 @@ pub trait CheckControl {
         observation_error: bool,
         control_read_unknown: bool,
     ) -> Result<()>;
+
+    /// Publish a fixed, token-bound diagnostic while output readers remain
+    /// unfinished after the owned process Group was observed empty.
+    fn output_capture_drain_pending(
+        &mut self,
+        owner: &OwnedCheckProcess,
+        elapsed: Duration,
+        stdout_pending: bool,
+        stderr_pending: bool,
+    ) -> Result<()>;
+
+    /// Re-read cancellation after the owned Group is empty without treating a
+    /// late request as a signal or evidence that cancellation caused exit.
+    fn cancellation_requested_after_group_empty(
+        &mut self,
+        owner: &OwnedCheckProcess,
+    ) -> Result<bool>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -441,8 +458,13 @@ pub fn execute_with_plan(
         },
     );
 
-    let stdout = finish_capture(stdout_path, stdout_reader);
-    let stderr = finish_capture(stderr_path, stderr_reader);
+    let (stdout, stderr) = finish_captures_after_group_empty(
+        (stdout_path, stdout_reader),
+        (stderr_path, stderr_reader),
+        control,
+        &owner,
+        &mut control_read_unknown,
+    );
     group.disarm()?;
 
     let termination = if process_observation_unknown {
@@ -669,6 +691,60 @@ fn finish_capture(path: PathBuf, reader: JoinHandle<io::Result<CaptureStats>>) -
             capture_complete: false,
         },
     }
+}
+
+fn finish_captures_after_group_empty(
+    stdout: (PathBuf, JoinHandle<io::Result<CaptureStats>>),
+    stderr: (PathBuf, JoinHandle<io::Result<CaptureStats>>),
+    control: &mut impl CheckControl,
+    owner: &OwnedCheckProcess,
+    control_read_unknown: &mut bool,
+) -> (CapturedStream, CapturedStream) {
+    let (stdout_path, stdout_reader) = stdout;
+    let (stderr_path, stderr_reader) = stderr;
+    let drain_started = Instant::now();
+    let mut diagnostic_published = false;
+    let mut last_diagnostic_attempt = None;
+    loop {
+        let stdout_pending = !stdout_reader.is_finished();
+        let stderr_pending = !stderr_reader.is_finished();
+        if !stdout_pending && !stderr_pending {
+            break;
+        }
+
+        if control
+            .cancellation_requested_after_group_empty(owner)
+            .is_err()
+        {
+            *control_read_unknown = true;
+        }
+
+        if !diagnostic_published
+            && drain_started.elapsed() >= LONG_DRAIN_DIAGNOSTIC_AFTER
+            && last_diagnostic_attempt
+                .is_none_or(|last: Instant| last.elapsed() >= Duration::from_secs(1))
+        {
+            last_diagnostic_attempt = Some(Instant::now());
+            if control
+                .output_capture_drain_pending(
+                    owner,
+                    drain_started.elapsed(),
+                    stdout_pending,
+                    stderr_pending,
+                )
+                .is_ok()
+            {
+                diagnostic_published = true;
+            }
+        }
+        thread::sleep(CHECK_POLL_INTERVAL);
+    }
+
+    // Each join is now nonblocking because its reader thread has finished.
+    (
+        finish_capture(stdout_path, stdout_reader),
+        finish_capture(stderr_path, stderr_reader),
+    )
 }
 
 fn abort_owned_child(

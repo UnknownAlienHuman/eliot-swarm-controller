@@ -7,6 +7,11 @@ use std::{
 };
 
 const MAX_GATEWAY_BODY_BYTES: usize = 1_048_576;
+const CODEX_RUST_ARTIFACT_ID: &str = "codex-rust-controller.1";
+const OPENCODE_RUST_ARTIFACT_ID: &str = "eliot-opencode-v2.rust-http.1";
+const COMMAND_RUST_ARTIFACT_ID: &str = "eliot-command.rust-headless.1";
+const ANTIGRAVITY_RUST_ARTIFACT_ID: &str = "eliot-antigravity.rust-headless.1";
+const ANTIGRAVITY_RUST_MODEL_ID: &str = "gemini-3.8-flash-high";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -99,6 +104,10 @@ pub struct Route {
     pub enabled: bool,
     #[serde(default)]
     pub native_options: Value,
+    /// Native option key to receive the exact admitted workspace path. New
+    /// standalone module artifacts declare this in their route contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_option: Option<String>,
     /// Explicit fresh foreground service declaration. External HTTP options
     /// remain unchanged; this declaration grants no process-start authority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -146,6 +155,49 @@ impl std::fmt::Debug for OwnedProviderAuthSourceConfig {
 }
 
 impl Route {
+    fn validate_activation_contract(&self) -> Result<()> {
+        if self.workspace_option.as_deref().is_some_and(|field| {
+            let mut bytes = field.bytes();
+            let first = bytes.next();
+            field.len() > 128
+                || !first.is_some_and(|byte| byte == b'_' || byte.is_ascii_alphabetic())
+                || !bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+        }) {
+            return Err(Error::new(
+                "CONFIG_ERROR",
+                "workspace_option must be a bounded native-options field name",
+            ));
+        }
+
+        let (runtime, workspace_field) = match self.module_artifact_id.as_str() {
+            CODEX_RUST_ARTIFACT_ID => ("codex", "workspaceRoot"),
+            OPENCODE_RUST_ARTIFACT_ID => ("module", "directory"),
+            COMMAND_RUST_ARTIFACT_ID => ("command", "workspaceRoot"),
+            ANTIGRAVITY_RUST_ARTIFACT_ID => ("antigravity", "workspaceRoot"),
+            _ if self.workspace_option.is_some() => {
+                return Err(Error::new(
+                    "CONFIG_ERROR",
+                    "workspace_option is supported only by the exact standalone Rust adapter artifacts",
+                ));
+            }
+            _ => return Ok(()),
+        };
+        if self.runtime != runtime || self.workspace_option.as_deref() != Some(workspace_field) {
+            return Err(Error::new(
+                "CONFIG_ERROR",
+                "standalone adapter route must retain its exact runtime and workspace option",
+            ));
+        }
+
+        match self.module_artifact_id.as_str() {
+            CODEX_RUST_ARTIFACT_ID => validate_codex_rust_options(&self.native_options),
+            OPENCODE_RUST_ARTIFACT_ID => validate_opencode_rust_options(&self.native_options),
+            COMMAND_RUST_ARTIFACT_ID => validate_command_rust_options(&self.native_options),
+            ANTIGRAVITY_RUST_ARTIFACT_ID => validate_antigravity_rust_options(&self.native_options),
+            _ => Ok(()),
+        }
+    }
+
     pub(crate) fn owned_opencode_service(
         &self,
     ) -> Result<Option<crate::runtime::opencode_v2::owned_service::OwnedServiceRoute>> {
@@ -163,6 +215,164 @@ impl Route {
         crate::runtime::opencode_v2::owned_service::OwnedServiceRoute::from_config(definition)
             .map(Some)
     }
+}
+
+fn validate_codex_rust_options(value: &Value) -> Result<()> {
+    let options = exact_option_object(value, &["modelProvider", "model", "workspaceRoot"], &[])?;
+    required_option_string(options, "modelProvider", 256)?;
+    required_option_string(options, "model", 256)?;
+    required_absolute_path(options, "workspaceRoot", 32 * 1024)?;
+    Ok(())
+}
+
+fn validate_opencode_rust_options(value: &Value) -> Result<()> {
+    let options = exact_option_object(
+        value,
+        &[
+            "service_id",
+            "connection_file",
+            "expected_version",
+            "directory",
+            "model",
+        ],
+        &[],
+    )?;
+    let service_id = required_option_string(options, "service_id", 128)?;
+    if !service_id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(Error::new("CONFIG_ERROR", "OpenCode service_id is invalid"));
+    }
+    required_absolute_path(options, "connection_file", 4096)?;
+    required_option_string(options, "expected_version", 256)?;
+    required_absolute_path(options, "directory", 4096)?;
+    let model = options
+        .get("model")
+        .and_then(Value::as_object)
+        .ok_or_else(|| Error::new("CONFIG_ERROR", "OpenCode model must be an object"))?;
+    ensure_exact_keys(model, &["id", "providerID", "variant"], &[])?;
+    required_option_string(model, "id", 256)?;
+    required_option_string(model, "providerID", 256)?;
+    required_option_string(model, "variant", 256)?;
+    Ok(())
+}
+
+fn validate_command_rust_options(value: &Value) -> Result<()> {
+    let options = exact_option_object(value, &["modelId", "workspaceRoot"], &[])?;
+    required_option_string(options, "modelId", 256)?;
+    required_absolute_path(options, "workspaceRoot", 32 * 1024)?;
+    Ok(())
+}
+
+fn validate_antigravity_rust_options(value: &Value) -> Result<()> {
+    let options = exact_option_object(
+        value,
+        &["modelId", "workspaceRoot"],
+        &["reasoningEffort", "agent", "dangerouslySkipPermissions"],
+    )?;
+    if required_option_string(options, "modelId", 256)? != ANTIGRAVITY_RUST_MODEL_ID {
+        return Err(Error::new(
+            "CONFIG_ERROR",
+            "Antigravity Rust route requires its exact supported model ID",
+        ));
+    }
+    required_absolute_path(options, "workspaceRoot", 32 * 1024)?;
+    if let Some(value) = options.get("reasoningEffort") {
+        let effort = option_string(value, "reasoningEffort", 32)?;
+        if !matches!(effort, "low" | "medium" | "high") {
+            return Err(Error::new(
+                "CONFIG_ERROR",
+                "Antigravity reasoningEffort must be low, medium, or high",
+            ));
+        }
+    }
+    if let Some(value) = options.get("agent") {
+        option_string(value, "agent", 256)?;
+    }
+    if options
+        .get("dangerouslySkipPermissions")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        return Err(Error::new(
+            "CONFIG_ERROR",
+            "Antigravity dangerouslySkipPermissions must be boolean",
+        ));
+    }
+    Ok(())
+}
+
+fn exact_option_object<'a>(
+    value: &'a Value,
+    required: &[&str],
+    optional: &[&str],
+) -> Result<&'a serde_json::Map<String, Value>> {
+    let options = value
+        .as_object()
+        .ok_or_else(|| Error::new("CONFIG_ERROR", "adapter native_options must be an object"))?;
+    ensure_exact_keys(options, required, optional)?;
+    Ok(options)
+}
+
+fn ensure_exact_keys(
+    options: &serde_json::Map<String, Value>,
+    required: &[&str],
+    optional: &[&str],
+) -> Result<()> {
+    if required.iter().any(|key| !options.contains_key(*key))
+        || options
+            .keys()
+            .any(|key| !required.contains(&key.as_str()) && !optional.contains(&key.as_str()))
+    {
+        return Err(Error::new(
+            "CONFIG_ERROR",
+            "adapter native_options omit required values or contain unsupported fields",
+        ));
+    }
+    Ok(())
+}
+
+fn required_option_string<'a>(
+    options: &'a serde_json::Map<String, Value>,
+    key: &str,
+    maximum_bytes: usize,
+) -> Result<&'a str> {
+    let value = options
+        .get(key)
+        .ok_or_else(|| Error::new("CONFIG_ERROR", "adapter native option is missing"))?;
+    option_string(value, key, maximum_bytes)
+}
+
+fn option_string<'a>(value: &'a Value, key: &str, maximum_bytes: usize) -> Result<&'a str> {
+    let value = value
+        .as_str()
+        .filter(|value| {
+            !value.trim().is_empty()
+                && value.len() <= maximum_bytes
+                && !value.chars().any(char::is_control)
+        })
+        .ok_or_else(|| {
+            Error::new(
+                "CONFIG_ERROR",
+                format!("adapter native option {key} is invalid"),
+            )
+        })?;
+    Ok(value)
+}
+
+fn required_absolute_path(
+    options: &serde_json::Map<String, Value>,
+    key: &str,
+    maximum_bytes: usize,
+) -> Result<()> {
+    let value = required_option_string(options, key, maximum_bytes)?;
+    if !Path::new(value).is_absolute() {
+        return Err(Error::new(
+            "CONFIG_ERROR",
+            format!("adapter native option {key} must be an absolute path"),
+        ));
+    }
+    Ok(())
 }
 
 impl Config {
@@ -543,13 +753,15 @@ impl Config {
                     "route aliases must be unique; runtime and artifact are required",
                 ));
             }
+            r.validate_activation_contract()?;
             if r.enabled
                 && r.runtime == crate::runtime::codex::RUNTIME
                 && r.module_artifact_id != crate::runtime::codex::ARTIFACT_ID
+                && r.module_artifact_id != CODEX_RUST_ARTIFACT_ID
             {
                 return Err(Error::new(
                     "CONFIG_ERROR",
-                    "Codex controller routes require the exact .2 artifact; the .1 observer is standalone",
+                    "Codex routes require the pinned bridge.3 controller or standalone Rust observer.1 artifact",
                 ));
             }
         }

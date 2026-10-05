@@ -16,13 +16,18 @@ pub const COMMAND_RUNTIME: &str = "command";
 pub const COMMAND_ARTIFACT_ID: &str = "command-mod-0.1.0-glue.4";
 pub const COMMAND_PREVIOUS_ARTIFACT_ID: &str = "command-mod-0.1.0-glue.3";
 pub const COMMAND_LEGACY_ARTIFACT_ID: &str = "command-mod-0.1.0-glue.2";
+pub const COMMAND_RUST_ARTIFACT_ID: &str = "eliot-command.rust-headless.1";
 pub const BATCH_OUTPUTS: [&str; 3] = ["result.json", "thread.md", "thread.json"];
+
+pub fn is_rust_command_route(route: &Value) -> bool {
+    route["runtime"] == COMMAND_RUNTIME && route["module_artifact_id"] == COMMAND_RUST_ARTIFACT_ID
+}
 
 pub fn is_command_route(route: &Value) -> bool {
     route["runtime"] == COMMAND_RUNTIME
         && matches!(
             route["module_artifact_id"].as_str(),
-            Some(COMMAND_ARTIFACT_ID | COMMAND_PREVIOUS_ARTIFACT_ID)
+            Some(COMMAND_ARTIFACT_ID | COMMAND_PREVIOUS_ARTIFACT_ID | COMMAND_RUST_ARTIFACT_ID)
         )
 }
 
@@ -252,9 +257,23 @@ pub fn validate_outcome(route: &Value, method: &str, outcome: &RuntimeOutcome) -
                     "sessionless batch dispatch must preserve its stable run identity",
                 ));
             }
+            if is_rust_command_route(route)
+                && (outcome.details["result_page_available"] != false
+                    || outcome.details["artifact_refs"] != json!([])
+                    || outcome.details["output_artifact_refs"] != json!({}))
+            {
+                return Err(Error::invalid(
+                    "Rust Command dispatch does not support result pages or artifacts",
+                ));
+            }
             match outcome.outcome {
                 EffectOutcome::Applied
-                    if !(if route["runtime"] == COMMAND_RUNTIME {
+                    // The versioned Rust adapter interprets Command's native
+                    // result stream and sends a typed ModuleReceiptIdentity.
+                    // Store validates that identity against the retained
+                    // descriptor and Operation; this generic layer must not
+                    // reinterpret vendor result/status/exit-code fields.
+                    if !is_rust_command_route(route) && !(if route["runtime"] == COMMAND_RUNTIME {
                         command_successful_terminal(&outcome.details)
                     } else {
                         successful_terminal(&outcome.details)
@@ -265,7 +284,7 @@ pub fn validate_outcome(route: &Value, method: &str, outcome: &RuntimeOutcome) -
                     ));
                 }
                 EffectOutcome::Rejected
-                    if !(if route["runtime"] == COMMAND_RUNTIME {
+                    if !is_rust_command_route(route) && !(if route["runtime"] == COMMAND_RUNTIME {
                         command_failed_terminal(&outcome.details)
                     } else {
                         failed_terminal(&outcome.details)

@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 
 pub const RUNTIME: &str = "antigravity";
 pub const ARTIFACT_ID: &str = "antigravity-cli-warm-bridge.2";
+pub const RUST_HEADLESS_ARTIFACT_ID: &str = "eliot-antigravity.rust-headless.1";
 const COMPLETION_CONDITION: &str = "native_terminal_result_observed";
 
 /// The binding, operation, and latest committed observation passed by the
@@ -26,10 +27,14 @@ pub struct OutcomeContext<'a> {
     pub observation: &'a Value,
 }
 
-/// Only the new artifact opts into this contract. Existing bridge.1 bindings
-/// retain their original behavior and cannot claim this stronger evidence.
+/// The supported warm-stream artifacts use this exact shared Store receipt
+/// contract; older bridge artifacts retain their prior behavior.
 pub fn is_route(route: &Value) -> bool {
-    route["runtime"] == RUNTIME && route["module_artifact_id"] == ARTIFACT_ID
+    route["runtime"] == RUNTIME
+        && matches!(
+            route["module_artifact_id"].as_str(),
+            Some(ARTIFACT_ID) | Some(RUST_HEADLESS_ARTIFACT_ID)
+        )
 }
 
 /// Validate a terminal warm-stream receipt and return a producer for a
@@ -48,7 +53,7 @@ pub fn validate_outcome(context: OutcomeContext<'_>) -> Result<Option<Value>> {
     if !is_route(&binding["route"]) {
         return Err(Error::new(
             "UNSUPPORTED_RUNTIME",
-            "warm-stream receipt requires the exact Antigravity bridge.2 route",
+            "warm-stream receipt requires a supported exact Antigravity artifact route",
         ));
     }
     if !matches!(

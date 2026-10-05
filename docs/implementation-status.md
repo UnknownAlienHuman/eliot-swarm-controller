@@ -2,6 +2,27 @@
 
 ## Current state
 
+### PR #25 adapter host contracts and capture diagnostics — 2026-10-05
+
+The host validates native options and forwards its admitted workspace for the
+separately packaged Codex, OpenCode, Command and Antigravity `.1` artifacts.
+Their configured runtime label remains separate from the trusted descriptor's
+opaque module ID; selection still checks the enabled route and exact artifact.
+A cold hello can omit both native identity fields and receive Store's retained
+pair. It cannot create or replace that identity.
+
+Checks now keep polling when their owned process group is empty but output
+readers still await EOF. A bounded `CHECK_OUTPUT_DRAIN_PENDING` diagnostic reaches
+authorized `check.get`; pending readers cannot produce completion or resource
+release. The wait neither signals another process nor adds an execution timeout.
+The shared/host error boundary preserves error code, message and rejection class.
+
+Frozen source review and scoped formatting pass. The previous compiler run
+reported seven root type/import errors; this source corrects that complete seam.
+The corrected compiler gate remains unverified at publication. Standalone binary
+integration, supervisor activation and actual provider qualification remain open.
+No local compilation, test, native or model call was performed.
+
 ### PR #25 trusted module handshake and shared checks executor — 2026-10-05
 
 The Store now registers immutable module descriptors through a reserved local
