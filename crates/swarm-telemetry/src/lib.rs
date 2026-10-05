@@ -590,11 +590,7 @@ fn writer_loop(
 ) {
     let stderr = io::stderr();
     let mut sink_failed = false;
-    loop {
-        let item = match receiver.recv() {
-            Ok(item) => item,
-            Err(_) => return,
-        };
+    while let Ok(item) = receiver.recv() {
         let byte_count = item.bytes.len() as u64;
         *active_bytes = Some(byte_count);
         if sink_failed {
