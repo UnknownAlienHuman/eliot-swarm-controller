@@ -64,7 +64,7 @@ impl ModuleContractTemplate {
             "agent.reconcile",
         ]
         .into_iter()
-        .map(|value| CapabilityId::new(value))
+        .map(CapabilityId::new)
         .collect::<Result<BTreeSet<_>, _>>()?;
         Ok(Self {
             module_id,

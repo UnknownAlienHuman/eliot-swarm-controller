@@ -148,6 +148,15 @@ struct CaptureStats {
     truncated: bool,
 }
 
+struct DrainState<'a> {
+    cancel_observed: &'a mut bool,
+    timed_out: &'a mut bool,
+    control_read_unknown: &'a mut bool,
+    process_observation_unknown: &'a mut bool,
+    termination_request_unconfirmed: &'a mut bool,
+    termination_requests: &'a mut u64,
+}
+
 /// Executes exactly one kernel-resolved command, after the host adapter has
 /// acknowledged the process owner. Uses direct argv (never a shell), a fresh
 /// check-owned process group, bounded stdout/stderr files, and no retries.
@@ -364,9 +373,8 @@ pub fn execute_with_plan(
                     &mut termination_requests,
                     &mut termination_request_unconfirmed,
                 );
-                match child.wait() {
-                    Ok(status) => exit_code = status.code(),
-                    Err(_) => {}
+                if let Ok(status) = child.wait() {
+                    exit_code = status.code();
                 }
                 break;
             }
@@ -423,12 +431,14 @@ pub fn execute_with_plan(
         deadline,
         control,
         &owner,
-        &mut cancel_observed,
-        &mut timed_out,
-        &mut control_read_unknown,
-        &mut process_observation_unknown,
-        &mut termination_request_unconfirmed,
-        &mut termination_requests,
+        &mut DrainState {
+            cancel_observed: &mut cancel_observed,
+            timed_out: &mut timed_out,
+            control_read_unknown: &mut control_read_unknown,
+            process_observation_unknown: &mut process_observation_unknown,
+            termination_request_unconfirmed: &mut termination_request_unconfirmed,
+            termination_requests: &mut termination_requests,
+        },
     );
 
     let stdout = finish_capture(stdout_path, stdout_reader);
@@ -466,12 +476,7 @@ fn wait_until_empty(
     deadline: Option<Instant>,
     control: &mut impl CheckControl,
     owner: &OwnedCheckProcess,
-    cancel_observed: &mut bool,
-    timed_out: &mut bool,
-    control_read_unknown: &mut bool,
-    process_observation_unknown: &mut bool,
-    termination_request_unconfirmed: &mut bool,
-    termination_requests: &mut u64,
+    state: &mut DrainState<'_>,
 ) {
     let drain_started = Instant::now();
     let mut drain_diagnostic_published = false;
@@ -482,12 +487,13 @@ fn wait_until_empty(
         match group.children_empty() {
             Ok(true) => return,
             Ok(false) => {}
-            Err(_) => *process_observation_unknown = true,
+            Err(_) => *state.process_observation_unknown = true,
         }
-        let needs_diagnostic = (*process_observation_unknown && !observation_diagnostic_published)
-            || (*control_read_unknown && !control_diagnostic_published)
-            || (!*process_observation_unknown
-                && !*control_read_unknown
+        let needs_diagnostic = (*state.process_observation_unknown
+            && !observation_diagnostic_published)
+            || (*state.control_read_unknown && !control_diagnostic_published)
+            || (!*state.process_observation_unknown
+                && !*state.control_read_unknown
                 && !drain_diagnostic_published);
         if needs_diagnostic
             && drain_started.elapsed() >= LONG_DRAIN_DIAGNOSTIC_AFTER
@@ -498,35 +504,39 @@ fn wait_until_empty(
             match control.process_group_drain_pending(
                 owner,
                 drain_started.elapsed(),
-                *process_observation_unknown,
-                *control_read_unknown,
+                *state.process_observation_unknown,
+                *state.control_read_unknown,
             ) {
                 Ok(()) => {
-                    if *process_observation_unknown {
+                    if *state.process_observation_unknown {
                         observation_diagnostic_published = true;
                     }
-                    if *control_read_unknown {
+                    if *state.control_read_unknown {
                         control_diagnostic_published = true;
                     }
-                    if !*process_observation_unknown && !*control_read_unknown {
+                    if !*state.process_observation_unknown && !*state.control_read_unknown {
                         drain_diagnostic_published = true;
                     }
                 }
                 Err(_) => {}
             }
         }
-        if !*control_read_unknown {
+        if !*state.control_read_unknown {
             match control.cancellation_requested(owner) {
-                Ok(true) => *cancel_observed = true,
+                Ok(true) => *state.cancel_observed = true,
                 Ok(false) => {}
-                Err(_) => *control_read_unknown = true,
+                Err(_) => *state.control_read_unknown = true,
             }
         }
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            *timed_out = true;
+            *state.timed_out = true;
         }
-        if *cancel_observed || *timed_out {
-            request_termination(group, termination_requests, termination_request_unconfirmed);
+        if *state.cancel_observed || *state.timed_out {
+            request_termination(
+                group,
+                state.termination_requests,
+                state.termination_request_unconfirmed,
+            );
         }
         thread::sleep(CHECK_POLL_INTERVAL);
     }

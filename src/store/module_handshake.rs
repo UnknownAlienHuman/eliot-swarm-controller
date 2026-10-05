@@ -167,6 +167,7 @@ fn validate_registry(registry: &Registry) -> Result<()> {
                 || alias.chars().any(char::is_control)
                 || selection.schema_version != 1
                 || selection.selected_revision == 0
+                || selection.selected_revision < selection.registered_revision
                 || selection.selected_revision > registry.revision
                 || !registry.descriptors.iter().any(|entry| {
                     entry.registered_revision == selection.registered_revision
@@ -337,11 +338,7 @@ pub(super) fn select_route(
             "module catalog changed; read module.catalog.get and retry selection",
         ));
     }
-    let route = config
-        .routes
-        .iter()
-        .find(|route| route.alias == route_alias)
-        .ok_or_else(|| Error::new("UNKNOWN_ROUTE", route_alias))?;
+    let route = config.route(route_alias)?;
     if route.module_artifact_id != artifact_id.as_str() {
         return Err(Error::new(
             "MODULE_ROUTE_ARTIFACT_MISMATCH",
@@ -868,7 +865,7 @@ mod tests {
         };
         let manager_one = Principal {
             link_id: "link-one".to_owned(),
-            client_id: "manager-one".to_owned(),
+            client_id: "manager one".to_owned(),
             role: Role::Manager,
         };
         let manager_two = Principal {
@@ -886,6 +883,21 @@ mod tests {
             })
         };
 
+        let mut disabled_config = config.clone();
+        disabled_config.routes[0].enabled = false;
+        assert_eq!(
+            select_route(
+                &tx,
+                &manager_one,
+                &select("2.1.0", 2),
+                &disabled_config,
+                "op-disabled",
+            )
+            .unwrap_err()
+            .code,
+            "ROUTE_DISABLED"
+        );
+        assert_eq!(load_registry(&tx).unwrap().revision, 2);
         let one_result =
             select_route(&tx, &manager_one, &select("2.1.0", 2), &config, "op-one").unwrap();
         assert_eq!(one_result["selection_scope"], "caller_future_bindings_only");
@@ -941,6 +953,46 @@ mod tests {
             read_catalog(&manager_one, &json!({}), &tx).unwrap()["route_selections"]["default"]["artifact"]
                 ["version"],
             "2.1.0"
+        );
+    }
+
+    #[test]
+    fn corrupt_selector_revision_fails_before_new_binding_admission() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE meta(key TEXT PRIMARY KEY,value_json TEXT NOT NULL);")
+            .unwrap();
+        let tx = db.unchecked_transaction().unwrap();
+        register_trusted_descriptor(&tx, descriptor()).unwrap();
+        let mut newer = descriptor();
+        newer.artifact.version = ArtifactVersion::new("3.0.0").unwrap();
+        register_trusted_descriptor(&tx, newer.clone()).unwrap();
+        let mut registry = load_registry(&tx).unwrap();
+        registry.selections.insert(
+            "manager one".to_owned(),
+            BTreeMap::from([(
+                "default".to_owned(),
+                RouteSelection {
+                    schema_version: 1,
+                    module_id: newer.module_id.clone(),
+                    artifact: newer.artifact.clone(),
+                    registered_revision: 2,
+                    selected_revision: 1,
+                },
+            )]),
+        );
+        super::super::set_meta(&tx, REGISTRY_KEY, &serde_json::to_value(registry).unwrap())
+            .unwrap();
+        assert_eq!(
+            selection_for_new_binding(
+                &tx,
+                "manager one",
+                "default",
+                newer.module_id.as_str(),
+                newer.artifact.artifact_id.as_str(),
+            )
+            .unwrap_err()
+            .code,
+            "MODULE_CATALOG_CORRUPT"
         );
     }
 

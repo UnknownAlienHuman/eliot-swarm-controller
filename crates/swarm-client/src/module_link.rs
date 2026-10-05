@@ -42,9 +42,7 @@ impl ModuleLink {
             ));
         }
         if let Some(claim) = claim {
-            claim
-                .validate()
-                .map_err(|message| Error::invalid(message))?;
+            claim.validate().map_err(Error::invalid)?;
             fields.insert("module_contract".to_owned(), serde_json::to_value(claim)?);
         }
         self.client.request("module.hello", params).await
