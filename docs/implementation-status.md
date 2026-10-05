@@ -2,6 +2,43 @@
 
 ## Current state
 
+### Hook lifecycle events and closed workspace admission — 2026-10-05
+
+Committed `controller:hook-source` / `hook.source.setup` and
+`hook.source.revoke` observations now enter the ordinary ScriptRun path. The
+closed adapter validates their retained source, client, identity and project,
+then projects setup as `applied` and revoke as `invalidated`. Current
+Manager/GM and project scope still govern admission. A delayed setup fact
+remains readable after revocation; the disabled credential remains disabled.
+No synthetic Operation, Task or Attempt is created for these events, and script
+input omits repository, actor, token, token hash and raw payload.
+
+The Windows Git adapter checks normalized repository and worktree `.git` paths
+against its 220-byte UTF-8 policy before `worktree add`. The Store closes
+`WORKSPACE_GIT_PATH_TOO_LONG` only for a queued, unbound launch with a preparing
+lease. It commits a blocked launch, settled Operation, stale lease and
+`not_attempted` evidence through the existing action/event path. Scoped current
+Manager readback exposes the exact code and the configuration repair. A legacy
+uncertain launch remains uncertain, retaining its first available failure even
+when a later observation reports that path code.
+
+Independent Luna source and integration reviews passed. Gate
+`6cedc71e-18a7-4116-8e2d-032b7ca0c239` passed all three affected checks: real
+HookSource setup/revoke writers and safe admission, normal/verbatim Windows
+UTF-8 paths at 220/221 bytes, and the actual closed/legacy Store failure writer
+with Manager readback. Crate formatting, strict production Clippy, compilation
+of all 328 library checks and the debug build passed; all 209 source pins
+remained unchanged during the final gate. Fresh full CI for this increment
+remains pending. The preceding `92efc38` source passed complete Windows and
+remote Ubuntu CI in run 37278544536.
+
+Fresh C35 native recovery and C24 v5 hosted Bunny remain unclaimed and
+unqualified. The v5 scenario corrects the artifact-read API mismatch in the
+unexecuted v4 plan. A complete O7 workflow harness and additional native error
+projection are private preparations. The consumed C34 attempt is retained;
+the installed launcher and current Codex/OpenCodex were preserved. Local
+Linux/WSL and all local models remain deferred. **PARTIAL_PROGRESS**.
+
 ### Native failure events and readable integrity holds — 2026-10-05
 
 Native MCP retry and stale-hold writers now commit a closed
@@ -34,8 +71,11 @@ gate `2680aa83-0ee4-48bf-b305-37e1c539114a` passed the corrected integrity check
 and healthy successor-manager history check. These are seven distinct passing
 affected checks. Crate formatting, strict production Clippy and compilation of
 all 325 library checks and the debug build passed. All 209 source pins were
-unchanged during the final gate. Fresh full CI remains pending; these Store
-checks do not establish native model use.
+unchanged during the final gate. Complete CI for published source
+`92efc384991057c3c2d2ce39b4154fa40a8ce0dd` passed on Windows and remote Ubuntu in
+[run 37278544536](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37278544536),
+including the Rust checks, offline adapters and release builds. These Store and
+CI checks do not establish native model use.
 
 The consumed C34 launch remains retained. A separate fresh offline Git
 reproducer with matching path lengths returned exit 128 and
@@ -1071,7 +1111,7 @@ and qualification follow it.
 
 2. **O1 manager-owned automation actions — Partial.** Owner-scoped configuration get/preview/apply/explain, WorkDispatch, ReviewDispatch, bounded ReviewDisposition, typed manager authority, and shared manual/automatic semantic slots are wired. C10 publishes the launch-parent dispatch schema and Store gate. C11 adds RepairDispatch and acceptance consumers on typed ledgers/cursors, with same-slot reuse, GM epoch and byte-verification checks, structured reviews, and manager history/visibility. C12 publishes owner-sponsored acceptance to an independent GM. C13 implements automated accepted-candidate publication; live publication qualification and GitHub projection remain gaps.
 
-3. **O2 durable intake and shared monitoring — Partial.** The dispatcher consumes bounded shared intake and journal readback for committed local controller/task.submission observations. Participant credential issuance, authenticated configured/connect readback, and C9 fresh-owned service lifecycle/readback are in the source path. Other source adapters are not admitted. C10 actual MCP schema and provider-auth gate are source-verified. Native OpenCode and end-to-end qualification remain partial; see Current State above for the latest evidence.
+3. **O2 durable intake and shared monitoring — Partial.** The dispatcher consumes bounded shared observations through generic source/kind rules, safe adapter projections, durable cursors and shared journal readback. Current source covers messages, coordination answers, Operation failures, native acceptance/terminal outcomes, ScriptRun results, host termination and native MCP failures. Taskless sources use the same kernel without invented Task records. Participant credential issuance and authenticated configured/connect readback are implemented. Additional adapter coverage and fresh native end-to-end qualification remain partial; see Current State above.
 
 4. **Productive launcher, workspace ownership and complete local O7 cycle — Partial.** Queue/context/overlap projections, launch preview, async lease, exact Task claim, agent.open, Participant context, WorkDispatch admission and C10 launch-linked task.dispatch gate are implemented. The same-Task/Attempt Store return/correction/fresh-review/exact-B-acceptance chain now passes as recorded above. Native service capability and productive correction delivery remain unqualified. Workspace enforcement remains database-backed, with a separate retained-proof service-departure fence. Full native workflow and publication qualification remain.
 5. **O3 Rust adapters and provider lifecycle — Partial.** Rust OpenCode V2 and
@@ -1095,7 +1135,9 @@ and qualification follow it.
    run, owned-process handling, bounded output and durable readback exist.
    One invocation-scoped Task-owner message grant is now implemented with
    completion-time revocation checks and a retained child Operation. Broader
-   declared effects/triggers and full native qualification remain.
+   declared effects and full native qualification remain. Event triggers use
+   the common bus and may select any bounded source/kind, including future
+   kinds; current source visibility and action rights remain separate checks.
 
 9. **O8 cron/typed rules and O9 shared Goal progression — Partial.**
    Manager-owned calendar CheckRuns now share the legacy scheduler, entry

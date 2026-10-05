@@ -437,9 +437,10 @@ impl PreparedWorkspace {
     }
 }
 
-/// Create/verify the exact worktree outside the Store transaction. Any Git or
-/// filesystem failure after reservation is an unknown external effect; callers
-/// must reconcile this exact reservation and must never choose a replacement.
+/// Create/verify the exact worktree outside the Store transaction. A proven
+/// Git metadata path admission failure is rejected before any mutating Git
+/// command; all other Git or filesystem failures after reservation remain an
+/// unknown external effect and must reconcile this exact reservation.
 pub fn prepare_lease(
     forge_config: &ForgeConfig,
     forge_project: &ForgeProject,
@@ -489,6 +490,7 @@ pub fn prepare_lease(
     )?;
     let disabled_hooks_git_path = git_path_argument(&disabled_hooks)?;
     let workspace_git_path = git_path_argument(workspace_path)?;
+    admit_git_metadata_paths(&registration.repository_path, &workspace_git_path)?;
     git_text(
         forge_config,
         forge_project,
@@ -1070,6 +1072,45 @@ fn path_string(path: &Path) -> Result<String> {
     Ok(value.to_owned())
 }
 
+/// Git for Windows' explicit-GIT_DIR startup guard is PATH_MAX - 40 <
+/// strlen(GIT_DIR). MinGW-w64 defines the ordinary Windows PATH_MAX as 260;
+/// this conservative policy ceiling keeps the pinned binary's explicit
+/// GIT_DIR below that guard without changing any Git or global configuration.
+#[cfg(windows)]
+const GIT_WINDOWS_EXPLICIT_GIT_DIR_MAX_BYTES: usize = 220;
+
+#[cfg(windows)]
+fn check_git_dir_length(label: &str, path: &str) -> Result<()> {
+    let length = path.len();
+    if length > GIT_WINDOWS_EXPLICIT_GIT_DIR_MAX_BYTES {
+        return Err(Error::new(
+            "WORKSPACE_GIT_PATH_TOO_LONG",
+            format!(
+                "{label} is {length} bytes; Git for Windows rejects explicit GIT_DIR values above {GIT_WINDOWS_EXPLICIT_GIT_DIR_MAX_BYTES} bytes before repository validation"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn admit_git_metadata_paths(repository_path: &Path, workspace_git_path: &str) -> Result<()> {
+    let repository_git_path = git_path_argument(&repository_path.join(".git"))?;
+    let candidates = [
+        ("repository GIT_DIR", repository_git_path),
+        ("worktree GIT_DIR", format!("{workspace_git_path}\\.git")),
+    ];
+    for (label, path) in candidates {
+        check_git_dir_length(label, &path)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn admit_git_metadata_paths(_repository_path: &Path, _workspace_git_path: &str) -> Result<()> {
+    Ok(())
+}
+
 /// Convert only Windows extended-length disk and UNC paths for Git argv.
 /// Filesystem checks and persisted lease paths keep their canonical form.
 #[cfg(windows)]
@@ -1289,6 +1330,31 @@ mod tests {
             .is_err()
         );
         assert!(git_path_argument(Path::new(r"\\.\PhysicalDrive0")).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn git_dir_admission_boundary_handles_normal_and_verbatim_paths() {
+        let normal_at_limit = format!(r"C:\{}é\.git", "a".repeat(210));
+        let normal_over_limit = format!(r"C:\{}é\.git", "a".repeat(211));
+        let verbatim_at_limit = format!(r"\\?\{normal_at_limit}");
+        let verbatim_over_limit = format!(r"\\?\{normal_over_limit}");
+        assert_eq!(normal_at_limit.len(), 220);
+        assert_eq!(normal_over_limit.len(), 221);
+        assert_eq!(
+            git_path_argument(Path::new(&verbatim_at_limit))
+                .expect("verbatim path at the policy boundary is supported"),
+            normal_at_limit
+        );
+        assert_eq!(
+            git_path_argument(Path::new(&verbatim_over_limit))
+                .expect("verbatim path over the boundary remains a valid argument"),
+            normal_over_limit
+        );
+        assert!(check_git_dir_length("normal-at-limit", &normal_at_limit).is_ok());
+        assert!(check_git_dir_length("verbatim-at-limit", &normal_at_limit).is_ok());
+        assert!(check_git_dir_length("normal-over-limit", &normal_over_limit).is_err());
+        assert!(check_git_dir_length("verbatim-over-limit", &normal_over_limit).is_err());
     }
 }
 

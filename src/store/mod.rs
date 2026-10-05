@@ -379,8 +379,13 @@ impl Store {
                     continue;
                 }
                 Err(error) => {
-                    self.record_launch_failure(operation_id, error.code).await?;
-                    unknown += 1;
+                    let closed_admission =
+                        self.record_launch_failure(operation_id, error.code).await?;
+                    if closed_admission {
+                        progressed += 1;
+                    } else {
+                        unknown += 1;
+                    }
                     continue;
                 }
             };
@@ -425,8 +430,13 @@ impl Store {
             let evidence = match evidence {
                 Ok(evidence) => evidence,
                 Err(error) => {
-                    self.record_launch_failure(operation_id, error.code).await?;
-                    unknown += 1;
+                    let closed_admission =
+                        self.record_launch_failure(operation_id, error.code).await?;
+                    if closed_admission {
+                        progressed += 1;
+                    } else {
+                        unknown += 1;
+                    }
                     continue;
                 }
             };
@@ -478,8 +488,13 @@ impl Store {
             match result {
                 Ok(_) => progressed += 1,
                 Err(error) => {
-                    self.record_launch_failure(operation_id, error.code).await?;
-                    unknown += 1;
+                    let closed_admission =
+                        self.record_launch_failure(operation_id, error.code).await?;
+                    if closed_admission {
+                        progressed += 1;
+                    } else {
+                        unknown += 1;
+                    }
                 }
             }
         }
@@ -487,15 +502,53 @@ impl Store {
         Ok(json!({"progressed":progressed,"outcome_unknown":unknown}))
     }
 
-    async fn record_launch_failure(&self, operation_id: String, safe_code: String) -> Result<()> {
+    async fn record_launch_failure(&self, operation_id: String, safe_code: String) -> Result<bool> {
         self.run(move |db| {
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let now = model::now_ms()?;
-            // Preserve an uncertain filesystem effect and never re-create it.
-            tx.execute("UPDATE workspace_leases SET state='outcome_unknown',updated_at_ms=?2 WHERE operation_id=?1 AND state='preparing'", params![operation_id,now])?;
             let operation = operations::get_operation(&tx, &operation_id)?;
-            let has_lease: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM workspace_leases WHERE operation_id=?1)", [&operation_id], |row| row.get(0))?;
-            let failure = if !operation["binding_id"].is_null() {
+            let has_preparing_lease: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM workspace_leases \
+                 WHERE operation_id=?1 AND state='preparing')",
+                [&operation_id],
+                |row| row.get(0),
+            )?;
+            let closed_admission = safe_code == "WORKSPACE_GIT_PATH_TOO_LONG"
+                && operation["state"] == "queued"
+                && operation["binding_id"].is_null()
+                && has_preparing_lease;
+            if closed_admission {
+                let facts = model::canonical(&json!({
+                    "status":"admission_rejected",
+                    "reason_code":safe_code.clone(),
+                    "native_effect_status":"not_attempted",
+                    "runtime_observation":"not_performed",
+                    "filesystem_cleanup":"not_attempted",
+                }))?;
+                tx.execute(
+                    "UPDATE workspace_leases SET state='stale',
+                         clean_state_json=json_set(?2,'$.prior_lease_state',state),
+                         updated_at_ms=?3
+                     WHERE operation_id=?1 AND state='preparing'",
+                    params![operation_id, facts, now],
+                )?;
+            } else {
+                // Preserve an uncertain filesystem effect and never re-create it.
+                tx.execute(
+                    "UPDATE workspace_leases
+                     SET state='outcome_unknown',updated_at_ms=?2
+                     WHERE operation_id=?1 AND state='preparing'",
+                    params![operation_id, now],
+                )?;
+            }
+            let has_lease: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM workspace_leases WHERE operation_id=?1)",
+                [&operation_id],
+                |row| row.get(0),
+            )?;
+            let failure = if closed_admission {
+                "workspace_admission_rejected"
+            } else if !operation["binding_id"].is_null() {
                 "binding_effect_unknown"
             } else if has_lease {
                 "workspace_effect_unknown"
@@ -535,12 +588,14 @@ impl Store {
                     "classification":failure,
                     "observed_at_ms":now,
                     "first_failure":first_failure,
+                    "closed_admission":closed_admission,
                 }),
             )?;
             launcher::fail_launch(&tx, &operation_id, failure, now)?;
             tx.commit()?;
-            Ok(())
-        }).await
+            Ok(closed_admission)
+        })
+        .await
     }
 
     pub(crate) async fn reconcile_automations_once(&self) -> Result<Value> {

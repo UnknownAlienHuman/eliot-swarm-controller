@@ -87,16 +87,19 @@ pub(super) fn get_operation_for_current_manager(
     Ok(operation)
 }
 
-/// Project only closed failure facts for an unknown workspace effect. The
-/// existing operation visibility/current-Manager gate runs before this helper.
+/// Project only safe retained readback for a proven closed workspace admission
+/// failure or an unknown workspace effect. The existing operation
+/// visibility/current-Manager gate runs before this helper.
 fn workspace_launch_failure_readback_for_operation(
     db: &Connection,
     operation_id: &str,
     operation: &Value,
 ) -> Result<Option<Value>> {
-    if operation["state"] != "outcome_unknown"
-        || operation["result"]["failure"]["code"] != "workspace_effect_unknown"
-    {
+    let unknown_effect = operation["state"] == "outcome_unknown"
+        && operation["result"]["failure"]["code"] == "workspace_effect_unknown";
+    let admission_rejected = operation["state"] == "settled"
+        && operation["result"]["failure"]["code"] == "workspace_admission_rejected";
+    if !unknown_effect && !admission_rejected {
         return Ok(None);
     }
     let Some(retained) = meta(db, &format!("launcher:failure:{operation_id}"))? else {
@@ -117,6 +120,18 @@ fn workspace_launch_failure_readback_for_operation(
     let first_code = first["code"].as_str();
     let first_classification = first["classification"].as_str();
     let first_observed_at_ms = first["observed_at_ms"].as_i64();
+    let closed_admission = admission_rejected
+        && retained["closed_admission"] == true
+        && latest_code == Some("WORKSPACE_GIT_PATH_TOO_LONG")
+        && latest_classification == Some("workspace_admission_rejected");
+    if !unknown_effect && !closed_admission {
+        return Ok(None);
+    }
+    let expected_latest_classification = if closed_admission {
+        "workspace_admission_rejected"
+    } else {
+        "workspace_effect_unknown"
+    };
     let safe_classification = |value: &str| {
         matches!(
             value,
@@ -133,12 +148,13 @@ fn workspace_launch_failure_readback_for_operation(
         && first_classification.is_some_and(safe_classification)
         && first_observed_at_ms
             .is_some_and(|value| value >= 0 && Some(value) <= latest_observed_at_ms)
-        && latest_classification == Some("workspace_effect_unknown");
+        && latest_classification == Some(expected_latest_classification)
+        && (!closed_admission || first_classification == Some("workspace_admission_rejected"));
     if !valid {
         return Ok(Some(workspace_launch_failure_diagnostic_corrupt()));
     }
 
-    Ok(Some(json!({
+    let mut readback = json!({
         "schema_version":1,
         "status":"readback_required",
         "first_retained_failure":{
@@ -151,7 +167,15 @@ fn workspace_launch_failure_readback_for_operation(
             "classification":latest_classification,
             "observed_at_ms":latest_observed_at_ms,
         },
-    })))
+    });
+    if closed_admission {
+        readback["status"] = json!("admission_rejected");
+        readback["reason_code"] = json!(latest_code);
+        readback["retry_authorized"] = json!(false);
+        readback["manager_action"] =
+            json!("shorten the configured workspace root and submit a new launch");
+    }
+    Ok(Some(readback))
 }
 
 fn workspace_launch_failure_diagnostic_corrupt() -> Value {

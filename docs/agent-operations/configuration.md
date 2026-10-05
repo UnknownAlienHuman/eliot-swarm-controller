@@ -552,6 +552,32 @@ provider-specific runner or service. A launch event may be taskless; when Task
 scope exists, the usual exact Task/Attempt checks still apply, and the event
 never completes a Task.
 
+### HookSource administration selectors
+
+Use `controller:hook-source` with `hook.source.setup` or `hook.source.revoke`
+and the ordinary `script_run` action. Omitting `status` selects either kind;
+setup projects `applied`, while revocation projects `invalidated`. For example:
+
+~~~json
+{
+  "enabled": true,
+  "steps": ["script_run"],
+  "script_run": {"script_id": "on_hook_source_change"},
+  "event_rules": [
+    {"source_id": "controller:hook-source", "event_kind": "hook.source.setup", "action": "script_run"},
+    {"source_id": "controller:hook-source", "event_kind": "hook.source.revoke", "action": "script_run"}
+  ]
+}
+~~~
+
+Both committed facts may be drained after revocation. The retained source and
+disabled client must still agree, and current Manager/GM and project checks
+still govern admission. Safe input contains the occurrence identity and status;
+repository, actor, credentials and raw payload are withheld. Revoked source
+credentials remain disabled. Rules for new events may activate without
+`include_existing`; enabling historical catch-up first drains its fixed cut
+before advancing to later events.
+
 The normalized `controller:messages` lifecycle facts feed event selection;
 they do not create a second addressed mailbox delivery in `report.delta` or
 `message.read`. Operation-linked observations are filtered by the existing
@@ -642,3 +668,21 @@ Before spawn, Store reserves one durable start. A proven pre-helper-spawn NoEffe
 Workspace cancellation/release remains blocked while the start is outcome_unknown or service_observed, even if the Task revision, Attempt, or current Manager changes. Bounded reconciliation reconstructs the original route and workspace from immutable launch/lease provenance, then requires matching clean server-stop receipts, the exact Bun PID birth/image to be absent, and a matching helper-family stop receipt proving no children remain. Only an exact durable compare-and-swap marks service_departed and removes this service-specific fence; it does not claim a general OS workspace lock.
 
 For current retained-run and qualification evidence, see [Implementation Status](../implementation-status.md). The execution and no-replay rules above remain normative.
+
+### Windows Git metadata path admission
+
+Choose repository and workspace roots whose normalized `.git` paths fit the
+workspace adapter's 220-byte Windows policy. Count UTF-8 bytes after supported
+verbatim-path normalization. This policy follows the explicit `GIT_DIR` startup
+guard in [Git for Windows v2.55.0.windows.5](https://github.com/git-for-windows/git/blob/v2.55.0.windows.5/setup.c#L1071-L1084)
+and the [MinGW-w64 `PATH_MAX` definition](https://github.com/mingw-w64/mingw-w64/blob/master/mingw-w64-headers/crt/limits.h#L18);
+it is not a portable filesystem limit. Review the policy when changing the Git
+integration. Non-Windows admission is unchanged.
+
+An over-limit path returns `WORKSPACE_GIT_PATH_TOO_LONG` before `worktree add`.
+Only a proven queued, unbound, preparing launch becomes a closed admission
+failure. Current Manager `operation.get` reports the exact code and the action
+to configure shorter roots, then admit a fresh launch. The rejected launch has
+no attempted native effect. A previously uncertain launch keeps its retained
+first failure and exact-readback requirement; shortening a root does not replay
+it. `core.longpaths` and global Git configuration are not changed by admission.

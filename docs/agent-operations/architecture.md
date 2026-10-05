@@ -1,6 +1,6 @@
 # Agent Operations — Rust Architecture and Execution Contracts
 
-Revision 11 · 2026-10-05 · source baseline `485cb28624eab204645127646cbbf0358b77a221`.
+Revision 12 · 2026-10-05 · source baseline `92efc384991057c3c2d2ce39b4154fa40a8ce0dd`.
 
 [Configuration](configuration.md) owns editable settings; [Delivery](delivery.md) owns work transitions; [Donor map](donor-map.md) separates source evidence from proposals. These contracts are not implementation claims.
 
@@ -121,6 +121,22 @@ current Task/Attempt scope when present. Safe event metadata can trigger the
 ordinary configured `script_run`; detailed diagnostics remain behind current
 Operation read rights. Failure or unknown status never establishes Task
 completion.
+
+Committed HookSource setup and revocation also use this common path. Their
+adapter checks the exact operationless observation against the retained source
+and client registration, then exposes only status and occurrence identity.
+Current Manager/GM and project scope govern script admission. A setup fact
+remains historical after revocation; selecting it does not restore the source
+credential. No synthetic Operation, Task or Attempt is required for either fact.
+
+An adapter can reject admission before its external effect. The workspace Git
+adapter checks normalized metadata path lengths before `worktree add`; the
+Store recognizes its exact path-limit failure as closed only for a queued,
+unbound launch with a preparing lease. It persists a blocked launch, settled
+Operation, stale lease and `not_attempted` evidence in one transaction, using
+the ordinary launch-progress event writer. The Manager receives the exact code
+and an actionable configuration correction through scoped readback. A retained
+uncertain launch stays uncertain even if a later check reports that same code.
 
 ## 2. Same action handler for both callers
 

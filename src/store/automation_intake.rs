@@ -24,6 +24,38 @@ const HOOK_COMMIT_INDEX_PREFIX: &str = "automation:v1:intake:hook_commit:";
 
 type ScriptTerminalProjectionRow = (String, String, String, Option<String>);
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HookSourceSetupFact {
+    source_id: String,
+    project_id: String,
+    canonical_repository: String,
+    registration_id: String,
+    registration_generation: i64,
+    event: String,
+    created_by: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HookSourceRevokeFact {
+    source_id: String,
+    project_id: String,
+    event: String,
+    revision: i64,
+    revoked_at_ms: i64,
+    revoked_by: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct HookSourceAdminOccurrence {
+    pub(crate) source_id: String,
+    pub(crate) project_id: String,
+    pub(crate) status: crate::automation::event_rules::EventStatus,
+    pub(crate) occurrence_phase: String,
+    pub(crate) occurrence_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct JournalRecord {
@@ -535,6 +567,228 @@ fn accepted_runtime_outcome_projection(
     }))
 }
 
+/// Revalidate the exact operationless HookSource administration fact against
+/// its retained source and client records. The DTOs are closed and bounded;
+/// actor, repository, and credential metadata never enter ScriptRun input.
+pub(crate) fn hook_source_admin_occurrence_by_observation(
+    db: &Connection,
+    event: &ObservedEvent,
+) -> Result<Option<HookSourceAdminOccurrence>> {
+    use crate::automation::event_rules::EventStatus;
+
+    const SOURCE_ID: &str = "controller:hook-source";
+    const SETUP_KIND: &str = "hook.source.setup";
+    const REVOKE_KIND: &str = "hook.source.revoke";
+    const EVENT_NAME: &str = "git.post_commit";
+    const MAX_PAYLOAD_BYTES: i64 = 2048;
+
+    if event.source_id != SOURCE_ID
+        || !matches!(event.event_kind.as_str(), SETUP_KIND | REVOKE_KIND)
+        || event.operation_id.is_some()
+    {
+        return Ok(None);
+    }
+    type HookAdminObservationRow = (Option<String>, Option<String>, Option<String>, i64, i64);
+    let row: Option<HookAdminObservationRow> = db
+        .query_row(
+            "SELECT CASE WHEN source_event_key IS NOT NULL \
+                         AND length(CAST(source_event_key AS BLOB))<=256 \
+                         THEN source_event_key END, \
+                    operation_id, \
+                    CASE WHEN length(CAST(payload_json AS BLOB))<=2048 \
+                         THEN payload_json END, \
+                    recorded_at_ms, length(CAST(payload_json AS BLOB)) \
+             FROM observations WHERE observation_id=?1 \
+               AND source_stream_id='controller:hook-source' AND kind=?2",
+            params![event.observation_id, event.event_kind],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((source_event_key, operation_id, raw, recorded_at_ms, payload_bytes)) = row else {
+        return Ok(None);
+    };
+    if source_event_key
+        .as_deref()
+        .is_none_or(|key| key.is_empty() || key.len() > 256)
+        || operation_id.is_some()
+        || event.recorded_at_ms != recorded_at_ms
+        || recorded_at_ms < 0
+        || !(0..=MAX_PAYLOAD_BYTES).contains(&payload_bytes)
+    {
+        return Ok(None);
+    }
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+
+    let (source_id, project_id, status, occurrence_phase, occurrence_id) =
+        match event.event_kind.as_str() {
+            SETUP_KIND => {
+                let Ok(fact) = serde_json::from_str::<HookSourceSetupFact>(&raw) else {
+                    return Ok(None);
+                };
+                let expected_key = format!("setup:{}", fact.source_id);
+                if !crate::hooks::contract::is_canonical_v4_uuid(&fact.source_id)
+                    || fact.project_id.trim().is_empty()
+                    || fact.project_id.len() > 128
+                    || fact.project_id.chars().any(char::is_control)
+                    || fact.canonical_repository.trim().is_empty()
+                    || fact.canonical_repository.len() > 512
+                    || fact.canonical_repository.chars().any(char::is_control)
+                    || !crate::forge::canonical_repository(&fact.canonical_repository)
+                        .is_ok_and(|repository| repository == fact.canonical_repository)
+                    || fact.registration_id.trim().is_empty()
+                    || fact.registration_id.len() > 128
+                    || fact.registration_id.chars().any(char::is_control)
+                    || fact.registration_generation <= 0
+                    || fact.event != EVENT_NAME
+                    || fact.created_by.trim().is_empty()
+                    || fact.created_by.len() > 128
+                    || fact.created_by.chars().any(char::is_control)
+                    || source_event_key.as_deref() != Some(expected_key.as_str())
+                    || recorded_at_ms < 0
+                {
+                    return Ok(None);
+                }
+                let source_id = fact.source_id;
+                (
+                    source_id.clone(),
+                    fact.project_id,
+                    EventStatus::Applied,
+                    "hook_source_setup_committed".to_owned(),
+                    format!("hook_source:{source_id}:setup:{recorded_at_ms}"),
+                )
+            }
+            REVOKE_KIND => {
+                let Ok(fact) = serde_json::from_str::<HookSourceRevokeFact>(&raw) else {
+                    return Ok(None);
+                };
+                let expected_key = format!("revoke:{}:{}", fact.source_id, fact.revision);
+                if !crate::hooks::contract::is_canonical_v4_uuid(&fact.source_id)
+                    || fact.project_id.trim().is_empty()
+                    || fact.project_id.len() > 128
+                    || fact.project_id.chars().any(char::is_control)
+                    || fact.event != EVENT_NAME
+                    || fact.revision <= 0
+                    || fact.revoked_at_ms != recorded_at_ms
+                    || fact.revoked_by.trim().is_empty()
+                    || fact.revoked_by.len() > 128
+                    || fact.revoked_by.chars().any(char::is_control)
+                    || source_event_key.as_deref() != Some(expected_key.as_str())
+                {
+                    return Ok(None);
+                }
+                let source_id = fact.source_id;
+                (
+                    source_id.clone(),
+                    fact.project_id,
+                    EventStatus::Invalidated,
+                    "hook_source_revoked".to_owned(),
+                    format!("hook_source:{source_id}:revoked:{}", fact.revision),
+                )
+            }
+            _ => return Ok(None),
+        };
+
+    let Some(source_value) =
+        config::read_record(db, &format!("hook:v1:source:{source_id}"), "hook source")?
+    else {
+        return Ok(None);
+    };
+    let Ok(source) =
+        serde_json::from_value::<crate::hooks::contract::HookSourceRecord>(source_value)
+    else {
+        return Ok(None);
+    };
+    let valid_digest =
+        |value: &str| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit());
+    if source.schema_version != crate::hooks::contract::SOURCE_SCHEMA_VERSION
+        || source.source_id != source_id
+        || source.client_id != format!("hook-source:{source_id}")
+        || source.project_id != project_id
+        || source.event != EVENT_NAME
+        || source.registration_id.trim().is_empty()
+        || source.registration_generation <= 0
+        || !valid_digest(&source.registration_digest)
+        || !valid_digest(&source.setup_request_digest)
+        || source.canonical_repository.trim().is_empty()
+        || source.canonical_repository.len() > 512
+        || source.canonical_repository.chars().any(char::is_control)
+        || !crate::forge::canonical_repository(&source.canonical_repository)
+            .is_ok_and(|repository| repository == source.canonical_repository)
+        || source.created_by.trim().is_empty()
+        || source.created_by.len() > 128
+        || source.created_by.chars().any(char::is_control)
+        || source.created_at_ms < 0
+        || source.revision <= 0
+        || source
+            .revoked_at_ms
+            .is_some_and(|revoked_at| revoked_at < source.created_at_ms)
+        || source.last_observation_id.is_some_and(|id| id <= 0)
+    {
+        return Ok(None);
+    }
+    let Some(client) = super::meta(db, &format!("client:{}", source.client_id))? else {
+        return Ok(None);
+    };
+    let Some(token_hash) = client["token_hash"].as_str() else {
+        return Ok(None);
+    };
+    if client["role"] != "hook_source"
+        || client["hook_source_id"] != source.source_id
+        || !valid_digest(token_hash)
+        || client["disabled"].as_bool() != Some(source.revoked_at_ms.is_some())
+    {
+        return Ok(None);
+    }
+
+    let producer_matches = match event.event_kind.as_str() {
+        SETUP_KIND => {
+            let Ok(fact) = serde_json::from_str::<HookSourceSetupFact>(&raw) else {
+                return Ok(None);
+            };
+            fact.project_id == source.project_id
+                && fact.canonical_repository == source.canonical_repository
+                && fact.registration_id == source.registration_id
+                && fact.registration_generation == source.registration_generation
+                && fact.created_by == source.created_by
+                && source.created_at_ms == recorded_at_ms
+        }
+        REVOKE_KIND => {
+            let Ok(fact) = serde_json::from_str::<HookSourceRevokeFact>(&raw) else {
+                return Ok(None);
+            };
+            fact.project_id == source.project_id
+                && fact.revision == source.revision
+                && source.revoked_at_ms == Some(fact.revoked_at_ms)
+                && client["disabled"] == true
+        }
+        _ => false,
+    };
+    if !producer_matches {
+        return Ok(None);
+    }
+    let occurrence = HookSourceAdminOccurrence {
+        source_id,
+        project_id,
+        status,
+        occurrence_phase,
+        occurrence_id,
+    };
+    if !valid_occurrence_identity(&occurrence.occurrence_id) {
+        return Ok(None);
+    }
+    Ok(Some(occurrence))
+}
+
 /// Read only producer-normalized status metadata for event kinds whose
 /// payload contract is explicitly safe. Unlisted event payloads are never
 /// parsed for selector matching.
@@ -557,6 +811,23 @@ pub(crate) fn safe_event_projection(
     }
     if event.source_id == "controller:native-mcp" && event.event_kind == "native.mcp.failure" {
         return native_mcp_failure_projection(db, event);
+    }
+    if event.source_id == "controller:hook-source"
+        && matches!(
+            event.event_kind.as_str(),
+            "hook.source.setup" | "hook.source.revoke"
+        )
+    {
+        return Ok(hook_source_admin_occurrence_by_observation(db, event)?
+            .map(
+                |occurrence| crate::automation::intake::SafeEventProjection {
+                    status: Some(occurrence.status),
+                    occurrence_phase: Some(occurrence.occurrence_phase),
+                    occurrence_id: Some(occurrence.occurrence_id),
+                    ..Default::default()
+                },
+            )
+            .unwrap_or_default());
     }
 
     let expected = match (event.source_id.as_str(), event.event_kind.as_str()) {

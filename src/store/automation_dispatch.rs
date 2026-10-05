@@ -1061,7 +1061,57 @@ fn event_requires_occurrence_projection(event: &crate::automation::intake::Obser
                     "operation.rejected" | "operation.outcome_unknown"
                 )
                 | ("controller:native-mcp", "native.mcp.failure")
+                | (
+                    "controller:hook-source",
+                    "hook.source.setup" | "hook.source.revoke"
+                )
         )
+}
+
+fn hook_source_admin_project_scope(
+    db: &Connection,
+    app_config: &Config,
+    project_id: &str,
+    event: &crate::automation::intake::ObservedEvent,
+) -> Result<String> {
+    let unauthorized = || {
+        Error::new(
+            "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
+            "selected HookSource administration fact is outside the current project source scope",
+        )
+    };
+    let occurrence = automation_intake::hook_source_admin_occurrence_by_observation(db, event)?
+        .ok_or_else(unauthorized)?;
+    if occurrence.project_id != project_id {
+        return Err(unauthorized());
+    }
+    let source_status = super::hooks::source_status(db, app_config, &occurrence.source_id)?;
+    match (event.event_kind.as_str(), source_status) {
+        (
+            "hook.source.setup",
+            super::hooks::HookSourceStatus::Current(source)
+            | super::hooks::HookSourceStatus::Revoked(source)
+            | super::hooks::HookSourceStatus::Stale(source),
+        ) if source.source_id == occurrence.source_id
+            && source.project_id == project_id
+            && source.event == "git.post_commit" =>
+        {
+            // Setup is a historical committed fact. Preserve it if the writer
+            // drains after a later revoke or workspace-registration change.
+            Ok(occurrence.project_id)
+        }
+        ("hook.source.revoke", super::hooks::HookSourceStatus::Revoked(source))
+            if source.source_id == occurrence.source_id
+                && source.project_id == project_id
+                && source.event == "git.post_commit"
+                && source.revoked_at_ms.is_some() =>
+        {
+            // The typed reader also requires the retained HookSource client to
+            // be disabled, so this historical fact cannot revive its credential.
+            Ok(occurrence.project_id)
+        }
+        _ => Err(unauthorized()),
+    }
 }
 
 fn queue_system_event_script_trigger(
@@ -1651,6 +1701,27 @@ pub(crate) fn validate_retained_script_event_cause(
                 "retained ScriptRun HookCommit belongs to another project",
             ));
         }
+    } else if event.source_id == "controller:hook-source"
+        && matches!(
+            event.event_kind.as_str(),
+            "hook.source.setup" | "hook.source.revoke"
+        )
+    {
+        let occurrence = automation_intake::hook_source_admin_occurrence_by_observation(
+            db, &event,
+        )?
+        .ok_or_else(|| {
+            Error::new(
+                "AUTOMATION_LINK_CORRUPT",
+                "retained HookSource administration event no longer matches its source record",
+            )
+        })?;
+        if occurrence.project_id != project_id {
+            return Err(Error::new(
+                "AUTOMATION_LINK_CORRUPT",
+                "retained HookSource administration event belongs to another project",
+            ));
+        }
     } else if event.source_id != "controller:host-lifecycle"
         || !((matches!(event.event_kind.as_str(), "host.exit" | "host.interrupted")
             && projection.occurrence_phase.as_deref() == Some("host_interruption_observed"))
@@ -1913,6 +1984,13 @@ pub(crate) fn script_event_invocation_context(
                 ));
             }
         }
+    } else if event.source_id == "controller:hook-source"
+        && matches!(
+            event.event_kind.as_str(),
+            "hook.source.setup" | "hook.source.revoke"
+        )
+    {
+        project_id = hook_source_admin_project_scope(db, app_config, &entry.project_id, &event)?;
     } else if event.source_id == "controller:host-lifecycle"
         && ((matches!(event.event_kind.as_str(), "host.exit" | "host.interrupted")
             && projection.occurrence_phase.as_deref() == Some("host_interruption_observed"))
@@ -5309,5 +5387,308 @@ mod script_event_trigger_tests {
         assert!(!rendered.contains("PRIVATE_NATIVE_INPUT_ID"));
         assert!(!rendered.contains(MODULE_LINK_ID));
         assert!(!rendered.contains("PRIVATE_INPUT_TEXT"));
+    }
+}
+
+#[cfg(test)]
+mod hook_source_admin_event_tests {
+    use super::*;
+    use crate::automation::{
+        actions::AutomationStep,
+        config::{AutomationEntry, ScriptRunSettings},
+        event_rules::{EventRule, EventRuleAction},
+    };
+    use crate::{
+        config::Config,
+        hooks::contract::HookSetupRequest,
+        model::{self, Credential, Principal, Role},
+    };
+    use rusqlite::Connection;
+    use serde_json::{Value, json};
+
+    const MANAGER_ID: &str = "hook-admin-event-manager";
+    const OPERATOR_ID: &str = "hook-admin-event-operator";
+    const PROJECT_ID: &str = "hook-admin-event-project";
+    const AUTOMATION_ID: &str = "hook_admin_event_route";
+    const SCRIPT_ID: &str = "hook_admin_event_fixture";
+
+    fn event_rule(event_kind: &str) -> EventRule {
+        EventRule {
+            source: None,
+            predicate: None,
+            source_id: Some("controller:hook-source".to_owned()),
+            event_kind: Some(event_kind.to_owned()),
+            status: None,
+            action: EventRuleAction::ScriptRun,
+        }
+    }
+
+    fn app_config() -> Config {
+        let mut config = Config::default();
+        config.forge.enabled = true;
+        config.forge.projects.insert(
+            PROJECT_ID.to_owned(),
+            crate::forge::ForgeProject {
+                canonical_repository: "github.com/owner/hook-admin-fixture".to_owned(),
+                repository_path: std::env::temp_dir().join("hook-admin-fixture-repository"),
+                remote_name: "origin".to_owned(),
+                policy_revision: crate::policy::OWNER_POLICY_V2_ID.to_owned(),
+                target_refs: vec!["refs/heads/main".to_owned()],
+            },
+        );
+        config.workspace.projects.insert(
+            PROJECT_ID.to_owned(),
+            crate::workspace::WorkspaceProjectConfig {
+                allowed_roots: vec![std::env::temp_dir().join("hook-admin-fixture-workspaces")],
+            },
+        );
+        config
+    }
+
+    fn fixture() -> (Connection, Config, AutomationEntry, Principal) {
+        let mut db = Connection::open_in_memory().unwrap();
+        db.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        db.execute_batch(super::super::SCHEMA).unwrap();
+        db.execute_batch(super::super::WORKSPACE_SCHEMA).unwrap();
+        db.execute_batch(super::super::SCRIPT_SCHEMA).unwrap();
+        super::super::set_meta(
+            &db,
+            &format!("client:{MANAGER_ID}"),
+            &json!({"role":"manager","disabled":false}),
+        )
+        .unwrap();
+        super::super::set_meta(
+            &db,
+            "gm",
+            &json!({"client_id":MANAGER_ID,"binding_id":null,"binding_generation":null,"epoch":1}),
+        )
+        .unwrap();
+        super::super::set_meta(&db, "local_operator_client_id", &json!(OPERATOR_ID)).unwrap();
+        super::super::set_meta(
+            &db,
+            &format!("client:{OPERATOR_ID}"),
+            &json!({"role":"operator","disabled":false}),
+        )
+        .unwrap();
+
+        let app_config = app_config();
+        let mut entry = AutomationEntry::new(MANAGER_ID, PROJECT_ID, AUTOMATION_ID, 1);
+        entry.enabled = true;
+        entry.steps = vec![AutomationStep::ScriptRun];
+        entry.script_run = Some(ScriptRunSettings {
+            script_id: SCRIPT_ID.to_owned(),
+        });
+        entry.event_rules = Some(vec![
+            event_rule("hook.source.setup"),
+            event_rule("hook.source.revoke"),
+        ]);
+        crate::automation::config::validate_entry(&entry).unwrap();
+
+        let tx = db.transaction().unwrap();
+        super::super::workspace::sync_configured_registrations(&tx, OPERATOR_ID, &app_config, 1)
+            .unwrap();
+        let cut = super::automation_intake::observed_event_high_water(&tx).unwrap();
+        // This fixture selects only events committed after the route is activated.
+        super::configure_script_trigger_activation(&tx, None, &entry, false, cut, 1).unwrap();
+        tx.commit().unwrap();
+        let manager = Principal {
+            link_id: "hook-admin-event-manager-link".to_owned(),
+            client_id: MANAGER_ID.to_owned(),
+            role: Role::Manager,
+        };
+        (db, app_config, entry, manager)
+    }
+
+    fn drain_events(
+        db: &mut Connection,
+        app_config: &Config,
+        entry: &AutomationEntry,
+        now_ms: i64,
+    ) -> ScriptTriggerState {
+        let tx = db.transaction().unwrap();
+        let intake = super::reconcile_source_intake(&tx, 64, false, now_ms).unwrap();
+        super::reconcile_script_trigger_entry(&tx, entry, 16, intake, app_config, now_ms).unwrap();
+        let state = super::load_script_trigger_state(&tx, entry)
+            .unwrap()
+            .expect("enabled ScriptRun event route retains a cursor");
+        tx.commit().unwrap();
+        state
+    }
+
+    fn checked_input(
+        db: &Connection,
+        app_config: &Config,
+        entry: &AutomationEntry,
+        cause: &Value,
+    ) -> Value {
+        let mut retained_cause = cause.clone();
+        retained_cause["script_revision"] = json!(1);
+        let retained =
+            super::validate_retained_script_event_cause(db, PROJECT_ID, &retained_cause).unwrap();
+        let context = super::script_event_invocation_context(db, app_config, entry, cause).unwrap();
+        assert_eq!(retained, context.input);
+        assert!(context.input.get("operation_id").is_none());
+        assert!(context.input.get("task_id").is_none());
+        assert!(context.input.get("attempt_id").is_none());
+        context.input
+    }
+
+    #[test]
+    fn real_hook_setup_and_revoke_writers_drain_through_statusless_script_rules() {
+        let (mut db, app_config, entry, manager) = fixture();
+        let source_id = model::new_id();
+        let credential = Credential {
+            client_id: format!("hook-source:{source_id}"),
+            token: format!("{}{}", model::new_id(), model::new_id()),
+        };
+        let credential_hash = model::digest(credential.token.as_bytes());
+        let request = HookSetupRequest {
+            client_request_id: model::new_id(),
+            project_id: PROJECT_ID.to_owned(),
+            source_id: source_id.clone(),
+            credential: credential.clone(),
+        };
+        let setup_id = {
+            let tx = db.transaction().unwrap();
+            let source =
+                super::super::hooks::setup_source(&tx, &manager, &app_config, &request, 10)
+                    .unwrap()
+                    .source;
+            assert_eq!(source.project_id, PROJECT_ID);
+            let id = tx.last_insert_rowid();
+            tx.commit().unwrap();
+            id
+        };
+
+        let hook_principal = Principal {
+            link_id: "revoked-hook-source-link".to_owned(),
+            client_id: credential.client_id.clone(),
+            role: Role::HookSource,
+        };
+        let revoke_id = {
+            let tx = db.transaction().unwrap();
+            super::super::hooks::revoke(&tx, &manager, &source_id, 1, 20).unwrap();
+            let id = tx.last_insert_rowid();
+            tx.commit().unwrap();
+            id
+        };
+        let revoked_emit =
+            super::super::hooks::emit_scope(&db, &hook_principal, &app_config, &source_id);
+        let error = match revoked_emit {
+            Err(error) => error,
+            Ok(_) => panic!("revoked HookSource credentials cannot emit another fact"),
+        };
+        assert_eq!(error.code, "UNAUTHORIZED");
+        let client = super::super::meta(&db, &format!("client:{}", credential.client_id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(client["disabled"], true);
+
+        let after_revoke = drain_events(&mut db, &app_config, &entry, 25);
+        assert_eq!(after_revoke.cursor, revoke_id);
+
+        let setup_event = super::automation_intake::observed_event_by_id(&db, setup_id)
+            .unwrap()
+            .expect("the committed setup observation remains readable");
+        let setup_projection =
+            super::automation_intake::safe_event_projection(&db, &setup_event).unwrap();
+        assert_eq!(
+            setup_projection.occurrence_phase.as_deref(),
+            Some("hook_source_setup_committed"),
+            "the real setup writer must yield its closed typed projection"
+        );
+        assert!(entry.accepts_script_run_event(
+            &setup_event.source_id,
+            &setup_event.event_kind,
+            setup_projection.status
+        ));
+        assert_eq!(
+            super::hook_source_admin_project_scope(&db, &app_config, PROJECT_ID, &setup_event)
+                .unwrap(),
+            PROJECT_ID
+        );
+        let setup_probe_cause =
+            super::system_event_cause(&setup_event, &setup_projection, SCRIPT_ID).unwrap();
+        super::script_event_invocation_context(&db, &app_config, &entry, &setup_probe_cause)
+            .unwrap_or_else(|error| {
+                panic!("setup Manager/source invocation probe: {}", error.code)
+            });
+
+        let revoke_event = super::automation_intake::observed_event_by_id(&db, revoke_id)
+            .unwrap()
+            .expect("the committed revoke observation remains readable");
+        let revoke_projection =
+            super::automation_intake::safe_event_projection(&db, &revoke_event).unwrap();
+        assert_eq!(
+            revoke_projection.occurrence_phase.as_deref(),
+            Some("hook_source_revoked"),
+            "the real revoke writer must yield its closed typed projection"
+        );
+        assert!(entry.accepts_script_run_event(
+            &revoke_event.source_id,
+            &revoke_event.event_kind,
+            revoke_projection.status
+        ));
+        assert_eq!(
+            super::hook_source_admin_project_scope(&db, &app_config, PROJECT_ID, &revoke_event)
+                .unwrap(),
+            PROJECT_ID
+        );
+        let revoke_probe_cause =
+            super::system_event_cause(&revoke_event, &revoke_projection, SCRIPT_ID).unwrap();
+        super::script_event_invocation_context(&db, &app_config, &entry, &revoke_probe_cause)
+            .unwrap_or_else(|error| {
+                panic!("revoke Manager/source invocation probe: {}", error.code)
+            });
+
+        let recent_dispositions: Vec<_> = after_revoke
+            .recent
+            .iter()
+            .filter_map(|item| item["disposition"].as_str())
+            .collect();
+        assert_eq!(
+            after_revoke.pending.len(),
+            2,
+            "safe recent dispositions: {recent_dispositions:?}"
+        );
+        let setup_cause = after_revoke
+            .pending
+            .iter()
+            .find(|pending| pending.observation_id == setup_id)
+            .expect("the earlier setup fact remains selectable after a later revoke");
+        assert_eq!(setup_cause.cause["source_id"], "controller:hook-source");
+        assert_eq!(setup_cause.cause["event_kind"], "hook.source.setup");
+        assert_eq!(setup_cause.cause["status"], "applied");
+        assert_eq!(
+            setup_cause.cause["occurrence_phase"],
+            "hook_source_setup_committed"
+        );
+        let setup_input = checked_input(&db, &app_config, &entry, &setup_cause.cause);
+        let setup_rendered = setup_input.to_string();
+        assert!(!setup_rendered.contains(&credential.token));
+        assert!(!setup_rendered.contains(&credential_hash));
+        assert!(!setup_rendered.contains("created_by"));
+        assert!(!setup_rendered.contains("github.com/owner/hook-admin-fixture"));
+        assert!(!setup_rendered.contains(MANAGER_ID));
+        assert!(setup_input.get("payload").is_none());
+
+        let revoke_cause = after_revoke
+            .pending
+            .iter()
+            .find(|pending| pending.observation_id == revoke_id)
+            .expect("the revocation fact remains selectable after credential disablement");
+        assert_eq!(revoke_cause.cause["event_kind"], "hook.source.revoke");
+        assert_eq!(revoke_cause.cause["status"], "invalidated");
+        assert_eq!(
+            revoke_cause.cause["occurrence_phase"],
+            "hook_source_revoked"
+        );
+        let revoke_input = checked_input(&db, &app_config, &entry, &revoke_cause.cause);
+        let revoke_rendered = revoke_input.to_string();
+        assert!(!revoke_rendered.contains(&credential.token));
+        assert!(!revoke_rendered.contains(&credential_hash));
+        assert!(!revoke_rendered.contains("revoked_by"));
+        assert!(!revoke_rendered.contains("github.com/owner/hook-admin-fixture"));
+        assert!(revoke_input.get("payload").is_none());
     }
 }
