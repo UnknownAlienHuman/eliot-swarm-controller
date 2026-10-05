@@ -185,6 +185,42 @@ struct Terminal {
     event: EventRef,
     outcome: String,
     reason: Option<String>,
+    /// Closed lifecycle stage retained for manager readback. Older
+    /// checkpoints omit this additive field, so restoration remains bounded
+    /// and compatible.
+    #[serde(default)]
+    stage: Option<String>,
+    /// Native failure codes are copied only when they already have the
+    /// bounded controller-safe shape; otherwise the fixed category fallback is
+    /// used instead of retaining native error text.
+    #[serde(default)]
+    error_code: Option<String>,
+}
+
+fn terminal_stage(kind: &str) -> &'static str {
+    match kind {
+        "session.execution.succeeded" => "execution_succeeded",
+        "session.execution.failed" => "execution_failed",
+        "session.execution.interrupted" => "execution_interrupted",
+        "session.inbox.cancelled" => "inbox_cancelled_before_delivery",
+        _ => "native_terminal",
+    }
+}
+
+fn safe_native_error_code(data: &Value) -> String {
+    let code = data["error"]["code"].as_str();
+    if let Some(code) = code.filter(|code| {
+        !code.is_empty()
+            && code.len() <= 64
+            && code.as_bytes().first().is_some_and(u8::is_ascii_uppercase)
+            && code
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+    }) {
+        code.to_owned()
+    } else {
+        "NATIVE_EXECUTION_FAILED".into()
+    }
 }
 
 /// This is a bounded projection, not copied history. It is stored atomically
@@ -491,6 +527,8 @@ impl ExecutionScan {
                         event: event.clone(),
                         outcome: "cancelled".into(),
                         reason: Some("inbox_cancelled_before_delivery".into()),
+                        stage: Some(terminal_stage(kind).into()),
+                        error_code: None,
                     });
                 }
             }
@@ -510,6 +548,9 @@ impl ExecutionScan {
                 if kind == "session.execution.failed" && !data["error"].is_object() {
                     return Err(gap("NATIVE_LOG_TERMINAL_SCHEMA"));
                 }
+                let stage = terminal_stage(kind);
+                let error_code =
+                    (kind == "session.execution.failed").then(|| safe_native_error_code(data));
                 if let Some(active) = &self.active
                     && self.run.as_ref() == Some(active)
                     && self.delivery.is_some()
@@ -524,6 +565,8 @@ impl ExecutionScan {
                         }
                         .into(),
                         reason,
+                        stage: Some(stage.into()),
+                        error_code,
                     });
                 }
                 self.active = None;
@@ -666,6 +709,8 @@ impl SessionPeriod {
         };
         json!({"sessionId":session_id,"turnId":self.started.id,"event":event,
         "terminal":self.terminal.as_ref().map(|t| t.outcome.clone()),
+        "stage":self.terminal.as_ref().and_then(|t| t.stage.clone()),
+        "error_code":self.terminal.as_ref().and_then(|t| t.error_code.clone()),
         "viewCursor":cursor,"disposition":self.disposition(),
         "native_run_id_kind":"execution_started_event",
         "reader_revision":SESSION_READER_REVISION})
@@ -825,6 +870,9 @@ impl SessionScan {
                 if kind == "session.execution.failed" && !data["error"].is_object() {
                     return Err(gap("NATIVE_LOG_TERMINAL_SCHEMA"));
                 }
+                let stage = terminal_stage(kind);
+                let error_code =
+                    (kind == "session.execution.failed").then(|| safe_native_error_code(data));
                 if let Some(period) = self
                     .periods
                     .last_mut()
@@ -842,6 +890,8 @@ impl SessionScan {
                             }
                             .into(),
                             reason,
+                            stage: Some(stage.into()),
+                            error_code,
                         });
                     }
                 }

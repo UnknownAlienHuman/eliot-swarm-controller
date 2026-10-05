@@ -2061,3 +2061,62 @@ async fn background_notice_may_be_observed_in_the_inbox_before_projection() {
     assert_eq!(r.details["background_notice_source"], "inbox");
     assert_eq!(f.posts(&format!("/api/session/{root}/background")), 1);
 }
+
+#[test]
+fn execution_and_session_failed_projections_keep_bounded_diagnostics() {
+    let root = root_id("fixture-binding", 1);
+    let operation = "op_failure_diagnostics";
+    let text = "root failure";
+    let marker = json!({"binding":"fixture-binding","generation":1,"operation":operation});
+    let command = RuntimeCommand {
+        operation_id: operation.into(),
+        method: "agent.goal".into(),
+        created_at_ms: 1,
+        binding_id: "fixture-binding".into(),
+        generation: 1,
+        native_root_id: Some(root.clone()),
+        route: json!({"runtime":RUNTIME,"module_artifact_id":ARTIFACT_ID,
+        "native_options":{"model":{"id":"fixture-model","providerID":"fixture-provider","variant":"explicit-variant"}}}),
+        input: json!({"text":text}),
+    };
+    let descriptor =
+        NativeInputDescriptor::for_goal_activation(&command, text, marker.clone()).unwrap();
+    let input = input_id(operation);
+    let mut root_scan = ExecutionScan::for_goal(&descriptor).unwrap();
+    for event in [
+        root_log_created(&root),
+        root_log_enqueued(&root, 2, &input, text, &marker),
+        root_log_started(&root, 3, "evt_root_failure_started"),
+        root_log_delivered(&root, 4, &input),
+    ] {
+        root_scan.consume(&event, &descriptor).unwrap();
+    }
+    let root_failed = root_log_event(
+        "evt_root_failure_terminal",
+        "session.execution.failed",
+        5,
+        &root,
+        json!({"sessionID":root,"error":{"code":"NATIVE_ROOT_FAILED","message":"raw root secret"}}),
+    );
+    root_scan.consume(&root_failed, &descriptor).unwrap();
+    let proof = root_scan.proof(&command).unwrap();
+    assert_eq!(proof["terminal"]["outcome"], "failed");
+    assert_eq!(proof["terminal"]["stage"], "execution_failed");
+    assert_eq!(proof["terminal"]["error_code"], "NATIVE_ROOT_FAILED");
+    assert!(!proof.to_string().contains("raw root secret"));
+
+    let child = "ses_child_failure";
+    let mut child_log = child_events(child, &root, &[("run_child_failure", Some("failed"))]);
+    let child_failed = child_log.last_mut().unwrap();
+    child_failed["data"]["error"]["code"] = json!("NATIVE_CHILD_FAILED");
+    child_failed["data"]["error"]["message"] = json!("raw child secret");
+    let mut child_scan = SessionScan::restore(child, &root, None).unwrap();
+    for event in child_log {
+        child_scan.consume(&event).unwrap();
+    }
+    let turn = child_scan.last_turn().unwrap();
+    assert_eq!(turn["terminal"], "failed");
+    assert_eq!(turn["stage"], "execution_failed");
+    assert_eq!(turn["error_code"], "NATIVE_CHILD_FAILED");
+    assert!(!turn.to_string().contains("raw child secret"));
+}

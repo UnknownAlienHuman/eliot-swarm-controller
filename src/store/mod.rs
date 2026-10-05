@@ -46,6 +46,7 @@ mod native_mcp;
 #[cfg(test)]
 mod o6_taskless_path_fixture;
 mod opencode;
+mod operation_cancel_event_schema;
 #[cfg(test)]
 mod operation_failure_event_fixture;
 mod operation_failure_event_schema;
@@ -1532,6 +1533,7 @@ fn open_database(root: &Path, credential: &Credential) -> Result<Connection> {
     )?;
     script_event_schema::install(&tx)?;
     operation_failure_event_schema::install(&tx)?;
+    operation_cancel_event_schema::install(&tx)?;
     install_schema_extension(
         &tx,
         "schema_extension:github:v1",

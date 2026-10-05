@@ -172,6 +172,14 @@ export function outcomeFromRun(run, evidence = run?.evidence_validation) {
     && run?.timed_out !== true;
   const applied = cleanEvidence && subtype === "success";
   const rejected = cleanEvidence && (subtype === "error" || subtype === "max_turns");
+  // A validated native error already carries a bounded, allowlisted vendor
+  // category in the persisted exit projection. Preserve that category in the
+  // manager-readable Operation receipt; raw result.error remains local evidence.
+  const nativeFailureCode = cleanEvidence && subtype === "error"
+    ? (Object.values(EXIT_MEANINGS).includes(run?.exit?.meaning)
+      ? run.exit.meaning
+      : "NATIVE_RESULT_ERROR")
+    : null;
   const resultText = run?.result?.final_text;
   return {
     outcome: applied ? "applied" : rejected ? "rejected" : "unknown",
@@ -201,6 +209,7 @@ export function outcomeFromRun(run, evidence = run?.evidence_validation) {
       artifact_refs: Array.isArray(run?.artifact_refs) ? run.artifact_refs : [],
       result_text_sha256: typeof resultText === "string" ? sha256Hex(resultText) : null,
       result_text_bytes: typeof resultText === "string" ? Buffer.byteLength(resultText, "utf8") : null,
+      ...(nativeFailureCode ? { diagnostic_code: nativeFailureCode } : {}),
       ...(!cleanEvidence ? {
         diagnostic_code: evidence?.diagnostic_code
           ?? run?.anomalies?.[0]

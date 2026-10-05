@@ -1058,7 +1058,7 @@ fn event_requires_occurrence_projection(event: &crate::automation::intake::Obser
                 )
                 | (
                     "controller:operations",
-                    "operation.rejected" | "operation.outcome_unknown"
+                    "operation.rejected" | "operation.outcome_unknown" | "operation.cancelled"
                 )
                 | ("controller:native-mcp", "native.mcp.failure")
                 | (
@@ -5387,6 +5387,248 @@ mod script_event_trigger_tests {
         assert!(!rendered.contains("PRIVATE_NATIVE_INPUT_ID"));
         assert!(!rendered.contains(MODULE_LINK_ID));
         assert!(!rendered.contains("PRIVATE_INPUT_TEXT"));
+    }
+
+    #[test]
+    fn store_operation_cancel_commits_one_safe_taskless_script_run_event() {
+        const HISTORICAL_OPERATION_ID: &str = "historical-cancel-before-event-schema";
+        const TARGET_OPERATION_ID: &str = "queued-cancel-event-target";
+        const PRIVATE_CANCEL_REASON: &str = "PRIVATE_CANCEL_REASON_FIXTURE";
+        const PRIVATE_TARGET_REQUEST: &str = "PRIVATE_TARGET_REQUEST_FIXTURE";
+        const PRIVATE_OLD_REASON: &str = "PRIVATE_OLD_CANCEL_REASON_FIXTURE";
+
+        let (mut db, _, _, _, _) = fixture();
+        // The real cancellation writer checks owned-service reservations even
+        // for a taskless target; use the same installed table as the Store.
+        db.execute_batch(super::super::OWNED_SERVICE_SCHEMA)
+            .unwrap();
+        {
+            let tx = db.transaction().unwrap();
+            tx.execute(
+                "INSERT INTO operations(
+                    operation_id,caller_id,client_request_id,method,original_request_json,
+                    effective_request_json,state,result_json,due_at_ms,settled_at_ms,
+                    created_at_ms,updated_at_ms
+                 ) VALUES(?1,?2,'historical-cancel-request','coordination.consult',?3,'{}',
+                    'cancelled',?4,1,1,1,1)",
+                params![
+                    HISTORICAL_OPERATION_ID,
+                    MANAGER_ID,
+                    format!(r#"{{"request":"{PRIVATE_TARGET_REQUEST}"}}"#),
+                    format!(r#"{{"reason":"{PRIVATE_OLD_REASON}"}}"#),
+                ],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO operations(
+                    operation_id,caller_id,client_request_id,method,original_request_json,
+                    effective_request_json,state,due_at_ms,created_at_ms,updated_at_ms
+                 ) VALUES(?1,?2,'queued-cancel-target','coordination.consult',?3,'{}',
+                    'queued',1,1,1)",
+                params![
+                    TARGET_OPERATION_ID,
+                    MANAGER_ID,
+                    format!(r#"{{"request":"{PRIVATE_TARGET_REQUEST}"}}"#),
+                ],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        // Installing the forward-only adapter after an existing cancellation
+        // must leave that historical Operation without a new occurrence.
+        {
+            let tx = db.transaction().unwrap();
+            super::super::operation_cancel_event_schema::install(&tx).unwrap();
+            let historical_events: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM observations
+                     WHERE source_stream_id='controller:operations'
+                       AND source_event_key=?1 AND kind='operation.cancelled'",
+                    [format!(
+                        "operation:{HISTORICAL_OPERATION_ID}:operation_cancelled"
+                    )],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(historical_events, 0);
+            tx.commit().unwrap();
+        }
+
+        let mut entry = AutomationEntry::new(MANAGER_ID, PROJECT_ID, AUTOMATION_ID, 1);
+        entry.enabled = true;
+        entry.steps = vec![AutomationStep::ScriptRun];
+        entry.script_run = Some(ScriptRunSettings {
+            script_id: SCRIPT_ID.to_owned(),
+        });
+        entry.event_rules = Some(vec![selector(
+            "controller:operations",
+            "operation.cancelled",
+            Some(EventStatus::Cancelled),
+        )]);
+        {
+            let tx = db.transaction().unwrap();
+            let cut = super::automation_intake::observed_event_high_water(&tx).unwrap();
+            super::configure_script_trigger_activation(&tx, None, &entry, false, cut, 20).unwrap();
+            tx.commit().unwrap();
+        }
+
+        let manager = crate::model::Principal {
+            link_id: "script-event-cancel-manager-link".to_owned(),
+            client_id: MANAGER_ID.to_owned(),
+            role: crate::model::Role::Manager,
+        };
+        let cancel_request = json!({
+            "client_request_id":"cancel-target-once",
+            "operation_id":TARGET_OPERATION_ID,
+            "reason":PRIVATE_CANCEL_REASON,
+        });
+        let first_receipt = super::super::mutate(
+            &mut db,
+            &manager,
+            "operation.cancel",
+            &cancel_request,
+            &Config::default(),
+        )
+        .unwrap();
+        assert_ne!(first_receipt["operation_id"], TARGET_OPERATION_ID);
+        assert_eq!(first_receipt["cancelled_operation_id"], TARGET_OPERATION_ID);
+
+        let target: (String, Option<String>, Option<i64>) = db
+            .query_row(
+                "SELECT state,result_json,settled_at_ms FROM operations WHERE operation_id=?1",
+                [TARGET_OPERATION_ID],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(target.0, "cancelled");
+        assert!(target.1.as_deref().unwrap().contains(PRIVATE_CANCEL_REASON));
+        assert!(target.2.is_some());
+
+        let event_key = format!("operation:{TARGET_OPERATION_ID}:operation_cancelled");
+        let (event_id, event_operation_id, event_kind, event_payload): (
+            i64,
+            String,
+            String,
+            String,
+        ) = db
+            .query_row(
+                "SELECT observation_id,operation_id,kind,payload_json FROM observations
+                 WHERE source_stream_id='controller:operations' AND source_event_key=?1",
+                [&event_key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(event_operation_id, TARGET_OPERATION_ID);
+        assert_eq!(event_kind, "operation.cancelled");
+        let payload: Value = serde_json::from_str(&event_payload).unwrap();
+        assert_eq!(
+            payload,
+            json!({
+                "schema_version":1,
+                "phase":"operation_cancelled",
+                "status":"cancelled",
+                "occurrence_id":event_key.clone(),
+                "error_code":"OPERATION_CANCELLED"
+            })
+        );
+
+        let app_config = Config::default();
+        let first_state = {
+            let tx = db.transaction().unwrap();
+            let intake = super::reconcile_source_intake(&tx, 64, false, 30).unwrap();
+            super::reconcile_script_trigger_entry(&tx, &entry, 16, intake, &app_config, 30)
+                .unwrap();
+            let state = super::load_script_trigger_state(&tx, &entry)
+                .unwrap()
+                .unwrap();
+            tx.commit().unwrap();
+            state
+        };
+        assert_eq!(first_state.pending.len(), 1);
+        assert!(first_state.cursor >= event_id);
+        let first_cause = first_state.pending[0].cause.clone();
+        assert_eq!(first_cause["observation_id"], event_id);
+        assert_eq!(first_cause["operation_id"], TARGET_OPERATION_ID);
+        assert_eq!(first_cause["source_id"], "controller:operations");
+        assert_eq!(first_cause["event_kind"], "operation.cancelled");
+        assert_eq!(first_cause["occurrence_phase"], "operation_cancelled");
+        assert_eq!(first_cause["occurrence_id"], event_key);
+        assert_eq!(first_cause["status"], "cancelled");
+        assert_eq!(first_cause["error_code"], "OPERATION_CANCELLED");
+        assert!(first_cause.get("task_id").is_none());
+        assert!(first_cause.get("attempt_id").is_none());
+        assert!(first_cause.get("payload").is_none());
+        assert!(first_cause.get("request").is_none());
+        assert!(first_cause.get("result").is_none());
+
+        let mut retained_cause = first_cause.clone();
+        retained_cause["script_revision"] = json!(1);
+        let retained_input =
+            super::validate_retained_script_event_cause(&db, PROJECT_ID, &retained_cause).unwrap();
+        let context =
+            super::script_event_invocation_context(&db, &app_config, &entry, &first_cause).unwrap();
+        assert_eq!(retained_input, context.input);
+        assert_eq!(context.task_id, None);
+        assert_eq!(context.task_revision, None);
+        assert_eq!(context.attempt_id, None);
+        assert_eq!(context.input["operation_id"], TARGET_OPERATION_ID);
+        assert_eq!(context.input["status"], "cancelled");
+        assert_eq!(context.input["error_code"], "OPERATION_CANCELLED");
+        assert!(context.input.get("task_id").is_none());
+        assert!(context.input.get("attempt_id").is_none());
+        assert!(context.input.get("payload").is_none());
+        assert!(context.input.get("request").is_none());
+        assert!(context.input.get("result").is_none());
+        let safe_views = format!("{payload} {first_cause} {}", context.input);
+        for private in [
+            PRIVATE_CANCEL_REASON,
+            PRIVATE_TARGET_REQUEST,
+            PRIVATE_OLD_REASON,
+        ] {
+            assert!(!safe_views.contains(private));
+        }
+        let task_count: i64 = db
+            .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(task_count, 0);
+
+        // Replaying the exact Store request and reconciling the ordinary
+        // cursor again must preserve one source fact and one pending ScriptRun.
+        let retry_receipt = super::super::mutate(
+            &mut db,
+            &manager,
+            "operation.cancel",
+            &cancel_request,
+            &app_config,
+        )
+        .unwrap();
+        assert_eq!(retry_receipt, first_receipt);
+        let event_count: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM observations
+                 WHERE source_stream_id='controller:operations'
+                   AND source_event_key=?1 AND kind='operation.cancelled'",
+                [&event_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(event_count, 1);
+
+        let second_state = {
+            let tx = db.transaction().unwrap();
+            let intake = super::reconcile_source_intake(&tx, 64, false, 40).unwrap();
+            super::reconcile_script_trigger_entry(&tx, &entry, 16, intake, &app_config, 40)
+                .unwrap();
+            let state = super::load_script_trigger_state(&tx, &entry)
+                .unwrap()
+                .unwrap();
+            tx.commit().unwrap();
+            state
+        };
+        assert_eq!(second_state.pending.len(), 1);
+        assert_eq!(second_state.pending[0].cause["id"], first_cause["id"]);
+        assert_eq!(second_state.cursor, first_state.cursor);
     }
 }
 

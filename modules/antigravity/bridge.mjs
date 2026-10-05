@@ -249,6 +249,23 @@ function settleSendForResult(sess, turn) {
   }, entry.method);
 }
 
+function failNativeInput(sess) {
+  if (sess.ended || sess.inputFailed) return;
+  sess.inputFailed = true;
+  // Writable errors are transport evidence only. Never retain their raw
+  // message; use the same closed diagnostic in the snapshot and outcomes.
+  noteStreamFailure(sess.state, codedError('NATIVE_INPUT_STREAM_FAILED'));
+  for (const entry of sess.pendingSends.splice(0)) {
+    saveOutcome(entry.operation_id, {
+      outcome: 'unknown',
+      native_root_id: sess.rootId,
+      native_scope_key: sess.scopeKey,
+      details: { diagnostic_code: 'NATIVE_INPUT_STREAM_FAILED' },
+    }, entry.method);
+  }
+  changed();
+}
+
 function finishSession(sess) {
   if (sess.ended) return;
   sess.ended = true;
@@ -324,7 +341,7 @@ async function startNative(command) {
   const state = createStreamState(resultOrdinal);
   const sess = {
     state, child: null, rootId: null, scopeKey: nativeScopeKey(),
-    pendingSends: [], openWait: null, ended: false,
+    pendingSends: [], openWait: null, ended: false, inputFailed: false,
   };
   let child;
   try {
@@ -337,6 +354,7 @@ async function startNative(command) {
   session = sess;
   child.stderr.setEncoding('utf8');
   child.stderr.on('data', chunk => { noteStderr(state, chunk); changed(); });
+  child.stdin.on('error', () => { failNativeInput(sess); });
   child.on('error', error => { noteStreamFailure(state, error); finishSession(sess); });
   child.on('close', code => {
     noteProcessExit(state, code);
@@ -360,6 +378,7 @@ function sendNative(command) {
   const sess = session;
   if (!sess || sess.ended || !sess.rootId) throw codedError('NATIVE_SESSION_NOT_READY');
   if (command.native_root_id !== sess.rootId) throw codedError('NATIVE_IDENTITY_MISMATCH');
+  if (sess.inputFailed) throw codedError('NATIVE_INPUT_STREAM_FAILED');
   const p = command.input ?? {};
   let text;
   if (command.method === 'task.dispatch') {
@@ -373,11 +392,14 @@ function sendNative(command) {
     text = required(p, 'text');
   }
   const line = JSON.stringify(encodeUserMessage(text)) + '\n';
-  sess.pendingSends.push({ operation_id: command.operation_id, method: command.method });
+  const pending = { operation_id: command.operation_id, method: command.method };
+  sess.pendingSends.push(pending);
   try {
     sess.child.stdin.write(line);
-  } catch (error) {
-    sess.pendingSends.pop();
+  } catch {
+    const index = sess.pendingSends.indexOf(pending);
+    if (index >= 0) sess.pendingSends.splice(index, 1);
+    failNativeInput(sess);
     throw codedError('NATIVE_WRITE_FAILED', true);
   }
   // Writing the user event is admission into the warm channel only. The

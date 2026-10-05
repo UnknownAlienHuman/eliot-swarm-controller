@@ -346,7 +346,10 @@ fn record(
                         if is_terminal(&proof) {
                             producer["disposition"] = proof["disposition"].clone();
                             producer["terminal_evidence"] = json!({"observation_id":observation,
-                                "event":proof["terminal"]["event"],"correlation":proof["correlation"]});
+                                "event":proof["terminal"]["event"],
+                                "stage":proof["terminal"]["stage"],
+                                "error_code":proof["terminal"]["error_code"],
+                                "correlation":proof["correlation"]});
                         }
                         tx.execute("UPDATE attempts SET producers_json=?2,updated_at_ms=?3 WHERE attempt_id=?1 AND released_at_ms IS NULL",
                             params![attempt_id,model::canonical(&json!(producers))?,now])?;

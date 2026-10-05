@@ -365,6 +365,10 @@ try {
     assert.equal(record.result.error, "not authenticated");
     assert.equal(record.mod.loaded, true); // factory ran
     assert.equal(record.mod.ready, false); // session never bound
+    const outcome = outcomeFromRun(record);
+    assert.equal(outcome.outcome, "rejected");
+    assert.equal(outcome.details.diagnostic_code, "EXIT_AUTH_ERROR");
+    assert.equal(JSON.stringify(outcome).includes("not authenticated"), false);
   });
 
   await test("open: max_turns is its own disposition, not success or failure", async () => {

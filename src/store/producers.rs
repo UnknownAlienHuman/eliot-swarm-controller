@@ -208,6 +208,57 @@ mod receipt_ambiguity_tests {
         );
         assert_eq!(unresolved["disposition"], "admitted");
     }
+
+    #[test]
+    fn child_terminal_diagnostics_are_bounded_and_match_exact_run() {
+        let terminal = json!({
+            "sessionId":"ses_child",
+            "turnId":"run_child",
+            "terminal":"failed",
+            "event":"evt_child_failed",
+            "viewCursor":3,
+            "stage":"execution_failed",
+            "error_code":"NATIVE_CHILD_FAILED"
+        });
+        let state = json!({
+            "turns":[],
+            "observed_children":[{"sessionId":"ses_child","last_turn":terminal}]
+        });
+        let producer = json!({
+            "native_session_id":"ses_child",
+            "native_run_id":"run_child",
+            "disposition":"admitted"
+        });
+
+        let mut valid = producer.clone();
+        apply_evidence(&mut valid, &state, Some(7));
+        assert_eq!(valid["disposition"], "failed");
+        assert_eq!(valid["terminal_evidence"]["stage"], "execution_failed");
+        assert_eq!(
+            valid["terminal_evidence"]["error_code"],
+            "NATIVE_CHILD_FAILED"
+        );
+
+        for (field, value) in [
+            ("stage", json!("raw stage text")),
+            ("error_code", json!("raw native error text")),
+            ("error_code", json!("A".repeat(65))),
+        ] {
+            let mut invalid_state = state.clone();
+            invalid_state["observed_children"][0]["last_turn"][field] = value;
+            let mut sanitized = producer.clone();
+            apply_evidence(&mut sanitized, &invalid_state, Some(8));
+            assert_eq!(sanitized["disposition"], "failed");
+            assert_eq!(sanitized["terminal_evidence"][field], Value::Null);
+            assert_eq!(sanitized["terminal_evidence"]["observation_id"], 8);
+        }
+
+        let mut wrong_run = producer;
+        wrong_run["native_run_id"] = json!("run_other");
+        apply_evidence(&mut wrong_run, &state, Some(9));
+        assert_eq!(wrong_run["disposition"], "admitted");
+        assert!(wrong_run["terminal_evidence"].is_null());
+    }
 }
 fn run_observed(state: &Value, session: &str, run: &str) -> bool {
     let member = state["native_root_id"] == session
@@ -227,6 +278,36 @@ fn run_observed(state: &Value, session: &str, run: &str) -> bool {
                             && c["snapshot"]["activeTurnId"] == run
                     })
                 }))
+}
+
+fn bounded_terminal_stage(value: &Value) -> Value {
+    value
+        .as_str()
+        .filter(|stage| {
+            matches!(
+                *stage,
+                "execution_succeeded"
+                    | "execution_failed"
+                    | "execution_interrupted"
+                    | "inbox_cancelled_before_delivery"
+            )
+        })
+        .map(|stage| json!(stage))
+        .unwrap_or(Value::Null)
+}
+
+fn bounded_terminal_error_code(value: &Value) -> Value {
+    let Some(code) = value.as_str().filter(|code| {
+        !code.is_empty()
+            && code.len() <= 64
+            && code.as_bytes().first().is_some_and(u8::is_ascii_uppercase)
+            && code
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+    }) else {
+        return Value::Null;
+    };
+    json!(code)
 }
 
 /// Terminal facts address an exact run; missing IDs never compare equal as null.
@@ -258,7 +339,13 @@ pub(super) fn apply_evidence(producer: &mut Value, state: &Value, observation_id
         return;
     }
     producer["disposition"] = json!(terminal);
-    producer["terminal_evidence"] = json!({"observation_id":observation_id,"event":event["event"],"view_cursor":event["viewCursor"]});
+    producer["terminal_evidence"] = json!({
+        "observation_id":observation_id,
+        "event":event["event"],
+        "view_cursor":event["viewCursor"],
+        "stage":bounded_terminal_stage(&event["stage"]),
+        "error_code":bounded_terminal_error_code(&event["error_code"])
+    });
 }
 
 /// Record a one-shot producer by its dispatch Operation, without pretending

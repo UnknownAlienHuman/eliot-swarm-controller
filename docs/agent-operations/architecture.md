@@ -1,6 +1,6 @@
 # Agent Operations — Rust Architecture and Execution Contracts
 
-Revision 12 · 2026-10-05 · source baseline `92efc384991057c3c2d2ce39b4154fa40a8ce0dd`.
+Revision 13 · 2026-10-05 · source baseline `821251f5e59e88df38de9659393a50f4c0546984`.
 
 [Configuration](configuration.md) owns editable settings; [Delivery](delivery.md) owns work transitions; [Donor map](donor-map.md) separates source evidence from proposals. These contracts are not implementation claims.
 
@@ -39,7 +39,7 @@ or graceful host exit establishes only that subject's lifecycle result. Neither
 establishes Task completion. Native receipt details are not event-selector
 metadata; their size must not silently remove a valid occurrence from the bus.
 
-Rejected and uncertain Operation outcomes are kernel facts, not a list of
+Rejected, cancelled and uncertain Operation outcomes are kernel facts, not a list of
 provider-specific failure callbacks. SQLite migration `010` captures an
 Operation inserted in `rejected` or `outcome_unknown`, and each transition into
 either state, in the same transaction as the state change. The normalized
@@ -49,6 +49,22 @@ text, and it does not backfill old rows. Adapters may alias a verified raw
 outcome to that same phase and occurrence. A raw `runtime.outcome` of `unknown`
 aliases `operation.outcome_unknown`; it is not a completion event. Duplicate
 views of one phase collapse, while distinct phases remain separate facts.
+
+Migration `011` captures new `cancelled` Operations and transitions into that
+state by the same transaction rule. The occurrence names the cancelled target
+Operation, independently of the command requesting cancellation. Its bounded
+`operation_cancelled` / `cancelled` projection enters ordinary ScriptRun routing
+without requiring a Task or Attempt. Installation does not backfill historical
+cancellations; identical requests and repeated reconciliation preserve one
+occurrence and its retained cause.
+
+Adapters preserve bounded native failure diagnostics in the common durable
+outcome. OpenCode retains the verified terminal lifecycle stage and code for
+the exact root or child execution; Command Code projects a validated native
+exit category into Operation details. Antigravity treats a failed input stream
+as an uncertain transport effect, settles each pending send once and blocks
+further writes to that stream. Raw native errors are not selector metadata.
+Current authorized managers obtain retained details through ordinary readback.
 
 These normalized observations are the framework event bus. Addressed mailbox
 messages remain durable delivery to their recipient, with one raw mailbox
@@ -68,7 +84,7 @@ the applicable identity and authority checks. An uncertain remote effect stays
 uncertain until exact readback; restarting a host or changing managers does not
 authorize a second effect or rewrite its original actor.
 
-For committed `rejected` and `outcome_unknown` state, the Store-level capture
+For committed `rejected`, `cancelled` and `outcome_unknown` state, the Store-level capture
 also commits in that transaction. A speculative exception is not an observed
 terminal fact, and opening the Store does not synthesize historical failure
 events. The bounded event is suitable for an enabled manager rule to select;

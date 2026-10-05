@@ -852,6 +852,9 @@ pub(crate) fn safe_event_projection(
         ("controller:operations", "operation.outcome_unknown") => {
             Some((EventStatus::Unknown, "operation_outcome_unknown"))
         }
+        ("controller:operations", "operation.cancelled") => {
+            Some((EventStatus::Cancelled, "operation_cancelled"))
+        }
         _ => None,
     };
     let Some((expected_status, expected_phase)) = expected else {
@@ -911,6 +914,7 @@ pub(crate) fn safe_event_projection(
         ("controller:host-lifecycle", "host.interrupted") => Some("HOST_INTERRUPTED"),
         ("controller:operations", "operation.rejected") => Some("OPERATION_REJECTED"),
         ("controller:operations", "operation.outcome_unknown") => Some("OUTCOME_UNKNOWN"),
+        ("controller:operations", "operation.cancelled") => Some("OPERATION_CANCELLED"),
         _ => None,
     };
     let error_code = match expected_error_code {

@@ -492,6 +492,13 @@ Operation and phase. The closed projection contains only the phase, status and
 fixed error category; it never copies request/result bodies, arbitrary error
 text or credentials. The migration does not backfill historical Operations.
 
+Migration `011` applies the same rule to new cancellations. Select
+`controller:operations` / `operation.cancelled` with optional status
+`cancelled` to react to the target Operation's committed cancellation. The
+event identifies the target rather than the cancellation request and supports
+taskless actions. Historical cancellations are not added at installation;
+repeated readback and the same request do not create a second occurrence.
+
 Provider adapters may expose a safe alias of the same fact. In particular,
 only an exact raw `runtime.outcome` of `unknown` aliases the corresponding
 `operation.outcome_unknown` phase and occurrence; it is never labeled as a

@@ -2,6 +2,51 @@
 
 ## Current state
 
+### Universal cancellation events and adapter diagnostics — 2026-10-05
+
+New Operation cancellations enter the shared durable event bus in the same
+transaction as the target state change. Migration `011` identifies the
+cancelled target and emits a bounded `operation.cancelled` occurrence for the
+ordinary manager-configured ScriptRun path. Historical cancellations are not
+backfilled; retries and reconciliation retain one occurrence. Taskless actions
+use this path without creating a Task or Attempt.
+
+OpenCode now retains bounded terminal stage and native failure code in exact
+root and child execution evidence. Command Code preserves validated native
+exit categories in manager-readable Operation details. Antigravity handles
+asynchronous stdin failure, settles pending sends once as uncertain and blocks
+future writes to the failed stream. Independent Luna production source audits
+passed. Gate `a9b2cb4e-9c53-4b02-99db-8f384756661d` passed all three affected
+checks: actual Store cancellation through ScriptRun, root/child OpenCode
+failure projections and exact child producer evidence. Formatting, strict
+production Clippy, compilation of 331 library checks and the debug build
+passed; all 211 source pins remained unchanged. Offline gate
+`d1481ed4-e0d6-44ad-8c63-d0e082839c17` passed Command Code glue/bridge fixtures
+and both changed adapters' syntax, including native auth-error diagnostic
+readback. Antigravity's codec self-test also passed; it does not exercise the
+new stdin-error path. Fresh full CI and native qualification of this increment
+remain pending.
+
+Published baseline `821251f` passed complete Windows and remote Ubuntu CI in
+[run 37284559675](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37284559675).
+C35 run `a030e80a-eb0b-4b6c-ac9e-c295ec1f1def` passed at that exact baseline:
+nine native MCP tools, challenge and manager readback were observed; restart
+did not respawn the service, and cleanup proved its departure. This was native
+inventory/recovery qualification and sent no model request.
+
+C24 v5 stopped before host readiness because its model configuration omitted
+the required variant. C24 v6 corrected that field and started the owned native
+service, then stopped with `NATIVE_MCP_INVENTORY_READBACK_INVALID`. Retained
+Store readback contains zero `task.dispatch` and zero `agent.send` commands.
+Its retained native inventory has nine tools and valid sequence zero with both
+hook statuses unknown. The private scenario incorrectly required a positive
+sequence; the maintained native proof producer and Rust reader already accept
+the correct hook-derived sequence. This diagnosis does not establish inference.
+Both attempts and their execution namespaces remain consumed and retained.
+Hosted Bunny inference and the complete O7 work/review workflow remain
+unqualified. The installed launcher and current Codex/OpenCodex were preserved;
+local Linux/WSL and all local models remain deferred. **PARTIAL_PROGRESS**.
+
 ### Hook lifecycle events and closed workspace admission — 2026-10-05
 
 Committed `controller:hook-source` / `hook.source.setup` and
