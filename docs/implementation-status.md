@@ -2,6 +2,36 @@
 
 ## Current state
 
+### PR #25 Store primitives and module child identity — 2026-10-05
+
+The root now consumes `swarm-store` for SQLite opening, schema identity/digest
+validation and transaction primitives. The existing writer thread retains the
+DataRoot lock; base initialization and all kernel bootstrap, extension and
+restart updates remain in one Immediate transaction. Root initializer errors,
+parsed JSON digest semantics and accepted empty-database identity cases are
+preserved. Status reads remain read-only/query-only with the existing principal
+policy. Store job ordering, MessageSend batching and domain admission remain
+host-owned; this is a staged storage extraction, not the complete kernel split.
+
+Shared contracts now include a data-only module catalog: exact artifact
+selection, protocol/capability compatibility, protected launch references and
+unknown-launch readback decisions. Metadata inspection starts nothing. The live
+Store handshake still checks artifact identity only; descriptor registration,
+full handshake and supervisor activation are separate integration work.
+
+`swarm-process` adds a read-only check for a distinct native child's exact
+identity and membership in its recorded live, nonkilling module owner. It does
+not authorize adoption, launch or input replay. A direct child exit and this
+membership observation do not prove whole-family departure.
+
+The preceding shared-package correction `43a9b78` passed strict production
+Clippy on remote Ubuntu in [run 37314690538](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37314690538).
+Windows reported an unused Linux-only helper; that helper is now compiled only
+for Linux. The current Store/membership source has metadata, formatting and
+source review evidence, with compilation and native qualification still pending.
+M2 kernel extraction and M3–M6 remain open. No owner-machine Linux/WSL or local
+native/model execution was performed for this increment.
+
 ### PR #25 shared packages and initial structured diagnostics — 2026-10-05
 
 The root now consumes four independent Cargo packages: `swarm-contracts`,
@@ -24,8 +54,9 @@ reload, recorder rotation, metrics RPCs or a live observer.
 
 Workspace metadata and lock resolution pass without compilation, and the lock
 adds only the four local packages. Explicit package formatting and source review
-are the current gate; this extraction has not been compiled or run yet. Store,
-kernel, generic supervision, the full bus/adapter split and M5/M6 remain open.
+were the publication gate. Later scoped compilation and its correction are
+recorded above; native interoperability remains unqualified. Kernel, generic
+supervision, the full bus/adapter split and M5/M6 remain open.
 See [shared package boundaries](agent-operations/shared-packages.md).
 
 ### PR #25 M1 source: Manager planning and disconnect persistence — 2026-10-05

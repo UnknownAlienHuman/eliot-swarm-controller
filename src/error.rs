@@ -50,6 +50,11 @@ impl From<rusqlite::Error> for Error {
         Self::new("STORE_ERROR", value.to_string())
     }
 }
+impl From<swarm_store::Error> for Error {
+    fn from(value: swarm_store::Error) -> Self {
+        Self::new(value.code(), value.message())
+    }
+}
 impl From<serde_json::Error> for Error {
     fn from(value: serde_json::Error) -> Self {
         Self::invalid(value.to_string())

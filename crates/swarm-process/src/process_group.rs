@@ -15,6 +15,7 @@ fn positive(identity: &Value, field: &str) -> Result<i64> {
         .ok_or_else(|| Error::invalid(format!("{field} must be a positive integer")))
 }
 
+#[cfg(target_os = "linux")]
 fn identity_text<'a>(identity: &'a Value, field: &str) -> Result<&'a str> {
     identity
         .get(field)

@@ -1418,58 +1418,41 @@ fn require_local_operator(db: &Connection, client_id: &str) -> Result<()> {
 }
 
 fn open_database(root: &Path, credential: &Credential) -> Result<Connection> {
-    if rusqlite::version_number() < 3_051_003 {
-        return Err(Error::new(
-            "SQLITE_VERSION",
-            "bundled SQLite >= 3.51.3 is required",
-        ));
-    }
-    let mut db = Connection::open(root.join("swarm.db"))?;
-    let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    let app: i64 = db.pragma_query_value(None, "application_id", |r| r.get(0))?;
-    let schema_hash = model::digest(SCHEMA.as_bytes());
-    let empty: bool = db.query_row(
-        "SELECT COUNT(*) = 0 FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
-        [],
-        |r| r.get(0),
-    )?;
-    if !(empty && version == 0 && app == 0) && (app != APPLICATION_ID || version != 1) {
-        return Err(Error::new(
-            "SCHEMA_MISMATCH",
-            "not this prototype's version-1 database; no automatic overwrite or downgrade",
-        ));
-    }
-    db.pragma_update(None, "foreign_keys", "ON")?;
-    db.pragma_update(None, "journal_mode", "WAL")?;
-    db.pragma_update(None, "synchronous", "FULL")?;
-    db.busy_timeout(std::time::Duration::from_secs(5))?;
-    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    if empty {
-        tx.execute_batch(SCHEMA)?;
-        tx.pragma_update(None, "application_id", APPLICATION_ID)?;
-        tx.pragma_update(None, "user_version", 1)?;
-        set_meta(&tx, "schema_digest", &json!(schema_hash))?;
-        set_meta(&tx, "controller_id", &json!(model::new_id()))?;
-        set_meta(&tx, "host_epoch", &json!(0))?;
-        set_meta(&tx, "execution_mode", &json!({"new_work":"enabled"}))?;
+    let opened = swarm_store::open_writer(
+        &root.join("swarm.db"),
+        swarm_store::SchemaIdentity {
+            application_id: APPLICATION_ID,
+            user_version: 1,
+            base_schema: SCHEMA,
+        },
+        swarm_store::WriterOptions::default(),
+        |tx, is_new| initialize_database(tx, is_new, credential),
+    );
+    let (db, ()) = match opened {
+        Ok(value) => value,
+        Err(swarm_store::OpenError::Store(error)) => return Err(error.into()),
+        Err(swarm_store::OpenError::Initializer(error)) => return Err(error),
+    };
+    Ok(db)
+}
+
+fn initialize_database(tx: &Transaction<'_>, is_new: bool, credential: &Credential) -> Result<()> {
+    if is_new {
+        set_meta(tx, "controller_id", &json!(model::new_id()))?;
+        set_meta(tx, "host_epoch", &json!(0))?;
+        set_meta(tx, "execution_mode", &json!({"new_work":"enabled"}))?;
         set_meta(
-            &tx,
+            tx,
             LOCAL_OPERATOR_CLIENT_ID_KEY,
             &json!(credential.client_id),
         )?;
         set_meta(
-            &tx,
+            tx,
             &format!("client:{}", credential.client_id),
             &json!({"role":"operator","token_hash":model::digest(credential.token.as_bytes()),"disabled":false}),
         )?;
     } else {
-        if meta(&tx, "schema_digest")? != Some(json!(schema_hash)) {
-            return Err(Error::new(
-                "SCHEMA_MISMATCH",
-                "migration content differs; refusing to open a draft/reference database",
-            ));
-        }
-        let local_operator = meta(&tx, LOCAL_OPERATOR_CLIENT_ID_KEY)?;
+        let local_operator = meta(tx, LOCAL_OPERATOR_CLIENT_ID_KEY)?;
         if let Some(local_operator) = &local_operator
             && local_operator.as_str() != Some(credential.client_id.as_str())
         {
@@ -1478,7 +1461,7 @@ fn open_database(root: &Path, credential: &Credential) -> Result<Connection> {
                 "bootstrap credential does not match the pinned local operator identity",
             ));
         }
-        let record = meta(&tx, &format!("client:{}", credential.client_id))?.ok_or_else(|| {
+        let record = meta(tx, &format!("client:{}", credential.client_id))?.ok_or_else(|| {
             Error::new(
                 "UNAUTHORIZED",
                 "operator credential does not match database",
@@ -1495,14 +1478,14 @@ fn open_database(root: &Path, credential: &Credential) -> Result<Connection> {
         }
         if local_operator.is_none() {
             set_meta(
-                &tx,
+                tx,
                 LOCAL_OPERATOR_CLIENT_ID_KEY,
                 &json!(credential.client_id),
             )?;
         }
     }
     let workspace_digest = json!(model::digest(WORKSPACE_SCHEMA.as_bytes()));
-    match meta(&tx, "schema_extension:workspace:v1")? {
+    match meta(tx, "schema_extension:workspace:v1")? {
         Some(digest) if digest == workspace_digest => {}
         Some(_) => {
             return Err(Error::new(
@@ -1523,11 +1506,11 @@ fn open_database(root: &Path, credential: &Credential) -> Result<Connection> {
                 ));
             }
             tx.execute_batch(WORKSPACE_SCHEMA)?;
-            set_meta(&tx, "schema_extension:workspace:v1", &workspace_digest)?;
+            set_meta(tx, "schema_extension:workspace:v1", &workspace_digest)?;
         }
     }
     let owned_digest = json!(model::digest(OWNED_SERVICE_SCHEMA.as_bytes()));
-    match meta(&tx, "schema_extension:owned_services:v1")? {
+    match meta(tx, "schema_extension:owned_services:v1")? {
         Some(digest) if digest == owned_digest => {}
         Some(_) => {
             return Err(Error::new(
@@ -1548,20 +1531,20 @@ fn open_database(root: &Path, credential: &Credential) -> Result<Connection> {
                 ));
             }
             tx.execute_batch(OWNED_SERVICE_SCHEMA)?;
-            set_meta(&tx, "schema_extension:owned_services:v1", &owned_digest)?;
+            set_meta(tx, "schema_extension:owned_services:v1", &owned_digest)?;
         }
     }
     install_schema_extension(
-        &tx,
+        tx,
         "schema_extension:scripts:v1",
         SCRIPT_SCHEMA,
         &["scripts", "script_revisions", "script_runs"],
     )?;
-    script_event_schema::install(&tx)?;
-    operation_failure_event_schema::install(&tx)?;
-    operation_cancel_event_schema::install(&tx)?;
+    script_event_schema::install(tx)?;
+    operation_failure_event_schema::install(tx)?;
+    operation_cancel_event_schema::install(tx)?;
     install_schema_extension(
-        &tx,
+        tx,
         "schema_extension:github:v1",
         GITHUB_SCHEMA,
         &[
@@ -1573,21 +1556,21 @@ fn open_database(root: &Path, credential: &Credential) -> Result<Connection> {
         ],
     )?;
     install_schema_extension(
-        &tx,
+        tx,
         "schema_extension:github_label_effects:v1",
         GITHUB_EFFECTS_SCHEMA,
         &["github_label_effect_slots"],
     )?;
     install_schema_extension(
-        &tx,
+        tx,
         "schema_extension:github_pr_effects:v1",
         GITHUB_PR_EFFECTS_SCHEMA,
         &["github_pr_effect_slots"],
     )?;
     let scheduler_key = format!("client:{}", model::INTERNAL_SCHEDULER_CLIENT_ID);
-    match meta(&tx, &scheduler_key)? {
+    match meta(tx, &scheduler_key)? {
         None => set_meta(
-            &tx,
+            tx,
             &scheduler_key,
             &json!({
                 "role": "scheduler", "internal_only": true, "disabled": false
@@ -1601,12 +1584,12 @@ fn open_database(root: &Path, credential: &Credential) -> Result<Connection> {
             ));
         }
     }
-    let epoch = meta(&tx, "host_epoch")?
+    let epoch = meta(tx, "host_epoch")?
         .and_then(|v| v.as_i64())
         .unwrap_or(0)
         .checked_add(1)
         .ok_or_else(|| Error::new("EPOCH_OVERFLOW", "host epoch exhausted"))?;
-    set_meta(&tx, "host_epoch", &json!(epoch))?;
+    set_meta(tx, "host_epoch", &json!(epoch))?;
     tx.execute(
         "UPDATE operations SET state='outcome_unknown',result_json=CASE \
          WHEN method='github.effect.managed_label' AND state='sending' THEN \
@@ -1646,17 +1629,7 @@ fn open_database(root: &Path, credential: &Credential) -> Result<Connection> {
         "UPDATE script_runs SET state='reconciling' WHERE state='running'",
         [],
     )?;
-    tx.commit()?;
-    let fk: i64 = db.pragma_query_value(None, "foreign_keys", |r| r.get(0))?;
-    let mode: String = db.pragma_query_value(None, "journal_mode", |r| r.get(0))?;
-    let sync: i64 = db.pragma_query_value(None, "synchronous", |r| r.get(0))?;
-    if fk != 1 || mode != "wal" || sync != 2 {
-        return Err(Error::new(
-            "STORE_CONFIGURATION",
-            "foreign_keys/WAL/FULL were not applied",
-        ));
-    }
-    Ok(db)
+    Ok(())
 }
 pub(super) fn meta(db: &Connection, key: &str) -> Result<Option<Value>> {
     let raw: Option<String> = db

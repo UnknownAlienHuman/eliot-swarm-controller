@@ -33,6 +33,7 @@ rusqlite = { version = "=0.40.2", features = ["bundled"] }
 swarm-client = { path = "crates/swarm-client" }
 swarm-contracts = { path = "crates/swarm-contracts" }
 swarm-process = { path = "crates/swarm-process" }
+swarm-store = { path = "crates/swarm-store" }
 swarm-telemetry = { path = "crates/swarm-telemetry" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -68,6 +69,7 @@ members = [
     "crates/swarm-contracts",
     "crates/swarm-client",
     "crates/swarm-process",
+    "crates/swarm-store",
     "crates/swarm-telemetry",
 ]
 default-members = ["."]

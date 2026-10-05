@@ -401,6 +401,7 @@ dependencies = [
  "swarm-client",
  "swarm-contracts",
  "swarm-process",
+ "swarm-store",
  "swarm-telemetry",
  "thiserror",
  "tokio",
@@ -1439,6 +1440,16 @@ dependencies = [
  "sha2",
  "swarm-contracts",
  "windows-sys",
+]
+
+[[package]]
+name = "swarm-store"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+ "serde_json",
+ "sha2",
+ "thiserror",
 ]
 
 [[package]]

@@ -1,5 +1,5 @@
 use super::{Config, Error, Principal, Result, Role, model};
-use rusqlite::{Connection, OpenFlags, TransactionBehavior};
+use rusqlite::{Connection, TransactionBehavior};
 use serde_json::{Value, json};
 use std::{path::Path, path::PathBuf, sync::Arc, thread::JoinHandle};
 use tokio::sync::{mpsc, oneshot};
@@ -92,31 +92,16 @@ async fn join_status_thread(thread: JoinHandle<()>) -> Result<()> {
 }
 
 fn open_status_database(path: &Path) -> Result<Connection> {
-    let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    db.busy_timeout(std::time::Duration::from_secs(5))?;
-    db.pragma_update(None, "query_only", "ON")?;
-
-    let query_only: i64 = db.pragma_query_value(None, "query_only", |row| row.get(0))?;
-    let application_id: i64 = db.pragma_query_value(None, "application_id", |row| row.get(0))?;
-    let user_version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    let schema_digest = super::meta(&db, "schema_digest")?;
-    let expected_digest = model::digest(super::SCHEMA.as_bytes());
-    if query_only != 1 {
-        return Err(Error::new(
-            "STORE_CONFIGURATION",
-            "status connection is not query-only",
-        ));
-    }
-    if application_id != super::APPLICATION_ID
-        || user_version != 1
-        || schema_digest != Some(json!(expected_digest))
-    {
-        return Err(Error::new(
-            "SCHEMA_MISMATCH",
-            "read-only status connection does not match the initialized store",
-        ));
-    }
-    Ok(db)
+    swarm_store::open_reader(
+        path,
+        swarm_store::SchemaIdentity {
+            application_id: super::APPLICATION_ID,
+            user_version: 1,
+            base_schema: super::SCHEMA,
+        },
+        swarm_store::ReaderOptions::default(),
+    )
+    .map_err(Into::into)
 }
 
 fn read_status(
