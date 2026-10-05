@@ -167,12 +167,7 @@ pub enum Role {
     Scheduler,
 }
 pub const INTERNAL_SCHEDULER_CLIENT_ID: &str = "eliot-internal-scheduler-v1";
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Credential {
-    pub client_id: String,
-    pub token: String,
-}
+pub use swarm_contracts::credential::Credential;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Principal {
     /// Ephemeral authenticated transport identity, never a durable client ID.
@@ -521,32 +516,7 @@ impl StartOwner {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Request {
-    pub jsonrpc: String,
-    pub id: String,
-    pub method: String,
-    #[serde(default = "empty_object")]
-    pub params: Value,
-}
-fn empty_object() -> Value {
-    json!({})
-}
-impl Request {
-    pub fn validate(&self) -> Result<()> {
-        if self.jsonrpc != "2.0"
-            || self.id.is_empty()
-            || self.method.is_empty()
-            || !self.params.is_object()
-        {
-            return Err(Error::invalid(
-                "expected JSON-RPC 2.0 with nonempty string id/method and object params",
-            ));
-        }
-        Ok(())
-    }
-}
+pub use swarm_contracts::rpc::Request;
 pub fn response(id: Value, result: Result<Value>) -> Value {
     match result {
         Ok(value) => json!({"jsonrpc":"2.0","id":id,"result":value}),

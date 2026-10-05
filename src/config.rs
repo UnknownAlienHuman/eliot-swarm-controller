@@ -88,14 +88,7 @@ pub struct Storage {
     pub data_dir: PathBuf,
     pub queue_capacity: usize,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct Ipc {
-    pub max_frame_bytes: usize,
-    pub max_connections: usize,
-    pub max_inflight_per_connection: usize,
-    pub write_timeout_seconds: u64,
-}
+pub use swarm_client::IpcConfig as Ipc;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Route {
@@ -251,16 +244,6 @@ impl Default for Storage {
         Self {
             data_dir: default_data_dir(),
             queue_capacity: 256,
-        }
-    }
-}
-impl Default for Ipc {
-    fn default() -> Self {
-        Self {
-            max_frame_bytes: 1_048_576,
-            max_connections: 256,
-            max_inflight_per_connection: 8,
-            write_timeout_seconds: 15,
         }
     }
 }

@@ -54,31 +54,10 @@ impl DataRoot {
 
 /// Only touches the prototype's explicitly selected state or credential paths.
 pub fn private_permissions(path: &Path, directory: bool) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(
-            path,
-            std::fs::Permissions::from_mode(if directory { 0o700 } else { 0o600 }),
-        )?;
-    }
-    #[cfg(windows)]
-    windows::restrict_path(path, directory)?;
-    Ok(())
+    swarm_process::private_permissions(path, directory).map_err(Into::into)
 }
 pub fn write_private_new(path: &Path, data: &[u8]) -> Result<()> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut f = options.open(path)?;
-    private_permissions(path, false)?;
-    f.write_all(data)?;
-    f.sync_all()?;
-    Ok(())
+    swarm_process::write_private_new(path, data).map_err(Into::into)
 }
 pub fn load_credential(path: &Path) -> Result<Credential> {
     let c: Credential = serde_json::from_slice(&std::fs::read(path)?)?;
@@ -107,30 +86,5 @@ pub fn bootstrap_credential(root: &Path) -> Result<Credential> {
     Ok(credential)
 }
 pub fn endpoint(root: &Path) -> Result<String> {
-    let canonical = std::fs::canonicalize(root)?;
-    #[cfg(windows)]
-    {
-        use crate::model::digest;
-        Ok(format!(
-            r"\\.\pipe\eliot-swarm-{}",
-            &digest(
-                canonical
-                    .as_os_str()
-                    .to_string_lossy()
-                    .to_lowercase()
-                    .as_bytes()
-            )[..32]
-        ))
-    }
-    #[cfg(unix)]
-    {
-        let path = canonical.join("control.sock");
-        use std::os::unix::ffi::OsStrExt;
-        if path.as_os_str().as_bytes().len() > 100 {
-            return Err(Error::invalid("data-dir too long for a Unix socket"));
-        }
-        path.to_str()
-            .map(str::to_owned)
-            .ok_or_else(|| Error::invalid("data-dir must be UTF-8 for local IPC discovery"))
-    }
+    swarm_client::ipc_endpoint(root).map_err(Into::into)
 }

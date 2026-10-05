@@ -2,6 +2,32 @@
 
 ## Current state
 
+### PR #25 shared packages and initial structured diagnostics — 2026-10-05
+
+The root now consumes four independent Cargo packages: `swarm-contracts`,
+`swarm-client`, `swarm-process` and `swarm-telemetry`. Contracts contain the
+existing transport/runtime DTOs and shared error classification, without
+database, process or provider dependencies. The client owns the existing
+authenticated bounded IPC exchange. Process ownership and private-file
+primitives have moved to their package; root compatibility facades preserve
+host error types. Module groups reject cancellation; check/script cancellation
+and serialized process receipts retain their existing behavior. The two existing
+transport-poisoning tests moved with their implementation; handshake/server
+tests remain in the host.
+
+A failed disconnect transaction emits a bounded metadata record with the known
+client/link and fixed failure category before returning its original error.
+The producer starts no worker at construction and uses a bounded nonblocking
+queue; stderr I/O runs on its lazy writer thread. Recorder failure/drop counters
+remain local diagnostics. This initial producer does not implement logging
+reload, recorder rotation, metrics RPCs or a live observer.
+
+Workspace metadata and lock resolution pass without compilation, and the lock
+adds only the four local packages. Explicit package formatting and source review
+are the current gate; this extraction has not been compiled or run yet. Store,
+kernel, generic supervision, the full bus/adapter split and M5/M6 remain open.
+See [shared package boundaries](agent-operations/shared-packages.md).
+
 ### PR #25 M1 source: Manager planning and disconnect persistence — 2026-10-05
 
 The modular-runtime specification is merged in `5a35389`. Its first source
@@ -19,11 +45,13 @@ exact old-link protection and conservative unknown outcome remain intact.
 
 CLI read classification now uses the canonical application registry, fixing
 `report.capacity` and `report.attention` and avoiding a separate read-method
-list. Source review covers this classification and the Manager policy. This
-slice is not yet compiled or runtime-qualified; the small telemetry producer
-and M2 package extraction are still in progress. No local tests/builds were
-requested. Full independent packages, optional-worker isolation, configurable
-live monitoring and the complete hosted workflow remain unfinished.
+list. Source review covers this classification and the Manager policy. Published
+`4057404` passed complete Windows and remote Ubuntu CI in
+[run 37307959079](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37307959079).
+No local tests/builds were run for that increment; hosted native qualification
+remains pending. The later package/telemetry extraction above has its own
+verification boundary. Full independent packages, optional-worker isolation,
+configurable live monitoring and the complete hosted workflow remain unfinished.
 
 ### Module disconnect and rootless-open readback — 2026-10-05
 

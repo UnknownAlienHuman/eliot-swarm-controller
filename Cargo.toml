@@ -30,6 +30,10 @@ hyper-util = { version = "=0.1.21", default-features = false, features = ["http1
 reqwest = { version = "=0.13.5", default-features = false, features = ["json", "stream"] }
 rmcp = { version = "=3.5.0", default-features = false, features = ["server", "transport-io", "transport-streamable-http-server"] }
 rusqlite = { version = "=0.40.2", features = ["bundled"] }
+swarm-client = { path = "crates/swarm-client" }
+swarm-contracts = { path = "crates/swarm-contracts" }
+swarm-process = { path = "crates/swarm-process" }
+swarm-telemetry = { path = "crates/swarm-telemetry" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
@@ -50,10 +54,24 @@ libc = "=0.2.189"
 lto = "thin"
 strip = "debuginfo"
 
-# Standalone repository: an empty workspace table keeps Cargo from attaching this package to a Cargo workspace
-# in a parent directory (a clone under C:\Development\Rust\projects\ failed with "current package believes
-# it's in a workspace when it's not"). Commands still default to the root package; CI formats it with `-p`.
+[profile.iterate]
+inherits = "dev"
+opt-level = 1
+debug = "line-tables-only"
+strip = "none"
+incremental = true
+lto = "off"
+
+# Own workspace boundary; the default entrypoint remains the root CLI/kernel.
 [workspace]
+members = [
+    "crates/swarm-contracts",
+    "crates/swarm-client",
+    "crates/swarm-process",
+    "crates/swarm-telemetry",
+]
+default-members = ["."]
+resolver = "3"
 # Note: the vendored atlas-redact path dependency becomes a workspace member. Never run a bare
 # `cargo fmt` at the root: it would reformat the preserved upstream Atlas snapshot (vendor/atlas,
-# hash-verified in CI). Format the owned crate only, as CI does: cargo fmt -p eliot-swarm-controller.
+# hash-verified in CI). Format explicit owned packages with cargo fmt -p <name>.

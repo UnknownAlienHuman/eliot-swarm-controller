@@ -1,0 +1,19 @@
+[package]
+name = "swarm-client"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+publish = false
+description = "Authenticated bounded local IPC client for Eliot Swarm"
+
+[dependencies]
+futures-util = { version = "0.3", features = ["sink"] }
+serde_json = "1"
+sha2 = "0.10"
+swarm-contracts = { path = "../swarm-contracts" }
+tokio = { version = "1", features = ["io-util", "net", "time"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }

@@ -6,8 +6,16 @@ default:
 metadata:
     cargo metadata --locked --no-deps --format-version 1
 
+# Scoped developer gate: format and strict Clippy only for changed packages
+# plus their actual local reverse dependencies. BASE and HEAD are full commit SHAs.
+verify BASE HEAD:
+    pwsh -NoProfile -File tools/ci/package-scope.ps1 -Stage Verify -BaseSha "{{BASE}}" -HeadSha "{{HEAD}}"
+
 fmt:
     cargo fmt -p eliot-swarm-controller -- --check
+
+fmt-package package:
+    cargo fmt --package "{{package}}" -- --check
 
 check:
     cargo check --locked --lib --bins
@@ -15,8 +23,14 @@ check:
 clippy:
     cargo clippy --locked --lib --bins --no-deps -- -D warnings
 
+clippy-package package:
+    cargo clippy --locked --package "{{package}}" --lib --bins --no-deps -- -D warnings
+
 test:
     cargo test --locked -p eliot-swarm-controller --lib --bins
+
+test-target package target:
+    cargo test --locked --package "{{package}}" --test "{{target}}"
 
 # These fixtures exercise native contracts; they never call a real model.
 bridge-fixtures:
@@ -39,5 +53,8 @@ opencode-fixtures:
 build:
     cargo build --locked --release --bin swarm
 
-# Install the documented locked module SDKs before invoking this gate.
-verify: fmt clippy test bridge-fixtures codex-fixtures opencode-fixtures build
+full-rust:
+    pwsh -NoProfile -File tools/ci/package-scope.ps1 -Stage FullRust
+
+# Explicit full local qualification; scoped PR checks do not call this recipe.
+verify-full: full-rust bridge-fixtures codex-fixtures opencode-fixtures build

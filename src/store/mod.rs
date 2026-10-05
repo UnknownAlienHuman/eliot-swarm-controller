@@ -113,6 +113,7 @@ pub struct Store {
     artifacts: ArtifactFiles,
     artifact_io: Arc<Semaphore>,
     data_dir: std::path::PathBuf,
+    telemetry: swarm_telemetry::Producer,
 }
 pub struct StoreOwner {
     thread: JoinHandle<()>,
@@ -220,6 +221,7 @@ impl StoreOwner {
                 artifacts,
                 data_dir,
                 artifact_io: Arc::new(Semaphore::new(4)),
+                telemetry: swarm_telemetry::Producer::new(swarm_telemetry::Config::default()),
             },
         })
     }
@@ -1357,9 +1359,28 @@ impl Store {
             .await
     }
     pub async fn disconnected(&self, principal: Principal) -> Result<()> {
-        let changed = self
+        let client_id = principal.client_id.clone();
+        let link_id = principal.link_id.clone();
+        let changed = match self
             .run(move |db| runtime::disconnected(db, &principal))
-            .await?;
+            .await
+        {
+            Ok(changed) => changed,
+            Err(error) => {
+                use swarm_telemetry::{Code, Kind, Phase, Record, Severity};
+                let _ = self.telemetry.emit(
+                    Record::new(
+                        Severity::Error,
+                        Kind::StoreOperationFailed,
+                        Phase::StoreDisconnect,
+                    )
+                    .with_client_id(Some(&client_id))
+                    .with_link_id(Some(&link_id))
+                    .with_code(Some(Code::DisconnectPersistenceFailed)),
+                );
+                return Err(error);
+            }
+        };
         if changed {
             self.changed
                 .send_modify(|revision| *revision = revision.wrapping_add(1));

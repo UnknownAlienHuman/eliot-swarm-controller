@@ -2,12 +2,231 @@ name: Rust
 on:
   push:
     branches: [main]
-    paths: ['src/**', 'migrations/**', 'modules/**', 'vendor/**', 'config/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.github/workflows/rust.yml']
+    paths:
+      - 'src/**'
+      - 'crates/**'
+      - 'migrations/**'
+      - 'modules/**'
+      - 'vendor/**'
+      - 'config/**'
+      - 'tests/**'
+      - 'tools/**'
+      - '.github/workflows/**'
+      - '.github/actions/**'
+      - 'Justfile'
+      - 'README.md'
+      - 'docs/**'
+      - 'THIRD_PARTY_NOTICES.md'
+      - '**/Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.cargo/**'
+      - '**/build.rs'
+      - '**/package.json'
+      - '**/package-lock.json'
+      - '**/npm-shrinkwrap.json'
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+    # Intentionally no path filter: the scoped classifier must see tests/**,
+    # tools/**, Justfile, workflow changes, documentation, and newly added paths.
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
+  scope:
+    name: Classify changed paths and package ownership
+    runs-on: ubuntu-latest
+    outputs:
+      docs_changed: ${{ steps.classify.outputs.docs_changed }}
+      rust_changed: ${{ steps.classify.outputs.rust_changed }}
+      metadata_needed: ${{ steps.classify.outputs.metadata_needed }}
+      tests_changed: ${{ steps.classify.outputs.tests_changed }}
+      tooling_changed: ${{ steps.classify.outputs.tooling_changed }}
+      atlas_changed: ${{ steps.classify.outputs.atlas_changed }}
+      product_changed: ${{ steps.classify.outputs.product_changed }}
+      changed_paths: ${{ steps.classify.outputs.changed_paths }}
+      module_js_files: ${{ steps.classify.outputs.module_js_files }}
+      packages: ${{ steps.resolve.outputs.packages_json || '[]' }}
+      clippy_packages: ${{ steps.resolve.outputs.clippy_packages_json || '[]' }}
+      test_targets: ${{ steps.resolve.outputs.test_targets_json || '[]' }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+      - name: Classify changed paths without Cargo
+        id: classify
+        shell: pwsh
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          & pwsh -NoProfile -File tools/ci/package-scope.ps1 -Stage Classify -BaseSha $env:BASE_SHA -HeadSha $env:HEAD_SHA
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Pinned toolchain for metadata only
+        if: steps.classify.outputs.metadata_needed == 'true'
+        shell: bash
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy --no-self-update
+          rustc --version
+          cargo --version
+      - name: Resolve changed packages and real local reverse dependencies
+        id: resolve
+        if: steps.classify.outputs.metadata_needed == 'true'
+        shell: pwsh
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          & pwsh -NoProfile -File tools/ci/package-scope.ps1 -Stage Resolve -BaseSha $env:BASE_SHA -HeadSha $env:HEAD_SHA
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  docs-only:
+    name: Documentation validation
+    needs: scope
+    if: (github.event_name == 'pull_request' || github.event_name == 'push') && needs.scope.outputs.docs_changed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+      - name: Validate changed Markdown and diff whitespace
+        shell: pwsh
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          & pwsh -NoProfile -File tools/ci/package-scope.ps1 -Stage ValidateDocs -BaseSha $env:BASE_SHA -HeadSha $env:HEAD_SHA
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  tooling-scope:
+    name: Build-recipe and tooling path checks
+    needs: scope
+    if: (github.event_name == 'pull_request' || github.event_name == 'push') && needs.scope.outputs.tooling_changed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+      - name: Check whitespace and changed tooling syntax/metadata
+        shell: pwsh
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          & pwsh -NoProfile -File tools/ci/package-scope.ps1 -Stage ValidateTooling -BaseSha $env:BASE_SHA -HeadSha $env:HEAD_SHA
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  module-syntax:
+    name: Changed JavaScript module syntax
+    needs: scope
+    if: (github.event_name == 'pull_request' || github.event_name == 'push') && needs.scope.outputs.module_js_files != '[]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Parse only changed module files
+        shell: pwsh
+        env:
+          MODULE_JS_FILES: ${{ needs.scope.outputs.module_js_files }}
+        run: |
+          $files = @($env:MODULE_JS_FILES | ConvertFrom-Json)
+          foreach ($file in $files) {
+            node --check $file
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+  scoped-rust:
+    name: Changed Rust packages (format, Clippy, changed integration targets)
+    needs: scope
+    if: (github.event_name == 'pull_request' || github.event_name == 'push') && (needs.scope.outputs.packages != '[]' || needs.scope.outputs.test_targets != '[]')
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Pinned toolchain
+        shell: bash
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy --no-self-update
+          rustc --version
+          cargo --version
+      - name: Formatting (selected packages only; vendor snapshots excluded)
+        shell: pwsh
+        env:
+          PACKAGE_SPECS: ${{ needs.scope.outputs.packages }}
+        run: |
+          $packages = @($env:PACKAGE_SPECS | ConvertFrom-Json)
+          if ($packages.Count -gt 0) {
+            $arguments = @('fmt', '--check')
+            foreach ($package in $packages) { $arguments += @('--package', [string]$package) }
+            $arguments += '--'
+            & cargo @arguments
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+      - name: Strict Clippy (selected library/binary packages only)
+        shell: pwsh
+        env:
+          PACKAGE_SPECS: ${{ needs.scope.outputs.clippy_packages }}
+        run: |
+          $packages = @($env:PACKAGE_SPECS | ConvertFrom-Json)
+          if ($packages.Count -gt 0) {
+            $arguments = @('clippy', '--locked', '--lib', '--bins', '--no-deps')
+            foreach ($package in $packages) { $arguments += @('--package', [string]$package) }
+            $arguments += @('--', '-D', 'warnings')
+            & cargo @arguments
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+      - name: Run changed integration targets only
+        if: needs.scope.outputs.tests_changed == 'true'
+        shell: pwsh
+        env:
+          TEST_TARGETS: ${{ needs.scope.outputs.test_targets }}
+        run: |
+          $targets = @($env:TEST_TARGETS | ConvertFrom-Json)
+          foreach ($target in $targets) {
+            & cargo test --locked --package $target.package --test $target.target
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+  atlas-integrity:
+    name: Preserve Atlas donor snapshot
+    needs: scope
+    if: (github.event_name == 'pull_request' || github.event_name == 'push') && needs.scope.outputs.atlas_changed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact donor file set and hashes
+        shell: python
+        run: |
+          import hashlib
+          from pathlib import Path
+          root = Path('vendor/atlas')
+          expected = {}
+          for line in (root / 'SHA256SUMS').read_text().splitlines():
+              digest, name = line.split('  ', 1)
+              assert name not in expected, name
+              path = root / name
+              assert not path.is_symlink() and path.is_file(), name
+              assert hashlib.sha256(path.read_bytes()).hexdigest() == digest, name
+              expected[name] = digest
+          actual = {p.relative_to(root).as_posix() for p in root.rglob('*') if p.is_file()}
+          assert actual == set(expected) | {'SHA256SUMS'}, 'donor file set changed'
+
   build:
+    name: Full existing qualification (manual only)
+    needs: scope
+    if: github.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
       matrix:
@@ -21,8 +240,11 @@ jobs:
           rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy --no-self-update
           rustc --version
           cargo --version
-      - name: Formatting (owned crate only; preserve upstream snapshot)
-        run: cargo fmt -p eliot-swarm-controller -- --check
+      - name: Format, lint, and test all owned workspace packages from metadata
+        shell: pwsh
+        run: |
+          & pwsh -NoProfile -File tools/ci/package-scope.ps1 -Stage FullRust
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Verify Atlas donor snapshot
         shell: python
         run: |
@@ -39,10 +261,6 @@ jobs:
               expected[name] = digest
           actual = {p.relative_to(root).as_posix() for p in root.rglob('*') if p.is_file()}
           assert actual == set(expected) | {'SHA256SUMS'}, 'donor file set changed'
-      - name: Clippy
-        run: cargo clippy --locked --lib --bins --no-deps -- -D warnings
-      - name: Rust application and protocol tests
-        run: cargo test --locked -p eliot-swarm-controller --lib --bins --tests
       - name: Muse bridge syntax and pinned SDK import
         shell: bash
         run: |

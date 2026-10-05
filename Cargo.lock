@@ -398,6 +398,10 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "swarm-client",
+ "swarm-contracts",
+ "swarm-process",
+ "swarm-telemetry",
  "thiserror",
  "tokio",
  "tokio-util",
@@ -1401,6 +1405,47 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "swarm-client"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "serde_json",
+ "sha2",
+ "swarm-contracts",
+ "tokio",
+ "tokio-util",
+ "uuid",
+]
+
+[[package]]
+name = "swarm-contracts"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "swarm-process"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde_json",
+ "sha2",
+ "swarm-contracts",
+ "windows-sys",
+]
+
+[[package]]
+name = "swarm-telemetry"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
