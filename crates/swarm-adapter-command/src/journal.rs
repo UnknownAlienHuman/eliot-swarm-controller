@@ -10,7 +10,7 @@ use std::{
 use swarm_contracts::{
     RuntimeOutcome,
     error::{Error, Result},
-    runtime::TaskDispatchAdmissionReceipt,
+    runtime::{TaskDispatchAdmissionReceipt, TaskDispatchContext},
 };
 use swarm_process::{private_permissions, write_private_new};
 
@@ -606,10 +606,226 @@ impl RunStore {
         receipt: &Value,
     ) -> Result<()> {
         let dir = self.directory(operation_id)?;
+        let admission: AdmissionRecord = read_json(&dir.join("admission.json"))?;
+        if admission.schema != 1
+            || admission.module_artifact_id != ARTIFACT_ID
+            || admission.execution_shape != EXECUTION_SHAPE
+            || admission.identity.operation_id != operation_id
+            || !admission_checksum_valid(&admission)
+        {
+            return Err(Error::new(
+                "ADAPTER_EVIDENCE_INVALID",
+                "native evidence has no matching immutable operation admission",
+            ));
+        }
+        let mut durable_receipt = receipt.clone();
+        let receipt_fields = durable_receipt.as_object_mut().ok_or_else(|| {
+            Error::new(
+                "ADAPTER_EVIDENCE_INVALID",
+                "native evidence receipt must be an object",
+            )
+        })?;
+        if receipt_fields
+            .get("operation_id")
+            .is_some_and(|saved| saved.as_str() != Some(operation_id))
+        {
+            return Err(Error::new(
+                "ADAPTER_EVIDENCE_CONFLICT",
+                "native evidence operation differs from its immutable admission",
+            ));
+        }
+        receipt_fields.insert("operation_id".to_owned(), json!(operation_id));
+        if !admission.identity.input_sha256.is_empty() {
+            if receipt_fields.get("input_sha256").is_some_and(|saved| {
+                saved.as_str() != Some(admission.identity.input_sha256.as_str())
+            }) {
+                return Err(Error::new(
+                    "ADAPTER_EVIDENCE_CONFLICT",
+                    "native evidence input digest differs from its immutable admission",
+                ));
+            }
+            receipt_fields.insert(
+                "input_sha256".to_owned(),
+                json!(admission.identity.input_sha256),
+            );
+        }
         write_replace_bytes(&dir.join("stdout.ndjson"), stdout)?;
         write_replace_bytes(&dir.join("stderr.txt"), stderr)?;
-        write_replace_json(&dir.join("run.json"), receipt)
+        write_replace_json(&dir.join("run.json"), &durable_receipt)
     }
+
+    /// Read only a previously admitted native capture. This never creates an
+    /// operation directory or admission record, and rechecks the normalized
+    /// dispatch marker when the exact Store request carried dispatch context.
+    pub fn read_native_output(
+        &self,
+        operation_id: &str,
+        input_sha256: &str,
+        binding_id: &str,
+        generation: i64,
+        route: &Value,
+        expected: &Value,
+    ) -> Result<Vec<u8>> {
+        let unavailable = || {
+            Error::new(
+                "BATCH_OUTPUT_UNAVAILABLE",
+                "exact Command capture evidence is not retained",
+            )
+        };
+        let dir = self.existing_directory(operation_id)?;
+        let admission: AdmissionRecord = read_json(&dir.join("admission.json"))?;
+        let route_sha256 = digest(canonical(route)?.as_bytes());
+        if admission.schema != 1
+            || admission.module_artifact_id != ARTIFACT_ID
+            || admission.execution_shape != EXECUTION_SHAPE
+            || admission.identity.operation_id != operation_id
+            || admission.identity.input_sha256 != input_sha256
+            || admission.binding_id != binding_id
+            || admission.generation != generation
+            || admission.route_sha256 != route_sha256
+            || !admission_checksum_valid(&admission)
+        {
+            return Err(unavailable());
+        }
+
+        let dispatch_marker = dir.join("dispatch-admission.json");
+        let marker_metadata = fs::symlink_metadata(&dispatch_marker);
+        match (
+            expected["task_dispatch_context"].is_object(),
+            marker_metadata,
+        ) {
+            (true, Ok(metadata)) if !metadata.file_type().is_symlink() && metadata.is_file() => {
+                let saved: DispatchAdmissionRecord = read_json(&dispatch_marker)?;
+                if saved.schema != 1
+                    || saved.module_artifact_id != ARTIFACT_ID
+                    || saved.operation_id != operation_id
+                    || saved.receipt.operation_id != operation_id
+                    || !dispatch_admission_checksum_valid(&saved)
+                    || saved.receipt.validate().is_err()
+                    || !dispatch_context_matches_projection(
+                        &expected["task_dispatch_context"],
+                        &saved.receipt.context(),
+                    )
+                    || serde_json::to_value(saved.receipt.module_receipt.clone())?
+                        != expected["module_receipt"]
+                    || saved.receipt.native_payload_sha256 != admission.identity.prompt_sha256
+                    || saved.receipt.native_payload_bytes != admission.identity.prompt_bytes as u64
+                    || (!expected["dispatch_admission"].is_null()
+                        && serde_json::to_value(&saved.receipt)? != expected["dispatch_admission"])
+                {
+                    return Err(unavailable());
+                }
+            }
+            (true, Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(unavailable());
+            }
+            (false, Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                if !expected["dispatch_admission"].is_null() {
+                    return Err(unavailable());
+                }
+            }
+            _ => {
+                return Err(unavailable());
+            }
+        }
+
+        let native_output = expected["native_output"]
+            .as_str()
+            .filter(|value| matches!(*value, "stdout.ndjson" | "stderr.txt"))
+            .ok_or_else(unavailable)?;
+        let receipt: Value = read_json(&dir.join("run.json"))?;
+        let stream = if native_output == "stdout.ndjson" {
+            "stdout"
+        } else {
+            "stderr"
+        };
+        let limit = if stream == "stdout" {
+            16 * 1024 * 1024
+        } else {
+            256 * 1024
+        };
+        let bytes = read_bounded_bytes(&dir.join(native_output), limit)?;
+        let stream_bytes = expected["stream_bytes"].as_u64().ok_or_else(unavailable)?;
+        let stored_bytes = expected["stored_bytes"].as_u64().ok_or_else(unavailable)?;
+        let stream_sha256 = expected["stream_sha256"].as_str().ok_or_else(unavailable)?;
+        let stored_sha256 = expected["stored_sha256"].as_str().ok_or_else(unavailable)?;
+        let truncated = expected["truncated"].as_bool().ok_or_else(unavailable)?;
+        let read_error = expected["read_error"].as_bool().ok_or_else(unavailable)?;
+        if receipt["operation_id"].as_str() != Some(operation_id)
+            || receipt["input_sha256"].as_str() != Some(input_sha256)
+            || receipt_capture_fact(&receipt, stream, "bytes", "bytes").and_then(Value::as_u64)
+                != Some(stream_bytes)
+            || receipt_capture_fact(&receipt, stream, "stored_bytes", "stored_bytes")
+                .and_then(Value::as_u64)
+                != Some(stored_bytes)
+            || receipt_capture_fact(&receipt, stream, "sha256", "sha256").and_then(Value::as_str)
+                != Some(stream_sha256)
+            || receipt_capture_fact(&receipt, stream, "stored_sha256", "stored_sha256")
+                .and_then(Value::as_str)
+                != Some(stored_sha256)
+            || receipt_capture_fact(&receipt, stream, "truncated", "truncated")
+                .and_then(Value::as_bool)
+                != Some(truncated)
+            || receipt_capture_fact(&receipt, stream, "read_error", "read_error")
+                .and_then(Value::as_bool)
+                != Some(read_error)
+            || receipt
+                .get("direct_child")
+                .or_else(|| receipt.get("native_child"))
+                != Some(&expected["native_child"])
+            || bytes.len() as u64 != stored_bytes
+            || bytes.len() as u64 > limit as u64
+            || digest(&bytes) != stored_sha256
+            || stream_bytes < stored_bytes
+            || (!truncated && !read_error && stream_bytes != stored_bytes)
+            || (!truncated && !read_error && stream_sha256 != stored_sha256)
+        {
+            return Err(unavailable());
+        }
+        Ok(bytes)
+    }
+
+    fn existing_directory(&self, operation_id: &str) -> Result<PathBuf> {
+        let path = self
+            .root
+            .join(format!("op-{}", digest(operation_id.as_bytes())));
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                Error::new(
+                    "BATCH_OUTPUT_UNAVAILABLE",
+                    "exact Command capture evidence is not retained",
+                )
+            } else {
+                error.into()
+            }
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(Error::new(
+                "ADAPTER_EVIDENCE_INVALID",
+                "operation evidence path is not a regular directory",
+            ));
+        }
+        let canonical = fs::canonicalize(&path)?;
+        if canonical.parent() != Some(self.root.as_path()) {
+            return Err(Error::new(
+                "ADAPTER_EVIDENCE_INVALID",
+                "operation evidence escaped the private run store",
+            ));
+        }
+        Ok(canonical)
+    }
+}
+
+fn receipt_capture_fact<'a>(
+    receipt: &'a Value,
+    stream: &str,
+    suffix: &str,
+    nested_name: &str,
+) -> Option<&'a Value> {
+    let top_name = format!("{stream}_{suffix}");
+    receipt
+        .get(top_name.as_str())
+        .or_else(|| receipt.get(stream).and_then(|value| value.get(nested_name)))
 }
 
 fn admission_checksum(record: &AdmissionRecord) -> Result<String> {
@@ -637,6 +853,39 @@ fn dispatch_admission_checksum(record: &DispatchAdmissionRecord) -> Result<Strin
         "receipt":record.receipt.clone()
     });
     Ok(digest(canonical(&value)?.as_bytes()))
+}
+
+fn dispatch_context_matches_projection(projection: &Value, context: &TaskDispatchContext) -> bool {
+    projection.as_object().is_some_and(|fields| {
+        fields.len() == 11
+            && [
+                "schema_version",
+                "operation_id",
+                "binding_id",
+                "binding_generation",
+                "worker_boot_id",
+                "attempt_id",
+                "task_id",
+                "task_revision",
+                "task_snapshot_sha256",
+                "source_text_sha256",
+                "source_text_bytes",
+            ]
+            .iter()
+            .all(|key| fields.contains_key(*key))
+    }) && context.validate().is_ok()
+        && projection["schema_version"] == context.schema_version
+        && projection["operation_id"] == context.operation_id
+        && projection["binding_id"] == context.binding_id
+        && projection["binding_generation"] == context.binding_generation
+        && (projection["worker_boot_id"].is_null()
+            || projection["worker_boot_id"] == context.worker_boot_id)
+        && projection["attempt_id"] == context.attempt_id
+        && projection["task_id"] == context.task_id
+        && projection["task_revision"] == context.task_revision
+        && projection["task_snapshot_sha256"] == context.task_snapshot_sha256
+        && projection["source_text_sha256"] == context.source_text_sha256
+        && projection["source_text_bytes"] == context.source_text_bytes
 }
 
 fn dispatch_admission_checksum_valid(record: &DispatchAdmissionRecord) -> bool {
@@ -696,6 +945,36 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
     }
     serde_json::from_slice(&bytes)
         .map_err(|_| Error::new("ADAPTER_EVIDENCE_INVALID", "saved JSON record is malformed"))
+}
+
+fn read_bounded_bytes(path: &Path, maximum: usize) -> Result<Vec<u8>> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            Error::new(
+                "BATCH_OUTPUT_UNAVAILABLE",
+                "exact Command capture bytes are not retained",
+            )
+        } else {
+            error.into()
+        }
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > maximum as u64 {
+        return Err(Error::new(
+            "ADAPTER_EVIDENCE_INVALID",
+            "native capture is not a bounded regular file",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    File::open(path)?
+        .take(maximum as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > maximum {
+        return Err(Error::new(
+            "ADAPTER_EVIDENCE_INVALID",
+            "native capture exceeds its byte limit",
+        ));
+    }
+    Ok(bytes)
 }
 
 fn write_new_json(path: &Path, value: &impl Serialize) -> Result<()> {

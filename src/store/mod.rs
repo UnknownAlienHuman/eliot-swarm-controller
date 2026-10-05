@@ -39,6 +39,9 @@ pub(crate) mod launcher;
 mod launcher_dispatch;
 mod launcher_issuance;
 mod launcher_mcp_tools;
+pub(crate) use launcher_mcp_tools::{
+    participant_capability_projection, ParticipantCapabilityScope,
+};
 mod launcher_native_mcp;
 mod launcher_owned_service;
 mod launcher_participant;
@@ -1772,10 +1775,13 @@ impl Store {
         let page: ResultPage = serde_json::from_value(params["page"].clone())?;
         let p = principal.clone();
         let source = page.source.clone();
-        let command_status_page = page.source["kind"] == "command_status";
+        let command_result_page = matches!(
+            page.source["kind"].as_str(),
+            Some("command_status" | "command_output")
+        );
         let mut metadata = self
             .run(move |db| {
-                if command_status_page {
+                if command_result_page {
                     command_results::prepare(db, &p, &op, &source)
                 } else {
                     results::prepare(db, &p, &op, &source)
@@ -1846,6 +1852,9 @@ impl Store {
                 ));
             }
         }
+        if metadata["selector"]["kind"] == "command_output" {
+            command_results::validate_output_page(&page, &metadata, &bytes)?;
+        }
         if metadata["requested_offset"].as_u64() != Some(page.offset_bytes)
             || page.byte_length > metadata["requested_length"].as_u64().unwrap_or(0)
         {
@@ -1866,10 +1875,13 @@ impl Store {
         let saved = record.clone();
         self.file_io(move |files| files.publish(&saved, &bytes))
             .await?;
-        let command_status_page = record.metadata["selector"]["kind"] == "command_status";
+        let command_result_page = matches!(
+            record.metadata["selector"]["kind"].as_str(),
+            Some("command_status" | "command_output")
+        );
         let result = self
             .run(move |db| {
-                if command_status_page {
+                if command_result_page {
                     command_results::record(db, &principal, &record)
                 } else {
                     results::record(db, &principal, &record)

@@ -446,11 +446,16 @@ pub(crate) fn reset_for_host_start(tx: &Transaction<'_>, now_ms: i64) -> Result<
             .and_then(|health| health.get("owner_receipt_sha256"))
             .cloned()
             .unwrap_or(Value::Null);
+        let error_code = previous_health
+            .and_then(|health| health.get("error_code"))
+            .and_then(Value::as_str)
+            .filter(|code| safe_error_code(code))
+            .unwrap_or("BUS_SERVICE_HOST_RESTART_RECONCILING");
         registration["managed_bus_service_health"] = json!({
             "schema_version":HEALTH_VERSION,
             "state":"unknown",
             "consecutive_failures":0,
-            "error_code":"BUS_SERVICE_HOST_RESTART_RECONCILING",
+            "error_code":error_code,
             "retry_after_ms":Value::Null,
             "updated_at_ms":now_ms,
             "start_attempts_ms":starts,

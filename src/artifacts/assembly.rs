@@ -72,21 +72,53 @@ fn identity(page: &ArtifactRecord) -> Result<Value> {
             "only registered native result pages can be assembled",
         ));
     }
-    for key in ["binding_id", "native_scope_key", "native_root_id"] {
-        model::text(m, key)?;
-    }
+    let command_output = m["source"]["kind"] == "command_output";
+    model::text(m, "binding_id")?;
     model::positive(m, "generation")?;
+    if command_output {
+        if m["selector"]["kind"] != "command_output" {
+            return Err(Error::new(
+                "RESULT_METADATA",
+                "Command output selector differs from its page provenance",
+            ));
+        }
+    } else {
+        for key in ["native_scope_key", "native_root_id"] {
+            model::text(m, key)?;
+        }
+    }
     let mut source = m["source"].clone();
     // This flag describes individual page coverage, not source identity.
     source
         .as_object_mut()
         .expect("checked object")
         .remove("whole_digest_verified");
-    Ok(
-        json!({"binding_id":m["binding_id"],"generation":m["generation"],
-        "native_scope_key":m["native_scope_key"],"native_root_id":m["native_root_id"],
-        "selector":m["selector"],"source":source,"media_type":m["media_type"],"total_bytes":m["total_bytes"]}),
-    )
+    if command_output {
+        let source = source.as_object_mut().expect("checked object");
+        source.remove("result_operation_id");
+        source.remove("result_input_sha256");
+        source.remove("result_module_receipt");
+        Ok(json!({
+            "binding_id":m["binding_id"],
+            "generation":m["generation"],
+            "binding_generation":m["generation"],
+            "selector":m["selector"],
+            "source":source,
+            "media_type":m["media_type"],
+            "total_bytes":m["total_bytes"]
+        }))
+    } else {
+        Ok(json!({
+            "binding_id":m["binding_id"],
+            "generation":m["generation"],
+            "native_scope_key":m["native_scope_key"],
+            "native_root_id":m["native_root_id"],
+            "selector":m["selector"],
+            "source":source,
+            "media_type":m["media_type"],
+            "total_bytes":m["total_bytes"]
+        }))
+    }
 }
 fn plan(pages: &[ArtifactRecord]) -> Result<(Value, Vec<ResultPart>, u64)> {
     let first = pages
@@ -164,8 +196,28 @@ impl ArtifactFiles {
                     "assembled bytes differ from expected_sha256",
                 ));
             }
-            let reported = identity["source"]["content_digest"].as_str();
-            let native_sha = reported.and_then(|h| h.strip_prefix("sha256:"));
+            let command_output = identity["source"]["kind"] == "command_output";
+            let capture = &identity["source"]["target_command_output"];
+            let stored_sha = command_output
+                .then(|| capture["stored_sha256"].as_str())
+                .flatten();
+            if stored_sha.is_some_and(|expected| !expected.eq_ignore_ascii_case(&digest)) {
+                return Err(Error::new(
+                    "RESULT_DIGEST_MISMATCH",
+                    "assembled bytes differ from the captured stored-stream digest",
+                ));
+            }
+            let native_sha = if command_output {
+                if capture["truncated"] == false && capture["read_error"] == false {
+                    capture["stream_sha256"].as_str()
+                } else {
+                    None
+                }
+            } else {
+                identity["source"]["content_digest"]
+                    .as_str()
+                    .and_then(|h| h.strip_prefix("sha256:"))
+            };
             if native_sha.is_some_and(|h| !h.eq_ignore_ascii_case(&digest)) {
                 return Err(Error::new(
                     "RESULT_DIGEST_MISMATCH",
@@ -183,7 +235,11 @@ impl ArtifactFiles {
                 metadata: json!({"assembly_operation_id":operation_id,"identity":identity,"parts":parts,
                     "part_count":pages.len(),"coverage":"complete","byte_length":total,
                     "sha256":digest,"expected_sha256":expected,"expected_digest_verified":expected.is_some(),
-                    "native_digest_verified":native_sha.is_some(),"task_accepted":false}),
+                    "native_digest_verified":native_sha.is_some(),
+                    "capture_prefix_verified":stored_sha.is_some(),
+                    "capture_truncated":if command_output {capture["truncated"].clone()} else {Value::Null},
+                    "capture_read_error":if command_output {capture["read_error"].clone()} else {Value::Null},
+                    "task_accepted":false}),
             };
             match fs::hard_link(&temp, self.path(&record)?) {
                 Ok(()) => {}

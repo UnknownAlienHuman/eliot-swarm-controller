@@ -4,7 +4,10 @@
 //! relevance indexes. Operations and Observations remain the audit/mailbox
 //! authority; this module adds no schema or Task graph.
 
-use super::{gm, meta, operations, results, set_meta, tasks};
+use super::{
+    gm, meta, operations, participant_capability_projection, results, set_meta, tasks,
+    ParticipantCapabilityScope,
+};
 use crate::{
     config::Config,
     coordination as keys,
@@ -2808,6 +2811,24 @@ fn context_get(db: &Connection, principal: &Principal, value: &Value) -> Result<
         ],
     )?;
     let scope = read_scope(db, principal, value)?;
+    let runtime_capability = if principal.role == Role::Participant {
+        participant_capability_projection(
+            db,
+            ParticipantCapabilityScope {
+                participant_id: &principal.client_id,
+                task_id: model::text(&scope.task, "task_id")?,
+                task_revision: model::positive(&scope.task, "revision")?,
+                attempt_id: model::text(&scope.attempt, "attempt_id")?,
+                binding_id: scope.attempt["binding_id"].as_str(),
+                binding_generation: scope.attempt["binding_generation"].as_i64(),
+                grant_revision: scope.registration["grant_revision"].as_i64(),
+                native_session_id: scope.registration["native_session_id"].as_str(),
+                basis_kind: scope.registration["participation_basis"]["kind"].as_str(),
+            },
+        )?
+    } else {
+        Value::Null
+    };
     let participant_id =
         (principal.role == Role::Participant).then_some(principal.client_id.as_str());
     let work_card = match participant_id {
@@ -2862,6 +2883,7 @@ fn context_get(db: &Connection, principal: &Principal, value: &Value) -> Result<
         "contract_cards":contract_cards,
         "contract_card_gaps":gaps,
         "peer_discovery":peer_discovery,
+        "runtime_capability":runtime_capability,
     }))
 }
 

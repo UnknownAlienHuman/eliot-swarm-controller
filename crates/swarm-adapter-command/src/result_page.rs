@@ -3,12 +3,15 @@
 //! Command's JSON result has no native assistant-message ID. The page exposes
 //! only Store-retained terminal status, never response text or task completion.
 
+use crate::journal::RunStore;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use swarm_contracts::{
     error::{Error, Result},
     module_contract::ModuleContractClaim,
-    runtime::{ModuleReceiptIdentity, RuntimeCommand},
+    runtime::{
+        ModuleReceiptIdentity, RuntimeCommand, TaskDispatchAdmissionReceipt, TaskDispatchContext,
+    },
 };
 
 const MAX_PAGE_BYTES: usize = 65_536;
@@ -112,6 +115,132 @@ pub fn build(command: &RuntimeCommand, claim: &ModuleContractClaim) -> Result<Va
     Ok(params)
 }
 
+pub fn build_output(
+    command: &RuntimeCommand,
+    claim: &ModuleContractClaim,
+    store: &RunStore,
+) -> Result<Value> {
+    if command.method != "agent.result"
+        || command.route["runtime"] != "command"
+        || command.route["module_artifact_id"] != "eliot-command.rust-headless.1"
+        || command.input["selector"]["kind"] != "command_output"
+    {
+        return Err(invalid("unsupported Command output selector"));
+    }
+    if claim.module_id.as_str() != "runtime.command"
+        || claim.artifact.artifact_id.as_str() != "eliot-command.rust-headless.1"
+        || claim.artifact.version.as_str() != "3"
+        || !claim
+            .capabilities
+            .iter()
+            .any(|capability| capability.as_str() == "agent.result")
+    {
+        return Err(invalid("Command result capability is not negotiated"));
+    }
+    let result_input_sha256 = command
+        .input_sha256
+        .as_deref()
+        .filter(|digest| is_sha256(digest))
+        .ok_or_else(|| invalid("Store omitted the exact result Operation digest"))?;
+    let target_id = command.input["selector"]["input_operation_id"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| invalid("output selector has no exact target Operation"))?;
+    let native_output = command.input["selector"]["native_output"]
+        .as_str()
+        .filter(|value| matches!(*value, "stdout.ndjson" | "stderr.txt"))
+        .ok_or_else(|| invalid("output selector names an unsupported stream"))?;
+    let target_input_sha256 = command
+        .target_input_sha256
+        .as_deref()
+        .filter(|digest| is_sha256(digest))
+        .ok_or_else(|| invalid("Store omitted the exact target Operation digest"))?;
+    let target = &command.input["target_command_output"];
+    validate_target_output(
+        target,
+        target_id,
+        target_input_sha256,
+        native_output,
+        claim,
+        &command.binding_id,
+        command.generation,
+    )?;
+    let result_receipt = receipt(command, claim, &command.operation_id, result_input_sha256)?;
+    let bytes = store.read_native_output(
+        target_id,
+        target_input_sha256,
+        &command.binding_id,
+        command.generation,
+        &command.route,
+        target,
+    )?;
+    let stored_bytes = target["stored_bytes"]
+        .as_u64()
+        .ok_or_else(|| invalid("Store output snapshot omitted its exact stored length"))?;
+    if bytes.len() as u64 != stored_bytes {
+        return Err(invalid(
+            "private Command output differs from Store's capture receipt",
+        ));
+    }
+    let offset = command.input["offset_bytes"].as_u64().unwrap_or(0);
+    let requested = command.input["length_bytes"]
+        .as_u64()
+        .unwrap_or(MAX_PAGE_BYTES as u64)
+        .min(MAX_PAGE_BYTES as u64);
+    if offset > stored_bytes || (requested == 0 && offset < stored_bytes) {
+        return Err(Error::new(
+            "RESULT_RANGE_INVALID",
+            "requested Command output page range is invalid",
+        ));
+    }
+    let end = offset
+        .checked_add(requested)
+        .unwrap_or(u64::MAX)
+        .min(stored_bytes);
+    let start = usize::try_from(offset)
+        .map_err(|_| Error::new("RESULT_RANGE_INVALID", "page offset is too large"))?;
+    let end_index = usize::try_from(end)
+        .map_err(|_| Error::new("RESULT_RANGE_INVALID", "page end is too large"))?;
+    let selected = &bytes[start..end_index];
+    let source = json!({
+        "kind":"command_output",
+        "result_operation_id":command.operation_id,
+        "result_input_sha256":result_input_sha256,
+        "result_module_receipt":result_receipt,
+        "input_operation_id":target_id,
+        "target_input_sha256":target_input_sha256,
+        "target_module_receipt":target["module_receipt"],
+        "target_command_output":target,
+        "native_response_identity":"unavailable",
+        "execution_complete":false,
+        "task_completion":"unknown",
+        "native_replay":false
+    });
+    if serde_json::to_vec(&source)?.len() > MAX_SOURCE_BYTES {
+        return Err(invalid("Command output provenance exceeds its size limit"));
+    }
+    let media_type = if native_output == "stdout.ndjson" {
+        "application/x-ndjson"
+    } else {
+        "text/plain; charset=utf-8"
+    };
+    let params = json!({
+        "operation_id":command.operation_id,
+        "page":{
+            "source":source,
+            "offset_bytes":offset,
+            "byte_length":selected.len(),
+            "total_bytes":stored_bytes,
+            "eof":end == stored_bytes,
+            "media_type":media_type,
+            "content_base64":encode_base64(selected),
+            "page_sha256":sha256_hex(selected)
+        }
+    });
+    validate_saved(&params, claim, &command.binding_id, command.generation)?;
+    Ok(params)
+}
+
 /// Validate a persisted page before an acknowledgement retry. The bytes and
 /// source must be derivable from its exact stored target snapshot and receipts.
 pub fn validate_saved(
@@ -131,6 +260,9 @@ pub fn validate_saved(
     }
     let page = Value::Object(page.clone());
     let source = &page["source"];
+    if source["kind"] == "command_output" {
+        return validate_saved_output(params, &page, claim, binding_id, generation);
+    }
     fields(
         source,
         &[
@@ -225,6 +357,330 @@ pub fn validate_saved(
     Ok(())
 }
 
+fn validate_saved_output(
+    params: &Value,
+    page: &Value,
+    claim: &ModuleContractClaim,
+    binding_id: &str,
+    generation: i64,
+) -> Result<()> {
+    fields(
+        &page["source"],
+        &[
+            "kind",
+            "result_operation_id",
+            "result_input_sha256",
+            "result_module_receipt",
+            "input_operation_id",
+            "target_input_sha256",
+            "target_module_receipt",
+            "target_command_output",
+            "native_response_identity",
+            "execution_complete",
+            "task_completion",
+            "native_replay",
+        ],
+    )?;
+    let source = &page["source"];
+    let target_id = text(source, "input_operation_id")?;
+    let target_digest = text(source, "target_input_sha256")?;
+    let result_digest = text(source, "result_input_sha256")?;
+    let output = &source["target_command_output"];
+    let native_output = text(output, "native_output")?;
+    if source["kind"] != "command_output"
+        || source["result_operation_id"] != params["operation_id"]
+        || source["target_module_receipt"] != output["module_receipt"]
+        || output["operation_id"] != target_id
+        || output["input_sha256"] != target_digest
+        || source["native_response_identity"] != "unavailable"
+        || source["execution_complete"] != false
+        || source["task_completion"] != "unknown"
+        || source["native_replay"] != false
+    {
+        return Err(invalid("saved Command output provenance is inconsistent"));
+    }
+    let result_receipt: ModuleReceiptIdentity =
+        serde_json::from_value(source["result_module_receipt"].clone())
+            .map_err(|_| invalid("saved result receipt is malformed"))?;
+    if result_receipt.operation_id != text(params, "operation_id")?
+        || result_receipt.input_sha256 != result_digest
+        || result_receipt.module_id != claim.module_id
+        || result_receipt.artifact != claim.artifact
+        || result_receipt.protocol != claim.protocol
+        || result_receipt.binding_id != binding_id
+        || result_receipt.binding_generation != generation
+        || claim.artifact.version.as_str() != "3"
+        || !claim
+            .capabilities
+            .iter()
+            .any(|capability| capability.as_str() == "agent.result")
+    {
+        return Err(invalid("saved result receipt differs from this binding"));
+    }
+    result_receipt
+        .validate()
+        .map_err(|_| invalid("saved result receipt is invalid"))?;
+    validate_target_output(
+        output,
+        target_id,
+        target_digest,
+        native_output,
+        claim,
+        binding_id,
+        generation,
+    )?;
+
+    let stored_bytes = output["stored_bytes"]
+        .as_u64()
+        .ok_or_else(|| invalid("saved output length is malformed"))?;
+    let offset = page["offset_bytes"]
+        .as_u64()
+        .ok_or_else(|| invalid("saved page offset is invalid"))?;
+    let byte_length = page["byte_length"]
+        .as_u64()
+        .ok_or_else(|| invalid("saved page length is invalid"))?;
+    let total = page["total_bytes"]
+        .as_u64()
+        .ok_or_else(|| invalid("saved page total is invalid"))?;
+    let end = offset
+        .checked_add(byte_length)
+        .ok_or_else(|| invalid("saved page range overflows"))?;
+    let media_type = if native_output == "stdout.ndjson" {
+        "application/x-ndjson"
+    } else {
+        "text/plain; charset=utf-8"
+    };
+    let encoded = page["content_base64"]
+        .as_str()
+        .ok_or_else(|| invalid("saved output body is missing"))?;
+    let bytes = decode_base64(encoded)?;
+    if total != stored_bytes
+        || end > total
+        || bytes.len() as u64 != byte_length
+        || page["eof"] != (end == total)
+        || page["media_type"] != media_type
+        || page["page_sha256"] != sha256_hex(&bytes)
+        || (offset == 0 && end == total && sha256_hex(&bytes) != output["stored_sha256"])
+    {
+        return Err(invalid(
+            "saved Command output bytes differ from their capture receipt",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_target_output(
+    target: &Value,
+    target_id: &str,
+    target_digest: &str,
+    native_output: &str,
+    claim: &ModuleContractClaim,
+    binding_id: &str,
+    generation: i64,
+) -> Result<()> {
+    fields(
+        target,
+        &[
+            "schema_version",
+            "operation_id",
+            "method",
+            "operation_state",
+            "operation_outcome",
+            "completion_condition",
+            "input_sha256",
+            "module_receipt",
+            "task_dispatch_context",
+            "dispatch_admission",
+            "native_output",
+            "stream_bytes",
+            "stored_bytes",
+            "stream_sha256",
+            "stored_sha256",
+            "truncated",
+            "read_error",
+            "native_child",
+            "native_response_identity",
+            "execution_complete",
+            "task_completion",
+            "native_replay",
+        ],
+    )?;
+    let receipt: ModuleReceiptIdentity =
+        serde_json::from_value(target["module_receipt"].clone())
+            .map_err(|_| invalid("Store target receipt is malformed"))?;
+    if target["schema_version"] != 1
+        || target["operation_id"] != target_id
+        || target["method"] != "task.dispatch"
+        || target["input_sha256"] != target_digest
+        || target["native_output"] != native_output
+        || !matches!(
+            (
+                target["operation_state"].as_str(),
+                target["operation_outcome"].as_str()
+            ),
+            (Some("settled"), Some("applied"))
+                | (Some("rejected"), Some("rejected"))
+                | (Some("outcome_unknown"), Some("unknown"))
+        )
+        || target["native_response_identity"] != "unavailable"
+        || target["execution_complete"] != false
+        || target["task_completion"] != "unknown"
+        || target["native_replay"] != false
+        || receipt.operation_id != target_id
+        || receipt.input_sha256 != target_digest
+        || receipt.binding_id != binding_id
+        || receipt.binding_generation != generation
+        || receipt.module_id != claim.module_id
+        || receipt.artifact != claim.artifact
+        || receipt.protocol != claim.protocol
+        || claim.artifact.version.as_str() != "3"
+        || !claim
+            .capabilities
+            .iter()
+            .any(|capability| capability.as_str() == "agent.result")
+    {
+        return Err(invalid(
+            "Store output snapshot differs from exact dispatch identity",
+        ));
+    }
+    receipt
+        .validate()
+        .map_err(|_| invalid("Store target receipt is invalid"))?;
+    let context = &target["task_dispatch_context"];
+    if !context.is_null() {
+        fields(
+            context,
+            &[
+                "schema_version",
+                "operation_id",
+                "binding_id",
+                "binding_generation",
+                "worker_boot_id",
+                "attempt_id",
+                "task_id",
+                "task_revision",
+                "task_snapshot_sha256",
+                "source_text_sha256",
+                "source_text_bytes",
+            ],
+        )?;
+        let boot_id_valid = context["worker_boot_id"].is_null()
+            || context["worker_boot_id"]
+                .as_str()
+                .is_some_and(|value| !value.trim().is_empty() && value.len() <= 256);
+        if context["schema_version"] != 1
+            || context["operation_id"] != target_id
+            || context["binding_id"] != binding_id
+            || context["binding_generation"] != generation
+            || !boot_id_valid
+            || (context["worker_boot_id"].is_null() && target["operation_outcome"] == "applied")
+            || text(context, "attempt_id").is_err()
+            || text(context, "task_id").is_err()
+            || context["task_revision"]
+                .as_i64()
+                .is_none_or(|value| value <= 0)
+            || context["source_text_bytes"].as_u64().is_none()
+            || !context["task_snapshot_sha256"]
+                .as_str()
+                .is_some_and(is_sha256)
+            || !context["source_text_sha256"]
+                .as_str()
+                .is_some_and(is_sha256)
+        {
+            return Err(invalid(
+                "Store dispatch context differs from target binding",
+            ));
+        }
+    }
+    let admission = if target["dispatch_admission"].is_null() {
+        None
+    } else {
+        let admission: TaskDispatchAdmissionReceipt =
+            serde_json::from_value(target["dispatch_admission"].clone())
+                .map_err(|_| invalid("Store dispatch admission is malformed"))?;
+        admission
+            .validate()
+            .map_err(|_| invalid("Store dispatch admission is invalid"))?;
+        Some(admission)
+    };
+    match (!context.is_null(), admission.as_ref()) {
+        (true, Some(admission))
+            if target["operation_outcome"] == "applied"
+                && dispatch_context_matches_projection(context, &admission.context())
+                && admission.module_receipt == receipt
+                && admission.operation_id == target_id
+                && admission.binding_id == binding_id
+                && admission.binding_generation == generation => {}
+        (true, None) if target["operation_outcome"] != "applied" => {}
+        (false, None) => {}
+        _ => return Err(invalid("Store dispatch admission differs from its target")),
+    }
+    let stream_bytes = target["stream_bytes"]
+        .as_u64()
+        .ok_or_else(|| invalid("Store stream length is malformed"))?;
+    let stored_bytes = target["stored_bytes"]
+        .as_u64()
+        .ok_or_else(|| invalid("Store stored length is malformed"))?;
+    let stream_sha256 = text(target, "stream_sha256")?;
+    let stored_sha256 = text(target, "stored_sha256")?;
+    let truncated = target["truncated"]
+        .as_bool()
+        .ok_or_else(|| invalid("Store truncation fact is malformed"))?;
+    let read_error = target["read_error"]
+        .as_bool()
+        .ok_or_else(|| invalid("Store read status is malformed"))?;
+    let limit = if native_output == "stdout.ndjson" {
+        16 * 1024 * 1024
+    } else if native_output == "stderr.txt" {
+        256 * 1024
+    } else {
+        return Err(invalid("Store output selector names an unsupported stream"));
+    };
+    if stored_bytes > limit
+        || stream_bytes < stored_bytes
+        || (stream_bytes > stored_bytes && !truncated)
+        || !is_sha256(stream_sha256)
+        || !is_sha256(stored_sha256)
+        || (!truncated && !read_error && stream_bytes != stored_bytes)
+        || (!truncated && !read_error && stream_sha256 != stored_sha256)
+    {
+        return Err(invalid("Store output capture facts are inconsistent"));
+    }
+    let child = &target["native_child"];
+    fields(
+        child,
+        &[
+            "spawn_returned_pid",
+            "birth_identity",
+            "exit_observed_through_child_handle",
+            "exit",
+            "family_departure_claimed",
+            "manager_group_drain_required",
+        ],
+    )?;
+    if child["family_departure_claimed"] != false || child["manager_group_drain_required"] != true {
+        return Err(invalid(
+            "native process receipt exceeds the direct-child contract",
+        ));
+    }
+    Ok(())
+}
+
+fn dispatch_context_matches_projection(projection: &Value, context: &TaskDispatchContext) -> bool {
+    projection["schema_version"] == context.schema_version
+        && projection["operation_id"] == context.operation_id
+        && projection["binding_id"] == context.binding_id
+        && projection["binding_generation"] == context.binding_generation
+        && (projection["worker_boot_id"].is_null()
+            || projection["worker_boot_id"] == context.worker_boot_id)
+        && projection["attempt_id"] == context.attempt_id
+        && projection["task_id"] == context.task_id
+        && projection["task_revision"] == context.task_revision
+        && projection["task_snapshot_sha256"] == context.task_snapshot_sha256
+        && projection["source_text_sha256"] == context.source_text_sha256
+        && projection["source_text_bytes"] == context.source_text_bytes
+}
+
 fn validate_target(
     target: &Value,
     target_id: &str,
@@ -266,8 +722,14 @@ fn validate_target(
     if target["schema_version"] != 1
         || target["operation_id"] != target_id
         || target["method"] != "task.dispatch"
-        || !matches!(target["operation_state"].as_str(), Some("settled" | "rejected" | "outcome_unknown"))
-        || !matches!(target["operation_outcome"].as_str(), Some("applied" | "rejected" | "unknown"))
+        || !matches!(
+            target["operation_state"].as_str(),
+            Some("settled" | "rejected" | "outcome_unknown")
+        )
+        || !matches!(
+            target["operation_outcome"].as_str(),
+            Some("applied" | "rejected" | "unknown")
+        )
         || target["input_sha256"] != target_digest
         || target["native_response_identity"] != "unavailable"
         || target["execution_complete"] != false
@@ -294,7 +756,9 @@ fn validate_target(
     } else if target["operation_state"] != "outcome_unknown"
         || target["operation_outcome"] != "unknown"
     {
-        return Err(invalid("terminal Command status is missing its module receipt"));
+        return Err(invalid(
+            "terminal Command status is missing its module receipt",
+        ));
     }
     let diagnostic = &target["diagnostic_code"];
     if !diagnostic.is_null()
@@ -319,19 +783,22 @@ fn validate_target(
             || !target["exit_code"].is_null()
             || !target["result_subtype"].is_null()
             || (!target["timed_out"].is_null() && !target["timed_out"].is_boolean())
-            || (!target["signal_observed"].is_null()
-                && !target["signal_observed"].is_boolean())
+            || (!target["signal_observed"].is_null() && !target["signal_observed"].is_boolean())
             || (target["completion_condition"] == "module_outcome_not_retained"
                 && !target["module_receipt"].is_null())
             || (target["completion_condition"] == "native_result_unconfirmed"
                 && target["module_receipt"].is_null())
         {
-            return Err(invalid("unknown Command status contains incompatible retained facts"));
+            return Err(invalid(
+                "unknown Command status contains incompatible retained facts",
+            ));
         }
         return Ok(());
     }
     if target["timed_out"] != false || target["signal_observed"] != false {
-        return Err(invalid("terminal Command status has inconsistent process facts"));
+        return Err(invalid(
+            "terminal Command status has inconsistent process facts",
+        ));
     }
     match (
         target["operation_state"].as_str(),
@@ -494,4 +961,58 @@ fn encode_base64(bytes: &[u8]) -> String {
         _ => unreachable!("three-byte chunks have at most two remainder bytes"),
     }
     encoded
+}
+
+fn decode_base64(encoded: &str) -> Result<Vec<u8>> {
+    if encoded.len() % 4 != 0 {
+        return Err(invalid("saved Command output is not canonical base64"));
+    }
+    let mut decoded = Vec::with_capacity(encoded.len() / 4 * 3);
+    let chunks: Vec<_> = encoded.as_bytes().chunks_exact(4).collect();
+    for (index, chunk) in chunks.iter().enumerate() {
+        let last = index + 1 == chunks.len();
+        let a =
+            base64_value(chunk[0]).ok_or_else(|| invalid("saved output base64 is malformed"))?;
+        let b =
+            base64_value(chunk[1]).ok_or_else(|| invalid("saved output base64 is malformed"))?;
+        decoded.push((a << 2) | (b >> 4));
+        match (chunk[2], chunk[3]) {
+            (b'=', b'=') if last => {
+                if b & 0x0f != 0 {
+                    return Err(invalid("saved output base64 is not canonical"));
+                }
+            }
+            (c, b'=') if last => {
+                let c =
+                    base64_value(c).ok_or_else(|| invalid("saved output base64 is malformed"))?;
+                if c & 0x03 != 0 {
+                    return Err(invalid("saved output base64 is not canonical"));
+                }
+                decoded.push((b << 4) | (c >> 2));
+            }
+            (c, d) => {
+                let c =
+                    base64_value(c).ok_or_else(|| invalid("saved output base64 is malformed"))?;
+                let d =
+                    base64_value(d).ok_or_else(|| invalid("saved output base64 is malformed"))?;
+                decoded.push((b << 4) | (c >> 2));
+                decoded.push((c << 6) | d);
+            }
+        }
+    }
+    if encode_base64(&decoded) != encoded {
+        return Err(invalid("saved Command output is not canonical base64"));
+    }
+    Ok(decoded)
+}
+
+fn base64_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
 }

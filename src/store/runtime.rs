@@ -104,15 +104,12 @@ fn validate_task_dispatch_admission(
             "admission receipt must name its exact task.dispatch Operation",
         ));
     }
-    let value = outcome
-        .details
-        .get("dispatch_admission")
-        .ok_or_else(|| {
-            Error::new(
-                "TASK_DISPATCH_ADMISSION_INVALID",
-                "normalized dispatch admission receipt is missing",
-            )
-        })?;
+    let value = outcome.details.get("dispatch_admission").ok_or_else(|| {
+        Error::new(
+            "TASK_DISPATCH_ADMISSION_INVALID",
+            "normalized dispatch admission receipt is missing",
+        )
+    })?;
     let receipt: swarm_contracts::runtime::TaskDispatchAdmissionReceipt =
         serde_json::from_value(value.clone()).map_err(|_| {
             Error::new(
@@ -130,8 +127,7 @@ fn validate_task_dispatch_admission(
         || receipt.operation_id != outcome.operation_id
         || receipt.binding_id != binding_id
         || receipt.binding_generation != binding_generation
-        || receipt.worker_boot_id
-            != model::text(&binding["observation"], "bridge_boot_id")?
+        || receipt.worker_boot_id != model::text(&binding["observation"], "bridge_boot_id")?
         || receipt.native_input_id != outcome.native_input_id
     {
         return Err(Error::new(
@@ -928,14 +924,8 @@ fn next_internal(
         let a = tasks::get_attempt(&tx, model::text(&input, "attempt_id")?)?;
         input["task_snapshot"] = a["task_snapshot"].clone();
         if selected_task_dispatch_admission(&tx, &b)? {
-            input["task_dispatch_context"] = serde_json::to_value(task_dispatch_context(
-                &op,
-                &id,
-                generation,
-                &b,
-                &input,
-                &a,
-            )?)?;
+            input["task_dispatch_context"] =
+                serde_json::to_value(task_dispatch_context(&op, &id, generation, &b, &input, &a)?)?;
         }
         if crate::runtime::codex::is_controller_route(&b["route"])
             || crate::runtime::prepared::is_prepared_claude_route(&b["route"])
@@ -1001,12 +991,18 @@ fn next_internal(
         method == "agent.result" && input["selector"]["kind"] == "antigravity_status";
     let command_status_result =
         method == "agent.result" && input["selector"]["kind"] == "command_status";
+    let command_output_result =
+        method == "agent.result" && input["selector"]["kind"] == "command_output";
     let target_input_sha256 = if method == "agent.reconcile"
         || input_status_result
         || antigravity_status_result
         || command_status_result
+        || command_output_result
     {
-        let target_id = if input_status_result || antigravity_status_result || command_status_result
+        let target_id = if input_status_result
+            || antigravity_status_result
+            || command_status_result
+            || command_output_result
         {
             model::text(&input["selector"], "input_operation_id")?
         } else {
@@ -1049,6 +1045,19 @@ fn next_internal(
             )?;
             let digest = model::text(&snapshot, "input_sha256")?.to_owned();
             input["target_operation_status"] = snapshot;
+            Some(digest)
+        } else if command_output_result {
+            let native_output = model::text(&input["selector"], "native_output")?;
+            let snapshot = super::command_results::admitted_output_snapshot(
+                &tx,
+                &op,
+                &id,
+                generation,
+                target_id,
+                native_output,
+            )?;
+            let digest = model::text(&snapshot, "input_sha256")?.to_owned();
+            input["target_command_output"] = snapshot;
             Some(digest)
         } else {
             let raw: String = tx.query_row(
@@ -3353,14 +3362,14 @@ fn user_command_with_actor(
     let id = model::text(v, "binding_id")?;
     let generation = model::positive(v, "generation")?;
     let b = operations::get_binding(tx, id, generation)?;
-    let strict_command_status =
+    let strict_command_result =
         method == "agent.result" && crate::runtime::batch::is_rust_command_route(&b["route"]);
-    let command_status_target_snapshot = if strict_command_status {
+    let command_result_target_snapshot = if strict_command_result {
         Some(super::command_results::validate_request(tx, &b, v)?)
     } else {
         None
     };
-    if crate::runtime::batch::is_sessionless_route(&b["route"]) && !strict_command_status {
+    if crate::runtime::batch::is_sessionless_route(&b["route"]) && !strict_command_result {
         crate::runtime::batch::validate_command(&b["route"], method, v)?;
     }
     let rootless_open_reconcile =
@@ -3531,7 +3540,7 @@ fn user_command_with_actor(
     }
     if method == "agent.result"
         && crate::runtime::batch::is_sessionless_route(&b["route"])
-        && !strict_command_status
+        && !strict_command_result
     {
         let target = operations::get_operation(tx, model::text(&v["selector"], "operation_id")?)?;
         if target["method"] != "task.dispatch"
@@ -3685,8 +3694,12 @@ fn user_command_with_actor(
             params![id,generation,now,model::canonical(&json!({"reason":"superseded_by_goal_stop","stop_operation_id":op}))?])?;
     }
     let mut effective = json!({"route":b["route"],"native_root_id":b["native_root_id"]});
-    if let Some(snapshot) = command_status_target_snapshot {
-        effective["command_status_target_snapshot"] = snapshot;
+    if let Some(snapshot) = command_result_target_snapshot {
+        if v["selector"]["kind"] == "command_output" {
+            effective["command_output_target_snapshot"] = snapshot;
+        } else {
+            effective["command_status_target_snapshot"] = snapshot;
+        }
     }
     if method == "agent.configure" && b["route"]["runtime"] == crate::runtime::opencode_v2::RUNTIME
     {

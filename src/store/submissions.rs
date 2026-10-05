@@ -105,6 +105,10 @@ fn candidate_for_attempt(
             ));
         }
     };
+    validate_complete_command_output(&record)?;
+    if command_output_snapshot(&record).is_some() {
+        validate_command_output_attempt(db, a, attempt_id, &record)?;
+    }
     let candidate_generation = if record.kind == "native_result_page" {
         identity["binding_generation"].clone()
     } else {
@@ -122,6 +126,101 @@ fn candidate_for_attempt(
     // Selection is the caller's assertion. This does not attest a Git source tree,
     // assign a child by timestamp, or promote the native report to an independent check.
     Ok(record)
+}
+
+fn command_output_snapshot(record: &ArtifactRecord) -> Option<&Value> {
+    match record.kind.as_str() {
+        "native_result_page" if record.metadata["source"]["kind"] == "command_output" => {
+            Some(&record.metadata["source"]["target_command_output"])
+        }
+        "native_result" if record.metadata["identity"]["source"]["kind"] == "command_output" => {
+            Some(&record.metadata["identity"]["source"]["target_command_output"])
+        }
+        _ => None,
+    }
+}
+
+fn validate_complete_command_output(record: &ArtifactRecord) -> Result<()> {
+    let Some(snapshot) = command_output_snapshot(record) else {
+        return Ok(());
+    };
+    if snapshot["method"] != "task.dispatch"
+        || snapshot["operation_state"] != "settled"
+        || snapshot["operation_outcome"] != "applied"
+        || snapshot["native_response_identity"] != "unavailable"
+        || snapshot["execution_complete"] != false
+        || snapshot["task_completion"] != "unknown"
+        || snapshot["native_replay"] != false
+        || snapshot["truncated"] != false
+        || snapshot["read_error"] != false
+        || snapshot["stream_bytes"] != snapshot["stored_bytes"]
+        || snapshot["stream_sha256"] != snapshot["stored_sha256"]
+    {
+        return Err(Error::new(
+            "CANDIDATE_INCOMPLETE",
+            "Command output is a Task candidate only when the retained stream is complete",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_command_output_attempt(
+    db: &Connection,
+    attempt: &Value,
+    attempt_id: &str,
+    candidate: &ArtifactRecord,
+) -> Result<()> {
+    let page_ids: Vec<String> = if candidate.kind == "native_result_page" {
+        vec![candidate.artifact_id.clone()]
+    } else {
+        candidate.metadata["parts"]
+            .as_array()
+            .filter(|parts| !parts.is_empty())
+            .ok_or_else(|| {
+                Error::new(
+                    "CANDIDATE_SCOPE",
+                    "assembled Command output has no retained result pages",
+                )
+            })?
+            .iter()
+            .map(|part| model::text(part, "artifact_ref").map(str::to_owned))
+            .collect::<Result<Vec<_>>>()?
+    };
+    for page_id in page_ids {
+        let page = results::get(db, &page_id)?;
+        let source = &page.metadata["source"];
+        let dispatch_id = model::text(source, "input_operation_id")?;
+        let result_operation_id = model::text(source, "result_operation_id")?;
+        let dispatch = operations::get_operation(db, dispatch_id)?;
+        let result_operation = operations::get_operation(db, result_operation_id)?;
+        if page.kind != "native_result_page"
+            || source["kind"] != "command_output"
+            || source["target_command_output"]["operation_id"] != dispatch_id
+            || page.metadata["operation_id"] != result_operation_id
+            || dispatch["method"] != "task.dispatch"
+            || dispatch["state"] != "settled"
+            || dispatch["result"]["outcome"] != "applied"
+            || dispatch["task_id"] != attempt["task_id"]
+            || dispatch["attempt_id"] != attempt_id
+            || dispatch["binding_id"] != attempt["binding_id"]
+            || dispatch["binding_generation"] != attempt["binding_generation"]
+            || result_operation["method"] != "agent.result"
+            || result_operation["state"] != "settled"
+            || result_operation["task_id"] != attempt["task_id"]
+            || result_operation["attempt_id"] != attempt_id
+            || result_operation["binding_id"] != attempt["binding_id"]
+            || result_operation["binding_generation"] != attempt["binding_generation"]
+            || result_operation["result"]["outcome"] != "applied"
+            || result_operation["result"]["details"]["artifact_ref"] != page_id
+            || result_operation["result"]["details"]["source"] != *source
+        {
+            return Err(Error::new(
+                "CANDIDATE_SCOPE",
+                "Command output is not the exact result retained for this Task Attempt",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Participant candidates must be tied to this exact Attempt by the source
@@ -187,54 +286,95 @@ fn authorize_participant_candidate(
                 "assembled candidate references a non-result page",
             ));
         }
-        let operation_id = page.metadata["operation_id"].as_str().ok_or_else(|| {
+        validate_complete_command_output(&page)?;
+        let command_output = page.metadata["source"]["kind"] == "command_output";
+        let operation_id = if command_output {
+            page.metadata["source"]["input_operation_id"].as_str()
+        } else {
+            page.metadata["operation_id"].as_str()
+        }
+        .ok_or_else(|| {
             Error::new(
                 "CANDIDATE_SCOPE",
                 "result page has no retained dispatch operation",
             )
         })?;
         let dispatch = operations::get_operation(db, operation_id)?;
+        let native_output = if command_output {
+            page.metadata["selector"]["native_output"].as_str()
+        } else {
+            page.metadata["native_output"].as_str()
+        };
         if dispatch["method"] != "task.dispatch"
-            || !matches!(dispatch["state"].as_str(), Some("settled" | "rejected"))
+            || (command_output
+                && (dispatch["state"] != "settled" || dispatch["result"]["outcome"] != "applied"))
+            || (!command_output
+                && !matches!(dispatch["state"].as_str(), Some("settled" | "rejected")))
             || dispatch["task_id"] != attempt["task_id"]
             || dispatch["attempt_id"] != attempt["attempt_id"]
             || dispatch["binding_id"] != attempt["binding_id"]
             || dispatch["binding_generation"] != attempt["binding_generation"]
             || page.metadata["binding_id"] != attempt["binding_id"]
             || page.metadata["binding_generation"] != attempt["binding_generation"]
-            || !crate::runtime::batch::BATCH_OUTPUTS
-                .contains(&page.metadata["native_output"].as_str().unwrap_or(""))
+            || (command_output
+                && (page.metadata["source"]["result_operation_id"]
+                    != page.metadata["operation_id"]
+                    || page.metadata["source"]["target_command_output"]["operation_id"]
+                        != operation_id
+                    || !matches!(native_output, Some("stdout.ndjson" | "stderr.txt"))))
+            || (!command_output
+                && !crate::runtime::batch::BATCH_OUTPUTS.contains(&native_output.unwrap_or("")))
         {
             return Err(Error::new(
                 "CANDIDATE_SCOPE",
                 "result page is not linked to this exact Task, Attempt, and binding generation",
             ));
         }
-        let mut linked = false;
-        let mut operation_stmt = db.prepare(
-            "SELECT result_json FROM operations WHERE method='agent.result' AND state='settled' AND task_id=?1 AND attempt_id=?2 AND binding_id=?3 AND binding_generation=?4",
-        )?;
-        let operation_rows = operation_stmt.query_map(
-            rusqlite::params![
-                attempt["task_id"].as_str(),
-                attempt["attempt_id"].as_str(),
-                attempt["binding_id"].as_str(),
-                attempt["binding_generation"].as_i64(),
-            ],
-            |row| row.get::<_, String>(0),
-        )?;
-        for raw in operation_rows {
-            let result: Value = serde_json::from_str(&raw?)?;
-            if result["outcome"] == "applied"
-                && result["details"]["dispatch_operation_id"] == operation_id
-                && result["details"]["artifact_refs"]
-                    .as_array()
-                    .is_some_and(|refs| refs.iter().any(|item| item.as_str() == Some(page_id.as_str())))
-            {
-                linked = true;
-                break;
+        let linked = if command_output {
+            let result_operation_id = model::text(&page.metadata, "operation_id")?;
+            let result_operation = operations::get_operation(db, result_operation_id)?;
+            result_operation["method"] == "agent.result"
+                && result_operation["state"] == "settled"
+                && result_operation["task_id"] == attempt["task_id"]
+                && result_operation["attempt_id"] == attempt["attempt_id"]
+                && result_operation["binding_id"] == attempt["binding_id"]
+                && result_operation["binding_generation"] == attempt["binding_generation"]
+                && result_operation["result"]["outcome"] == "applied"
+                && result_operation["result"]["details"]["artifact_ref"] == page_id
+                && result_operation["result"]["details"]["source"]["kind"] == "command_output"
+                && result_operation["result"]["details"]["source"]["input_operation_id"]
+                    == operation_id
+        } else {
+            let mut linked = false;
+            let mut operation_stmt = db.prepare(
+                "SELECT result_json FROM operations WHERE method='agent.result' AND state='settled' AND task_id=?1 AND attempt_id=?2 AND binding_id=?3 AND binding_generation=?4",
+            )?;
+            let operation_rows = operation_stmt.query_map(
+                rusqlite::params![
+                    attempt["task_id"].as_str(),
+                    attempt["attempt_id"].as_str(),
+                    attempt["binding_id"].as_str(),
+                    attempt["binding_generation"].as_i64(),
+                ],
+                |row| row.get::<_, String>(0),
+            )?;
+            for raw in operation_rows {
+                let result: Value = serde_json::from_str(&raw?)?;
+                if result["outcome"] == "applied"
+                    && result["details"]["dispatch_operation_id"] == operation_id
+                    && result["details"]["artifact_refs"]
+                        .as_array()
+                        .is_some_and(|refs| {
+                            refs.iter()
+                                .any(|item| item.as_str() == Some(page_id.as_str()))
+                        })
+                {
+                    linked = true;
+                    break;
+                }
             }
-        }
+            linked
+        };
         if !linked {
             return Err(Error::new(
                 "CANDIDATE_SCOPE",

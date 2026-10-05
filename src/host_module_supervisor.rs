@@ -38,6 +38,7 @@ use tokio::{sync::watch, task::JoinHandle, time};
 const HOST_MODULE_PROTOCOL: ProtocolVersion = ProtocolVersion { major: 1, minor: 0 };
 const MODULE_SCAN_FALLBACK: Duration = Duration::from_secs(2);
 const MODULE_ACTOR_RETRY_MAX: Duration = Duration::from_secs(30);
+const MODULE_ACTOR_ISOLATED_RETRY: Duration = Duration::from_secs(60);
 const MODULE_HELLO_IDENTITY_RETRY: Duration = Duration::from_millis(50);
 const MODULE_HELLO_IDENTITY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_ADDITIONAL_PROTECTED_FILES: usize = 128;
@@ -1608,6 +1609,7 @@ pub(crate) fn spawn_isolated_module_supervisor(
     let actor_handle = handle.clone();
     let task = tokio::spawn(async move {
         let mut retry = Duration::from_millis(250);
+        let mut failures = 0_u32;
         loop {
             if *stopping.borrow() {
                 return;
@@ -1621,23 +1623,34 @@ pub(crate) fn spawn_isolated_module_supervisor(
                         "optional module supervisor configuration unavailable: {}",
                         error.code
                     );
+                    record_module_actor_status(
+                        &store,
+                        "isolated",
+                        failures.saturating_add(1),
+                        Some(&error.code),
+                        Some(MODULE_ACTOR_ISOLATED_RETRY),
+                    )
+                    .await;
                     // The host's Config is immutable for this run. Repeating
                     // the same malformed paths cannot repair it; a changed
                     // configuration is picked up on the next host start.
                     return;
                 }
             };
-            let host = ModuleSupervisorHost::start(
+            let host = AssertUnwindSafe(ModuleSupervisorHost::start(
                 store.clone(),
                 supervisor_credential.clone(),
                 actor_handle.admission.clone(),
                 &root,
                 ipc.clone(),
                 host_config,
-            )
+            ))
+            .catch_unwind()
             .await;
             match host {
-                Ok(host) => {
+                Ok(Ok(host)) => {
+                    failures = 0;
+                    record_module_actor_status(&store, "running", 0, None, None).await;
                     let host = Arc::new(host);
                     actor_handle.install(host.clone());
                     let run = AssertUnwindSafe(host.run(stopping.clone()))
@@ -1646,23 +1659,83 @@ pub(crate) fn spawn_isolated_module_supervisor(
                     actor_handle.clear();
                     match run {
                         Ok(Ok(())) if *stopping.borrow() => return,
-                        Ok(Ok(())) => eprintln!("optional module supervisor returned unexpectedly"),
+                        Ok(Ok(())) => {
+                            failures = failures.saturating_add(1).min(32);
+                            record_module_actor_status(
+                                &store,
+                                "retry_wait",
+                                failures,
+                                Some("SUPERVISOR_STOPPED"),
+                                Some(retry),
+                            )
+                            .await;
+                            eprintln!("optional module supervisor returned unexpectedly");
+                        }
                         Ok(Err(error)) => {
+                            failures = failures.saturating_add(1).min(32);
+                            record_module_actor_status(
+                                &store,
+                                "retry_wait",
+                                failures,
+                                Some(&error.code),
+                                Some(retry),
+                            )
+                            .await;
                             eprintln!("optional module supervisor isolated: {}", error.code)
                         }
-                        Err(_) => eprintln!(
-                            "optional module supervisor panicked; retaining host and native workers"
-                        ),
+                        Err(_) => {
+                            failures = failures.saturating_add(1).min(32);
+                            record_module_actor_status(
+                                &store,
+                                "retry_wait",
+                                failures,
+                                Some("SUPERVISOR_PANIC"),
+                                Some(retry),
+                            )
+                            .await;
+                            eprintln!(
+                                "optional module supervisor panicked; retaining host and native workers"
+                            );
+                        }
                     }
                 }
-                Err(error) => {
+                Ok(Err(error)) => {
                     eprintln!("optional module supervisor unavailable: {}", error.code);
                     if !retryable_supervisor_start(&error) {
+                        record_module_actor_status(
+                            &store,
+                            "isolated",
+                            failures.saturating_add(1).min(32),
+                            Some(&error.code),
+                            Some(MODULE_ACTOR_ISOLATED_RETRY),
+                        )
+                        .await;
                         // Incompatible protocol, rejected credential, or a
                         // malformed trusted descriptor needs changed local
                         // evidence. Do not repeat the identical failure.
                         return;
                     }
+                    failures = failures.saturating_add(1).min(32);
+                    record_module_actor_status(
+                        &store,
+                        "retry_wait",
+                        failures,
+                        Some(&error.code),
+                        Some(retry),
+                    )
+                    .await;
+                }
+                Err(_) => {
+                    failures = failures.saturating_add(1).min(32);
+                    record_module_actor_status(
+                        &store,
+                        "retry_wait",
+                        failures,
+                        Some("SUPERVISOR_START_PANIC"),
+                        Some(retry),
+                    )
+                    .await;
+                    eprintln!("optional module supervisor panicked during startup");
                 }
             }
             tokio::select! {
@@ -1673,6 +1746,42 @@ pub(crate) fn spawn_isolated_module_supervisor(
         }
     });
     OptionalModuleSupervisor { handle, task }
+}
+
+async fn record_module_actor_status(
+    store: &Store,
+    state: &'static str,
+    failures: u32,
+    error_code: Option<&str>,
+    retry: Option<Duration>,
+) {
+    let error_code = error_code.map(safe_optional_worker_code);
+    let retry_in_ms = retry.map(|delay| u64::try_from(delay.as_millis()).unwrap_or(u64::MAX));
+    if let Err(error) = store
+        .record_legacy_worker_status(
+            "module-supervisor",
+            state,
+            failures,
+            error_code,
+            retry_in_ms,
+        )
+        .await
+    {
+        eprintln!("module supervisor health readback unavailable: {}", error.code);
+    }
+}
+
+fn safe_optional_worker_code(code: &str) -> String {
+    if !code.is_empty()
+        && code.len() <= 64
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        code.to_owned()
+    } else {
+        "SUPERVISOR_ERROR".to_owned()
+    }
 }
 
 async fn wait_for_stop(mut stopping: watch::Receiver<bool>) -> bool {

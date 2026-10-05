@@ -366,10 +366,12 @@ pub(crate) fn spawn_isolated_managed_bus_supervisor(
     };
     let task = tokio::spawn(async move {
         let mut retry = BASE_RETRY;
+        let mut failures = 0_u32;
         loop {
             if *stopping.borrow() {
                 return;
             }
+            record_managed_bus_actor_status(&store, "running", failures, None, None).await;
             let run = AssertUnwindSafe(run(
                 store.clone(),
                 data_root.clone(),
@@ -380,16 +382,47 @@ pub(crate) fn spawn_isolated_managed_bus_supervisor(
             .await;
             match run {
                 Ok(Ok(())) if *stopping.borrow() => return,
-                Ok(Ok(())) => eprintln!("managed bus coordinator returned unexpectedly"),
+                Ok(Ok(())) => {
+                    failures = failures.saturating_add(1).min(32);
+                    record_managed_bus_actor_status(
+                        &store,
+                        "retry_wait",
+                        failures,
+                        Some("BUS_SUPERVISOR_ERROR"),
+                        Some(retry),
+                    )
+                    .await;
+                    eprintln!("managed bus coordinator returned unexpectedly");
+                }
                 Ok(Err(error)) => {
+                    failures = failures.saturating_add(1).min(32);
+                    record_managed_bus_actor_status(
+                        &store,
+                        "retry_wait",
+                        failures,
+                        Some(&error.code),
+                        Some(retry),
+                    )
+                    .await;
                     eprintln!(
                         "managed bus coordinator isolated: {}",
                         safe_reconcile_error(&error.code)
                     );
                 }
-                Err(_) => eprintln!(
-                    "managed bus coordinator panicked; retained registrations remain durable"
-                ),
+                Err(_) => {
+                    failures = failures.saturating_add(1).min(32);
+                    record_managed_bus_actor_status(
+                        &store,
+                        "retry_wait",
+                        failures,
+                        Some("BUS_SUPERVISOR_ERROR"),
+                        Some(retry),
+                    )
+                    .await;
+                    eprintln!(
+                        "managed bus coordinator panicked; retained registrations remain durable"
+                    );
+                }
             }
             tokio::select! {
                 _ = tokio::time::sleep(retry) => {},
@@ -399,6 +432,29 @@ pub(crate) fn spawn_isolated_managed_bus_supervisor(
         }
     });
     Some(OptionalManagedBusSupervisor { task })
+}
+
+async fn record_managed_bus_actor_status(
+    store: &Store,
+    state: &'static str,
+    failures: u32,
+    error_code: Option<&str>,
+    retry: Option<Duration>,
+) {
+    let error_code = error_code.map(|code| safe_reconcile_error(code).to_owned());
+    let retry_in_ms = retry.map(|delay| u64::try_from(delay.as_millis()).unwrap_or(u64::MAX));
+    if let Err(error) = store
+        .record_legacy_worker_status(
+            "managed-bus-supervisor",
+            state,
+            failures,
+            error_code,
+            retry_in_ms,
+        )
+        .await
+    {
+        eprintln!("managed bus supervisor health readback unavailable: {}", error.code);
+    }
 }
 
 async fn wait_for_stop(mut stopping: watch::Receiver<bool>) -> bool {

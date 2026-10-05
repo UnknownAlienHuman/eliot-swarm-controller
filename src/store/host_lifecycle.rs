@@ -27,6 +27,8 @@ const SUPERVISORS: &[&str] = &[
     "forge",
 ];
 const OPTIONAL_WORKERS: &[&str] = &[
+    "module-supervisor",
+    "managed-bus-supervisor",
     "checks",
     "scripts",
     "opencode",
@@ -302,12 +304,62 @@ pub(super) fn start(tx: &Transaction<'_>, now: i64) -> Result<()> {
         }),
     )?;
     // Previous host tasks may have been interrupted before their shutdown
-    // receipt. Never expose their last `running` state as current readiness.
-    set_meta(
-        tx,
-        OPTIONAL_WORKER_HEALTH,
-        &json!({"schema_version":1,"workers":{}}),
-    )
+    // receipt. Never expose their last `running` state as current readiness;
+    // retain only a bounded retry/isolated reason until the new actor reports
+    // its own state, so a restart does not erase the last typed failure.
+    let health = preserve_optional_failure_health(tx)?;
+    set_meta(tx, OPTIONAL_WORKER_HEALTH, &health)
+}
+
+fn preserve_optional_failure_health(db: &Connection) -> Result<Value> {
+    let mut retained = serde_json::Map::new();
+    let Some(value) = meta(db, OPTIONAL_WORKER_HEALTH)? else {
+        return Ok(json!({"schema_version":1,"workers":retained}));
+    };
+    let Some(workers) = value.get("workers").and_then(Value::as_object) else {
+        return Ok(json!({"schema_version":1,"workers":retained}));
+    };
+    if value["schema_version"] != 1 || workers.len() > OPTIONAL_WORKERS.len() {
+        return Ok(json!({"schema_version":1,"workers":retained}));
+    }
+    for (name, receipt) in workers {
+        let state = receipt["state"].as_str();
+        let code = receipt["last_error_code"].as_str();
+        let failures = receipt["consecutive_failures"].as_u64();
+        let updated_at_ms = receipt["updated_at_ms"].as_i64();
+        let retry_after_ms = receipt["retry_after_ms"].as_i64();
+        let valid_code = code.is_some_and(|code| {
+            !code.is_empty()
+                && code.len() <= 64
+                && code
+                    .bytes()
+                    .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+        });
+        if !OPTIONAL_WORKERS.contains(&name.as_str())
+            || !matches!(state, Some("retry_wait" | "isolated"))
+            || failures.is_none_or(|value| value > 32)
+            || updated_at_ms.is_none_or(|value| value < 0)
+            || !valid_code
+            || retry_after_ms.is_none_or(|retry| {
+                updated_at_ms.is_none_or(|updated| {
+                    retry < updated || retry.saturating_sub(updated) > 60_000
+                })
+            })
+        {
+            continue;
+        }
+        retained.insert(
+            name.clone(),
+            json!({
+                "state":state,
+                "consecutive_failures":failures,
+                "last_error_code":code,
+                "retry_after_ms":retry_after_ms,
+                "updated_at_ms":updated_at_ms,
+            }),
+        );
+    }
+    Ok(json!({"schema_version":1,"workers":retained}))
 }
 
 pub(super) fn ready(tx: &Transaction<'_>, now: i64) -> Result<()> {
@@ -324,7 +376,7 @@ pub(super) fn ready(tx: &Transaction<'_>, now: i64) -> Result<()> {
     set_meta(tx, CURRENT, &json!(current))
 }
 
-/// Retain the latest bounded state for the eleven optional workers. The
+/// Retain the latest bounded state for the thirteen optional workers. The
 /// Store status reader exposes this through the existing `host.status` path.
 /// Error details, process output, and route/native payloads are never stored.
 pub(super) fn update_optional_worker(

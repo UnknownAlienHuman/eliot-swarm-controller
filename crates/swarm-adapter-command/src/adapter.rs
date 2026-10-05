@@ -305,13 +305,19 @@ fn normalized_dispatch_admission(
     {
         return Ok(None);
     }
-    let context: TaskDispatchContext = serde_json::from_value(
-        command.input["task_dispatch_context"].clone(),
-    )
-    .map_err(|_| Error::new("TASK_DISPATCH_CONTEXT_INVALID", "dispatch context is malformed"))?;
-    context
-        .validate()
-        .map_err(|_| Error::new("TASK_DISPATCH_CONTEXT_INVALID", "dispatch context is invalid"))?;
+    let context: TaskDispatchContext =
+        serde_json::from_value(command.input["task_dispatch_context"].clone()).map_err(|_| {
+            Error::new(
+                "TASK_DISPATCH_CONTEXT_INVALID",
+                "dispatch context is malformed",
+            )
+        })?;
+    context.validate().map_err(|_| {
+        Error::new(
+            "TASK_DISPATCH_CONTEXT_INVALID",
+            "dispatch context is invalid",
+        )
+    })?;
     if context.operation_id != command.operation_id
         || context.binding_id != command.binding_id
         || context.binding_generation != command.generation
@@ -370,9 +376,12 @@ fn normalized_dispatch_admission(
         native_payload_bytes: identity.prompt_bytes as u64,
         native_input_id: None,
     };
-    receipt
-        .validate()
-        .map_err(|_| Error::new("TASK_DISPATCH_CONTEXT_INVALID", "dispatch admission is invalid"))?;
+    receipt.validate().map_err(|_| {
+        Error::new(
+            "TASK_DISPATCH_CONTEXT_INVALID",
+            "dispatch admission is invalid",
+        )
+    })?;
     Ok(Some(receipt))
 }
 
@@ -501,7 +510,8 @@ async fn process_command(
         "task.dispatch" => {
             let (prompt, identity) = native::prompt_for(command)?;
             let workspace = native::route_workspace(command)?;
-            let dispatch_admission = normalized_dispatch_admission(owner, command, &identity, &prompt)?;
+            let dispatch_admission =
+                normalized_dispatch_admission(owner, command, &identity, &prompt)?;
             let (_dir, existing) = store.admit(
                 &command.operation_id,
                 Some(&identity),
@@ -633,7 +643,11 @@ async fn process_command(
                     // A result-page Operation has no native effect. When the
                     // first page was not sealed before a crash, regenerate it
                     // from the exact current Store snapshot in this command.
-                    let params = result_page::build(command, &owner.host.claim)?;
+                    let params = if command.input["selector"]["kind"] == "command_output" {
+                        result_page::build_output(command, &owner.host.claim, store)?
+                    } else {
+                        result_page::build(command, &owner.host.claim)?
+                    };
                     let hash = store.save_result_page(&command.operation_id, &params)?;
                     store
                         .read_result_page(&command.operation_id)?
@@ -1079,7 +1093,7 @@ fn module_state(
                 "task_dispatch":"one_shot_sessionless_batch",
                 "reconcile":"saved_evidence_readback_only",
                 "refresh":"module_snapshot_read_only",
-                "result_pages":"bounded_exact_command_status_pages",
+                "result_pages":"bounded_exact_command_status_and_output_pages",
                 "send":"unavailable_sessionless_batch",
                 "configure":"unavailable",
                 "goal":"unavailable",
@@ -1117,19 +1131,23 @@ fn validate_command(command: &RuntimeCommand, link: &Link) -> Result<()> {
             "Command sessionless module received an unsupported method",
         ));
     }
+    let result_kind = command.input["selector"]["kind"].as_str();
     if command.method == "agent.result"
-        && (command.input["selector"]["kind"] != "command_status"
+        && (!matches!(result_kind, Some("command_status" | "command_output"))
             || command
                 .target_input_sha256
                 .as_deref()
                 .is_none_or(|digest| !is_sha256(digest))
-            || command.input["target_operation_status"]
-                .as_object()
-                .is_none())
+            || (result_kind == Some("command_status")
+                && command.input["target_operation_status"]
+                    .as_object()
+                    .is_none())
+            || (result_kind == Some("command_output")
+                && command.input["target_command_output"].as_object().is_none()))
     {
         return Err(Error::new(
             "CAPABILITY_UNAVAILABLE",
-            "Command result requires an exact Store status snapshot",
+            "Command result requires an exact Store status or output snapshot",
         ));
     }
     route_model(command)?;

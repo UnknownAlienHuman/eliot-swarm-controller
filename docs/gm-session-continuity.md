@@ -133,3 +133,20 @@ left `outcome_unknown` by a controller host crash has an explicit
 or local Operator verifies the exact already-existing file; recovery preserves
 the original submitter and cannot publish a missing file. This is distinct from
 losing the GM chat while the controller host remains running.
+
+## Communication and successor readback
+
+Store retains Operations, Task and Attempt identities, candidates and mailbox
+history across chat disconnects. A reconnect using the same durable client
+identity reads that history. An explicitly appointed successor reads current
+Task/Attempt state, retained Operations, `report.delta`, `message.read` and
+`report.attention`; the handover watermark is a resynchronization hint, not a
+delivery acknowledgement. Historical authors, owners and reviewers stay intact.
+
+Participant coordination messages use the existing durable Operation and
+mailbox path for their exact assigned scope. Passive watches do not start native
+work or invoke a model. External successor notification currently uses
+`checkpoint_poll`; native push delivery has no current qualification. A
+successor can continue retained work without the former chat, using the adapter's
+supported readback for uncertain effects and explicit automation transfer where
+ownership changes. Neither a lost reply nor a chat replacement authorizes replay.

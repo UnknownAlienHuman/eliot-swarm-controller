@@ -60,6 +60,12 @@ Manager admission captures the selected status page in the existing result
 Operation. Delivery and acknowledgement reuse these bytes even if the original
 dispatch is later reconciled. A sealed `outcome_unknown` page reports the saved
 state without promoting it to completion or authorizing replay.
+The adapter also exposes bounded `command_output` pages for retained stdout
+and stderr captures. Store seals the stream and process facts at admission,
+verifies page receipts against that snapshot, and permits complete untruncated
+output to become an Attempt-bound candidate. Empty streams are valid captures.
+Missing durable capture facts remain unavailable; output retrieval does not
+invent an assistant response identity or establish Task acceptance.
 Module diagnostics correlate the exact event, module, artifact, build and boot.
 Task/Attempt attribution requires the retained transactional binding. Manager
 attention and observer timeline gaps preserve bounded typed metadata without raw
@@ -133,6 +139,10 @@ revision and Attempt. Scoped Operation and artifact reads expose only its own
 source snapshot or retained native candidate origin. Sponsored reviewers keep
 their separate review scope. Submission does not grant Task acceptance or
 native runtime control; collection of already-published bytes survives handover.
+Participant context reads now project the retained runtime MCP capability
+receipt with bounded launch ancestry. Missing or incomplete capability evidence
+is reported as a gap and does not become dispatch permission. Sponsored
+reviewers retain their separate scope.
 
 Per owner direction, remaining code is completed before test and model runs.
 This source batch has not passed a current compiler gate or native qualification. CI

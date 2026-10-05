@@ -2826,6 +2826,11 @@ fn record_key(operation_id: &str) -> String {
 
 const MAX_PUBLIC_C8_RECORD_BYTES: usize = MAX_PRIVATE_READBACK_BYTES + 65_536;
 const MAX_PUBLIC_C8_SCHEDULE_BYTES: usize = 4096;
+// Capability readback must not scan an unbounded set of historical launch
+// Operations for one Attempt. Fetch one sentinel row beyond the accepted
+// bound so overflow is reported as relay_only instead of silently truncating
+// ancestry or choosing a potentially ambiguous parent.
+const MAX_PARTICIPANT_LAUNCH_LINEAGE_ROWS: usize = 64;
 
 enum DiagnosticMeta {
     Missing,
@@ -3139,6 +3144,492 @@ fn public_summary(record: &Value) -> Value {
         "last_error":record["last_error"],
         "dispatch_permitted":false,
     })
+}
+
+// This is deliberately a bounded Participant read projection. It reuses the
+// durable C8 record and the retained launch Operation; it never contacts the
+// native service, returns private identity/configuration, or grants dispatch.
+const PARTICIPANT_RUNTIME_CORE_TOOLS: &[(&str, &str)] = &[
+    ("swarm.context.get", "swarm_context_get"),
+    ("coordination.send", "coordination_send"),
+    ("coordination.consult", "coordination_consult"),
+    ("operation.get", "operation_get"),
+];
+
+pub(crate) struct ParticipantCapabilityScope<'a> {
+    pub(crate) participant_id: &'a str,
+    pub(crate) task_id: &'a str,
+    pub(crate) task_revision: i64,
+    pub(crate) attempt_id: &'a str,
+    pub(crate) binding_id: Option<&'a str>,
+    pub(crate) binding_generation: Option<i64>,
+    pub(crate) grant_revision: Option<i64>,
+    pub(crate) native_session_id: Option<&'a str>,
+    pub(crate) basis_kind: Option<&'a str>,
+}
+
+pub(crate) fn participant_capability_projection(
+    db: &Connection,
+    scope_input: ParticipantCapabilityScope<'_>,
+) -> Result<Value> {
+    let ParticipantCapabilityScope {
+        participant_id,
+        task_id,
+        task_revision,
+        attempt_id,
+        binding_id,
+        binding_generation,
+        grant_revision,
+        native_session_id,
+        basis_kind,
+    } = scope_input;
+    let scope = json!({
+        "task_id":task_id,
+        "task_revision":task_revision,
+        "attempt_id":attempt_id,
+        "binding_id":binding_id,
+        "binding_generation":binding_generation,
+    });
+    let required_core_methods: Vec<&str> = PARTICIPANT_RUNTIME_CORE_TOOLS
+        .iter()
+        .map(|(method, _)| *method)
+        .collect();
+    let profile = if basis_kind == Some("sponsored_reviewer") {
+        "assigned-reviewer"
+    } else {
+        "participant"
+    };
+    let surface = if basis_kind == Some("sponsored_reviewer") {
+        "assigned-reviewer"
+    } else {
+        "participant-core"
+    };
+    let mut projection = json!({
+        "schema_version":1,
+        "profile":profile,
+        "surface":surface,
+        "coverage":"bounded_required_core_only",
+        "presentation":"pull_only",
+        "scope":scope,
+        "current_task":{
+            "task_id":task_id,
+            "revision":task_revision,
+            "attempt_id":attempt_id,
+        },
+        "state":"relay_only",
+        "availability":{
+            "configured":"unknown",
+            "installed":"unknown",
+            "callable":"unknown",
+        },
+        "core_tools":{
+            "observed":[],
+            "missing":required_core_methods,
+            "coverage":"bounded_required_core_only",
+        },
+        "boot":{
+            "launch_operation_id":null,
+            "launch_state":null,
+            "dispatch_stage":null,
+            "runtime_status":"unknown",
+            "scope_match":"unresolved",
+        },
+        "readiness":{
+            "state":"relay_only",
+            "dispatch_permitted":false,
+            "model_consumed":"unknown",
+        },
+        "observations":{
+            "native_discovered":"unknown",
+            "session_context":"unknown",
+            "provider_request":"unknown",
+        },
+        "gaps":[],
+    });
+
+    // A sponsored reviewer may use the same context read, but its retained
+    // review slot is never a native launch or Task-submission authority.
+    if basis_kind == Some("sponsored_reviewer") {
+        projection["state"] = json!("relay_only");
+        projection["availability"] = json!({
+            "configured":"not_applicable",
+            "installed":"not_applicable",
+            "callable":"not_applicable",
+        });
+        projection["boot"]["scope_match"] = json!("exact_review_scope");
+        projection["readiness"] = json!({
+            "state":"relay_only",
+            "dispatch_permitted":false,
+            "model_consumed":"unknown",
+        });
+        projection["gaps"] = json!([
+            "review_only_participant_scope",
+            "native_dispatch_not_authorized",
+        ]);
+        return Ok(projection);
+    }
+
+    let Some(binding_id) = binding_id.filter(|value| !value.is_empty()) else {
+        projection["gaps"] = json!(["current_binding_missing"]);
+        return Ok(projection);
+    };
+    let Some(binding_generation) = binding_generation.filter(|value| *value > 0) else {
+        projection["gaps"] = json!(["current_binding_generation_missing"]);
+        return Ok(projection);
+    };
+    let Some(grant_revision) = grant_revision.filter(|value| *value > 0) else {
+        projection["gaps"] = json!(["current_grant_revision_missing"]);
+        return Ok(projection);
+    };
+    let Some(native_session_id) = native_session_id.filter(|value| !value.is_empty()) else {
+        projection["gaps"] = json!(["current_native_session_missing"]);
+        return Ok(projection);
+    };
+
+    // Retain only the exact current launch lineage. A stale or unrelated
+    // launch is not a capability receipt for this Participant scope.
+    let mut statement = db.prepare(
+        r#"SELECT operation_id,state,task_id,attempt_id,binding_id,binding_generation,
+                  effective_request_json
+           FROM operations
+          WHERE method='swarm.launch'
+            AND (attempt_id=?1
+              OR json_extract(effective_request_json,'$.launch_manifest.task.attempt_id')=?1)
+          ORDER BY created_at_ms,operation_id
+          LIMIT ?2"#,
+    )?;
+    let scan_limit = i64::try_from(MAX_PARTICIPANT_LAUNCH_LINEAGE_ROWS)
+        .ok()
+        .and_then(|limit| limit.checked_add(1))
+        .unwrap_or(i64::MAX);
+    let rows = statement.query_map(params![attempt_id, scan_limit], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, Option<String>>(4)?,
+            row.get::<_, Option<i64>>(5)?,
+            row.get::<_, String>(6)?,
+        ))
+    })?;
+    let mut parent: Option<(String, String, Value)> = None;
+    let mut ancestry_corrupt = false;
+    let mut scanned_lineage_rows = 0usize;
+    for row in rows {
+        scanned_lineage_rows = scanned_lineage_rows.saturating_add(1);
+        if scanned_lineage_rows > MAX_PARTICIPANT_LAUNCH_LINEAGE_ROWS {
+            projection["state"] = json!("relay_only");
+            projection["readiness"] = json!({
+                "state":"relay_only",
+                "dispatch_permitted":false,
+                "model_consumed":"unknown",
+            });
+            projection["gaps"] = json!(["launch_lineage_scan_bound_exceeded"]);
+            return Ok(projection);
+        }
+        let (
+            operation_id,
+            state,
+            row_task_id,
+            row_attempt_id,
+            row_binding_id,
+            row_generation,
+            effective_json,
+        ) =
+            row?;
+        let effective: Value = match serde_json::from_str(&effective_json) {
+            Ok(value) => value,
+            Err(_) => {
+                ancestry_corrupt = true;
+                continue;
+            }
+        };
+        let Some(manifest) = effective.get("launch_manifest") else {
+            ancestry_corrupt = true;
+            continue;
+        };
+        let row_attempt_matches = row_attempt_id.as_deref() == Some(attempt_id);
+        let manifest_attempt_matches = manifest["task"]["attempt_id"].as_str() == Some(attempt_id);
+        if !row_attempt_matches && !manifest_attempt_matches {
+            continue;
+        }
+        if row_task_id.as_deref() != Some(task_id)
+            || !row_attempt_matches
+            || !manifest_attempt_matches
+            || manifest["task"]["task_id"] != task_id
+        {
+            ancestry_corrupt = true;
+            continue;
+        }
+        let row_binding_mismatch = row_binding_id
+            .as_deref()
+            .is_some_and(|value| value != binding_id)
+            || row_generation.is_some_and(|value| value != binding_generation);
+        if manifest["task"]["observed_revision"] != task_revision
+            || row_binding_mismatch
+            || manifest["binding"]["binding_id"] != binding_id
+            || manifest["binding"]["generation"] != binding_generation
+        {
+            continue;
+        }
+        if parent.is_some() {
+            projection["state"] = json!("incompatible");
+            projection["readiness"] = json!({
+                "state":"incompatible",
+                "dispatch_permitted":false,
+                "model_consumed":"unknown",
+            });
+            projection["gaps"] = json!(["launch_ancestry_ambiguous"]);
+            return Ok(projection);
+        }
+        parent = Some((operation_id, state, manifest.clone()));
+    }
+    drop(statement);
+
+    let Some((launch_operation_id, launch_state, manifest)) = parent else {
+        if ancestry_corrupt {
+            projection["state"] = json!("incompatible");
+            projection["readiness"] = json!({
+                "state":"incompatible",
+                "dispatch_permitted":false,
+                "model_consumed":"unknown",
+            });
+            projection["gaps"] = json!(["launch_ancestry_corrupt"]);
+        } else {
+            projection["gaps"] = json!(["current_launch_operation_not_found"]);
+        }
+        return Ok(projection);
+    };
+
+    projection["boot"] = json!({
+        "launch_operation_id":launch_operation_id.clone(),
+        "launch_state":public_launch_state(&launch_state),
+        "dispatch_stage":public_dispatch_stage(&manifest["progress"]["task_dispatch"]),
+        "runtime_status":"unknown",
+        "scope_match":"exact",
+    });
+
+    let record = match read_diagnostic_meta(
+        db,
+        &record_key(&launch_operation_id),
+        MAX_PUBLIC_C8_RECORD_BYTES,
+    )? {
+        DiagnosticMeta::Missing => {
+            projection["gaps"] = json!(["runtime_capability_receipt_not_recorded"]);
+            return Ok(projection);
+        }
+        DiagnosticMeta::Corrupt => {
+            projection["state"] = json!("incompatible");
+            projection["readiness"] = json!({
+                "state":"incompatible",
+                "dispatch_permitted":false,
+                "model_consumed":"unknown",
+            });
+            projection["gaps"] = json!(["runtime_capability_receipt_corrupt"]);
+            return Ok(projection);
+        }
+        DiagnosticMeta::Value(value) => value,
+    };
+    if !valid_public_c8_record(&record, &launch_operation_id) {
+        projection["state"] = json!("incompatible");
+        projection["readiness"] = json!({
+            "state":"incompatible",
+            "dispatch_permitted":false,
+            "model_consumed":"unknown",
+        });
+        projection["gaps"] = json!(["runtime_capability_receipt_invalid"]);
+        return Ok(projection);
+    }
+
+    let assignment = &record["assignment"];
+    if assignment["task_id"] != task_id
+        || assignment["task_revision"] != task_revision
+        || assignment["attempt_id"] != attempt_id
+        || assignment["binding_id"] != binding_id
+        || assignment["binding_generation"] != binding_generation
+        || assignment["grant_revision"] != grant_revision
+        || assignment["participant_id"] != participant_id
+        || assignment["native_session_id"] != native_session_id
+        || record["dispatch_permitted"] != false
+    {
+        projection["state"] = json!("incompatible");
+        projection["readiness"] = json!({
+            "state":"incompatible",
+            "dispatch_permitted":false,
+            "model_consumed":"unknown",
+        });
+        projection["gaps"] = json!(["runtime_capability_scope_mismatch"]);
+        return Ok(projection);
+    }
+
+    let install_state = public_c8_status(
+        &record["install"]["state"],
+        &["prepared", "outcome_unknown", "registered", "observed_after_unknown"],
+    );
+    let runtime_status = public_c8_status(
+        &record["install"]["readback"]["runtime_status"],
+        &["connected", "pending", "disabled", "failed", "needs_auth"],
+    );
+    let observer_state = public_c8_status(
+        &record["challenge"]["state"],
+        &["not_started", "prepared", "outcome_unknown", "armed", "observed"],
+    );
+    let tools = &record["tools_readback"];
+    let native_discovered = public_c8_status(
+        &tools["native_discovered"]["status"],
+        &["unknown", "observed"],
+    );
+    let session_context = public_c8_status(
+        &tools["session_context"]["status"],
+        &["unknown", "observed"],
+    );
+    let provider_request = public_c8_status(
+        &tools["provider_request"]["status"],
+        &["unknown", "observed"],
+    );
+    let mut observed = BTreeSet::new();
+    let mut inventory_shape_ok = true;
+    let expected_server = record["install"]["intent"]["server_name"].as_str();
+    if expected_server.is_none() {
+        inventory_shape_ok = false;
+    }
+    if native_discovered == "observed" {
+        match tools["native_discovered"]["tools"].as_array() {
+            Some(items) if items.len() <= 512 => {
+                for item in items {
+                    if item["server"].as_str() != expected_server {
+                        continue;
+                    }
+                    if let Some(name) = item["name"].as_str() {
+                        for &(method, native_name) in PARTICIPANT_RUNTIME_CORE_TOOLS {
+                            if name == native_name {
+                                observed.insert(method.to_owned());
+                            }
+                        }
+                    }
+                }
+            }
+            _ => inventory_shape_ok = false,
+        }
+    }
+    let observed: Vec<String> = observed.into_iter().collect();
+    let missing: Vec<String> = PARTICIPANT_RUNTIME_CORE_TOOLS
+        .iter()
+        .filter(|entry| !observed.iter().any(|item| item.as_str() == entry.0))
+        .map(|entry| entry.0.to_owned())
+        .collect();
+    let missing_values: Vec<Value> = missing.iter().cloned().map(Value::String).collect();
+    let observed_values: Vec<Value> = observed.iter().cloned().map(Value::String).collect();
+    let mut core_status = serde_json::Map::new();
+    for &(method, _) in PARTICIPANT_RUNTIME_CORE_TOOLS {
+        let status = if observed.iter().any(|item| item == method) {
+            "available"
+        } else {
+            "missing"
+        };
+        core_status.insert(
+            method.to_owned(),
+            json!(status),
+        );
+    }
+    projection["core_tools"] = json!({
+        "observed":observed_values,
+        "missing":missing_values,
+        "status":core_status,
+        "coverage":"bounded_required_core_only",
+    });
+    projection["availability"] = json!({
+        "configured":install_state,
+        "installed":runtime_status,
+        "callable":if native_discovered == "observed" && inventory_shape_ok {
+            "observed"
+        } else {
+            "unknown"
+        },
+    });
+    projection["observations"] = json!({
+        "native_discovered":native_discovered,
+        "session_context":session_context,
+        "provider_request":provider_request,
+    });
+    projection["boot"]["runtime_status"] = json!(runtime_status);
+
+    let mut gaps = vec!["model_consumption_unknown".to_owned()];
+    if session_context == "unknown" {
+        gaps.push("session_context_not_observed".to_owned());
+    }
+    if provider_request == "unknown" {
+        gaps.push("provider_request_not_observed".to_owned());
+    }
+    let state = if matches!(runtime_status, "failed" | "needs_auth" | "disabled") {
+        gaps.push("native_runtime_unavailable".to_owned());
+        "incompatible"
+    } else if runtime_status != "connected" {
+        gaps.push("native_runtime_not_connected".to_owned());
+        "relay_only"
+    } else if install_state == "observed_after_unknown" {
+        gaps.push("installation_observed_after_unknown".to_owned());
+        "relay_only"
+    } else if install_state != "registered" {
+        gaps.push("native_install_not_registered".to_owned());
+        "relay_only"
+    } else if observer_state != "observed"
+        || native_discovered != "observed"
+        || !inventory_shape_ok
+        || !missing.is_empty()
+    {
+        if !missing.is_empty() {
+            gaps.push("required_core_tools_missing".to_owned());
+        }
+        if observer_state != "observed" || native_discovered != "observed" || !inventory_shape_ok {
+            gaps.push("callability_not_observed".to_owned());
+        }
+        "relay_only"
+    } else {
+        gaps.push("dispatch_remains_manager_owned".to_owned());
+        "ready_with_gaps"
+    };
+    projection["state"] = json!(state);
+    projection["readiness"] = json!({
+        "state":state,
+        "dispatch_permitted":false,
+        "model_consumed":"unknown",
+    });
+    projection["gaps"] = Value::Array(gaps.into_iter().map(Value::String).collect());
+    Ok(projection)
+}
+
+fn public_c8_status(value: &Value, allowed: &[&'static str]) -> &'static str {
+    let value = value.as_str().unwrap_or("unknown");
+    allowed
+        .iter()
+        .copied()
+        .find(|allowed| *allowed == value)
+        .unwrap_or("unknown")
+}
+
+fn public_launch_state(state: &str) -> &'static str {
+    match state {
+        "queued" => "queued",
+        "running" => "running",
+        "settled" => "settled",
+        "rejected" => "rejected",
+        "cancelled" => "cancelled",
+        "outcome_unknown" => "outcome_unknown",
+        _ => "unknown",
+    }
+}
+
+fn public_dispatch_stage(value: &Value) -> &'static str {
+    match value.as_str() {
+        Some("not_started") => "not_started",
+        Some("admitted") => "admitted",
+        Some("dispatched") => "dispatched",
+        Some("completed") => "completed",
+        Some("failed") => "failed",
+        _ => "unknown",
+    }
 }
 
 fn safe_label(value: &str) -> Result<String> {
