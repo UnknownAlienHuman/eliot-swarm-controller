@@ -26,11 +26,25 @@ $packageMap = @{
     }
     'swarm-cli' = [ordered]@{
         manifest = 'crates/swarm-cli/Cargo.toml'
-        binary = 'swarm-cli'
+        binary = 'swarm'
         role = 'cli_client'
     }
 }
 
+function Get-PublicCliHostRequirement([object] $Target, [object] $SelectedPackage) {
+    $source = Get-Content -LiteralPath ([string]$Target.src_path) -Raw
+    foreach ($literal in @('fn command_uses_host(', '"swarm-host.exe"', 'HOST_BINARY_MISSING', '.args(arguments).status()')) {
+        if (-not $source.Contains($literal)) { throw "Public swarm CLI is missing its explicit host sibling contract: $literal" }
+    }
+    if ($source.Contains('eliot_swarm_controller::') -or $source.Contains('swarm_store::') -or $source.Contains('swarm_kernel::')) {
+        throw 'Public swarm CLI source imports a root controller, Store, or kernel implementation.'
+    }
+    $forbidden = @($SelectedPackage.dependencies | Where-Object {
+        [string]$_.name -match '\A(?:eliot-swarm-controller|swarm-store|swarm-kernel|swarm-adapter-)'
+    })
+    if ($forbidden.Count -gt 0) { throw 'Public swarm CLI package directly depends on root host, Store, kernel, or adapter packages.' }
+    return @('eliot-swarm-controller')
+}
 function Get-CanonicalPath([string] $Path, [string] $Label) {
     if (-not [IO.Path]::IsPathFullyQualified($Path)) { throw "$Label must be an absolute path." }
     return [IO.Path]::GetFullPath($Path)
@@ -110,7 +124,7 @@ function Copy-ToNewFile([string] $Source, [string] $Destination) {
 }
 
 if ($Package -cnotin @('swarm-mcp', 'swarm-gateway', 'swarm-cli')) {
-    throw 'Package must be exactly one of: swarm-mcp, swarm-gateway, swarm-cli. Build the root swarm host/compatibility CLI with Build-SwarmHostProvenance.ps1.'
+    throw 'Package must be exactly one of: swarm-mcp, swarm-gateway, swarm-cli. Build the root swarm-host package with Build-SwarmHostProvenance.ps1.'
 }
 if (-not (Test-Path -LiteralPath $rootManifest -PathType Leaf) -or
     -not (Test-Path -LiteralPath $lockFile -PathType Leaf) -or
@@ -208,9 +222,23 @@ if ($targetMatches.Count -ne 1) {
     throw "Package '$Package' must expose exactly one expected binary target '$($selectedSpec.binary)'."
 }
 $dependencyPins = Get-ResolvedDependencyPins $metadata $selected $repoRoot $lockFile
+if ($Package -ceq 'swarm-cli') {
+    $forbiddenTransitive = @($dependencyPins | Where-Object {
+        [string]$_.name -match '\A(?:eliot-swarm-controller|swarm-store|swarm-kernel|swarm-adapter-)'
+    })
+    if ($forbiddenTransitive.Count -gt 0) {
+        throw 'Resolved public CLI dependency graph reaches the root host, Store, kernel, or an adapter package.'
+    }
+}
 $hostIpcProtocolVersion = Get-HostIpcProtocolVersion $repoRoot
 $rustcHostTriple = Get-RustcHostTriple $rustcVersion
 $gatewayArguments = Get-GatewayAcceptedArguments $repoRoot $targetMatches[0]
+$requiredHostPackages = @()
+$hostLauncher = $null
+if ($Package -ceq 'swarm-cli') {
+    $requiredHostPackages = Get-PublicCliHostRequirement $targetMatches[0] $selected
+    $hostLauncher = [ordered]@{ package_name = 'eliot-swarm-controller'; binary_target = 'swarm-host'; required_arguments = @() }
+}
 if ([string]$selected.version -cnotmatch '\A[0-9A-Za-z.+-]{1,128}\z') {
     throw "Package '$Package' has an invalid Cargo package version."
 }
@@ -292,6 +320,13 @@ $artifact = [ordered]@{
     source_sha256 = $sourceBinaryHash
     artifact_sha256 = $artifactHash
 }
+$compatibilityFacts = [ordered]@{
+    required_sibling_binaries = @($requiredHostPackages)
+    host_ipc = [ordered]@{ protocol_version = $hostIpcProtocolVersion }
+    target = [ordered]@{ rustc_host_triple = $rustcHostTriple }
+    accepted_launcher_arguments = @($gatewayArguments)
+}
+if ($null -ne $hostLauncher) { $compatibilityFacts['host_launcher'] = $hostLauncher }
 $provenance = [ordered]@{
     schema_version = 1
     format = 'eliot.frontend_build_manifest.v1'
@@ -310,12 +345,7 @@ $provenance = [ordered]@{
         feature_sets = 'workspace_unified_not_package_specific_build_features'
     }
     artifacts = @($artifact)
-    compatibility = [ordered]@{
-        required_sibling_binaries = @()
-        host_ipc = [ordered]@{ protocol_version = $hostIpcProtocolVersion }
-        target = [ordered]@{ rustc_host_triple = $rustcHostTriple }
-        accepted_launcher_arguments = @($gatewayArguments)
-    }
+    compatibility = $compatibilityFacts
     installation = [ordered]@{
         installed = $false
         registered = $false

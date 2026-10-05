@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use swarm_contracts::module_catalog::{
     ArtifactIdentity, ArtifactVersion, CapabilityId, ModuleCatalog, ModuleDescriptor, ModuleId,
-    PreInputOpenContract, ProtocolVersion, WorkspaceOptionContract,
+    PreInputOpenContract, ProtocolVersion, SchemaDescriptor, WorkspaceOptionContract,
 };
 use swarm_contracts::module_contract::{MODULE_PROTOCOL_V1, ModuleContractClaim};
 
@@ -90,6 +90,8 @@ pub(super) struct RetainedModuleIdentity {
     /// Trusted implementation metadata only. These names can gate adapter
     /// compatibility, but never grant Store or native-effect authority.
     pub capabilities: BTreeSet<CapabilityId>,
+    pub command_schemas: BTreeSet<SchemaDescriptor>,
+    pub event_schemas: BTreeSet<SchemaDescriptor>,
 }
 
 fn catalog_error(error: impl std::fmt::Display) -> Error {
@@ -698,6 +700,8 @@ pub(super) fn retained_contract_identity(
         artifact: entry.descriptor.artifact.clone(),
         protocol: HOST_PROTOCOL,
         capabilities: entry.descriptor.capabilities.clone(),
+        command_schemas: entry.descriptor.command_schemas.clone(),
+        event_schemas: entry.descriptor.event_schemas.clone(),
     }))
 }
 

@@ -11,7 +11,7 @@ name = "eliot_swarm_controller"
 path = "src/lib.rs"
 
 [[bin]]
-name = "swarm"
+name = "swarm-host"
 path = "src/main.rs"
 
 [dependencies]
@@ -28,6 +28,7 @@ rmcp = { version = "=3.5.0", default-features = false, features = ["server", "tr
 rusqlite = { version = "=0.40.2", features = ["bundled"] }
 swarm-client = { path = "crates/swarm-client" }
 swarm-bus = { path = "crates/swarm-bus" }
+swarm-automation = { path = "crates/swarm-automation" }
 swarm-contracts = { path = "crates/swarm-contracts" }
 swarm-kernel = { path = "crates/swarm-kernel" }
 swarm-mcp = { path = "crates/swarm-mcp" }
@@ -66,7 +67,7 @@ strip = "none"
 incremental = true
 lto = "off"
 
-# Own workspace boundary; the default entrypoint remains the root CLI/kernel.
+# Public default entrypoint is the lightweight IPC CLI; host/admin code remains the explicit root package.
 [workspace]
 members = [
     "crates/swarm-adapter-codex",
@@ -80,6 +81,7 @@ members = [
     "crates/swarm-observer",
     "crates/swarm-forge-worker",
     "crates/swarm-bus",
+    "crates/swarm-automation",
     "crates/swarm-kernel",
     "crates/swarm-mcp",
     "crates/swarm-process",
@@ -91,7 +93,7 @@ members = [
     "crates/swarm-gateway",
     "modules/antigravity-rust",
 ]
-default-members = ["."]
+default-members = ["crates/swarm-cli"]
 resolver = "3"
 # Note: the vendored atlas-redact path dependency becomes a workspace member. Never run a bare
 # `cargo fmt` at the root: it would reformat the preserved upstream Atlas snapshot (vendor/atlas,

@@ -25,10 +25,12 @@
     "semantics": "replace_with_admitted_absolute_workspace"
   },
   "command_schemas": [
-    { "schema_id": "swarm.runtime_command", "version": "1", "sha256": null }
+    { "schema_id": "swarm.runtime_command", "version": "1", "sha256": null },
+    { "schema_id": "swarm.task_dispatch_context", "version": "1", "sha256": null }
   ],
   "event_schemas": [
-    { "schema_id": "swarm.runtime_outcome", "version": "1", "sha256": null }
+    { "schema_id": "swarm.runtime_outcome", "version": "1", "sha256": null },
+    { "schema_id": "swarm.task_dispatch_admission", "version": "1", "sha256": null }
   ],
   "protocol": {
     "minimum": { "major": 1, "minor": 0 },

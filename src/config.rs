@@ -48,6 +48,21 @@ pub struct ScriptConfig {
     pub executor: Option<swarm_script_worker::ExecutorPin>,
 }
 
+/// Explicit opt-in for the independent Store-backed scheduler process. The
+/// built-in scheduler remains the compatibility and recovery path when this
+/// is absent or disabled.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AutomationSchedulerConfig {
+    pub enabled: bool,
+}
+
+impl Default for AutomationSchedulerConfig {
+    fn default() -> Self {
+        Self { enabled: false }
+    }
+}
+
 impl ScriptConfig {
     pub fn validate(&self) -> Result<()> {
         if let Some(executor) = &self.executor {
@@ -103,6 +118,10 @@ pub struct Config {
     pub forge: crate::forge::ForgeConfig,
     pub workspace: crate::workspace::WorkspaceConfig,
     pub schedules: Vec<crate::scheduler::ScheduleConfig>,
+    /// Independent Rust worker stays dormant unless explicitly enabled and
+    /// the Store reports a current scheduler due/future fact.
+    #[serde(default)]
+    pub automation_scheduler: AutomationSchedulerConfig,
     /// Optional module failures isolate the actor while the Store remains available.
     pub module_supervisor: ModuleSupervisorConfig,
     /// Optional managed bus lifecycle selected by trusted local configuration.
@@ -509,6 +528,7 @@ impl Default for Config {
             forge: crate::forge::ForgeConfig::default(),
             workspace: crate::workspace::WorkspaceConfig::default(),
             schedules: Vec::new(),
+            automation_scheduler: AutomationSchedulerConfig::default(),
             module_supervisor: ModuleSupervisorConfig::default(),
             bus_supervisor: BusSupervisorConfig::default(),
         }

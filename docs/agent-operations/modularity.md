@@ -108,6 +108,20 @@ not require replacing every process. Reject incompatible messages with a bounded
 capability error before effect; unknown optional event fields are retained only
 under a bounded extension envelope, never interpreted as new authority.
 
+The normalized dispatch pair is an explicit descriptor opt-in: a module advertises
+`swarm.task_dispatch_context@1` as a command schema together with
+`swarm.task_dispatch_admission@1` as an outcome schema. Store adds the context
+to that exact `task.dispatch` command with operation, binding and generation,
+worker boot, Attempt and Task identity, Task revision, immutable snapshot digest,
+and original source text digest and byte count. The adapter returns the context
+unchanged, echoes the strict `ModuleReceiptIdentity`, and records the digest and
+byte count of the exact native payload it submitted plus an optional native input
+ID. Store recomputes the context from the original Operation and retained Attempt,
+requires the outer identity and native input ID to match, and records an existing
+Attempt producer for `Accepted` or `Applied`. `Unknown` remains unresolved and
+cannot mark the Task complete. Descriptors without both schemas retain the legacy
+codec and runtime-specific producer path.
+
 The adapter owns native schemas, workspace-field mapping, connection identity,
 capability interpretation, command translation and normalization of observations.
 The kernel owns command identity, authorization, durable ordering, deduplication

@@ -9,16 +9,26 @@ use crate::{
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::{Value, json};
+use swarm_kernel::reviews as review_contract;
 
 fn current(db: &Connection, p: &Principal, input: &SubmitRequest) -> Result<Value> {
-    if !matches!(p.role, Role::Operator | Role::Manager) {
+    let a = tasks::get_attempt(db, &input.attempt_id)?;
+    if p.role == Role::Participant {
+        super::coordination::authorize_task_submission(
+            db,
+            p,
+            model::text(&a, "task_id")?,
+            input.expected_revision,
+            &input.attempt_id,
+        )?;
+    } else if matches!(p.role, Role::Operator | Role::Manager) {
+        super::gm::require_attempt_control(db, p, &a)?;
+    } else {
         return Err(Error::new(
             "FORBIDDEN",
-            "submission requires a manager or operator",
+            "submission requires an assigned Participant, Attempt owner, current GM, or operator",
         ));
     }
-    let a = tasks::get_attempt(db, &input.attempt_id)?;
-    super::gm::require_attempt_control(db, p, &a)?;
     let t = tasks::get_task(db, model::text(&a, "task_id")?)?;
     if t["state"] != "open"
         || t["revision"] != input.expected_revision
@@ -48,10 +58,27 @@ fn current(db: &Connection, p: &Principal, input: &SubmitRequest) -> Result<Valu
     Ok(a)
 }
 fn candidate(db: &Connection, a: &Value, input: &SubmitRequest) -> Result<ArtifactRecord> {
-    let record = results::get(db, &input.candidate_ref)?;
+    candidate_for_attempt(
+        db,
+        a,
+        &input.attempt_id,
+        input.expected_revision,
+        &input.candidate_ref,
+    )
+}
+
+fn candidate_for_attempt(
+    db: &Connection,
+    a: &Value,
+    attempt_id: &str,
+    expected_revision: i64,
+    candidate_ref: &str,
+) -> Result<ArtifactRecord> {
+    let record = results::get(db, candidate_ref)?;
     if record.kind == "source_snapshot" {
-        if record.metadata["attempt_id"] != input.attempt_id
-            || record.metadata["task_revision"] != input.expected_revision
+        if record.metadata["task_id"] != a["task_id"]
+            || record.metadata["attempt_id"] != attempt_id
+            || record.metadata["task_revision"] != expected_revision
         {
             return Err(Error::new(
                 "CANDIDATE_SCOPE",
@@ -78,9 +105,14 @@ fn candidate(db: &Connection, a: &Value, input: &SubmitRequest) -> Result<Artifa
             ));
         }
     };
+    let candidate_generation = if record.kind == "native_result_page" {
+        identity["binding_generation"].clone()
+    } else {
+        identity["generation"].clone()
+    };
     if !a["binding_id"].is_null()
         && (a["binding_id"] != identity["binding_id"]
-            || a["binding_generation"] != identity["generation"])
+            || a["binding_generation"] != candidate_generation)
     {
         return Err(Error::new(
             "CANDIDATE_SCOPE",
@@ -90,6 +122,179 @@ fn candidate(db: &Connection, a: &Value, input: &SubmitRequest) -> Result<Artifa
     // Selection is the caller's assertion. This does not attest a Git source tree,
     // assign a child by timestamp, or promote the native report to an independent check.
     Ok(record)
+}
+
+/// Participant candidates must be tied to this exact Attempt by the source
+/// snapshot metadata or by the retained agent.result Operation that produced
+/// every page. Binding equality alone is insufficient because one native
+/// binding may have served more than one Task/Attempt.
+fn authorize_participant_candidate(
+    db: &Connection,
+    attempt: &Value,
+    candidate: &ArtifactRecord,
+) -> Result<()> {
+    if candidate.kind == "source_snapshot" {
+        if candidate.metadata["task_id"] == attempt["task_id"]
+            && candidate.metadata["attempt_id"] == attempt["attempt_id"]
+            && candidate.metadata["task_revision"] == attempt["task_revision"]
+        {
+            return Ok(());
+        }
+        return Err(Error::new(
+            "CANDIDATE_SCOPE",
+            "source snapshot belongs to another Task or Attempt",
+        ));
+    }
+    if attempt["binding_id"].is_null() || attempt["binding_generation"].is_null() {
+        return Err(Error::new(
+            "CANDIDATE_SCOPE",
+            "native result candidate is not linked to this bound Attempt",
+        ));
+    }
+    let page_ids: Vec<String> = match candidate.kind.as_str() {
+        "native_result_page" => vec![candidate.artifact_id.clone()],
+        "native_result" => candidate.metadata["parts"]
+            .as_array()
+            .filter(|parts| !parts.is_empty())
+            .ok_or_else(|| {
+                Error::new(
+                    "CANDIDATE_SCOPE",
+                    "assembled candidate has no retained result pages",
+                )
+            })?
+            .iter()
+            .map(|part| model::text(part, "artifact_ref").map(str::to_owned))
+            .collect::<Result<Vec<_>>>()?,
+        _ => {
+            return Err(Error::new(
+                "CANDIDATE_SCOPE",
+                "candidate is not an assigned source or native result",
+            ));
+        }
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    for page_id in page_ids {
+        if !seen.insert(page_id.clone()) {
+            return Err(Error::new(
+                "CANDIDATE_SCOPE",
+                "candidate repeats a retained result page",
+            ));
+        }
+        let page = results::get(db, &page_id)?;
+        if page.kind != "native_result_page" {
+            return Err(Error::new(
+                "CANDIDATE_SCOPE",
+                "assembled candidate references a non-result page",
+            ));
+        }
+        let operation_id = page.metadata["operation_id"].as_str().ok_or_else(|| {
+            Error::new(
+                "CANDIDATE_SCOPE",
+                "result page has no retained dispatch operation",
+            )
+        })?;
+        let dispatch = operations::get_operation(db, operation_id)?;
+        if dispatch["method"] != "task.dispatch"
+            || !matches!(dispatch["state"].as_str(), Some("settled" | "rejected"))
+            || dispatch["task_id"] != attempt["task_id"]
+            || dispatch["attempt_id"] != attempt["attempt_id"]
+            || dispatch["binding_id"] != attempt["binding_id"]
+            || dispatch["binding_generation"] != attempt["binding_generation"]
+            || page.metadata["binding_id"] != attempt["binding_id"]
+            || page.metadata["binding_generation"] != attempt["binding_generation"]
+            || !crate::runtime::batch::BATCH_OUTPUTS
+                .contains(&page.metadata["native_output"].as_str().unwrap_or(""))
+        {
+            return Err(Error::new(
+                "CANDIDATE_SCOPE",
+                "result page is not linked to this exact Task, Attempt, and binding generation",
+            ));
+        }
+        let mut linked = false;
+        let mut operation_stmt = db.prepare(
+            "SELECT result_json FROM operations WHERE method='agent.result' AND state='settled' AND task_id=?1 AND attempt_id=?2 AND binding_id=?3 AND binding_generation=?4",
+        )?;
+        let operation_rows = operation_stmt.query_map(
+            rusqlite::params![
+                attempt["task_id"].as_str(),
+                attempt["attempt_id"].as_str(),
+                attempt["binding_id"].as_str(),
+                attempt["binding_generation"].as_i64(),
+            ],
+            |row| row.get::<_, String>(0),
+        )?;
+        for raw in operation_rows {
+            let result: Value = serde_json::from_str(&raw?)?;
+            if result["outcome"] == "applied"
+                && result["details"]["dispatch_operation_id"] == operation_id
+                && result["details"]["artifact_refs"]
+                    .as_array()
+                    .is_some_and(|refs| refs.iter().any(|item| item.as_str() == Some(page_id.as_str())))
+            {
+                linked = true;
+                break;
+            }
+        }
+        if !linked {
+            return Err(Error::new(
+                "CANDIDATE_SCOPE",
+                "result page is not linked to an applied agent.result Operation",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The normal artifact reader uses this same exact-assignment rule, so an
+/// ordinary Participant can inspect only its current candidate/work result.
+pub(crate) fn authorize_participant_artifact_read(
+    db: &Connection,
+    principal: &Principal,
+    artifact_id: &str,
+) -> Result<()> {
+    principal.require_participant()?;
+    let scope = super::coordination::current_scope(db, principal)?;
+    if !matches!(
+        scope["participant"]["participation_basis"]["kind"].as_str(),
+        Some("attempt_owner" | "producer_ref")
+    ) {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "review-only Participant grants cannot read Task work artifacts",
+        ));
+    }
+    let attempt_id = model::text(&scope["attempt"], "attempt_id")?;
+    let attempt = tasks::get_attempt(db, attempt_id)?;
+    if scope["attempt"]["submission_ref"] == artifact_id {
+        let submission = results::get(db, artifact_id)?;
+        let operation_id = model::text(&submission.metadata, "operation_id").ok();
+        let operation = operation_id
+            .map(|id| operations::get_operation(db, id))
+            .transpose()?;
+        if submission.kind == "task_submission"
+            && submission.metadata["task_id"] == attempt["task_id"]
+            && submission.metadata["attempt_id"] == attempt_id
+            && submission.metadata["task_revision"] == attempt["task_revision"]
+            && operation.as_ref().is_some_and(|operation| {
+                operation["method"] == "task.submit"
+                    && operation["state"] == "settled"
+                    && operation["result"]["outcome"] == "applied"
+                    && operation["task_id"] == attempt["task_id"]
+                    && operation["attempt_id"] == attempt_id
+                    && operation["result"]["submission_ref"] == artifact_id
+            })
+        {
+            return Ok(());
+        }
+    }
+    let candidate = candidate_for_attempt(
+        db,
+        &attempt,
+        attempt_id,
+        model::positive(&scope["task"], "revision")?,
+        artifact_id,
+    )?;
+    authorize_participant_candidate(db, &attempt, &candidate)
 }
 
 struct RetainedSubmission {
@@ -242,6 +447,9 @@ pub(super) fn reserve(tx: &Transaction<'_>, p: &Principal, v: &Value, id: &str) 
     let input = SubmitRequest::parse(v)?;
     let a = current(tx, p, &input)?;
     let candidate = candidate(tx, &a, &input)?;
+    if p.role == Role::Participant {
+        authorize_participant_candidate(tx, &a, &candidate)?;
+    }
     let spec: TaskSpec = serde_json::from_value(a["task_snapshot"]["spec"].clone())?;
     let claims = input.normalized_claims(&spec)?;
     let counts = claim_counts(&claims);
@@ -669,10 +877,10 @@ pub(super) fn begin(
 ) -> Result<Option<(ArtifactRecord, Value)>> {
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let p = current_principal(&tx, p)?;
-    if !matches!(p.role, Role::Operator | Role::Manager) {
+    if !matches!(p.role, Role::Operator | Role::Manager | Role::Participant) {
         return Err(Error::new(
             "FORBIDDEN",
-            "submission requires a manager or operator",
+            "submission requires an assigned Participant, Attempt owner, current GM, or operator",
         ));
     }
     let op = operations::get_operation(&tx, id)?;
@@ -701,6 +909,13 @@ pub(super) fn begin(
     let effective: Value = serde_json::from_str(&raw)?;
     let document = effective["submission_document"].clone();
     let record = results::get(&tx, model::text(&document, "candidate_ref")?)?;
+    if p.role == Role::Participant {
+        authorize_participant_candidate(
+            &tx,
+            &tasks::get_attempt(&tx, &input.attempt_id)?,
+            &record,
+        )?;
+    }
     let now = model::now_ms()?;
     tx.execute("UPDATE operations SET state='sending',sent_at_ms=?2,updated_at_ms=?2 WHERE operation_id=?1", params![id,now])?;
     tx.commit()?;
@@ -1235,10 +1450,17 @@ fn retain_review_disposition(
         .optional()?;
     if let Some(raw) = old_disposition {
         let prior: Value = serde_json::from_str(&raw)?;
+        review_contract::validate_disposition(&prior).map_err(|_| {
+            Error::new(
+                "REVIEW_DISPOSITION_CONFLICT",
+                "the exact review slot already has a different manager disposition",
+            )
+        })?;
         if prior["review_assignment_id"] != assignment_id
             || prior["identity"] != provenance["identity"]
             || prior["review_result_operation_id"] != provenance["review_operation_id"]
-            || prior["disposition"] != "return_for_correction"
+            || prior["disposition"]
+                != review_contract::ReviewDisposition::ReturnForCorrection.as_str()
         {
             return Err(Error::new(
                 "REVIEW_DISPOSITION_CONFLICT",
@@ -1252,7 +1474,7 @@ fn retain_review_disposition(
         "kind":"review.disposition",
         "review_assignment_id":assignment_id,
         "operation_id":operation_id,
-        "disposition":"return_for_correction",
+        "disposition":review_contract::ReviewDisposition::ReturnForCorrection.as_str(),
         "review_result_operation_id":provenance["review_operation_id"],
         "reason":input.reason,
         "evidence_refs":input.evidence,
@@ -1261,6 +1483,12 @@ fn retain_review_disposition(
         "identity":provenance["identity"],
         "task_feedback_operation_id":feedback_operation_id,
     });
+    review_contract::validate_disposition(&disposition).map_err(|error| {
+        Error::new(
+            "REVIEW_DISPOSITION_DAMAGED",
+            format!("generated review disposition is invalid: {error}"),
+        )
+    })?;
     tx.execute(
         "INSERT INTO observations(source_stream_id,source_event_key,operation_id,kind,payload_json,recorded_at_ms) VALUES('controller:review',?1,?2,'review.disposition',?3,?4)",
         params![disposition_key, operation_id, model::canonical(&disposition)?, now],

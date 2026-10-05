@@ -311,7 +311,9 @@ jobs:
           bun test native-mcp-proof.test.mjs
           node selftest.mjs
       - name: Build
-        run: cargo build --locked --release --bin swarm
+        run: |
+          cargo build --locked --release --package swarm-cli --bin swarm
+          cargo build --locked --release --package eliot-swarm-controller --bin swarm-host
       - name: Record build inputs
         if: always()
         shell: bash
@@ -350,3 +352,5 @@ jobs:
             build-info/
             target/release/swarm
             target/release/swarm.exe
+            target/release/swarm-host
+            target/release/swarm-host.exe

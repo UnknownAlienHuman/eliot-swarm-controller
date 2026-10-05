@@ -1,6 +1,9 @@
 use serde::Serialize;
 use serde_json::Value;
-use swarm_contracts::runtime::{ModuleReceiptIdentity, RuntimeCommand};
+use sha2::{Digest, Sha256};
+use swarm_contracts::runtime::{
+    ModuleReceiptIdentity, RuntimeCommand, TaskDispatchAdmissionReceipt, TaskDispatchContext,
+};
 
 pub const ARTIFACT_ID: &str = "eliot-antigravity.rust-headless.1";
 pub const ARTIFACT_VERSION: &str = "3";
@@ -146,6 +149,66 @@ pub fn encode_user_line(text: &str) -> Result<Vec<u8>, &'static str> {
         return Err("PROMPT_TOO_LARGE");
     }
     Ok(line)
+}
+
+pub fn normalized_dispatch_admission(
+    command: &RuntimeCommand,
+    identity: &OperationIdentity,
+    boot_id: &str,
+    payload: &[u8],
+) -> Result<TaskDispatchAdmissionReceipt, &'static str> {
+    if command.method != "task.dispatch" {
+        return Err("EXPECTED_TASK_DISPATCH");
+    }
+    let context: TaskDispatchContext = serde_json::from_value(
+        command.input["task_dispatch_context"].clone(),
+    )
+    .map_err(|_| "TASK_DISPATCH_CONTEXT_INVALID")?;
+    context
+        .validate()
+        .map_err(|_| "TASK_DISPATCH_CONTEXT_INVALID")?;
+    if context.operation_id != command.operation_id
+        || context.binding_id != command.binding_id
+        || context.binding_generation != command.generation
+        || context.worker_boot_id != boot_id
+        || identity.operation_id != command.operation_id
+    {
+        return Err("TASK_DISPATCH_CONTEXT_INVALID");
+    }
+    let source_text = command.input["text"]
+        .as_str()
+        .filter(|text| !text.trim().is_empty())
+        .ok_or("TASK_DISPATCH_CONTEXT_INVALID")?;
+    if context.source_text_sha256 != sha256(source_text.as_bytes())
+        || context.source_text_bytes != source_text.len() as u64
+    {
+        return Err("TASK_DISPATCH_CONTEXT_INVALID");
+    }
+    let receipt = TaskDispatchAdmissionReceipt {
+        schema_version: 1,
+        module_receipt: identity.module_receipt.clone(),
+        operation_id: context.operation_id,
+        binding_id: context.binding_id,
+        binding_generation: context.binding_generation,
+        worker_boot_id: context.worker_boot_id,
+        attempt_id: context.attempt_id,
+        task_id: context.task_id,
+        task_revision: context.task_revision,
+        task_snapshot_sha256: context.task_snapshot_sha256,
+        source_text_sha256: context.source_text_sha256,
+        source_text_bytes: context.source_text_bytes,
+        native_payload_sha256: sha256(payload),
+        native_payload_bytes: payload.len() as u64,
+        native_input_id: None,
+    };
+    receipt
+        .validate()
+        .map_err(|_| "TASK_DISPATCH_CONTEXT_INVALID")?;
+    Ok(receipt)
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 pub fn prompt_for(command: &RuntimeCommand) -> Result<String, &'static str> {

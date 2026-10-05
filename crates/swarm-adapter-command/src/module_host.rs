@@ -10,7 +10,9 @@ use serde_json::Value;
 use swarm_contracts::{
     error::{Error, Result},
     module_contract::ModuleContractClaim,
-    runtime::{ModuleReceiptIdentity, RuntimeCommand, RuntimeOutcome},
+    runtime::{
+        ModuleReceiptIdentity, RuntimeCommand, RuntimeOutcome,
+    },
 };
 
 pub struct ModuleHostIdentity {
@@ -159,14 +161,63 @@ fn command_capabilities_match(claim: &ModuleContractClaim) -> bool {
 }
 
 fn schemas_match(claim: &ModuleContractClaim) -> bool {
-    claim.command_schemas.len() == 1
-        && claim.command_schemas[0].schema_id == "swarm.runtime_command"
-        && claim.command_schemas[0].version == "1"
-        && claim.command_schemas[0].sha256.is_none()
+    fn is_schema(schema: &swarm_contracts::module_catalog::SchemaDescriptor, id: &str) -> bool {
+        schema.schema_id == id && schema.version == "1" && schema.sha256.is_none()
+    }
+    let legacy = claim.command_schemas.len() == 1
+        && is_schema(&claim.command_schemas[0], "swarm.runtime_command")
         && claim.event_schemas.len() == 1
-        && claim.event_schemas[0].schema_id == "swarm.runtime_outcome"
-        && claim.event_schemas[0].version == "1"
-        && claim.event_schemas[0].sha256.is_none()
+        && is_schema(&claim.event_schemas[0], "swarm.runtime_outcome");
+    let normalized = claim.command_schemas.len() == 2
+        && is_schema(&claim.command_schemas[0], "swarm.runtime_command")
+        && is_schema(&claim.command_schemas[1], "swarm.task_dispatch_context")
+        && claim.event_schemas.len() == 2
+        && is_schema(&claim.event_schemas[0], "swarm.runtime_outcome")
+        && is_schema(&claim.event_schemas[1], "swarm.task_dispatch_admission");
+    legacy || normalized
+}
+
+pub fn normalized_dispatch_enabled(claim: &ModuleContractClaim) -> bool {
+    fn is_schema(schema: &swarm_contracts::module_catalog::SchemaDescriptor, id: &str) -> bool {
+        schema.schema_id == id && schema.version == "1" && schema.sha256.is_none()
+    }
+    claim.command_schemas.len() == 2
+        && claim.event_schemas.len() == 2
+        && is_schema(&claim.command_schemas[0], "swarm.runtime_command")
+        && is_schema(&claim.command_schemas[1], "swarm.task_dispatch_context")
+        && is_schema(&claim.event_schemas[0], "swarm.runtime_outcome")
+        && is_schema(&claim.event_schemas[1], "swarm.task_dispatch_admission")
+}
+
+pub fn receipt_identity_for_input(
+    claim: &ModuleContractClaim,
+    command: &RuntimeCommand,
+    operation_id: &str,
+    input_sha256: &str,
+) -> Result<ModuleReceiptIdentity> {
+    if operation_id.trim().is_empty() || !is_sha256(input_sha256) {
+        return Err(Error::new(
+            "MODULE_RECEIPT_IDENTITY_INVALID",
+            "module receipt input identity is invalid",
+        ));
+    }
+    let identity = ModuleReceiptIdentity {
+        schema_version: 1,
+        module_id: claim.module_id.clone(),
+        artifact: claim.artifact.clone(),
+        protocol: claim.protocol,
+        binding_id: command.binding_id.clone(),
+        binding_generation: command.generation,
+        operation_id: operation_id.to_owned(),
+        input_sha256: input_sha256.to_owned(),
+    };
+    identity.validate().map_err(|_| {
+        Error::new(
+            "MODULE_RECEIPT_IDENTITY_INVALID",
+            "module receipt identity is invalid",
+        )
+    })?;
+    Ok(identity)
 }
 
 pub fn require_negotiated(hello: &Value, host: &ModuleHostIdentity) -> Result<()> {

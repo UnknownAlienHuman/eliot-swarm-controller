@@ -791,6 +791,18 @@ static TOOLS: &[(bool, ToolSpec)] = &[
         &["project_id", "changes"],
     ),
     mutation(
+        "event.emit",
+        "Record one bounded Manager-owned system event for an exact project. The event is durable and may trigger the configured ScriptRun action; payload and cause remain private to the owning Manager.",
+        &[
+            f("project_id", S),
+            f("name", S),
+            f("payload", "non_null_json"),
+            f("dedupe_key", S),
+            f("cause", O),
+        ],
+        &["project_id", "name", "payload", "dedupe_key"],
+    ),
+    mutation(
         "bus.consumer.admit",
         "Compare the current Manager-owned ScriptRun cursor, revalidate one bounded exact event page and its canonical ScriptRun actions, retain pending intents, and advance the existing cursor in the same Store transaction. The existing ScriptRun continuation admits script.run later.",
         &[
@@ -1603,6 +1615,32 @@ fn refine_input_schema(method: &str, schema: &mut Value) {
             properties["client_request_id"]["minLength"] = json!(1);
             properties["client_request_id"]["maxLength"] = json!(128);
             properties["client_request_id"]["pattern"] = json!("^\\S+$");
+        }
+        "event.emit" => {
+            properties["project_id"] =
+                json!({"type":"string","minLength":1,"maxLength":128,"pattern":"^\\S+$"});
+            properties["name"] = json!({
+                "type":"string",
+                "minLength":1,
+                "maxLength":256,
+                "pattern":"^[A-Za-z0-9._:/@-]+$"
+            });
+            properties["payload"] = json!({
+                "not":{"type":"null"},
+                "description":"Bounded JSON event payload. It is retained only in the owner-visible observation ledger."
+            });
+            properties["dedupe_key"] =
+                json!({"type":"string","minLength":1,"maxLength":256,"pattern":"^\\S+$"});
+            properties["cause"] = json!({
+                "type":["object","null"],
+                "properties":{
+                    "operation_id":{"type":"string","minLength":1,"maxLength":128,"pattern":"^\\S+$"},
+                    "observation_id":{"type":"integer","minimum":1,"maximum":9223372036854775807_i64}
+                },
+                "minProperties":1,
+                "maxProperties":2,
+                "additionalProperties":false
+            });
         }
         "task.dispatch" => {
             properties["launch_operation_id"] = json!({

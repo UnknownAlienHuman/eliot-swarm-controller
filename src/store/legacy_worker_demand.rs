@@ -14,6 +14,7 @@ pub(crate) struct LegacyWorkerDemand {
     pub(crate) opencode: bool,
     pub(crate) zed: bool,
     pub(crate) scheduler: bool,
+    pub(crate) automation_scheduler: bool,
     pub(crate) automation: bool,
     pub(crate) launcher: bool,
     pub(crate) native_mcp: bool,
@@ -93,6 +94,9 @@ pub(super) fn snapshot(db: &Connection, config: &Config) -> Result<LegacyWorkerD
                AND json_extract(value_json,'$.record.enabled')=1 \
                AND json_type(value_json,'$.record.cron')='object'))",
     )?;
+    // The extracted process is opt-in and demanded only by its exact
+    // read-only due projection. The legacy predicate above remains unchanged.
+    demand.automation_scheduler = super::automation_scheduler::has_demand(db, config)?;
     demand.automation = exists(
         db,
         "SELECT EXISTS(SELECT 1 FROM meta WHERE \

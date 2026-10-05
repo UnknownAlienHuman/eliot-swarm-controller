@@ -8,7 +8,7 @@ use std::{
 };
 use swarm_contracts::{
     error::{Error, Result},
-    runtime::{ModuleReceiptIdentity, RuntimeOutcome},
+    runtime::{ModuleReceiptIdentity, RuntimeOutcome, TaskDispatchAdmissionReceipt},
 };
 use swarm_process::{private_permissions, write_private_new};
 
@@ -36,6 +36,11 @@ pub struct OperationIntent {
     /// readback-only input-status page. Missing on older journal records.
     #[serde(default)]
     pub result_input_status: Option<ResultInputStatusIntent>,
+    /// Exact normalized dispatch admission persisted before the native POST.
+    /// Missing on legacy records; a normalized descriptor fails closed if the
+    /// record cannot prove this pre-effect marker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_admission: Option<TaskDispatchAdmissionReceipt>,
     pub route_sha256: String,
     pub model: Value,
     pub marker: Value,

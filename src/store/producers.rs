@@ -397,6 +397,109 @@ pub(super) fn record_batch(
     Ok(producer)
 }
 
+/// Record the normalized descriptor-backed dispatch admission for the exact
+/// Attempt that owns the Operation. The receipt proves native input admission;
+/// it carries no terminal Task evidence and therefore never invokes
+/// `apply_evidence`.
+pub(super) fn record_task_dispatch(
+    tx: &Transaction<'_>,
+    operation: &Value,
+    outcome: &RuntimeOutcome,
+    admission: &swarm_contracts::runtime::TaskDispatchAdmissionReceipt,
+    now: i64,
+) -> Result<Value> {
+    if operation["method"] != "task.dispatch"
+        || outcome.operation_id != model::text(operation, "operation_id")?
+        || admission.operation_id != outcome.operation_id
+        || admission.binding_id != model::text(operation, "binding_id")?
+        || admission.binding_generation != model::positive(operation, "binding_generation")?
+    {
+        return Err(Error::invalid(
+            "normalized dispatch producer must belong to its exact task.dispatch Operation",
+        ));
+    }
+    let attempt_id = model::text(operation, "attempt_id")?.to_owned();
+    let attempt = tasks::get_attempt(tx, &attempt_id)?;
+    if !attempt["released_at_ms"].is_null()
+        || matches!(
+            attempt["state"].as_str(),
+            Some("accepted" | "failed" | "cancelled" | "superseded")
+        )
+        || attempt["start_operation_id"] != outcome.operation_id
+        || admission.attempt_id != attempt_id
+        || admission.task_id != model::text(&attempt, "task_id")?.to_owned()
+        || admission.task_revision != model::positive(&attempt, "task_revision")?
+    {
+        return Err(Error::conflict(
+            "normalized dispatch admission cannot be attached to a resolved or differently started Attempt",
+        ));
+    }
+
+    let producer = json!({
+        "assignment_id": outcome.operation_id,
+        "dispatch_operation_id": outcome.operation_id,
+        "attempt_id": admission.attempt_id,
+        "task_id": admission.task_id,
+        "task_revision": admission.task_revision,
+        "task_snapshot_sha256": admission.task_snapshot_sha256,
+        "source_text_sha256": admission.source_text_sha256,
+        "source_text_bytes": admission.source_text_bytes,
+        "native_session_id": outcome.native_root_id,
+        "native_input_id": admission.native_input_id,
+        "native_payload_sha256": admission.native_payload_sha256,
+        "native_payload_bytes": admission.native_payload_bytes,
+        "module_receipt": admission.module_receipt,
+        "admission_kind": "normalized_task_dispatch",
+        "completion_condition": "native_input_admitted",
+        "execution_complete": false,
+        "task_completion": "unknown",
+        "disposition": "admitted"
+    });
+    let mut producers: Vec<Value> = serde_json::from_value(attempt["producers"].clone())?;
+    if let Some(index) = producers.iter().position(|item| {
+        item["assignment_id"] == outcome.operation_id
+            || item["dispatch_operation_id"] == outcome.operation_id
+    }) {
+        let mut existing_identity = producers[index].clone();
+        let mut producer_identity = producer.clone();
+        if let Some(fields) = existing_identity.as_object_mut() {
+            fields.remove("native_session_id");
+        }
+        if let Some(fields) = producer_identity.as_object_mut() {
+            fields.remove("native_session_id");
+        }
+        if model::canonical(&existing_identity)? != model::canonical(&producer_identity)? {
+            return Err(Error::conflict(
+                "normalized dispatch Operation already has different producer evidence",
+            ));
+        }
+        if !producers[index]["native_session_id"].is_null()
+            && !producer["native_session_id"].is_null()
+            && producers[index]["native_session_id"] != producer["native_session_id"]
+        {
+            return Err(Error::conflict(
+                "normalized dispatch Operation changed its native session identity",
+            ));
+        }
+        if producers[index]["native_session_id"].is_null()
+            && !producer["native_session_id"].is_null()
+        {
+            producers[index]["native_session_id"] = producer["native_session_id"].clone();
+            tx.execute(
+                "UPDATE attempts SET producers_json=?2,updated_at_ms=?3 WHERE attempt_id=?1 AND released_at_ms IS NULL",
+                params![&attempt_id, model::canonical(&json!(producers))?, now],
+            )?;
+        }
+        return Ok(producers[index].clone());
+    }
+    producers.push(producer.clone());
+    tx.execute(
+        "UPDATE attempts SET state=CASE WHEN state='reserved' THEN 'running' ELSE state END,producers_json=?2,updated_at_ms=?3 WHERE attempt_id=?1 AND released_at_ms IS NULL",
+        params![&attempt_id, model::canonical(&json!(producers))?, now],
+    )?;
+    Ok(producer)
+}
+
 pub(super) fn bind(
     tx: &Transaction<'_>,
     p: &Principal,

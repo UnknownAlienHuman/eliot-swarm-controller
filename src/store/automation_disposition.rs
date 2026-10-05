@@ -13,6 +13,7 @@ use crate::{
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
+use swarm_kernel::reviews as review_contract;
 
 const REVIEW_STREAM: &str = "controller:review";
 struct CommittedReviewResult {
@@ -537,6 +538,12 @@ fn committed_review_result(
         return Ok(None);
     }
     let record: Value = serde_json::from_str(&result_json)?;
+    review_contract::validate_result_record(&record).map_err(|error| {
+        Error::new(
+            "REVIEW_RESULT_DAMAGED",
+            format!("retained review result is invalid: {error}"),
+        )
+    })?;
     if record["schema_version"] != 1
         || record["review_assignment_id"] != assignment_id
         || record["operation_id"] != result_operation_id

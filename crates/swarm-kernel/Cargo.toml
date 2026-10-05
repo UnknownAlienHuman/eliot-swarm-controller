@@ -7,5 +7,6 @@ publish = false
 description = "Generic bounded writer actor primitives for the Swarm kernel"
 
 [dependencies]
+sha2 = "0.10"
 serde_json = "1"
 tokio = { version = "1", features = ["sync"] }

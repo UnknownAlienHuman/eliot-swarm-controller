@@ -2,12 +2,16 @@
 //!
 //! Dormant registrations create no task or timer. Active scopes share one
 //! Store-change watch and one fallback scan. Each dispatcher owns a distinct
-//! non-killing OS process group; the coordinator never adopts or kills one.
+//! non-killing OS process group; the coordinator adopts only an exact verified
+//! receipt and never kills a process family.
 
 use crate::{
     config::BusSupervisorConfig,
     error::{Error, Result},
-    store::{ManagedBusServiceDemand, Store, bus_kernel::DemandState},
+    store::{
+        Store,
+        bus_kernel::{DemandState, ManagedBusOwnerState, ManagedBusServiceDemand},
+    },
 };
 use futures_util::FutureExt;
 use serde::Deserialize;
@@ -26,7 +30,9 @@ use swarm_bus::{
     verify_managed_worker_config,
 };
 use swarm_contracts::DeclaredServiceScope;
-use swarm_process::{departed_empty, process_image_identity, write_private_new};
+use swarm_process::{
+    departed_empty, process_image_identity, service_owner_is_live, write_private_new,
+};
 use tokio::{
     process::{Child, Command},
     sync::watch,
@@ -59,6 +65,25 @@ struct OwnerReceipt {
     scope: DeclaredServiceScope,
     owner: OwnerIdentity,
     worker_image: serde_json::Value,
+    #[serde(default)]
+    worker_config_sha256: Option<String>,
+    #[serde(default)]
+    credential_token_sha256: Option<String>,
+    #[serde(default)]
+    scope_digest: Option<String>,
+}
+
+struct OwnerReceiptFile {
+    receipt: OwnerReceipt,
+    sha256: String,
+}
+
+impl std::ops::Deref for OwnerReceiptFile {
+    type Target = OwnerReceipt;
+
+    fn deref(&self) -> &Self::Target {
+        &self.receipt
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -405,9 +430,12 @@ fn safe_reconcile_error(code: &str) -> &'static str {
         | "BUS_SERVICE_HEALTH_INVALID"
         | "BUS_SERVICE_OWNER_UNKNOWN"
         | "BUS_SERVICE_OWNER_READ_FAILED"
+        | "BUS_SERVICE_OWNER_READBACK_INVALID"
+        | "BUS_SERVICE_OWNER_READBACK_STALE"
         | "BUS_SERVICE_OWNER_SCOPE_MISMATCH"
         | "BUS_SERVICE_OWNER_DIRECTORY_INVALID"
         | "BUS_SERVICE_STOP_REQUEST_INVALID"
+        | "BUS_SERVICE_STOP_REQUEST_UNKNOWN"
         | "BUS_WORKER_CONFIG_MISMATCH"
         | "BUS_WORKER_CONFIG_MISSING"
         | "BUS_WORKER_CONFIG_INVALID"
@@ -501,6 +529,38 @@ async fn reconcile_slot(
             .await?;
             return Ok(());
         }
+        if receipt.schema_version != 2 {
+            // Legacy receipts have no retained config/token/scope binding. Keep
+            // them unknown even after the old process family has disappeared;
+            // clearing one would authorize a replacement without v2 proof.
+            slot.last_error = Some("BUS_SERVICE_OWNER_UNKNOWN");
+            persist_status(
+                store,
+                slot,
+                "unknown",
+                Some("BUS_SERVICE_OWNER_UNKNOWN"),
+                None,
+            )
+            .await?;
+            return Ok(());
+        }
+        if demand.is_some_and(|demand| {
+            demand
+                .owner_receipt_sha256
+                .as_deref()
+                .is_some_and(|digest| digest != receipt.sha256)
+        }) {
+            slot.last_error = Some("BUS_SERVICE_OWNER_SCOPE_MISMATCH");
+            persist_status(
+                store,
+                slot,
+                "unknown",
+                Some("BUS_SERVICE_OWNER_SCOPE_MISMATCH"),
+                None,
+            )
+            .await?;
+            return Ok(());
+        }
         if slot.child.is_some() && !slot.spawn_verified {
             slot.spawn_verified = true;
             slot.spawned_image = Some(receipt.worker_image.clone());
@@ -519,6 +579,88 @@ async fn reconcile_slot(
             .await?;
             return Ok(());
         }
+        let owner_live = match service_owner_is_live(&receipt.owner.process, &receipt.owner.token) {
+            Ok(live) => live,
+            Err(_) => {
+                slot.last_error = Some("BUS_SERVICE_OWNER_READ_FAILED");
+                persist_status(
+                    store,
+                    slot,
+                    "unknown",
+                    Some("BUS_SERVICE_OWNER_READ_FAILED"),
+                    None,
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+        if owner_live {
+            let Some(demand) = demand else {
+                slot.last_error = Some("BUS_SERVICE_OWNER_UNKNOWN");
+                persist_status(
+                    store,
+                    slot,
+                    "unknown",
+                    Some("BUS_SERVICE_OWNER_UNKNOWN"),
+                    None,
+                )
+                .await?;
+                return Ok(());
+            };
+            if verify_adoptable_owner_receipt(
+                slot,
+                demand,
+                &receipt,
+                pin,
+                matches!(demand.state, DemandState::Ready),
+            )
+            .is_err()
+            {
+                // V1 receipts and any mismatch in Store scope, token/config
+                // hashes, executable bytes, or OS incarnation remain held.
+                // A live but unproven owner is never stopped or replaced.
+                slot.last_error = Some("BUS_SERVICE_OWNER_UNKNOWN");
+                persist_status(
+                    store,
+                    slot,
+                    "unknown",
+                    Some("BUS_SERVICE_OWNER_UNKNOWN"),
+                    None,
+                )
+                .await?;
+                return Ok(());
+            }
+            if !matches!(demand.state, DemandState::Ready) {
+                // A stop marker is scoped to this exact live receipt. Host
+                // shutdown and Store outages never create one.
+                request_stop(slot)?;
+                persist_status(store, slot, "stopping", None, None).await?;
+                return Ok(());
+            }
+            if stop_request_exists(slot)? {
+                slot.last_error = Some("BUS_SERVICE_STOP_REQUEST_UNKNOWN");
+                persist_status(
+                    store,
+                    slot,
+                    "unknown",
+                    Some("BUS_SERVICE_STOP_REQUEST_UNKNOWN"),
+                    None,
+                )
+                .await?;
+                return Ok(());
+            }
+            store
+                .record_managed_bus_owner_readback(
+                    slot.scope.clone(),
+                    ManagedBusOwnerState::Live,
+                    Some(receipt.sha256.clone()),
+                )
+                .await?;
+            slot.last_error = None;
+            slot.reset_after_healthy_run(Instant::now());
+            persist_status(store, slot, "running", None, None).await?;
+            return Ok(());
+        }
         let departed = match departed_empty(&receipt.owner.process, &receipt.owner.token) {
             Ok(departed) => departed,
             Err(_) => {
@@ -535,48 +677,25 @@ async fn reconcile_slot(
             }
         };
         if !departed {
-            if slot.child.is_none() {
-                // A live receipt from an earlier host is not enough to adopt
-                // the worker: it does not bind the retained credential token
-                // hash to this process incarnation. Keep the verified scope
-                // visible as unknown and do not stop or replace the live owner.
-                slot.last_error = Some("BUS_SERVICE_OWNER_UNKNOWN");
-                persist_status(
-                    store,
-                    slot,
-                    "unknown",
-                    Some("BUS_SERVICE_OWNER_UNKNOWN"),
-                    None,
-                )
-                .await?;
-            } else if slot
-                .spawned_image
-                .as_ref()
-                .is_some_and(|image| image == &receipt.worker_image)
-            {
-                if slot.demanded && !slot.stopping {
-                    slot.last_error = None;
-                    slot.reset_after_healthy_run(Instant::now());
-                    persist_status(store, slot, "running", None, None).await?;
-                } else {
-                    request_stop(slot)?;
-                    persist_status(store, slot, "stopping", None, None).await?;
-                }
-            } else {
-                // A different same-scope process can win the create-only
-                // receipt race. Never route this actor's stop request to that
-                // live owner; hold the slot for exact readback instead.
-                slot.last_error = Some("BUS_SERVICE_OWNER_SCOPE_MISMATCH");
-                persist_status(
-                    store,
-                    slot,
-                    "unknown",
-                    Some("BUS_SERVICE_OWNER_SCOPE_MISMATCH"),
-                    None,
-                )
-                .await?;
-            }
+            slot.last_error = Some("BUS_SERVICE_OWNER_UNKNOWN");
+            persist_status(
+                store,
+                slot,
+                "unknown",
+                Some("BUS_SERVICE_OWNER_UNKNOWN"),
+                None,
+            )
+            .await?;
             return Ok(());
+        }
+        if demand.is_some() {
+            store
+                .record_managed_bus_owner_readback(
+                    slot.scope.clone(),
+                    ManagedBusOwnerState::Departed,
+                    None,
+                )
+                .await?;
         }
         remove_owner_receipt(slot)?;
         slot.child = None;
@@ -620,6 +739,15 @@ async fn reconcile_slot(
             )
             .await?;
             return Ok(());
+        }
+        if demand.is_some() {
+            store
+                .record_managed_bus_owner_readback(
+                    slot.scope.clone(),
+                    ManagedBusOwnerState::Departed,
+                    None,
+                )
+                .await?;
         }
         slot.child = None;
         slot.spawned_image = None;
@@ -665,7 +793,6 @@ async fn reconcile_slot(
         };
         if let Some(code) = error {
             slot.last_error = Some(code);
-            request_stop(slot)?;
             persist_status(store, slot, "unknown", Some(code), None).await?;
         } else {
             persist_status(store, slot, "starting", None, None).await?;
@@ -677,6 +804,21 @@ async fn reconcile_slot(
         persist_status(store, slot, "dormant", None, None).await?;
         return Ok(());
     };
+    if !matches!(
+        demand.owner_state,
+        ManagedBusOwnerState::NeverStarted | ManagedBusOwnerState::Departed
+    ) {
+        slot.last_error = Some("BUS_SERVICE_OWNER_UNKNOWN");
+        persist_status(
+            store,
+            slot,
+            "unknown",
+            Some("BUS_SERVICE_OWNER_UNKNOWN"),
+            None,
+        )
+        .await?;
+        return Ok(());
+    }
     if matches!(demand.state, DemandState::Disabled) {
         persist_status(store, slot, "dormant", None, None).await?;
         return Ok(());
@@ -811,6 +953,7 @@ async fn start_worker(
             } else {
                 StartFailure::Code(match error.code.as_str() {
                     "BUS_SERVICE_START_LIMIT" => "BUS_SERVICE_START_LIMIT",
+                    "BUS_SERVICE_OWNER_UNKNOWN" => "BUS_SERVICE_OWNER_UNKNOWN",
                     "BUS_SERVICE_SCOPE_INACTIVE" => "BUS_SERVICE_SCOPE_INACTIVE",
                     "BUS_SERVICE_SCOPE_STALE" => "BUS_SERVICE_SCOPE_STALE",
                     _ => "BUS_SERVICE_START_GATE_FAILED",
@@ -820,6 +963,7 @@ async fn start_worker(
     let attempt_now = Instant::now();
     slot.note_start(attempt_now);
     let mut command = Command::new(executable);
+    let generation = demand.scope.generation.to_string();
     command
         .env_clear()
         .args([
@@ -833,7 +977,13 @@ async fn start_worker(
                 .to_str()
                 .ok_or(StartFailure::Code("BUS_SERVICE_OWNER_PATH_INVALID"))?,
             "--service-generation",
-            &demand.scope.generation.to_string(),
+            &generation,
+            "--worker-config-sha256",
+            &demand.worker_config_sha256,
+            "--credential-token-sha256",
+            &demand.credential_token_sha256,
+            "--scope-digest",
+            &demand.scope_digest,
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -935,7 +1085,9 @@ fn image_matches_pin(image: &serde_json::Value, pin: &DispatcherPin) -> bool {
         && observed_image == configured_image
 }
 
-fn read_owner_receipt(slot: &Slot) -> std::result::Result<Option<OwnerReceipt>, OwnerReadError> {
+fn read_owner_receipt(
+    slot: &Slot,
+) -> std::result::Result<Option<OwnerReceiptFile>, OwnerReadError> {
     match validate_private_dir_beneath(&slot.data_root, &slot.owner_dir) {
         Ok(false) => return Err(OwnerReadError::Missing),
         Ok(true) => {}
@@ -963,9 +1115,9 @@ fn read_owner_receipt(slot: &Slot) -> std::result::Result<Option<OwnerReceipt>, 
         }
     }
     let bytes = fs::read(path).map_err(|_| OwnerReadError::Io)?;
-    serde_json::from_slice(&bytes)
-        .map(Some)
-        .map_err(|_| OwnerReadError::Invalid)
+    let sha256 = format!("{:x}", sha2::Sha256::digest(&bytes));
+    let receipt = serde_json::from_slice(&bytes).map_err(|_| OwnerReadError::Invalid)?;
+    Ok(Some(OwnerReceiptFile { receipt, sha256 }))
 }
 
 enum OwnerReadError {
@@ -981,7 +1133,17 @@ enum StartFailure {
 
 fn verify_owner_receipt(slot: &Slot, receipt: &OwnerReceipt, pin: &DispatcherPin) -> Result<()> {
     receipt.scope.validate()?;
-    if receipt.schema_version != 1
+    let valid_version = matches!(receipt.schema_version, 1 | 2);
+    let valid_v2_hashes = receipt.schema_version == 1
+        || [
+            receipt.worker_config_sha256.as_deref(),
+            receipt.credential_token_sha256.as_deref(),
+            receipt.scope_digest.as_deref(),
+        ]
+        .into_iter()
+        .all(|value| value.is_some_and(is_sha256));
+    if !valid_version
+        || !valid_v2_hashes
         || receipt.scope != slot.scope
         || receipt.owner.version != 1
         || uuid::Uuid::parse_str(&receipt.owner.token).is_err()
@@ -1011,6 +1173,74 @@ fn verify_owner_receipt(slot: &Slot, receipt: &OwnerReceipt, pin: &DispatcherPin
         ));
     }
     Ok(())
+}
+
+fn verify_adoptable_owner_receipt(
+    slot: &Slot,
+    demand: &ManagedBusServiceDemand,
+    receipt: &OwnerReceiptFile,
+    pin: &DispatcherPin,
+    require_ready: bool,
+) -> Result<()> {
+    verify_owner_receipt(slot, receipt, pin)?;
+    if receipt.schema_version != 2
+        || demand.scope != receipt.scope
+        || (require_ready && !matches!(demand.state, DemandState::Ready))
+        || !matches!(
+            demand.owner_state,
+            ManagedBusOwnerState::LaunchUncertain
+                | ManagedBusOwnerState::Live
+                | ManagedBusOwnerState::Unknown
+        )
+        || (slot.child.is_none()
+            && demand.owner_receipt_sha256.as_deref() != Some(receipt.sha256.as_str()))
+        || receipt.worker_config_sha256.as_deref() != Some(demand.worker_config_sha256.as_str())
+        || receipt.credential_token_sha256.as_deref()
+            != Some(demand.credential_token_sha256.as_str())
+        || receipt.scope_digest.as_deref() != Some(demand.scope_digest.as_str())
+    {
+        return Err(Error::new(
+            "BUS_SERVICE_OWNER_SCOPE_MISMATCH",
+            "owner receipt does not match the retained Store registration",
+        ));
+    }
+    let expected = ManagedWorkerConfigExpectation {
+        path: slot.config_path.clone(),
+        store_root: slot.data_root.clone(),
+        manager_id: demand.owner_manager_id.clone(),
+        project_id: demand.project_id.clone(),
+        automation_id: demand.automation_id.clone(),
+        consumer_client_id: demand.consumer_client_id.clone(),
+        credential_token_sha256: demand.credential_token_sha256.clone(),
+        worker_config_sha256: demand.worker_config_sha256.clone(),
+    };
+    verify_managed_worker_config(&expected).map_err(|_| {
+        Error::new(
+            "BUS_WORKER_CONFIG_MISMATCH",
+            "retained worker configuration no longer matches Store registration",
+        )
+    })?;
+    let pid = receipt.worker_image["pid"]
+        .as_u64()
+        .and_then(|pid| u32::try_from(pid).ok())
+        .ok_or_else(|| Error::new("BUS_SERVICE_OWNER_SCOPE_MISMATCH", "owner PID is invalid"))?;
+    let observed = process_image_identity(pid)?;
+    if !same_process_image(&observed, &receipt.worker_image)
+        || !service_owner_is_live(&receipt.owner.process, &receipt.owner.token)?
+    {
+        return Err(Error::new(
+            "BUS_SERVICE_OWNER_UNKNOWN",
+            "prior owner process incarnation or family membership is not live",
+        ));
+    }
+    Ok(())
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn same_process_image(left: &serde_json::Value, right: &serde_json::Value) -> bool {
@@ -1303,227 +1533,16 @@ async fn persist_status(
 }
 
 async fn drain_on_shutdown(
-    store: &Store,
-    pin: &DispatcherPin,
-    slots: &mut BTreeMap<DeclaredServiceScope, Slot>,
+    _store: &Store,
+    _pin: &DispatcherPin,
+    _slots: &mut BTreeMap<DeclaredServiceScope, Slot>,
 ) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut status_error = None;
-    for slot in slots.values_mut() {
-        match read_owner_receipt(slot) {
-            Ok(Some(receipt)) if verify_owner_receipt(slot, &receipt, pin).is_ok() => {
-                if matches!(
-                    departed_empty(&receipt.owner.process, &receipt.owner.token),
-                    Ok(false)
-                ) && request_stop(slot).is_err()
-                {
-                    slot.last_error = Some("BUS_SERVICE_STOP_REQUEST_INVALID");
-                }
-            }
-            Ok(None) | Err(OwnerReadError::Missing)
-                if slot.child.is_some() && slot.spawn_verified =>
-            {
-                if request_stop(slot).is_err() {
-                    slot.last_error = Some("BUS_SERVICE_STOP_REQUEST_INVALID");
-                }
-            }
-            _ => {}
-        }
-    }
-
-    loop {
-        let mut pending = false;
-        for slot in slots.values_mut() {
-            if let Some(child) = slot.child.as_mut() {
-                match child.try_wait() {
-                    Ok(Some(_)) => slot.child_exited = true,
-                    Ok(None) => pending = true,
-                    Err(_) => {
-                        slot.last_error = Some("BUS_WORKER_WAIT_UNKNOWN");
-                        persist_drain_status(
-                            store,
-                            slot,
-                            "unknown",
-                            Some("BUS_WORKER_WAIT_UNKNOWN"),
-                            &mut status_error,
-                        )
-                        .await;
-                        pending = true;
-                    }
-                }
-            }
-
-            match read_owner_receipt(slot) {
-                Ok(Some(receipt)) => {
-                    if verify_owner_receipt(slot, &receipt, pin).is_err() {
-                        slot.last_error = Some("BUS_SERVICE_OWNER_SCOPE_MISMATCH");
-                        persist_drain_status(
-                            store,
-                            slot,
-                            "unknown",
-                            Some("BUS_SERVICE_OWNER_SCOPE_MISMATCH"),
-                            &mut status_error,
-                        )
-                        .await;
-                        pending = true;
-                        continue;
-                    }
-                    match departed_empty(&receipt.owner.process, &receipt.owner.token) {
-                        Ok(true) => {
-                            if remove_owner_receipt(slot)
-                                .and_then(|()| clear_stop_request(slot))
-                                .is_err()
-                            {
-                                slot.last_error = Some("BUS_SERVICE_OWNER_UNKNOWN");
-                                persist_drain_status(
-                                    store,
-                                    slot,
-                                    "unknown",
-                                    Some("BUS_SERVICE_OWNER_UNKNOWN"),
-                                    &mut status_error,
-                                )
-                                .await;
-                                pending = true;
-                                continue;
-                            }
-                            slot.child = None;
-                            slot.spawned_image = None;
-                            slot.spawn_verified = false;
-                            slot.child_exited = false;
-                            slot.stopping = false;
-                            slot.last_error = None;
-                            persist_drain_status(store, slot, "dormant", None, &mut status_error)
-                                .await;
-                        }
-                        Ok(false) => {
-                            if request_stop(slot).is_err() {
-                                slot.last_error = Some("BUS_SERVICE_STOP_REQUEST_INVALID");
-                                persist_drain_status(
-                                    store,
-                                    slot,
-                                    "unknown",
-                                    Some("BUS_SERVICE_STOP_REQUEST_INVALID"),
-                                    &mut status_error,
-                                )
-                                .await;
-                            } else {
-                                persist_drain_status(
-                                    store,
-                                    slot,
-                                    "stopping",
-                                    None,
-                                    &mut status_error,
-                                )
-                                .await;
-                            }
-                            pending = true;
-                        }
-                        Err(_) => {
-                            slot.last_error = Some("BUS_SERVICE_OWNER_READ_FAILED");
-                            persist_drain_status(
-                                store,
-                                slot,
-                                "unknown",
-                                Some("BUS_SERVICE_OWNER_READ_FAILED"),
-                                &mut status_error,
-                            )
-                            .await;
-                            pending = true;
-                        }
-                    }
-                }
-                Ok(None) | Err(OwnerReadError::Missing) => {
-                    if slot.child.is_some() && slot.child_exited && slot.spawn_verified {
-                        // The dispatcher cannot create descendants before its
-                        // owner receipt is published; the waited exact child
-                        // has therefore left no family to adopt.
-                        if clear_stop_request(slot).is_err() {
-                            slot.last_error = Some("BUS_SERVICE_STOP_REQUEST_INVALID");
-                            persist_drain_status(
-                                store,
-                                slot,
-                                "unknown",
-                                Some("BUS_SERVICE_STOP_REQUEST_INVALID"),
-                                &mut status_error,
-                            )
-                            .await;
-                            pending = true;
-                            continue;
-                        }
-                        slot.child = None;
-                        slot.spawned_image = None;
-                        slot.spawn_verified = false;
-                        slot.child_exited = false;
-                        slot.stopping = false;
-                        persist_drain_status(store, slot, "dormant", None, &mut status_error).await;
-                    } else if slot.child.is_some() {
-                        if slot.spawn_verified && request_stop(slot).is_ok() {
-                            persist_drain_status(store, slot, "stopping", None, &mut status_error)
-                                .await;
-                        } else {
-                            slot.last_error = Some("BUS_DISPATCHER_IMAGE_UNKNOWN");
-                            persist_drain_status(
-                                store,
-                                slot,
-                                "unknown",
-                                Some("BUS_DISPATCHER_IMAGE_UNKNOWN"),
-                                &mut status_error,
-                            )
-                            .await;
-                        }
-                        pending = true;
-                    } else {
-                        persist_drain_status(store, slot, "dormant", None, &mut status_error).await;
-                    }
-                }
-                Err(OwnerReadError::Invalid) => {
-                    slot.last_error = Some("BUS_SERVICE_OWNER_UNKNOWN");
-                    persist_drain_status(
-                        store,
-                        slot,
-                        "unknown",
-                        Some("BUS_SERVICE_OWNER_UNKNOWN"),
-                        &mut status_error,
-                    )
-                    .await;
-                    pending = true;
-                }
-                Err(OwnerReadError::Io) => {
-                    slot.last_error = Some("BUS_SERVICE_OWNER_READ_FAILED");
-                    persist_drain_status(
-                        store,
-                        slot,
-                        "unknown",
-                        Some("BUS_SERVICE_OWNER_READ_FAILED"),
-                        &mut status_error,
-                    )
-                    .await;
-                    pending = true;
-                }
-            }
-        }
-        if !pending || Instant::now() >= deadline {
-            return match status_error {
-                Some(error) => Err(error),
-                None => Ok(()),
-            };
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    // Process ownership is independent of this host actor. Child handles use
+    // kill_on_drop(false), and owner.json is the next host's read-only
+    // adoption proof. Host shutdown alone is not authorization to stop a
+    // durable bus consumer or mutate its receipt.
+    Ok(())
 }
-
-async fn persist_drain_status(
-    store: &Store,
-    slot: &mut Slot,
-    state: &str,
-    error: Option<&str>,
-    first_error: &mut Option<Error>,
-) {
-    if let Err(error) = persist_status(store, slot, state, error, None).await {
-        first_error.get_or_insert(error);
-    }
-}
-
 #[cfg(windows)]
 fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;

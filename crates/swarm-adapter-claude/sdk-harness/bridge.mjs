@@ -43,6 +43,27 @@ function boundedSdkText(value, maximum) {
     : null;
 }
 
+function safeSdkResourceLinks(value) {
+  if (!Array.isArray(value)) return null;
+  const links = value.slice(0, 50).map(link => {
+    const uri = boundedSdkText(link?.uri, 2_048);
+    const name = boundedSdkText(link?.name, 256);
+    if (uri === null || name === null) return null;
+    const safe = { uri, name };
+    const title = boundedSdkText(link?.title, 256);
+    const mimeType = boundedSdkText(link?.mimeType, 128);
+    if (title !== null) safe.title = title;
+    if (mimeType !== null) safe.mimeType = mimeType;
+    if (Number.isSafeInteger(link?.size) && link.size >= 0) safe.size = link.size;
+    return safe;
+  }).filter(Boolean);
+  return {
+    links,
+    count: value.length,
+    overflow: value.length > 50,
+  };
+}
+
 function safeSdkFrame(message) {
   const frame = {
     type: boundedSdkText(message?.type, 32) ?? 'unknown',
@@ -68,12 +89,70 @@ function safeSdkFrame(message) {
     frame.tools_count = Array.isArray(message.tools) ? message.tools.length : null;
     frame.effort = boundedSdkText(message.effort, 64);
   }
+  if (message?.type === 'system' && [
+    'task_started', 'task_progress', 'task_notification', 'task_updated',
+  ].includes(message.subtype)) {
+    frame.task_id = boundedSdkText(message.task_id, 256);
+    frame.tool_use_id = boundedSdkText(message.tool_use_id, 256);
+    frame.task_type = boundedSdkText(message.task_type, 64);
+    frame.subagent_type = boundedSdkText(message.subagent_type, 128);
+    frame.task_status = boundedSdkText(message.status, 32);
+    frame.task_reason = boundedSdkText(message.reason, 64);
+    frame.task_last_tool_name = boundedSdkText(message.last_tool_name, 128);
+    frame.is_backgrounded = typeof message.is_backgrounded === 'boolean' ? message.is_backgrounded : null;
+    frame.spawn_depth = Number.isSafeInteger(message.spawn_depth)
+      && message.spawn_depth >= 0 && message.spawn_depth <= 128
+      ? message.spawn_depth
+      : null;
+    frame.ambient = typeof message.ambient === 'boolean' ? message.ambient : null;
+    if (message.subtype === 'task_updated') {
+      const patch = message.patch && typeof message.patch === 'object' ? message.patch : {};
+      frame.task_patch_status = boundedSdkText(patch.status, 32);
+      frame.task_patch_is_backgrounded = typeof patch.is_backgrounded === 'boolean'
+        ? patch.is_backgrounded
+        : null;
+    }
+    const resourceLinks = safeSdkResourceLinks(message.resource_links);
+    if (resourceLinks !== null) {
+      frame.resource_links = resourceLinks.links;
+      frame.resource_links_count = resourceLinks.count;
+      frame.resource_links_overflow = resourceLinks.overflow;
+    }
+  }
+  if (message?.type === 'assistant' || message?.type === 'user') {
+    frame.parent_tool_use_id = boundedSdkText(message.parent_tool_use_id, 256);
+    frame.subagent_type = boundedSdkText(message.subagent_type, 128);
+  }
+  if (message?.type === 'system' && message.subtype === 'permission_denied') {
+    frame.agent_id = boundedSdkText(message.agent_id, 256);
+    frame.agent_type = boundedSdkText(message.agent_type, 128);
+    frame.tool_use_id = boundedSdkText(message.tool_use_id, 256);
+  }
   if (message?.type === 'result') {
     const output = typeof message.result === 'string' ? message.result : null;
     frame.result_sha256 = output === null ? null : createHash('sha256').update(output, 'utf8').digest('hex');
     frame.result_bytes = output === null ? null : Buffer.byteLength(output, 'utf8');
   }
   return frame;
+}
+
+function safeSubagentHookFrame(subtype, input, toolUseID) {
+  return {
+    type: 'hook',
+    subtype,
+    session_id: boundedSdkText(input?.session_id, 512),
+    agent_id: boundedSdkText(input?.agent_id, 256),
+    agent_type: boundedSdkText(input?.agent_type, 128),
+    hook_tool_use_id: boundedSdkText(toolUseID, 256),
+    prompt_id: boundedSdkText(input?.prompt_id, 128),
+  };
+}
+
+function captureSubagentHook(subtype) {
+  return async (input, toolUseID) => {
+    emit({ kind: 'sdk_frame', frame: safeSubagentHookFrame(subtype, input, toolUseID) });
+    return {};
+  };
 }
 
 async function pump(sess) {
@@ -167,6 +246,10 @@ async function prepare(command) {
       message: DENY_MESSAGE,
       ...(typeof toolOptions.toolUseID === 'string' ? { toolUseID: toolOptions.toolUseID } : {}),
     }),
+    hooks: {
+      SubagentStart: [{ hooks: [captureSubagentHook('subagent_started')] }],
+      SubagentStop: [{ hooks: [captureSubagentHook('subagent_stopped')] }],
+    },
   };
   if (command.permission_mode !== null) options.permissionMode = command.permission_mode;
   if (command.permission_mode === 'bypassPermissions') options.allowDangerouslySkipPermissions = true;

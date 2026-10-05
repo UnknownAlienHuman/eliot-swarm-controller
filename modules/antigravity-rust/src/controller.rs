@@ -3,14 +3,16 @@ use std::collections::VecDeque;
 use serde_json::json;
 use swarm_contracts::{
     error::Result,
-    runtime::{EffectOutcome, RuntimeCommand, RuntimeOutcome},
+    runtime::{EffectOutcome, RuntimeCommand, RuntimeOutcome, TaskDispatchAdmissionReceipt},
 };
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::{
     module_receipt,
     stream::{StreamState, TerminalDisposition, Turn},
-    wire::{OperationIdentity, encode_user_line, prompt_for},
+    wire::{
+        OperationIdentity, encode_user_line, normalized_dispatch_admission, prompt_for,
+    },
 };
 
 const MAX_RECONCILE_RECEIPTS: usize = 128;
@@ -36,6 +38,7 @@ struct PendingPrompt {
     identity: OperationIdentity,
     conversation_id: String,
     result_ordinal_before: u64,
+    dispatch_admission: Option<TaskDispatchAdmissionReceipt>,
 }
 
 /// Stateful native turn reducer. The manager remains the sole durable
@@ -48,6 +51,7 @@ pub struct Controller {
     binding_id: String,
     generation: i64,
     native_root_id: Option<String>,
+    normalized_dispatch_enabled: bool,
     pending_open: Option<OperationIdentity>,
     pending: Option<PendingPrompt>,
     stream: StreamState,
@@ -65,6 +69,7 @@ impl Controller {
         binding_id: String,
         generation: i64,
         native_root_id: Option<String>,
+        normalized_dispatch_enabled: bool,
     ) -> Self {
         Self {
             boot_id,
@@ -72,6 +77,7 @@ impl Controller {
             binding_id,
             generation,
             native_root_id,
+            normalized_dispatch_enabled,
             pending_open: None,
             pending: None,
             stream: StreamState::new(0),
@@ -293,10 +299,21 @@ impl Controller {
         }
         let text = prompt_for(command).map_err(swarm_contracts::error::Error::invalid)?;
         let line = encode_user_line(&text).map_err(swarm_contracts::error::Error::invalid)?;
+        let dispatch_admission = if self.normalized_dispatch_enabled
+            && identity.method == "task.dispatch"
+        {
+            Some(
+                normalized_dispatch_admission(command, &identity, &self.boot_id, &line)
+                    .map_err(swarm_contracts::error::Error::invalid)?,
+            )
+        } else {
+            None
+        };
         self.pending = Some(PendingPrompt {
             identity,
             conversation_id: conversation_id.to_owned(),
             result_ordinal_before: self.stream.result_ordinal,
+            dispatch_admission,
         });
         Ok(line)
     }
@@ -325,12 +342,13 @@ impl Controller {
     /// A result settles only the single in-flight prompt, for the same native
     /// conversation and an explicitly terminal status with response digest.
     pub fn settle_terminal(&mut self) -> Option<RuntimeOutcome> {
-        let (identity, conversation_id, result_ordinal_before) = {
+        let (identity, conversation_id, result_ordinal_before, dispatch_admission) = {
             let pending = self.pending.as_ref()?;
             (
                 pending.identity.clone(),
                 pending.conversation_id.clone(),
                 pending.result_ordinal_before,
+                pending.dispatch_admission.clone(),
             )
         };
         let (turn, disposition) = self.stream.terminal_for(&conversation_id)?;
@@ -348,6 +366,7 @@ impl Controller {
             &conversation_id,
             &turn,
             disposition,
+            dispatch_admission.as_ref(),
         );
         if let Some(receipt) = outcome.details.get("local_execution_ref") {
             if self.local_execution_results.len() == crate::stream::MAX_TURNS {
@@ -763,6 +782,7 @@ fn terminal_outcome(
     conversation_id: &str,
     turn: &Turn,
     disposition: TerminalDisposition,
+    dispatch_admission: Option<&TaskDispatchAdmissionReceipt>,
 ) -> RuntimeOutcome {
     let status = turn.status.as_str();
     let reference = json!({
@@ -773,6 +793,18 @@ fn terminal_outcome(
         "response_sha256": turn.response_sha256,
         "status": status,
     });
+    let mut details = json!({
+        "completion_condition": "native_terminal_result_observed",
+        "turn_status": status,
+        "num_turns": turn.num_turns,
+        "local_execution_ref": reference,
+    });
+    if matches!(disposition, TerminalDisposition::Applied) {
+        if let Some(admission) = dispatch_admission {
+            details["dispatch_admission"] =
+                serde_json::to_value(admission).unwrap_or(serde_json::Value::Null);
+        }
+    }
     RuntimeOutcome {
         operation_id: identity.operation_id.clone(),
         outcome: match disposition {
@@ -785,11 +817,6 @@ fn terminal_outcome(
         // local sequential association, so keep the native turn field empty.
         turn_id: None,
         native_input_id: None,
-        details: json!({
-            "completion_condition": "native_terminal_result_observed",
-            "turn_status": status,
-            "num_turns": turn.num_turns,
-            "local_execution_ref": reference,
-        }),
+        details,
     }
 }

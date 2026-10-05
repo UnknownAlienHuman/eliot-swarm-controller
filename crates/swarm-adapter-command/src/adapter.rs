@@ -16,6 +16,7 @@ use swarm_client::{HostConnectionConfig, ModuleLink};
 use swarm_contracts::{
     Credential, EffectOutcome, RuntimeCommand, RuntimeOutcome,
     error::{Error, Result},
+    runtime::{TaskDispatchAdmissionReceipt, TaskDispatchContext},
 };
 use tokio::time;
 
@@ -293,6 +294,131 @@ pub async fn run() -> Result<()> {
     }
 }
 
+fn normalized_dispatch_admission(
+    owner: &Owner,
+    command: &RuntimeCommand,
+    identity: &DispatchIdentity,
+    prompt: &str,
+) -> Result<Option<TaskDispatchAdmissionReceipt>> {
+    if command.method != "task.dispatch"
+        || !module_host::normalized_dispatch_enabled(&owner.host.claim)
+    {
+        return Ok(None);
+    }
+    let context: TaskDispatchContext = serde_json::from_value(
+        command.input["task_dispatch_context"].clone(),
+    )
+    .map_err(|_| Error::new("TASK_DISPATCH_CONTEXT_INVALID", "dispatch context is malformed"))?;
+    context
+        .validate()
+        .map_err(|_| Error::new("TASK_DISPATCH_CONTEXT_INVALID", "dispatch context is invalid"))?;
+    if context.operation_id != command.operation_id
+        || context.binding_id != command.binding_id
+        || context.binding_generation != command.generation
+        || context.worker_boot_id != owner.host.boot_id
+        || identity.operation_id != command.operation_id
+        || context.task_snapshot_sha256 != identity.task_snapshot_sha256
+    {
+        return Err(Error::new(
+            "TASK_DISPATCH_CONTEXT_INVALID",
+            "dispatch context does not match the durable Command identity",
+        ));
+    }
+    let source_text = command.input["text"]
+        .as_str()
+        .filter(|text| !text.trim().is_empty())
+        .ok_or_else(|| Error::new("TASK_DISPATCH_CONTEXT_INVALID", "source text is missing"))?;
+    if context.source_text_sha256 != digest(source_text.as_bytes())
+        || context.source_text_bytes != source_text.len() as u64
+    {
+        return Err(Error::new(
+            "TASK_DISPATCH_CONTEXT_INVALID",
+            "dispatch context source identity differs from the command",
+        ));
+    }
+    if prompt.as_bytes().len() != identity.prompt_bytes
+        || digest(prompt.as_bytes()) != identity.prompt_sha256
+    {
+        return Err(Error::new(
+            "ADAPTER_EVIDENCE_CONFLICT",
+            "native prompt identity differs from its durable admission identity",
+        ));
+    }
+    let module_receipt = module_host::receipt_identity_for_input(
+        &owner.host.claim,
+        command,
+        &command.operation_id,
+        &identity.input_sha256,
+    )?;
+    let receipt = TaskDispatchAdmissionReceipt {
+        schema_version: 1,
+        module_receipt,
+        operation_id: context.operation_id,
+        binding_id: context.binding_id,
+        binding_generation: context.binding_generation,
+        worker_boot_id: context.worker_boot_id,
+        attempt_id: context.attempt_id,
+        task_id: context.task_id,
+        task_revision: context.task_revision,
+        task_snapshot_sha256: context.task_snapshot_sha256,
+        source_text_sha256: context.source_text_sha256,
+        source_text_bytes: context.source_text_bytes,
+        // Command passes the prompt as the final argv argument. This is the
+        // exact native payload available before the subprocess starts; the
+        // CLI exposes no native input ID or echo channel.
+        native_payload_sha256: identity.prompt_sha256.clone(),
+        native_payload_bytes: identity.prompt_bytes as u64,
+        native_input_id: None,
+    };
+    receipt
+        .validate()
+        .map_err(|_| Error::new("TASK_DISPATCH_CONTEXT_INVALID", "dispatch admission is invalid"))?;
+    Ok(Some(receipt))
+}
+
+fn validate_dispatch_outcome(
+    outcome: &RuntimeOutcome,
+    admission: Option<&TaskDispatchAdmissionReceipt>,
+) -> Result<()> {
+    let saved = outcome.details["dispatch_admission"].clone();
+    match outcome.outcome {
+        EffectOutcome::Applied | EffectOutcome::Accepted => {
+            if let Some(expected) = admission {
+                let actual: TaskDispatchAdmissionReceipt =
+                    serde_json::from_value(saved).map_err(|_| {
+                        Error::new(
+                            "ADAPTER_EVIDENCE_INVALID",
+                            "known dispatch outcome lacks its typed admission receipt",
+                        )
+                    })?;
+                actual.validate().map_err(|_| {
+                    Error::new(
+                        "ADAPTER_EVIDENCE_INVALID",
+                        "saved dispatch admission receipt is invalid",
+                    )
+                })?;
+                if &actual != expected
+                    || actual.native_input_id.as_deref() != outcome.native_input_id.as_deref()
+                {
+                    return Err(Error::new(
+                        "ADAPTER_EVIDENCE_CONFLICT",
+                        "known dispatch outcome differs from its durable admission marker",
+                    ));
+                }
+            }
+        }
+        EffectOutcome::Rejected | EffectOutcome::Unknown => {
+            if !saved.is_null() {
+                return Err(Error::new(
+                    "ADAPTER_EVIDENCE_INVALID",
+                    "rejected or unknown dispatch outcome cannot carry admission evidence",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn process_command(
     config: &Config,
     owner: &Owner,
@@ -375,6 +501,7 @@ async fn process_command(
         "task.dispatch" => {
             let (prompt, identity) = native::prompt_for(command)?;
             let workspace = native::route_workspace(command)?;
+            let dispatch_admission = normalized_dispatch_admission(owner, command, &identity, &prompt)?;
             let (_dir, existing) = store.admit(
                 &command.operation_id,
                 Some(&identity),
@@ -383,6 +510,17 @@ async fn process_command(
                 &command.route,
             )?;
             if existing {
+                if module_host::normalized_dispatch_enabled(&owner.host.claim)
+                    && store
+                        .read_dispatch_admission(&command.operation_id)?
+                        .as_ref()
+                        != dispatch_admission.as_ref()
+                {
+                    return Err(Error::new(
+                        "ADAPTER_EVIDENCE_CONFLICT",
+                        "saved dispatch admission differs from the current Store context",
+                    ));
+                }
                 let outcome = if let Some((saved, _)) = store.read_outcome(&command.operation_id)? {
                     if !native::result_identity_matches(&serde_json::to_value(&saved)?, &identity) {
                         return Err(Error::new(
@@ -398,7 +536,11 @@ async fn process_command(
                         "native_result_missing_after_admission",
                     )
                 };
+                validate_dispatch_outcome(&outcome, dispatch_admission.as_ref())?;
                 return Ok((vec![outcome], false));
+            }
+            if let Some(admission) = dispatch_admission.as_ref() {
+                store.save_dispatch_admission(&command.operation_id, admission)?;
             }
             let invocation = native::invoke(
                 &native::InvocationConfig {
@@ -415,7 +557,14 @@ async fn process_command(
                 &workspace,
             )
             .await?;
-            Ok((vec![invocation.outcome], invocation.stop_bridge))
+            let mut outcome = invocation.outcome;
+            if matches!(outcome.outcome, EffectOutcome::Applied) {
+                if let Some(admission) = dispatch_admission.as_ref() {
+                    outcome.details["dispatch_admission"] = serde_json::to_value(admission)?;
+                }
+            }
+            validate_dispatch_outcome(&outcome, dispatch_admission.as_ref())?;
+            Ok((vec![outcome], invocation.stop_bridge))
         }
         "agent.refresh" => {
             let (_, existing) = store.admit(

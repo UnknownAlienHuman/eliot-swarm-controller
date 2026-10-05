@@ -10,6 +10,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
+use swarm_kernel::reviews as review_contract;
 
 pub(crate) const PRIMARY_REVIEW_SLOT: &str = "primary";
 
@@ -163,93 +164,76 @@ impl ReviewSubmitRequest {
         ] {
             model::text(value, field)?;
         }
-        if request.evidence_refs.is_empty()
-            || request
-                .evidence_refs
-                .iter()
-                .any(|reference| reference.trim().is_empty())
-        {
-            return Err(Error::invalid(
+        review_contract::validate_submit_request(value).map_err(|error| match error {
+            review_contract::ReviewValidationError::Evidence => Error::invalid(
                 "review result needs nonempty retained evidence refs",
-            ));
-        }
-        let mut finding_ids = BTreeSet::new();
-        if request.findings.iter().any(|finding| {
-            finding.finding_id.trim().is_empty()
-                || !finding_ids.insert(finding.finding_id.as_str())
-                || finding.reason.trim().is_empty()
-                || finding.requested_change.trim().is_empty()
-                || finding.evidence_refs.is_empty()
-                || finding
-                    .evidence_refs
-                    .iter()
-                    .any(|reference| reference.trim().is_empty())
-        }) {
-            return Err(Error::invalid(
+            ),
+            review_contract::ReviewValidationError::Findings => Error::invalid(
                 "findings need unique IDs, reasons, requested changes, and evidence refs",
-            ));
-        }
-        match request.verdict {
-            ReviewVerdict::Pass
-                if request.coverage != ReviewCoverage::Complete || !request.findings.is_empty() =>
-            {
-                return Err(Error::invalid(
+            ),
+            review_contract::ReviewValidationError::Verdict => match request.verdict {
+                ReviewVerdict::Pass => Error::invalid(
                     "pass requires complete coverage and no unresolved findings",
-                ));
-            }
-            ReviewVerdict::ChangesRequested if request.findings.is_empty() => {
-                return Err(Error::invalid(
+                ),
+                ReviewVerdict::ChangesRequested => Error::invalid(
                     "changes_requested requires at least one actionable finding",
-                ));
+                ),
+                ReviewVerdict::Inconclusive => Error::invalid("review verdict is invalid"),
+            },
+            review_contract::ReviewValidationError::RequirementReviews => {
+                let mut requirement_ids = BTreeSet::new();
+                let malformed = request.requirement_reviews.iter().any(|review| {
+                    review.requirement_id.trim().is_empty()
+                        || !requirement_ids.insert(review.requirement_id.as_str())
+                        || review.rationale.trim().is_empty()
+                        || review.evidence.is_empty()
+                        || review
+                            .evidence
+                            .iter()
+                            .any(|reference| reference.trim().is_empty())
+                });
+                if malformed {
+                    Error::invalid(
+                        "requirement reviews need unique IDs, rationale, and evidence refs",
+                    )
+                } else {
+                    Error::invalid(
+                        "requirement reviews require a complete pass with no unresolved findings",
+                    )
+                }
             }
-            _ => {}
-        }
-        let mut requirement_ids = BTreeSet::new();
-        if request.requirement_reviews.iter().any(|review| {
-            review.requirement_id.trim().is_empty()
-                || !requirement_ids.insert(review.requirement_id.as_str())
-                || review.rationale.trim().is_empty()
-                || review.evidence.is_empty()
-                || review
-                    .evidence
-                    .iter()
-                    .any(|reference| reference.trim().is_empty())
-        }) {
-            return Err(Error::invalid(
-                "requirement reviews need unique IDs, rationale, and evidence refs",
-            ));
-        }
-        if !request.requirement_reviews.is_empty()
-            && (request.verdict != ReviewVerdict::Pass
-                || request.coverage != ReviewCoverage::Complete
-                || !request.findings.is_empty())
-        {
-            return Err(Error::invalid(
-                "requirement reviews require a complete pass with no unresolved findings",
-            ));
-        }
+            review_contract::ReviewValidationError::Identity => {
+                Error::invalid("review submission identity fields must be nonempty")
+            }
+            review_contract::ReviewValidationError::Coverage => {
+                Error::invalid("review coverage is invalid")
+            }
+            review_contract::ReviewValidationError::Shape => {
+                Error::invalid("review submission fields are invalid")
+            }
+            _ => Error::invalid("review submission is invalid"),
+        })?;
         Ok(request)
     }
 
     pub(crate) fn validate_findings(&self, requirement_ids: &BTreeSet<String>) -> Result<()> {
-        for finding in &self.findings {
-            if finding.requirement_ids.is_empty() {
-                return Err(Error::invalid(
-                    "each actionable finding must name a Task requirement",
-                ));
-            }
-            let mut unique = BTreeSet::new();
-            if finding
-                .requirement_ids
-                .iter()
-                .any(|id| !requirement_ids.contains(id) || !unique.insert(id))
-            {
-                return Err(Error::invalid(
+        let findings = serde_json::to_value(&self.findings)?;
+        review_contract::validate_finding_requirements(&findings, requirement_ids).map_err(
+            |error| match error {
+                review_contract::ReviewValidationError::RequirementCoverage
+                    if self
+                        .findings
+                        .iter()
+                        .any(|finding| finding.requirement_ids.is_empty()) =>
+                {
+                    Error::invalid("each actionable finding must name a Task requirement")
+                }
+                review_contract::ReviewValidationError::RequirementCoverage => Error::invalid(
                     "finding requirement IDs must be unique and belong to this Task revision",
-                ));
-            }
-        }
-        Ok(())
+                ),
+                _ => Error::new("REVIEW_RESULT_DAMAGED", error.to_string()),
+            },
+        )
     }
 
     pub(crate) fn validate_requirement_reviews(
@@ -259,27 +243,16 @@ impl ReviewSubmitRequest {
         if self.requirement_reviews.is_empty() {
             return Ok(());
         }
-        if self.verdict != ReviewVerdict::Pass
-            || self.coverage != ReviewCoverage::Complete
-            || !self.findings.is_empty()
-        {
-            return Err(Error::invalid(
-                "requirement reviews require a complete pass with no unresolved findings",
-            ));
-        }
-        let supplied: BTreeSet<_> = self
-            .requirement_reviews
-            .iter()
-            .map(|review| review.requirement_id.as_str())
-            .collect();
-        let expected: BTreeSet<_> = requirement_ids.iter().map(String::as_str).collect();
-        if supplied.len() != self.requirement_reviews.len() || supplied != expected {
-            return Err(Error::new(
-                "REVIEW_INCOMPLETE",
-                "structured review must address exactly the frozen Task requirements",
-            ));
-        }
-        Ok(())
+        let reviews = serde_json::to_value(&self.requirement_reviews)?;
+        review_contract::validate_requirement_coverage(&reviews, requirement_ids).map_err(
+            |error| match error {
+                review_contract::ReviewValidationError::RequirementCoverage => Error::new(
+                    "REVIEW_INCOMPLETE",
+                    "structured review must address exactly the frozen Task requirements",
+                ),
+                _ => Error::new("REVIEW_RESULT_DAMAGED", error.to_string()),
+            },
+        )
     }
 }
 

@@ -1,10 +1,13 @@
-//! Generic single-threaded bounded writer actor primitives for the Swarm kernel.
+//! Provider-neutral Task policy and bounded writer ownership for the Swarm kernel.
 //!
 //! The actor owns one FIFO queue and one OS thread. The caller supplies the
 //! authoritative resource initializer and typed job handlers; this crate does
-//! not own a database, domain policy, or a second source of durable state.
+//! not own a database or a second source of durable state. Task policy operates
+//! on supplied values while the Store retains authorization and transactions.
 
 pub mod dispatch;
+pub mod reviews;
+pub mod tasks;
 
 use std::{
     fmt,
@@ -339,12 +342,24 @@ pub struct KernelHost<Run, Batch, InitError> {
 /// The handle carries only the bounded queue sender and the host status view;
 /// the owning [`KernelHost`] still retains the sole writer thread and must be
 /// joined by its owner during shutdown.
-#[derive(Clone)]
 pub struct KernelHostHandle<Run, Batch> {
     sender: WriterSender<Run, Batch>,
     status: Arc<Mutex<KernelHostSnapshot>>,
     writer_finished: Arc<AtomicBool>,
     writer_thread: Arc<Thread>,
+}
+
+// Cloning a queue handle does not clone its jobs. Store submits FnOnce
+// callbacks, which must not acquire a Clone bound from this facade.
+impl<Run, Batch> Clone for KernelHostHandle<Run, Batch> {
+    fn clone(&self) -> Self {
+        Self {
+            sender: self.sender.clone(),
+            status: Arc::clone(&self.status),
+            writer_finished: Arc::clone(&self.writer_finished),
+            writer_thread: Arc::clone(&self.writer_thread),
+        }
+    }
 }
 
 fn refresh_writer_status(status: &Arc<Mutex<KernelHostSnapshot>>, writer_finished: &AtomicBool) {

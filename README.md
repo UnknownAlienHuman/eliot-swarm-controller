@@ -40,16 +40,23 @@ Capability states use the [Documentation Program](docs/documentation-program.md)
 ## Build and run
 
 ```powershell
-cargo build --locked --release --bin swarm
-.\target\release\swarm.exe --data-dir C:\SwarmState host
+$target = Join-Path $env:LOCALAPPDATA 'eliot-swarm-shared-target'
+[void][IO.Directory]::CreateDirectory($target)
+cargo build --locked --release --package swarm-cli --bin swarm --target-dir $target
+cargo build --locked --release --package eliot-swarm-controller --bin swarm-host --target-dir $target
+$swarmHost = Join-Path (Join-Path $target 'release') 'swarm-host.exe'
+& $swarmHost --data-dir C:\SwarmState host
 ```
 
-Use an initially empty dedicated local directory. The host owns only its marker/lock, database, artifacts and credentials there. It refuses unrelated nonempty directories; global PATH, UAC and vendor settings are untouched. Read-only CLI calls do not initialize a database or launch the host.
+Use an initially empty dedicated local directory. The host owns only its marker/lock, database, artifacts and credentials there. It refuses unrelated nonempty directories; global PATH, UAC and vendor settings are untouched. Read-only CLI calls do not initialize a database or launch the host. The public swarm client invokes the adjacent swarm-host only for explicit local commands; ordinary application requests never start the host.
+
+The CLI and host are separately built artifacts, each with its own source commit, tree, and image digest in its provenance manifest. The installer checks each manifest against its own receipt and verifies the declared IPC protocol, target, and host-launch contract; the two artifacts need not come from the same source revision.
 
 In another PowerShell:
 
 ```powershell
-$swarm = '.\target\release\swarm.exe'
+$target = Join-Path $env:LOCALAPPDATA 'eliot-swarm-shared-target'
+$swarm = Join-Path (Join-Path $target 'release') 'swarm.exe'
 & $swarm --data-dir C:\SwarmState status
 & $swarm --data-dir C:\SwarmState --request-id create-demo-1 task create --project eliot-swarm-controller --file config\task.example.json
 & $swarm --data-dir C:\SwarmState task list
@@ -176,7 +183,7 @@ Use [the CheckRunner guide](docs/check-runner.md), [trusted check configuration]
 
 ```powershell
 swarm --request-id capture-1 source capture --file capture.json
-# Read Operation result.candidate_ref; submit/check that same candidate.
+# Read the scoped Operation result.candidate_ref (or candidate_refs for a native result); submit/check that same candidate.
 swarm --request-id check-1 check run --file check.json
 swarm check get CHECK_ID
 swarm artifact get RESULT_REF
@@ -204,7 +211,7 @@ Windows uses a uniquely named Global Job and query-only recovery; cancellation v
 
 ## Task submission and anchored feedback
 
-`task.submit` seals a candidate and requirement report. The candidate can be an exact source snapshot of this Attempt/revision, an assembled native result, or one native page covering its complete source. Bound native results must belong to that binding/generation. Bytes are checked off the DB thread before immutable submission publication. Only source snapshots can be machine-checked by CheckRunner.
+`task.submit` seals a candidate and requirement report. An ordinary Participant may submit only its exact current Task revision and Attempt; this does not accept the Task or grant create/claim/accept/runtime/recovery authority. The candidate can be an exact source snapshot of this Attempt/revision, an assembled native result, or one native page covering its complete source. Bound native results must belong to that binding/generation and an applied `agent.result` origin. Bytes are checked off the DB thread before immutable submission publication. Only source snapshots can be machine-checked by CheckRunner.
 
 ```powershell
 # Fill config/submission.example.json with actual IDs and claims:

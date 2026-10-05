@@ -52,8 +52,8 @@ The installer creates a coordinate-hashed directory with `module.exe`, `module-d
 ## Package independent frontends
 
 The independent package/binary coordinates are `swarm-mcp`/`swarm-mcp`,
-`swarm-cli`/`swarm-cli` and `swarm-gateway`/`swarm-gateway`. The controller still
-provides the public `swarm` executable during CLI migration. Gateway is optional;
+`swarm-cli`/`swarm` and `swarm-gateway`/`swarm-gateway`. The separate controller
+package provides `swarm-host`. Gateway is optional;
 installing the base host does not require it.
 
 `Build-SwarmFrontendProvenance.ps1` builds one selected release binary using an
@@ -177,17 +177,50 @@ just package-module swarm-bus release `
   'D:\build-cache\eliot-shared-target' 'D:\artifacts\swarm-bus-release'
 ```
 
-The root host is its own coordinate: `eliot-swarm-controller` / binary `swarm`,
+The root host is its own coordinate: `eliot-swarm-controller` / binary `swarm-host`,
 built in release profile by `Build-SwarmHostProvenance.ps1` or
-`just package-host`. The manual workflow offers the ten module coordinates
+`just package-host`. The manual workflow offers the twelve module coordinates
 above, that host, and the three independent frontends. It selects one package
 per run, creates one external shared target and fresh package output, and keeps
 host/frontend builds release-only. Gateway is optional for the base host.
 
-There is no standalone automation-scheduler executable target in the current
-Cargo graph. `src/scheduler.rs` is host code, and `swarm-scripts` and
-`swarm-supervisor` are libraries. A service-scope identity does not create a
-binary or independent package coordinate; this workflow does not advertise one.
+## Build and install the standalone automation worker
+
+`swarm-automation` / `swarm-automation-worker` is an explicit release package
+coordinate. Build the host and worker as separate packages with separate fresh
+output directories; each `build-manifest.json` retains its own source, target,
+dependency, and image provenance. Do not copy the host source or image digest
+into the worker record.
+
+```powershell
+$TargetDir = 'D:\build-cache\eliot-shared-target'
+$HostOutput = 'D:\release\swarm-host'
+$WorkerOutput = 'D:\release\swarm-automation-worker'
+pwsh -NoProfile -File .\tools\ci\build-module-package.ps1 `
+  -Package eliot-swarm-controller -Profile release `
+  -TargetDir $TargetDir -OutputDir $HostOutput
+pwsh -NoProfile -File .\tools\ci\build-module-package.ps1 `
+  -Package swarm-automation -Profile release `
+  -TargetDir $TargetDir -OutputDir $WorkerOutput
+
+$PackageExecutable = Join-Path $WorkerOutput 'bin\swarm-automation-worker.exe'
+$Installer = '.\tools\modules\Install-StandaloneWorker.ps1'
+$installed = & $Installer `
+  -WorkerCoordinate swarm-automation-worker `
+  -HostExecutable 'C:\Program Files\Eliot Swarm\swarm.exe' `
+  -PackageExecutable $PackageExecutable -WhatIf
+$installed
+```
+
+Review the worker coordinate, source commit/tree, `source_sha256`,
+`image_sha256`, and host image digest, then repeat without `-WhatIf`. The
+installer accepts only the positive worker coordinate and its exact release
+manifest row, rehashes the package, staged bytes, and final sibling, and uses
+create-only placement beside the selected host. Identical bytes are an
+idempotent no-op; different bytes are rejected. It does not edit configuration,
+write a registration ledger, restart, or launch either process. The returned
+`image_sha256` is the worker pin for deployment evidence; host configuration
+remains an explicit operator action.
 
 ## Package and install the Forge worker
 
@@ -203,14 +236,18 @@ compiling. Both Clippy and tests use that one cache; neither stage allocates a
 separate default `target` for each checkout.
 The output contains `bin/swarm-forge-worker.exe` and `build-manifest.json`.
 
-Pass that absolute executable path and the chosen host executable to
-`tools/modules/Install-ForgeWorker.ps1 -HostExecutable <absolute-swarm.exe>
--PackageExecutable <absolute-worker.exe>`. `-WhatIf` previews placement.
-The installer validates the exact package manifest, clean source revision,
-binary target, length and SHA-256, then places the worker beside that host.
-Identical installed bytes are a no-op; different bytes are not overwritten.
-It does not configure or launch either process. The unsigned build manifest
-provides consistency evidence; it is not a signature.
+Pass that absolute executable path and the chosen host executable to the common
+installer:
+`tools/modules/Install-StandaloneWorker.ps1 -WorkerCoordinate swarm-forge-worker
+-HostExecutable <absolute-swarm-host.exe> -PackageExecutable <absolute-worker.exe>`.
+`-WhatIf` previews placement. The installer validates the exact package
+manifest, clean source revision, binary target, length, own source digest, and
+image SHA-256, then places the worker beside that host. Identical installed
+bytes are a no-op; different bytes are not overwritten. It does not configure
+or launch either process. The unsigned build manifest provides consistency
+evidence; it is not a signature. The existing specialized
+`Install-ForgeWorker.ps1` remains compatible for operators who need that
+narrow coordinate-specific entrypoint.
 
 ## Build and install the standalone ScriptRun worker
 

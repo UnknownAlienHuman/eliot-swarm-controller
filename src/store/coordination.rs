@@ -4,7 +4,7 @@
 //! relevance indexes. Operations and Observations remain the audit/mailbox
 //! authority; this module adds no schema or Task graph.
 
-use super::{gm, meta, operations, set_meta, tasks};
+use super::{gm, meta, operations, results, set_meta, tasks};
 use crate::{
     config::Config,
     coordination as keys,
@@ -50,10 +50,12 @@ struct ConsultCardMatch {
 struct ParticipantOperationRecord {
     caller_id: String,
     method: String,
+    state: String,
     task_id: Option<String>,
     attempt_id: Option<String>,
     binding_id: Option<String>,
     binding_generation: Option<i64>,
+    result: Value,
 }
 
 /// The returned value is safe for a participant-facing context projection.
@@ -62,6 +64,39 @@ pub(crate) fn current_scope(db: &Connection, principal: &Principal) -> Result<Va
     principal.require_participant()?;
     let scope = load_current_scope_for_client(db, &principal.client_id)?;
     Ok(scope_projection(&scope))
+}
+
+/// Admit submission only from a live, ordinary Participant grant for this
+/// exact Task revision and Attempt. Sponsored reviewer grants remain limited
+/// to their retained review slot and never acquire Task submission authority.
+pub(crate) fn authorize_task_submission(
+    db: &Connection,
+    principal: &Principal,
+    task_id: &str,
+    task_revision: i64,
+    attempt_id: &str,
+) -> Result<()> {
+    principal.require_participant()?;
+    let scope = load_current_scope(db, principal)?;
+    if !matches!(
+        scope.registration["participation_basis"]["kind"].as_str(),
+        Some("attempt_owner" | "producer_ref")
+    ) {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "review-only Participant grants cannot submit a Task",
+        ));
+    }
+    if scope.task["task_id"] != task_id
+        || scope.task["revision"] != task_revision
+        || scope.attempt["attempt_id"] != attempt_id
+    {
+        return Err(Error::new(
+            "STALE_PARTICIPANT",
+            "submission must name this Participant's exact current Task revision and Attempt",
+        ));
+    }
+    Ok(())
 }
 
 /// Enforce current Participant scope before the Store reaches general writer
@@ -3190,22 +3225,44 @@ fn participant_operation_get(
     let operation_id = model::text(value, "operation_id")?;
     let raw: Option<ParticipantOperationRecord> = db
         .query_row(
-            "SELECT caller_id,method,task_id,attempt_id,binding_id,binding_generation \
+            "SELECT caller_id,method,state,task_id,attempt_id,binding_id,binding_generation,result_json \
              FROM operations WHERE operation_id=?1",
             [operation_id],
             |row| {
+                let result_raw: Option<String> = row.get(7)?;
+                let result = result_raw
+                    .map(|raw| {
+                        serde_json::from_str(&raw).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                7,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })
+                    })
+                    .transpose()?
+                    .unwrap_or(Value::Null);
                 Ok(ParticipantOperationRecord {
                     caller_id: row.get(0)?,
                     method: row.get(1)?,
-                    task_id: row.get(2)?,
-                    attempt_id: row.get(3)?,
-                    binding_id: row.get(4)?,
-                    binding_generation: row.get(5)?,
+                    state: row.get(2)?,
+                    task_id: row.get(3)?,
+                    attempt_id: row.get(4)?,
+                    binding_id: row.get(5)?,
+                    binding_generation: row.get(6)?,
+                    result,
                 })
             },
         )
         .optional()?;
     let record = raw.ok_or_else(|| Error::new("NOT_FOUND", format!("Operation {operation_id}")))?;
+    if matches!(
+        scope.registration["participation_basis"]["kind"].as_str(),
+        Some("attempt_owner" | "producer_ref")
+    ) && matches!(record.method.as_str(), "source.capture" | "agent.result")
+    {
+        return participant_native_operation_projection(db, &scope, operation_id, &record);
+    }
     if record.caller_id != principal.client_id
         || !record.method.starts_with("coordination.")
         || record.task_id.as_deref() != scope.task["task_id"].as_str()
@@ -3219,6 +3276,170 @@ fn participant_operation_get(
         ));
     }
     operations::get_operation(db, operation_id)
+}
+
+/// Return only the retained candidate-origin facts an ordinary Participant
+/// needs to continue its exact current Attempt. Manager/native operation
+/// contracts, caller identity and runtime references stay private here.
+fn participant_native_operation_projection(
+    db: &Connection,
+    scope: &ScopeData,
+    operation_id: &str,
+    record: &ParticipantOperationRecord,
+) -> Result<Value> {
+    let task_id = scope.task["task_id"]
+        .as_str()
+        .ok_or_else(|| Error::new("NOT_FOUND", "Participant Task scope is incomplete"))?;
+    let attempt_id = scope.attempt["attempt_id"]
+        .as_str()
+        .ok_or_else(|| Error::new("NOT_FOUND", "Participant Attempt scope is incomplete"))?;
+    if record.task_id.as_deref() != Some(task_id)
+        || record.attempt_id.as_deref() != Some(attempt_id)
+        || record.state != "settled"
+        || record.result["outcome"] != "applied"
+    {
+        return Err(Error::new(
+            "NOT_FOUND",
+            "Operation is outside the authenticated participant scope",
+        ));
+    }
+    let task_revision = model::positive(&scope.task, "revision")?;
+    let base = json!({
+        "operation_id":operation_id,
+        "method":record.method,
+        "state":record.state,
+        "task_id":task_id,
+        "task_revision":task_revision,
+        "attempt_id":attempt_id,
+    });
+    match record.method.as_str() {
+        "source.capture" => {
+            let candidate_ref = record.result["candidate_ref"].as_str().ok_or_else(|| {
+                Error::new(
+                    "NOT_FOUND",
+                    "source capture has no applied candidate origin",
+                )
+            })?;
+            let candidate = results::get(db, candidate_ref)?;
+            if candidate.kind != "source_snapshot"
+                || candidate.metadata["task_id"] != task_id
+                || candidate.metadata["attempt_id"] != attempt_id
+                || candidate.metadata["task_revision"] != task_revision
+            {
+                return Err(Error::new(
+                    "NOT_FOUND",
+                    "source capture candidate is outside the current Participant Attempt",
+                ));
+            }
+            Ok(json!({
+                "operation_id":base["operation_id"],
+                "method":base["method"],
+                "state":base["state"],
+                "task_id":base["task_id"],
+                "task_revision":base["task_revision"],
+                "attempt_id":base["attempt_id"],
+                "candidate_ref":candidate_ref,
+                "candidate_kind":candidate.kind,
+                "candidate_sha256":candidate.content_digest,
+                "candidate_byte_length":candidate.byte_length,
+                "result":{"outcome":"applied","candidate_ref":candidate_ref},
+            }))
+        }
+        "agent.result" => {
+            let binding_id = scope.attempt["binding_id"].as_str().ok_or_else(|| {
+                Error::new(
+                    "NOT_FOUND",
+                    "native result is not linked to the current Attempt binding",
+                )
+            })?;
+            let binding_generation = scope.attempt["binding_generation"].as_i64().ok_or_else(|| {
+                Error::new(
+                    "NOT_FOUND",
+                    "native result is not linked to the current Attempt generation",
+                )
+            })?;
+            if record.binding_id.as_deref() != Some(binding_id)
+                || record.binding_generation != Some(binding_generation)
+            {
+                return Err(Error::new(
+                    "NOT_FOUND",
+                    "Operation is outside the authenticated participant binding scope",
+                ));
+            }
+            let details = &record.result["details"];
+            if details["completion_condition"] != "batch_output_artifacts_selected"
+                || details["dispatch_operation_id"].as_str().is_none()
+            {
+                return Err(Error::new(
+                    "NOT_FOUND",
+                    "native result has no complete retained candidate origin",
+                ));
+            }
+            let dispatch_id = details["dispatch_operation_id"].as_str().unwrap_or_default();
+            let dispatch = operations::get_operation(db, dispatch_id)?;
+            if dispatch["method"] != "task.dispatch"
+                || !matches!(dispatch["state"].as_str(), Some("settled" | "rejected"))
+                || dispatch["task_id"] != task_id
+                || dispatch["attempt_id"] != attempt_id
+                || dispatch["binding_id"] != binding_id
+                || dispatch["binding_generation"] != binding_generation
+            {
+                return Err(Error::new(
+                    "NOT_FOUND",
+                    "native result dispatch is outside the current Participant Attempt",
+                ));
+            }
+            let refs = details["artifact_refs"].as_array().ok_or_else(|| {
+                Error::new(
+                    "NOT_FOUND",
+                    "native result has no retained artifact pages",
+                )
+            })?;
+            if refs.is_empty() {
+                return Err(Error::new(
+                    "NOT_FOUND",
+                    "native result has no retained artifact pages",
+                ));
+            }
+            let mut candidate_refs = Vec::with_capacity(refs.len());
+            for reference in refs {
+                let page_id = reference.as_str().ok_or_else(|| {
+                    Error::new("NOT_FOUND", "native result artifact reference is invalid")
+                })?;
+                let page = results::get(db, page_id)?;
+                if page.kind != "native_result_page"
+                    || page.metadata["operation_id"] != dispatch_id
+                    || page.metadata["binding_id"] != binding_id
+                    || page.metadata["binding_generation"] != binding_generation
+                    || !crate::runtime::batch::BATCH_OUTPUTS
+                        .contains(&page.metadata["native_output"].as_str().unwrap_or(""))
+                {
+                    return Err(Error::new(
+                        "NOT_FOUND",
+                        "native result page is outside the retained dispatch origin",
+                    ));
+                }
+                candidate_refs.push(page_id.to_owned());
+            }
+            Ok(json!({
+                "operation_id":base["operation_id"],
+                "method":base["method"],
+                "state":base["state"],
+                "task_id":base["task_id"],
+                "task_revision":base["task_revision"],
+                "attempt_id":base["attempt_id"],
+                "binding_id":binding_id,
+                "binding_generation":binding_generation,
+                "candidate_ref":if candidate_refs.len() == 1 { json!(candidate_refs[0]) } else { Value::Null },
+                "candidate_refs":candidate_refs.clone(),
+                "result":{"outcome":"applied","dispatch_operation_id":dispatch_id,"artifact_refs":candidate_refs},
+            }))
+        }
+        _ => Err(Error::new(
+            "NOT_FOUND",
+            "Operation is outside the authenticated participant scope",
+        )),
+    }
 }
 
 fn send(

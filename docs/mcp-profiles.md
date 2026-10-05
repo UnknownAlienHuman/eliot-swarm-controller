@@ -47,7 +47,7 @@ by [Canonical MCP Surfaces](mcp-canonical-surfaces-and-topologies.md).
 |---|---|
 | `observer` | Search/dashboard/status and selected Task, Attempt, Operation, family, check, artifact, report and mailbox reads. |
 | `reviewer` | Legacy observer-plus-`task.request_changes` profile. This is not the assignment-bound auditor role. |
-| `participant` | Scoped context, peer/card/inbox/watch/consultation/integration and selected review/evidence methods. Application assignment checks remain authoritative. |
+| `participant` | Scoped context, peer/card/inbox/watch/consultation/integration, exact current Task submission and candidate/artifact reads, plus selected review/evidence methods. Application assignment checks remain authoritative. |
 | `assigned_reviewer` | Selected review context/get/list/submit and linked submission/check/artifact/Operation reads. After release, only the exact retained reads permitted by the canonical assignment contract remain available. |
 | `manager` | Observer plus Task/Attempt/agent control, messages, participant administration, review assignment, manager-owned automation configuration, manual scheduled invocation, hooks, Goal, scripts, queue/launch/overlap, scoped watches and selected GitHub effects. No generic shell passthrough or automatic acceptance rights. |
 | `gm` | Most manager methods plus client/host/acceptance/Forge, GitHub source/work-pool and recovery methods, and GM handover. **Current code excludes `automation.config.preview` and `automation.config.apply` from this profile**; it is not an unconditional superset of manager. Application role/GM epoch checks still apply. |

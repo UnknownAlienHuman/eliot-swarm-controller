@@ -57,9 +57,7 @@ pub fn build(command: &RuntimeCommand, claim: &ModuleContractClaim) -> Result<Va
     )?;
 
     let result_receipt = receipt(command, claim, &command.operation_id, result_input_sha256)?;
-    let target_receipt: ModuleReceiptIdentity =
-        serde_json::from_value(target["module_receipt"].clone())
-            .map_err(|_| invalid("Store target receipt has an invalid shape"))?;
+    let target_receipt = target["module_receipt"].clone();
     let source = json!({
         "kind":"command_status",
         "result_operation_id":command.operation_id,
@@ -69,7 +67,7 @@ pub fn build(command: &RuntimeCommand, claim: &ModuleContractClaim) -> Result<Va
         "target_input_sha256":target_input_sha256,
         "target_module_receipt":target_receipt,
         "target_operation_status":target,
-        "evidence":"store_retained_module_reported_operation_receipt",
+        "evidence":target_evidence(target),
         "native_response_identity":"unavailable",
         "execution_complete":false,
         "task_completion":"unknown",
@@ -159,7 +157,7 @@ pub fn validate_saved(
         || source["target_operation_status"]["operation_id"] != target_id
         || source["target_operation_status"]["input_sha256"] != target_digest
         || source["target_operation_status"]["module_receipt"] != source["target_module_receipt"]
-        || source["evidence"] != "store_retained_module_reported_operation_receipt"
+        || source["evidence"] != target_evidence(&source["target_operation_status"])
         || source["native_response_identity"] != "unavailable"
         || source["execution_complete"] != false
         || source["task_completion"] != "unknown"
@@ -257,40 +255,47 @@ fn validate_target(
             "native_replay",
         ],
     )?;
-    let receipt: ModuleReceiptIdentity =
-        serde_json::from_value(target["module_receipt"].clone())
-            .map_err(|_| invalid("Store target receipt is malformed"))?;
+    let receipt = if target["module_receipt"].is_null() {
+        None
+    } else {
+        Some(
+            serde_json::from_value::<ModuleReceiptIdentity>(target["module_receipt"].clone())
+                .map_err(|_| invalid("Store target receipt is malformed"))?,
+        )
+    };
     if target["schema_version"] != 1
         || target["operation_id"] != target_id
         || target["method"] != "task.dispatch"
-        || !matches!(
-            target["operation_state"].as_str(),
-            Some("settled" | "rejected")
-        )
-        || !matches!(
-            target["operation_outcome"].as_str(),
-            Some("applied" | "rejected")
-        )
+        || !matches!(target["operation_state"].as_str(), Some("settled" | "rejected" | "outcome_unknown"))
+        || !matches!(target["operation_outcome"].as_str(), Some("applied" | "rejected" | "unknown"))
         || target["input_sha256"] != target_digest
         || target["native_response_identity"] != "unavailable"
         || target["execution_complete"] != false
         || target["task_completion"] != "unknown"
         || target["native_replay"] != false
-        || receipt.operation_id != target_id
-        || receipt.input_sha256 != target_digest
-        || receipt.binding_id != binding_id
-        || receipt.binding_generation != generation
-        || receipt.module_id != claim.module_id
-        || receipt.artifact != claim.artifact
-        || receipt.protocol != claim.protocol
+        || receipt.as_ref().is_some_and(|receipt| {
+            receipt.operation_id != target_id
+                || receipt.input_sha256 != target_digest
+                || receipt.binding_id != binding_id
+                || receipt.binding_generation != generation
+                || receipt.module_id != claim.module_id
+                || receipt.artifact != claim.artifact
+                || receipt.protocol != claim.protocol
+        })
     {
         return Err(invalid(
             "Store target snapshot differs from exact dispatch identity",
         ));
     }
-    receipt
-        .validate()
-        .map_err(|_| invalid("Store target receipt is invalid"))?;
+    if let Some(receipt) = &receipt {
+        receipt
+            .validate()
+            .map_err(|_| invalid("Store target receipt is invalid"))?;
+    } else if target["operation_state"] != "outcome_unknown"
+        || target["operation_outcome"] != "unknown"
+    {
+        return Err(invalid("terminal Command status is missing its module receipt"));
+    }
     let diagnostic = &target["diagnostic_code"];
     if !diagnostic.is_null()
         && !diagnostic.as_str().is_some_and(|value| {
@@ -298,17 +303,35 @@ fn validate_target(
                 && value.len() <= 64
                 && value
                     .bytes()
-                    .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
         })
     {
         return Err(invalid(
             "Store target diagnostic is outside the closed form",
         ));
     }
+    if target["operation_state"] == "outcome_unknown" {
+        if target["operation_outcome"] != "unknown"
+            || !matches!(
+                target["completion_condition"].as_str(),
+                Some("native_result_unconfirmed" | "module_outcome_not_retained")
+            )
+            || !target["exit_code"].is_null()
+            || !target["result_subtype"].is_null()
+            || (!target["timed_out"].is_null() && !target["timed_out"].is_boolean())
+            || (!target["signal_observed"].is_null()
+                && !target["signal_observed"].is_boolean())
+            || (target["completion_condition"] == "module_outcome_not_retained"
+                && !target["module_receipt"].is_null())
+            || (target["completion_condition"] == "native_result_unconfirmed"
+                && target["module_receipt"].is_null())
+        {
+            return Err(invalid("unknown Command status contains incompatible retained facts"));
+        }
+        return Ok(());
+    }
     if target["timed_out"] != false || target["signal_observed"] != false {
-        return Err(invalid(
-            "terminal Command status has inconsistent process facts",
-        ));
+        return Err(invalid("terminal Command status has inconsistent process facts"));
     }
     match (
         target["operation_state"].as_str(),
@@ -367,6 +390,18 @@ fn status_body(target: &Value) -> Result<Vec<u8>> {
         "task_completion":"unknown",
         "native_replay":false
     }))?)
+}
+
+fn target_evidence(target: &Value) -> &'static str {
+    if target["operation_state"] == "outcome_unknown" {
+        if target["module_receipt"].is_null() {
+            "store_retained_operation_state_only"
+        } else {
+            "store_retained_module_reported_unknown_outcome"
+        }
+    } else {
+        "store_retained_module_reported_operation_receipt"
+    }
 }
 
 fn receipt(

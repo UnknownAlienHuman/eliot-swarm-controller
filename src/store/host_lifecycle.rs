@@ -19,6 +19,7 @@ const SUPERVISORS: &[&str] = &[
     "opencode",
     "zed",
     "scheduler",
+    "automation-scheduler",
     "automation",
     "launcher",
     "native-mcp",
@@ -31,6 +32,7 @@ const OPTIONAL_WORKERS: &[&str] = &[
     "opencode",
     "zed",
     "scheduler",
+    "automation-scheduler",
     "automation",
     "launcher",
     "native-mcp",
@@ -322,7 +324,7 @@ pub(super) fn ready(tx: &Transaction<'_>, now: i64) -> Result<()> {
     set_meta(tx, CURRENT, &json!(current))
 }
 
-/// Retain the latest bounded state for the ten optional legacy workers. The
+/// Retain the latest bounded state for the eleven optional workers. The
 /// Store status reader exposes this through the existing `host.status` path.
 /// Error details, process output, and route/native payloads are never stored.
 pub(super) fn update_optional_worker(

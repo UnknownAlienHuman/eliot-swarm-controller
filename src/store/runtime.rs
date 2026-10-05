@@ -30,6 +30,161 @@ fn descriptor_pre_input_open(
     )
 }
 
+/// A descriptor opts into normalized task dispatch only when it advertises
+/// both halves of the additive contract.  Legacy descriptors retain their
+/// existing runtime-specific codec and receipt path.
+fn selected_task_dispatch_admission(db: &Connection, binding: &Value) -> Result<bool> {
+    let Some(selector) = binding["observation"].get("module_contract_selector") else {
+        return Ok(false);
+    };
+    let identity = super::module_handshake::retained_contract_identity(
+        db,
+        model::text(binding, "module_artifact_id")?,
+        Some(selector),
+    )?
+    .ok_or_else(|| {
+        Error::new(
+            "MODULE_DESCRIPTOR_MISSING",
+            "selected binding has no retained module descriptor",
+        )
+    })?;
+    let context = swarm_contracts::module_contract::task_dispatch_context_schema();
+    let admission = swarm_contracts::module_contract::task_dispatch_admission_schema();
+    let declares_context = identity.command_schemas.contains(&context);
+    let declares_admission = identity.event_schemas.contains(&admission);
+    if declares_context != declares_admission {
+        return Err(Error::new(
+            "MODULE_CONTRACT_INCOMPATIBLE",
+            "normalized task dispatch requires both context and admission schemas",
+        ));
+    }
+    Ok(declares_context)
+}
+
+fn task_dispatch_context(
+    operation_id: &str,
+    binding_id: &str,
+    binding_generation: i64,
+    binding: &Value,
+    request: &Value,
+    attempt: &Value,
+) -> Result<swarm_contracts::runtime::TaskDispatchContext> {
+    let text = model::text(request, "text")?;
+    let snapshot = &attempt["task_snapshot"];
+    Ok(swarm_contracts::runtime::TaskDispatchContext {
+        schema_version: 1,
+        operation_id: operation_id.to_owned(),
+        binding_id: binding_id.to_owned(),
+        binding_generation,
+        worker_boot_id: model::text(&binding["observation"], "bridge_boot_id")?.to_owned(),
+        attempt_id: model::text(attempt, "attempt_id")?.to_owned(),
+        task_id: model::text(attempt, "task_id")?.to_owned(),
+        task_revision: model::positive(attempt, "task_revision")?,
+        task_snapshot_sha256: model::digest(model::canonical(snapshot)?.as_bytes()),
+        source_text_sha256: model::digest(text.as_bytes()),
+        source_text_bytes: u64::try_from(text.len())
+            .map_err(|_| Error::invalid("task dispatch text length is out of range"))?,
+    })
+}
+
+fn validate_task_dispatch_admission(
+    db: &Connection,
+    binding_id: &str,
+    binding_generation: i64,
+    binding: &Value,
+    operation: &Value,
+    outcome: &RuntimeOutcome,
+    module_receipt: &swarm_contracts::runtime::ModuleReceiptIdentity,
+) -> Result<swarm_contracts::runtime::TaskDispatchAdmissionReceipt> {
+    if model::text(operation, "method")? != "task.dispatch"
+        || model::text(operation, "operation_id")? != outcome.operation_id
+    {
+        return Err(Error::new(
+            "TASK_DISPATCH_ADMISSION_INVALID",
+            "admission receipt must name its exact task.dispatch Operation",
+        ));
+    }
+    let value = outcome
+        .details
+        .get("dispatch_admission")
+        .ok_or_else(|| {
+            Error::new(
+                "TASK_DISPATCH_ADMISSION_INVALID",
+                "normalized dispatch admission receipt is missing",
+            )
+        })?;
+    let receipt: swarm_contracts::runtime::TaskDispatchAdmissionReceipt =
+        serde_json::from_value(value.clone()).map_err(|_| {
+            Error::new(
+                "TASK_DISPATCH_ADMISSION_INVALID",
+                "normalized dispatch admission receipt has an invalid shape",
+            )
+        })?;
+    receipt.validate().map_err(|_| {
+        Error::new(
+            "TASK_DISPATCH_ADMISSION_INVALID",
+            "normalized dispatch admission receipt is invalid",
+        )
+    })?;
+    if receipt.module_receipt != *module_receipt
+        || receipt.operation_id != outcome.operation_id
+        || receipt.binding_id != binding_id
+        || receipt.binding_generation != binding_generation
+        || receipt.worker_boot_id
+            != model::text(&binding["observation"], "bridge_boot_id")?
+        || receipt.native_input_id != outcome.native_input_id
+    {
+        return Err(Error::new(
+            "TASK_DISPATCH_ADMISSION_INVALID",
+            "normalized dispatch receipt names another module, boot, binding, Operation, or native input",
+        ));
+    }
+
+    let raw: String = db.query_row(
+        "SELECT original_request_json FROM operations WHERE operation_id=?1 AND binding_id=?2 AND binding_generation=?3",
+        params![outcome.operation_id.as_str(), binding_id, binding_generation],
+        |row| row.get(0),
+    )?;
+    let request: Value = serde_json::from_str(&raw).map_err(|_| {
+        Error::new(
+            "TASK_DISPATCH_ADMISSION_INVALID",
+            "stored task.dispatch request is malformed",
+        )
+    })?;
+    let attempt_id = model::text(&request, "attempt_id")?;
+    if receipt.attempt_id != attempt_id || model::text(operation, "attempt_id")? != attempt_id {
+        return Err(Error::new(
+            "TASK_DISPATCH_ADMISSION_INVALID",
+            "normalized dispatch receipt names another Attempt",
+        ));
+    }
+    let attempt = tasks::get_attempt(db, attempt_id)?;
+    if attempt["binding_id"] != binding_id
+        || attempt["binding_generation"] != binding_generation
+        || attempt["start_operation_id"] != outcome.operation_id
+    {
+        return Err(Error::new(
+            "TASK_DISPATCH_ADMISSION_INVALID",
+            "normalized dispatch receipt does not match the retained Attempt owner",
+        ));
+    }
+    let expected = task_dispatch_context(
+        &outcome.operation_id,
+        binding_id,
+        binding_generation,
+        binding,
+        &request,
+        &attempt,
+    )?;
+    if receipt.context() != expected {
+        return Err(Error::new(
+            "TASK_DISPATCH_ADMISSION_INVALID",
+            "normalized dispatch receipt differs from the original text or immutable Task snapshot",
+        ));
+    }
+    Ok(receipt)
+}
+
 fn batch_bindings(db: &Connection) -> Result<Vec<Value>> {
     let mut stmt = db.prepare(
         "SELECT binding_id,generation FROM bindings WHERE released_at_ms IS NULL AND route_json IS NOT NULL ORDER BY created_at_ms,binding_id",
@@ -772,6 +927,16 @@ fn next_internal(
     if method == "task.dispatch" {
         let a = tasks::get_attempt(&tx, model::text(&input, "attempt_id")?)?;
         input["task_snapshot"] = a["task_snapshot"].clone();
+        if selected_task_dispatch_admission(&tx, &b)? {
+            input["task_dispatch_context"] = serde_json::to_value(task_dispatch_context(
+                &op,
+                &id,
+                generation,
+                &b,
+                &input,
+                &a,
+            )?)?;
+        }
         if crate::runtime::codex::is_controller_route(&b["route"])
             || crate::runtime::prepared::is_prepared_claude_route(&b["route"])
             || pre_input_open.is_some()
@@ -879,7 +1044,9 @@ fn next_internal(
             input["target_operation_status"] = snapshot;
             Some(digest)
         } else if command_status_result {
-            let snapshot = super::command_results::target_snapshot(&tx, &b, target_id)?;
+            let snapshot = super::command_results::admitted_target_snapshot(
+                &tx, &op, &id, generation, target_id,
+            )?;
             let digest = model::text(&snapshot, "input_sha256")?.to_owned();
             input["target_operation_status"] = snapshot;
             Some(digest)
@@ -1351,9 +1518,38 @@ pub(super) fn outcome_with_artifacts(
     }
     // Versioned bindings require a typed receipt for every outcome. Legacy
     // unversioned bindings retain their existing validators and wire contract.
-    if b["observation"].get("module_contract_selector").is_some() {
-        validate_module_receipt_for_operation(&tx, &id, generation, &b, &r)?;
-    }
+    let module_receipt = if b["observation"].get("module_contract_selector").is_some() {
+        Some(validate_module_receipt_for_operation(
+            &tx, &id, generation, &b, &r,
+        )?)
+    } else {
+        None
+    };
+    // The normalized receipt is required only for a known native admission.
+    // Unknown is deliberately left unresolved so it cannot create an Attempt
+    // producer or imply Task completion.
+    let normalized_dispatch_admission = if o["method"] == "task.dispatch"
+        && selected_task_dispatch_admission(&tx, &b)?
+        && matches!(r.outcome, EffectOutcome::Applied | EffectOutcome::Accepted)
+    {
+        let module_receipt = module_receipt.as_ref().ok_or_else(|| {
+            Error::new(
+                "MODULE_RECEIPT_INVALID",
+                "normalized dispatch requires a typed module receipt",
+            )
+        })?;
+        Some(validate_task_dispatch_admission(
+            &tx,
+            &id,
+            generation,
+            &b,
+            &o,
+            &r,
+            module_receipt,
+        )?)
+    } else {
+        None
+    };
     let sessionless_batch = crate::runtime::batch::is_sessionless_route(&b["route"]);
     if b["route"]["runtime"] == crate::runtime::codex::RUNTIME
         && b["observation"].get("module_contract_selector").is_none()
@@ -1712,6 +1908,13 @@ pub(super) fn outcome_with_artifacts(
             "result pages require module.result and durable artifact publication",
         ));
     }
+    // Accepted is a durable native admission for the normalized contract. It
+    // records the Attempt producer while keeping Task completion unresolved.
+    if matches!(r.outcome, EffectOutcome::Accepted) {
+        if let Some(admission) = normalized_dispatch_admission.as_ref() {
+            producers::record_task_dispatch(&tx, &o, &r, admission, now)?;
+        }
+    }
     if matches!(r.outcome, EffectOutcome::Applied) {
         if o["method"] == "agent.open" {
             if let Some(contract) = pre_input_open.as_ref() {
@@ -1741,7 +1944,9 @@ pub(super) fn outcome_with_artifacts(
                 tx.execute("UPDATE bindings SET native_root_id=?3,native_scope_key=?4,state=CASE WHEN json_extract(state_json,'$.recovery_required')=1 THEN 'reconciling' ELSE 'ready' END,state_json=json_set(state_json,'$.waiting_for',NULL,'$.opening_evidence',json(?5)) WHERE binding_id=?1 AND generation=?2",params![id,generation,native,namespace,model::canonical(&r.details)?])?;
             }
         } else if o["method"] == "task.dispatch" {
-            if warm_producer.is_some() {
+            if let Some(admission) = normalized_dispatch_admission.as_ref() {
+                producers::record_task_dispatch(&tx, &o, &r, admission, now)?;
+            } else if warm_producer.is_some() {
                 // Its terminal producer is recorded below for both successful
                 // and rejected native terminal outcomes.
             } else if sessionless_batch {
@@ -3150,6 +3355,11 @@ fn user_command_with_actor(
     let b = operations::get_binding(tx, id, generation)?;
     let strict_command_status =
         method == "agent.result" && crate::runtime::batch::is_rust_command_route(&b["route"]);
+    let command_status_target_snapshot = if strict_command_status {
+        Some(super::command_results::validate_request(tx, &b, v)?)
+    } else {
+        None
+    };
     if crate::runtime::batch::is_sessionless_route(&b["route"]) && !strict_command_status {
         crate::runtime::batch::validate_command(&b["route"], method, v)?;
     }
@@ -3319,9 +3529,6 @@ fn user_command_with_actor(
         let session_id = model::text(&v["selector"], "session_id")?;
         super::results::antigravity_status_snapshot(tx, id, generation, &b, target_id, session_id)?;
     }
-    if strict_command_status {
-        super::command_results::validate_request(tx, &b, v)?;
-    }
     if method == "agent.result"
         && crate::runtime::batch::is_sessionless_route(&b["route"])
         && !strict_command_status
@@ -3478,6 +3685,9 @@ fn user_command_with_actor(
             params![id,generation,now,model::canonical(&json!({"reason":"superseded_by_goal_stop","stop_operation_id":op}))?])?;
     }
     let mut effective = json!({"route":b["route"],"native_root_id":b["native_root_id"]});
+    if let Some(snapshot) = command_status_target_snapshot {
+        effective["command_status_target_snapshot"] = snapshot;
+    }
     if method == "agent.configure" && b["route"]["runtime"] == crate::runtime::opencode_v2::RUNTIME
     {
         let native_options = if b["route"]

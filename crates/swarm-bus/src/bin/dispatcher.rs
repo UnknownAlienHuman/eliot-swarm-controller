@@ -470,9 +470,13 @@ async fn run_worker(options: &std::collections::BTreeMap<String, String>) -> Res
             "--worker-config",
             "--managed-owner-dir",
             "--service-generation",
+            "--worker-config-sha256",
+            "--credential-token-sha256",
+            "--scope-digest",
         ],
     )?;
-    let worker = read_worker_config(Path::new(required(options, "--worker-config")?))?;
+    let (worker, config_sha256) =
+        read_worker_config_with_digest(Path::new(required(options, "--worker-config")?))?;
     if worker.schema_version != 1
         || !(MIN_POLL_MS..=MAX_POLL_MS).contains(&worker.poll_interval_ms)
         || worker.manager_id.is_empty()
@@ -493,18 +497,49 @@ async fn run_worker(options: &std::collections::BTreeMap<String, String>) -> Res
         .map(|value| value.parse::<u64>())
         .transpose()
         .map_err(|_| Error::invalid("service generation is invalid"))?;
-    match (worker.managed_service, owner_dir, generation) {
-        (true, Some(owner_dir), Some(generation)) if generation > 0 => {
-            return run_managed_worker(worker, owner_dir, generation).await;
+    let expected_config_sha256 = options.get("--worker-config-sha256");
+    let expected_token_sha256 = options.get("--credential-token-sha256");
+    let expected_scope_digest = options.get("--scope-digest");
+    match (
+        worker.managed_service,
+        owner_dir,
+        generation,
+        expected_config_sha256,
+        expected_token_sha256,
+        expected_scope_digest,
+    ) {
+        (
+            true,
+            Some(owner_dir),
+            Some(generation),
+            Some(config_hash),
+            Some(token_hash),
+            Some(scope_digest),
+        ) if generation > 0
+            && is_sha256(config_hash)
+            && is_sha256(token_hash)
+            && is_sha256(scope_digest)
+            && config_sha256.eq_ignore_ascii_case(config_hash)
+            && hex_sha256(worker.credential.token.as_bytes()).eq_ignore_ascii_case(token_hash) =>
+        {
+            return run_managed_worker(
+                worker,
+                owner_dir,
+                generation,
+                config_sha256,
+                token_hash.to_ascii_lowercase(),
+                scope_digest.to_ascii_lowercase(),
+            )
+            .await;
         }
-        (true, _, _) => {
+        (true, _, _, _, _, _) => {
             return Err(Error::new(
                 "BUS_SERVICE_OWNER_REQUIRED",
-                "managed worker requires its host-provided owner directory and generation",
+                "managed worker requires its exact host-provided owner and integrity metadata",
             ));
         }
-        (false, None, None) => {}
-        (false, _, _) => {
+        (false, None, None, None, None, None) => {}
+        (false, _, _, _, _, _) => {
             return Err(Error::new(
                 "BUS_SERVICE_OWNER_UNEXPECTED",
                 "unmanaged worker cannot join a host-owned service scope",
@@ -536,6 +571,9 @@ async fn run_managed_worker(
     worker: WorkerConfig,
     owner_dir: PathBuf,
     generation: u64,
+    worker_config_sha256: String,
+    credential_token_sha256: String,
+    scope_digest: String,
 ) -> Result<()> {
     let scope = DeclaredServiceScope::new(
         DeclaredServicePurpose::BusConsumer,
@@ -567,10 +605,13 @@ async fn run_managed_worker(
     let group = Group::enter_service(&token, scope.purpose)?;
     let worker_image = process_image_identity(std::process::id())?;
     let receipt = json!({
-        "schema_version":1,
+        "schema_version":2,
         "scope":scope,
         "owner":{"version":1,"token":token,"process":group.identity},
         "worker_image":worker_image,
+        "worker_config_sha256":worker_config_sha256,
+        "credential_token_sha256":credential_token_sha256,
+        "scope_digest":scope_digest,
     });
     write_private_new(
         &owner_path,
@@ -712,6 +753,10 @@ fn hex_sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn admission_request_id(
     consumer_client_id: &str,
     project_id: &str,
@@ -746,10 +791,17 @@ fn read_credential(path: &Path) -> Result<Credential> {
 }
 
 fn read_worker_config(path: &Path) -> Result<WorkerConfig> {
+    read_worker_config_with_digest(path).map(|(worker, _)| worker)
+}
+
+fn read_worker_config_with_digest(path: &Path) -> Result<(WorkerConfig, String)> {
     let mut bytes = read_private_file(path)?;
+    let digest = hex_sha256(&bytes);
     let parsed = serde_json::from_slice(&bytes);
     bytes.zeroize();
-    parsed.map_err(|_| Error::invalid("private worker config is malformed"))
+    parsed
+        .map(|worker| (worker, digest))
+        .map_err(|_| Error::invalid("private worker config is malformed"))
 }
 
 fn write_worker_config(path: &Path, worker: &WorkerConfig) -> Result<()> {

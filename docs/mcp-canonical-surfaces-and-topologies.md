@@ -3,7 +3,7 @@
 **Current qualification status:** See [Implementation Status](implementation-status.md) for the current source and native qualification; this document remains authoritative for canonical MCP names and authorization contracts.
 
 ### Historical C7/C8 status snapshot
-**Revision:** 11 — 2026-10-03
+**Revision:** 12 — 2026-10-05
 **Integration review:** published C5 snapshot `a0a931e` and [Agent Operations PR #23](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/23).
 **Historical C7/C8 CI:** Exact runs and source commits are recorded in [Implementation Status](implementation-status.md).
 
@@ -38,9 +38,13 @@ coordination.inbox
 coordination.consult
 coordination.sync_integration
 coordination.watch.create
+task.submit
+artifact.read
 swarm.overlap.check
 operation.get
 ```
+
+The ordinary assigned Participant may submit only the exact current Task revision and Attempt. This adds no Task creation, claim, acceptance, manager runtime, or GM recovery authority. Its `operation.get` is a narrow candidate-origin projection for applied `source.capture` and `agent.result` Operations in that current Attempt; sponsored review credentials remain review-only.
 
 ### Manager
 

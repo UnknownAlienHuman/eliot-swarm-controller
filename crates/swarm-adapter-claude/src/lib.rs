@@ -8,8 +8,8 @@ mod sdk_harness;
 pub use config::{ARTIFACT_ID, ARTIFACT_VERSION, AdapterConfig, NativeOptions, RUNTIME};
 pub use module_runtime::OwnedBootstrap;
 
-use journal::{OperationJournal, digest_json};
-use native_state::NativeControl;
+use journal::{OperationJournal, digest_bytes, digest_json};
+use native_state::{NativeControl, safe_family_resource_links};
 use sdk_harness::{HarnessFrame, NativeHarness};
 use serde_json::{Value, json};
 use std::{path::Path, time::Duration};
@@ -18,7 +18,10 @@ use swarm_contracts::{
     Credential,
     error::{Error, Result},
     module_contract::ModuleContractClaim,
-    runtime::{EffectOutcome, RuntimeCommand, RuntimeOutcome},
+    runtime::{
+        EffectOutcome, RuntimeCommand, RuntimeOutcome, TaskDispatchAdmissionReceipt,
+        TaskDispatchContext,
+    },
 };
 use tokio::{sync::mpsc, time::sleep};
 
@@ -27,6 +30,7 @@ const MAX_FRAMES: usize = 256;
 const MAX_INPUT_TEXT_BYTES: usize = 64 * 1024;
 const MAX_TASK_SNAPSHOT_BYTES: usize = 64 * 1024;
 const MAX_REFRESH_EXECUTIONS: usize = 16;
+const MAX_REFRESH_FAMILY_EVENTS: usize = 16;
 
 pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
     let OwnedBootstrap {
@@ -457,6 +461,9 @@ async fn handle_command(
                     );
                 }
             };
+            let source_text = command.input["text"]
+                .as_str()
+                .ok_or_else(|| Error::invalid("input text must be nonempty"))?;
             let prompt_sha256 = digest_bytes(text.as_bytes());
             let task_snapshot_sha256 = if first_dispatch {
                 Some(digest_bytes(
@@ -469,17 +476,42 @@ async fn handle_command(
                 None
             };
             let input_id = uuid::Uuid::new_v4().to_string();
+            let native_payload = json!({
+                "kind":"send",
+                "operation_id":command.operation_id,
+                "initial_dispatch":first_dispatch,
+                "text":text,
+                "native_root_id":native_root_id,
+                "user_message_uuid":input_id
+            });
+            let dispatch_admission = if command.method == "task.dispatch" {
+                normalized_dispatch_admission(
+                    claim,
+                    command,
+                    &receipt,
+                    boot_id,
+                    &input_id,
+                    source_text,
+                    &native_payload,
+                )?
+            } else {
+                None
+            };
+            let mut native_intent = json!({
+                "user_message_uuid":input_id,
+                "prompt_sha256":prompt_sha256,
+                "prompt_bytes":text.len(),
+                "task_snapshot_sha256":task_snapshot_sha256,
+                "native_root_id":native_root_id,
+                "native_scope_key":config.native_options.scope_key(),
+            });
+            if let Some(admission) = dispatch_admission.as_ref() {
+                native_intent["dispatch_admission"] = serde_json::to_value(admission)?;
+            }
             let intent = intent_for(
                 command,
                 &receipt,
-                Some(json!({
-                    "user_message_uuid":input_id,
-                    "prompt_sha256":prompt_sha256,
-                    "prompt_bytes":text.len(),
-                    "task_snapshot_sha256":task_snapshot_sha256,
-                    "native_root_id":native_root_id,
-                    "native_scope_key":config.native_options.scope_key(),
-                })),
+                Some(native_intent),
                 boot_id,
                 &config.native_options.scope_key(),
             )?;
@@ -505,14 +537,7 @@ async fn handle_command(
                 return Ok(false);
             }
             let sent = native
-                .send(json!({
-                    "kind":"send",
-                    "operation_id":command.operation_id,
-                    "initial_dispatch":first_dispatch,
-                    "text":text,
-                    "native_root_id":native_root_id,
-                    "user_message_uuid":input_id
-                }))
+                .send(native_payload)
                 .await;
             if sent.is_err() {
                 *harness_alive = false;
@@ -648,7 +673,10 @@ fn handle_refresh(
         "native_session_id":requested_session,
         "family_completeness":"partial",
         "enumeration_complete":false,
-        "completeness_reason":"the SDK metadata stream does not enumerate every native process or durable family member",
+        "completeness_reason":"SDK task and subagent lifecycle events are a bounded observation stream; they do not enumerate every native process or durable family member",
+        "native_process_family_status":"unknown",
+        "family_departure_proven":false,
+        "family_events_available":observation_matches,
         "execution_complete":false,
         "task_completion_claimed":false,
         "replay_permitted":false
@@ -709,6 +737,88 @@ fn compact_refresh_observation(latest_state: &Value) -> Value {
             Value::Object(compact)
         })
         .collect::<Vec<_>>();
+    let family_all = state["family_events"]
+        .as_array()
+        .map_or(&[][..], Vec::as_slice);
+    let family_events_truncated = family_all.len() > MAX_REFRESH_FAMILY_EVENTS
+        || state["family_events_truncated"] == true;
+    let family_events = family_all
+        .iter()
+        .rev()
+        .take(MAX_REFRESH_FAMILY_EVENTS)
+        .rev()
+        .map(|event| {
+            let mut compact = serde_json::Map::new();
+            for key in [
+                "source",
+                "event_type",
+                "native_session_id",
+                "task_id",
+                "task_identity",
+                "agent_id",
+                "member_identity",
+                "tool_use_id",
+                "hook_tool_use_id",
+                "parent_tool_use_id",
+                "agent_type",
+                "task_type",
+                "task_reason",
+                "task_last_tool_name",
+                "frame_uuid",
+                "prompt_id",
+                "user_message_uuid",
+                "sdk_task_status",
+                "task_patch_status",
+            ] {
+                if let Some(value) = event.get(key).and_then(Value::as_str)
+                    && !value.is_empty()
+                    && value.len() <= 512
+                    && !value.bytes().any(|byte| byte.is_ascii_control())
+                {
+                    compact.insert(key.to_owned(), json!(value));
+                }
+            }
+            if let Some(ids) = event.get("user_message_uuids").and_then(Value::as_array) {
+                let ids = ids
+                    .iter()
+                    .take(16)
+                    .filter_map(Value::as_str)
+                    .filter(|id| {
+                        !id.is_empty()
+                            && id.len() <= 256
+                            && !id.bytes().any(|byte| byte.is_ascii_control())
+                    })
+                    .collect::<Vec<_>>();
+                if !ids.is_empty() {
+                    compact.insert("user_message_uuids".to_owned(), json!(ids));
+                }
+            }
+            for key in [
+                "is_backgrounded",
+                "task_patch_is_backgrounded",
+                "ambient",
+                "input_links_truncated",
+            ] {
+                if let Some(value) = event.get(key).and_then(Value::as_bool) {
+                    compact.insert(key.to_owned(), json!(value));
+                }
+            }
+            if let Some(value) = event.get("spawn_depth").filter(|value| value.as_u64().is_some_and(|depth| depth <= 128)) {
+                compact.insert("spawn_depth".to_owned(), value.clone());
+            }
+            if let Some(links) = event.get("resource_links").and_then(safe_family_resource_links) {
+                let truncated = links.len() > 16 || event["resource_links_truncated"] == true;
+                compact.insert(
+                    "resource_links".to_owned(),
+                    json!(links.into_iter().take(16).collect::<Vec<_>>()),
+                );
+                if truncated {
+                    compact.insert("resource_links_truncated".to_owned(), json!(true));
+                }
+            }
+            Value::Object(compact)
+        })
+        .collect::<Vec<_>>();
     json!({
         "bridge_boot_id":latest_state["bridge_boot_id"],
         "native_scope_key":latest_state["native_scope_key"],
@@ -718,7 +828,11 @@ fn compact_refresh_observation(latest_state: &Value) -> Value {
             "effective_model":state["effective_model"],
             "native_events_seen":state["native_events_seen"],
             "input_executions":executions,
-            "input_executions_truncated":truncated
+            "input_executions_truncated":truncated,
+            "family_events":family_events,
+            "family_event_count":state["family_event_count"],
+            "family_events_truncated":family_events_truncated,
+            "family_projection_incomplete":state["family_projection_incomplete"]
         }
     })
 }
@@ -965,6 +1079,94 @@ fn intent_for(
         object.insert("native_root_id".to_owned(), json!(root));
     }
     Ok(intent)
+}
+
+fn normalized_dispatch_enabled(claim: &ModuleContractClaim) -> bool {
+    claim.command_schemas.iter().any(|schema| {
+        schema.schema_id == "swarm.task_dispatch_context"
+            && schema.version == "1"
+            && schema.sha256.is_none()
+    }) && claim.event_schemas.iter().any(|schema| {
+        schema.schema_id == "swarm.task_dispatch_admission"
+            && schema.version == "1"
+            && schema.sha256.is_none()
+    })
+}
+
+fn normalized_dispatch_admission(
+    claim: &ModuleContractClaim,
+    command: &RuntimeCommand,
+    receipt: &swarm_contracts::runtime::ModuleReceiptIdentity,
+    boot_id: &str,
+    input_id: &str,
+    source_text: &str,
+    native_payload: &Value,
+) -> Result<Option<TaskDispatchAdmissionReceipt>> {
+    if !normalized_dispatch_enabled(claim) {
+        return Ok(None);
+    }
+    if command.method != "task.dispatch" {
+        return Ok(None);
+    }
+    let value = command.input.get("task_dispatch_context").ok_or_else(|| {
+        Error::new(
+            "TASK_DISPATCH_CONTEXT_MISSING",
+            "normalized task.dispatch command has no Store-supplied context",
+        )
+    })?;
+    let context: TaskDispatchContext = serde_json::from_value(value.clone()).map_err(|_| {
+        Error::new(
+            "TASK_DISPATCH_CONTEXT_INVALID",
+            "Store-supplied task.dispatch context is malformed",
+        )
+    })?;
+    context.validate().map_err(|_| {
+        Error::new(
+            "TASK_DISPATCH_CONTEXT_INVALID",
+            "Store-supplied task.dispatch context is invalid",
+        )
+    })?;
+    let source_text_bytes = u64::try_from(source_text.len())
+        .map_err(|_| Error::invalid("task dispatch text length is out of range"))?;
+    if context.operation_id != command.operation_id
+        || context.binding_id != command.binding_id
+        || context.binding_generation != command.generation
+        || context.worker_boot_id != boot_id
+        || context.source_text_sha256 != digest_bytes(source_text.as_bytes())
+        || context.source_text_bytes != source_text_bytes
+    {
+        return Err(Error::new(
+            "TASK_DISPATCH_CONTEXT_INVALID",
+            "Store-supplied task.dispatch context differs from the authenticated command",
+        ));
+    }
+    let payload_bytes = serde_json::to_vec(native_payload)?;
+    let native_payload_bytes = u64::try_from(payload_bytes.len())
+        .map_err(|_| Error::invalid("native dispatch payload length is out of range"))?;
+    let admission = TaskDispatchAdmissionReceipt {
+        schema_version: context.schema_version,
+        module_receipt: receipt.clone(),
+        operation_id: context.operation_id.clone(),
+        binding_id: context.binding_id.clone(),
+        binding_generation: context.binding_generation,
+        worker_boot_id: context.worker_boot_id.clone(),
+        attempt_id: context.attempt_id.clone(),
+        task_id: context.task_id.clone(),
+        task_revision: context.task_revision,
+        task_snapshot_sha256: context.task_snapshot_sha256.clone(),
+        source_text_sha256: context.source_text_sha256.clone(),
+        source_text_bytes: context.source_text_bytes,
+        native_payload_sha256: digest_bytes(&payload_bytes),
+        native_payload_bytes,
+        native_input_id: Some(input_id.to_owned()),
+    };
+    admission.validate().map_err(|_| {
+        Error::new(
+            "TASK_DISPATCH_ADMISSION_INVALID",
+            "generated normalized task dispatch receipt is invalid",
+        )
+    })?;
+    Ok(Some(admission))
 }
 
 fn input_text(command: &RuntimeCommand, first_dispatch: bool) -> Result<String> {

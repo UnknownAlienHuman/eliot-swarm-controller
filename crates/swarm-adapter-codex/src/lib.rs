@@ -19,7 +19,10 @@ use sha2::{Digest, Sha256};
 use swarm_client::{IpcConfig, ModuleLink};
 use swarm_contracts::{
     module_contract::ModuleContractClaim,
-    runtime::{EffectOutcome, ModuleReceiptIdentity, RuntimeCommand, RuntimeOutcome},
+    runtime::{
+        EffectOutcome, ModuleReceiptIdentity, RuntimeCommand, RuntimeOutcome,
+        TaskDispatchAdmissionReceipt, TaskDispatchContext,
+    },
 };
 use tokio::{net::TcpStream, time::timeout};
 use tokio_tungstenite::{
@@ -151,6 +154,8 @@ struct OperationRecord {
     returned_turn_id: Option<String>,
     returned_turn_status: Option<String>,
     native_input_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dispatch_admission: Option<TaskDispatchAdmissionReceipt>,
     outcome: Option<Value>,
 }
 
@@ -176,6 +181,7 @@ impl OperationRecord {
             returned_turn_id: None,
             returned_turn_status: None,
             native_input_id: None,
+            dispatch_admission: None,
             outcome: None,
         }
     }
@@ -201,6 +207,7 @@ impl OperationRecord {
             returned_turn_id: None,
             returned_turn_status: None,
             native_input_id: None,
+            dispatch_admission: None,
             outcome: Some(outcome),
         }
     }
@@ -1520,6 +1527,102 @@ fn prompt_for(command: &RuntimeCommand) -> Result<String, &'static str> {
     Ok(prompt)
 }
 
+fn native_send_payload(
+    root: &str,
+    prompt: &str,
+    model: &str,
+    operation_id: &str,
+    steer: bool,
+    expected_turn_id: Option<&str>,
+) -> Value {
+    let input = json!([{"type":"text","text":prompt}]);
+    if steer {
+        json!({
+            "threadId": root,
+            "expectedTurnId": expected_turn_id,
+            "input": input,
+            "clientUserMessageId": operation_id,
+        })
+    } else {
+        json!({
+            "threadId": root,
+            "input": input,
+            "model": model,
+            "clientUserMessageId": operation_id,
+        })
+    }
+}
+
+fn normalized_dispatch_admission(
+    command: &RuntimeCommand,
+    claim: &ModuleContractClaim,
+    boot_id: &str,
+    payload: &Value,
+) -> Result<Option<TaskDispatchAdmissionReceipt>, AdapterError> {
+    if command.method != "task.dispatch"
+        || !module_contract::normalized_dispatch_enabled(claim)
+    {
+        return Ok(None);
+    }
+    let context: TaskDispatchContext = serde_json::from_value(
+        command.input["task_dispatch_context"].clone(),
+    )
+    .map_err(|_| AdapterError::HostProtocol)?;
+    context
+        .validate()
+        .map_err(|_| AdapterError::HostProtocol)?;
+    if context.operation_id != command.operation_id
+        || context.binding_id != command.binding_id
+        || context.binding_generation != command.generation
+        || context.worker_boot_id != boot_id
+    {
+        return Err(AdapterError::HostProtocol);
+    }
+    let source_text = command.input["text"]
+        .as_str()
+        .filter(|text| !text.trim().is_empty())
+        .ok_or(AdapterError::HostProtocol)?;
+    if context.source_text_sha256 != digest_hex(source_text.as_bytes())
+        || context.source_text_bytes != source_text.len() as u64
+    {
+        return Err(AdapterError::HostProtocol);
+    }
+    let input_sha256 = command
+        .input_sha256
+        .as_deref()
+        .filter(|digest| valid_sha256(digest))
+        .ok_or(AdapterError::HostProtocol)?;
+    let module_receipt = module_contract::receipt_identity(
+        claim,
+        &command.binding_id,
+        command.generation,
+        &command.operation_id,
+        input_sha256,
+    )?;
+    let native_payload = serde_json::to_vec(payload).map_err(|_| AdapterError::HostProtocol)?;
+    let receipt = TaskDispatchAdmissionReceipt {
+        schema_version: 1,
+        module_receipt,
+        operation_id: context.operation_id,
+        binding_id: context.binding_id,
+        binding_generation: context.binding_generation,
+        worker_boot_id: context.worker_boot_id,
+        attempt_id: context.attempt_id,
+        task_id: context.task_id,
+        task_revision: context.task_revision,
+        task_snapshot_sha256: context.task_snapshot_sha256,
+        source_text_sha256: context.source_text_sha256,
+        source_text_bytes: context.source_text_bytes,
+        native_payload_sha256: digest_hex(&native_payload),
+        native_payload_bytes: native_payload.len() as u64,
+        native_input_id: Some(command.operation_id.clone()),
+    };
+    receipt
+        .validate()
+        .map_err(|_| AdapterError::HostProtocol)?;
+    Ok(Some(receipt))
+}
+
 fn outcome(
     operation_id: &str,
     disposition: EffectOutcome,
@@ -1659,6 +1762,73 @@ fn validate_saved_receipt(
     Ok(())
 }
 
+fn validate_saved_dispatch_admission(
+    outcome: &RuntimeOutcome,
+    command: &RuntimeCommand,
+    claim: &ModuleContractClaim,
+    boot_id: &str,
+) -> Result<(), AdapterError> {
+    if command.method != "task.dispatch"
+        || !module_contract::normalized_dispatch_enabled(claim)
+    {
+        return Ok(());
+    }
+    let details = outcome
+        .details
+        .as_object()
+        .ok_or(AdapterError::Checkpoint)?;
+    let admission = details
+        .get("dispatch_admission")
+        .map(|value| {
+            let receipt: TaskDispatchAdmissionReceipt =
+                serde_json::from_value(value.clone()).map_err(|_| AdapterError::Checkpoint)?;
+            receipt
+                .validate()
+                .map_err(|_| AdapterError::Checkpoint)?;
+            Ok::<_, AdapterError>(receipt)
+        })
+        .transpose()?;
+    match outcome.outcome {
+        EffectOutcome::Applied | EffectOutcome::Accepted => {
+            let receipt = admission.ok_or(AdapterError::Checkpoint)?;
+            let input_sha256 = command
+                .input_sha256
+                .as_deref()
+                .filter(|digest| valid_sha256(digest))
+                .ok_or(AdapterError::Checkpoint)?;
+            let expected = module_contract::receipt_identity(
+                claim,
+                &command.binding_id,
+                command.generation,
+                &command.operation_id,
+                input_sha256,
+            )?;
+            let context = receipt.context();
+            let source_text = command.input["text"]
+                .as_str()
+                .filter(|text| !text.trim().is_empty())
+                .ok_or(AdapterError::Checkpoint)?;
+            if receipt.module_receipt != expected
+                || context.operation_id != command.operation_id
+                || context.binding_id != command.binding_id
+                || context.binding_generation != command.generation
+                || context.worker_boot_id != boot_id
+                || context.source_text_sha256 != digest_hex(source_text.as_bytes())
+                || context.source_text_bytes != source_text.len() as u64
+                || receipt.native_input_id.as_deref() != outcome.native_input_id.as_deref()
+            {
+                return Err(AdapterError::Checkpoint);
+            }
+        }
+        EffectOutcome::Rejected | EffectOutcome::Unknown => {
+            if admission.is_some() {
+                return Err(AdapterError::Checkpoint);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn base_details(state: &Checkpoint) -> Value {
     json!({
         "module_artifact_id": ARTIFACT_ID,
@@ -1749,6 +1919,19 @@ async fn reconcile_send(
         return unknown_send(record, operation_id, "NATIVE_ITEM_CORRELATION_NOT_UNIQUE");
     }
     let matched = &matches[0];
+    if record
+        .dispatch_admission
+        .as_ref()
+        .and_then(|receipt| receipt.native_input_id.as_deref())
+        != Some(matched.item_id.as_str())
+        && record.dispatch_admission.is_some()
+    {
+        return unknown_send(
+            record,
+            operation_id,
+            "NATIVE_DISPATCH_ADMISSION_ID_MISMATCH",
+        );
+    }
     if digest_hex(matched.text.as_bytes()) != expected_digest
         || matched.text.len() as u64 != expected_bytes
         || record
@@ -1851,6 +2034,20 @@ async fn reconcile_send(
         "billing_status": "unknown",
         "fallback_used": false,
     });
+    if !status_is_failed {
+        if let Some(admission) = record.dispatch_admission.as_ref() {
+            details["dispatch_admission"] = match serde_json::to_value(admission) {
+                Ok(value) => value,
+                Err(_) => {
+                    return unknown_send(
+                        record,
+                        operation_id,
+                        "DISPATCH_ADMISSION_SERIALIZATION_FAILED",
+                    )
+                }
+            };
+        }
+    }
     if status_is_failed {
         let failure_code = turn_error_diagnostic(&turn);
         details["diagnostic_code"] = json!(failure_code);
@@ -2275,6 +2472,8 @@ async fn open_operation(
 async fn send_operation(
     command: &RuntimeCommand,
     journal: &mut Journal,
+    claim: &ModuleContractClaim,
+    boot_id: &str,
     endpoint: &str,
     token: Option<&str>,
     credential_unavailable: bool,
@@ -2290,6 +2489,16 @@ async fn send_operation(
                 previous,
                 &command.operation_id,
                 "NATIVE_OPERATION_CONTEXT_CHANGED",
+            );
+        }
+        if command.method == "task.dispatch"
+            && module_contract::normalized_dispatch_enabled(claim)
+            && previous.dispatch_admission.is_none()
+        {
+            return unknown_send(
+                previous,
+                &command.operation_id,
+                "DISPATCH_ADMISSION_INTENT_MISSING",
             );
         }
         let mut native = match NativeClient::attach(endpoint, token, credential_unavailable).await {
@@ -2418,6 +2627,23 @@ async fn send_operation(
     } else if thread["status"]["type"] != "idle" {
         return rejected(command, "THREAD_NOT_IDLE", &journal.state);
     }
+    let native_payload = native_send_payload(
+        &root,
+        &prompt,
+        &model,
+        &command.operation_id,
+        steer,
+        expected_turn.as_deref(),
+    );
+    let dispatch_admission = match normalized_dispatch_admission(
+        command,
+        claim,
+        boot_id,
+        &native_payload,
+    ) {
+        Ok(admission) => admission,
+        Err(_) => return rejected(command, "TASK_DISPATCH_CONTEXT_INVALID", &journal.state),
+    };
     let mut record = OperationRecord::intent(&command.method, "send");
     record.input_sha256 = command.input_sha256.clone();
     record.native_root_id = Some(root.clone());
@@ -2430,6 +2656,7 @@ async fn send_operation(
     record.prompt_bytes = Some(byte_count);
     record.delivery = Some(if steer { "steer" } else { "next_turn" }.into());
     record.expected_turn_id = expected_turn.clone();
+    record.dispatch_admission = dispatch_admission;
     journal
         .state
         .operations
@@ -2445,17 +2672,11 @@ async fn send_operation(
             json!({"diagnostic_code":"CHECKPOINT_WRITE_FAILED","native_replay":false}),
         );
     }
-    let input = json!([{"type":"text","text":prompt}]);
     let request = if steer {
         native
             .request(
                 "turn/steer",
-                json!({
-                    "threadId":root,
-                    "expectedTurnId":expected_turn,
-                    "input":input,
-                    "clientUserMessageId":command.operation_id,
-                }),
+                native_payload.clone(),
             )
             .await
             .map(|response| {
@@ -2468,12 +2689,7 @@ async fn send_operation(
         native
             .request(
                 "turn/start",
-                json!({
-                    "threadId":root,
-                    "input":input,
-                    "model":model,
-                    "clientUserMessageId":command.operation_id,
-                }),
+                native_payload,
             )
             .await
             .map(|response| {
@@ -2799,6 +3015,7 @@ async fn handle_command(
     command: RuntimeCommand,
     journal: &mut Journal,
     claim: &ModuleContractClaim,
+    boot_id: &str,
     endpoint: &str,
     token: Option<&str>,
     credential_unavailable: bool,
@@ -2843,6 +3060,7 @@ async fn handle_command(
                 &command.operation_id,
                 input_sha256,
             )?;
+            validate_saved_dispatch_admission(&result, &command, claim, boot_id)?;
             return Ok(vec![result]);
         }
     }
@@ -2872,8 +3090,16 @@ async fn handle_command(
             }
             "task.dispatch" | "agent.send" => {
                 let mut result =
-                    send_operation(&command, journal, endpoint, token, credential_unavailable)
-                        .await;
+                    send_operation(
+                        &command,
+                        journal,
+                        claim,
+                        boot_id,
+                        endpoint,
+                        token,
+                        credential_unavailable,
+                    )
+                    .await;
                 attach_command_receipt(&mut result, &command, claim)?;
                 vec![result]
             }
@@ -3021,6 +3247,7 @@ pub async fn run(config: AdapterConfig) -> Result<(), AdapterError> {
                     command,
                     &mut journal,
                     &context.claim,
+                    &context.worker.boot_id,
                     &endpoint,
                     token.as_deref(),
                     credential_unavailable,

@@ -10,6 +10,7 @@ use std::{
 use swarm_contracts::{
     RuntimeOutcome,
     error::{Error, Result},
+    runtime::TaskDispatchAdmissionReceipt,
 };
 use swarm_process::{private_permissions, write_private_new};
 
@@ -38,6 +39,16 @@ struct AdmissionRecord {
     binding_id: String,
     generation: i64,
     route_sha256: String,
+    checksum: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DispatchAdmissionRecord {
+    schema: u8,
+    module_artifact_id: String,
+    operation_id: String,
+    receipt: TaskDispatchAdmissionReceipt,
     checksum: String,
 }
 
@@ -226,6 +237,76 @@ impl RunStore {
             ));
         }
         Ok(Some((saved.outcome, hash)))
+    }
+
+    pub fn save_dispatch_admission(
+        &self,
+        operation_id: &str,
+        receipt: &TaskDispatchAdmissionReceipt,
+    ) -> Result<()> {
+        receipt.validate().map_err(|_| {
+            Error::new(
+                "ADAPTER_EVIDENCE_INVALID",
+                "dispatch admission receipt is invalid",
+            )
+        })?;
+        if receipt.operation_id != operation_id {
+            return Err(Error::new(
+                "ADAPTER_EVIDENCE_CONFLICT",
+                "dispatch admission operation identity differs from its directory",
+            ));
+        }
+        let dir = self.directory(operation_id)?;
+        let path = dir.join("dispatch-admission.json");
+        if path.exists() {
+            let saved: DispatchAdmissionRecord = read_json(&path)?;
+            if saved.schema != 1
+                || saved.module_artifact_id != ARTIFACT_ID
+                || saved.operation_id != operation_id
+                || saved.receipt != receipt.clone()
+                || !dispatch_admission_checksum_valid(&saved)
+            {
+                return Err(Error::new(
+                    "ADAPTER_EVIDENCE_CONFLICT",
+                    "saved dispatch admission differs from the current command",
+                ));
+            }
+            return Ok(());
+        }
+        let mut saved = DispatchAdmissionRecord {
+            schema: 1,
+            module_artifact_id: ARTIFACT_ID.to_owned(),
+            operation_id: operation_id.to_owned(),
+            receipt: receipt.clone(),
+            checksum: String::new(),
+        };
+        saved.checksum = dispatch_admission_checksum(&saved)?;
+        write_new_json(&path, &saved)
+    }
+
+    pub fn read_dispatch_admission(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<TaskDispatchAdmissionReceipt>> {
+        let dir = self.directory(operation_id)?;
+        let path = dir.join("dispatch-admission.json");
+        if !path.exists() {
+            return Ok(None);
+        }
+        let saved: DispatchAdmissionRecord = read_json(&path)?;
+        if saved.schema != 1
+            || saved.module_artifact_id != ARTIFACT_ID
+            || saved.operation_id != operation_id
+            || saved.receipt.operation_id != operation_id
+            || !dispatch_admission_checksum_valid(&saved)
+            || saved.receipt.validate().is_err()
+        {
+            return Err(Error::new(
+                "ADAPTER_EVIDENCE_INVALID",
+                "saved dispatch admission failed its identity or digest check",
+            ));
+        }
+        Ok(Some(saved.receipt))
     }
 
     pub fn save_outcome(&self, outcome: &RuntimeOutcome) -> Result<String> {
@@ -546,6 +627,20 @@ fn admission_checksum(record: &AdmissionRecord) -> Result<String> {
 
 fn admission_checksum_valid(record: &AdmissionRecord) -> bool {
     admission_checksum(record).is_ok_and(|expected| expected == record.checksum)
+}
+
+fn dispatch_admission_checksum(record: &DispatchAdmissionRecord) -> Result<String> {
+    let value = json!({
+        "schema":record.schema,
+        "module_artifact_id":record.module_artifact_id.clone(),
+        "operation_id":record.operation_id.clone(),
+        "receipt":record.receipt.clone()
+    });
+    Ok(digest(canonical(&value)?.as_bytes()))
+}
+
+fn dispatch_admission_checksum_valid(record: &DispatchAdmissionRecord) -> bool {
+    dispatch_admission_checksum(record).is_ok_and(|expected| expected == record.checksum)
 }
 
 fn identity_matches(saved: &DispatchIdentity, expected: &DispatchIdentity) -> bool {

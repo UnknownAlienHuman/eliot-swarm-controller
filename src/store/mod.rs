@@ -10,6 +10,7 @@ pub(crate) mod automation_goal_progression;
 mod automation_intake;
 mod automation_publication;
 pub(crate) mod automation_repair;
+mod automation_scheduler;
 mod automation_transfer;
 pub(crate) mod automation_work_dispatch;
 pub(crate) mod bus_kernel;
@@ -108,6 +109,7 @@ const GITHUB_EFFECTS_SCHEMA: &str = include_str!("../../migrations/007_github_la
 const GITHUB_PR_EFFECTS_SCHEMA: &str = include_str!("../../migrations/008_github_pr_effects.sql");
 const APPLICATION_ID: i64 = 0x45534331;
 const LOCAL_OPERATOR_CLIENT_ID_KEY: &str = "local_operator_client_id";
+pub(crate) const MANAGER_EVENT_SOURCE_STREAM: &str = "controller:manager-events";
 type RunJob = Box<dyn FnOnce(&mut Connection) + Send>;
 type Job = swarm_kernel::WriterJob<RunJob, message_batch::Request>;
 type KernelHost = swarm_kernel::KernelHost<RunJob, message_batch::Request, Error>;
@@ -121,6 +123,7 @@ pub struct Store {
     artifacts: ArtifactFiles,
     artifact_io: Arc<Semaphore>,
     data_dir: std::path::PathBuf,
+    automation_scheduler_owner_token: Option<Arc<String>>,
     telemetry: swarm_telemetry::Producer,
 }
 pub struct StoreOwner {
@@ -157,6 +160,97 @@ impl StoreOwner {
         let telemetry_config = swarm_telemetry::Config::default();
         let artifacts = ArtifactFiles::new(&root.path)?;
         let data_dir = root.path.clone();
+        let automation_scheduler_enabled = config.automation_scheduler.enabled;
+        let retained_scheduler_config = if automation_scheduler_enabled {
+            swarm_automation::load_worker_config(&data_dir).map_err(|_| {
+                Error::new(
+                    "AUTOMATION_SERVICE_CONFIG_INVALID",
+                    "private scheduler config cannot be validated",
+                )
+            })?
+        } else {
+            None
+        };
+        let automation_scheduler_credential = if automation_scheduler_enabled {
+            Some(
+                retained_scheduler_config
+                    .as_ref()
+                    .map(|entry| entry.credential.clone())
+                    .unwrap_or_else(|| Credential {
+                        client_id: automation_scheduler::SERVICE_ID.to_owned(),
+                        token: format!("{}{}", model::new_id(), model::new_id()),
+                    }),
+            )
+        } else {
+            None
+        };
+        let retained_scheduler_scope = retained_scheduler_config
+            .as_ref()
+            .map(|entry| entry.scope.clone());
+        let scheduler_owner_token = if automation_scheduler_enabled {
+            Some(
+                retained_scheduler_config
+                    .as_ref()
+                    .map(|entry| entry.service_owner_token.clone())
+                    .unwrap_or_else(|| format!("{}{}", model::new_id(), model::new_id())),
+            )
+        } else {
+            None
+        };
+        let automation_scheduler_config_sha256 = if automation_scheduler_enabled {
+            let scheduler_credential =
+                automation_scheduler_credential.as_ref().ok_or_else(|| {
+                    Error::new(
+                        "AUTOMATION_SERVICE_IDENTITY_INVALID",
+                        "enabled scheduler has no host-issued Module credential",
+                    )
+                })?;
+            let owner_token = scheduler_owner_token.as_deref().ok_or_else(|| {
+                Error::new(
+                    "AUTOMATION_SERVICE_IDENTITY_INVALID",
+                    "enabled scheduler has no service-owner token",
+                )
+            })?;
+            let scope = match retained_scheduler_scope.as_ref() {
+                Some(scope) => scope.clone(),
+                None => swarm_contracts::DeclaredServiceScope::new(
+                    swarm_contracts::DeclaredServicePurpose::AutomationScheduler,
+                    automation_scheduler::SERVICE_ID,
+                    1,
+                )
+                .map_err(|_| {
+                    Error::new(
+                        "AUTOMATION_SERVICE_IDENTITY_INVALID",
+                        "scheduler service scope could not be constructed",
+                    )
+                })?,
+            };
+            if let Some(retained) = retained_scheduler_config.as_ref() {
+                Some(retained.config_sha256.clone())
+            } else {
+                Some(
+                    swarm_automation::worker_config_sha256(
+                        data_dir.to_str().ok_or_else(|| {
+                            Error::new(
+                                "AUTOMATION_SERVICE_CONFIG_INVALID",
+                                "scheduler data root must be valid UTF-8",
+                            )
+                        })?,
+                        &scope,
+                        scheduler_credential,
+                        owner_token,
+                    )
+                    .map_err(|_| {
+                        Error::new(
+                            "AUTOMATION_SERVICE_CONFIG_INVALID",
+                            "scheduler config digest could not be computed",
+                        )
+                    })?,
+                )
+            }
+        } else {
+            None
+        };
         let module_supervisor_credential = Credential {
             client_id: model::INTERNAL_MODULE_SUPERVISOR_CLIENT_ID.to_owned(),
             token: format!("{}{}", model::new_id(), model::new_id()),
@@ -165,13 +259,27 @@ impl StoreOwner {
         let writer_root = root.path.clone();
         let writer_lock = root.lock;
         let writer_config = config.clone();
+        let writer_open_config = config.clone();
+        let writer_scheduler_credential = automation_scheduler_credential.clone();
+        let writer_retained_scheduler_scope = retained_scheduler_scope.clone();
+        let writer_scheduler_config_sha256 = automation_scheduler_config_sha256.clone();
         let mut kernel = swarm_kernel::spawn_kernel_host(
             swarm_kernel::KernelHostConfig {
                 queue_capacity: config.storage.queue_capacity,
                 batch_capacity: message_batch::MAX_BATCH_SIZE,
             },
             writer_lock,
-            move || open_database(&writer_root, &credential, &writer_supervisor_credential),
+            move || {
+                open_database(
+                    &writer_root,
+                    &credential,
+                    &writer_supervisor_credential,
+                    &writer_open_config,
+                    writer_scheduler_credential.as_ref(),
+                    writer_retained_scheduler_scope.as_ref(),
+                    writer_scheduler_config_sha256.as_deref(),
+                )
+            },
             |db, job: RunJob| job(db),
             move |db, batch| message_batch::process(db, batch, &writer_config),
         )
@@ -202,23 +310,64 @@ impl StoreOwner {
                 return Err(error);
             }
         };
+        let store = Store {
+            kernel: kernel_handle,
+            status_reader,
+            config: config.clone(),
+            changed: watch::channel(0).0,
+            artifacts,
+            data_dir: data_dir.clone(),
+            automation_scheduler_owner_token: scheduler_owner_token.clone().map(Arc::new),
+            artifact_io: Arc::new(Semaphore::new(4)),
+            telemetry: swarm_telemetry::Producer::with_line_observer(
+                telemetry_config,
+                line_observer,
+            ),
+        };
+        if automation_scheduler_enabled && retained_scheduler_config.is_none() {
+            let scheduler_credential = automation_scheduler_credential
+                .as_ref()
+                .expect("enabled scheduler has an issued Module credential");
+            let scope = match store
+                .run(|db| automation_scheduler::current_scope(db))
+                .await
+            {
+                Ok(scope) => scope,
+                Err(error) => {
+                    kernel.close_admission(swarm_kernel::KernelAdmissionFault::ShuttingDown);
+                    let status_shutdown = store.status_reader.shutdown().await;
+                    drop(store);
+                    join_store_threads(status_thread, kernel).await?;
+                    status_shutdown?;
+                    return Err(error);
+                }
+            };
+            if swarm_automation::write_worker_config(
+                &data_dir,
+                &scope,
+                scheduler_credential,
+                scheduler_owner_token
+                    .as_deref()
+                    .expect("enabled scheduler has an owner token"),
+            )
+            .is_err()
+            {
+                kernel.close_admission(swarm_kernel::KernelAdmissionFault::ShuttingDown);
+                let status_shutdown = store.status_reader.shutdown().await;
+                drop(store);
+                join_store_threads(status_thread, kernel).await?;
+                status_shutdown?;
+                return Err(Error::new(
+                    "AUTOMATION_SERVICE_CONFIG_WRITE_FAILED",
+                    "private scheduler config could not be created",
+                ));
+            }
+        }
         Ok(Self {
             kernel,
             status_thread,
             module_supervisor_credential,
-            store: Store {
-                kernel: kernel_handle,
-                status_reader,
-                config,
-                changed: watch::channel(0).0,
-                artifacts,
-                data_dir,
-                artifact_io: Arc::new(Semaphore::new(4)),
-                telemetry: swarm_telemetry::Producer::with_line_observer(
-                    telemetry_config,
-                    line_observer,
-                ),
-            },
+            store,
         })
     }
     pub async fn close(self) -> Result<()> {
@@ -365,6 +514,152 @@ impl Store {
             .await
     }
 
+    pub(crate) fn automation_scheduler_worker_config_path(&self) -> std::path::PathBuf {
+        swarm_automation::worker_config_path(&self.data_dir)
+    }
+
+    pub(crate) fn scheduler_owner_token(&self) -> Result<&str> {
+        self.automation_scheduler_owner_token
+            .as_deref()
+            .map(String::as_str)
+            .ok_or_else(|| {
+                Error::new(
+                    "AUTOMATION_SERVICE_NOT_CONFIGURED",
+                    "scheduler process owner token is unavailable",
+                )
+            })
+    }
+
+    pub(crate) async fn begin_automation_scheduler_worker(
+        &self,
+    ) -> Result<(swarm_contracts::DeclaredServiceScope, String)> {
+        if !self.config.automation_scheduler.enabled {
+            return Err(Error::new(
+                "AUTOMATION_SCHEDULER_DISABLED",
+                "independent scheduler worker is not enabled",
+            ));
+        }
+        let owner_token = self
+            .automation_scheduler_owner_token
+            .as_ref()
+            .ok_or_else(|| {
+                Error::new(
+                    "AUTOMATION_SERVICE_NOT_CONFIGURED",
+                    "scheduler owner token is unavailable",
+                )
+            })?
+            .clone();
+        let scope = self
+            .run(|db| automation_scheduler::current_scope(db))
+            .await?;
+        let launch_id = model::new_id();
+        let tx_launch_id = launch_id.clone();
+        let tx_scope = scope.clone();
+        self.run(move |db| {
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            automation_scheduler::begin_owner(&tx, &tx_scope, &tx_launch_id, &owner_token)?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await?;
+        Ok((scope, launch_id))
+    }
+
+    pub(crate) async fn activate_automation_scheduler_worker(
+        &self,
+        scope: swarm_contracts::DeclaredServiceScope,
+        launch_id: String,
+        identity: Value,
+    ) -> Result<()> {
+        let owner_token = self
+            .automation_scheduler_owner_token
+            .as_ref()
+            .ok_or_else(|| {
+                Error::new(
+                    "AUTOMATION_SERVICE_NOT_CONFIGURED",
+                    "scheduler process owner token is unavailable",
+                )
+            })?
+            .clone();
+        self.run(move |db| {
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            automation_scheduler::activate_owner(&tx, &scope, &launch_id, identity, &owner_token)?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub(crate) async fn abandon_automation_scheduler_worker(
+        &self,
+        scope: swarm_contracts::DeclaredServiceScope,
+        launch_id: String,
+    ) -> Result<()> {
+        self.run(move |db| {
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            automation_scheduler::abandon_unspawned_owner(&tx, &scope, &launch_id)?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub(crate) async fn abandon_exited_automation_scheduler_worker(
+        &self,
+        scope: swarm_contracts::DeclaredServiceScope,
+        launch_id: String,
+        identity: Value,
+    ) -> Result<()> {
+        let owner_token = self
+            .automation_scheduler_owner_token
+            .as_ref()
+            .ok_or_else(|| {
+                Error::new(
+                    "AUTOMATION_SERVICE_NOT_CONFIGURED",
+                    "scheduler process owner token is unavailable",
+                )
+            })?
+            .clone();
+        self.run(move |db| {
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            automation_scheduler::abandon_exited_owner(
+                &tx,
+                &scope,
+                &launch_id,
+                &identity,
+                &owner_token,
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub(crate) async fn finish_automation_scheduler_worker(
+        &self,
+        scope: swarm_contracts::DeclaredServiceScope,
+        launch_id: String,
+        identity: Value,
+    ) -> Result<()> {
+        let owner_token = self
+            .automation_scheduler_owner_token
+            .as_ref()
+            .ok_or_else(|| {
+                Error::new(
+                    "AUTOMATION_SERVICE_NOT_CONFIGURED",
+                    "scheduler process owner token is unavailable",
+                )
+            })?
+            .clone();
+        self.run(move |db| {
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            automation_scheduler::finish_owner(&tx, &scope, &launch_id, &identity, &owner_token)?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
     /// Persist only a fixed worker name/state/error code. `host.status` exposes
     /// this bounded readback; a failed Store write is never reported delivered.
     pub(crate) async fn record_legacy_worker_status(
@@ -437,6 +732,29 @@ impl Store {
         self.run(move |db| {
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
             bus_kernel::record_managed_service_start(&tx, &scope, model::now_ms()?)?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Record a host-verified declared-service owner readback. This does not
+    /// advance or replay any bus cursor or admitted action.
+    pub(crate) async fn record_managed_bus_owner_readback(
+        &self,
+        scope: swarm_contracts::DeclaredServiceScope,
+        state: bus_kernel::ManagedBusOwnerState,
+        receipt_sha256: Option<String>,
+    ) -> Result<()> {
+        self.run(move |db| {
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            bus_kernel::record_managed_service_owner_readback(
+                &tx,
+                &scope,
+                state,
+                receipt_sha256.as_deref(),
+                model::now_ms()?,
+            )?;
             tx.commit()?;
             Ok(())
         })
@@ -1028,6 +1346,18 @@ impl Store {
         .await
     }
     pub async fn call(&self, principal: Principal, method: String, params: Value) -> Result<Value> {
+        if principal.client_id == automation_scheduler::SERVICE_ID {
+            if !matches!(
+                method.as_str(),
+                "automation.scheduler.page" | "automation.scheduler.admit"
+            ) {
+                return Err(Error::new(
+                    "FORBIDDEN",
+                    "scheduler Module may call only its exact page and admission methods",
+                ));
+            }
+            return automation_scheduler::call(self, principal, &method, params).await;
+        }
         if principal.role == Role::ModuleSupervisor {
             if method != "module.descriptor.register" {
                 return Err(Error::new(
@@ -1213,6 +1543,7 @@ impl Store {
                 | "module.outcome"
                 | "bus.consumer.admit"
                 | "automation.config.apply"
+                | "event.emit"
                 | "automation.config.transfer"
                 | "review.assign"
                 | "review.submit"
@@ -1554,10 +1885,10 @@ impl Store {
         let receipt = self
             .run(move |db| {
                 let p = current_principal(db, p)?;
-                if !matches!(p.role, Role::Operator | Role::Manager) {
+                if !matches!(p.role, Role::Operator | Role::Manager | Role::Participant) {
                     return Err(Error::new(
                         "FORBIDDEN",
-                        "submission requires a manager or operator",
+                        "submission requires an assigned Participant, Attempt owner, current GM, or operator",
                     ));
                 }
                 mutate(db, &p, "task.submit", &params, &config)
@@ -1805,6 +2136,10 @@ fn open_database(
     root: &Path,
     credential: &Credential,
     module_supervisor_credential: &Credential,
+    config: &Config,
+    automation_scheduler_credential: Option<&Credential>,
+    retained_scheduler_scope: Option<&swarm_contracts::DeclaredServiceScope>,
+    automation_scheduler_config_sha256: Option<&str>,
 ) -> Result<Connection> {
     let opened = swarm_store::open_writer(
         &root.join("swarm.db"),
@@ -1814,7 +2149,18 @@ fn open_database(
             base_schema: SCHEMA,
         },
         swarm_store::WriterOptions::default(),
-        |tx, is_new| initialize_database(tx, is_new, credential, module_supervisor_credential),
+        |tx, is_new| {
+            initialize_database(
+                tx,
+                is_new,
+                credential,
+                module_supervisor_credential,
+                config,
+                automation_scheduler_credential,
+                retained_scheduler_scope,
+                automation_scheduler_config_sha256,
+            )
+        },
     );
     let (db, ()) = match opened {
         Ok(value) => value,
@@ -1829,6 +2175,10 @@ fn initialize_database(
     is_new: bool,
     credential: &Credential,
     module_supervisor_credential: &Credential,
+    config: &Config,
+    automation_scheduler_credential: Option<&Credential>,
+    retained_scheduler_scope: Option<&swarm_contracts::DeclaredServiceScope>,
+    automation_scheduler_config_sha256: Option<&str>,
 ) -> Result<()> {
     if is_new {
         set_meta(tx, "controller_id", &json!(model::new_id()))?;
@@ -2009,6 +2359,26 @@ fn initialize_database(
             ));
         }
     }
+    if config.automation_scheduler.enabled {
+        let service_credential = automation_scheduler_credential.ok_or_else(|| {
+            Error::new(
+                "AUTOMATION_SERVICE_IDENTITY_INVALID",
+                "enabled scheduler has no host-issued Module credential",
+            )
+        })?;
+        let config_sha256 = automation_scheduler_config_sha256.ok_or_else(|| {
+            Error::new(
+                "AUTOMATION_SERVICE_CONFIG_INVALID",
+                "enabled scheduler has no canonical config digest",
+            )
+        })?;
+        automation_scheduler::provision(
+            tx,
+            service_credential,
+            retained_scheduler_scope,
+            config_sha256,
+        )?;
+    }
     let epoch = meta(tx, "host_epoch")?
         .and_then(|v| v.as_i64())
         .unwrap_or(0)
@@ -2166,6 +2536,7 @@ fn participant_method_allowed(method: &str) -> bool {
         || matches!(
             method,
             "mcp.authorization"
+                | "task.submit"
                 | "review.submit"
                 | "review.get"
                 | "review.list"
@@ -2211,7 +2582,7 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
     :operator = 1
     OR (
         op.method NOT IN ('message.send', 'message.cancel', 'coordination.send',
-            'task.request_changes', 'check.run', 'check.cancel')
+            'task.request_changes', 'check.run', 'check.cancel', 'event.emit')
         AND op.method NOT LIKE 'coordination.%'
         AND op.method NOT LIKE 'review.%'
         AND op.method NOT LIKE 'automation.%'
@@ -3308,7 +3679,12 @@ fn mcp_authorization(db: &Connection, p: &Principal, value: &Value) -> Result<Va
                             ))
                             || model::PARTICIPANT_MUTATION_METHODS.contains(method)
                     }));
-                    if registration["participation_basis"]["kind"] == "sponsored_reviewer" {
+                    if matches!(
+                        registration["participation_basis"]["kind"].as_str(),
+                        Some("attempt_owner" | "producer_ref")
+                    ) {
+                        allowed.extend(["task.submit", "artifact.read"]);
+                    } else if registration["participation_basis"]["kind"] == "sponsored_reviewer" {
                         allowed.extend([
                             "review.submit",
                             "review.get",
@@ -4352,7 +4728,9 @@ fn mutate_in_transaction_with_authority(
             // The admitted operation now holds (or releases) native
             // capacity; record that in the durable ledger (R23).
             capacity::sync_operation(tx, &id, now)?;
-            tx.execute("INSERT INTO observations(source_stream_id,source_event_key,operation_id,kind,payload_json,recorded_at_ms) VALUES('controller',?1,?1,?2,?3,?4)",params![id,method,model::canonical(value)?,now])?;
+            if method != "event.emit" {
+                tx.execute("INSERT INTO observations(source_stream_id,source_event_key,operation_id,kind,payload_json,recorded_at_ms) VALUES('controller',?1,?1,?2,?3,?4)",params![id,method,model::canonical(value)?,now])?;
+            }
             record_safe_system_events(tx, method, &id, value, *queued, now)?;
             json!({"ok":true,"value":value})
         }
@@ -4910,6 +5288,265 @@ fn apply_goal_progression(
     Ok((result, true))
 }
 
+fn operation_project_id(tx: &Connection, operation_id: &str) -> Result<Option<String>> {
+    let row: Option<(Option<String>, Option<String>, String, String)> = tx
+        .query_row(
+            "SELECT task_id,attempt_id,original_request_json,effective_request_json \
+             FROM operations WHERE operation_id=?1",
+            [operation_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((task_id, attempt_id, original_json, effective_json)) = row else {
+        return Ok(None);
+    };
+    if let Some(task_id) = task_id {
+        return tx
+            .query_row(
+                "SELECT project_id FROM tasks WHERE task_id=?1",
+                [task_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into);
+    }
+    if let Some(attempt_id) = attempt_id {
+        let task_id: Option<String> = tx
+            .query_row(
+                "SELECT task_id FROM attempts WHERE attempt_id=?1",
+                [attempt_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(task_id) = task_id {
+            return tx
+                .query_row(
+                    "SELECT project_id FROM tasks WHERE task_id=?1",
+                    [task_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(Into::into);
+        }
+    }
+    for encoded in [effective_json, original_json] {
+        let value: Value = serde_json::from_str(&encoded).map_err(|_| {
+            Error::new(
+                "EVENT_CAUSE_INVALID",
+                "cause Operation authority record is malformed",
+            )
+        })?;
+        for candidate in [&value["event_emit"]["project_id"], &value["project_id"]] {
+            if let Some(project_id) = candidate.as_str() {
+                return Ok(Some(project_id.to_owned()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn validate_manager_event_cause(
+    tx: &Connection,
+    principal: &Principal,
+    project_id: &str,
+    cause: &Value,
+) -> Result<()> {
+    let Some(cause) = cause.as_object() else {
+        return Ok(());
+    };
+    let operation_id = cause
+        .get("operation_id")
+        .filter(|value| !value.is_null())
+        .and_then(Value::as_str);
+    let observation_id = cause
+        .get("observation_id")
+        .filter(|value| !value.is_null())
+        .and_then(Value::as_i64);
+    if operation_id.is_none() && observation_id.is_none() {
+        return Err(Error::new(
+            "EVENT_CAUSE_INVALID",
+            "cause must retain an existing operation_id or observation_id",
+        ));
+    }
+    let observed_operation_id: Option<String> = if let Some(observation_id) = observation_id {
+        tx.query_row(
+            "SELECT operation_id FROM observations WHERE observation_id=?1",
+            [observation_id],
+            |row| row.get(0),
+        )
+        .optional()?
+    } else {
+        None
+    };
+    if observation_id.is_some() && observed_operation_id.is_none() {
+        return Err(Error::new(
+            "EVENT_CAUSE_INVALID",
+            "cause observation is missing or is not linked to an Operation",
+        ));
+    }
+    if let (Some(operation_id), Some(observed_operation_id)) =
+        (operation_id, observed_operation_id.as_deref())
+        && operation_id != observed_operation_id
+    {
+        return Err(Error::new(
+            "EVENT_CAUSE_INVALID",
+            "cause operation_id does not match its observation",
+        ));
+    }
+    let operation_id = operation_id
+        .or(observed_operation_id.as_deref())
+        .ok_or_else(|| Error::new("EVENT_CAUSE_INVALID", "cause Operation is unavailable"))?;
+    if !operation_visible_to(tx, principal, operation_id)? {
+        return Err(Error::new(
+            "EVENT_CAUSE_UNAUTHORIZED",
+            "cause Operation is outside the current Manager's visibility",
+        ));
+    }
+    let caller_id: String = tx.query_row(
+        "SELECT caller_id FROM operations WHERE operation_id=?1",
+        [operation_id],
+        |row| row.get(0),
+    )?;
+    if caller_id != principal.client_id {
+        return Err(Error::new(
+            "EVENT_CAUSE_UNAUTHORIZED",
+            "cause Operation is not owned by the current Manager",
+        ));
+    }
+    if operation_project_id(tx, operation_id)?.as_deref() != Some(project_id) {
+        return Err(Error::new(
+            "EVENT_CAUSE_SCOPE_MISMATCH",
+            "cause Operation is outside the emitted event project",
+        ));
+    }
+    Ok(())
+}
+
+fn emit_manager_event(
+    tx: &Transaction<'_>,
+    principal: &Principal,
+    value: &Value,
+    operation_id: &str,
+    now_ms: i64,
+) -> Result<Value> {
+    if principal.role != Role::Manager {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "event.emit is owned by an authenticated Manager",
+        ));
+    }
+    let project_id = model::text(value, "project_id")?;
+    let name = model::text(value, "name")?;
+    let dedupe_key = model::text(value, "dedupe_key")?;
+    let payload = value
+        .get("payload")
+        .filter(|payload| !payload.is_null())
+        .ok_or_else(|| Error::invalid("event payload must be non-null"))?;
+    let cause = value.get("cause").cloned().unwrap_or(Value::Null);
+    validate_manager_event_cause(tx, principal, project_id, &cause)?;
+    let identity = json!({
+        "owner_manager_id":principal.client_id.clone(),
+        "project_id":project_id,
+        "name":name,
+        "dedupe_key":dedupe_key,
+    });
+    let source_event_key = format!(
+        "emit:{}",
+        model::digest(model::canonical(&identity)?.as_bytes())
+    );
+    let payload_digest = model::digest(model::canonical(payload)?.as_bytes());
+    let scope = json!({
+        "schema_version":1,
+        "source_stream_id":MANAGER_EVENT_SOURCE_STREAM,
+        "source_event_key":source_event_key.clone(),
+        "owner_manager_id":principal.client_id.clone(),
+        "project_id":project_id.to_owned(),
+        "name":name.to_owned(),
+        "dedupe_key":dedupe_key.to_owned(),
+        "payload_digest":payload_digest.clone(),
+    });
+    tx.execute(
+        "UPDATE operations SET effective_request_json=json_set(effective_request_json,'$.event_emit',json(?2)) WHERE operation_id=?1",
+        params![operation_id, model::canonical(&scope)?],
+    )?;
+    let event_payload = json!({
+        "schema_version":1,
+        "source_stream_id":MANAGER_EVENT_SOURCE_STREAM,
+        "source_event_key":source_event_key.clone(),
+        "owner_manager_id":principal.client_id.clone(),
+        "project_id":project_id.to_owned(),
+        "name":name.to_owned(),
+        "dedupe_key":dedupe_key.to_owned(),
+        "payload":payload.clone(),
+        "cause":cause.clone(),
+    });
+    let encoded = model::canonical(&event_payload)?;
+    if encoded.len()
+        > model::MAX_MANAGER_EVENT_PAYLOAD_BYTES
+            + model::MAX_MANAGER_EVENT_CAUSE_BYTES
+            + 2048
+    {
+        return Err(Error::invalid("manager event exceeds its storage bound"));
+    }
+    let existing: Option<(i64, Option<String>, String)> = tx
+        .query_row(
+            "SELECT observation_id,operation_id,payload_json FROM observations \
+             WHERE source_stream_id=?1 AND source_event_key=?2",
+            params![MANAGER_EVENT_SOURCE_STREAM, &source_event_key],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    if let Some((observation_id, existing_operation_id, old_payload)) = existing {
+        if old_payload != encoded {
+            return Err(Error::new(
+                "EVENT_DEDUPE_CONFLICT",
+                "event dedupe identity already has different immutable content",
+            ));
+        }
+        let existing_operation_id = existing_operation_id.ok_or_else(|| {
+            Error::new(
+                "EVENT_LEDGER_CORRUPT",
+                "manager event observation has no linked Operation",
+            )
+        })?;
+        return Ok(json!({
+            "operation_id":existing_operation_id,
+            "observation_id":observation_id,
+            "source_id":MANAGER_EVENT_SOURCE_STREAM,
+            "source_event_key":source_event_key,
+            "event_kind":name,
+            "project_id":project_id,
+            "dedupe_key":dedupe_key,
+            "duplicate":true,
+            "recorded_at_ms":now_ms,
+        }));
+    }
+    tx.execute(
+        "INSERT INTO observations(source_stream_id,source_event_key,operation_id,kind,payload_json,recorded_at_ms) \
+         VALUES(?1,?2,?3,?4,?5,?6)",
+        params![
+            MANAGER_EVENT_SOURCE_STREAM,
+            &source_event_key,
+            operation_id,
+            name,
+            encoded,
+            now_ms,
+        ],
+    )?;
+    let observation_id = tx.last_insert_rowid();
+    Ok(json!({
+        "operation_id":operation_id,
+        "observation_id":observation_id,
+        "source_id":MANAGER_EVENT_SOURCE_STREAM,
+        "source_event_key":source_event_key,
+        "event_kind":name,
+        "project_id":project_id,
+        "dedupe_key":dedupe_key,
+        "duplicate":false,
+        "recorded_at_ms":now_ms,
+    }))
+}
+
 fn apply(
     tx: &Transaction<'_>,
     p: &Principal,
@@ -4994,6 +5631,7 @@ fn apply(
         "automation.config.apply" => {
             automation::apply(tx, p, v, id, config, now).map(|value| (value, false))
         }
+        "event.emit" => emit_manager_event(tx, p, v, id, now).map(|value| (value, false)),
         "automation.config.transfer" => {
             automation_transfer::apply(tx, p, v, id, now).map(|value| (value, false))
         }
@@ -5082,10 +5720,11 @@ fn apply(
             }
             if role == Role::ModuleSupervisor
                 || client == model::INTERNAL_MODULE_SUPERVISOR_CLIENT_ID
+                || client == automation_scheduler::SERVICE_ID
             {
                 return Err(Error::new(
                     "FORBIDDEN",
-                    "module supervisor identity is reserved for the local host",
+                    "reserved host Module identities cannot be registered by a caller",
                 ));
             }
             if role == Role::Scheduler || client == model::INTERNAL_SCHEDULER_CLIENT_ID {

@@ -13,4 +13,7 @@ pub use credential::Credential;
 pub use declared_service_scope::{DeclaredServicePurpose, DeclaredServiceScope};
 pub use error::{Error, NativeRpcRejectionClass, Result};
 pub use rpc::Request;
-pub use runtime::{EffectOutcome, RuntimeCommand, RuntimeOutcome};
+pub use runtime::{
+    EffectOutcome, ModuleReceiptIdentity, RuntimeCommand, RuntimeOutcome,
+    TaskDispatchAdmissionReceipt, TaskDispatchContext,
+};

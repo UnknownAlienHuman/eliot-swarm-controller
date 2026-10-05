@@ -33,7 +33,22 @@ pub(crate) struct ManagedBusServiceDemand {
     /// The token hash is never returned to IPC or Manager status.
     pub credential_token_sha256: String,
     pub worker_config_sha256: String,
+    pub owner_state: ManagedBusOwnerState,
+    pub owner_receipt_sha256: Option<String>,
     pub state: DemandState,
+}
+
+/// Durable distinction between a never-started registration, a start whose
+/// process outcome is not yet known, and a host-verified owner readback.
+/// This state is intentionally independent of the Manager-facing health text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ManagedBusOwnerState {
+    NeverStarted,
+    LaunchUncertain,
+    Live,
+    Departed,
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -105,6 +120,27 @@ pub(crate) fn managed_demands(db: &Connection) -> Result<Vec<ManagedBusServiceDe
         let Some(disabled) = registration.get("disabled").and_then(Value::as_bool) else {
             continue;
         };
+        let health = registration.get("managed_bus_service_health");
+        let owner_state = parse_owner_state(health);
+        let owner_receipt_sha256 = health
+            .and_then(|value| value.get("owner_receipt_sha256"))
+            .and_then(Value::as_str)
+            .filter(|value| is_sha256(value))
+            .map(str::to_ascii_lowercase);
+        let owner_state = if health
+            .and_then(|value| value.get("owner_receipt_sha256"))
+            .is_some_and(|value| !value.is_null() && owner_receipt_sha256.is_none())
+            || (owner_receipt_sha256.is_some()
+                && !matches!(
+                    owner_state,
+                    ManagedBusOwnerState::Live | ManagedBusOwnerState::Unknown
+                ))
+            || (matches!(owner_state, ManagedBusOwnerState::Live) && owner_receipt_sha256.is_none())
+        {
+            ManagedBusOwnerState::Unknown
+        } else {
+            owner_state
+        };
         let state = if disabled {
             DemandState::Disabled
         } else {
@@ -148,6 +184,8 @@ pub(crate) fn managed_demands(db: &Connection) -> Result<Vec<ManagedBusServiceDe
             scope_digest: binding.scope_digest().to_owned(),
             credential_token_sha256: token_hash.to_ascii_lowercase(),
             worker_config_sha256,
+            owner_state,
+            owner_receipt_sha256,
             state,
         });
     }
@@ -197,6 +235,12 @@ pub(crate) fn record_health(
         .and_then(|health| health.get("start_attempts_ms"))
         .cloned()
         .unwrap_or_else(|| json!([]));
+    let previous_health = registration.get("managed_bus_service_health");
+    let owner_state = owner_state_json(previous_health);
+    let owner_receipt_sha256 = previous_health
+        .and_then(|health| health.get("owner_receipt_sha256"))
+        .cloned()
+        .unwrap_or(Value::Null);
     registration["managed_bus_service_health"] = json!({
         "schema_version":HEALTH_VERSION,
         "state":state,
@@ -205,6 +249,8 @@ pub(crate) fn record_health(
         "retry_after_ms":retry_in_ms.map(|delay| now_ms.saturating_add(i64::try_from(delay).unwrap_or(i64::MAX))),
         "updated_at_ms":now_ms,
         "start_attempts_ms":start_attempts_ms,
+        "owner_state":owner_state,
+        "owner_receipt_sha256":owner_receipt_sha256,
     });
     set_meta(tx, &key, &registration)
 }
@@ -285,6 +331,16 @@ pub(crate) fn record_start(
         .get("managed_bus_service_health")
         .cloned()
         .unwrap_or_else(|| json!({"schema_version":HEALTH_VERSION}));
+    let owner_state = parse_owner_state(Some(&health));
+    if !matches!(
+        owner_state,
+        ManagedBusOwnerState::NeverStarted | ManagedBusOwnerState::Departed
+    ) {
+        return Err(Error::new(
+            "BUS_SERVICE_OWNER_UNKNOWN",
+            "managed service owner has not been proven departed",
+        ));
+    }
     let mut starts = health
         .get("start_attempts_ms")
         .and_then(Value::as_array)
@@ -330,6 +386,8 @@ pub(crate) fn record_start(
     }
     retained.push(json!(now_ms));
     health["start_attempts_ms"] = json!(retained);
+    health["owner_state"] = json!("launch_uncertain");
+    health["owner_receipt_sha256"] = Value::Null;
     health["updated_at_ms"] = json!(now_ms);
     if health["schema_version"].as_u64().is_none() {
         health["schema_version"] = json!(HEALTH_VERSION);
@@ -378,11 +436,16 @@ pub(crate) fn reset_for_host_start(tx: &Transaction<'_>, now_ms: i64) -> Result<
         if binding.validate(client_id).is_err() {
             continue;
         }
-        let starts = registration
-            .get("managed_bus_service_health")
+        let previous_health = registration.get("managed_bus_service_health");
+        let starts = previous_health
             .and_then(|health| health.get("start_attempts_ms"))
             .cloned()
             .unwrap_or_else(|| json!([]));
+        let owner_state = owner_state_json(previous_health);
+        let owner_receipt_sha256 = previous_health
+            .and_then(|health| health.get("owner_receipt_sha256"))
+            .cloned()
+            .unwrap_or(Value::Null);
         registration["managed_bus_service_health"] = json!({
             "schema_version":HEALTH_VERSION,
             "state":"unknown",
@@ -391,10 +454,141 @@ pub(crate) fn reset_for_host_start(tx: &Transaction<'_>, now_ms: i64) -> Result<
             "retry_after_ms":Value::Null,
             "updated_at_ms":now_ms,
             "start_attempts_ms":starts,
+            "owner_state":owner_state,
+            "owner_receipt_sha256":owner_receipt_sha256,
         });
         set_meta(tx, &key, &registration)?;
     }
     Ok(())
+}
+
+/// Persist a host-only process-family readback. The Store does not interpret
+/// this as cursor progress or permission to replay a bus action.
+pub(crate) fn record_owner_readback(
+    tx: &Transaction<'_>,
+    scope: &DeclaredServiceScope,
+    state: ManagedBusOwnerState,
+    receipt_sha256: Option<&str>,
+    now_ms: i64,
+) -> Result<()> {
+    scope.validate()?;
+    if now_ms < 0
+        || receipt_sha256.is_some_and(|digest| !is_sha256(digest))
+        || (matches!(state, ManagedBusOwnerState::Live) && receipt_sha256.is_none())
+        || (matches!(
+            state,
+            ManagedBusOwnerState::Departed | ManagedBusOwnerState::NeverStarted
+        ) && receipt_sha256.is_some())
+    {
+        return Err(Error::new(
+            "BUS_SERVICE_OWNER_READBACK_INVALID",
+            "managed service owner readback is invalid",
+        ));
+    }
+    let key = format!("client:{}", scope.service_id);
+    let mut registration = meta(tx, &key)?
+        .ok_or_else(|| Error::new("BUS_SERVICE_SCOPE_STALE", "managed bus scope was removed"))?;
+    let binding: super::ScriptRunConsumerBinding =
+        serde_json::from_value(registration.get("bus_consumer").cloned().ok_or_else(|| {
+            Error::new("BUS_SERVICE_SCOPE_STALE", "managed bus scope was removed")
+        })?)
+        .map_err(|_| Error::new("BUS_CONSUMER_REGISTRATION_CORRUPT", "invalid bus scope"))?;
+    binding.validate(&scope.service_id)?;
+    if !binding.managed_service() || &binding.service_scope()? != scope {
+        return Err(Error::new(
+            "BUS_SERVICE_SCOPE_STALE",
+            "consumer is not enrolled for this managed service generation",
+        ));
+    }
+    let mut health = registration
+        .get("managed_bus_service_health")
+        .cloned()
+        .unwrap_or_else(|| json!({"schema_version":HEALTH_VERSION}));
+    if !health.is_object() {
+        return Err(Error::new(
+            "BUS_SERVICE_HEALTH_CORRUPT",
+            "managed service health record is invalid",
+        ));
+    }
+    let previous = parse_owner_state(Some(&health));
+    let previous_digest = health
+        .get("owner_receipt_sha256")
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase);
+    let transition_allowed = match state {
+        ManagedBusOwnerState::Live => matches!(
+            previous,
+            ManagedBusOwnerState::LaunchUncertain
+                | ManagedBusOwnerState::Live
+                | ManagedBusOwnerState::Unknown
+        ),
+        ManagedBusOwnerState::Departed => {
+            matches!(
+                previous,
+                ManagedBusOwnerState::LaunchUncertain
+                    | ManagedBusOwnerState::Live
+                    | ManagedBusOwnerState::Unknown
+            ) || (matches!(previous, ManagedBusOwnerState::Departed) && receipt_sha256.is_none())
+        }
+        ManagedBusOwnerState::Unknown => !matches!(
+            previous,
+            ManagedBusOwnerState::NeverStarted | ManagedBusOwnerState::Departed
+        ),
+        ManagedBusOwnerState::NeverStarted | ManagedBusOwnerState::LaunchUncertain => false,
+    };
+    if !transition_allowed
+        || (matches!(previous, ManagedBusOwnerState::Live)
+            && matches!(state, ManagedBusOwnerState::Live)
+            && previous_digest.as_deref() != receipt_sha256)
+    {
+        return Err(Error::new(
+            "BUS_SERVICE_OWNER_READBACK_STALE",
+            "owner readback conflicts with the retained service incarnation",
+        ));
+    }
+    health["schema_version"] = json!(HEALTH_VERSION);
+    health["owner_state"] = json!(state);
+    health["owner_receipt_sha256"] = receipt_sha256
+        .map(|digest| json!(digest.to_ascii_lowercase()))
+        .unwrap_or(Value::Null);
+    health["updated_at_ms"] = json!(now_ms);
+    registration["managed_bus_service_health"] = health;
+    set_meta(tx, &key, &registration)
+}
+
+fn parse_owner_state(health: Option<&Value>) -> ManagedBusOwnerState {
+    match health
+        .and_then(|value| value.get("owner_state"))
+        .and_then(Value::as_str)
+    {
+        Some("never_started") => ManagedBusOwnerState::NeverStarted,
+        Some("launch_uncertain") => ManagedBusOwnerState::LaunchUncertain,
+        Some("live") => ManagedBusOwnerState::Live,
+        Some("departed") => ManagedBusOwnerState::Departed,
+        Some("unknown") => ManagedBusOwnerState::Unknown,
+        Some(_) => ManagedBusOwnerState::Unknown,
+        None => {
+            let has_attempts = health
+                .and_then(|value| value.get("start_attempts_ms"))
+                .and_then(Value::as_array)
+                .is_some_and(|attempts| !attempts.is_empty());
+            if has_attempts {
+                ManagedBusOwnerState::Unknown
+            } else {
+                ManagedBusOwnerState::NeverStarted
+            }
+        }
+    }
+}
+
+fn owner_state_json(health: Option<&Value>) -> Value {
+    match parse_owner_state(health) {
+        ManagedBusOwnerState::NeverStarted => json!("never_started"),
+        ManagedBusOwnerState::LaunchUncertain => json!("launch_uncertain"),
+        ManagedBusOwnerState::Live => json!("live"),
+        ManagedBusOwnerState::Departed => json!("departed"),
+        ManagedBusOwnerState::Unknown => json!("unknown"),
+    }
 }
 
 /// Manager-readable host.status projection. It never exposes Manager IDs,
@@ -479,6 +673,9 @@ pub(crate) fn health_projection(db: &Connection) -> Result<Value> {
             continue;
         };
         let state = health["state"].as_str();
+        let owner_state_field_present = health.get("owner_state").is_some();
+        let owner_state = health.get("owner_state").and_then(Value::as_str);
+        let owner_receipt_sha256 = health.get("owner_receipt_sha256").and_then(Value::as_str);
         let failures = health["consecutive_failures"].as_u64();
         let updated_at_ms = health["updated_at_ms"].as_i64();
         let retry_after_ms = health["retry_after_ms"].as_i64();
@@ -486,6 +683,24 @@ pub(crate) fn health_projection(db: &Connection) -> Result<Value> {
             .as_str()
             .filter(|value| safe_error_code(value));
         if health["schema_version"] != HEALTH_VERSION
+            || !(owner_state.is_none()
+                || matches!(
+                    owner_state,
+                    Some("never_started" | "launch_uncertain" | "live" | "departed" | "unknown")
+                ))
+            || (owner_state_field_present && owner_state.is_none())
+            || !(health
+                .get("owner_receipt_sha256")
+                .is_none_or(Value::is_null)
+                || owner_receipt_sha256.is_some_and(is_sha256))
+            || (owner_state == Some("live")
+                && owner_receipt_sha256.is_none_or(|value| !is_sha256(value)))
+            || (owner_state.is_none() && owner_receipt_sha256.is_some())
+            || (owner_receipt_sha256.is_some()
+                && matches!(
+                    owner_state,
+                    Some("never_started" | "launch_uncertain" | "departed")
+                ))
             || !matches!(
                 state,
                 Some(
@@ -516,6 +731,7 @@ pub(crate) fn health_projection(db: &Connection) -> Result<Value> {
         output.push(json!({
             "service_key":service_key,
             "state":health["state"],
+            "owner_state":owner_state_json(Some(health)),
             "consecutive_failures":health["consecutive_failures"],
             "last_error_code":health["error_code"],
             "retry_after_ms":health["retry_after_ms"],

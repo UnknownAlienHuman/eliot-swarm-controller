@@ -16,6 +16,8 @@ use std::collections::BTreeSet;
 pub const MODULE_PROTOCOL_V1: ProtocolVersion = ProtocolVersion { major: 1, minor: 0 };
 pub const RUNTIME_COMMAND_SCHEMA_ID: &str = "swarm.runtime_command";
 pub const RUNTIME_OUTCOME_SCHEMA_ID: &str = "swarm.runtime_outcome";
+pub const TASK_DISPATCH_CONTEXT_SCHEMA_ID: &str = "swarm.task_dispatch_context";
+pub const TASK_DISPATCH_ADMISSION_SCHEMA_ID: &str = "swarm.task_dispatch_admission";
 pub const RUNTIME_SCHEMA_VERSION: &str = "1";
 
 pub fn runtime_command_schema() -> SchemaDescriptor {
@@ -29,6 +31,26 @@ pub fn runtime_command_schema() -> SchemaDescriptor {
 pub fn runtime_outcome_schema() -> SchemaDescriptor {
     SchemaDescriptor {
         schema_id: RUNTIME_OUTCOME_SCHEMA_ID.to_owned(),
+        version: RUNTIME_SCHEMA_VERSION.to_owned(),
+        sha256: None,
+    }
+}
+
+/// Descriptor declaration for the Store-enriched, immutable task-dispatch
+/// context supplied to an adapter that implements normalized admission.
+pub fn task_dispatch_context_schema() -> SchemaDescriptor {
+    SchemaDescriptor {
+        schema_id: TASK_DISPATCH_CONTEXT_SCHEMA_ID.to_owned(),
+        version: RUNTIME_SCHEMA_VERSION.to_owned(),
+        sha256: None,
+    }
+}
+
+/// Descriptor declaration for the typed normalized dispatch receipt returned
+/// by an adapter that implements `task_dispatch_context_schema`.
+pub fn task_dispatch_admission_schema() -> SchemaDescriptor {
+    SchemaDescriptor {
+        schema_id: TASK_DISPATCH_ADMISSION_SCHEMA_ID.to_owned(),
         version: RUNTIME_SCHEMA_VERSION.to_owned(),
         sha256: None,
     }

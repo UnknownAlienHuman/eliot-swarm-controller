@@ -17,6 +17,7 @@ use crate::{
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use swarm_kernel::reviews as review_contract;
 
 const STATE_SCHEMA_VERSION: u32 = 1;
 const GLOBAL_CURSOR_KEY: &str = "automation:v1:review-disposition:global-cursor";
@@ -572,17 +573,13 @@ fn event_identity(event: &ReviewResultEvent) -> Result<(String, String)> {
             "canonical review result payload is invalid JSON",
         )
     })?;
-    if record["schema_version"] != 1
-        || record["review_assignment_id"] != assignment_id
-        || record["operation_id"] != result_operation_id
-        || record["result"]["review_assignment_id"] != assignment_id
-        || record["result"]["operation_id"] != result_operation_id
-    {
-        return Err(Error::new(
-            "REVIEW_DISPOSITION_EVENT_DAMAGED",
-            "canonical review result event identity differs from its retained payload",
-        ));
-    }
+    review_contract::validate_result_event(&record, assignment_id, result_operation_id)
+        .map_err(|_| {
+            Error::new(
+                "REVIEW_DISPOSITION_EVENT_DAMAGED",
+                "canonical review result event identity differs from its retained payload",
+            )
+        })?;
     Ok((assignment_id.to_owned(), result_operation_id.to_owned()))
 }
 

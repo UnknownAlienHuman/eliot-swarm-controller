@@ -10,7 +10,7 @@ pub use module_runtime::OwnedBootstrap;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use journal::{Journal, OperationIntent, ResultInputStatusIntent, digest_json};
-use native::{InputEvidence, NativeClient, input_id, intent_for, root_id};
+use native::{InputEvidence, NativeClient, input_id, input_payload, intent_for, root_id};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{sync::Mutex, time::Duration};
@@ -18,7 +18,10 @@ use swarm_contracts::{
     Credential,
     error::{Error, Result},
     module_contract::ModuleContractClaim,
-    runtime::{EffectOutcome, RuntimeCommand, RuntimeOutcome},
+    runtime::{
+        EffectOutcome, RuntimeCommand, RuntimeOutcome, TaskDispatchAdmissionReceipt,
+        TaskDispatchContext,
+    },
 };
 use tokio::time::sleep;
 
@@ -31,6 +34,7 @@ struct HostSession<'a> {
     credential: &'a Credential,
     journal: &'a Journal,
     claim: &'a ModuleContractClaim,
+    boot_id: String,
     hello_base: Value,
     root_hint: Mutex<Option<String>>,
 }
@@ -78,6 +82,7 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
         credential: &credential,
         journal: &journal,
         claim: &contract,
+        boot_id: boot_id.clone(),
         hello_base,
         root_hint: Mutex::new(root_hint),
     };
@@ -165,6 +170,7 @@ async fn handle_command(host: &HostSession<'_>, command: &RuntimeCommand) -> Res
         ));
     }
     if let Some(saved) = history.outcome.as_ref() {
+        validate_saved_dispatch_outcome(host, command, &history, saved)?;
         let digest = digest_json(saved)?;
         if history.acknowledged_sha256.as_deref() == Some(digest.as_str()) {
             return Ok(());
@@ -569,6 +575,158 @@ async fn handle_open(
     flush_outbox(host).await
 }
 
+fn sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn normalized_dispatch_admission(
+    host: &HostSession<'_>,
+    command: &RuntimeCommand,
+    intent: &OperationIntent,
+    input_id: &str,
+    prompt_text: &str,
+) -> Result<Option<TaskDispatchAdmissionReceipt>> {
+    if command.method != "task.dispatch"
+        || !module_runtime::normalized_dispatch_enabled(host.claim)
+    {
+        return Ok(None);
+    }
+    let context: TaskDispatchContext = serde_json::from_value(
+        command.input["task_dispatch_context"].clone(),
+    )
+    .map_err(|_| Error::new("TASK_DISPATCH_CONTEXT_INVALID", "dispatch context is malformed"))?;
+    context
+        .validate()
+        .map_err(|_| Error::new("TASK_DISPATCH_CONTEXT_INVALID", "dispatch context is invalid"))?;
+    if context.operation_id != command.operation_id
+        || context.binding_id != command.binding_id
+        || context.binding_generation != command.generation
+        || context.worker_boot_id != host.boot_id
+    {
+        return Err(Error::new(
+            "TASK_DISPATCH_CONTEXT_INVALID",
+            "dispatch context does not match this operation, binding, or boot",
+        ));
+    }
+    let source_text = command.input["text"]
+        .as_str()
+        .filter(|text| !text.trim().is_empty())
+        .ok_or_else(|| Error::new("TASK_DISPATCH_CONTEXT_INVALID", "source text is missing"))?;
+    let source_text_sha256 = sha256(source_text.as_bytes());
+    if context.source_text_sha256 != source_text_sha256
+        || context.source_text_bytes != source_text.len() as u64
+    {
+        return Err(Error::new(
+            "TASK_DISPATCH_CONTEXT_INVALID",
+            "dispatch context source identity differs from the command",
+        ));
+    }
+    if intent.module_receipt.operation_id != command.operation_id
+        || intent.native_input_id.as_deref() != Some(input_id)
+    {
+        return Err(Error::new(
+            "ADAPTER_INTENT_MISMATCH",
+            "native input identity differs from the durable module intent",
+        ));
+    }
+    let payload = input_payload(command, input_id, prompt_text);
+    let payload_bytes = serde_json::to_vec(&payload)?;
+    let receipt = TaskDispatchAdmissionReceipt {
+        schema_version: 1,
+        module_receipt: intent.module_receipt.clone(),
+        operation_id: context.operation_id,
+        binding_id: context.binding_id,
+        binding_generation: context.binding_generation,
+        worker_boot_id: context.worker_boot_id,
+        attempt_id: context.attempt_id,
+        task_id: context.task_id,
+        task_revision: context.task_revision,
+        task_snapshot_sha256: context.task_snapshot_sha256,
+        source_text_sha256: context.source_text_sha256,
+        source_text_bytes: context.source_text_bytes,
+        native_payload_sha256: sha256(&payload_bytes),
+        native_payload_bytes: payload_bytes.len() as u64,
+        native_input_id: Some(input_id.to_owned()),
+    };
+    receipt
+        .validate()
+        .map_err(|_| Error::new("TASK_DISPATCH_CONTEXT_INVALID", "dispatch admission is invalid"))?;
+    Ok(Some(receipt))
+}
+
+fn validate_saved_dispatch_outcome(
+    host: &HostSession<'_>,
+    command: &RuntimeCommand,
+    history: &journal::OperationHistory,
+    saved: &Value,
+) -> Result<()> {
+    if command.method != "task.dispatch"
+        || !module_runtime::normalized_dispatch_enabled(host.claim)
+    {
+        return Ok(());
+    }
+    let outcome: RuntimeOutcome = serde_json::from_value(saved.clone()).map_err(|_| {
+        Error::new(
+            "ADAPTER_JOURNAL",
+            "saved outcome does not match the shared runtime outcome",
+        )
+    })?;
+    let admission = saved["details"]["dispatch_admission"].clone();
+    match outcome.outcome {
+        EffectOutcome::Applied | EffectOutcome::Accepted => {
+            let receipt: TaskDispatchAdmissionReceipt =
+                serde_json::from_value(admission).map_err(|_| {
+                    Error::new(
+                        "ADAPTER_INTENT_MISMATCH",
+                        "known dispatch outcome lacks a typed admission receipt",
+                    )
+                })?;
+            receipt.validate().map_err(|_| {
+                Error::new(
+                    "ADAPTER_INTENT_MISMATCH",
+                    "saved dispatch admission receipt is invalid",
+                )
+            })?;
+            let context = receipt.context();
+            let source_text = command.input["text"].as_str().ok_or_else(|| {
+                Error::new(
+                    "ADAPTER_INTENT_MISMATCH",
+                    "dispatch source text is missing while validating saved receipt",
+                )
+            })?;
+            let expected = module_receipt::for_command(host.claim, command)?;
+            if receipt.module_receipt != expected
+                || context.operation_id != command.operation_id
+                || context.binding_id != command.binding_id
+                || context.binding_generation != command.generation
+                || context.worker_boot_id != host.boot_id
+                || context.source_text_sha256 != sha256(source_text.as_bytes())
+                || context.source_text_bytes != source_text.len() as u64
+                || receipt.native_input_id.as_deref() != outcome.native_input_id.as_deref()
+                || history
+                    .intent
+                    .as_ref()
+                    .and_then(|intent| intent.dispatch_admission.as_ref())
+                    .is_none_or(|saved| saved != &receipt)
+            {
+                return Err(Error::new(
+                    "ADAPTER_INTENT_MISMATCH",
+                    "saved dispatch outcome differs from its durable admission intent",
+                ));
+            }
+        }
+        EffectOutcome::Rejected | EffectOutcome::Unknown => {
+            if !saved["details"]["dispatch_admission"].is_null() {
+                return Err(Error::new(
+                    "ADAPTER_INTENT_MISMATCH",
+                    "rejected or unknown dispatch outcome cannot carry admission evidence",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn handle_send(
     host: &HostSession<'_>,
     command: &RuntimeCommand,
@@ -600,12 +758,19 @@ async fn handle_send(
         }
     };
     let input = input_id(&command.operation_id);
-    let intent = intent_for(
+    let mut intent = intent_for(
         command,
         claim,
         options,
         Some(input.clone()),
         Some(&prompt_text),
+    )?;
+    intent.dispatch_admission = normalized_dispatch_admission(
+        host,
+        command,
+        &intent,
+        &input,
+        &prompt_text,
     )?;
     // Only the digest and byte count are retained; prompt text stays in this
     // stack frame and the HTTP request body.
@@ -614,14 +779,8 @@ async fn handle_send(
         .admit_input(command, root, &input, &prompt_text)
         .await
     {
-        Ok(()) => outcome(
-            command,
-            claim,
-            EffectOutcome::Applied,
-            options,
-            Some(root.into()),
-            Some(input),
-            json!({
+        Ok(()) => {
+            let mut details = json!({
                 "completion_condition":"native_input_admitted",
                 "delivery":"queue",
                 "evidence":"prompt_response",
@@ -629,8 +788,26 @@ async fn handle_send(
                 "assistant_result_correlation_reason":"assistant_message_has_no_input_parent_in_public_projection",
                 "execution_complete":false,
                 "native_replay":false
-            }),
-        )?,
+            });
+            if let Some(admission) = intent.dispatch_admission.as_ref() {
+                if admission.native_input_id.as_deref() != Some(input.as_str()) {
+                    return Err(Error::new(
+                        "ADAPTER_INTENT_MISMATCH",
+                        "native admission receipt does not match the submitted input ID",
+                    ));
+                }
+                details["dispatch_admission"] = serde_json::to_value(admission)?;
+            }
+            outcome(
+                command,
+                claim,
+                EffectOutcome::Applied,
+                options,
+                Some(root.into()),
+                Some(input),
+                details,
+            )?
+        }
         Err(error) => effect_failure(
             command,
             claim,
@@ -875,6 +1052,15 @@ fn applied_from_intent(
             "native_replay":false
         })
     };
+    if let Some(admission) = intent.dispatch_admission.as_ref() {
+        if input_id.as_deref() != admission.native_input_id.as_deref() {
+            return Err(Error::new(
+                "ADAPTER_INTENT_MISMATCH",
+                "saved native input readback differs from its dispatch admission receipt",
+            ));
+        }
+        details["dispatch_admission"] = serde_json::to_value(admission)?;
+    }
     module_receipt::insert_into_details(&mut details, &intent.module_receipt)?;
     Ok(RuntimeOutcome {
         operation_id: intent.operation_id.clone(),

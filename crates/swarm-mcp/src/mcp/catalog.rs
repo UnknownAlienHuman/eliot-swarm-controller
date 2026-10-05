@@ -204,6 +204,12 @@ const MANAGER_AUDIENCES: &[ToolAudience] = &[
     ToolAudience::GmOperator,
     ToolAudience::FullCompatibility,
 ];
+const TASK_SUBMIT_AUDIENCES: &[ToolAudience] = &[
+    ToolAudience::Participant,
+    ToolAudience::Manager,
+    ToolAudience::GmOperator,
+    ToolAudience::FullCompatibility,
+];
 const COORDINATION_READ_AUDIENCES: &[ToolAudience] = &[
     ToolAudience::Participant,
     ToolAudience::Manager,
@@ -657,10 +663,10 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
     entry!(
         "task.submit",
         TaskManagement,
-        MANAGER_AUDIENCES,
+        TASK_SUBMIT_AUDIENCES,
         Searchable,
         "Seal an immutable submission and requirement report for an attempt.",
-        "Use when an attempt owner is ready to submit a candidate and summary.",
+        "Use from the current assigned Participant or Attempt owner to submit its exact Task revision and Attempt; this does not accept the Task.",
         &["task", "submit", "submission", "candidate", "claims"],
         &[
             "attempt_id",
@@ -1627,6 +1633,23 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
         "One guarded configuration update; enabling dispatch does not start a model turn."
     ),
     entry!(
+        "event.emit",
+        Scripts,
+        MANAGER_ONLY_AUDIENCES,
+        ManualOnly,
+        "Record one bounded Manager-owned system event for an exact project.",
+        "Use when a Manager-owned producer needs to publish an arbitrary event that an exact configured ScriptRun selector may consume.",
+        &["event", "emit", "custom", "system event", "dedupe"],
+        &[
+            "project_id",
+            "name",
+            "non-null JSON payload",
+            "dedupe_key",
+            "optional existing cause"
+        ],
+        "One durable owner-scoped observation and Operation; payload is visible only through the owner's existing report/Operation reads, while bus pages expose safe headers."
+    ),
+    entry!(
         "automation.config.transfer",
         Administration,
         MANAGER_AUDIENCES,
@@ -2147,6 +2170,8 @@ const PARTICIPANT_CORE: &[&str] = &[
     "coordination.inbox",
     "coordination.watch.create",
     "swarm.overlap.check",
+    "task.submit",
+    "artifact.read",
     "operation.get",
 ];
 const NO_FULL_COMPATIBILITY_CORE: &[&str] = &[];

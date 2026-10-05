@@ -41,7 +41,7 @@ impl Fixture {
     }
 
     fn start(&self, sequence: u8) -> HostChild {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_swarm"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_swarm-host"));
         command
             .arg("--config")
             .arg(&self.config_path)

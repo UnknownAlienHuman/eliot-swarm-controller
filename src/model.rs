@@ -122,6 +122,116 @@ pub fn fields(value: &Value, allowed: &[&str]) -> Result<()> {
     Ok(())
 }
 
+pub(crate) const MAX_MANAGER_EVENT_NAME_BYTES: usize = 256;
+pub(crate) const MAX_MANAGER_EVENT_PROJECT_BYTES: usize = 128;
+pub(crate) const MAX_MANAGER_EVENT_DEDUPE_BYTES: usize = 256;
+pub(crate) const MAX_MANAGER_EVENT_PAYLOAD_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_MANAGER_EVENT_CAUSE_BYTES: usize = 4 * 1024;
+
+fn bounded_event_text<'a>(
+    value: &'a Value,
+    field: &str,
+    max_bytes: usize,
+    mut allowed: impl FnMut(u8) -> bool,
+) -> Result<&'a str> {
+    let text = text(value, field)?;
+    if text.len() > max_bytes || !text.bytes().all(allowed) {
+        return Err(Error::invalid(format!(
+            "{field} must be 1..={max_bytes} bytes with the supported event identity characters"
+        )));
+    }
+    Ok(text)
+}
+
+fn validate_manager_event_mutation(params: &Value) -> Result<()> {
+    fields(
+        params,
+        &[
+            "client_request_id",
+            "project_id",
+            "name",
+            "payload",
+            "dedupe_key",
+            "cause",
+        ],
+    )?;
+    let request_id = text(params, "client_request_id")?;
+    if request_id.len() > 128
+        || request_id
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        return Err(Error::invalid(
+            "client_request_id must be 1..=128 bytes without whitespace",
+        ));
+    }
+    bounded_event_text(
+        params,
+        "project_id",
+        MAX_MANAGER_EVENT_PROJECT_BYTES,
+        |byte| !byte.is_ascii_control() && !byte.is_ascii_whitespace(),
+    )?;
+    bounded_event_text(
+        params,
+        "name",
+        MAX_MANAGER_EVENT_NAME_BYTES,
+        |byte| byte.is_ascii_alphanumeric() || b"._:-/@".contains(&byte),
+    )?;
+    bounded_event_text(
+        params,
+        "dedupe_key",
+        MAX_MANAGER_EVENT_DEDUPE_BYTES,
+        |byte| !byte.is_ascii_control() && !byte.is_ascii_whitespace(),
+    )?;
+    let payload = params
+        .get("payload")
+        .filter(|value| !value.is_null())
+        .ok_or_else(|| Error::invalid("payload must be a non-null JSON value"))?;
+    if canonical(payload)?.len() > MAX_MANAGER_EVENT_PAYLOAD_BYTES {
+        return Err(Error::invalid("event payload exceeds its storage bound"));
+    }
+    if let Some(cause) = params.get("cause").filter(|value| !value.is_null()) {
+        if !cause.is_object() {
+            return Err(Error::invalid(
+                "cause must be an object containing an existing Operation or observation reference",
+            ));
+        }
+        fields(cause, &["operation_id", "observation_id"])?;
+        let has_operation = cause
+            .get("operation_id")
+            .is_some_and(|value| !value.is_null());
+        let has_observation = cause
+            .get("observation_id")
+            .is_some_and(|value| !value.is_null());
+        if !has_operation && !has_observation {
+            return Err(Error::invalid(
+                "cause must name an existing operation_id or observation_id",
+            ));
+        }
+        if cause
+            .get("operation_id")
+            .is_some_and(|value| !value.is_null())
+        {
+            bounded_event_text(
+                cause,
+                "operation_id",
+                128,
+                |byte| !byte.is_ascii_control() && !byte.is_ascii_whitespace(),
+            )?;
+        }
+        if cause
+            .get("observation_id")
+            .is_some_and(|value| !value.is_null())
+        {
+            positive(cause, "observation_id")?;
+        }
+        if canonical(cause)?.len() > MAX_MANAGER_EVENT_CAUSE_BYTES {
+            return Err(Error::invalid("event cause exceeds its storage bound"));
+        }
+    }
+    Ok(())
+}
+
 /// Validate the closed request shapes for the two automation configuration
 /// reads. `owner_manager_id` is an optional read selector; authorization for
 /// selecting another owner's scope remains in the Store handler.
@@ -296,63 +406,8 @@ pub struct TaskSourceIndexEntry {
 
 impl TaskSourceIndexEntry {
     pub fn validate(&self) -> Result<()> {
-        if self.source_ref.trim().is_empty() {
-            return Err(Error::invalid("source_index source_ref must be nonempty"));
-        }
-        if self
-            .revision
-            .as_ref()
-            .is_some_and(|revision| revision.trim().is_empty())
-        {
-            return Err(Error::invalid("source_index revision cannot be empty"));
-        }
-        if let Some(digest) = self.content_sha256.as_deref() {
-            if digest.len() != 64
-                || !digest
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            {
-                return Err(Error::invalid(
-                    "source_index content_sha256 must be 64 lowercase hexadecimal characters",
-                ));
-            }
-            if let Some(text) = self.text.as_deref()
-                && digest != crate::model::digest(text.as_bytes())
-            {
-                return Err(Error::invalid(
-                    "source_index content_sha256 does not match the exact UTF-8 text",
-                ));
-            }
-        }
-        match self.status {
-            SourceIndexStatus::Selected => {
-                if self.revision.is_none()
-                    || self.text.as_deref().is_none_or(str::is_empty)
-                    || self.content_sha256.is_none()
-                {
-                    return Err(Error::invalid(
-                        "selected source_index entries require revision, exact text and content_sha256",
-                    ));
-                }
-                if self.gap_reason.is_some() {
-                    return Err(Error::invalid(
-                        "selected source_index entries cannot have a gap_reason",
-                    ));
-                }
-            }
-            SourceIndexStatus::Gap => {
-                if self
-                    .gap_reason
-                    .as_deref()
-                    .is_none_or(|reason| reason.trim().is_empty())
-                {
-                    return Err(Error::invalid(
-                        "gap source_index entries require a nonempty gap_reason",
-                    ));
-                }
-            }
-        }
-        Ok(())
+        let value = serde_json::to_value(self)?;
+        swarm_kernel::tasks::validate_source_index_entry(&value).map_err(task_validation_error)
     }
 
     fn legacy_gap(source_ref: &str) -> Self {
@@ -439,70 +494,13 @@ impl TaskSpec {
         if let Some(policy) = &self.acceptance {
             policy.validate()?;
         }
-        if self
-            .owner_policy_id
-            .as_ref()
-            .is_some_and(|policy_id| policy_id.trim().is_empty())
-        {
-            return Err(Error::invalid("owner_policy_id cannot be empty"));
-        }
-        if self
-            .baseline_candidate_ref
-            .as_ref()
-            .is_some_and(|reference| {
-                reference.trim().is_empty() || reference.len() > 512 || reference.contains('\0')
-            })
-        {
-            return Err(Error::invalid(
-                "baseline_candidate_ref must be a nonempty artifact reference of at most 512 bytes",
-            ));
-        }
-        if self.objective.trim().is_empty()
-            || self.phase.trim().is_empty()
-            || self.requirements.is_empty()
-        {
-            return Err(Error::invalid(
-                "objective, phase and at least one requirement are required",
-            ));
-        }
-        let mut ids = BTreeSet::new();
-        for r in &self.requirements {
-            if r.id.trim().is_empty() || r.statement.trim().is_empty() || !ids.insert(&r.id) {
-                return Err(Error::invalid(
-                    "requirement IDs must be nonempty and unique; statements cannot be empty",
-                ));
-            }
-        }
-        let mut deps = BTreeSet::new();
-        for d in &self.dependencies {
-            if d.task_id.trim().is_empty()
-                || d.required_revision < 1
-                || d.required_phase.trim().is_empty()
-                || !deps.insert(&d.task_id)
-            {
-                return Err(Error::invalid(
-                    "dependencies require unique task IDs, revision and phase",
-                ));
-            }
-        }
-        for source_ref in &self.source_refs {
-            if source_ref.trim().is_empty() {
-                return Err(Error::invalid(
-                    "source_refs cannot contain empty references",
-                ));
-            }
-        }
-        let mut indexed_refs = BTreeSet::new();
-        for source in &self.source_index {
-            source.validate()?;
-            if !indexed_refs.insert(source.source_ref.as_str()) {
-                return Err(Error::invalid(
-                    "source_index source_ref values must be unique",
-                ));
-            }
-        }
-        Ok(())
+        let value = serde_json::to_value(self)?;
+        swarm_kernel::tasks::validate_spec(&value).map_err(task_validation_error)
     }
+}
+
+fn task_validation_error(error: swarm_kernel::tasks::ValidationError) -> Error {
+    Error::new(error.code(), error.message())
 }
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -566,6 +564,10 @@ pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
         }
         "review.submit" => {
             crate::review::ReviewSubmitRequest::parse(params)?;
+            return Ok(());
+        }
+        "event.emit" => {
+            validate_manager_event_mutation(params)?;
             return Ok(());
         }
         "automation.config.apply" => {

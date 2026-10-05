@@ -36,8 +36,18 @@ SDK transport and `WarmQuery` driver. This is therefore a staged controller
 migration, not a full Rust implementation of the vendor SDK.
 
 Version 4 adds `agent.refresh` as an exact-session read of the Rust adapter's
-bounded SDK metadata cache. The outcome carries compact input/result metadata
-and reports `family_completeness: partial` and `enumeration_complete: false`.
+bounded SDK metadata cache. This private continuation also retains the pinned
+SDK's `task_started`, `task_progress`, `task_notification`, and
+`task_updated` frames, `SubagentStart` and `SubagentStop` hook observations,
+and assistant/user frames carrying a parent tool link. It preserves only
+bounded identity and link metadata: the raw task and agent IDs, tool and
+parent-tool IDs, frame and prompt IDs, user-message UUID links, and the
+notification `resource_links` URI/name metadata. The cache keeps at most 128
+family events; refresh returns the newest 16 family events and 16 input/result
+records with truncation and projection-incomplete flags.
+
+The outcome reports `family_completeness: partial` and
+`enumeration_complete: false`.
 The SDK metadata stream does not enumerate every native process or durable
 family member. Refresh records this snapshot; it does not establish Task or
 native turn completion. An absent cache is reported as unavailable.

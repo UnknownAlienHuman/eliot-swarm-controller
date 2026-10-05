@@ -10,14 +10,19 @@ admission, lifecycle and fault snapshot through the existing read-only reader.
 Shutdown wakes the same writer without polling and closes its queue even when
 client facades retain sender handles. The status reader receives a Stop job
 through its existing queue; late facade submissions return `STORE_CLOSED`.
-The complete domain and host executable extraction remains unfinished.
+Task specification, source-index, revision, claim and release validation now use
+`swarm_kernel::tasks`. Structured Review results, requirement coverage and
+disposition validation now use `swarm_kernel::reviews`; Store retains
+authorization, SQLite and receipts. Acceptance extraction and the independent
+kernel executable remain unfinished.
 
 `swarm-mcp`, `swarm-cli` and `swarm-gateway` are real independent Cargo packages.
 Their resolved dependency closures contain no controller, adapter, Store, kernel
 or SQLite dependency. MCP integration fixtures use the extracted implementation.
 The CLI supports authenticated status, generic calls, Task operations and agent
 readback; HookSource retains its existing durable-ack retry contract. The public
-`swarm` executable still belongs to the controller during CLI migration. Gateway
+`swarm` executable now belongs to `swarm-cli`; local runtime/admin commands use
+the separate `swarm-host` sibling. Ordinary requests do not start it. Gateway
 remains optional and disabled by default; launcher failures retain their exit
 status and installation guidance.
 
@@ -30,12 +35,20 @@ No frontend installation or native invocation has qualified this source yet.
 The managed bus has explicit opt-in and current durable demand, a dedicated
 Module identity, a positive Store generation and protected configuration/image
 bindings. Store outages retain the existing child handle; unknown ownership
-holds the scope without replacement. Verified owner adoption after host restart
-is still being implemented. These source changes do not start the bus.
+holds the scope without replacement. Restart adoption now verifies the retained
+configuration, credential, image, OS birth identity and service-group membership
+before resuming readback. Replacement requires committed whole-family departure;
+host shutdown leaves an admitted live family available for adoption. Legacy
+receipts without these proofs remain held. These source changes do not start the
+bus and have no current native qualification.
 
 Command version 3 provides exact durable status/failure readback. It continues to
 report `execution_complete=false`, `native_response_identity=unavailable` and
 `task_completion=unknown`; status alone does not qualify an assistant result.
+Manager admission captures the selected status page in the existing result
+Operation. Delivery and acknowledgement reuse these bytes even if the original
+dispatch is later reconciled. A sealed `outcome_unknown` page reports the saved
+state without promoting it to completion or authorizing replay.
 Module diagnostics correlate the exact event, module, artifact, build and boot.
 Task/Attempt attribution requires the retained transactional binding. Manager
 attention and observer timeline gaps preserve bounded typed metadata without raw
@@ -47,9 +60,11 @@ identity adoption. Rust owns IPC and durable operation receipts; the pinned
 Node SDK shim owns its process-local query objects. The supervisor materializes
 the module IPC connection file in the exact launch state directory through the
 typed argv marker. Command version 3 uses the same host connection mechanism.
-`agent.refresh` reads a bounded cache for the exact SDK session. Claude remains
-disabled and reports partial family completeness; descendant
-lifecycle implementation and runtime qualification remain pending.
+`agent.refresh` reads a bounded cache for the exact SDK session. The SDK bridge
+now captures bounded task and subagent lifecycle metadata with exact parent links
+when the SDK supplies them. Cache and page limits report truncation. Claude
+remains disabled and reports partial family completeness; runtime qualification
+and productive result capture remain pending.
 
 The source also records a bounded cancellation-control diagnostic in the existing
 ScriptRun Operation result. It binds the private receipt to the exact run,
@@ -61,6 +76,33 @@ Manager-owned system-event ScriptRuns can now apply `manager_notification` and
 transactions and captured project/owner authority. Task creation retains its
 child Operation and deterministic identity; effect history validates the exact
 effect kind and preserves cancellation diagnostics.
+
+The standalone `swarm-automation-worker` source is integrated behind an explicit
+default-off flag and current due/future demand. It uses one shared wait loop and
+the existing Store reconcilers for interval schedules, calendar actions, Goal
+reminders and check readback. Registration retains the canonical private-config
+digest, exact service generation and process owner. The host records readiness
+only after the worker enters its service group. These handlers retain their own
+transactions; the shared due page does not create a cross-source transaction.
+The package builder and adjacent, create-only installer now cover the standalone
+automation worker, retaining its own build and image provenance.
+
+An authenticated Manager can publish `event.emit` with bounded immutable payload,
+project, cause and deduplication identity. The existing Observation/Operation
+transaction records one event; other Managers cannot read its raw private body.
+Configured ScriptRun rules use the common bus and safe metadata projection.
+
+Codex, OpenCode, Command, Antigravity and Claude now implement the descriptor's
+normalized Task dispatch admission pair. Each records the exact submitted native
+payload digest and bytes, echoes the retained module/Task/Attempt context, and
+preserves unresolved outcomes without replay. Input admission alone does not
+establish assistant completion or a deliverable candidate.
+
+An ordinary Participant can submit the candidate for its exact current Task
+revision and Attempt. Scoped Operation and artifact reads expose only its own
+source snapshot or retained native candidate origin. Sponsored reviewers keep
+their separate review scope. Submission does not grant Task acceptance or
+native runtime control; collection of already-published bytes survives handover.
 
 Per owner direction, remaining code is completed before test and model runs.
 This source batch has not passed a current compiler gate or native qualification. CI

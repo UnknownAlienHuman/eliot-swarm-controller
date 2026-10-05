@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Host-only load measurement for the Eliot Swarm Controller.
 
-Drives one real `swarm host` process over its local IPC (newline-delimited
+Drives one real `swarm-host host` process over its local IPC (newline-delimited
 JSON-RPC 2.0 on the Unix socket / Windows named pipe endpoint) with
 controller clients only: no native runtimes, no bridges, no model calls.
 

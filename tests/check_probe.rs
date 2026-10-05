@@ -97,7 +97,7 @@ fn run_probe(program: &Path, args: &[&str], timeout_ms: u64, stdout_limit: usize
         }
     });
     fs::write(&request_path, serde_json::to_vec(&request).unwrap()).unwrap();
-    let mut helper = Command::new(env!("CARGO_BIN_EXE_swarm"));
+    let mut helper = Command::new(env!("CARGO_BIN_EXE_swarm-host"));
     helper
         .arg("check-worker")
         .arg("--file")
@@ -192,7 +192,7 @@ fn owned_probe_bounds_output_deadline_and_descendant_lifetime() {
         // Use the already-built controller CLI as a deterministic leaf. A
         // system shell can have environment-specific Job descendants even
         // when its command body is only an internal echo.
-        let leaf = PathBuf::from(env!("CARGO_BIN_EXE_swarm"));
+        let leaf = PathBuf::from(env!("CARGO_BIN_EXE_swarm-host"));
         let success = run_probe(&leaf, &["--version"], 5_000, 1024);
         assert_probe_success(&success, b"swarm ", 1024);
         assert!(

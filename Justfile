@@ -20,21 +20,25 @@ verify BASE HEAD TARGET=shared_target:
 
 fmt:
     cargo fmt -p eliot-swarm-controller -- --check
+    cargo fmt -p swarm-cli -- --check
 
 fmt-package package:
     cargo fmt --package "{{package}}" -- --check
 
 check TARGET=shared_target: (_shared-target TARGET)
-    cargo check --locked --lib --bins --target-dir "{{TARGET}}"
+    cargo check --locked --package eliot-swarm-controller --lib --bins --target-dir "{{TARGET}}"
+    cargo check --locked --package swarm-cli --lib --bins --target-dir "{{TARGET}}"
 
 clippy TARGET=shared_target: (_shared-target TARGET)
-    cargo clippy --locked --lib --bins --no-deps --target-dir "{{TARGET}}" -- -D warnings
+    cargo clippy --locked --package eliot-swarm-controller --lib --bins --no-deps --target-dir "{{TARGET}}" -- -D warnings
+    cargo clippy --locked --package swarm-cli --lib --bins --no-deps --target-dir "{{TARGET}}" -- -D warnings
 
 clippy-package package TARGET=shared_target: (_shared-target TARGET)
     cargo clippy --locked --package "{{package}}" --lib --bins --no-deps --target-dir "{{TARGET}}" -- -D warnings
 
 test TARGET=shared_target: (_shared-target TARGET)
     cargo test --locked -p eliot-swarm-controller --lib --bins --target-dir "{{TARGET}}"
+    cargo test --locked -p swarm-cli --lib --bins --target-dir "{{TARGET}}"
 
 test-target package target TARGET=shared_target: (_shared-target TARGET)
     cargo test --locked --package "{{package}}" --test "{{target}}" --target-dir "{{TARGET}}"
@@ -58,7 +62,8 @@ opencode-fixtures:
     node modules/opencode/selftest.mjs
 
 build TARGET=shared_target: (_shared-target TARGET)
-    cargo build --locked --release --bin swarm --target-dir "{{TARGET}}"
+    cargo build --locked --release --package swarm-cli --bin swarm --target-dir "{{TARGET}}"
+    cargo build --locked --release --package eliot-swarm-controller --bin swarm-host --target-dir "{{TARGET}}"
 
 # Create one provenance package at a time. The package builders require a
 # caller-owned external shared target and a fresh, separate output directory.

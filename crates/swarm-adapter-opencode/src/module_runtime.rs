@@ -154,10 +154,29 @@ fn command_event_schemas_match(claim: &ModuleContractClaim) -> bool {
     fn is_schema(schema: &SchemaDescriptor, id: &str) -> bool {
         schema.schema_id == id && schema.version == "1" && schema.sha256.is_none()
     }
-    claim.command_schemas.len() == 1
+    let legacy = claim.command_schemas.len() == 1
         && is_schema(&claim.command_schemas[0], "swarm.runtime_command")
         && claim.event_schemas.len() == 1
+        && is_schema(&claim.event_schemas[0], "swarm.runtime_outcome");
+    let normalized = claim.command_schemas.len() == 2
+        && is_schema(&claim.command_schemas[0], "swarm.runtime_command")
+        && is_schema(&claim.command_schemas[1], "swarm.task_dispatch_context")
+        && claim.event_schemas.len() == 2
         && is_schema(&claim.event_schemas[0], "swarm.runtime_outcome")
+        && is_schema(&claim.event_schemas[1], "swarm.task_dispatch_admission");
+    legacy || normalized
+}
+
+pub fn normalized_dispatch_enabled(claim: &ModuleContractClaim) -> bool {
+    fn is_schema(schema: &SchemaDescriptor, id: &str) -> bool {
+        schema.schema_id == id && schema.version == "1" && schema.sha256.is_none()
+    }
+    claim.command_schemas.len() == 2
+        && claim.event_schemas.len() == 2
+        && is_schema(&claim.command_schemas[0], "swarm.runtime_command")
+        && is_schema(&claim.command_schemas[1], "swarm.task_dispatch_context")
+        && is_schema(&claim.event_schemas[0], "swarm.runtime_outcome")
+        && is_schema(&claim.event_schemas[1], "swarm.task_dispatch_admission")
 }
 
 fn parse_protocol(value: &str) -> Result<ProtocolVersion> {

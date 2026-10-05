@@ -233,13 +233,7 @@ impl NativeClient {
         input_id: &str,
         prompt_text: &str,
     ) -> Result<()> {
-        let body = json!({
-            "id":input_id,
-            "text":prompt_text,
-            "metadata":{"eliot":marker(command)},
-            "delivery":"queue",
-            "resume":true
-        });
+        let body = input_payload(command, input_id, prompt_text);
         let value = self
             .post(&format!("/api/session/{root}/prompt"), body)
             .await?;
@@ -998,9 +992,20 @@ pub fn intent_for(
         prompt_bytes: text.map(|text| text.len() as u64),
         reconcile_target_operation_id,
         result_input_status: None,
+        dispatch_admission: None,
         route_sha256,
         model: serde_json::to_value(&options.model)?,
         marker: marker(command),
+    })
+}
+
+pub fn input_payload(command: &RuntimeCommand, input_id: &str, prompt_text: &str) -> Value {
+    json!({
+        "id":input_id,
+        "text":prompt_text,
+        "metadata":{"eliot":marker(command)},
+        "delivery":"queue",
+        "resume":true
     })
 }
 

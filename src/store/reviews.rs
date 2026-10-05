@@ -18,6 +18,7 @@ use crate::{
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
+use swarm_kernel::reviews as review_contract;
 
 const REVIEW_STREAM: &str = "controller:review";
 
@@ -198,6 +199,12 @@ fn result_observation(db: &Connection, assignment_id: &str) -> Result<Option<Val
         return Ok(None);
     };
     let record: Value = serde_json::from_str(&raw)?;
+    review_contract::validate_result_record(&record).map_err(|error| {
+        Error::new(
+            "REVIEW_RESULT_DAMAGED",
+            format!("retained review result is invalid: {error}"),
+        )
+    })?;
     let operation = operations::get_operation(db, &operation_id)?;
     let assignment = assignment_observation(db, assignment_id)?;
     if record["operation_id"] != operation_id
@@ -416,10 +423,17 @@ pub(crate) fn reserve_assign(
             ));
         };
         let prior_disposition: Value = serde_json::from_str(&prior_disposition)?;
+        review_contract::validate_disposition(&prior_disposition).map_err(|_| {
+            Error::new(
+                "REVIEW_REPLACEMENT_DISPOSITION_MISMATCH",
+                "prior disposition does not authorize replacement of this exact returned result",
+            )
+        })?;
         if prior_disposition["review_assignment_id"] != existing_id
             || prior_disposition["identity"] != json!(context.identity)
             || prior_disposition["review_result_operation_id"] != previous_result["operation_id"]
-            || prior_disposition["disposition"] != "return_for_correction"
+            || prior_disposition["disposition"]
+                != review_contract::ReviewDisposition::ReturnForCorrection.as_str()
         {
             return Err(Error::new(
                 "REVIEW_REPLACEMENT_DISPOSITION_MISMATCH",
@@ -764,28 +778,28 @@ pub(crate) fn actionable_finding(
             "current review assignment has no submitted result",
         )
     })?;
-    if assignment["identity"] != json!(retained.identity)
-        || result["result"]["verdict"] != "changes_requested"
-        || result["result"]["applicability"] != "current_candidate"
-    {
+    if assignment["identity"] != json!(retained.identity) {
         return Err(Error::new(
             "REVIEW_FINDING_NOT_ACTIONABLE",
             "current assigned result is not an applicable changes_requested verdict",
         ));
     }
-    let finding = result["result"]["findings"]
-        .as_array()
-        .and_then(|findings| {
-            findings
-                .iter()
-                .find(|finding| finding["finding_id"] == finding_id)
-        })
-        .ok_or_else(|| {
-            Error::new(
+    let finding = review_contract::actionable_finding(&result["result"], finding_id).map_err(
+        |error| match error {
+            review_contract::ReviewValidationError::NotActionable => Error::new(
+                "REVIEW_FINDING_NOT_ACTIONABLE",
+                "current assigned result is not an applicable changes_requested verdict",
+            ),
+            review_contract::ReviewValidationError::FindingNotFound => Error::new(
                 "REVIEW_FINDING_NOT_FOUND",
                 "finding is not present in the current assigned review result",
-            )
-        })?;
+            ),
+            _ => Error::new(
+                "REVIEW_RESULT_DAMAGED",
+                format!("retained review result is invalid: {error}"),
+            ),
+        },
+    )?;
     Ok(json!({
         "review_assignment_id":assignment_id,
         "review_operation_id":result["operation_id"],
@@ -953,9 +967,17 @@ fn latest_disposition(db: &Connection, assignment_id: &str) -> Result<Value> {
             |row| row.get(0),
         )
         .optional()?;
-    raw.map(|raw| serde_json::from_str(&raw).map_err(Into::into))
-        .transpose()
-        .map(|value: Option<Value>| value.unwrap_or(Value::Null))
+    let Some(raw) = raw else {
+        return Ok(Value::Null);
+    };
+    let value: Value = serde_json::from_str(&raw)?;
+    review_contract::validate_disposition(&value).map_err(|error| {
+        Error::new(
+            "REVIEW_DISPOSITION_DAMAGED",
+            format!("retained review disposition is invalid: {error}"),
+        )
+    })?;
+    Ok(value)
 }
 
 fn list_assignments(db: &Connection) -> Result<Vec<(i64, Value)>> {
@@ -1012,6 +1034,12 @@ pub(crate) fn authorize_artifact_read(
     principal.require_participant()?;
     let registration = meta(db, &format!("client:{}", principal.client_id))?
         .ok_or_else(|| Error::new("UNAUTHORIZED", "participant is not registered"))?;
+    if matches!(
+        registration["participation_basis"]["kind"].as_str(),
+        Some("attempt_owner" | "producer_ref")
+    ) {
+        return submissions::authorize_participant_artifact_read(db, principal, artifact_id);
+    }
     let scope = registration["participation_basis"]["review_scope"].clone();
     let assignment_id = model::text(&scope, "review_assignment_id")?;
     coordination::require_review_scope(db, principal, assignment_id, &scope)?;

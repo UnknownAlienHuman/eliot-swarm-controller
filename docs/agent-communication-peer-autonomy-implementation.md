@@ -61,7 +61,7 @@ The exact final allowlist is fixed in code and profile documentation. Unknown me
 ### 1.2 Participant cannot call
 
 ```text
-task.create/revise/claim/dispatch/submit/accept/request_changes/invalidate
+task.create/revise/claim/dispatch/accept/request_changes/invalidate
 attempt.bind_producer/release
 agent.*
 check.*
@@ -77,7 +77,7 @@ Concilium preview/open/advance/close
 forge/module/service/admin methods
 ```
 
-A participant's natural-language message cannot invoke any forbidden method.
+A participant's natural-language message cannot invoke any forbidden method. An ordinary current Attempt owner or `producer_ref` Participant may use the separately scoped `task.submit` path; sponsored review Participants remain limited to their review slot.
 
 ### 1.3 Store routing
 

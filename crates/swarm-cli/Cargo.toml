@@ -7,7 +7,7 @@ publish = false
 description = "Thin standalone CLI client for the local Eliot Swarm host"
 
 [[bin]]
-name = "swarm-cli"
+name = "swarm"
 path = "src/main.rs"
 
 [dependencies]

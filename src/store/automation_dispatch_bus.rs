@@ -869,6 +869,101 @@ fn consumer_owner_has_current_attempt(
 /// Module-consumer source check. It uses the persisted Manager identity only
 /// as data and revalidates that identity's current Task scope; it never creates
 /// a Manager Principal or depends on a Manager IPC/GM session.
+fn require_manager_event_scope(
+    db: &Connection,
+    event: &crate::automation::intake::ObservedEvent,
+    operation_id: &str,
+    entry: &AutomationEntry,
+    caller_id: &str,
+) -> Result<()> {
+    if event.source_id != crate::store::MANAGER_EVENT_SOURCE_STREAM {
+        return Ok(());
+    }
+    if caller_id != entry.owner_manager_id {
+        return Err(Error::new(
+            "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
+            "Manager event Operation is outside the configured owner scope",
+        ));
+    }
+    let (method, effective_json): (String, String) = db.query_row(
+        "SELECT method,effective_request_json FROM operations WHERE operation_id=?1",
+        [operation_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if method != "event.emit" {
+        return Err(Error::new(
+            "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
+            "Manager event observation is linked to the wrong Operation method",
+        ));
+    }
+    let effective: Value = serde_json::from_str(&effective_json).map_err(|_| {
+        Error::new(
+            "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
+            "Manager event Operation authority record is malformed",
+        )
+    })?;
+    let scope = &effective["event_emit"];
+    if scope["schema_version"] != 1
+        || scope["source_stream_id"] != crate::store::MANAGER_EVENT_SOURCE_STREAM
+        || scope["owner_manager_id"] != entry.owner_manager_id
+        || scope["project_id"] != entry.project_id
+        || scope["name"] != event.event_kind
+        || scope["source_event_key"].as_str().is_none()
+        || scope["payload_digest"].as_str().is_none()
+    {
+        return Err(Error::new(
+            "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
+            "Manager event Operation scope does not match the selected automation",
+        ));
+    }
+    let row: Option<(String, Option<String>, String, String)> = db
+        .query_row(
+            "SELECT source_event_key,operation_id,kind,payload_json FROM observations \
+             WHERE observation_id=?1",
+            [event.observation_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((source_event_key, observation_operation_id, kind, payload_json)) = row else {
+        return Err(Error::new(
+            "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
+            "Manager event observation is unavailable",
+        ));
+    };
+    if observation_operation_id.as_deref() != Some(operation_id)
+        || kind != event.event_kind
+        || source_event_key != scope["source_event_key"].as_str().unwrap_or_default()
+    {
+        return Err(Error::new(
+            "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
+            "Manager event observation identity no longer matches its Operation",
+        ));
+    }
+    let payload: Value = serde_json::from_str(&payload_json).map_err(|_| {
+        Error::new(
+            "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
+            "Manager event observation payload is malformed",
+        )
+    })?;
+    if payload["schema_version"] != 1
+        || payload["source_stream_id"] != crate::store::MANAGER_EVENT_SOURCE_STREAM
+        || payload["source_event_key"] != scope["source_event_key"]
+        || payload["owner_manager_id"] != entry.owner_manager_id
+        || payload["project_id"] != entry.project_id
+        || payload["name"] != event.event_kind
+        || payload["dedupe_key"] != scope["dedupe_key"]
+        || payload["payload"].is_null()
+        || model::digest(model::canonical(&payload["payload"])?.as_bytes())
+            != scope["payload_digest"].as_str().unwrap_or_default()
+    {
+        return Err(Error::new(
+            "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
+            "Manager event observation payload does not match its retained scope",
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn script_event_invocation_context_for_consumer(
     db: &Connection,
     app_config: &Config,
@@ -971,6 +1066,7 @@ pub(super) fn script_event_invocation_context_for_consumer(
                 "linked Operation no longer exists",
             ));
         };
+        require_manager_event_scope(db, &event, event_operation_id, entry, &caller_id)?;
         if super::event_is_script_feedback_from_same_automation(
             db,
             event_operation_id,

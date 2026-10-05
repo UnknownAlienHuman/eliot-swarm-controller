@@ -81,6 +81,7 @@ pub(super) fn exposes_method(profile: McpToolProfile, method: &str) -> bool {
                 | "review.list"
                 | "swarm.review.context"
                 | "review.submit"
+                | "task.submit"
                 | "task.submission"
                 | "check.get"
                 | "artifact.read"

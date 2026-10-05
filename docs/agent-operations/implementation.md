@@ -295,7 +295,7 @@ Reconcile these interfaces with #22 in the same implementation increment:
 | Interface | Combined contract |
 |---|---|
 | Assigned reviewer | Canonical `review.submit`, exact-assignment `review.get` and linked `operation.get` may finish/read after release while authenticated and unrevoked. `task.request_changes` stays manager disposition; explicit legacy `Reviewer` compatibility remains separate. |
-| Participant registration | Sponsored review scope may submit its exact slot; ordinary workers do not acquire review/Task rights. |
+| Participant registration | Sponsored review scope may submit its exact review slot; an ordinary current Attempt owner or `producer_ref` Participant may submit only its exact current Task revision and Attempt. Neither basis acquires Task creation, claim, acceptance, manager runtime or GM recovery rights. |
 | Operations/status | Manager sees authorized on-behalf actions despite service requester identity; result ingestion and new-effect permission differ. |
 | Launcher | One candidate/worktree owner, separate native continuation identity, real reporting capability evidence. |
 | Watches | One service and one enabled/owner record for recurring actions; one-shot notices create no model work. |

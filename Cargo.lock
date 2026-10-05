@@ -410,6 +410,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "swarm-automation",
  "swarm-bus",
  "swarm-checks",
  "swarm-client",
@@ -1687,6 +1688,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "swarm-automation"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "swarm-client",
+ "swarm-contracts",
+ "swarm-process",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "swarm-bus"
 version = "0.1.0"
 dependencies = [
@@ -1787,6 +1802,7 @@ name = "swarm-kernel"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+ "sha2",
  "tokio",
 ]
 

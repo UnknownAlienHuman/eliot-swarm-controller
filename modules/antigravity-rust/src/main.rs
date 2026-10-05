@@ -416,12 +416,16 @@ fn controller_from_hello(host: &HostSession, hello: &VerifiedModuleHello) -> Res
             "manager returned an incomplete or foreign native root identity",
         ));
     }
+    let normalized_dispatch_enabled = swarm_antigravity_adapter::contract::normalized_dispatch_enabled(
+        &swarm_antigravity_adapter::contract::claim()?,
+    );
     Ok(Controller::new(
         host.boot_id.clone(),
         host.native_scope_key.clone(),
         binding_id.to_owned(),
         generation,
         native_root_id,
+        normalized_dispatch_enabled,
     ))
 }
 

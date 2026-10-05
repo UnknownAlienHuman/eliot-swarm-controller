@@ -9,8 +9,9 @@ use swarm_contracts::{
         WorkspaceOptionContract, WorkspaceOptionSemantics,
     },
     module_contract::{
-        MODULE_PROTOCOL_V1, ModuleContractClaim, ModuleContractTemplate, runtime_command_schema,
-        runtime_outcome_schema,
+        MODULE_PROTOCOL_V1, ModuleContractClaim, ModuleContractTemplate,
+        runtime_command_schema, runtime_outcome_schema, task_dispatch_admission_schema,
+        task_dispatch_context_schema,
     },
 };
 
@@ -60,8 +61,14 @@ pub fn template() -> Result<ModuleContractTemplate> {
             semantics: WorkspaceOptionSemantics::ReplaceWithAdmittedAbsoluteWorkspace,
         }),
         pre_input_open: None,
-        command_schemas: BTreeSet::from([runtime_command_schema()]),
-        event_schemas: BTreeSet::from([runtime_outcome_schema()]),
+        command_schemas: BTreeSet::from([
+            runtime_command_schema(),
+            task_dispatch_context_schema(),
+        ]),
+        event_schemas: BTreeSet::from([
+            runtime_outcome_schema(),
+            task_dispatch_admission_schema(),
+        ]),
     })
 }
 
@@ -107,8 +114,7 @@ pub fn claim() -> Result<ModuleContractClaim> {
         || claim.protocol != MODULE_PROTOCOL_V1
         || claim.capabilities != template.capabilities.into_iter().collect::<Vec<_>>()
         || claim.config_schema != template.config_schema
-        || claim.command_schemas != template.command_schemas.into_iter().collect::<Vec<_>>()
-        || claim.event_schemas != template.event_schemas.into_iter().collect::<Vec<_>>()
+        || !schemas_match(&claim)
     {
         return Err(Error::new(
             "MODULE_CONTRACT_MISMATCH",
@@ -116,6 +122,33 @@ pub fn claim() -> Result<ModuleContractClaim> {
         ));
     }
     Ok(claim)
+}
+
+pub fn normalized_dispatch_enabled(claim: &ModuleContractClaim) -> bool {
+    claim
+        .command_schemas
+        .iter()
+        .any(|schema| schema.schema_id == "swarm.task_dispatch_context" && schema.version == "1")
+        && claim
+            .event_schemas
+            .iter()
+            .any(|schema| schema.schema_id == "swarm.task_dispatch_admission" && schema.version == "1")
+}
+
+fn schemas_match(claim: &ModuleContractClaim) -> bool {
+    let legacy_commands = vec![runtime_command_schema()];
+    let legacy_events = vec![runtime_outcome_schema()];
+    let normalized_commands = vec![
+        runtime_command_schema(),
+        task_dispatch_context_schema(),
+    ];
+    let normalized_events = vec![
+        runtime_outcome_schema(),
+        task_dispatch_admission_schema(),
+    ];
+    (claim.command_schemas == legacy_commands && claim.event_schemas == legacy_events)
+        || (claim.command_schemas == normalized_commands
+            && claim.event_schemas == normalized_events)
 }
 
 fn valid_build_id(value: &str) -> bool {

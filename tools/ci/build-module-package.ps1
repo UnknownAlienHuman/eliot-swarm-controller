@@ -57,11 +57,11 @@ function Get-Sha256([string] $Path) {
 . (Join-Path $PSScriptRoot 'SwarmBuildProvenanceHelpers.ps1')
 
 function Get-RootGatewayLauncherArguments([object[]] $Targets) {
-    $matches = @($Targets | Where-Object { [string]$_.name -ceq 'swarm' -and @($_.kind) -contains 'bin' })
-    if ($matches.Count -ne 1) { throw 'Root host package must expose exactly one swarm binary for gateway compatibility.' }
+    $matches = @($Targets | Where-Object { [string]$_.name -ceq 'swarm-host' -and @($_.kind) -contains 'bin' })
+    if ($matches.Count -ne 1) { throw 'Root host package must expose exactly one swarm-host binary for gateway compatibility.' }
     $source = Get-Content -LiteralPath ([string]$matches[0].src_path) -Raw
     $start = $source.IndexOf('async fn run_gateway_binary', [StringComparison]::Ordinal)
-    if ($start -lt 0) { throw 'Root swarm binary has no run_gateway_binary compatibility launcher.' }
+    if ($start -lt 0) { throw 'Root swarm-host binary has no run_gateway_binary compatibility launcher.' }
     $launcher = $source.Substring($start)
     foreach ($literal in @('"swarm-gateway.exe"', '"swarm-gateway"', 'child.arg("--config").arg(path)', 'child.arg("--data-dir").arg(path)')) {
         if (-not $launcher.Contains($literal)) { throw "Root gateway launcher no longer satisfies the sibling CLI contract: missing $literal" }

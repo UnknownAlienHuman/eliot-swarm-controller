@@ -11,8 +11,8 @@ if (-not $IsWindows) { throw 'This create-only installer accepts Windows fronten
 $packageMap = @{
     'eliot-swarm-controller' = [ordered]@{
         manifest = 'Cargo.toml'
-        binary = 'swarm'
-        role = 'host_cli'
+        binary = 'swarm-host'
+        role = 'host_runtime'
         required_siblings = @()
     }
     'swarm-mcp' = [ordered]@{
@@ -29,9 +29,9 @@ $packageMap = @{
     }
     'swarm-cli' = [ordered]@{
         manifest = 'crates/swarm-cli/Cargo.toml'
-        binary = 'swarm-cli'
+        binary = 'swarm'
         role = 'cli_client'
-        required_siblings = @()
+        required_siblings = @('eliot-swarm-controller')
     }
 }
 
@@ -149,13 +149,20 @@ function Assert-CompatibilityManifest(
         if ($launcher.package_name -cne 'swarm-gateway' -or
             $launcher.binary_target -cne 'swarm-gateway' -or
             $arguments.Count -ne 2 -or $arguments[0] -cne '--config' -or $arguments[1] -cne '--data-dir') {
-            throw "$Label does not declare the observed swarm-gateway binary and argv contract. Rebuild root swarm with the updated provenance builder."
+            throw "$Label does not declare the observed swarm-gateway binary and argv contract. Rebuild the root swarm-host package with the updated provenance builder."
+        }
+    } elseif ($PackageName -ceq 'swarm-cli') {
+        $launcher = $Manifest.compatibility.host_launcher
+        if ($launcher.package_name -cne 'eliot-swarm-controller' -or
+            $launcher.binary_target -cne 'swarm-host' -or
+            @($Manifest.compatibility.required_sibling_binaries | Where-Object { [string]$_ -ceq 'eliot-swarm-controller' }).Count -ne 1) {
+            throw "$Label does not declare its exact required swarm-host sibling. Rebuild the public CLI with the updated provenance builder."
         }
     } elseif ($PackageName -ceq 'swarm-gateway') {
         $arguments = @($Manifest.compatibility.accepted_launcher_arguments | ForEach-Object { [string]$_ })
         foreach ($required in @('--config', '--data-dir')) {
             if (@($arguments | Where-Object { $_ -ceq $required }).Count -ne 1) {
-                throw "$Label does not advertise the '$required' option forwarded by the root swarm launcher. Rebuild the gateway package with the updated provenance builder."
+                throw "$Label does not advertise the '$required' option forwarded by the root swarm-host launcher. Rebuild the gateway package with the updated provenance builder."
             }
         }
     }
@@ -174,13 +181,13 @@ function Assert-HostIpcCompatible([object] $Left, [string] $LeftLabel, [object] 
 function Assert-GatewayLauncherCompatible([object] $HostManifest, [object] $GatewayManifest) {
     $launcher = $HostManifest.compatibility.gateway_launcher
     if ($launcher.package_name -cne 'swarm-gateway' -or $launcher.binary_target -cne 'swarm-gateway') {
-        throw 'The root swarm package does not name the actual swarm-gateway sibling binary.'
+        throw 'The root swarm-host package does not name the actual swarm-gateway sibling binary.'
     }
     $required = @($launcher.required_arguments | ForEach-Object { [string]$_ })
     $accepted = @($GatewayManifest.compatibility.accepted_launcher_arguments | ForEach-Object { [string]$_ })
     foreach ($argument in $required) {
         if (@($accepted | Where-Object { $_ -ceq $argument }).Count -ne 1) {
-            throw "The installed swarm-gateway manifest does not declare root swarm's required '$argument' argument. Install a compatible gateway artifact into a new versioned directory; no files were changed."
+            throw "The installed swarm-gateway manifest does not declare root swarm-host's required '$argument' argument. Install a compatible gateway artifact into a new versioned directory; no files were changed."
         }
     }
 }
@@ -225,7 +232,7 @@ function Get-InstalledFrontend(
     if ($present.Count -ne $paths.Count) {
         $missing = @($paths | Where-Object { -not (Test-Path -LiteralPath $_) })
         if ($Name -ceq 'swarm-gateway' -and $RequestedPackage -ceq 'eliot-swarm-controller') {
-            throw "The existing swarm gateway sibling is not provenance-complete; missing $($missing -join ', '). Use a new empty install directory, install the matching swarm-gateway package there first, then install the root swarm CLI."
+            throw "The existing swarm gateway sibling is not provenance-complete; missing $($missing -join ', '). Use a new empty install directory, install the matching swarm-gateway package there first, then install the root swarm-host package."
         }
         throw "Installed frontend '$Name' is incomplete; missing $($missing -join ', '). Use a new empty install directory or restore the exact package files before installing another frontend."
     }
@@ -446,12 +453,12 @@ if ($null -ne $hostManifest -and $null -ne $gatewayManifest) {
     Assert-GatewayLauncherCompatible $hostManifest $gatewayManifest
 }
 foreach ($requiredName in $expectedSiblings) {
-    $requiredBinary = [string]$packageMap[$requiredName].binary + '.exe'
-    if ($requiredName -cne 'swarm-gateway') {
-        throw "Unrecognized required frontend sibling '$requiredName'; update the installer map before installing this package."
+    if (-not $packageMap.Contains($requiredName) -or $null -eq $existing[$requiredName]) {
+        throw "Required sibling package '$requiredName' is not installed with verified provenance. Install that exact package to '$installRoot' first."
     }
+    $requiredBinary = [string]$packageMap[$requiredName].binary + '.exe'
     if (-not (Test-Path -LiteralPath (Join-Path $installRoot $requiredBinary) -PathType Leaf)) {
-        throw "Required sibling '$requiredBinary' is missing. Install the matching '$requiredName' package to '$installRoot' first."
+        throw "Required sibling '$requiredBinary' is missing from '$installRoot'."
     }
 }
 if ($null -ne $existing[$packageName]) {

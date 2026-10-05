@@ -1,6 +1,6 @@
 //! Lazy, isolated lifecycle for the Store's legacy host reconcilers.
 //!
-//! One coordinator owns the wake/timer for all ten workers. A worker exists
+//! One coordinator owns the wake/timer for all eleven workers. A worker exists
 //! only while its exact config or retained-work predicate is true. Failures
 //! are visible through Store `host.status`, paced with bounded backoff, and
 //! never terminate the IPC listener unless the Store/kernel itself failed.
@@ -8,8 +8,10 @@ use crate::{
     error::{Error, Result},
     store::{LegacyWorkerDemand, Store},
 };
-use std::{collections::BTreeMap, time::Duration};
+use std::{collections::BTreeMap, process::Stdio, time::Duration};
+use tokio::process::Command;
 use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, BufReader},
     sync::watch,
     task::JoinHandle,
     time::{Instant, MissedTickBehavior},
@@ -29,6 +31,7 @@ enum Worker {
     OpenCode,
     Zed,
     Scheduler,
+    AutomationScheduler,
     Automation,
     Launcher,
     NativeMcp,
@@ -37,12 +40,13 @@ enum Worker {
 }
 
 impl Worker {
-    const ALL: [Self; 10] = [
+    const ALL: [Self; 11] = [
         Self::Checks,
         Self::Scripts,
         Self::OpenCode,
         Self::Zed,
         Self::Scheduler,
+        Self::AutomationScheduler,
         Self::Automation,
         Self::Launcher,
         Self::NativeMcp,
@@ -57,6 +61,7 @@ impl Worker {
             Self::OpenCode => "opencode",
             Self::Zed => "zed",
             Self::Scheduler => "scheduler",
+            Self::AutomationScheduler => "automation-scheduler",
             Self::Automation => "automation",
             Self::Launcher => "launcher",
             Self::NativeMcp => "native-mcp",
@@ -72,6 +77,7 @@ impl Worker {
             Self::OpenCode => demand.opencode,
             Self::Zed => demand.zed,
             Self::Scheduler => demand.scheduler,
+            Self::AutomationScheduler => demand.automation_scheduler,
             Self::Automation => demand.automation,
             Self::Launcher => demand.launcher,
             Self::NativeMcp => demand.native_mcp,
@@ -210,12 +216,230 @@ async fn run_worker(worker: Worker, store: Store, stopping: watch::Receiver<bool
             Ok(())
         }
         Worker::Scheduler => crate::scheduler::run(store, stopping).await,
+        Worker::AutomationScheduler => run_automation_scheduler_worker(store, stopping).await,
         Worker::Automation => super::supervise_automation(store, stopping).await,
         Worker::Launcher => super::supervise_launcher(store, stopping).await,
         Worker::NativeMcp => super::supervise_native_mcp(store, stopping).await,
         Worker::NativeMcpTools => super::supervise_native_mcp_tools(store, stopping).await,
         Worker::Forge => super::supervise_forge(store, stopping).await,
     }
+}
+
+async fn run_automation_scheduler_worker(
+    store: Store,
+    mut stopping: watch::Receiver<bool>,
+) -> Result<()> {
+    let executable_name = if cfg!(windows) {
+        "swarm-automation-worker.exe"
+    } else {
+        "swarm-automation-worker"
+    };
+    let executable = std::env::current_exe()
+        .map_err(|_| {
+            Error::new(
+                "AUTOMATION_WORKER_PATH_UNAVAILABLE",
+                "host path is unavailable",
+            )
+        })?
+        .with_file_name(executable_name);
+    if !executable.is_file() {
+        return Err(Error::new(
+            "AUTOMATION_WORKER_NOT_INSTALLED",
+            "standalone scheduler executable is unavailable",
+        ));
+    }
+    let config_path = store.automation_scheduler_worker_config_path();
+    let (scope, launch_id) = store.begin_automation_scheduler_worker().await?;
+    let mut command = Command::new(executable);
+    command.env_clear();
+    #[cfg(windows)]
+    if let Some(system_root) = std::env::var_os("SystemRoot") {
+        command.env("SystemRoot", system_root);
+    }
+    let spawn = command
+        .arg("run")
+        .arg("--config")
+        .arg(config_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(false)
+        .spawn();
+    let mut child = match spawn {
+        Ok(child) => child,
+        Err(_) => {
+            store
+                .abandon_automation_scheduler_worker(scope, launch_id)
+                .await?;
+            return Err(Error::new(
+                "AUTOMATION_WORKER_START_FAILED",
+                "standalone scheduler process could not be started",
+            ));
+        }
+    };
+    let Some(pid) = child.id() else {
+        let _ = child.kill().await;
+        if child.wait().await.is_err() {
+            return Err(Error::new(
+                "AUTOMATION_WORKER_DEPARTURE_UNKNOWN",
+                "scheduler process exit could not be confirmed",
+            ));
+        }
+        return Err(Error::new(
+            "AUTOMATION_WORKER_IDENTITY_UNKNOWN",
+            "standalone scheduler PID is unavailable; owner receipt remains held",
+        ));
+    };
+    let launched = swarm_process::spawned_identity(pid).map_err(|_| {
+        Error::new(
+            "AUTOMATION_WORKER_IDENTITY_UNKNOWN",
+            "standalone scheduler birth proof could not be read",
+        )
+    });
+    let identity = match launched.and_then(|identity| {
+        swarm_automation::service_owner_group_identity(&identity, store.scheduler_owner_token()?)
+            .map_err(|_| {
+                Error::new(
+                    "AUTOMATION_WORKER_IDENTITY_UNKNOWN",
+                    "standalone scheduler group proof is invalid",
+                )
+            })
+    }) {
+        Ok(identity) => identity,
+        Err(error) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err(error);
+        }
+    };
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill().await;
+        if child.wait().await.is_err() {
+            return Err(Error::new(
+                "AUTOMATION_WORKER_DEPARTURE_UNKNOWN",
+                "scheduler process exit could not be confirmed",
+            ));
+        }
+        store
+            .abandon_exited_automation_scheduler_worker(
+                scope.clone(),
+                launch_id.clone(),
+                identity.clone(),
+            )
+            .await?;
+        return Err(Error::new(
+            "AUTOMATION_WORKER_READY_UNKNOWN",
+            "scheduler readiness pipe is unavailable",
+        ));
+    };
+    if let Err(error) = wait_for_scheduler_ready(stdout).await {
+        let _ = child.kill().await;
+        if child.wait().await.is_err() {
+            return Err(Error::new(
+                "AUTOMATION_WORKER_DEPARTURE_UNKNOWN",
+                "scheduler process exit could not be confirmed",
+            ));
+        }
+        store
+            .abandon_exited_automation_scheduler_worker(
+                scope.clone(),
+                launch_id.clone(),
+                identity.clone(),
+            )
+            .await?;
+        return Err(error);
+    }
+    if let Err(error) = store
+        .activate_automation_scheduler_worker(scope.clone(), launch_id.clone(), identity.clone())
+        .await
+    {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        let _ = store
+            .finish_automation_scheduler_worker(scope.clone(), launch_id.clone(), identity.clone())
+            .await;
+        let _ = store
+            .abandon_exited_automation_scheduler_worker(scope, launch_id, identity.clone())
+            .await;
+        return Err(error);
+    }
+    tokio::select! {
+        status = child.wait() => {
+            let status = status.map_err(|_| Error::new(
+                "AUTOMATION_WORKER_STATUS_UNKNOWN",
+                "standalone scheduler process status could not be read",
+            ))?;
+            store
+                .finish_automation_scheduler_worker(scope, launch_id, identity)
+                .await?;
+            if status.success() {
+                Err(Error::new(
+                    "AUTOMATION_WORKER_STOPPED",
+                    "standalone scheduler stopped while Store demand remained active",
+                ))
+            } else {
+                Err(Error::new(
+                    "AUTOMATION_WORKER_EXITED",
+                    "standalone scheduler process exited unsuccessfully",
+                ))
+            }
+        }
+        changed = stopping.changed() => {
+            if changed.is_err() || *stopping.borrow() {
+                // Only this exact Store-owned Rust worker is stopped here. It
+                // starts no native/provider child; external SDK processes are
+                // outside this supervisor and are never terminated here.
+                child.kill().await.map_err(|_| Error::new(
+                    "AUTOMATION_WORKER_STOP_UNKNOWN",
+                    "standalone scheduler did not confirm shutdown",
+                ))?;
+                child.wait().await.map_err(|_| Error::new(
+                    "AUTOMATION_WORKER_STOP_UNKNOWN",
+                    "standalone scheduler exit could not be confirmed",
+                ))?;
+                store
+                    .finish_automation_scheduler_worker(scope, launch_id, identity)
+                    .await?;
+                Ok(())
+            } else {
+                Err(Error::new(
+                    "AUTOMATION_WORKER_STOP_UNKNOWN",
+                    "standalone scheduler stop channel changed unexpectedly",
+                ))
+            }
+        }
+    }
+}
+
+async fn wait_for_scheduler_ready(stdout: tokio::process::ChildStdout) -> Result<()> {
+    const MAX_READY_FRAME_BYTES: usize = 64;
+    let bounded = stdout.take((MAX_READY_FRAME_BYTES + 1) as u64);
+    let mut reader = BufReader::new(bounded);
+    let mut frame = Vec::with_capacity(MAX_READY_FRAME_BYTES + 1);
+    let read = tokio::time::timeout(
+        Duration::from_secs(10),
+        reader.read_until(b'\n', &mut frame),
+    )
+    .await
+    .map_err(|_| {
+        Error::new(
+            "AUTOMATION_WORKER_READY_TIMEOUT",
+            "scheduler did not confirm service-group readiness",
+        )
+    })?
+    .map_err(|_| {
+        Error::new(
+            "AUTOMATION_WORKER_READY_READ_FAILED",
+            "scheduler readiness frame could not be read",
+        )
+    })?;
+    if read > MAX_READY_FRAME_BYTES || frame.as_slice() != swarm_automation::READY_FRAME {
+        return Err(Error::new(
+            "AUTOMATION_WORKER_READY_INVALID",
+            "scheduler readiness frame did not match its fixed protocol",
+        ));
+    }
+    Ok(())
 }
 
 async fn reap_finished(store: &Store, slots: &mut BTreeMap<Worker, Slot>) -> Result<()> {

@@ -12,7 +12,7 @@ one run measured, under the conditions stated below, and no more.
 ## Scenario
 
 `tools/host-load.py` (Python 3 standard library only) starts one real
-`swarm host` process on a fresh temporary data directory and drives it over
+`swarm-host host` process on a fresh temporary data directory and drives it over
 its local IPC — newline-delimited JSON-RPC 2.0 on the Unix socket or the
 Windows named pipe (`control.sock` or the host's announced pipe; the
 request `id` must be a nonempty string,
@@ -52,8 +52,8 @@ Phases, in order:
 Reproduce:
 
 ```sh
-cargo build --locked --release --bin swarm
-python3 tools/host-load.py --swarm target/release/swarm --out result.json
+cargo build --locked --release --package eliot-swarm-controller --bin swarm-host
+python3 tools/host-load.py --swarm target/release/swarm-host --out result.json
 ```
 
 ## Windows owner-machine observation, 2026-10-03

@@ -20,6 +20,7 @@ on:
           - swarm-checks
           - swarm-forge-worker
           - swarm-bus
+          - swarm-automation
           - eliot-swarm-controller
         required: true
       profile:

@@ -14,7 +14,7 @@ use std::{
 
 #[derive(Parser)]
 #[command(
-    name = "swarm",
+    name = "swarm-host",
     version,
     about = "Headless task controller with explicitly connected native modules."
 )]

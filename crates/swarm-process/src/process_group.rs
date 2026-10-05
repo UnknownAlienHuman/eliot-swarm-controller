@@ -635,6 +635,106 @@ mod os {
             Ok(count.ActiveProcesses == 0)
         }
     }
+    /// Prove that the exact declared-service owner process is still alive in
+    /// its recorded non-killing Job. This is read-only and never adopts a Job
+    /// handle for signaling or starts a replacement.
+    pub fn service_owner_is_live(identity: &Value, token: &str) -> Result<bool> {
+        let purpose = match identity["purpose"].as_str() {
+            Some("bus_consumer") => "BusConsumer",
+            Some("automation_scheduler") => "AutomationScheduler",
+            _ => {
+                return Err(Error::new(
+                    "SERVICE_OWNER_UNSUPPORTED",
+                    "process owner purpose is not a declared service",
+                ));
+            }
+        };
+        let expected_name = format!(r"Global\EliotSwarmService-{purpose}-{token}");
+        if identity["scope"] != "windows_job"
+            || identity["job_name"] != expected_name
+            || uuid::Uuid::parse_str(token).is_err()
+        {
+            return Err(Error::new(
+                "SERVICE_OWNER_IDENTITY_INVALID",
+                "recorded service owner is not the expected named Job",
+            ));
+        }
+        let pid = u32::try_from(positive(identity, "pid")?)
+            .map_err(|_| Error::invalid("invalid service owner PID"))?;
+        let birth = identity["creation_filetime"]
+            .as_u64()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| Error::invalid("service owner creation time is missing"))?;
+        let name: Vec<u16> = expected_name.encode_utf16().chain(Some(0)).collect();
+        // SAFETY: name is nul-terminated UTF-16; the returned query-only Job
+        // handle is closed on every path below.
+        unsafe {
+            let job = OpenJobObjectW(JOB_QUERY_ACCESS, 0, name.as_ptr());
+            if job.is_null() {
+                let error = std::io::Error::last_os_error();
+                return if error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) {
+                    Ok(false)
+                } else {
+                    Err(error.into())
+                };
+            }
+            let result = (|| -> Result<bool> {
+                let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                if QueryInformationJobObject(
+                    job,
+                    JobObjectExtendedLimitInformation,
+                    (&mut limits as *mut JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                    size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                    ptr::null_mut(),
+                ) == 0
+                {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+                if limits.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE != 0
+                {
+                    return Err(Error::new(
+                        "SERVICE_OWNER_KILLING",
+                        "declared service Job must be non-killing",
+                    ));
+                }
+                let process = OpenProcess(
+                    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                    0,
+                    pid,
+                );
+                if process.is_null() {
+                    let error = std::io::Error::last_os_error();
+                    return if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+                        Ok(false)
+                    } else {
+                        Err(error.into())
+                    };
+                }
+                let process_result = (|| -> Result<bool> {
+                    if wait_process_signaled(process, 0)?
+                        || process_creation_filetime(process)? != birth
+                    {
+                        return Ok(false);
+                    }
+                    let mut member = 0;
+                    if IsProcessInJob(process, job, &mut member) == 0 {
+                        return Err(std::io::Error::last_os_error().into());
+                    }
+                    if member == 0
+                        || wait_process_signaled(process, 0)?
+                        || process_creation_filetime(process)? != birth
+                    {
+                        return Ok(false);
+                    }
+                    Ok(true)
+                })();
+                CloseHandle(process);
+                process_result
+            })();
+            CloseHandle(job);
+            result
+        }
+    }
     pub fn spawned_identity(pid: u32) -> Result<Value> {
         // Host-side evidence for a worker it just created, captured before the
         // worker can publish its own identity. A bare PID is never enough: the
@@ -1098,6 +1198,104 @@ mod os {
         }
         Ok(true)
     }
+    /// Prove that the exact declared-service owner process is still alive as
+    /// leader of its recorded process group. The pidfd pins the incarnation
+    /// throughout the read-only checks; this does not signal or adopt it.
+    pub fn service_owner_is_live(identity: &Value, token: &str) -> Result<bool> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        if !matches!(
+            identity["purpose"].as_str(),
+            Some("bus_consumer" | "automation_scheduler")
+        ) || identity["scope"] != "linux_process_group"
+            || identity["disposition_source"] != "proc_group_members"
+            || uuid::Uuid::parse_str(token).is_err()
+        {
+            return Err(Error::new(
+                "SERVICE_OWNER_IDENTITY_INVALID",
+                "recorded owner is not a declared Linux service process group",
+            ));
+        }
+        let pid = u32::try_from(positive(identity, "pid")?)
+            .map_err(|_| Error::invalid("invalid service owner PID"))?;
+        let pgid = i32::try_from(positive(identity, "pgid")?)
+            .map_err(|_| Error::invalid("invalid service owner process group"))?;
+        if i64::from(pid) != i64::from(pgid) {
+            return Err(Error::new(
+                "SERVICE_OWNER_IDENTITY_INVALID",
+                "service owner must be its process-group leader",
+            ));
+        }
+        let expected_boot = identity_text(identity, "boot_id")?;
+        let expected_start = identity_text(identity, "start_ticks")?;
+        if uuid::Uuid::parse_str(expected_boot).is_err()
+            || expected_start
+                .parse::<u64>()
+                .ok()
+                .filter(|value| *value > 0)
+                .is_none()
+        {
+            return Err(Error::new(
+                "SERVICE_OWNER_IDENTITY_INVALID",
+                "service owner boot or start identity is invalid",
+            ));
+        }
+        let boot_now = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+        if boot_now.trim() != expected_boot {
+            return Ok(false);
+        }
+        // SAFETY: pidfd_open returns a new owned descriptor on success.
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0u32) };
+        if raw < 0 {
+            let error = std::io::Error::last_os_error();
+            return if error.raw_os_error() == Some(libc::ESRCH) {
+                Ok(false)
+            } else {
+                Err(error.into())
+            };
+        }
+        // SAFETY: raw is the descriptor returned by pidfd_open above.
+        let pidfd = unsafe { OwnedFd::from_raw_fd(raw as i32) };
+        let exited = || -> Result<bool> {
+            let mut poll = libc::pollfd {
+                fd: pidfd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one initialized pollfd and a zero-duration poll.
+            if unsafe { libc::poll(&mut poll, 1, 0) } < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            if poll.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+                return Err(Error::new(
+                    "PROCESS_IDENTITY",
+                    "cannot observe the pinned service owner process",
+                ));
+            }
+            Ok(poll.revents & (libc::POLLIN | libc::POLLHUP) != 0)
+        };
+        if exited()? {
+            return Ok(false);
+        }
+        let (state, current_pgid, start) = match stat(pid) {
+            Ok(value) => value,
+            Err(error) if error.code == "PROCESS_GONE" => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if current_pgid != pgid || start != expected_start || !live(pid, state)? || exited()? {
+            return Ok(false);
+        }
+        let boot_after = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+        let (state_after, pgid_after, start_after) = match stat(pid) {
+            Ok(value) => value,
+            Err(error) if error.code == "PROCESS_GONE" => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        Ok(boot_after.trim() == expected_boot
+            && pgid_after == pgid
+            && start_after == expected_start
+            && live(pid, state_after)?
+            && !exited()?)
+    }
     pub fn spawned_identity(pid: u32) -> Result<Value> {
         // Host-side evidence for a worker it just created, captured before the
         // worker can publish its own identity. The boot ID and start ticks pin
@@ -1215,6 +1413,12 @@ mod os {
             "no process disposition",
         ))
     }
+    pub fn service_owner_is_live(_identity: &Value, _token: &str) -> Result<bool> {
+        Err(Error::new(
+            "PROCESS_PLATFORM_UNSUPPORTED",
+            "service owner verification is implemented for Windows and Linux",
+        ))
+    }
     pub fn spawned_identity(_pid: u32) -> Result<Value> {
         Err(Error::new(
             "CHECK_PLATFORM_UNSUPPORTED",
@@ -1241,6 +1445,6 @@ mod os {
     }
 }
 pub use os::{
-    Group, departed_empty, process_birth_identity, process_image_identity, spawned_departed,
-    spawned_identity,
+    Group, departed_empty, process_birth_identity, process_image_identity, service_owner_is_live,
+    spawned_departed, spawned_identity,
 };

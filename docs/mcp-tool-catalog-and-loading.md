@@ -4,7 +4,7 @@
 **Current qualification status:** See [Implementation Status](implementation-status.md) for current source, gate, and native evidence; this document owns catalog grouping and deferred-loading behavior.
 
 ### Historical C7/C8 catalog qualification snapshot
-**Revision:** 11 — 2026-10-03
+**Revision:** 12 — 2026-10-05
 **Source baseline:** C10 `cea63dde1d923f821c436c61f2561bcfb6a4bb0d`; prior C9 CI baseline `2e609ecf7d826da7019fe5e5f2ed397a992bc45a`.
 **Applies to:** [Communication Program](agent-communication-program.md), [Fleet-Scale Freedom](agent-communication-fleet-scale-freedom.md), [MCP Profiles](mcp-profiles.md)
 **Historical C7/C8 CI:** Exact runs and source commits are recorded in [Implementation Status](implementation-status.md).
@@ -14,7 +14,7 @@ All local model/inference remains deferred by owner. C10 credential state `store
 
 ## 0. Decision
 
-The [Canonical MCP Surfaces](mcp-canonical-surfaces-and-topologies.md) document is authoritative for exact public names. The canonical assigned-reviewer core uses `review.submit`, with `review.get` and linked `operation.get` limited to that reviewer's exact retained assignment/result, even after release if the credential remains valid and unrevoked. No historical context/list, artifact or evidence reads are implied. A null `review_scope.review_assignment_id` is pending until an atomic server bind. The legacy profile named `Reviewer` may remain only as an explicitly identified compatibility profile; its behavior does not redefine the assigned-reviewer core.
+The [Canonical MCP Surfaces](mcp-canonical-surfaces-and-topologies.md) document is authoritative for exact public names. The canonical assigned-reviewer core uses `review.submit`, with `review.get` and linked `operation.get` limited to that reviewer's exact retained assignment/result, even after release if the credential remains valid and unrevoked. No historical context/list, artifact or evidence reads are implied. A null `review_scope.review_assignment_id` is pending until an atomic server bind. An ordinary assigned Participant also has `task.submit`, `artifact.read`, and a narrow current-scope `operation.get`: applied `source.capture` and `agent.result` origins expose only the exact current Task/revision/Attempt candidate references. The legacy profile named `Reviewer` may remain only as an explicitly identified compatibility profile; its behavior does not redefine the assigned-reviewer core.
 
 ELIOT may eventually expose many application methods, but an ordinary model must not receive the complete schema catalog at session start.
 
@@ -234,6 +234,8 @@ operation.get
 
 `swarm.context.get` is role-sensitive and bounded. It returns the caller's current assignment/dashboard neighborhood rather than the whole fleet.
 
+For an ordinary assigned Participant, `operation.get` remains a bounded read. It returns a candidate origin only for an applied `source.capture` or `agent.result` Operation tied to the exact current Attempt; manager/native request and caller fields remain private. Sponsored review credentials keep their review-only Operation path.
+
 `swarm.tools.search` searches only methods already allowed by the hard profile. Native tool-search clients may not need to call it directly, but it remains the compatibility affordance for harnesses without native search.
 
 ## 4.2 `participant-coordination`
@@ -352,7 +354,7 @@ task.create
 task.revise
 task.claim
 task.dispatch
-task.submit
+task.submit  (ordinary assigned Participant or manager/current GM)
 attempt.bind_producer
 attempt.release
 operation.cancel
@@ -450,6 +452,8 @@ coordination.consult
 coordination.sync_integration
 coordination.watch.create/list/cancel
 swarm.overlap.check
+task.submit
+artifact.read
 operation.get
 ```
 
@@ -463,7 +467,7 @@ review reads explicitly sponsored for this participant
 mailbox-raw
 ```
 
-The participant never sees manager runtime, acceptance, admin or publication tools.
+The participant never sees Task creation/claim/acceptance, manager runtime control or recovery, admin or publication tools. `task.submit` does not accept a Task, and its candidate must match the current Task revision and Attempt.
 
 ## 5.2 Manager
 

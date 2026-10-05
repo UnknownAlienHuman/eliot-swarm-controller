@@ -1,4 +1,4 @@
-//! Exact, bounded status pages for a terminal Command dispatch.
+//! Exact, bounded status pages for a Command dispatch.
 //!
 //! Command's one-shot JSON result does not carry a native assistant-message
 //! identity. This projection reports only the saved Operation state and
@@ -11,8 +11,8 @@ use crate::{
     model::{self, Principal},
     runtime::{EffectOutcome, RuntimeOutcome},
 };
-use rusqlite::{Connection, OptionalExtension, params};
-use serde_json::{Value, json};
+use rusqlite::{params, Connection, OptionalExtension};
+use serde_json::{json, Value};
 
 const COMMAND_ARTIFACT_ID: &str = "eliot-command.rust-headless.1";
 const COMMAND_ARTIFACT_VERSION: &str = "3";
@@ -23,7 +23,7 @@ const MAX_PAGE_BYTES: usize = crate::artifacts::MAX_PAGE_BYTES;
 /// Validate the Command v3 result selector at manager admission. The
 /// descriptor capability is compatibility metadata; normal Store method,
 /// principal, binding and Attempt checks remain authoritative.
-pub(super) fn validate_request(db: &Connection, binding: &Value, request: &Value) -> Result<()> {
+pub(super) fn validate_request(db: &Connection, binding: &Value, request: &Value) -> Result<Value> {
     require_result_capability(db, binding)?;
     let selector = request
         .get("selector")
@@ -55,12 +55,13 @@ pub(super) fn validate_request(db: &Connection, binding: &Value, request: &Value
             "Command status offset exceeds the exact status page",
         ));
     }
-    Ok(())
+    Ok(snapshot)
 }
 
 /// Build the Store-authoritative target snapshot injected into `module.next`.
-/// Only a terminal dispatch can be published; pending/unknown Operations stay
-/// visible through their existing Operation readback and are never promoted.
+/// Terminal dispatches retain their typed receipt. An `outcome_unknown`
+/// dispatch can be shown as Store status without a module receipt; it never
+/// becomes terminal or authorizes a retry.
 pub(super) fn target_snapshot(
     db: &Connection,
     binding: &Value,
@@ -70,10 +71,12 @@ pub(super) fn target_snapshot(
     let binding_id = model::text(binding, "binding_id")?;
     let generation = model::positive(binding, "generation")?;
     let target = operations::get_operation(db, target_operation_id)?;
+    let state = model::text(&target, "state")?;
+    let unknown = state == "outcome_unknown";
     if target["binding_id"] != binding_id
         || target["binding_generation"] != generation
         || target["method"] != "task.dispatch"
-        || !matches!(target["state"].as_str(), Some("settled" | "rejected"))
+        || (!unknown && !matches!(state.as_str(), "settled" | "rejected"))
     {
         return Err(Error::new(
             "RESULT_TARGET_NOT_TERMINAL",
@@ -97,47 +100,128 @@ pub(super) fn target_snapshot(
     let request: Value = serde_json::from_str(&raw)?;
     let input_sha256 = model::digest(model::canonical(&request)?.as_bytes());
 
-    let outcome: RuntimeOutcome =
-        serde_json::from_value(target["result"].clone()).map_err(|_| {
-            Error::new(
-                "RESULT_TARGET_RECEIPT_INVALID",
-                "terminal Command dispatch has no typed outcome",
-            )
-        })?;
-    let (outcome_name, expected_state) = match &outcome.outcome {
-        EffectOutcome::Applied => ("applied", "settled"),
-        EffectOutcome::Rejected => ("rejected", "rejected"),
-        EffectOutcome::Accepted | EffectOutcome::Unknown => {
+    let (
+        outcome_name,
+        expected_state,
+        completion,
+        diagnostic_code,
+        result_subtype,
+        exit_code,
+        timed_out,
+        signal_observed,
+        receipt,
+    ) = if unknown && target["result"].is_null() {
+        (
+            "unknown",
+            "outcome_unknown",
+            json!("module_outcome_not_retained"),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+        )
+    } else {
+        let outcome: RuntimeOutcome =
+            serde_json::from_value(target["result"].clone()).map_err(|_| {
+                Error::new(
+                    "RESULT_TARGET_RECEIPT_INVALID",
+                    "Command dispatch has no typed retained outcome",
+                )
+            })?;
+        if outcome.operation_id != target_operation_id
+            || outcome.native_root_id.is_some()
+            || outcome.native_scope_key.is_some()
+        {
             return Err(Error::new(
-                "RESULT_TARGET_NOT_TERMINAL",
-                "Command status target has no terminal outcome",
+                "RESULT_TARGET_RECEIPT_INVALID",
+                "Command receipt differs from its retained Operation",
             ));
         }
+        if unknown {
+            if outcome.outcome != EffectOutcome::Unknown
+                || outcome.details["execution_shape"] != crate::runtime::batch::EXECUTION_SHAPE
+                || outcome.details["task_acceptance_claimed"] != false
+                || outcome.details["result_page_available"] != false
+            {
+                return Err(Error::new(
+                    "RESULT_TARGET_RECEIPT_INVALID",
+                    "unknown Command status contains incompatible retained facts",
+                ));
+            }
+            let receipt = runtime::validate_module_receipt_for_operation(
+                db, binding_id, generation, binding, &outcome,
+            )?;
+            if receipt.input_sha256 != input_sha256 {
+                return Err(Error::new(
+                    "RESULT_TARGET_RECEIPT_INVALID",
+                    "Command receipt is not bound to the exact original request",
+                ));
+            }
+            (
+                "unknown",
+                "outcome_unknown",
+                json!("native_result_unconfirmed"),
+                safe_diagnostic(&outcome.details["diagnostic_code"]),
+                Value::Null,
+                Value::Null,
+                outcome
+                    .details
+                    .get("timed_out")
+                    .filter(|value| value.is_boolean())
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                outcome
+                    .details
+                    .get("signal")
+                    .map(|value| json!(!value.is_null()))
+                    .unwrap_or(Value::Null),
+                json!(receipt),
+            )
+        } else {
+            let (outcome_name, expected_state) = match outcome.outcome {
+                EffectOutcome::Applied => ("applied", "settled"),
+                EffectOutcome::Rejected => ("rejected", "rejected"),
+                EffectOutcome::Accepted | EffectOutcome::Unknown => {
+                    return Err(Error::new(
+                        "RESULT_TARGET_NOT_TERMINAL",
+                        "Command status target has no terminal outcome",
+                    ));
+                }
+            };
+            if state != expected_state {
+                return Err(Error::new(
+                    "RESULT_TARGET_RECEIPT_INVALID",
+                    "Command terminal state differs from its retained outcome",
+                ));
+            }
+            let receipt = runtime::validate_module_receipt_for_operation(
+                db, binding_id, generation, binding, &outcome,
+            )?;
+            if receipt.input_sha256 != input_sha256 {
+                return Err(Error::new(
+                    "RESULT_TARGET_RECEIPT_INVALID",
+                    "Command receipt is not bound to the exact original request",
+                ));
+            }
+            let details = &outcome.details;
+            let completion = model::text(details, "completion_condition")?;
+            let (diagnostic_code, result_subtype, exit_code, timed_out, signal_observed) =
+                terminal_facts(details, outcome_name)?;
+            (
+                outcome_name,
+                expected_state,
+                json!(completion),
+                diagnostic_code,
+                result_subtype,
+                exit_code,
+                json!(timed_out),
+                json!(signal_observed),
+                json!(receipt),
+            )
+        }
     };
-    if target["state"] != expected_state
-        || outcome.operation_id != target_operation_id
-        || !outcome.native_root_id.is_none()
-        || !outcome.native_scope_key.is_none()
-    {
-        return Err(Error::new(
-            "RESULT_TARGET_RECEIPT_INVALID",
-            "Command terminal receipt differs from its retained Operation",
-        ));
-    }
-    let receipt = runtime::validate_module_receipt_for_operation(
-        db, binding_id, generation, binding, &outcome,
-    )?;
-    if receipt.input_sha256 != input_sha256 {
-        return Err(Error::new(
-            "RESULT_TARGET_RECEIPT_INVALID",
-            "Command receipt is not bound to the exact original request",
-        ));
-    }
-
-    let details = &outcome.details;
-    let completion = model::text(details, "completion_condition")?;
-    let (diagnostic_code, result_subtype, exit_code, timed_out, signal_observed) =
-        terminal_facts(details, outcome_name)?;
     Ok(json!({
         "schema_version":1,
         "operation_id":target_operation_id,
@@ -157,6 +241,199 @@ pub(super) fn target_snapshot(
         "task_completion":"unknown",
         "native_replay":false
     }))
+}
+
+/// Return the snapshot sealed when the Manager admitted this result Operation.
+/// The dispatch may be reconciled later; acknowledgement retries must validate
+/// the same historical status bytes rather than silently changing the page.
+/// Older queued terminal-only pages predate this field and can be reconstructed
+/// safely because their terminal Operation state cannot change.
+pub(super) fn admitted_target_snapshot(
+    db: &Connection,
+    result_operation_id: &str,
+    binding_id: &str,
+    generation: i64,
+    target_operation_id: &str,
+) -> Result<Value> {
+    let row: Option<(String, String)> = db
+        .query_row(
+            "SELECT original_request_json,effective_request_json FROM operations WHERE operation_id=?1 AND binding_id=?2 AND binding_generation=?3 AND method='agent.result'",
+            params![result_operation_id, binding_id, generation],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((original, effective)) = row else {
+        return Err(Error::new(
+            "RESULT_TARGET_SCOPE_INVALID",
+            "Command result Operation is absent from this binding generation",
+        ));
+    };
+    let original: Value = serde_json::from_str(&original)?;
+    if original["selector"]["kind"] != "command_status"
+        || original["selector"]["input_operation_id"] != target_operation_id
+    {
+        return Err(Error::new(
+            "RESULT_PROVENANCE_INVALID",
+            "Command result Operation selector differs from its retained target",
+        ));
+    }
+    let effective: Value = serde_json::from_str(&effective)?;
+    let snapshot = match effective.get("command_status_target_snapshot") {
+        Some(snapshot) if snapshot.is_object() => snapshot.clone(),
+        Some(_) => {
+            return Err(Error::new(
+                "RESULT_PROVENANCE_INVALID",
+                "sealed Command status snapshot is malformed",
+            ));
+        }
+        None => {
+            // Compatibility for a queued v3 Operation admitted before this
+            // snapshot field existed. Such an Operation can only have passed
+            // the old terminal-only admission check.
+            let binding = operations::get_binding(db, binding_id, generation)?;
+            let snapshot = target_snapshot(db, &binding, target_operation_id)?;
+            if snapshot["operation_state"] == "outcome_unknown" {
+                return Err(Error::new(
+                    "RESULT_PROVENANCE_INVALID",
+                    "unknown Command status requires a Manager-admission snapshot",
+                ));
+            }
+            snapshot
+        }
+    };
+    validate_frozen_snapshot(db, binding_id, generation, target_operation_id, &snapshot)?;
+    Ok(snapshot)
+}
+
+fn validate_frozen_snapshot(
+    db: &Connection,
+    binding_id: &str,
+    generation: i64,
+    target_operation_id: &str,
+    snapshot: &Value,
+) -> Result<()> {
+    model::fields(
+        snapshot,
+        &[
+            "schema_version",
+            "operation_id",
+            "method",
+            "operation_state",
+            "operation_outcome",
+            "completion_condition",
+            "diagnostic_code",
+            "result_subtype",
+            "exit_code",
+            "timed_out",
+            "signal_observed",
+            "input_sha256",
+            "module_receipt",
+            "native_response_identity",
+            "execution_complete",
+            "task_completion",
+            "native_replay",
+        ],
+    )?;
+    if snapshot["operation_id"] != target_operation_id
+        || snapshot["schema_version"] != 1
+        || snapshot["method"] != "task.dispatch"
+        || !matches!(
+            (
+                snapshot["operation_state"].as_str(),
+                snapshot["operation_outcome"].as_str()
+            ),
+            (Some("settled"), Some("applied"))
+                | (Some("rejected"), Some("rejected"))
+                | (Some("outcome_unknown"), Some("unknown"))
+        )
+        || snapshot["native_response_identity"] != "unavailable"
+        || snapshot["execution_complete"] != false
+        || snapshot["task_completion"] != "unknown"
+        || snapshot["native_replay"] != false
+    {
+        return Err(Error::new(
+            "RESULT_PROVENANCE_INVALID",
+            "sealed Command status snapshot has an invalid identity or authority claim",
+        ));
+    }
+    let raw: Option<String> = db
+        .query_row(
+            "SELECT original_request_json FROM operations WHERE operation_id=?1 AND binding_id=?2 AND binding_generation=?3 AND method='task.dispatch'",
+            params![target_operation_id, binding_id, generation],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let raw = raw.ok_or_else(|| {
+        Error::new(
+            "RESULT_TARGET_SCOPE_INVALID",
+            "Command status target is absent from this binding generation",
+        )
+    })?;
+    let request: Value = serde_json::from_str(&raw)?;
+    let expected = model::digest(model::canonical(&request)?.as_bytes());
+    if snapshot["input_sha256"].as_str() != Some(expected.as_str()) {
+        return Err(Error::new(
+            "RESULT_PROVENANCE_INVALID",
+            "sealed Command status snapshot no longer matches the exact target request",
+        ));
+    }
+    if snapshot["module_receipt"].is_null() {
+        if snapshot["operation_state"] != "outcome_unknown"
+            || snapshot["operation_outcome"] != "unknown"
+        {
+            return Err(Error::new(
+                "RESULT_PROVENANCE_INVALID",
+                "only an unknown Command status may omit its module receipt",
+            ));
+        }
+    } else {
+        let binding = operations::get_binding(db, binding_id, generation)?;
+        let outcome = RuntimeOutcome {
+            operation_id: target_operation_id.to_owned(),
+            outcome: EffectOutcome::Unknown,
+            native_scope_key: None,
+            native_root_id: None,
+            turn_id: None,
+            native_input_id: None,
+            details: json!({"module_receipt":snapshot["module_receipt"]}),
+        };
+        let receipt = runtime::validate_module_receipt_for_operation(
+            db, binding_id, generation, &binding, &outcome,
+        )?;
+        if receipt.input_sha256 != expected {
+            return Err(Error::new(
+                "RESULT_PROVENANCE_INVALID",
+                "sealed Command module receipt differs from its exact target request",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn safe_diagnostic(value: &Value) -> Value {
+    value
+        .as_str()
+        .filter(|code| {
+            !code.is_empty()
+                && code.len() <= 64
+                && code
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        })
+        .map(|code| json!(code))
+        .unwrap_or(Value::Null)
+}
+
+pub(super) fn target_evidence(snapshot: &Value) -> &'static str {
+    if snapshot["operation_state"] == "outcome_unknown" {
+        if snapshot["module_receipt"].is_null() {
+            "store_retained_operation_state_only"
+        } else {
+            "store_retained_module_reported_unknown_outcome"
+        }
+    } else {
+        "store_retained_module_reported_operation_receipt"
+    }
 }
 
 fn terminal_facts(details: &Value, outcome: &str) -> Result<(Value, Value, Value, bool, bool)> {
@@ -322,8 +599,13 @@ fn target_snapshot_from_context(
 ) -> Result<Value> {
     let binding_id = model::text(context, "binding_id")?;
     let generation = model::positive(context, "generation")?;
-    let binding = operations::get_binding(db, binding_id, generation)?;
-    target_snapshot(db, &binding, target_id)
+    admitted_target_snapshot(
+        db,
+        model::text(context, "operation_id")?,
+        binding_id,
+        generation,
+        target_id,
+    )
 }
 
 fn request_digest(
@@ -376,7 +658,7 @@ fn validate_source(
         || source["target_input_sha256"] != target_snapshot["input_sha256"]
         || source["target_module_receipt"] != target_snapshot["module_receipt"]
         || source["target_operation_status"] != *target_snapshot
-        || source["evidence"] != "store_retained_module_reported_operation_receipt"
+        || source["evidence"] != target_evidence(target_snapshot)
         || source["native_response_identity"] != "unavailable"
         || source["execution_complete"] != false
         || source["task_completion"] != "unknown"

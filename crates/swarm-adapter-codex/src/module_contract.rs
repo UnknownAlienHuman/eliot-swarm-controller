@@ -117,10 +117,27 @@ fn has_generic_schemas(claim: &ModuleContractClaim) -> bool {
             sha256: None,
         }
     }
-    claim.command_schemas.len() == 1
-        && claim.command_schemas.first() == Some(&schema("swarm.runtime_command", "1"))
-        && claim.event_schemas.len() == 1
-        && claim.event_schemas.first() == Some(&schema("swarm.runtime_outcome", "1"))
+    let runtime_command = schema("swarm.runtime_command", "1");
+    let runtime_outcome = schema("swarm.runtime_outcome", "1");
+    let dispatch_context = schema("swarm.task_dispatch_context", "1");
+    let dispatch_admission = schema("swarm.task_dispatch_admission", "1");
+    (claim.command_schemas == [runtime_command.clone()].as_slice()
+        && claim.event_schemas == [runtime_outcome.clone()].as_slice())
+        || (claim.command_schemas
+            == [runtime_command, dispatch_context].as_slice()
+            && claim.event_schemas == [runtime_outcome, dispatch_admission].as_slice())
+}
+
+pub(crate) fn normalized_dispatch_enabled(claim: &ModuleContractClaim) -> bool {
+    fn schema(id: &str, version: &str) -> SchemaDescriptor {
+        SchemaDescriptor {
+            schema_id: id.to_owned(),
+            version: version.to_owned(),
+            sha256: None,
+        }
+    }
+    claim.command_schemas.contains(&schema("swarm.task_dispatch_context", "1"))
+        && claim.event_schemas.contains(&schema("swarm.task_dispatch_admission", "1"))
 }
 
 pub(crate) fn receipt_identity(

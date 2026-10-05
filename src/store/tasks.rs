@@ -67,6 +67,10 @@ fn spec(v: &Value) -> Result<TaskSpec> {
     Ok(s)
 }
 
+fn task_validation_error(error: swarm_kernel::tasks::ValidationError) -> Error {
+    Error::new(error.code(), error.message())
+}
+
 /// Task creation and revision are local planning rights shared by Managers
 /// and the pinned local Operator. Do not use `require_writer`: it is a broad
 /// role filter, not this positive method policy.
@@ -200,16 +204,18 @@ pub(super) fn revise(
     let expected = model::positive(v, "expected_revision")?;
     let s = spec(v)?;
     let previous = get_task(tx, task_id)?;
-    if previous["revision"] != expected || previous["state"] == "archived" {
-        return Err(Error::new("STALE_REVISION", "Task changed or is archived"));
-    }
+    swarm_kernel::tasks::validate_revision_state(
+        expected,
+        previous["revision"].as_i64().unwrap_or_default(),
+        previous["state"].as_str().unwrap_or_default(),
+    )
+    .map_err(task_validation_error)?;
     authorize_foreign_live_attempt_revision(tx, p, &previous)?;
-    if s.dependencies.iter().any(|d| d.task_id == task_id) {
-        return Err(Error::invalid("Task cannot depend on itself"));
-    }
-    let next = expected
-        .checked_add(1)
-        .ok_or_else(|| Error::invalid("revision overflow"))?;
+    let next = swarm_kernel::tasks::validate_revision_update(
+        expected,
+        s.dependencies.iter().any(|d| d.task_id == task_id),
+    )
+    .map_err(task_validation_error)?;
     tx.execute("UPDATE tasks SET revision=?2,spec_json=?3,state='open',accepted_attempt_id=NULL,accepted_operation_id=NULL,accepted_revision=NULL,accepted_phase=NULL,accepted_candidate_ref=NULL,updated_at_ms=?4 WHERE task_id=?1",params![task_id,next,model::canonical(&json!(s))?,now])?;
     tx.execute(
         "UPDATE operations SET task_id=?2,effective_request_json=?3 WHERE operation_id=?1",
@@ -318,19 +324,15 @@ fn claim_with_authority(
     } else {
         StartOwner::NativeManager
     };
-    if launch_claim && start.as_str() != "controller" {
-        return Err(Error::new(
-            "FORBIDDEN",
-            "launch claims require controller-owned Attempt start",
-        ));
-    }
+    swarm_kernel::tasks::validate_claim_start(start.as_str(), launch_claim)
+        .map_err(task_validation_error)?;
     let task = get_task(tx, task_id)?;
-    if task["revision"] != revision || task["state"] != "open" {
-        return Err(Error::new(
-            "STALE_REVISION",
-            "Task is not open at the expected revision",
-        ));
-    }
+    swarm_kernel::tasks::validate_claim_task_state(
+        task["revision"].as_i64().unwrap_or_default(),
+        revision,
+        task["state"].as_str().unwrap_or_default(),
+    )
+    .map_err(task_validation_error)?;
     if let Some(existing) = task["current_attempt_id"].as_str() {
         let a = get_attempt(tx, existing)?;
         if a["owner_id"] == owner
@@ -365,6 +367,11 @@ fn claim_with_authority(
         let accepted = acceptance::resolve_dependency(tx, d)?;
         dependency_receipts.push(json!({"task_id":d.task_id,"acceptance_operation_id":accepted}));
     }
+    swarm_kernel::tasks::validate_claim_binding_pair(
+        v.get("binding_id"),
+        v.get("binding_generation"),
+    )
+    .map_err(task_validation_error)?;
     let (binding, generation) = match (v.get("binding_id"), v.get("binding_generation")) {
         (None, None) | (Some(Value::Null), Some(Value::Null)) => (None, None),
         (Some(_), Some(_)) => {
@@ -379,11 +386,7 @@ fn claim_with_authority(
             }
             (Some(binding), Some(generation))
         }
-        _ => {
-            return Err(Error::invalid(
-                "binding_id and binding_generation must be supplied together",
-            ));
-        }
+        _ => unreachable!("claim binding pair was validated by swarm-kernel"),
     };
     let attempt = model::new_id();
     let snapshot = task_snapshot(
@@ -422,16 +425,8 @@ pub(super) fn release(
     let attempt_id = model::text(v, "attempt_id")?;
     let outcome = model::text(v, "outcome")?;
     let reason = model::text(v, "reason")?;
-    if !["accepted", "failed", "cancelled", "superseded"].contains(&outcome) {
-        return Err(Error::invalid(
-            "release outcome must be accepted/failed/cancelled/superseded; accepted requires an existing decision",
-        ));
-    }
-    if v["assignment_closed"] != true {
-        return Err(Error::invalid(
-            "explicit assignment_closed=true attestation required; no process is stopped by release",
-        ));
-    }
+    swarm_kernel::tasks::validate_release_request(outcome, v["assignment_closed"] == true)
+        .map_err(task_validation_error)?;
     let a = get_attempt(tx, attempt_id)?;
     super::gm::require_attempt_control(tx, p, &a)?;
     if !a["released_at_ms"].is_null() {
@@ -441,39 +436,24 @@ pub(super) fn release(
         );
     }
     let accepted = a["state"] == "accepted" && acceptance::accepted_attempt(tx, &a)?;
-    if (outcome == "accepted") != accepted {
-        return Err(Error::new(
-            "ACCEPTANCE_STATE_MISMATCH",
-            "accepted ownership must be released as accepted; revoke the decision before changing its outcome",
-        ));
-    }
     let held: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM check_runs WHERE attempt_id=?1 AND resource_claimed_at_ms IS NOT NULL AND resource_released_at_ms IS NULL)", [attempt_id], |r| r.get(0))?;
-    if held {
-        return Err(Error::new(
-            "CHECK_RESOURCE_HELD",
-            "check process disposition is unresolved",
-        ));
-    }
     let unresolved:i64=tx.query_row("SELECT count(*) FROM operations WHERE attempt_id=?1 AND state IN ('sending','native_accepted','outcome_unknown')",[attempt_id],|r|r.get(0))?;
-    if unresolved > 0 {
-        return Err(Error::new(
-            "OUTCOME_UNKNOWN",
-            "resolve already-sent effects before releasing ownership",
-        ));
-    }
-    if a["producers"].as_array().is_some_and(|items| {
+    let unresolved_producers = a["producers"].as_array().is_some_and(|items| {
         items.iter().any(|item| {
             !matches!(
                 item["disposition"].as_str(),
                 Some("completed" | "failed" | "cancelled")
             )
         })
-    }) {
-        return Err(Error::new(
-            "NATIVE_WORK_UNRESOLVED",
-            "the exact assigned native runs have not ended; attestation cannot override a known producer",
-        ));
-    }
+    });
+    swarm_kernel::tasks::validate_release_transition(
+        outcome,
+        accepted,
+        held,
+        unresolved,
+        unresolved_producers,
+    )
+    .map_err(task_validation_error)?;
     operations::prepare_owned_service_attempt_release(tx, &a, id, now)?;
     // Caller explicitly seals cooperative native work. This is not process evidence.
     // A queued check needs a retained cancellation result, not an orphaned row.
