@@ -5,6 +5,7 @@
 //! not own a database or a second source of durable state. Task policy operates
 //! on supplied values while the Store retains authorization and transactions.
 
+pub mod acceptance;
 pub mod dispatch;
 pub mod reviews;
 pub mod tasks;

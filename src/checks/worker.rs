@@ -2,7 +2,7 @@
 //! at most one configured command, after the host durably acknowledges its identity.
 use super::{
     inputs,
-    model::{CheckProfile, Parser},
+    model::{CheckProfile, ExecutorPin, Parser},
     scope::CargoTargetIdentity,
     source,
 };
@@ -36,6 +36,10 @@ pub struct Work {
     pub data_dir: PathBuf,
     pub candidate: ArtifactRecord,
     pub profile: CheckProfile,
+    /// The admission-time executor selection. A missing value is retained for
+    /// legacy CheckRuns created before standalone executor pinning existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor: Option<ExecutorPin>,
     #[serde(default)]
     pub resolved_inputs: Option<Value>,
     #[serde(default)]
@@ -2240,6 +2244,7 @@ mod tests {
                 fingerprint_env: Vec::new(),
                 versioned_inputs: BTreeMap::new(),
             },
+            executor: None,
             resolved_inputs: None,
             scope_plan: None,
             input_fingerprint: None,

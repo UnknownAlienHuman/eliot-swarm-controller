@@ -1,11 +1,10 @@
 //! Acceptance is an explicit decision over a sealed submission, never a model stop.
 use crate::{
     error::{Error, Result},
-    model::{self, TaskSpec},
+    model::TaskSpec,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -23,18 +22,8 @@ pub struct AcceptancePolicy {
 }
 impl AcceptancePolicy {
     pub fn validate(&self) -> Result<()> {
-        let mut ids = BTreeSet::new();
-        for p in &self.required_check_profiles {
-            if p.profile_id.trim().is_empty()
-                || p.profile_revision.trim().is_empty()
-                || !ids.insert(&p.profile_id)
-            {
-                return Err(Error::invalid(
-                    "check profiles need unique IDs and explicit revisions",
-                ));
-            }
-        }
-        Ok(())
+        let value = serde_json::to_value(self)?;
+        swarm_kernel::acceptance::validate_policy(&value).map_err(acceptance_validation_error)
     }
 }
 
@@ -66,55 +55,15 @@ pub struct AcceptRequest {
 impl AcceptRequest {
     pub fn parse(v: &Value) -> Result<Self> {
         let input: Self = serde_json::from_value(v.clone())?;
-        for field in [
-            "client_request_id",
-            "attempt_id",
-            "submission_ref",
-            "candidate_ref",
-            "reason",
-        ] {
-            model::text(v, field)?;
-        }
-        if input.expected_revision < 1 || input.expected_feedback_observation_id < 0 {
-            return Err(Error::invalid("acceptance revision/cursor is invalid"));
-        }
-        let mut ids = BTreeSet::new();
-        for r in &input.reviews {
-            if r.requirement_id.trim().is_empty()
-                || r.rationale.trim().is_empty()
-                || r.evidence.is_empty()
-                || r.evidence.iter().any(|s| s.trim().is_empty())
-                || !ids.insert(&r.requirement_id)
-            {
-                return Err(Error::invalid(
-                    "every reviewed requirement needs a unique ID, rationale and evidence",
-                ));
-            }
-        }
-        let mut checks = BTreeSet::new();
-        if input
-            .check_ids
-            .iter()
-            .any(|id| id.trim().is_empty() || !checks.insert(id))
-        {
-            return Err(Error::invalid("check IDs must be nonempty and unique"));
-        }
+        swarm_kernel::acceptance::validate_accept_request(v)
+            .map_err(acceptance_validation_error)?;
         Ok(input)
     }
     pub fn validate_coverage(&self, spec: &TaskSpec) -> Result<()> {
-        let expected: BTreeSet<_> = spec.requirements.iter().map(|r| r.id.as_str()).collect();
-        let actual: BTreeSet<_> = self
-            .reviews
-            .iter()
-            .map(|r| r.requirement_id.as_str())
-            .collect();
-        if expected != actual {
-            return Err(Error::new(
-                "REVIEW_INCOMPLETE",
-                "review must address exactly the frozen Task requirements",
-            ));
-        }
-        Ok(())
+        let spec = serde_json::to_value(spec)?;
+        let reviews = serde_json::to_value(&self.reviews)?;
+        swarm_kernel::acceptance::validate_review_coverage(&spec, &reviews)
+            .map_err(acceptance_validation_error)
     }
 }
 
@@ -130,13 +79,17 @@ impl InvalidateRequest {
     pub fn parse(v: &Value) -> Result<Self> {
         let input: Self = serde_json::from_value(v.clone())?;
         for field in ["client_request_id", "acceptance_operation_id", "reason"] {
-            model::text(v, field)?;
+            let _ = v
+                .get(field)
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| Error::invalid(format!("{field} must be a nonempty string")))?;
         }
-        if input.evidence.is_empty() || input.evidence.iter().any(|s| s.trim().is_empty()) {
-            return Err(Error::invalid(
-                "invalidation needs concrete evidence references",
-            ));
-        }
+        swarm_kernel::acceptance::validate_invalidation(v).map_err(acceptance_validation_error)?;
         Ok(input)
     }
+}
+
+fn acceptance_validation_error(error: swarm_kernel::acceptance::ValidationError) -> Error {
+    Error::new(error.code(), error.message())
 }

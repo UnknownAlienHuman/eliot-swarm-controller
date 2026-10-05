@@ -13,6 +13,10 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
+fn acceptance_validation_error(error: swarm_kernel::acceptance::ValidationError) -> Error {
+    Error::new(error.code(), error.message())
+}
+
 pub(super) fn feedback_cursor(db: &Connection, submission: &str) -> Result<i64> {
     Ok(db.query_row(
         "SELECT coalesce(max(observation_id),0) FROM observations WHERE kind='task.feedback' AND (json_extract(payload_json,'$.finding.submission_ref')=?1 OR json_extract(payload_json,'$.submission_ref')=?1)",
@@ -179,28 +183,17 @@ pub(super) fn freeze_baseline_candidate(
 }
 
 fn validate_dependencies(db: &Connection, attempt: &Value, spec: &TaskSpec) -> Result<()> {
-    let pins = attempt["task_snapshot"]["dependency_acceptances"]
-        .as_array()
-        .ok_or_else(|| {
-            Error::new(
-                "DEPENDENCY_EVIDENCE_MISSING",
-                "Attempt has no dependency receipt list",
-            )
-        })?;
-    if pins.len() != spec.dependencies.len() {
-        return Err(Error::new(
-            "DEPENDENCY_EVIDENCE_MISSING",
-            "dependency receipts do not cover the frozen Task",
-        ));
-    }
-    for dependency in &spec.dependencies {
-        let pin = pins
-            .iter()
-            .find(|p| p["task_id"] == dependency.task_id)
-            .ok_or_else(|| Error::new("DEPENDENCY_EVIDENCE_MISSING", &dependency.task_id))?;
-        let id = model::text(pin, "acceptance_operation_id")?;
-        let d = decision(db, id)?;
-        if revoked(db, id)?
+    let dependency_task_ids: Vec<&str> = spec
+        .dependencies
+        .iter()
+        .map(|dependency| dependency.task_id.as_str())
+        .collect();
+    let acceptance_ids =
+        swarm_kernel::acceptance::dependency_receipt_ids(attempt, &dependency_task_ids)
+            .map_err(acceptance_validation_error)?;
+    for (dependency, id) in spec.dependencies.iter().zip(acceptance_ids) {
+        let d = decision(db, &id)?;
+        if revoked(db, &id)?
             || d["task_id"] != dependency.task_id
             || d["task_revision"] != dependency.required_revision
             || d["phase"] != dependency.required_phase
@@ -273,15 +266,6 @@ impl AcceptActor<'_> {
     }
 }
 
-fn evidence_level(on_behalf: bool, has_checks: bool) -> &'static str {
-    match (on_behalf, has_checks) {
-        (false, false) => "operator_review",
-        (false, true) => "operator_review_with_checks",
-        (true, false) => "manager_review",
-        (true, true) => "manager_review_with_checks",
-    }
-}
-
 fn evidence(
     db: &Connection,
     actor: &AcceptActor<'_>,
@@ -293,29 +277,18 @@ fn evidence(
     let task_id = model::text(&a, "task_id")?;
     let t = tasks::get_task(db, task_id)?;
     actor.require_exact_scope(db, task_id, input)?;
-    if doc["attempt_id"] != input.attempt_id
-        || doc["task_revision"] != input.expected_revision
-        || doc["candidate_ref"] != input.candidate_ref
-        || a["submission_ref"] != input.submission_ref
-        || a["candidate_ref"] != input.candidate_ref
-        || a["task_revision"] != input.expected_revision
-        || t["revision"] != input.expected_revision
-        || t["current_attempt_id"] != input.attempt_id
-        || t["state"] != "open"
-        || !a["released_at_ms"].is_null()
-        || !matches!(a["state"].as_str(), Some("submitted" | "needs_correction"))
-    {
-        return Err(Error::new(
-            "STALE_SUBMISSION",
-            "acceptance no longer targets the current unreleased submission",
-        ));
-    }
-    if doc["owner_id"] == actor.reviewer_id() || doc["submitted_by"] == actor.reviewer_id() {
-        return Err(Error::new(
-            "INDEPENDENT_REVIEW_REQUIRED",
-            "the writer/submitter cannot accept its own proposal",
-        ));
-    }
+    swarm_kernel::acceptance::validate_submission_scope(
+        &doc,
+        &a,
+        &t,
+        &input.attempt_id,
+        input.expected_revision,
+        &input.submission_ref,
+        &input.candidate_ref,
+    )
+    .map_err(acceptance_validation_error)?;
+    swarm_kernel::acceptance::validate_reviewer_independence(&doc, actor.reviewer_id())
+        .map_err(acceptance_validation_error)?;
     if feedback_cursor(db, &input.submission_ref)? != input.expected_feedback_observation_id {
         return Err(Error::new(
             "REVIEW_CHANGED",
@@ -323,6 +296,9 @@ fn evidence(
         ));
     }
     let spec: TaskSpec = serde_json::from_value(a["task_snapshot"]["spec"].clone())?;
+    let spec_value = serde_json::to_value(&spec)?;
+    swarm_kernel::acceptance::validate_acceptance_required(&spec_value)
+        .map_err(acceptance_validation_error)?;
     let policy = spec.acceptance.as_ref().ok_or_else(|| {
         Error::new(
             "ACCEPTANCE_POLICY_REQUIRED",
@@ -332,15 +308,15 @@ fn evidence(
     input.validate_coverage(&spec)?;
     validate_dependencies(db, &a, &spec)?;
     let candidate = results::get(db, &input.candidate_ref)?;
-    if candidate.content_digest != doc["candidate_sha256"].as_str().unwrap_or("")
-        || Some(candidate.byte_length) != doc["candidate_byte_length"].as_u64()
-    {
-        return Err(Error::new(
-            "CANDIDATE_DAMAGED",
-            "candidate identity no longer matches the sealed submission",
-        ));
-    }
+    swarm_kernel::acceptance::validate_candidate_identity(
+        &candidate.content_digest,
+        candidate.byte_length,
+        doc["candidate_sha256"].as_str(),
+        doc["candidate_byte_length"].as_u64(),
+    )
+    .map_err(acceptance_validation_error)?;
     let mut files = vec![results::get(db, &input.submission_ref)?, candidate];
+    let policy_value = serde_json::to_value(policy)?;
     let mut profiles = BTreeSet::new();
     let mut checks = Vec::new();
     for id in &input.check_ids {
@@ -350,31 +326,15 @@ fn evidence(
         ).optional()?;
         let c: Value =
             serde_json::from_str(&raw.ok_or_else(|| Error::new("CHECK_NOT_READY", id))?)?;
-        let profile = model::text(&c["spec"], "profile_id")?;
-        let revision = model::text(&c["spec"], "profile_revision")?;
-        if !policy
-            .required_check_profiles
-            .iter()
-            .any(|r| r.profile_id == profile && r.profile_revision == revision)
-            || !profiles.insert(profile.to_owned())
-        {
-            return Err(Error::new(
-                "CHECK_PROFILE_MISMATCH",
-                "check does not match a unique required profile revision",
-            ));
-        }
-        if c["attempt_id"] != input.attempt_id
-            || c["candidate_ref"] != input.candidate_ref
-            || c["state"] != "passed"
-            || c["coverage"]["gaps"]
-                .as_array()
-                .is_none_or(|g| !g.is_empty())
-        {
-            return Err(Error::new(
-                "CHECK_NOT_READY",
-                "required check is not a complete pass for this Attempt/candidate",
-            ));
-        }
+        let profile = swarm_kernel::acceptance::validate_check(
+            &policy_value,
+            &c,
+            &input.attempt_id,
+            &input.candidate_ref,
+            &profiles,
+        )
+        .map_err(acceptance_validation_error)?;
+        profiles.insert(profile);
         let check_profile: CheckProfile = serde_json::from_value(c["spec"]["profile"].clone())
             .map_err(|_| Error::new("CHECK_EVIDENCE_MISSING", "check profile is malformed"))?;
         let expected_targets: Vec<String> =
@@ -393,28 +353,14 @@ fn evidence(
             &c["coverage"],
         )
         .map_err(|_| Error::new("CHECK_INCOMPLETE", "check parser coverage is incomplete"))?;
-        if c["spec"]["resolved_inputs"]["profile_identity"].is_object()
-            && c["spec"]["resolved_inputs"]["profile_identity"]["parser"]
-                != json!(check_profile.parser)
-        {
-            return Err(Error::new(
-                "CHECK_EVIDENCE_MISSING",
-                "check profile differs from its resolved identity",
-            ));
-        }
+        swarm_kernel::acceptance::validate_check_profile_identity(
+            &c["spec"]["resolved_inputs"],
+            &json!(check_profile.parser),
+        )
+        .map_err(acceptance_validation_error)?;
         let op = operations::get_operation(db, model::text(&c, "operation_id")?)?;
-        if op["method"] != "check.run"
-            || op["state"] != "settled"
-            || op["result"]["outcome"] != "applied"
-            || op["result"]["source_checkout_verified"] != true
-            || op["result"]["check_id"] != id.as_str()
-            || op["result"]["result_ref"] != c["result_ref"]
-        {
-            return Err(Error::new(
-                "CHECK_EVIDENCE_MISSING",
-                "check has no matching controller execution receipt",
-            ));
-        }
+        swarm_kernel::acceptance::validate_check_operation(&op, id, &c["result_ref"])
+            .map_err(acceptance_validation_error)?;
         if !c["cached_from"].is_null() {
             // Cache rows point directly at one original, completed process row.
             // Input identity is stable across Tasks/Attempts, so the full spec
@@ -453,39 +399,31 @@ fn evidence(
                     .ok_or_else(|| {
                         Error::new("CHECK_NOT_READY", "cached source process is missing")
                     })?;
-                if !source_spec["cache_source_acceptance"].is_null()
-                    || !source_spec["cached_from_check_id"].is_null()
-                    || source_spec["resolved_inputs"]["profile_identity"]["parser"]
-                        != json!(source_profile.parser)
-                    || !super::checks::valid_process_receipt(&source_process, &source_spec)
-                    || worker::validate_passed_coverage(
-                        &source_profile.parser,
-                        &source_targets,
-                        &source_spec["scope_plan"],
-                        &source_coverage,
-                    )
-                    .is_err()
-                {
-                    return Err(Error::new(
-                        "CHECK_NOT_READY",
-                        "cached source is not an original parser-complete process result",
-                    ));
-                }
+                let source_process_valid =
+                    super::checks::valid_process_receipt(&source_process, &source_spec);
+                let source_coverage_valid = worker::validate_passed_coverage(
+                    &source_profile.parser,
+                    &source_targets,
+                    &source_spec["scope_plan"],
+                    &source_coverage,
+                )
+                .is_ok();
+                swarm_kernel::acceptance::validate_cached_source(
+                    &source_spec,
+                    &json!(source_profile.parser),
+                    source_process_valid,
+                    source_coverage_valid,
+                )
+                .map_err(acceptance_validation_error)?;
             }
             let original = operations::get_operation(db, source)?;
-            let valid = source_candidate_ref.is_some()
-                && original["method"] == "check.run"
-                && original["state"] == "settled"
-                && original["result"]["cached"].is_null()
-                && original["result"]["cached_from_check_id"].is_null()
-                && original["result"]["output_refs"] == op["result"]["output_refs"]
-                && op["result"]["cached_from_check_id"] == source;
-            if !valid {
-                return Err(Error::new(
-                    "CHECK_NOT_READY",
-                    "cached process evidence is not valid",
-                ));
-            }
+            swarm_kernel::acceptance::validate_cached_operation(
+                source_candidate_ref.is_some(),
+                &original,
+                &op,
+                source,
+            )
+            .map_err(acceptance_validation_error)?;
             let source_candidate_ref = source_candidate_ref
                 .ok_or_else(|| Error::new("CHECK_NOT_READY", "cached process row disappeared"))?;
             let source_candidate = results::get(db, &source_candidate_ref)?;
@@ -533,12 +471,11 @@ fn evidence(
         }
         checks.push(c);
     }
-    if profiles.len() != policy.required_check_profiles.len() {
-        return Err(Error::new(
-            "CHECKS_REQUIRED",
-            "required machine checks are missing; a review cannot substitute for them",
-        ));
-    }
+    swarm_kernel::acceptance::validate_checks_complete(
+        profiles.len(),
+        policy.required_check_profiles.len(),
+    )
+    .map_err(acceptance_validation_error)?;
     let manifest: Vec<_> = files.iter().map(|f| json!({"artifact_id":f.artifact_id,"sha256":f.content_digest,"length":f.byte_length,"path":f.relative_path})).collect();
     Ok((
         json!({"task_id":a["task_id"],"phase":spec.phase,"policy":policy,"artifacts":manifest,"checks":checks,
@@ -568,23 +505,15 @@ fn reserve_with_actor(
             && !revoked(tx, prior)?
         {
             if actor.is_on_behalf() {
-                if t["revision"] != input.expected_revision
-                    || t["current_attempt_id"] != input.attempt_id
-                {
-                    return Err(Error::new(
-                        "STALE_SUBMISSION",
-                        "coalesced acceptance no longer targets the exact current Task and Attempt",
-                    ));
-                }
+                swarm_kernel::acceptance::validate_coalesced_scope(
+                    &t,
+                    input.expected_revision,
+                    &input.attempt_id,
+                )
+                .map_err(acceptance_validation_error)?;
                 let doc = submissions::document(tx, &input.submission_ref)?;
-                if doc["owner_id"] == actor.reviewer_id()
-                    || doc["submitted_by"] == actor.reviewer_id()
-                {
-                    return Err(Error::new(
-                        "INDEPENDENT_REVIEW_REQUIRED",
-                        "the writer/submitter cannot accept its own proposal",
-                    ));
-                }
+                swarm_kernel::acceptance::validate_reviewer_independence(&doc, actor.reviewer_id())
+                    .map_err(acceptance_validation_error)?;
             }
             if let Some(linkage) = actor.automation_linkage() {
                 let mut effective = json!({"request":v});
@@ -803,7 +732,7 @@ pub(super) fn finish(
         now,
         result,
         Some(&reviewer_id),
-        evidence_level(false, !input.check_ids.is_empty()),
+        swarm_kernel::acceptance::evidence_level(false, !input.check_ids.is_empty()),
     )?;
     tx.commit()?;
     Ok(())
@@ -844,7 +773,7 @@ pub(super) fn finish_on_behalf(db: &mut Connection, id: &str, verified: Result<(
         now,
         result,
         reviewer_id.as_deref(),
-        evidence_level(true, !input.check_ids.is_empty()),
+        swarm_kernel::acceptance::evidence_level(true, !input.check_ids.is_empty()),
     )?;
     tx.commit()?;
     Ok(())

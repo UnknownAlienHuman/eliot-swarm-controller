@@ -63,6 +63,52 @@ impl ModuleFailureStage {
             _ => None,
         }
     }
+
+    /// Recover a bounded phase for failures recorded before the host emitted
+    /// the status callback. The code is an identifier only; message/detail is
+    /// deliberately ignored so public observations never expose raw errors.
+    pub(crate) fn from_failure_code(code: &str) -> Option<Self> {
+        if code.starts_with("STORE_")
+            || code.starts_with("KERNEL_")
+            || code.starts_with("MODULE_READBACK_")
+            || matches!(
+                code,
+                "BINDING_CLOSED"
+                    | "KERNEL_ADMISSION_CLOSED"
+                    | "MODULE_CREDENTIAL_OPERATION_NOT_PENDING"
+            )
+        {
+            Some(Self::Store)
+        } else if code.starts_with("MODULE_CREDENTIAL_")
+            || code.starts_with("MODULE_RESOLVER_")
+            || matches!(code, "MODULE_SELECTION" | "MODULE_CAPABILITY_INVALID")
+        {
+            Some(Self::ResolveRefs)
+        } else if code.starts_with("MODULE_OWNER_SPAWN_") {
+            Some(Self::Spawn)
+        } else if code.starts_with("MODULE_WORKER_")
+            || matches!(
+                code,
+                "MODULE_EXITED" | "MODULE_NOT_ACTIVE" | "MODULE_SUPERVISOR_EXITED"
+            )
+        {
+            Some(Self::Worker)
+        } else if code == "MODULE_STATE_DIRECTORY"
+            || code == "MODULE_RESTART_HISTORY_INVALID"
+            || code == "MODULE_OWNER_STATE_UNSAFE"
+        {
+            Some(Self::Journal)
+        } else if code.starts_with("MODULE_OWNER_")
+            || code.starts_with("MODULE_LAUNCH_INTENT_")
+            || code.starts_with("MODULE_LAUNCH_RESULT_")
+        {
+            Some(Self::Owner)
+        } else if code.starts_with("MODULE_") {
+            Some(Self::ValidateLaunch)
+        } else {
+            None
+        }
+    }
 }
 
 /// A bounded, status-only Store callback. `event_id` is stable for retries of
@@ -140,6 +186,11 @@ impl ModuleSupervisorObservation {
                 "module observation error code is outside its closed safe format",
             ));
         }
+        let stage = status.failure_stage.or_else(|| {
+            error_code
+                .as_deref()
+                .and_then(ModuleFailureStage::from_failure_code)
+        });
         Ok(Self {
             schema_version: 1,
             actor_instance_id: actor_instance_id.to_owned(),
@@ -153,7 +204,7 @@ impl ModuleSupervisorObservation {
             boot_id,
             phase: ModuleSupervisorPhase::from_status(status),
             effect_certainty: status.effect_certainty,
-            stage: status.failure_stage,
+            stage,
             error_code,
             unknown_operation_ids,
             unknown_operation_count: status.unknown_operation_count,

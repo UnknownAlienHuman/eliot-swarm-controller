@@ -837,12 +837,40 @@ fn delegate_to_host(arguments: &[OsString]) -> ExitCode {
     } else {
         "swarm-host"
     });
+    let sibling_is_file = executable.is_file();
     match ProcessCommand::new(&executable).args(arguments).status() {
-        Ok(status) => ExitCode::from(status.code().unwrap_or(1).clamp(0, 255) as u8),
-        Err(_) => {
+        Ok(status) if status.success() => ExitCode::SUCCESS,
+        Ok(status) => {
             eprintln!(
                 "{}",
-                json!({"error":{"code":"HOST_BINARY_MISSING","message":"this explicit local command requires the matching swarm-host sibling beside swarm"}})
+                json!({"error":{"code":"HOST_COMMAND_FAILED","message":"the explicit host command exited unsuccessfully","exit_code":status.code()}})
+            );
+            // Windows exception statuses can be negative i32 values. Never
+            // clamp an unsuccessful child exit to zero and report success.
+            ExitCode::from(
+                status
+                    .code()
+                    .and_then(|code| u8::try_from(code).ok())
+                    .filter(|code| *code != 0)
+                    .unwrap_or(1),
+            )
+        }
+        Err(error) => {
+            let (code, message) =
+                if error.kind() == std::io::ErrorKind::NotFound && !sibling_is_file {
+                    (
+                        "HOST_BINARY_MISSING",
+                        "install the swarm-host sibling beside the public swarm executable and retry",
+                    )
+                } else {
+                    (
+                        "HOST_START_FAILED",
+                        "check the host executable, runtime dependencies and launch permissions, then retry",
+                    )
+                };
+            eprintln!(
+                "{}",
+                json!({"error":{"code":code,"message":message}})
             );
             ExitCode::FAILURE
         }

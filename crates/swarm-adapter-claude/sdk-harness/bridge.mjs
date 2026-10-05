@@ -3,7 +3,8 @@
 // The live SDK WarmQuery, query stream, and input iterator must remain in Node.
 // Operation matching, session adoption, receipts, and readback are Rust-owned.
 // This process never connects to the Store and only emits a bounded metadata
-// projection; prompt, transcript, tool arguments, and result text stay local.
+// projection; prompt, transcript, and tool arguments stay local. A bounded
+// final result body is emitted only when it fits the result boundary.
 import { createInterface } from 'node:readline';
 import { createHash } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
@@ -13,6 +14,7 @@ import { prepareQuery } from './prepared-query.mjs';
 
 const MAX_INPUT_BYTES = 1_100_000;
 const MAX_OUTPUT_BYTES = 700_000;
+const MAX_RESULT_BODY_BYTES = 512_000;
 const MAX_INPUT_QUEUE = 64;
 const PERMISSION_MODES = ['default', 'acceptEdits', 'bypassPermissions', 'plan', 'dontAsk', 'auto'];
 const DENY_MESSAGE = 'Denied by the Rust Claude adapter: this artifact has no permission-reply capability.';
@@ -132,6 +134,15 @@ function safeSdkFrame(message) {
     const output = typeof message.result === 'string' ? message.result : null;
     frame.result_sha256 = output === null ? null : createHash('sha256').update(output, 'utf8').digest('hex');
     frame.result_bytes = output === null ? null : Buffer.byteLength(output, 'utf8');
+    if (output === null) {
+      frame.result_body_available = false;
+    } else if (frame.result_bytes <= MAX_RESULT_BODY_BYTES) {
+      frame.result_content_base64 = Buffer.from(output, 'utf8').toString('base64');
+      frame.result_body_available = true;
+    } else {
+      frame.result_body_available = false;
+      frame.result_body_truncated = true;
+    }
   }
   return frame;
 }
@@ -158,8 +169,8 @@ function captureSubagentHook(subtype) {
 async function pump(sess) {
   try {
     for await (const message of sess.query) {
-      // Raw SDK content remains in the SDK process. Rust receives only bounded
-      // identity and result-digest metadata, then owns receipt correlation.
+      // Raw SDK content remains in the SDK process except for the bounded final
+      // result body; Rust owns receipt correlation and verifies its digest.
       if (message?.type !== 'stream_event') emit({ kind: 'sdk_frame', frame: safeSdkFrame(message) });
     }
   } catch {

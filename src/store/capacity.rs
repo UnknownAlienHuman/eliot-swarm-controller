@@ -1150,6 +1150,132 @@ fn attention_item(
     })
 }
 
+fn safe_health_code(value: &Value) -> Option<&str> {
+    value.as_str().filter(|code| {
+        !code.is_empty()
+            && code.len() <= 64
+            && code
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+    })
+}
+
+/// Surface existing independent-worker health through the same read-only
+/// Manager attention projection used by binding observations. These facts
+/// already have bounded Store projections; this helper adds no journal, queue,
+/// retry, or ownership mutation.
+fn append_independent_module_attention(
+    db: &Connection,
+    now: i64,
+    items: &mut Vec<Value>,
+) -> Result<()> {
+    let lifecycle = super::host_lifecycle::status(db)?;
+    if lifecycle["latest_failure"]["manager_action_required"] == true
+        && let Some(error_code) = safe_health_code(&lifecycle["latest_failure"]["error_code"])
+    {
+        let observed_at_ms = lifecycle["latest_failure"]["observed_at_ms"].as_i64();
+        let stale = observed_at_ms
+            .map(|observed| now.saturating_sub(observed) > STALE_AFTER_MS)
+            .unwrap_or(true);
+        items.push(attention_item(
+            "host_failure",
+            "host:lifecycle",
+            None,
+            None,
+            json!({
+                "error_code":error_code,
+                "failed_supervisor":lifecycle["latest_failure"]["failed_supervisor"],
+                "failure_category":lifecycle["latest_failure"]["failure_category"],
+                "observed_at_ms":observed_at_ms,
+                "retry_authorized":false,
+                "next_step":"read host.status and retain affected ownership until the required supervisor or Store recovery is explicit",
+            }),
+            attention_source("host_lifecycle", observed_at_ms, stale),
+            json!({"method":"host.status"}),
+            true,
+        ));
+    }
+    if let Some(workers) = lifecycle["optional_workers"].as_object() {
+        let mut names = workers.keys().map(|name| name.as_str()).collect::<Vec<_>>();
+        names.sort_unstable();
+        for name in names {
+            let health = &workers[name];
+            let state = health["state"].as_str();
+            let Some(error_code) = safe_health_code(&health["last_error_code"]) else {
+                continue;
+            };
+            if !matches!(state, Some("retry_wait" | "isolated")) {
+                continue;
+            }
+            let observed_at_ms = health["updated_at_ms"].as_i64();
+            let stale = observed_at_ms
+                .map(|observed| now.saturating_sub(observed) > STALE_AFTER_MS)
+                .unwrap_or(true);
+            let scope_key = format!("host:optional:{name}");
+            items.push(attention_item(
+                "optional_module_failure",
+                &scope_key,
+                None,
+                None,
+                json!({
+                    "module_id":name,
+                    "state":state,
+                    "error_code":error_code,
+                    "consecutive_failures":health["consecutive_failures"],
+                    "retry_after_ms":health["retry_after_ms"],
+                    "retry_authorized":false,
+                    "next_step":"read host.status for this bounded worker health and await its recorded retry or changed configuration",
+                }),
+                attention_source("host_lifecycle", observed_at_ms, stale),
+                json!({"method":"host.status"}),
+                true,
+            ));
+        }
+    }
+
+    let bus_health = super::bus_kernel::managed_health_projection(db)?;
+    if let Some(services) = bus_health.as_array() {
+        for health in services {
+            let Some(service_key) = health["service_key"].as_str() else {
+                continue;
+            };
+            let state = health["state"].as_str();
+            let owner_state = health["owner_state"].as_str();
+            let error_code = safe_health_code(&health["last_error_code"]);
+            let owner_uncertain = matches!(owner_state, Some("launch_uncertain" | "unknown"));
+            let state_degraded = matches!(state, Some("retry_wait" | "isolated" | "unknown"));
+            if !owner_uncertain && (error_code.is_none() || !state_degraded) {
+                continue;
+            }
+            let observed_at_ms = health["updated_at_ms"].as_i64();
+            let stale = observed_at_ms
+                .map(|observed| now.saturating_sub(observed) > STALE_AFTER_MS)
+                .unwrap_or(true);
+            let scope_key = format!("managed-bus:{service_key}");
+            items.push(attention_item(
+                "managed_bus_failure",
+                &scope_key,
+                None,
+                None,
+                json!({
+                    "service_key":service_key,
+                    "state":state,
+                    "owner_state":owner_state,
+                    "error_code":error_code,
+                    "consecutive_failures":health["consecutive_failures"],
+                    "retry_after_ms":health["retry_after_ms"],
+                    "retry_authorized":false,
+                    "next_step":"read host.status for this managed service and retain the owner until its exact readback is resolved",
+                }),
+                attention_source("managed_bus_health", observed_at_ms, stale),
+                json!({"method":"host.status"}),
+                true,
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Builds every attention item the recorded facts support. The kinds
 /// are those of §8.3; an item exists only when an exact recorded fact
 /// addresses it — a native request by its recorded ID and fingerprint,
@@ -1157,6 +1283,7 @@ fn attention_item(
 /// native input ID, a scope by its recorded capacity facts.
 fn build_attention_items(db: &Connection, now: i64) -> Result<Vec<Value>> {
     let mut items: Vec<Value> = Vec::new();
+    append_independent_module_attention(db, now, &mut items)?;
     let mut stmt = db.prepare(
         "SELECT binding_id,generation FROM bindings WHERE released_at_ms IS NULL ORDER BY binding_id,generation",
     )?;

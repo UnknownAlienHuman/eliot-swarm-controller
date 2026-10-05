@@ -7,9 +7,18 @@ This runbook covers the standalone adapter packages, independent frontend binari
 New OpenCode and Command Code qualification runs use
 `inclusionai/ling-3.1-flash`. Pass that exact reference to
 `New-NativeQualification.ps1 -OpenCodeCommandTestModelRef inclusionai/ling-3.1-flash`
-and verify the selected native provider exposes it before invocation. Bunny is
-disabled for new runs; historical receipts retain their original model identity.
-Other harnesses keep their own explicitly supported provider/model contract.
+as a selector. For OpenCode, the configured route is accepted only when its
+actual `id` equals that full reference or its exact `providerID/id` composite
+equals it; the harness records the route's actual provider and model and never
+infers a provider from the reference. The launch fixture's `requested_model`
+remains the route's actual `id`, matching Store launch admission. Before
+creating a native session, `agent.open` reads the current OpenCode model catalog and checks that exact
+provider/model/variant. If the native catalog does not contain the selected
+model, the operation fails before the harness sends its single task input.
+Bunny is disabled for new runs; historical receipts retain their original
+model identity. Command retains exact whole-string model matching. Claude's
+version-4 source is present, but the current native qualification entrypoint
+still blocks Claude until its route-specific contract is integrated.
 
 Build only the selected package, using a caller-owned shared target directory. The package/binary pairs are:
 
@@ -207,7 +216,7 @@ $PackageExecutable = Join-Path $WorkerOutput 'bin\swarm-automation-worker.exe'
 $Installer = '.\tools\modules\Install-StandaloneWorker.ps1'
 $installed = & $Installer `
   -WorkerCoordinate swarm-automation-worker `
-  -HostExecutable 'C:\Program Files\Eliot Swarm\swarm.exe' `
+  -HostExecutable 'C:\Program Files\Eliot Swarm\swarm-host.exe' `
   -PackageExecutable $PackageExecutable -WhatIf
 $installed
 ```
@@ -275,11 +284,40 @@ keep their admitted backend. The standalone worker starts after Store admission,
 reports readiness and waits for Store Go before launching the interpreter.
 It cannot apply controller effects. An invalid selected image cannot fall back.
 
+## Build and install the managed bus dispatcher
+
+Build package `swarm-bus` with the existing module package builder, using the
+same external shared Cargo target directory and a new explicit output directory.
+Pass its `bin/swarm-bus-dispatcher.exe` to
+`tools/modules/Install-BusDispatcher.ps1 -PackageExecutable <absolute-dispatcher.exe>
+-InstallDirectory <existing-absolute-directory>`. Use `-WhatIf` to preview.
+The installer verifies the exact release package, clean source manifest,
+dependency graph scope, binary target, length and the dispatcher's own image
+SHA-256. Identical installed bytes are a no-op; different bytes are rejected.
+It does not edit configuration, create a registration record, restart, or
+launch the dispatcher. The returned `sha256` is the pin for the selected
+dispatcher artifact; it is not compared with an unrelated host or worker
+artifact.
+
+Configure the returned values explicitly:
+
+```toml
+[bus_supervisor]
+enabled = true
+dispatcher_executable = 'C:\ELIOT\artifacts\swarm-bus-dispatcher.exe'
+dispatcher_sha256 = '<64-lowercase-hex-digest-returned-by-installer>'
+```
+
+The supervisor starts this image only for an explicitly managed, ready Store
+registration and keeps the dispatcher lifecycle isolated. Installing the
+binary and setting its pin do not create that registration or qualify a live
+bus service.
+
 ## Package the host with source provenance
 
 `tools/ci/Build-SwarmHostProvenance.ps1 -TargetDir <existing-shared-target>
 -OutputDir <new-package-directory>` manually builds only the release host package
-through the existing builder. It emits `bin/swarm.exe` and the source/build/image
+through the existing builder. It emits `bin/swarm-host.exe` and the source/build/image
 manifest used to bind a qualification run to an exact artifact. Normal source
 pushes do not invoke this release entrypoint. The caller supplies the existing
 shared target directory; no separate worker or worktree build cache is required.
@@ -292,19 +330,30 @@ Select one package and profile; host and frontends require `release`. All choice
 use one runner shared target directory and produce one package manifest.
 Library-only scheduler/supervisor crates are not executable selections.
 For current-source native qualification, use
-`tools/qualification/New-NativeQualification.ps1` with explicit host/module
-build-manifest and image hashes, installed descriptor and private configuration.
-The harness uses a fresh DataRoot, protects unrelated/current Codex processes
-and sends a native input once. Unknown effects use bounded readback rather
-than another send. Source/manifest consistency is recorded separately from
-the actual runtime result.
+`tools/qualification/New-NativeQualification.ps1` with separate explicit
+`-HostExecutable`, `-ExpectedHostSha256`, `-HostBuildManifestPath`,
+`-ExpectedHostBuildManifestSha256` and `-PublicCliExecutable`,
+`-ExpectedPublicCliSha256`, `-PublicCliBuildManifestPath`,
+`-ExpectedPublicCliBuildManifestSha256` arguments, plus the installed module
+descriptor, module manifest, and private configuration inputs. The host image
+is `swarm-host.exe`; the public CLI is `swarm.exe` and is staged beside its
+required host sibling. Their manifests and image hashes are independently
+pinned; the CLI and host may have different source revisions. The installed
+module still has to match the host's retained build-set contract. The harness
+starts the host directly, uses the public CLI for ordinary IPC, creates a fresh
+DataRoot, protects unrelated/current Codex processes, and submits one native
+input. Unknown effects use bounded readback rather than another send.
+Source/manifest consistency is recorded separately from the runtime result.
 
 `tools/qualification/Invoke-CoreFailureQualification.ps1` uses an explicitly
-pinned host and a fresh private DataRoot for lost-caller-ACK, request-conflict and
-optional HookSource deduplication checks. Its independent Manager readback must
-prove admission before graceful restart. It never treats a missing caller reply
-as a native-effect unknown outcome, injects a vendor effect, or stops another
-host. Source availability and AST validation do not establish a passing run.
+pinned `-HostExecutable` and `-PublicCliExecutable` with their independent image
+hashes and build manifests. It starts only the host image directly; the public
+CLI handles Manager operations, ordinary IPC, and independent readback. It uses
+a fresh private DataRoot for lost-caller-ACK, request-conflict and optional
+HookSource deduplication checks. Readback must prove admission before graceful
+restart. The harness never treats a missing caller reply as a native-effect
+unknown outcome, injects a vendor effect, or stops another host. Source
+availability and AST validation do not establish a passing run.
 
 The checks executor is a separate optional process pin, not a module descriptor. Build package `swarm-checks` and configure its binary using `[checks.executor]`. Checks default disabled, and the executor pin defaults absent:
 

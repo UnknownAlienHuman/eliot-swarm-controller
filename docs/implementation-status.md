@@ -13,8 +13,10 @@ through its existing queue; late facade submissions return `STORE_CLOSED`.
 Task specification, source-index, revision, claim and release validation now use
 `swarm_kernel::tasks`. Structured Review results, requirement coverage and
 disposition validation now use `swarm_kernel::reviews`; Store retains
-authorization, SQLite and receipts. Acceptance extraction and the independent
-kernel executable remain unfinished.
+authorization, SQLite and receipts. `swarm_kernel::acceptance` now validates
+serialized policy and deterministic candidate/check/review facts at the existing
+Store boundaries. Store retains current GM/epoch and file-evidence checks. The
+independent kernel executable remains unfinished.
 
 `swarm-mcp`, `swarm-cli` and `swarm-gateway` are real independent Cargo packages.
 Their resolved dependency closures contain no controller, adapter, Store, kernel
@@ -25,6 +27,9 @@ readback; HookSource retains its existing durable-ack retry contract. The public
 the separate `swarm-host` sibling. Ordinary requests do not start it. Gateway
 remains optional and disabled by default; launcher failures retain their exit
 status and installation guidance.
+The public CLI reports host launch failures separately from a missing sibling
+and records unsuccessful child exits. Windows exception exit codes remain
+failures rather than being clamped to a successful zero exit.
 
 Frontend tooling records each artifact's own source, dependency and image pins.
 Sibling compatibility checks the actual IPC protocol, target triple and launch
@@ -41,6 +46,12 @@ before resuming readback. Replacement requires committed whole-family departure;
 host shutdown leaves an admitted live family available for adoption. Legacy
 receipts without these proofs remain held. These source changes do not start the
 bus and have no current native qualification.
+Manager attention now includes recorded host, optional-worker and managed-bus
+failures. Stale module readback and startup/ownership errors retain bounded typed
+stages through the existing observations. Attention does not authorize replay or
+claim departure. Descriptor-selected observations compare the retained module
+selector and artifact rather than equating an opaque module ID with a harness
+label.
 
 Command version 3 provides exact durable status/failure readback. It continues to
 report `execution_complete=false`, `native_response_identity=unavailable` and
@@ -63,8 +74,17 @@ typed argv marker. Command version 3 uses the same host connection mechanism.
 `agent.refresh` reads a bounded cache for the exact SDK session. The SDK bridge
 now captures bounded task and subagent lifecycle metadata with exact parent links
 when the SDK supplies them. Cache and page limits report truncation. Claude
-remains disabled and reports partial family completeness; runtime qualification
-and productive result capture remain pending.
+remains disabled and reports partial family completeness. The adapter retains a
+bounded terminal SDK result body, correlates its actual input UUID and submitted
+payload digest to the retained dispatch, and exposes exact result pages through
+`agent.result`. Store capture and Participant submission wiring remain in
+progress. An SDK invocation result does not complete the Task or prove process
+family departure. The source descriptor and disabled
+route identify `claude-agent-sdk-0.3.287-rust-controller.4` (version 4).
+This status does not assert an installed image, selected version-4 route, or
+native execution receipt; those still require separate evidence. The current
+native qualification entrypoint also blocks Claude as unsupported until its
+version-4 route and receipt contract is integrated.
 
 The source also records a bounded cancellation-control diagnostic in the existing
 ScriptRun Operation result. It binds the private receipt to the exact run,
@@ -86,6 +106,16 @@ only after the worker enters its service group. These handlers retain their own
 transactions; the shared due page does not create a cross-source transaction.
 The package builder and adjacent, create-only installer now cover the standalone
 automation worker, retaining its own build and image provenance.
+
+CheckRun admission retains the selected standalone executor in the existing
+immutable run specification. The worker reconstructs that selection after a
+host restart instead of switching queued work to the current configuration.
+Historical rows without an executor retain their legacy route. Supervisor
+descriptor replacements inherit the same per-service demand gate; slow
+readiness and ownership checks no longer hold the registry-wide mutex.
+The bus installer follows the existing adjacent, create-only worker contract.
+Scoped CI and explicit release builds use validated external Cargo targets;
+only the preserved Atlas snapshot bypasses Cargo package seed resolution.
 
 An authenticated Manager can publish `event.emit` with bounded immutable payload,
 project, cause and deduplication identity. The existing Observation/Operation
@@ -217,7 +247,9 @@ HookSource deduplication cases. A separate Manager must prove the exact admitted
 Task/Operation before graceful host restart and read the same IDs afterward.
 A lost caller ACK is not presented as a native-effect `outcome_unknown`.
 The harness has not been executed and does not prove optional-worker crash or
-uncertain external-effect recovery. No tests or model calls ran in this batch.
+uncertain external-effect recovery. It requires separately pinned `swarm-host`
+and public `swarm` CLI images; the host is started directly and the public CLI
+performs ordinary RPC and readback. No tests or model calls ran in this batch.
 
 ### PR #25 durable bus wiring and launch/install closure — 2026-10-05
 
@@ -275,8 +307,13 @@ the retained plan and proving whole-family departure even if the private worker
 result is absent or malformed. Wrong-scope evidence blocks readback with a
 durable reason. Unknown native writes are never replayed. The source-only
 `tools/qualification/New-NativeQualification.ps1` harness verifies explicit
-image/manifest pins and trusted descriptors before a fresh Manager workflow;
-its presence does not establish a successful qualification run.
+host, public CLI, and module image/manifest pins and trusted descriptors before
+a fresh Manager workflow. The independently pinned public CLI communicates with
+the directly started host. For OpenCode, its `agent.open` path checks the current
+native model catalog against the exact route provider/model/variant before
+creating a session; qualification still requires a successful native run and
+Manager readback. The harness source does not establish a successful
+qualification run.
 
 CI [37356657538](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37356657538)
 for `410c327` passed formatting, documentation and tooling checks, then stopped

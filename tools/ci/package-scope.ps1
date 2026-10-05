@@ -82,13 +82,17 @@ function Get-Classification([string[]] $Paths) {
     $docsOnly = $Paths.Count -gt 0 -and $productPaths.Count -eq 0
 
     $rustChanged = @($Paths | Where-Object {
-        $_ -match '\.rs$' -or
-        $_ -match '(^|/)Cargo\.(toml|lock)$' -or
-        $_ -match '(^|/)rust-toolchain(\.toml)?$' -or
-        $_ -match '^\.cargo/' -or
-        $_ -match '^migrations/.*\.(sql|toml)$'
+        $_ -notmatch '^vendor/atlas/' -and (
+            $_ -match '\.rs$' -or
+            $_ -match '(^|/)Cargo\.(toml|lock)$' -or
+            $_ -match '(^|/)rust-toolchain(\.toml)?$' -or
+            $_ -match '^\.cargo/' -or
+            $_ -match '^migrations/.*\.(sql|toml)$'
+        )
     }).Count -gt 0
-    $testsChanged = @($productPaths | Where-Object { $_ -match '(^|/)tests/' }).Count -gt 0
+    $testsChanged = @($productPaths | Where-Object {
+        $_ -notmatch '^vendor/atlas/' -and $_ -match '(^|/)tests/'
+    }).Count -gt 0
     $toolingChanged = @($Paths | Where-Object {
         $_ -eq 'Justfile' -or
         $_ -match '^tools/' -or
@@ -220,7 +224,7 @@ function Get-LocalPackageGraph {
     }
 
     $memberIds = @($metadata.workspace_members)
-    $vendorRoot = Get-FullPath 'vendor'
+    $vendorRoot = Get-FullPath 'vendor/atlas'
     $entries = @(
         foreach ($package in @($metadata.packages)) {
             if ($memberIds -contains [string]$package.id) {
@@ -321,6 +325,8 @@ function Resolve-PackageScope($Changes, $Classification) {
     $graph = Get-LocalPackageGraph
     $seeds = [Collections.Generic.HashSet[string]]::new()
     $testPackageIds = [Collections.Generic.HashSet[string]]::new()
+    $vendorRoot = Get-FullPath 'vendor'
+    $nonVendorRustChange = $false
 
     if ($Classification.GlobalCargoChange) {
         foreach ($entry in $graph.Entries) { [void]$seeds.Add($entry.Id) }
@@ -333,6 +339,10 @@ function Resolve-PackageScope($Changes, $Classification) {
             })
             foreach ($relativePath in $rustPaths) {
                 $absolutePath = Get-FullPath $relativePath
+                if (Test-PathWithin $absolutePath $vendorRoot) {
+                    continue
+                }
+                $nonVendorRustChange = $true
                 $workspaceMatches = @($graph.Entries | Where-Object {
                     Test-PathWithin $absolutePath $_.Directory
                 } | Sort-Object { $_.Directory.Length } -Descending)
@@ -361,6 +371,10 @@ function Resolve-PackageScope($Changes, $Classification) {
         $_ -match '(^|/)tests/' -and $_ -notmatch '\.md$'
     })) {
         $absolutePath = Get-FullPath $relativePath
+        if (Test-PathWithin $absolutePath $vendorRoot) {
+            continue
+        }
+        $nonVendorRustChange = $true
         $workspaceMatches = @($graph.Entries | Where-Object {
             Test-PathWithin $absolutePath $_.Directory
         } | Sort-Object { $_.Directory.Length } -Descending)
@@ -372,6 +386,14 @@ function Resolve-PackageScope($Changes, $Classification) {
         [void]$seeds.Add($testPackageId)
     }
     if ($seeds.Count -eq 0) {
+        if (-not $nonVendorRustChange) {
+            return [pscustomobject]@{
+                FormatPackages = @()
+                ClippyPackages = @()
+                TestTargets = @()
+                WorkspaceWide = $false
+            }
+        }
         throw 'Rust-relevant changes produced no package seed; refusing a guessed scope.'
     }
 

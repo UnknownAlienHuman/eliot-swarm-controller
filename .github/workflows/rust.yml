@@ -159,6 +159,12 @@ jobs:
           rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy --no-self-update
           rustc --version
           cargo --version
+      - name: Prepare one external target for scoped Cargo jobs
+        shell: pwsh
+        run: |
+          $sharedTargetDir = Join-Path $env:RUNNER_TEMP 'eliot-scoped-rust-shared-target'
+          & pwsh -NoProfile -File tools/ci/package-scope.ps1 -Stage ValidateTarget -TargetDir $sharedTargetDir
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Formatting (selected packages only; vendor snapshots excluded)
         shell: pwsh
         env:
@@ -179,7 +185,8 @@ jobs:
         run: |
           $packages = @($env:PACKAGE_SPECS | ConvertFrom-Json)
           if ($packages.Count -gt 0) {
-            $arguments = @('clippy', '--locked', '--lib', '--bins', '--no-deps')
+            $sharedTargetDir = Join-Path $env:RUNNER_TEMP 'eliot-scoped-rust-shared-target'
+            $arguments = @('clippy', '--locked', '--lib', '--bins', '--no-deps', '--target-dir', $sharedTargetDir)
             foreach ($package in $packages) { $arguments += @('--package', [string]$package) }
             $arguments += @('--', '-D', 'warnings')
             & cargo @arguments
@@ -192,8 +199,9 @@ jobs:
           TEST_TARGETS: ${{ needs.scope.outputs.test_targets }}
         run: |
           $targets = @($env:TEST_TARGETS | ConvertFrom-Json)
+          $sharedTargetDir = Join-Path $env:RUNNER_TEMP 'eliot-scoped-rust-shared-target'
           foreach ($target in $targets) {
-            & cargo test --locked --package $target.package --test $target.target
+            & cargo test --locked --package $target.package --test $target.target --target-dir $sharedTargetDir
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
 
@@ -311,9 +319,15 @@ jobs:
           bun test native-mcp-proof.test.mjs
           node selftest.mjs
       - name: Build
+        shell: pwsh
         run: |
-          cargo build --locked --release --package swarm-cli --bin swarm
-          cargo build --locked --release --package eliot-swarm-controller --bin swarm-host
+          $sharedTargetDir = Join-Path $env:RUNNER_TEMP 'eliot-full-rust-shared-target'
+          & pwsh -NoProfile -File tools/ci/package-scope.ps1 -Stage ValidateTarget -TargetDir $sharedTargetDir
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & cargo build --locked --release --package swarm-cli --bin swarm --target-dir $sharedTargetDir
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & cargo build --locked --release --package eliot-swarm-controller --bin swarm-host --target-dir $sharedTargetDir
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Record build inputs
         if: always()
         shell: bash
@@ -350,7 +364,7 @@ jobs:
             modules/opencode/package*.json
             vendor/atlas/
             build-info/
-            target/release/swarm
-            target/release/swarm.exe
-            target/release/swarm-host
-            target/release/swarm-host.exe
+            ${{ runner.temp }}/eliot-full-rust-shared-target/release/swarm
+            ${{ runner.temp }}/eliot-full-rust-shared-target/release/swarm.exe
+            ${{ runner.temp }}/eliot-full-rust-shared-target/release/swarm-host
+            ${{ runner.temp }}/eliot-full-rust-shared-target/release/swarm-host.exe

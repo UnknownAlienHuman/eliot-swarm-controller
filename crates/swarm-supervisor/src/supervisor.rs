@@ -563,54 +563,28 @@ impl SupervisorRegistry {
             module_id: descriptor.module_id.to_string(),
             scope: scope.clone(),
         };
-        let service = {
-            let mut services = self.services.lock().await;
-            if let Some(existing) = services.get(&key).cloned() {
-                let wanted = descriptor_fingerprint(
-                    &descriptor,
-                    &launch_config,
-                    &module_client_id,
-                    claim.protocol,
-                )?;
-                if existing.descriptor_fingerprint != wanted {
-                    if !existing.can_replace_descriptor().await {
-                        return Err(Error::new(
-                            "MODULE_UPDATE_DEFERRED",
-                            "the previous module artifact or its native owner is still active",
-                        ));
-                    }
-                    existing.clear_restart_history()?;
-                    let replacement = Arc::new(Service::new(ServiceInitialization {
-                        descriptor: Arc::new(descriptor.clone()),
-                        descriptor_fingerprint: wanted,
-                        scope: scope.clone(),
-                        state_dir: service_state_dir(&self.state_root, &descriptor, &scope)?,
-                        state_root: self.state_root.clone(),
-                        host_data_dir: self.ipc_root.clone(),
-                        ipc: self.ipc.clone(),
-                        launch_config: launch_config.clone(),
-                        module_client_id: module_client_id.clone(),
-                        protocol: claim.protocol,
-                        module_contract_json: contract_json.clone(),
-                        owner_executable: self.owner_executable.clone(),
-                        resolver: self.resolver.clone(),
-                        admission: self.admission.clone(),
-                    }));
-                    services.insert(key, replacement.clone());
-                    replacement
-                } else {
-                    existing
-                }
-            } else {
-                let digest = descriptor_fingerprint(
-                    &descriptor,
-                    &launch_config,
-                    &module_client_id,
-                    claim.protocol,
-                )?;
-                let service = Arc::new(Service::new(ServiceInitialization {
+        let wanted = descriptor_fingerprint(
+            &descriptor,
+            &launch_config,
+            &module_client_id,
+            claim.protocol,
+        )?;
+
+        // Descriptor replacement may wait for a per-scope lifecycle runner and
+        // private owner receipts. Never hold the registry-wide map mutex over
+        // that wait: a retained or faulted scope must not head-of-line block
+        // unrelated module scopes. The shared per-scope gate keeps every
+        // descriptor generation's replacement and demand linearizable while
+        // different scopes proceed.
+        loop {
+            let existing = {
+                let services = self.services.lock().await;
+                services.get(&key).cloned()
+            };
+            let Some(existing) = existing else {
+                let candidate = Arc::new(Service::new(ServiceInitialization {
                     descriptor: Arc::new(descriptor.clone()),
-                    descriptor_fingerprint: digest,
+                    descriptor_fingerprint: wanted.clone(),
                     scope: scope.clone(),
                     state_dir: service_state_dir(&self.state_root, &descriptor, &scope)?,
                     state_root: self.state_root.clone(),
@@ -619,17 +593,66 @@ impl SupervisorRegistry {
                     launch_config: launch_config.clone(),
                     module_client_id: module_client_id.clone(),
                     protocol: claim.protocol,
-                    module_contract_json: contract_json,
+                    module_contract_json: contract_json.clone(),
                     owner_executable: self.owner_executable.clone(),
                     resolver: self.resolver.clone(),
                     admission: self.admission.clone(),
+                    demand_gate: Arc::new(AsyncMutex::new(())),
                 }));
-                services.insert(key, service.clone());
-                service
-            }
-        };
+                let mut services = self.services.lock().await;
+                services.entry(key.clone()).or_insert(candidate);
+                continue;
+            };
 
-        service.demand(cause, readback).await
+            let _gate = existing.demand_gate.lock().await;
+            let current = {
+                let services = self.services.lock().await;
+                services.get(&key).cloned()
+            };
+            if current
+                .as_ref()
+                .is_none_or(|current| !Arc::ptr_eq(current, &existing))
+            {
+                continue;
+            }
+            if existing.descriptor_fingerprint != wanted {
+                if !existing.can_replace_descriptor().await {
+                    return Err(Error::new(
+                        "MODULE_UPDATE_DEFERRED",
+                        "the previous module artifact or its native owner is still active",
+                    ));
+                }
+                existing.clear_restart_history()?;
+                let replacement = Arc::new(Service::new(ServiceInitialization {
+                    descriptor: Arc::new(descriptor.clone()),
+                    descriptor_fingerprint: wanted.clone(),
+                    scope: scope.clone(),
+                    state_dir: service_state_dir(&self.state_root, &descriptor, &scope)?,
+                    state_root: self.state_root.clone(),
+                    host_data_dir: self.ipc_root.clone(),
+                    ipc: self.ipc.clone(),
+                    launch_config: launch_config.clone(),
+                    module_client_id: module_client_id.clone(),
+                    protocol: claim.protocol,
+                    module_contract_json: contract_json.clone(),
+                    owner_executable: self.owner_executable.clone(),
+                    resolver: self.resolver.clone(),
+                    admission: self.admission.clone(),
+                    demand_gate: existing.demand_gate.clone(),
+                }));
+                let mut services = self.services.lock().await;
+                if services
+                    .get(&key)
+                    .is_none_or(|current| !Arc::ptr_eq(current, &existing))
+                {
+                    continue;
+                }
+                services.insert(key.clone(), replacement.clone());
+                drop(services);
+                return replacement.demand(cause.clone(), readback.clone()).await;
+            }
+            return existing.demand(cause.clone(), readback.clone()).await;
+        }
     }
 
     /// Root calls this on a Store or durable-journal failure. Existing workers
@@ -798,6 +821,9 @@ struct Service {
     admission: watch::Sender<AdmissionState>,
     status: watch::Sender<SupervisorStatus>,
     demands: Mutex<HashMap<String, usize>>,
+    /// Serializes replacement and demand for this exact module/scope across
+    /// descriptor generations. It is an in-memory gate, not durable state.
+    demand_gate: Arc<AsyncMutex<()>>,
     demand_epoch: watch::Sender<u64>,
     recovery_epoch: watch::Sender<u64>,
     readback_required: AtomicBool,
@@ -820,6 +846,7 @@ struct ServiceInitialization {
     owner_executable: ModuleOwnerExecutable,
     resolver: Arc<dyn ProtectedResolver>,
     admission: watch::Sender<AdmissionState>,
+    demand_gate: Arc<AsyncMutex<()>>,
 }
 
 struct OwnerHelperExit {
@@ -883,6 +910,7 @@ impl Service {
             admission: initialization.admission,
             status,
             demands: Mutex::new(HashMap::new()),
+            demand_gate: initialization.demand_gate,
             demand_epoch,
             recovery_epoch,
             readback_required: AtomicBool::new(prior_state),
@@ -2716,6 +2744,13 @@ impl Service {
                 code: code.to_owned(),
                 detail: detail.to_owned(),
             });
+            // Keep the manager-facing callback useful even when a failure
+            // happened before the helper could publish a typed launch result.
+            // Only the closed code vocabulary is mapped; detail remains
+            // private and is never copied into the observation DTO.
+            if let Some(stage) = ModuleFailureStage::from_failure_code(code) {
+                status.failure_stage = Some(stage);
+            }
         });
     }
 

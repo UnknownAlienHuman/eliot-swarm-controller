@@ -46,6 +46,7 @@
   "capabilities": [
     "agent.open",
     "agent.reconcile",
+    "agent.result",
     "agent.refresh",
     "agent.send/next_turn",
     "task.dispatch"

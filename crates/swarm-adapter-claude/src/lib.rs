@@ -127,6 +127,7 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
                         &config,
                         &contract,
                         &journal,
+                        &mut link,
                         &mut harness,
                         &frame_tx,
                         &boot_id,
@@ -205,6 +206,7 @@ async fn handle_command(
     config: &AdapterConfig,
     claim: &ModuleContractClaim,
     journal: &OperationJournal,
+    link: &mut ModuleLink,
     harness: &mut Option<NativeHarness>,
     frame_tx: &mpsc::Sender<HarnessFrame>,
     boot_id: &str,
@@ -484,6 +486,10 @@ async fn handle_command(
                 "native_root_id":native_root_id,
                 "user_message_uuid":input_id
             });
+            let native_payload_bytes = serde_json::to_vec(&native_payload)?;
+            let native_payload_byte_length = u64::try_from(native_payload_bytes.len())
+                .map_err(|_| Error::invalid("native dispatch payload length is out of range"))?;
+            let native_payload_sha256 = digest_bytes(&native_payload_bytes);
             let dispatch_admission = if command.method == "task.dispatch" {
                 normalized_dispatch_admission(
                     claim,
@@ -504,6 +510,8 @@ async fn handle_command(
                 "task_snapshot_sha256":task_snapshot_sha256,
                 "native_root_id":native_root_id,
                 "native_scope_key":config.native_options.scope_key(),
+                "native_payload_sha256":native_payload_sha256,
+                "native_payload_bytes":native_payload_byte_length,
             });
             if let Some(admission) = dispatch_admission.as_ref() {
                 native_intent["dispatch_admission"] = serde_json::to_value(admission)?;
@@ -591,6 +599,19 @@ async fn handle_command(
                 latest_state,
             )
         }
+        "agent.result" => {
+            handle_result(
+                config,
+                claim,
+                journal,
+                link,
+                boot_id,
+                native_root_id,
+                native_control,
+                command,
+            )
+            .await
+        }
         _ => queue_rejected(
             config,
             claim,
@@ -601,6 +622,573 @@ async fn handle_command(
             native_root_id,
         ),
     }
+}
+
+async fn handle_result(
+    config: &AdapterConfig,
+    claim: &ModuleContractClaim,
+    journal: &OperationJournal,
+    link: &mut ModuleLink,
+    boot_id: &str,
+    native_root_id: Option<&str>,
+    native_control: &NativeControl,
+    command: &RuntimeCommand,
+) -> Result<bool> {
+    let receipt = receipt::for_command(claim, command)?;
+    let selector = &command.input["selector"];
+    let valid_selector = selector.as_object().is_some_and(|fields| {
+        fields.len() == 3
+            && fields.keys().all(|field| {
+                matches!(field.as_str(), "kind" | "input_operation_id" | "session_id")
+            })
+            && selector["kind"] == "claude_assistant_result"
+    });
+    if !valid_selector {
+        return queue_rejected(
+            config,
+            claim,
+            journal,
+            command,
+            &receipt,
+            "UNSUPPORTED_RESULT_SELECTOR",
+            native_root_id,
+        );
+    }
+    let target_operation_id = selector["input_operation_id"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty() && value.len() <= 128)
+        .ok_or_else(|| Error::invalid("assistant result selector lacks its Operation ID"))?;
+    let selected_session_id = selector["session_id"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty() && value.len() <= 512)
+        .ok_or_else(|| Error::invalid("assistant result selector lacks its native session ID"))?;
+    if native_root_id != Some(selected_session_id)
+        || command.native_root_id.as_deref() != Some(selected_session_id)
+    {
+        return queue_rejected(
+            config,
+            claim,
+            journal,
+            command,
+            &receipt,
+            "NATIVE_IDENTITY_MISMATCH",
+            native_root_id,
+        );
+    }
+    let target = journal.get(target_operation_id)?.ok_or_else(|| {
+        Error::new(
+            "RESULT_TARGET_INTENT_MISSING",
+            "assistant result requires the saved task.dispatch intent",
+        )
+    })?;
+    let target_receipt = target.receipt.as_ref().ok_or_else(|| {
+        Error::new(
+            "RESULT_TARGET_INTENT_MISSING",
+            "assistant result target has no retained module receipt",
+        )
+    })?;
+    if target.method.as_deref() != Some("task.dispatch")
+        || target_receipt.binding_id != command.binding_id
+        || target_receipt.binding_generation != command.generation
+        || command.target_input_sha256.as_deref()
+            != Some(target_receipt.input_sha256.as_str())
+    {
+        return queue_rejected(
+            config,
+            claim,
+            journal,
+            command,
+            &receipt,
+            "RESULT_TARGET_SCOPE_INVALID",
+            native_root_id,
+        );
+    }
+    let target_intent = target.intent.as_ref().ok_or_else(|| {
+        Error::new(
+            "RESULT_TARGET_INTENT_MISSING",
+            "assistant result target has no native intent",
+        )
+    })?;
+    let target_native = &target_intent["native"];
+    let target_input_id = target_native["user_message_uuid"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| Error::new("RESULT_TARGET_INTENT_MISSING", "target has no native input identity"))?;
+    let target_outcome = target.outcome.as_ref().ok_or_else(|| {
+        Error::new(
+            "RESULT_TARGET_NOT_ADMITTED",
+            "assistant result target has no native input outcome",
+        )
+    })?;
+    if target_outcome["outcome"] != "applied"
+        || target_outcome["native_root_id"] != selected_session_id
+        || target_outcome["native_input_id"] != target_input_id
+        || target_outcome["details"]["completion_condition"] != "native_input_admitted"
+    {
+        return queue_rejected(
+            config,
+            claim,
+            journal,
+            command,
+            &receipt,
+            "RESULT_TARGET_NOT_ADMITTED",
+            native_root_id,
+        );
+    }
+    let result = match native_control.result_for_operation(target_operation_id) {
+        Ok(result) => result,
+        Err(error) => {
+            return save_result_unknown(
+                config,
+                journal,
+                command,
+                &receipt,
+                boot_id,
+                selected_session_id,
+                target_operation_id,
+                target_input_id,
+                target_receipt,
+                &error.code,
+                false,
+            );
+        }
+    };
+    if result["input_operation_id"] != target_operation_id
+        || result["native_session_id"] != selected_session_id
+        || result["native_input_id"] != target_input_id
+    {
+        return save_result_unknown(
+            config,
+            journal,
+            command,
+            &receipt,
+            boot_id,
+            selected_session_id,
+            target_operation_id,
+            target_input_id,
+            target_receipt,
+            "RESULT_NATIVE_IDENTITY_MISMATCH",
+            false,
+        );
+    }
+    let expected_payload_sha256 = target_native["native_payload_sha256"]
+        .as_str()
+        .or_else(|| target_native["dispatch_admission"]["native_payload_sha256"].as_str())
+        .filter(|digest| receipt::is_sha256(digest))
+        .ok_or_else(|| {
+            Error::new(
+                "RESULT_TARGET_INTENT_MISSING",
+                "target has no exact native payload digest",
+            )
+        })?;
+    let expected_payload_bytes = target_native["native_payload_bytes"]
+        .as_u64()
+        .or_else(|| target_native["dispatch_admission"]["native_payload_bytes"].as_u64())
+        .filter(|bytes| *bytes > 0)
+        .ok_or_else(|| {
+            Error::new(
+                "RESULT_TARGET_INTENT_MISSING",
+                "target has no exact native payload byte length",
+            )
+        })?;
+    if result["native_payload_sha256"] != expected_payload_sha256
+        || result["native_payload_bytes"] != expected_payload_bytes
+    {
+        return save_result_unknown(
+            config,
+            journal,
+            command,
+            &receipt,
+            boot_id,
+            selected_session_id,
+            target_operation_id,
+            target_input_id,
+            target_receipt,
+            "RESULT_NATIVE_PAYLOAD_MISMATCH",
+            false,
+        );
+    }
+    let Some(result_status) = result["result_status"]
+        .as_str()
+        .filter(|status| matches!(*status, "completed" | "failed"))
+    else {
+        return save_result_unknown(
+            config,
+            journal,
+            command,
+            &receipt,
+            boot_id,
+            selected_session_id,
+            target_operation_id,
+            target_input_id,
+            target_receipt,
+            "RESULT_NATIVE_STATUS_INVALID",
+            false,
+        );
+    };
+    let Some(result_frame_uuid) = result["result_frame_uuid"]
+        .as_str()
+        .filter(|value| !value.is_empty() && value.len() <= 512)
+    else {
+        return save_result_unknown(
+            config,
+            journal,
+            command,
+            &receipt,
+            boot_id,
+            selected_session_id,
+            target_operation_id,
+            target_input_id,
+            target_receipt,
+            "RESULT_NATIVE_IDENTITY_INVALID",
+            false,
+        );
+    };
+    let Some(result_sha256) = result["result_sha256"]
+        .as_str()
+        .filter(|digest| receipt::is_sha256(digest))
+    else {
+        return save_result_unknown(
+            config,
+            journal,
+            command,
+            &receipt,
+            boot_id,
+            selected_session_id,
+            target_operation_id,
+            target_input_id,
+            target_receipt,
+            "RESULT_NATIVE_IDENTITY_INVALID",
+            false,
+        );
+    };
+    let Some(result_bytes) = result["result_bytes"]
+        .as_u64()
+        .filter(|bytes| *bytes <= 512_000)
+    else {
+        return save_result_unknown(
+            config,
+            journal,
+            command,
+            &receipt,
+            boot_id,
+            selected_session_id,
+            target_operation_id,
+            target_input_id,
+            target_receipt,
+            "RESULT_NATIVE_IDENTITY_INVALID",
+            false,
+        );
+    };
+    let Some(encoded) = result["result_content_base64"]
+        .as_str()
+        .filter(|value| result["result_body_available"] == true && value.len() <= 700_000)
+    else {
+        return save_result_unknown(
+            config,
+            journal,
+            command,
+            &receipt,
+            boot_id,
+            selected_session_id,
+            target_operation_id,
+            target_input_id,
+            target_receipt,
+            "RESULT_BODY_UNAVAILABLE",
+            false,
+        );
+    };
+    let body = match decode_base64(encoded) {
+        Ok(body) => body,
+        Err(_) => {
+            return save_result_unknown(
+                config,
+                journal,
+                command,
+                &receipt,
+                boot_id,
+                selected_session_id,
+                target_operation_id,
+                target_input_id,
+                target_receipt,
+                "RESULT_BODY_INVALID",
+                false,
+            );
+        }
+    };
+    if body.len() as u64 != result_bytes || digest_bytes(&body) != result_sha256 {
+        return save_result_unknown(
+            config,
+            journal,
+            command,
+            &receipt,
+            boot_id,
+            selected_session_id,
+            target_operation_id,
+            target_input_id,
+            target_receipt,
+            "RESULT_BODY_DIGEST_MISMATCH",
+            false,
+        );
+    }
+    let offset = command.input["offset_bytes"].as_u64().unwrap_or(0);
+    let requested_length = command.input["length_bytes"]
+        .as_u64()
+        .unwrap_or(65_536)
+        .min(65_536);
+    let total = body.len() as u64;
+    if offset > total || (requested_length == 0 && offset < total) {
+        return queue_rejected(
+            config,
+            claim,
+            journal,
+            command,
+            &receipt,
+            "RESULT_RANGE_INVALID",
+            native_root_id,
+        );
+    }
+    let end = offset.saturating_add(requested_length).min(total);
+    let start_index = usize::try_from(offset)
+        .map_err(|_| Error::invalid("result offset is too large"))?;
+    let end_index = usize::try_from(end)
+        .map_err(|_| Error::invalid("result range is too large"))?;
+    let selected = &body[start_index..end_index];
+    let result_receipt = receipt::for_command(claim, command)?;
+    let native_intent = json!({
+        "result_target_operation_id":target_operation_id,
+        "native_root_id":selected_session_id,
+        "native_scope_key":config.native_options.scope_key(),
+        "native_input_id":target_input_id,
+        "result_frame_uuid":result_frame_uuid,
+        "result_sha256":result_sha256,
+        "result_bytes":result_bytes,
+        "native_payload_sha256":expected_payload_sha256,
+        "native_payload_bytes":expected_payload_bytes
+    });
+    let intent = intent_for(
+        command,
+        &result_receipt,
+        Some(native_intent),
+        boot_id,
+        &config.native_options.scope_key(),
+    )?;
+    journal.write_intent(&command.operation_id, &result_receipt, &command.method, &intent)?;
+    let source = json!({
+        "kind":"claude_assistant_result",
+        "result_operation_id":command.operation_id,
+        "result_input_sha256":result_receipt.input_sha256,
+        "result_module_receipt":result_receipt,
+        "input_operation_id":target_operation_id,
+        "target_method":"task.dispatch",
+        "target_input_sha256":target_receipt.input_sha256,
+        "target_module_receipt":target_receipt,
+        "native_session_id":selected_session_id,
+        "native_input_id":target_input_id,
+        "native_payload_sha256":expected_payload_sha256,
+        "native_payload_bytes":expected_payload_bytes,
+        "result_frame_uuid":result_frame_uuid,
+        "result_subtype":result["result_subtype"],
+        "result_status":result_status,
+        "result_sha256":result_sha256,
+        "result_bytes":result_bytes,
+        "content_digest":format!("sha256:{result_sha256}"),
+        "native_output":"claude.assistant.result",
+        "evidence":"exact_claude_sdk_assistant_result",
+        "native_response_identity":"sdk_result_frame",
+        "execution_complete":true,
+        "task_completion":"unknown",
+        "native_replay":false
+    });
+    let page = json!({
+        "source":source,
+        "offset_bytes":offset,
+        "byte_length":selected.len(),
+        "total_bytes":total,
+        "eof":end == total,
+        "media_type":"text/plain; charset=utf-8",
+        "content_base64":encode_base64(selected),
+        "page_sha256":digest_bytes(selected)
+    });
+    let response = link.result(json!({"operation_id":command.operation_id,"page":page})).await;
+    match response {
+        Ok(value)
+            if value["recorded"] == true
+                && value["artifact_ref"]
+                    .as_str()
+                    .is_some_and(|artifact| !artifact.trim().is_empty()) =>
+        {
+            let mut details = json!({
+                "completion_condition":"result_page_persisted",
+                "artifact_ref":value["artifact_ref"],
+                "target_operation_id":target_operation_id,
+                "result_frame_uuid":result_frame_uuid,
+                "result_status":result_status,
+                "result_sha256":result_sha256,
+                "result_bytes":result_bytes,
+                "native_payload_sha256":expected_payload_sha256,
+                "native_payload_bytes":expected_payload_bytes,
+                "native_response_identity":"sdk_result_frame",
+                "execution_complete":true,
+                "task_completion":"unknown",
+                "native_replay":false
+            });
+            receipt::insert(&mut details, &result_receipt)?;
+            let outcome = RuntimeOutcome {
+                operation_id:command.operation_id.clone(),
+                outcome:EffectOutcome::Applied,
+                native_scope_key:Some(config.native_options.scope_key()),
+                native_root_id:Some(selected_session_id.to_owned()),
+                turn_id:None,
+                native_input_id:Some(target_input_id.to_owned()),
+                details
+            };
+            journal.save_outcome(&command.operation_id, &outcome)?;
+            Ok(false)
+        }
+        Ok(_) => save_result_unknown(
+            config,
+            journal,
+            command,
+            &result_receipt,
+            boot_id,
+            selected_session_id,
+            target_operation_id,
+            target_input_id,
+            target_receipt,
+            "MODULE_RESULT_ACK_SCHEMA",
+            false,
+        ),
+        Err(_) => save_result_unknown(
+            config,
+            journal,
+            command,
+            &result_receipt,
+            boot_id,
+            selected_session_id,
+            target_operation_id,
+            target_input_id,
+            target_receipt,
+            "MODULE_RESULT_UNKNOWN",
+            true,
+        ),
+    }
+}
+
+fn save_result_unknown(
+    config: &AdapterConfig,
+    journal: &OperationJournal,
+    command: &RuntimeCommand,
+    receipt: &swarm_contracts::runtime::ModuleReceiptIdentity,
+    boot_id: &str,
+    native_root_id: &str,
+    target_operation_id: &str,
+    target_input_id: &str,
+    target_receipt: &swarm_contracts::runtime::ModuleReceiptIdentity,
+    code: &str,
+    reconnect: bool,
+) -> Result<bool> {
+    let intent = intent_for(
+        command,
+        receipt,
+        Some(json!({
+            "result_target_operation_id":target_operation_id,
+            "native_root_id":native_root_id,
+            "native_scope_key":config.native_options.scope_key(),
+            "native_input_id":target_input_id
+        })),
+        boot_id,
+        &config.native_options.scope_key(),
+    )?;
+    journal.write_intent(&command.operation_id, receipt, &command.method, &intent)?;
+    let mut outcome = unknown_outcome(
+        command,
+        receipt,
+        code,
+        Some(native_root_id),
+        &config.native_options.scope_key(),
+    )?;
+    outcome.details["completion_condition"] = json!("assistant_result_unavailable");
+    outcome.details["target_operation_id"] = json!(target_operation_id);
+    outcome.details["target_input_id"] = json!(target_input_id);
+    outcome.details["target_module_receipt"] = serde_json::to_value(target_receipt)?;
+    outcome.details["native_response_identity"] = json!("sdk_result_frame");
+    outcome.details["execution_complete"] = json!(false);
+    outcome.details["task_completion"] = json!("unknown");
+    outcome.details["native_replay"] = json!(false);
+    journal.save_outcome(&command.operation_id, &outcome)?;
+    Ok(reconnect)
+}
+
+fn decode_base64(value: &str) -> Result<Vec<u8>> {
+    if value.len() % 4 != 0 || value.len() > 700_000 {
+        return Err(Error::new(
+            "RESULT_BODY_INVALID",
+            "SDK result body encoding is outside its boundary",
+        ));
+    }
+    fn digit(value: u8) -> Option<u8> {
+        match value {
+            b'A'..=b'Z' => Some(value - b'A'),
+            b'a'..=b'z' => Some(value - b'a' + 26),
+            b'0'..=b'9' => Some(value - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let bytes = value.as_bytes();
+    let mut output = Vec::with_capacity(value.len() / 4 * 3);
+    for (index, chunk) in bytes.chunks_exact(4).enumerate() {
+        let last = index + 1 == bytes.len() / 4;
+        let first = digit(chunk[0]).ok_or_else(|| Error::invalid("invalid SDK result base64"))?;
+        let second = digit(chunk[1]).ok_or_else(|| Error::invalid("invalid SDK result base64"))?;
+        output.push((first << 2) | (second >> 4));
+        match (chunk[2], chunk[3]) {
+            (b'=', b'=') if last && second & 0x0f == 0 => {}
+            (third, b'=') if last => {
+                let third = digit(third).ok_or_else(|| Error::invalid("invalid SDK result base64"))?;
+                if third & 0x03 != 0 {
+                    return Err(Error::invalid("invalid SDK result base64"));
+                }
+                output.push((second << 4) | (third >> 2));
+            }
+            (third, fourth) => {
+                let third = digit(third).ok_or_else(|| Error::invalid("invalid SDK result base64"))?;
+                let fourth = digit(fourth).ok_or_else(|| Error::invalid("invalid SDK result base64"))?;
+                output.push((second << 4) | (third >> 2));
+                output.push((third << 6) | fourth);
+            }
+        }
+    }
+    Ok(output)
+}
+
+fn encode_base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0];
+        encoded.push(ALPHABET[(first >> 2) as usize] as char);
+        if chunk.len() == 1 {
+            encoded.push(ALPHABET[((first & 0x03) << 4) as usize] as char);
+            encoded.push('=');
+            encoded.push('=');
+            continue;
+        }
+        let second = chunk[1];
+        encoded.push(ALPHABET[(((first & 0x03) << 4) | (second >> 4)) as usize] as char);
+        if chunk.len() == 2 {
+            encoded.push(ALPHABET[((second & 0x0f) << 2) as usize] as char);
+            encoded.push('=');
+            continue;
+        }
+        let third = chunk[2];
+        encoded.push(ALPHABET[(((second & 0x0f) << 2) | (third >> 6)) as usize] as char);
+        encoded.push(ALPHABET[(third & 0x3f) as usize] as char);
+    }
+    encoded
 }
 
 fn handle_refresh(

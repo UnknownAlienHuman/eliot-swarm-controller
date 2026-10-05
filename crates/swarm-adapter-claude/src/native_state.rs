@@ -16,10 +16,14 @@ const MAX_SEEN_FRAMES: usize = 8_192;
 const MAX_INPUT_EXECUTIONS: usize = 128;
 const MAX_PENDING_INPUTS: usize = 64;
 const MAX_FAMILY_EVENTS: usize = 128;
+const MAX_RESULT_RECORDS: usize = 16;
+const MAX_RESULT_BODY_BYTES: usize = 512_000;
 
 #[derive(Default)]
 pub struct NativeControl {
     pending_inputs: HashMap<String, String>,
+    input_operations: HashMap<String, String>,
+    input_operation_order: VecDeque<String>,
     init_session_id: Option<String>,
     init_model: Option<String>,
     input_executions: Vec<Value>,
@@ -27,6 +31,7 @@ pub struct NativeControl {
     family_event_count: u64,
     family_events_truncated: bool,
     family_projection_incomplete: bool,
+    result_records: Vec<Value>,
     seen_frames: HashSet<String>,
     frame_order: VecDeque<String>,
     native_events_seen: u64,
@@ -53,6 +58,11 @@ impl NativeControl {
     pub fn forget_operation(&mut self, operation_id: &str) {
         self.pending_inputs
             .retain(|_, pending_operation| pending_operation != operation_id);
+        self.input_operations
+            .retain(|_, pending_operation| pending_operation != operation_id);
+        self.input_operation_order.retain(|input_id| {
+            self.input_operations.contains_key(input_id)
+        });
     }
 
     pub fn clear_pending(&mut self) {
@@ -185,10 +195,18 @@ impl NativeControl {
                 *session_root = Some(session_id.to_owned());
             }
             self.pending_inputs.remove(&input_id);
+            self.input_operations
+                .insert(input_id.clone(), operation_id.clone());
+            self.input_operation_order.push_back(input_id);
+            while self.input_operation_order.len() > MAX_INPUT_EXECUTIONS {
+                if let Some(oldest) = self.input_operation_order.pop_front() {
+                    self.input_operations.remove(&oldest);
+                }
+            }
         }
 
         if !duplicate_frame && frame_type == "result" {
-            self.record_result(frame, session_root.as_deref());
+            self.record_result(frame, session_root.as_deref(), journal);
         }
         if !duplicate_frame {
             self.record_family_event(frame, frame_type, frame_session.as_deref(), session_root.as_deref());
@@ -406,7 +424,12 @@ impl NativeControl {
         self.family_events.push(event);
     }
 
-    fn record_result(&mut self, frame: &Value, session_root: Option<&str>) {
+    fn record_result(
+        &mut self,
+        frame: &Value,
+        session_root: Option<&str>,
+        journal: &OperationJournal,
+    ) {
         let Some(session) = safe_identity(&frame["session_id"]) else {
             return;
         };
@@ -455,13 +478,49 @@ impl NativeControl {
             | (Some("error_max_structured_output_retries"), Some(_)) => Some("failed"),
             _ => None,
         };
+        let (input_operation_id, native_payload_sha256, native_payload_bytes) = if unique_link {
+            primary_id
+                .as_ref()
+                .and_then(|input_id| self.input_operations.get(input_id))
+                .and_then(|operation_id| {
+                    let saved = journal.get(operation_id).ok().flatten()?;
+                    if saved.method.as_deref() != Some("task.dispatch") {
+                        return None;
+                    }
+                    let native = saved.intent.as_ref()?.get("native")?;
+                    let admission = native.get("dispatch_admission");
+                    let payload_sha256 = safe_sha256(
+                        native
+                            .get("native_payload_sha256")
+                            .or_else(|| admission.and_then(|value| value.get("native_payload_sha256")))?,
+                    )?;
+                    let payload_bytes = native
+                        .get("native_payload_bytes")
+                        .or_else(|| admission.and_then(|value| value.get("native_payload_bytes")))
+                        .and_then(Value::as_u64)?;
+                    Some((operation_id.clone(), payload_sha256, payload_bytes))
+                })
+                .map_or((None, None, None), |(operation_id, payload_sha256, payload_bytes)| {
+                    (Some(operation_id), Some(payload_sha256), Some(payload_bytes))
+                })
+        } else {
+            (None, None, None)
+        };
+        let result_content_base64 = frame
+            .get("result_content_base64")
+            .and_then(Value::as_str)
+            .filter(|value| value.len() <= MAX_RESULT_BODY_BYTES.div_ceil(3) * 4 + 4)
+            .map(ToOwned::to_owned);
+        let result_body_available = frame["result_body_available"] == true
+            && result_content_base64.is_some();
         let metadata = json!({
-            "native_session_id":session,
+            "native_session_id":session.clone(),
             "native_input_id":Value::Null,
-            "user_message_uuid":primary_id,
+            "input_operation_id":input_operation_id.clone(),
+            "user_message_uuid":primary_id.clone(),
             "user_message_uuids":input_ids,
             "correlation":if unique_link {"unique"} else {"ambiguous_multi_input"},
-            "result_frame_uuid":frame_id,
+            "result_frame_uuid":frame_id.clone(),
             "result_index":frame["result_index"],
             "result_subtype":subtype,
             "terminal_status":terminal_status,
@@ -469,7 +528,11 @@ impl NativeControl {
             "stop_reason":frame["stop_reason"],
             "effective_model":self.init_model,
             "result_sha256":frame["result_sha256"],
-            "result_bytes":frame["result_bytes"]
+            "result_bytes":frame["result_bytes"],
+            "result_body_available":result_body_available,
+            "result_body_truncated":frame["result_body_truncated"] == true,
+            "native_payload_sha256":native_payload_sha256.clone(),
+            "native_payload_bytes":native_payload_bytes
         });
         if let Some(ids) = metadata["user_message_uuids"].as_array() {
             for id in ids {
@@ -483,11 +546,73 @@ impl NativeControl {
             let excess = self.input_executions.len() - MAX_INPUT_EXECUTIONS;
             self.input_executions.drain(0..excess);
         }
+        if let (Some(operation_id), Some(native_payload_sha256), Some(native_payload_bytes)) =
+            (input_operation_id, native_payload_sha256, native_payload_bytes)
+        {
+            if !self
+                .result_records
+                .iter()
+                .any(|record| record["result_frame_uuid"] == frame_id)
+            {
+                if self.result_records.len() == MAX_RESULT_RECORDS {
+                    self.result_records.remove(0);
+                }
+                self.result_records.push(json!({
+                    "input_operation_id":operation_id,
+                    "native_session_id":session,
+                    "native_input_id":primary_id,
+                    "native_payload_sha256":native_payload_sha256,
+                    "native_payload_bytes":native_payload_bytes,
+                    "result_frame_uuid":frame_id,
+                    "result_subtype":subtype,
+                    "result_status":terminal_status,
+                    "result_sha256":frame["result_sha256"],
+                    "result_bytes":frame["result_bytes"],
+                    "result_content_base64":result_content_base64,
+                    "result_body_available":result_body_available,
+                    "result_body_truncated":frame["result_body_truncated"] == true
+                }));
+            }
+        }
+    }
+
+    pub fn result_for_operation(&self, operation_id: &str) -> Result<Value> {
+        if operation_id.trim().is_empty() {
+            return Err(Error::invalid("result target Operation ID is empty"));
+        }
+        let matches = self
+            .result_records
+            .iter()
+            .filter(|record| record["input_operation_id"] == operation_id)
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [] => Err(Error::new(
+                "RESULT_NOT_AVAILABLE",
+                "no bounded Claude SDK result is retained for the target Operation",
+            )),
+            [record] => Ok((*record).clone()),
+            _ => Err(Error::new(
+                "RESULT_AMBIGUOUS",
+                "multiple Claude SDK result frames match the target Operation",
+            )),
+        }
     }
 }
 
 fn safe_family_link(value: &Value) -> Option<String> {
     safe_identity(value).filter(|identity| identity.len() <= 256)
+}
+
+fn safe_sha256(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .filter(|digest| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .map(ToOwned::to_owned)
 }
 
 fn safe_family_uri(value: &Value) -> Option<String> {

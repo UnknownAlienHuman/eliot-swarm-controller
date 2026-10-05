@@ -1,10 +1,14 @@
 #requires -Version 7.0
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)][string] $SwarmExecutable,
-    [Parameter(Mandatory)][ValidatePattern('^[A-Fa-f0-9]{64}$')][string] $ExpectedSwarmSha256,
-    [Parameter(Mandatory)][string] $SwarmBuildManifestPath,
-    [Parameter(Mandatory)][ValidatePattern('^[A-Fa-f0-9]{64}$')][string] $ExpectedSwarmBuildManifestSha256,
+    [Parameter(Mandatory)][string] $HostExecutable,
+    [Parameter(Mandatory)][ValidatePattern('^[A-Fa-f0-9]{64}$')][string] $ExpectedHostSha256,
+    [Parameter(Mandatory)][string] $HostBuildManifestPath,
+    [Parameter(Mandatory)][ValidatePattern('^[A-Fa-f0-9]{64}$')][string] $ExpectedHostBuildManifestSha256,
+    [Parameter(Mandatory)][string] $PublicCliExecutable,
+    [Parameter(Mandatory)][ValidatePattern('^[A-Fa-f0-9]{64}$')][string] $ExpectedPublicCliSha256,
+    [Parameter(Mandatory)][string] $PublicCliBuildManifestPath,
+    [Parameter(Mandatory)][ValidatePattern('^[A-Fa-f0-9]{64}$')][string] $ExpectedPublicCliBuildManifestSha256,
     [Parameter(Mandatory)][string] $HostConfigPath,
     [Parameter(Mandatory)][string] $OutputRoot,
     [Parameter(Mandatory)][ValidatePattern('^[A-Za-z0-9._:-]{1,128}$')][string] $ProjectId,
@@ -35,7 +39,8 @@ $script:MaxCliOutputCharacters = 4MB
 $script:RequestDirectory = $null
 $script:RunDirectory = $null
 $script:StateDirectory = $null
-$script:SwarmPath = $null
+$script:HostPath = $null
+$script:PublicCliPath = $null
 $script:ConfigPath = $null
 $script:ManagerCredentialPath = $null
 $script:OperatorCredentialPath = $null
@@ -45,7 +50,7 @@ $script:HostPendingProcessId = $null
 $script:DispatchSubmitted = $false
 $script:CurrentStage = 'preflight'
 $script:FailureCode = $null
-$script:ProcessIdsPending = [System.Collections.Generic.List[int]]::new()
+$script:PublicCliProcessIdsPending = [System.Collections.Generic.List[int]]::new()
 $script:TimedOutRequestFiles = [System.Collections.Generic.List[object]]::new()
 $script:Stages = [System.Collections.Generic.List[object]]::new()
 $script:Report = [ordered]@{
@@ -180,11 +185,12 @@ function Get-BuildProvenance {
         Stop-Qualification 'BUILD_MANIFEST_CONTRACT_INVALID'
     }
     $arguments = @($manifest.build.cargo_arguments | ForEach-Object { [string]$_ })
-    foreach ($requiredArgument in @('--bins', '--locked')) {
+    foreach ($requiredArgument in @('--locked')) {
         if ($requiredArgument -notin $arguments) { Stop-Qualification 'BUILD_MANIFEST_ARGUMENTS_MISMATCH' }
     }
     $argumentPairs = [ordered]@{
         '--package' = $ExpectedPackage
+        '--bin' = $ExpectedTarget
         '--profile' = 'release'
         '--target-dir' = [string]$manifest.build.target_dir
     }
@@ -213,6 +219,8 @@ function Get-BuildProvenance {
     foreach ($name in @('descriptor_generated', 'installed', 'registered', 'route_enabled', 'activated')) {
         if ($installation[$name] -ne $false) { Stop-Qualification 'BUILD_MANIFEST_HAS_INSTALL_EFFECTS' }
     }
+    $hostTripleMatches = [System.Text.RegularExpressions.Regex]::Matches([string]$manifest.toolchain.rustc_version_verbose, '(?m)^host:\s*(?<triple>[A-Za-z0-9_-]+)\s*$')
+    if ($hostTripleMatches.Count -ne 1) { Stop-Qualification 'BUILD_MANIFEST_TARGET_TRIPLE_INVALID' }
     $targetDirCanonical = [System.IO.Path]::GetFullPath([string]$manifest.build.target_dir).ToUpperInvariant()
     $targetDirIdentity = [Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes($targetDirCanonical))).ToLowerInvariant()
     return [ordered]@{
@@ -233,7 +241,126 @@ function Get-BuildProvenance {
         pinned_channel = $manifest.toolchain.pinned_channel
         rustc_version_verbose = $manifest.toolchain.rustc_version_verbose
         cargo_version_verbose = $manifest.toolchain.cargo_version_verbose
+        rustc_host_triple = $hostTripleMatches[0].Groups['triple'].Value
         provenance = 'manifest_sha256_and_image_hash_verified; manifest_is_not_signed'
+    }
+}
+
+function Get-PublicCliBuildProvenance {
+    param(
+        [Parameter(Mandatory)][string] $ManifestPath,
+        [Parameter(Mandatory)][string] $ExpectedManifestSha256,
+        [Parameter(Mandatory)][string] $BinaryPath,
+        [Parameter(Mandatory)][string] $ExpectedBinarySha256
+    )
+    $manifestFile = Assert-ExistingFile $ManifestPath
+    $binary = Assert-ExistingFile $BinaryPath
+    if ([System.IO.Path]::GetFileName($manifestFile) -cne 'build-manifest.json') { Stop-Qualification 'PUBLIC_CLI_MANIFEST_FILENAME_INVALID' }
+    $manifestHash = Get-FileSha256 $manifestFile
+    $binaryHash = Get-FileSha256 $binary
+    if ($manifestHash -cne $ExpectedManifestSha256.ToLowerInvariant()) { Stop-Qualification 'PUBLIC_CLI_MANIFEST_HASH_MISMATCH' }
+    if ($binaryHash -cne $ExpectedBinarySha256.ToLowerInvariant()) { Stop-Qualification 'PUBLIC_CLI_BINARY_HASH_MISMATCH' }
+    $manifest = Read-JsonFile $manifestFile
+    if ($manifest.schema_version -ne 1 -or $manifest.format -cne 'eliot.frontend_build_manifest.v1' -or
+        $manifest.source.checkout_clean_before -ne $true -or $manifest.source.checkout_clean_after -ne $true -or
+        $manifest.source.commit -notmatch '\A[a-f0-9]{40}\z' -or $manifest.source.tree -notmatch '\A[a-f0-9]{40}\z' -or
+        $manifest.source.cargo_toml_sha256 -notmatch '\A[a-f0-9]{64}\z' -or
+        $manifest.source.cargo_lock_sha256 -notmatch '\A[a-f0-9]{64}\z' -or
+        $manifest.source.rust_toolchain_toml_sha256 -notmatch '\A[a-f0-9]{64}\z' -or
+        $manifest.build.role -cne 'cli_client' -or $manifest.build.profile -cne 'release' -or
+        $manifest.build.package_name -cne 'swarm-cli' -or
+        $manifest.build.package_manifest -cne 'crates/swarm-cli/Cargo.toml' -or
+        $manifest.build.binary_target -cne 'swarm' -or
+        [string]::IsNullOrWhiteSpace([string]$manifest.build.external_target_dir) -or
+        -not [System.IO.Path]::IsPathFullyQualified([string]$manifest.build.external_target_dir) -or
+        [string]::IsNullOrWhiteSpace([string]$manifest.toolchain.pinned_channel) -or
+        [string]::IsNullOrWhiteSpace([string]$manifest.toolchain.active_toolchain) -or
+        [string]::IsNullOrWhiteSpace([string]$manifest.toolchain.rustc_version_verbose) -or
+        [string]::IsNullOrWhiteSpace([string]$manifest.toolchain.cargo_version_verbose)) {
+        Stop-Qualification 'PUBLIC_CLI_MANIFEST_CONTRACT_INVALID'
+    }
+    $arguments = @($manifest.build.cargo_arguments | ForEach-Object { [string]$_ })
+    foreach ($requiredArgument in @('--release', '--locked')) {
+        if ($requiredArgument -notin $arguments) { Stop-Qualification 'PUBLIC_CLI_MANIFEST_ARGUMENTS_MISMATCH' }
+    }
+    $argumentPairs = [ordered]@{
+        '--package' = 'swarm-cli'
+        '--bin' = 'swarm'
+        '--target-dir' = [string]$manifest.build.external_target_dir
+    }
+    foreach ($option in $argumentPairs.Keys) {
+        $optionIndex = [Array]::IndexOf($arguments, [string]$option)
+        if ($optionIndex -lt 0 -or $optionIndex + 1 -ge $arguments.Count -or $arguments[$optionIndex + 1] -cne [string]$argumentPairs[$option]) {
+            Stop-Qualification 'PUBLIC_CLI_MANIFEST_ARGUMENTS_MISMATCH'
+        }
+    }
+    $launcher = $manifest.compatibility.host_launcher
+    $protocolVersion = $manifest.compatibility.host_ipc.protocol_version
+    $targetTriple = [string]$manifest.compatibility.target.rustc_host_triple
+    if ($null -eq $launcher -or $launcher.package_name -cne 'eliot-swarm-controller' -or
+        $launcher.binary_target -cne 'swarm-host' -or @($launcher.required_arguments).Count -ne 0 -or
+        $null -eq $protocolVersion -or [int]$protocolVersion -le 0 -or
+        [string]::IsNullOrWhiteSpace($targetTriple)) {
+        Stop-Qualification 'PUBLIC_CLI_HOST_LAUNCHER_CONTRACT_INVALID'
+    }
+    $artifacts = @($manifest.artifacts)
+    if ($artifacts.Count -ne 1 -or $artifacts[0].target_name -cne 'swarm' -or
+        $artifacts[0].file -cne 'bin/swarm.exe' -or
+        [long]$artifacts[0].bytes -ne (Get-Item -LiteralPath $binary).Length -or
+        $artifacts[0].source_sha256 -cne $binaryHash -or $artifacts[0].artifact_sha256 -cne $binaryHash) {
+        Stop-Qualification 'PUBLIC_CLI_ARTIFACT_IDENTITY_MISMATCH'
+    }
+    $builtBinary = Assert-ExistingFile (Join-Path (Split-Path -LiteralPath $manifestFile -Parent) 'bin\swarm.exe')
+    if ((Get-FileSha256 $builtBinary) -cne $binaryHash -or
+        (Get-Item -LiteralPath $builtBinary).Length -ne (Get-Item -LiteralPath $binary).Length) {
+        Stop-Qualification 'PUBLIC_CLI_IMAGE_IS_NOT_BUILD_OUTPUT'
+    }
+    foreach ($name in @('installed', 'registered', 'configured', 'activated')) {
+        if ($manifest.installation[$name] -ne $false) { Stop-Qualification 'PUBLIC_CLI_MANIFEST_HAS_INSTALL_EFFECTS' }
+    }
+    $targetDirCanonical = [System.IO.Path]::GetFullPath([string]$manifest.build.external_target_dir).ToUpperInvariant()
+    $targetDirIdentity = [Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes($targetDirCanonical))).ToLowerInvariant()
+    return [ordered]@{
+        manifest_sha256 = $manifestHash
+        source_commit = $manifest.source.commit
+        source_tree = $manifest.source.tree
+        package_name = $manifest.build.package_name
+        package_manifest = $manifest.build.package_manifest
+        profile = $manifest.build.profile
+        target_dir_sha256 = $targetDirIdentity
+        binary_target = 'swarm'
+        binary_sha256 = $binaryHash
+        binary_bytes = [long]$artifacts[0].bytes
+        cargo_toml_sha256 = $manifest.source.cargo_toml_sha256
+        cargo_lock_sha256 = $manifest.source.cargo_lock_sha256
+        rust_toolchain_toml_sha256 = $manifest.source.rust_toolchain_toml_sha256
+        active_toolchain = $manifest.toolchain.active_toolchain
+        pinned_channel = $manifest.toolchain.pinned_channel
+        rustc_version_verbose = $manifest.toolchain.rustc_version_verbose
+        cargo_version_verbose = $manifest.toolchain.cargo_version_verbose
+        host_launcher_package_name = $launcher.package_name
+        host_launcher_binary_target = $launcher.binary_target
+        host_ipc_protocol_version = [int]$protocolVersion
+        rustc_host_triple = $targetTriple
+        provenance = 'frontend_manifest_sha256_and_image_hash_verified; manifest_is_not_signed'
+    }
+}
+
+function Assert-PublicCliHostSibling {
+    param(
+        [Parameter(Mandatory)][string] $PublicCliPath,
+        [Parameter(Mandatory)][string] $HostPath,
+        [Parameter(Mandatory)][System.Collections.IDictionary] $PublicCliBuild,
+        [Parameter(Mandatory)][System.Collections.IDictionary] $HostBuild
+    )
+    $expectedSibling = [System.IO.Path]::GetFullPath((Join-Path (Split-Path -LiteralPath $PublicCliPath -Parent) 'swarm-host.exe'))
+    if ([System.IO.Path]::GetFileName($PublicCliPath) -cne 'swarm.exe' -or
+        -not [string]::Equals($expectedSibling, $HostPath, [StringComparison]::OrdinalIgnoreCase) -or
+        $PublicCliBuild.host_launcher_package_name -cne $HostBuild.package_name -or
+        $PublicCliBuild.host_launcher_binary_target -cne $HostBuild.binary_target -or
+        $PublicCliBuild.rustc_host_triple -cne $HostBuild.rustc_host_triple -or
+        (Get-FileSha256 $expectedSibling) -cne $HostBuild.binary_sha256) {
+        Stop-Qualification 'PUBLIC_CLI_HOST_COORDINATE_MISMATCH'
     }
 }
 
@@ -329,13 +456,15 @@ function Invoke-SwarmProcess {
         [switch] $HostProcess
     )
     $start = [System.Diagnostics.ProcessStartInfo]::new()
-    $start.FileName = $script:SwarmPath
+    $executablePath = if ($HostProcess) { $script:HostPath } else { $script:PublicCliPath }
+    if ([string]::IsNullOrWhiteSpace([string]$executablePath)) { Stop-Qualification 'QUALIFICATION_BINARY_PATH_UNSET' }
+    $start.FileName = $executablePath
     $start.UseShellExecute = $false
     $start.CreateNoWindow = $true
     $start.RedirectStandardOutput = $true
     $start.RedirectStandardError = $true
     $start.RedirectStandardInput = [bool]$HostProcess
-    $start.WorkingDirectory = Split-Path -LiteralPath $script:SwarmPath -Parent
+    $start.WorkingDirectory = Split-Path -LiteralPath $executablePath -Parent
     foreach ($argument in $Arguments) { [void]$start.ArgumentList.Add([string]$argument) }
     $process = [System.Diagnostics.Process]::new()
     $process.StartInfo = $start
@@ -353,7 +482,7 @@ function Invoke-SwarmProcess {
         $stderrTask = $process.StandardError.ReadToEndAsync()
         $completed = $process.WaitForExit($TimeoutMilliseconds)
         if (-not $completed) {
-            $script:ProcessIdsPending.Add($processId)
+            $script:PublicCliProcessIdsPending.Add($processId)
             return [pscustomobject]@{ started = $true; completed = $false; exit_code = $null; error_code = 'CLI_TIMEOUT_OUTCOME_UNKNOWN'; stdout = $null; process_id = $processId }
         }
         $process.WaitForExit()
@@ -390,7 +519,7 @@ function Invoke-ApplicationCall {
         try { [System.IO.File]::Delete($requestPath) } catch { }
     }
     elseif ($null -ne $result.process_id) {
-        $script:TimedOutRequestFiles.Add([pscustomobject]@{ process_id = [int]$result.process_id; path = $requestPath })
+        $script:TimedOutRequestFiles.Add([pscustomobject]@{ public_cli_process_id = [int]$result.process_id; path = $requestPath })
     }
     $parsed = $null
     if ($result.completed -and $result.exit_code -eq 0 -and $null -ne $result.stdout) {
@@ -403,7 +532,7 @@ function Invoke-ApplicationCall {
         error_code = $result.error_code
         value = $parsed
         request_id = $requestId
-        process_id = $result.process_id
+        public_cli_process_id = $result.process_id
     }
 }
 
@@ -420,7 +549,7 @@ function Get-AdapterContract {
                 build_package = 'swarm-adapter-opencode'; build_target = 'swarm-adapter-opencode';
                 capabilities = @('agent.open', 'agent.reconcile', 'agent.result', 'agent.send/next_turn', 'task.dispatch');
                 model_provider_field = 'providerID'; model_field = 'id'; effort_field = 'variant';
-                expected_provider = $OpenCodeCommandTestModelRef.Split('/', 2)[0]; expected_model = $OpenCodeCommandTestModelRef.Split('/', 2)[1]; expected_effort = $null
+                expected_provider = $null; expected_model = $null; expected_model_ref = $OpenCodeCommandTestModelRef; expected_effort = $null
             }
         }
         'Command' {
@@ -429,7 +558,7 @@ function Get-AdapterContract {
                 build_package = 'swarm-adapter-command'; build_target = 'swarm-adapter-command';
                 capabilities = @('agent.open', 'agent.reconcile', 'agent.refresh', 'task.dispatch');
                 model_provider_field = $null; model_field = 'modelId'; effort_field = $null;
-                expected_provider = $null; expected_model = $OpenCodeCommandTestModelRef; expected_effort = $null
+                expected_provider = $null; expected_model = $OpenCodeCommandTestModelRef; expected_model_ref = $null; expected_effort = $null
             }
         }
         'Codex' {
@@ -438,7 +567,7 @@ function Get-AdapterContract {
                 build_package = 'swarm-adapter-codex'; build_target = 'swarm-codex-adapter';
                 capabilities = @('agent.open', 'agent.reconcile', 'agent.send', 'task.dispatch');
                 model_provider_field = 'modelProvider'; model_field = 'model'; effort_field = $null;
-                expected_provider = $null; expected_model = $null; expected_effort = $null
+                expected_provider = $null; expected_model = $null; expected_model_ref = $null; expected_effort = $null
             }
         }
         'Antigravity' {
@@ -447,7 +576,7 @@ function Get-AdapterContract {
                 build_package = 'swarm-antigravity-adapter'; build_target = 'swarm-antigravity';
                 capabilities = @('agent.open', 'agent.reconcile', 'agent.refresh', 'agent.send/next_turn', 'task.dispatch');
                 model_provider_field = $null; model_field = 'modelId'; effort_field = $null;
-                expected_provider = $null; expected_model = 'gemini-3.8-flash-high'; expected_effort = $null
+                expected_provider = $null; expected_model = 'gemini-3.8-flash-high'; expected_model_ref = $null; expected_effort = $null
             }
         }
         default { Stop-Qualification 'CLAUDE_ADAPTER_UNAVAILABLE' }
@@ -690,7 +819,13 @@ function Get-RouteModelFacts {
         $provider = [string]$model.providerID
         $modelId = [string]$model.id
         $effort = [string]$model.variant
-        if ($provider -ne $Contract.expected_provider -or $modelId -ne $Contract.expected_model) { Stop-Qualification 'ROUTE_MODEL_MISMATCH' }
+        $qualifiedModelRef = '{0}/{1}' -f $provider, $modelId
+        $modelIdMatches = [string]::Equals($modelId, [string]$Contract.expected_model_ref, [StringComparison]::Ordinal)
+        $qualifiedRefMatches = [string]::Equals($qualifiedModelRef, [string]$Contract.expected_model_ref, [StringComparison]::Ordinal)
+        if ([string]::IsNullOrWhiteSpace($provider) -or [string]::IsNullOrWhiteSpace($modelId) -or
+            (-not $modelIdMatches -and -not $qualifiedRefMatches)) {
+            Stop-Qualification 'ROUTE_MODEL_MISMATCH'
+        }
         if ($null -ne $Contract.expected_effort -and $effort -ne $Contract.expected_effort) { Stop-Qualification 'ROUTE_VARIANT_MISMATCH' }
     }
     elseif ($Contract.runtime -eq 'codex') {
@@ -706,7 +841,7 @@ function Get-RouteModelFacts {
         $modelId = [string]$options.modelId
         if ($modelId -ne $Contract.expected_model) { Stop-Qualification 'ROUTE_MODEL_MISMATCH' }
     }
-    return [pscustomobject]@{ model_id = $modelId; provider_id = $provider; variant = $effort }
+    return [pscustomobject]@{ model_id = $modelId; provider_id = $provider; variant = $effort; requested_model_ref = $Contract.expected_model_ref }
 }
 
 function Get-ModuleCatalog {
@@ -817,9 +952,15 @@ try {
         Stop-Qualification 'CLAUDE_ADAPTER_UNAVAILABLE'
     }
     $contract = Get-AdapterContract
-    $script:SwarmPath = Assert-ExistingFile $SwarmExecutable
-    $actualSwarmHash = Get-FileSha256 $script:SwarmPath
-    if ($actualSwarmHash -ne $ExpectedSwarmSha256.ToLowerInvariant()) { Stop-Qualification 'SWARM_BINARY_HASH_MISMATCH' }
+    $script:HostPath = Assert-ExistingFile $HostExecutable
+    $script:PublicCliPath = Assert-ExistingFile $PublicCliExecutable
+    $actualHostHash = Get-FileSha256 $script:HostPath
+    $actualPublicCliHash = Get-FileSha256 $script:PublicCliPath
+    if ($actualHostHash -cne $ExpectedHostSha256.ToLowerInvariant()) { Stop-Qualification 'HOST_BINARY_HASH_MISMATCH' }
+    if ($actualPublicCliHash -cne $ExpectedPublicCliSha256.ToLowerInvariant()) { Stop-Qualification 'PUBLIC_CLI_BINARY_HASH_MISMATCH' }
+    $hostBuild = Get-BuildProvenance -ManifestPath $HostBuildManifestPath -ExpectedManifestSha256 $ExpectedHostBuildManifestSha256 -BinaryPath $script:HostPath -ExpectedPackage 'eliot-swarm-controller' -ExpectedTarget 'swarm-host'
+    $publicCliBuild = Get-PublicCliBuildProvenance -ManifestPath $PublicCliBuildManifestPath -ExpectedManifestSha256 $ExpectedPublicCliBuildManifestSha256 -BinaryPath $script:PublicCliPath -ExpectedBinarySha256 $actualPublicCliHash
+    Assert-PublicCliHostSibling -PublicCliPath $script:PublicCliPath -HostPath $script:HostPath -PublicCliBuild $publicCliBuild -HostBuild $hostBuild
     $script:ConfigPath = Assert-ExistingFile $HostConfigPath
     $outputRoot = Assert-ExistingDirectory $OutputRoot
     New-PrivateRunDirectory -Parent $outputRoot
@@ -844,7 +985,8 @@ try {
         if ($CodexAppServerPid -le 0 -or [string]::IsNullOrWhiteSpace($CodexAppServerImagePath)) { Stop-Qualification 'CODEX_ATTACH_PID_AND_IMAGE_REQUIRED' }
         $CodexAppServerImagePath = Assert-ExistingFile $CodexAppServerImagePath
     }
-    $script:Report.safe_facts.swarm_sha256 = $actualSwarmHash
+    $script:Report.safe_facts.host_binary = $hostBuild
+    $script:Report.safe_facts.public_cli = $publicCliBuild
     $script:Report.safe_facts.owner_helper_sha256 = (Get-FileSha256 $ownerHelper)
     $script:Report.safe_facts.task_spec_sha256 = Get-FileSha256 $taskPath
     $script:Report.safe_facts.launch_settings_sha256 = Get-FileSha256 $settingsPath
@@ -853,7 +995,6 @@ try {
     $script:Report.safe_facts.one_turn_input_bytes = $oneTurnBytes
     Assert-ModuleSupervisorConfig -Path $script:ConfigPath -InstallRoot $installRoot -DescriptorPath $descriptorPath -OwnerHelperPath $ownerHelper -OwnerHelperSha256 $expectedHelperHash
     $module = Get-InstalledModuleFacts -InstallRoot $installRoot -ExecutablePath $executable -DescriptorPath $descriptorPath -OwnerHelperPath $ownerHelper -OwnerHelperSha256 $expectedHelperHash -Contract $contract
-    $hostBuild = Get-BuildProvenance -ManifestPath $SwarmBuildManifestPath -ExpectedManifestSha256 $ExpectedSwarmBuildManifestSha256 -BinaryPath $script:SwarmPath -ExpectedPackage 'eliot-swarm-controller' -ExpectedTarget 'swarm' -RequireBinaryPathMatch
     $moduleBuild = Get-BuildProvenance -ManifestPath $ModuleBuildManifestPath -ExpectedManifestSha256 $ExpectedModuleBuildManifestSha256 -BinaryPath $module.executable -ExpectedPackage $contract.build_package -ExpectedTarget $contract.build_target
     if ($hostBuild.source_commit -cne $moduleBuild.source_commit -or $hostBuild.source_tree -cne $moduleBuild.source_tree -or
         $hostBuild.cargo_toml_sha256 -cne $moduleBuild.cargo_toml_sha256 -or
@@ -872,7 +1013,7 @@ try {
     $script:Report.safe_facts.host_build = $hostBuild
     $script:Report.safe_facts.module_build = $moduleBuild
     $script:Report.safe_facts.build_set = [ordered]@{ source_commit = $hostBuild.source_commit; source_tree = $hostBuild.source_tree; lock_sha256 = $hostBuild.cargo_lock_sha256; toolchain_sha256 = $hostBuild.rust_toolchain_toml_sha256; shared_active_toolchain = $hostBuild.active_toolchain }
-    Add-Stage -Name 'preflight' -Status 'passed' -Facts ([ordered]@{ swarm_sha256 = $actualSwarmHash; module_executable_sha256 = $module.executable_sha256; descriptor_sha256 = $module.descriptor_sha256; install_receipt_sha256 = $module.receipt_sha256; module_identity = $script:Report.safe_facts.module; host_build = $hostBuild; module_build = $moduleBuild })
+    Add-Stage -Name 'preflight' -Status 'passed' -Facts ([ordered]@{ host_binary_sha256 = $actualHostHash; public_cli_sha256 = $actualPublicCliHash; host_build = $hostBuild; public_cli_build = $publicCliBuild; cli_host_sibling_verified = $true; cli_host_ipc_protocol_version = $publicCliBuild.host_ipc_protocol_version; module_executable_sha256 = $module.executable_sha256; descriptor_sha256 = $module.descriptor_sha256; install_receipt_sha256 = $module.receipt_sha256; module_identity = $script:Report.safe_facts.module; module_build = $moduleBuild })
 
     $script:CurrentStage = 'isolated_host'
     $hostArgs = @('--config', $script:ConfigPath, '--data-dir', $script:StateDirectory, 'host', '--stop-on-stdin-eof')
@@ -892,7 +1033,7 @@ try {
         Start-Sleep -Milliseconds 500
     }
     if (-not $hostReady) { Add-Stage -Name 'isolated_host' -Status 'blocked' -Code 'HOST_NOT_READY'; Stop-Qualification 'HOST_NOT_READY' }
-    Add-Stage -Name 'isolated_host' -Status 'passed' -Facts ([ordered]@{ isolated_data_root = $true; host_pid = $script:HostProcess.Id; operator_credential_created = (Test-Path -LiteralPath $script:OperatorCredentialPath) })
+    Add-Stage -Name 'isolated_host' -Status 'passed' -Facts ([ordered]@{ isolated_data_root = $true; host_process_id = $script:HostProcess.Id; host_image_sha256 = $actualHostHash; public_cli_image_sha256 = $actualPublicCliHash; operator_credential_created = (Test-Path -LiteralPath $script:OperatorCredentialPath) })
 
     $script:CurrentStage = 'manager_admission'
     $managerId = 'native-qualification-' + [Guid]::NewGuid().ToString('N')
@@ -959,7 +1100,7 @@ try {
     if ($null -ne $routeModel.variant -and $null -eq $launchSettings.requested_effort -and $contract.module_id -eq 'eliot.opencode.v2' -and $routeModel.variant -ne '') {
         # Effort remains optional; the exact configured route variant is retained only when the caller explicitly selects it.
     }
-    $script:Report.safe_facts.route = [ordered]@{ alias = $route.alias; runtime = $route.runtime; artifact_id = $route.module_artifact_id; model_id = $routeModel.model_id; provider_id = $routeModel.provider_id; variant = $routeModel.variant }
+    $script:Report.safe_facts.route = [ordered]@{ alias = $route.alias; runtime = $route.runtime; artifact_id = $route.module_artifact_id; model_id = $routeModel.model_id; provider_id = $routeModel.provider_id; variant = $routeModel.variant; requested_model_ref = $routeModel.requested_model_ref }
     if ($Adapter -eq 'Codex') {
         $module.config_path = Get-AdapterConfigPath -Descriptor $module.descriptor
         $codexProcessFacts = Assert-CodexProcessAttachment -AdapterConfigPath $module.config_path
@@ -969,7 +1110,7 @@ try {
         $module.config_path = Get-AdapterConfigPath -Descriptor $module.descriptor
         $script:Report.safe_facts.adapter_config_sha256 = Get-FileSha256 $module.config_path
     }
-    Add-Stage -Name 'route_configuration' -Status 'passed' -Facts ([ordered]@{ route_alias = $route.alias; runtime = $route.runtime; artifact_id = $route.module_artifact_id; model_id = $routeModel.model_id; provider_id = $routeModel.provider_id; variant = $routeModel.variant })
+    Add-Stage -Name 'route_configuration' -Status 'passed' -Facts ([ordered]@{ route_alias = $route.alias; runtime = $route.runtime; artifact_id = $route.module_artifact_id; model_id = $routeModel.model_id; provider_id = $routeModel.provider_id; variant = $routeModel.variant; requested_model_ref = $routeModel.requested_model_ref })
 
     $script:CurrentStage = 'manager_route_selection'
     $selectionParams = [ordered]@{
@@ -1218,7 +1359,7 @@ finally {
     foreach ($pendingRequest in $script:TimedOutRequestFiles) {
         $stillRunning = $false
         try {
-            $timedOutProcess = [System.Diagnostics.Process]::GetProcessById([int]$pendingRequest.process_id)
+            $timedOutProcess = [System.Diagnostics.Process]::GetProcessById([int]$pendingRequest.public_cli_process_id)
             $stillRunning = -not $timedOutProcess.HasExited
             $timedOutProcess.Dispose()
         }
@@ -1226,7 +1367,7 @@ finally {
         if ($stillRunning) { $activeCliProcessPending = $true }
         if (-not $stillRunning) { try { [System.IO.File]::Delete([string]$pendingRequest.path) } catch { } }
     }
-    foreach ($pendingProcessId in $script:ProcessIdsPending) {
+    foreach ($pendingProcessId in $script:PublicCliProcessIdsPending) {
         try {
             $timedOutProcess = [System.Diagnostics.Process]::GetProcessById([int]$pendingProcessId)
             if (-not $timedOutProcess.HasExited) { $activeCliProcessPending = $true }
@@ -1242,13 +1383,13 @@ finally {
         }
     }
     if ($null -ne $script:HostPendingProcessId) {
-        $script:Report.safe_facts.host_shutdown = [ordered]@{ graceful_eof_sent = $true; pending_pid = $script:HostPendingProcessId; force_terminated = $false }
+        $script:Report.safe_facts.host_shutdown = [ordered]@{ graceful_eof_sent = $true; pending_host_process_id = $script:HostPendingProcessId; force_terminated = $false }
         $script:Report.status = if ($script:Report.status -eq 'running') { 'host_shutdown_pending' } else { $script:Report.status }
     }
     elseif ($null -ne $script:HostProcess -or $null -ne $script:OperatorCredentialPath) {
         $script:Report.safe_facts.host_shutdown = [ordered]@{ graceful_eof_sent = $true; exited = $true; force_terminated = $false }
     }
-    if ($script:ProcessIdsPending.Count -gt 0) { $script:Report.safe_facts.cli_processes_timed_out = @($script:ProcessIdsPending.ToArray()) }
+    if ($script:PublicCliProcessIdsPending.Count -gt 0) { $script:Report.safe_facts.public_cli_processes_timed_out = @($script:PublicCliProcessIdsPending.ToArray()) }
     if ($script:Report.status -eq 'running') { $script:Report.status = if ($script:FailureCode) { 'blocked' } else { 'dispatch_readback_complete' } }
     $script:Report.completed_at_utc = [DateTime]::UtcNow.ToString('o')
     Save-Report

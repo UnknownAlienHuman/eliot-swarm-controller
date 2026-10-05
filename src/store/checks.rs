@@ -67,6 +67,12 @@ pub(super) struct CheckPlanResolution {
     pub cache_hit: Option<PreparedCacheHit>,
 }
 
+struct CheckAdmission<'a> {
+    resolution: Option<&'a CheckPlanResolution>,
+    cron_context: Option<&'a crate::automation::authorization::CronExecutionContext>,
+    executor: Option<crate::checks::model::ExecutorPin>,
+}
+
 /// Capture DB-owned inputs for the filesystem resolver. The context hash is
 /// checked again in the admission transaction, after artifact verification.
 pub(super) fn plan_inputs(
@@ -910,7 +916,18 @@ pub(super) fn reserve(
     let input = CheckRequest::parse(v)?;
     let a = attempt(tx, p, &input.attempt_id)?;
     let facts = plan_inputs(tx, p, v, config)?;
-    reserve_with_facts(tx, input, a, facts, id, resolution, None)
+    reserve_with_facts(
+        tx,
+        input,
+        a,
+        facts,
+        id,
+        CheckAdmission {
+            resolution,
+            cron_context: None,
+            executor: config.checks.executor.clone(),
+        },
+    )
 }
 
 pub(super) fn reserve_cron(
@@ -926,7 +943,18 @@ pub(super) fn reserve_cron(
     let input = CheckRequest::parse(&request)?;
     let a = tasks::get_attempt(tx, &input.attempt_id)?;
     let facts = plan_inputs_for_attempt(tx, &input, &a, config)?;
-    reserve_with_facts(tx, input, a, facts, id, resolution, Some(context))
+    reserve_with_facts(
+        tx,
+        input,
+        a,
+        facts,
+        id,
+        CheckAdmission {
+            resolution,
+            cron_context: Some(context),
+            executor: config.checks.executor.clone(),
+        },
+    )
 }
 
 fn reserve_with_facts(
@@ -935,10 +963,9 @@ fn reserve_with_facts(
     a: Value,
     facts: CheckPlanInputs,
     id: &str,
-    resolution: Option<&CheckPlanResolution>,
-    cron_context: Option<&crate::automation::authorization::CronExecutionContext>,
+    admission: CheckAdmission<'_>,
 ) -> Result<(Value, bool)> {
-    let resolution = resolution.ok_or_else(|| {
+    let resolution = admission.resolution.ok_or_else(|| {
         Error::new(
             "CHECK_PLAN_REQUIRED",
             "CheckRunner inputs must be resolved before admission",
@@ -964,7 +991,7 @@ fn reserve_with_facts(
     let key = prepared.input_fingerprint.clone();
     let existing:Option<(String,String)>=tx.query_row("SELECT check_id,operation_id FROM check_runs WHERE attempt_id=?1 AND cache_key=?2 AND (state IN ('queued','running','reconciling') OR (resource_claimed_at_ms IS NOT NULL AND resource_released_at_ms IS NULL))",params![input.attempt_id,key],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
     if let Some((check, op)) = existing {
-        if cron_context.is_some() {
+        if admission.cron_context.is_some() {
             tx.execute(
                 "UPDATE operations SET task_id=?2,attempt_id=?3,effective_request_json=json_object('coalesced_check_id',?4) WHERE operation_id=?1",
                 params![id, a["task_id"].as_str(), input.attempt_id, check],
@@ -994,6 +1021,9 @@ fn reserve_with_facts(
         "scope_plan":prepared.scope_plan,
         "input_fingerprint":prepared.input_fingerprint,
     });
+    if let Some(executor) = admission.executor {
+        spec["executor"] = serde_json::to_value(executor)?;
+    }
     let resource = format!("check-target:{}", profile.resource.to_lowercase());
     let current_cache_hit = match resolution.cache_hit.as_ref() {
         Some(hit) if cache_hit_is_current(tx, hit, prepared)? => Some(hit),
@@ -1260,6 +1290,12 @@ fn work(db: &Connection, id: &str, root: PathBuf) -> Result<Work> {
             .get("input_fingerprint")
             .and_then(Value::as_str)
             .map(str::to_owned),
+        executor: spec
+            .get("executor")
+            .filter(|value| !value.is_null())
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()?,
         cancel_request: spec
             .get("cancel_request")
             .filter(|v| !v.is_null())
@@ -1685,7 +1721,10 @@ impl Store {
             match self.run(move |db| next(db, &config, root)).await {
                 Ok(Some(w)) => {
                     let launch = w.clone();
-                    let executor = self.config.checks.executor.clone();
+                    // The executor selection is part of the immutable admitted
+                    // CheckRun spec. Existing rows without it retain the
+                    // legacy root-worker path during migration.
+                    let executor = launch.executor.clone();
                     let error = if let Some(e) = w.preflight_error.clone() {
                         Some(e)
                     } else {

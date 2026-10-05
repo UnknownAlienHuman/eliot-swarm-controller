@@ -322,6 +322,10 @@ struct DemandKey {
 
 struct HeldDemand {
     _lease: swarm_supervisor::DemandLease,
+    /// Retain the admission-time descriptor beside the lease so a later
+    /// bounded stale-scope readback can publish an exact observation even
+    /// after the demand page no longer contains that scope.
+    descriptor: ModuleDescriptor,
 }
 
 #[derive(Clone, Hash, PartialEq, Eq)]
@@ -1113,7 +1117,13 @@ impl ModuleSupervisorHost {
                 }
                 match self.start_demand(&demand).await {
                     Ok(lease) => {
-                        held.insert(key, HeldDemand { _lease: lease });
+                        held.insert(
+                            key,
+                            HeldDemand {
+                                _lease: lease,
+                                descriptor: demand.descriptor.clone(),
+                            },
+                        );
                     }
                     Err(error) => {
                         if is_store_unavailable(&error) {
@@ -1149,19 +1159,25 @@ impl ModuleSupervisorHost {
         // Store failure callback. Refresh each scope whose held leases would
         // otherwise disappear before dropping its final lease. This readback
         // also retains a scope with an unresolved operation or native identity.
-        let mut stale_scopes = BTreeSet::<(String, String, u64)>::new();
-        for key in held.keys().filter(|key| !seen.contains(*key)) {
-            stale_scopes.insert((
-                key.module_id.clone(),
-                key.scope.binding_id.clone(),
-                key.scope.generation,
-            ));
+        let mut stale_scopes = BTreeMap::<(String, String, u64), ModuleDescriptor>::new();
+        for (key, held_demand) in held.iter().filter(|(key, _)| !seen.contains(*key)) {
+            stale_scopes
+                .entry((
+                    key.module_id.clone(),
+                    key.scope.binding_id.clone(),
+                    key.scope.generation,
+                ))
+                .or_insert_with(|| held_demand.descriptor.clone());
         }
         let mut retained_scopes = HashSet::<(String, ServiceScope)>::new();
-        for (module_id, binding_id, generation) in stale_scopes {
+        for ((module_id, binding_id, generation), descriptor) in stale_scopes {
             let scope = ServiceScope {
                 binding_id: binding_id.clone(),
                 generation,
+            };
+            let scope_key = ModuleScopeKey {
+                module_id: module_id.clone(),
+                scope: scope.clone(),
             };
             let readback = match self
                 .store
@@ -1176,10 +1192,13 @@ impl ModuleSupervisorHost {
                 Ok(readback) => readback,
                 Err(error) if is_store_unavailable(&error) => return Err(error),
                 Err(error) => {
-                    eprintln!(
-                        "module stale scope retained for binding {}: {}",
-                        binding_id, error.code
-                    );
+                    self.set_recovery_block_at_stage(
+                        &scope_key,
+                        &descriptor,
+                        &error.code,
+                        failure_stage_for(&error.code),
+                        recovery_events,
+                    )?;
                     retained_scopes.insert((module_id, scope));
                     continue;
                 }
@@ -1187,10 +1206,13 @@ impl ModuleSupervisorHost {
             let operations = match operation_readback_for_scope(&scope, &readback) {
                 Ok(operations) => operations,
                 Err(error) => {
-                    eprintln!(
-                        "module stale scope readback retained for binding {}: {}",
-                        binding_id, error.code
-                    );
+                    self.set_recovery_block_at_stage(
+                        &scope_key,
+                        &descriptor,
+                        &error.code,
+                        failure_stage_for(&error.code),
+                        recovery_events,
+                    )?;
                     retained_scopes.insert((module_id, scope));
                     continue;
                 }
@@ -1204,10 +1226,13 @@ impl ModuleSupervisorHost {
                 if is_store_unavailable(&error) {
                     return Err(error);
                 }
-                eprintln!(
-                    "module stale scope held after supervisor readback failure for binding {}: {}",
-                    binding_id, error.code
-                );
+                self.set_recovery_block_at_stage(
+                    &scope_key,
+                    &descriptor,
+                    &error.code,
+                    failure_stage_for(&error.code),
+                    recovery_events,
+                )?;
                 retained_scopes.insert((module_id, scope));
                 continue;
             }
@@ -1862,6 +1887,7 @@ fn remember_host_diagnostic(diagnostics: &mut VecDeque<String>, mut value: Strin
 
 fn failure_stage_for(code: &str) -> ModuleFailureStage {
     if code.starts_with("STORE_")
+        || code.starts_with("KERNEL_")
         || code.starts_with("AUTOMATION_INTAKE_")
         || code.starts_with("AUTOMATION_HOOK_INDEX_")
         || code.starts_with("MODULE_READBACK_")
@@ -1870,8 +1896,27 @@ fn failure_stage_for(code: &str) -> ModuleFailureStage {
         || code == "KERNEL_ADMISSION_CLOSED"
     {
         ModuleFailureStage::Store
-    } else if code.starts_with("MODULE_CREDENTIAL_") || code.starts_with("MODULE_RESOLVER_") {
+    } else if code.starts_with("MODULE_CREDENTIAL_")
+        || code.starts_with("MODULE_RESOLVER_")
+        || matches!(code, "MODULE_SELECTION" | "MODULE_CAPABILITY_INVALID")
+    {
         ModuleFailureStage::ResolveRefs
+    } else if code.starts_with("MODULE_OWNER_SPAWN_") {
+        ModuleFailureStage::Spawn
+    } else if code.starts_with("MODULE_WORKER_")
+        || matches!(code, "MODULE_EXITED" | "MODULE_NOT_ACTIVE" | "MODULE_SUPERVISOR_EXITED")
+    {
+        ModuleFailureStage::Worker
+    } else if code == "MODULE_STATE_DIRECTORY"
+        || code == "MODULE_RESTART_HISTORY_INVALID"
+        || code == "MODULE_OWNER_STATE_UNSAFE"
+    {
+        ModuleFailureStage::Journal
+    } else if code.starts_with("MODULE_OWNER_")
+        || code.starts_with("MODULE_LAUNCH_INTENT_")
+        || code.starts_with("MODULE_LAUNCH_RESULT_")
+    {
+        ModuleFailureStage::Owner
     } else {
         ModuleFailureStage::ValidateLaunch
     }

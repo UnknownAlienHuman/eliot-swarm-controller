@@ -1465,13 +1465,14 @@ fn validate_binding_identity(
     };
     let registered_revision = selector["registered_revision"].as_u64();
     let selected_revision = selector["selected_revision"].as_u64();
+    // The route runtime names the native harness; the retained descriptor
+    // selector identifies the exact module, artifact and version for this binding.
     if selector["schema_version"] != 1
         || registered_revision.is_none_or(|revision| revision == 0)
         || selected_revision.is_none_or(|revision| revision < registered_revision.unwrap_or(0))
         || binding["binding_id"].as_str() != Some(observation.scope.binding_id.as_str())
         || binding_generation != i64::try_from(observation.scope.generation).ok()
         || binding["module_artifact_id"].as_str() != Some(observation.artifact_id.as_str())
-        || binding["route"]["runtime"].as_str() != Some(observation.module_id.as_str())
         || selector["module_id"].as_str() != Some(observation.module_id.as_str())
         || artifact["artifact_id"].as_str() != Some(observation.artifact_id.as_str())
         || artifact["version"].as_str() != Some(observation.artifact_version.as_str())

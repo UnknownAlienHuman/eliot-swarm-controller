@@ -14,9 +14,10 @@ use swarm_contracts::{
 };
 use swarm_process::module_owner::{VerifiedModuleWorker, verify_current_adapter_from_env};
 
-const CAPABILITIES: [&str; 5] = [
+const CAPABILITIES: [&str; 6] = [
     "agent.open",
     "agent.reconcile",
+    "agent.result",
     "agent.refresh",
     "agent.send/next_turn",
     "task.dispatch",
