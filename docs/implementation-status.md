@@ -2,6 +2,15 @@
 
 ## Current state
 
+### PR #25 scoped child environment — 2026-10-05
+
+The module-owner wrapper clears the adapter child's inherited environment.
+Windows carries an explicit OS/home/config baseline, then the validated plan's
+literals and protected file references. Arbitrary ambient provider credentials
+are excluded. This changes future child launches only; operator services and the
+running Codex process retain their environment. Independent source review passes;
+live launch and provider behavior remain unqualified.
+
 ### PR #25 adapter host contracts and capture diagnostics — 2026-10-05
 
 The host validates native options and forwards its admitted workspace for the

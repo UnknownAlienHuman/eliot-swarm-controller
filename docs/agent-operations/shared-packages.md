@@ -106,8 +106,10 @@ the existing v1 owner envelope and an exact distinct adapter image receipt, then
 retains ownership through direct-child exit and native-family drain. Its plan
 contains scope, artifact/version, boot identity and protected references; the
 resolver passes existing credential-file paths, without serializing token bytes
-or placing them in argv. Ambient module identity/credential environment is
-cleared before the selected scope is supplied. Explicit path metadata checks
+or placing them in argv. The child starts with a cleared environment, an explicit
+Windows OS/home/config baseline and the validated plan's literals and protected
+file paths. Arbitrary ambient provider credentials are excluded. Trusted plan
+values can override the baseline. Explicit path metadata checks
 reject symlink/reparse components; they do not provide a same-user sandbox or
 an atomic filesystem-race guarantee.
 

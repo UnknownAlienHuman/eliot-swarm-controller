@@ -2282,7 +2282,7 @@ pub(super) fn open_for_launch_for_actor(
     let workspace_field = route
         .workspace_option
         .as_deref()
-        .or_else(|| {
+        .or({
             // Compatibility mapping for legacy built-in routes. New standalone
             // artifacts declare their own exact field in the route contract.
             match route.runtime.as_str() {
@@ -2307,7 +2307,7 @@ pub(super) fn open_for_launch_for_actor(
     options.insert(workspace_field.into(), json!(workspace_path));
     reserve_open_route(
         tx,
-        &effective_manager_id,
+        effective_manager_id,
         model::text(v, "lane_id")?,
         &route,
         id,

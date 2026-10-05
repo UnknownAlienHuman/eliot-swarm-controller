@@ -31,6 +31,27 @@ const MAX_REF_BYTES: usize = 4_096;
 const OWNER_MAX_BYTES: u64 = 65_536;
 const MARKER: &str = "ELIOT_SWARM_MODULE_V1\n";
 
+/// Only these non-secret Windows values are carried into the adapter child.
+/// Descriptor literals and late protected-reference paths are installed after
+/// this baseline; arbitrary provider, API, bearer, or user environment values
+/// are deliberately excluded.
+#[cfg(windows)]
+const WINDOWS_LAUNCH_ENVIRONMENT: &[&str] = &[
+    "SystemRoot",
+    "WINDIR",
+    "ComSpec",
+    "PATH",
+    "PATHEXT",
+    "TEMP",
+    "TMP",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "ProgramData",
+    "HOMEDRIVE",
+    "HOMEPATH",
+];
+
 fn reject_link_components(path: &Path, allow_missing_tail: bool) -> Result<()> {
     if !path.is_absolute() {
         return Err(Error::invalid("path must be absolute"));
@@ -355,17 +376,7 @@ pub fn run_module_with_resolver<R: ProtectedRefResolver>(
     }
 
     let mut command = Command::new(&resolved.executable);
-    // A new scoped worker must not inherit a previous module's credential or
-    // identity. Restore only the fixed plan context and resolved file refs.
-    for (name, _) in env::vars_os() {
-        if name
-            .to_string_lossy()
-            .to_ascii_uppercase()
-            .starts_with("ELIOT_SWARM_MODULE_")
-        {
-            command.env_remove(name);
-        }
-    }
+    apply_launch_environment(&mut command);
     command
         .args(&resolved.argv)
         .env_remove("ELIOT_SWARM_MODULE_BOOT_ID")
@@ -443,6 +454,21 @@ pub fn run_module_with_resolver<R: ProtectedRefResolver>(
             "MODULE_EXITED",
             format!("bridge ended: {status}; native group is empty"),
         ))
+    }
+}
+
+/// Start the adapter from a deliberately bounded environment. The Windows
+/// baseline is limited to OS launch, home, and configuration discovery values;
+/// all module-specific literals and protected-reference file paths come from
+/// the validated plan/resolver below. This is an environment boundary, not a
+/// same-user sandbox or a provider/account authorization boundary.
+fn apply_launch_environment(command: &mut Command) {
+    command.env_clear();
+    #[cfg(windows)]
+    for name in WINDOWS_LAUNCH_ENVIRONMENT {
+        if let Some(value) = env::var_os(name) {
+            command.env(name, value);
+        }
     }
 }
 
