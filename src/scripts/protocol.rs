@@ -107,18 +107,43 @@ pub struct ScriptResult {
 #[serde(deny_unknown_fields)]
 pub struct ScriptEffectRequest {
     pub effect: ScriptControllerEffect,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec: Option<Value>,
 }
 
 impl ScriptEffectRequest {
     pub fn validate(&self) -> Result<()> {
-        if self.text.trim().is_empty()
-            || self.text.len() > MAX_CONTROLLER_EFFECT_TEXT_BYTES
-            || self.text.contains('\0')
-        {
-            return Err(Error::invalid(
-                "task-owner message must be nonempty and at most 4096 UTF-8 bytes",
-            ));
+        match self.effect {
+            ScriptControllerEffect::TaskOwnerMessage
+            | ScriptControllerEffect::ManagerNotification
+                if self.spec.is_none() =>
+            {
+                if self.text.trim().is_empty()
+                    || self.text.len() > MAX_CONTROLLER_EFFECT_TEXT_BYTES
+                    || self.text.contains('\0')
+                {
+                    return Err(Error::invalid(
+                        "controller-effect text must be nonempty and at most 4096 UTF-8 bytes",
+                    ));
+                }
+            }
+            ScriptControllerEffect::TaskCreate
+                if self.text.is_empty() && self.spec.as_ref().is_some_and(Value::is_object) =>
+            {
+                let spec = self.spec.as_ref().expect("guard checked spec");
+                if model::canonical(spec)?.len() > MAX_INPUT_BYTES {
+                    return Err(Error::invalid(
+                        "task_create spec exceeds the 256 KiB input limit",
+                    ));
+                }
+            }
+            _ => {
+                return Err(Error::invalid(
+                    "controller-effect fields do not match the selected closed effect",
+                ));
+            }
         }
         Ok(())
     }

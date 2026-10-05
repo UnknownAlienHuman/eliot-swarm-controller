@@ -23,7 +23,7 @@ use std::{
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use swarm_client::{Client, IpcConfig};
+use swarm_client::{Client, HostConnectionConfig, IpcConfig};
 use swarm_contracts::{
     Credential,
     error::{Error, Result},
@@ -586,6 +586,8 @@ impl SupervisorRegistry {
                         scope: scope.clone(),
                         state_dir: service_state_dir(&self.state_root, &descriptor, &scope)?,
                         state_root: self.state_root.clone(),
+                        host_data_dir: self.ipc_root.clone(),
+                        ipc: self.ipc.clone(),
                         launch_config: launch_config.clone(),
                         module_client_id: module_client_id.clone(),
                         protocol: claim.protocol,
@@ -612,6 +614,8 @@ impl SupervisorRegistry {
                     scope: scope.clone(),
                     state_dir: service_state_dir(&self.state_root, &descriptor, &scope)?,
                     state_root: self.state_root.clone(),
+                    host_data_dir: self.ipc_root.clone(),
+                    ipc: self.ipc.clone(),
                     launch_config: launch_config.clone(),
                     module_client_id: module_client_id.clone(),
                     protocol: claim.protocol,
@@ -783,6 +787,8 @@ struct Service {
     scope: ServiceScope,
     state_dir: PathBuf,
     state_root: PathBuf,
+    host_data_dir: PathBuf,
+    ipc: IpcConfig,
     launch_config: BindingLaunchConfig,
     module_client_id: String,
     protocol: ProtocolVersion,
@@ -805,6 +811,8 @@ struct ServiceInitialization {
     scope: ServiceScope,
     state_dir: PathBuf,
     state_root: PathBuf,
+    host_data_dir: PathBuf,
+    ipc: IpcConfig,
     launch_config: BindingLaunchConfig,
     module_client_id: String,
     protocol: ProtocolVersion,
@@ -864,6 +872,8 @@ impl Service {
             scope: initialization.scope,
             state_dir: initialization.state_dir,
             state_root: initialization.state_root,
+            host_data_dir: initialization.host_data_dir,
+            ipc: initialization.ipc,
             launch_config: initialization.launch_config,
             module_client_id: initialization.module_client_id,
             protocol: initialization.protocol,
@@ -1670,6 +1680,18 @@ impl Service {
             }));
         }
 
+        let host_config_path = self
+            .descriptor
+            .launch
+            .argv
+            .iter()
+            .find_map(|value| match value {
+                LaunchValue::ModuleHostConfigPath { schema_version } => Some(*schema_version),
+                _ => None,
+            })
+            .map(|schema_version| self.materialize_module_host_config(schema_version))
+            .transpose()?;
+
         let argv = self
             .descriptor
             .launch
@@ -1683,6 +1705,21 @@ impl Service {
                 }
                 LaunchValue::Literal(_) => Err(Error::invalid(
                     "module argv entry is outside the bounded helper plan",
+                )),
+                LaunchValue::ModuleHostConfigPath { schema_version: 1 } => host_config_path
+                    .as_ref()
+                    .and_then(|path| path.to_str())
+                    .filter(|path| path.len() <= 4_096)
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        Error::new(
+                            "MODULE_HOST_CONFIG_INVALID",
+                            "module host config path was not materialized as an absolute bounded Unicode path",
+                        )
+                    }),
+                LaunchValue::ModuleHostConfigPath { .. } => Err(Error::new(
+                    "MODULE_HOST_CONFIG_INVALID",
+                    "module host config path marker uses an unsupported schema",
                 )),
                 LaunchValue::Protected(_) => Err(Error::new(
                     "MODULE_PROTECTED_ARGV_UNSUPPORTED",
@@ -1757,6 +1794,59 @@ impl Service {
         Ok((child, plan_path))
     }
 
+    fn materialize_module_host_config(&self, schema_version: u16) -> Result<PathBuf> {
+        if schema_version != 1 {
+            return Err(Error::new(
+                "MODULE_HOST_CONFIG_INVALID",
+                "module host config path marker uses an unsupported schema",
+            ));
+        }
+        let path = self.state_dir.join("module-host-connection.json");
+        if !path.is_absolute() || path.to_str().is_none_or(|value| value.len() > 4_096) {
+            return Err(Error::new(
+                "MODULE_HOST_CONFIG_INVALID",
+                "module host config must resolve to an absolute bounded Unicode path",
+            ));
+        }
+        let config = HostConnectionConfig {
+            schema_version: u32::from(schema_version),
+            host_data_dir: self.host_data_dir.clone(),
+            ipc: self.ipc.clone(),
+        };
+        config.validate()?;
+        let data = serde_json::to_vec(&config)?;
+        if data.len() as u64 > MODULE_PLAN_LIMIT {
+            return Err(Error::invalid(
+                "module host connection config exceeds its size bound",
+            ));
+        }
+
+        // This path is overwritten only when the prior exact owner has been
+        // reconciled as gone. Exclusive creation after leaf validation avoids
+        // following a module-planted link or launching against partial bytes.
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err(Error::new(
+                    "MODULE_HOST_CONFIG_PATH_UNSAFE",
+                    "module host config path is not a regular file",
+                ));
+            }
+            Ok(_) => fs::remove_file(&path)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        swarm_process::private_permissions(&path, false)?;
+        file.write_all(&data)?;
+        file.sync_all()?;
+        drop(file);
+        sync_directory(&self.state_dir)?;
+        Ok(path)
+    }
+
     fn add_launch_value(
         &self,
         name: &str,
@@ -1802,6 +1892,11 @@ impl Service {
                     "name": name,
                     "reference": reference.as_str(),
                 }));
+            }
+            LaunchValue::ModuleHostConfigPath { .. } => {
+                return Err(Error::invalid(
+                    "module host config path markers are valid only in descriptor argv",
+                ));
             }
         }
         Ok(())

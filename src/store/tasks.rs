@@ -128,6 +128,40 @@ pub(super) fn create(
     } else {
         None
     };
+    create_validated(tx, &project, &s, origin.as_deref(), id, now)
+}
+
+/// Taskless automation can create a Task only in the project retained by its
+/// current Manager-owned event entry. The typed ScriptEffect authority checks
+/// the Manager, source, active entry and ScriptRun before and after this
+/// shared Task.create body.
+pub(super) fn create_for_script_effect(
+    tx: &Transaction<'_>,
+    expected_project_id: &str,
+    v: &Value,
+    id: &str,
+    now: i64,
+) -> Result<Value> {
+    model::fields(v, &["client_request_id", "project_id", "spec"])?;
+    let project = model::text(v, "project_id")?;
+    if project != expected_project_id {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "script task_create is limited to its retained automation project",
+        ));
+    }
+    let s = spec(v)?;
+    create_validated(tx, &project, &s, None, id, now)
+}
+
+fn create_validated(
+    tx: &Transaction<'_>,
+    project: &str,
+    s: &TaskSpec,
+    origin: Option<&str>,
+    id: &str,
+    now: i64,
+) -> Result<Value> {
     if let Some(origin) = origin {
         let prior: Option<String> = tx
             .query_row(

@@ -17,23 +17,20 @@ path = "src/main.rs"
 [dependencies]
 atlas-redact = { path = "modules/atlas-redact" }
 base64 = "=0.22.1"
-bytes = "=1.12.1"
 clap = { version = "4.5", features = ["derive"] }
 chrono = "0.4"
 chrono-tz = "0.10"
 croner = { version = "4", features = ["chrono"] }
 eventsource-stream = "=0.2.3"
 futures-util = { version = "0.3", features = ["sink"] }
-http-body-util = "=0.1.5"
-hyper = { version = "=1.11.1", default-features = false, features = ["http1", "server"] }
-hyper-util = { version = "=0.1.21", default-features = false, features = ["http1", "server", "tokio"] }
 reqwest = { version = "=0.13.5", default-features = false, features = ["json", "stream"] }
-rmcp = { version = "=3.5.0", default-features = false, features = ["server", "transport-io", "transport-streamable-http-server"] }
+rmcp = { version = "=3.5.0", default-features = false, features = ["server", "transport-io"] }
 rusqlite = { version = "=0.40.2", features = ["bundled"] }
 swarm-client = { path = "crates/swarm-client" }
 swarm-bus = { path = "crates/swarm-bus" }
 swarm-contracts = { path = "crates/swarm-contracts" }
 swarm-kernel = { path = "crates/swarm-kernel" }
+swarm-mcp = { path = "crates/swarm-mcp" }
 swarm-process = { path = "crates/swarm-process" }
 swarm-script-worker = { path = "crates/swarm-script-worker" }
 swarm-scripts = { path = "crates/swarm-scripts" }
@@ -48,7 +45,6 @@ swarm-observer = { path = "crates/swarm-observer" }
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "process", "sync", "signal", "time"] }
 tokio-util = { version = "0.7", features = ["codec"] }
-tower-service = "=0.3.3"
 toml = "0.9"
 uuid = { version = "1", features = ["v4", "serde"] }
 
@@ -75,20 +71,24 @@ lto = "off"
 members = [
     "crates/swarm-adapter-codex",
     "crates/swarm-adapter-command",
+    "crates/swarm-adapter-claude",
     "crates/swarm-adapter-opencode",
     "crates/swarm-contracts",
     "crates/swarm-client",
+    "crates/swarm-cli",
     "crates/swarm-checks",
     "crates/swarm-observer",
     "crates/swarm-forge-worker",
     "crates/swarm-bus",
     "crates/swarm-kernel",
+    "crates/swarm-mcp",
     "crates/swarm-process",
     "crates/swarm-script-worker",
     "crates/swarm-scripts",
     "crates/swarm-store",
     "crates/swarm-supervisor",
     "crates/swarm-telemetry",
+    "crates/swarm-gateway",
     "modules/antigravity-rust",
 ]
 default-members = ["."]

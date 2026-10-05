@@ -1,8 +1,15 @@
 # Install and select a local module
 
-This runbook covers the four Rust adapters and the local observer/check executor settings in the current controller config. It installs adapter executables only. It does not install a provider, native service, model, or vendor CLI, and installation or route selection does not qualify those native systems.
+This runbook covers the standalone adapter packages, independent frontend binaries, and local observer/check executor settings in the current controller config. It installs adapter executables only. It does not install a provider, native service, model, or vendor CLI, and installation or route selection does not qualify those native systems.
 
 ## Build and install one adapter
+
+New OpenCode and Command Code qualification runs use
+`inclusionai/ling-3.1-flash`. Pass that exact reference to
+`New-NativeQualification.ps1 -OpenCodeCommandTestModelRef inclusionai/ling-3.1-flash`
+and verify the selected native provider exposes it before invocation. Bunny is
+disabled for new runs; historical receipts retain their original model identity.
+Other harnesses keep their own explicitly supported provider/model contract.
 
 Build only the selected package, using a caller-owned shared target directory. The package/binary pairs are:
 
@@ -10,8 +17,9 @@ Build only the selected package, using a caller-owned shared target directory. T
 |---|---|---|---|
 | Codex | `swarm-adapter-codex` | `swarm-codex-adapter` | `crates/swarm-adapter-codex/module-descriptor.template.json` |
 | OpenCode | `swarm-adapter-opencode` | `swarm-adapter-opencode` | `crates/swarm-adapter-opencode/registration/descriptor.template.json` |
-| Command | `swarm-adapter-command` | `swarm-adapter-command` | `crates/swarm-adapter-command/module-descriptor.template.json` |
+| Command | `swarm-adapter-command` | `swarm-adapter-command` | `crates/swarm-adapter-command/module-descriptor.template.json` (version 3; version 2 is retained separately) |
 | Antigravity | `swarm-antigravity-adapter` | `swarm-antigravity` | `modules/antigravity-rust/module-descriptor.template.json` |
+| Claude | `swarm-adapter-claude` | `swarm-adapter-claude` | `modules/claude-rust/module-descriptor.template.json` |
 
 ```powershell
 $Manifest = 'C:\src\eliot-swarm-controller\crates\swarm-adapter-command\Cargo.toml'
@@ -24,7 +32,9 @@ Use the resulting `$Target/release/<binary>.exe` as the installer source. Build 
 
 The host writes the private scoped launch plan and resolver map below its storage data directory after durable module demand. It invokes the pinned helper as `swarm-module-owner <absolute-plan-path> <absolute-resolver-map-path>`. The helper accepts exactly these two paths; its per-launch files are produced by the host.
 
-Copy the selected descriptor template outside the checkout. Set `enabled` to `true` only when ready to make that version selectable, and replace any `<INSTALLER_CREDENTIAL_FILE_REF>` with an opaque protected-reference name. Keep adapter identity, protocol, schema, command/event schemas, capabilities, lifecycle and restart policy aligned with that adapter's template. Do not put credential bytes or provider tokens in the descriptor. The installer fills `launch.executable` and `launch.executable_sha256` from the built file.
+Copy the selected descriptor template outside the checkout. Set `enabled` to `true` only when ready to make that version selectable, and replace the credential placeholder (`<INSTALLER_CREDENTIAL_FILE_REF>` or the retained version-2 `REPLACE_AT_INSTALL` token) with an opaque protected-reference name. Keep adapter identity, protocol, schema, command/event schemas, capabilities, lifecycle and restart policy aligned with that adapter's template. Do not put credential bytes or provider tokens in the descriptor. The installer fills `launch.executable` and `launch.executable_sha256` from the built file.
+
+For Command version 3, keep the typed `module_host_config_path` argument marker unchanged; the supervisor materializes that schema-v1 IPC config inside the exact binding's private state directory at launch. Replace only the final `--config` argument with the absolute path to the operator-maintained Command native config JSON, and make sure that file exists and is readable by the adapter. The installer rejects unresolved `<INSTALLER_...>` and `REPLACE_AT_INSTALL` placeholders, preserves the typed marker, and copies neither the native config nor the Command CLI/mod. The native config contains the native executable and preserved mod paths; it does not select the model. Version 2 keeps its original descriptor and config contract for existing installations.
 
 Use an existing dedicated absolute install root outside the controller/Codex/OpenCode trees. The root must already exist, remain within the installer's path limit, and contain no reparse-point traversal. Preview first, then repeat without `-WhatIf`:
 
@@ -37,7 +47,41 @@ pwsh -NoProfile -File $Installer -SourceExecutable $Source -DescriptorTemplate $
 # After reviewing the preview, run the same command without -WhatIf.
 ```
 
-The installer creates a coordinate-hashed directory with `module.exe`, `module-descriptor.json`, `install-receipt.json`, and local `install-coordinate.json`. It never registers or launches anything and never replaces different bytes at an existing identity. Use a new artifact version for changed executable or descriptor bytes. At host startup, the optional supervisor loads only configured descriptor files, checks the descriptor/receipt/executable hashes, then registers through its reserved local identity. Managers do not receive that credential. A descriptor template being installed is not a registration receipt; registration is also not a route selection.
+The installer creates a coordinate-hashed directory with `module.exe`, `module-descriptor.json`, `install-receipt.json`, and local `install-coordinate.json`. It never registers or launches anything and never replaces different bytes at an existing identity. Use a new artifact version for changed executable or descriptor bytes. The Command native config is operator-managed outside that immutable artifact receipt; keep its configured path available and protected from unintended edits. At host startup, the optional supervisor loads only configured descriptor files, checks the descriptor/receipt/executable hashes, then registers through its reserved local identity. Managers do not receive that credential. A descriptor template being installed is not a registration receipt; registration is also not a route selection.
+
+## Package independent frontends
+
+The independent package/binary coordinates are `swarm-mcp`/`swarm-mcp`,
+`swarm-cli`/`swarm-cli` and `swarm-gateway`/`swarm-gateway`. The controller still
+provides the public `swarm` executable during CLI migration. Gateway is optional;
+installing the base host does not require it.
+
+`Build-SwarmFrontendProvenance.ps1` builds one selected release binary using an
+existing external shared target and writes a new package directory. It requires
+a clean committed checkout and records the artifact's own source, lockfile,
+dependency and executable hashes. For example:
+
+```powershell
+$TargetDir = 'C:\Users\kleym\AppData\Local\Eliot\build\rust-env-target'
+$PackageDirectory = 'D:\eliot\packages\swarm-mcp-new-version'
+pwsh -NoProfile -File tools/ci/Build-SwarmFrontendProvenance.ps1 `
+  -Package swarm-mcp -TargetDir $TargetDir -OutputDir $PackageDirectory
+pwsh -NoProfile -File tools/modules/Install-SwarmFrontend.ps1 `
+  -PackageDirectory $PackageDirectory -InstallDirectory 'D:\eliot\frontend-version' -WhatIf
+```
+
+Use a new output directory and an existing dedicated absolute install directory.
+After reviewing the preview, the same installer command without `-WhatIf` stages
+and installs the verified package. Existing differing bytes are not replaced.
+Each artifact retains its own provenance; installed siblings are checked against
+the shared IPC protocol, target triple and supported launcher arguments, not an
+unrelated artifact's repository SHA. Packaging and installation do not start a
+service or establish native qualification.
+
+The frontend dependency manifest records a workspace-resolved Cargo graph. Its
+package closure is traversed from the selected package through that graph, while
+feature arrays are explicitly labeled workspace-unified; they are not claimed
+to be the selected artifact's exact compiled feature set.
 
 ## Configure the host and route
 
@@ -81,7 +125,7 @@ modelId = 'REPLACE_WITH_YOUR_NATIVE_MODEL_ID'
 workspaceRoot = 'D:\work\your-repository'
 ```
 
-Set `enabled` only for routes you want to admit new work on; omitted route `enabled` defaults to `false`. Keep the adapter's private host/config file and native executable location at the path named by its descriptor `argv`; the installer copies neither. Use the adapter's own README for that file's exact fields. Existing native services/endpoints, access, models, and provider credentials remain operator-managed and must be independently qualified.
+Set `enabled` only for routes you want to admit new work on; omitted route `enabled` defaults to `false`. Command v3's typed host-config marker resolves to a supervisor-generated per-binding IPC config; its final `--config` argument names the separate operator-maintained native Command JSON file. The installer copies neither the native config nor the native executable/mod. Use the Command adapter README for the exact JSON fields. Existing native services/endpoints, access, models, and provider credentials remain operator-managed and must be independently qualified.
 
 After restarting with the local config, read `module.catalog.get`, note `catalog_revision`, and select the exact enabled descriptor for your authenticated Manager identity (Operator identity is also accepted):
 
@@ -90,12 +134,60 @@ After restarting with the local config, read `module.catalog.get`, note `catalog
   "route_alias": "command-local",
   "module_id": "runtime.command",
   "artifact_id": "eliot-command.rust-headless.1",
-  "version": "1",
+  "version": "3",
   "expected_catalog_revision": 12
 }
 ```
 
 Call `module.route.select` with that object. Use the exact values and revision returned by the catalog; a stale revision must be reread. Selection applies only to that identity's future bindings. It does not change existing bindings or start a worker. A later admitted pending Operation creates module demand; the host provisions and verifies the binding-scoped IPC credential, then launches the adapter under the descriptor and owner-helper checks. `external_attach` on Codex/OpenCode does not grant control of their native service. `owned_service` on Command/Antigravity describes the adapter module lifecycle; it does not install or qualify their native CLI.
+
+Command descriptor version 3 adds only the bounded `agent.result` status-page capability. Its page reports retained Operation facts with `native_response_identity: "unavailable"`, `execution_complete: false`, and `task_completion: "unknown"`; it does not contain inferred assistant text or authorize Task acceptance. Existing version-2 registrations retain their four-capability claim and are not upgraded by selecting version 3 for a future binding.
+
+## Package executable workspace coordinates
+
+`tools/ci/module-package-policy.json` pins the package, manifest, and single
+binary target for each module-role build. The builder compares this table with
+Cargo metadata and invokes only the declared `--bin`; a package with an
+unexpected or additional binary target requires an explicit policy update before
+it can be packaged. The builder records local source hashes, registry pins,
+lockfile/toolchain and executable digests. Cargo's full-workspace resolved graph
+can include workspace-unified edges/features, so its provenance manifest labels
+that scope rather than presenting the feature list as the selected binary's
+exact compiled feature set.
+
+| Cargo package | Manifest | Binary target | Role |
+|---|---|---|---|
+| `swarm-adapter-codex` | `crates/swarm-adapter-codex/Cargo.toml` | `swarm-codex-adapter` | Codex adapter |
+| `swarm-adapter-command` | `crates/swarm-adapter-command/Cargo.toml` | `swarm-adapter-command` | Command adapter |
+| `swarm-antigravity-adapter` | `modules/antigravity-rust/Cargo.toml` | `swarm-antigravity` | Antigravity adapter |
+| `swarm-adapter-opencode` | `crates/swarm-adapter-opencode/Cargo.toml` | `swarm-adapter-opencode` | OpenCode adapter |
+| `swarm-process` | `crates/swarm-process/Cargo.toml` | `swarm-module-owner` | Per-module owner helper |
+| `swarm-script-worker` | `crates/swarm-script-worker/Cargo.toml` | `swarm-script-worker` | Script executor |
+| `swarm-observer` | `crates/swarm-observer/Cargo.toml` | `swarm-observer` | Optional observer CLI |
+| `swarm-checks` | `crates/swarm-checks/Cargo.toml` | `swarm-checks` | Optional checks executor |
+| `swarm-forge-worker` | `crates/swarm-forge-worker/Cargo.toml` | `swarm-forge-worker` | Forge worker |
+| `swarm-bus` | `crates/swarm-bus/Cargo.toml` | `swarm-bus-dispatcher` | Managed bus dispatcher |
+
+For example, this recipe packages just the bus dispatcher into a new output
+directory, while sharing the caller-owned external Cargo target with other
+sequential package builds:
+
+```powershell
+just package-module swarm-bus release `
+  'D:\build-cache\eliot-shared-target' 'D:\artifacts\swarm-bus-release'
+```
+
+The root host is its own coordinate: `eliot-swarm-controller` / binary `swarm`,
+built in release profile by `Build-SwarmHostProvenance.ps1` or
+`just package-host`. The manual workflow offers the ten module coordinates
+above, that host, and the three independent frontends. It selects one package
+per run, creates one external shared target and fresh package output, and keeps
+host/frontend builds release-only. Gateway is optional for the base host.
+
+There is no standalone automation-scheduler executable target in the current
+Cargo graph. `src/scheduler.rs` is host code, and `swarm-scripts` and
+`swarm-supervisor` are libraries. A service-scope identity does not create a
+binary or independent package coordinate; this workflow does not advertise one.
 
 ## Package and install the Forge worker
 
@@ -157,10 +249,11 @@ shared target directory; no separate worker or worktree build cache is required.
 
 ## Optional checks and local observer
 
-The manual `module-package.yml` workflow offers eleven actual executable
-packages. Select one package and profile; `eliot-swarm-controller` requires
-`release`. All choices use one runner shared target directory and produce one
-package manifest. Library-only supervisor is not an executable selection.
+The manual `module-package.yml` workflow offers 14 current executable package
+coordinates: ten module roles, the root host, and three standalone frontends.
+Select one package and profile; host and frontends require `release`. All choices
+use one runner shared target directory and produce one package manifest.
+Library-only scheduler/supervisor crates are not executable selections.
 For current-source native qualification, use
 `tools/qualification/New-NativeQualification.ps1` with explicit host/module
 build-manifest and image hashes, installed descriptor and private configuration.

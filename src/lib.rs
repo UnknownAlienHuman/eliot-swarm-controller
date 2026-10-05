@@ -2,6 +2,7 @@
 pub mod acceptance;
 pub mod artifacts;
 pub mod automation;
+mod bus_supervisor_config;
 pub mod checks;
 pub mod config;
 pub mod coordination;
@@ -9,15 +10,17 @@ pub mod doctor;
 pub mod error;
 pub mod export;
 pub mod forge;
-pub mod gateway;
 pub mod github;
 pub mod goals;
 pub mod hooks;
 pub mod host;
+mod host_bus_supervisor;
 mod host_module_supervisor;
 pub mod ipc;
 pub mod launcher;
 pub mod mcp;
+#[cfg(test)]
+mod mcp_integration_tests;
 pub mod model;
 mod module_supervisor_config;
 mod native_mcp;

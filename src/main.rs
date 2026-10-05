@@ -810,21 +810,7 @@ async fn run(cli: Cli) -> Result<()> {
                 "gateway is disabled; set gateway.enabled = true in the local configuration",
             ));
         }
-        let credential_path = config.gateway.credential_file.as_ref().ok_or_else(|| {
-            Error::new("CONFIG_ERROR", "gateway credential_file is not configured")
-        })?;
-        let bearer_path = config.gateway.local_bearer_file.as_ref().ok_or_else(|| {
-            Error::new(
-                "CONFIG_ERROR",
-                "gateway local_bearer_file is not configured",
-            )
-        })?;
-        let credential = platform::load_credential(credential_path)?;
-        config
-            .mcp
-            .selected_tool_profile(Some(&config.gateway.profile), &credential.client_id)?;
-        let bearer_token = load_local_bearer(bearer_path)?;
-        return eliot_swarm_controller::gateway::run(config, credential, bearer_token).await;
+        return run_gateway_binary(cli.config.as_deref(), cli.data_dir.as_deref()).await;
     }
     if let Command::Observer {
         command:
@@ -1945,25 +1931,55 @@ async fn hook_install(
     Ok(())
 }
 
-fn load_local_bearer(path: &PathBuf) -> Result<String> {
-    use std::io::Read;
-
-    let mut contents = String::new();
-    std::fs::File::open(path)?
-        .take(515)
-        .read_to_string(&mut contents)?;
-    if contents.len() > 514 {
-        return Err(Error::new(
-            "AUTH_ERROR",
-            "gateway bearer file exceeds 512 bytes plus a final line ending",
-        ));
+async fn run_gateway_binary(config_path: Option<&Path>, data_dir: Option<&Path>) -> Result<()> {
+    let mut executable = std::env::current_exe().map_err(|error| {
+        Error::new(
+            "GATEWAY_BINARY_PATH_FAILED",
+            format!("could not locate the running swarm executable: {error}"),
+        )
+    })?;
+    executable.set_file_name(if cfg!(windows) {
+        "swarm-gateway.exe"
+    } else {
+        "swarm-gateway"
+    });
+    let sibling_is_file = executable.is_file();
+    let mut child = tokio::process::Command::new(&executable);
+    if let Some(path) = config_path {
+        child.arg("--config").arg(path);
     }
-    let token = contents.trim_end_matches(['\r', '\n']);
-    if !(32..=512).contains(&token.len()) || !token.bytes().all(|byte| byte.is_ascii_graphic()) {
-        return Err(Error::new(
-            "AUTH_ERROR",
-            "gateway bearer file must contain one printable token of 32 to 512 bytes",
-        ));
+    if let Some(path) = data_dir {
+        child.arg("--data-dir").arg(path);
     }
-    Ok(token.to_owned())
+    let status = child.status().await.map_err(|error| {
+        let (code, recovery) = if error.kind() == std::io::ErrorKind::NotFound && !sibling_is_file {
+            (
+                "GATEWAY_BINARY_MISSING",
+                "Gateway is optional; install the matching swarm-gateway sibling beside this swarm executable and retry.",
+            )
+        } else {
+            (
+                "GATEWAY_START_FAILED",
+                "Check the sibling executable and its dependent runtime files and permissions, then retry.",
+            )
+        };
+        Error::new(
+            code,
+            format!(
+                "could not start the sibling executable at '{}': {error}. {recovery}",
+                executable.display()
+            ),
+        )
+    })?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(Error::new(
+            "GATEWAY_FAILED",
+            format!(
+                "the sibling swarm-gateway process at '{}' exited unsuccessfully ({status})",
+                executable.display()
+            ),
+        ))
+    }
 }

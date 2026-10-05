@@ -162,6 +162,13 @@ pub enum Kind {
     RecorderFailure,
 }
 
+/// Finite producer components associated with correlated records.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Component {
+    ModuleSupervisor,
+}
+
 /// Closed lifecycle phase vocabulary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -209,6 +216,42 @@ impl KnownId {
     }
 }
 
+/// Additional bounded metadata identities used only by the correlated
+/// supervisor diagnostic shape. Their accepted alphabets mirror the already
+/// validated Store observation fields.
+#[derive(Clone, Debug)]
+struct KnownMetadata(String);
+
+impl KnownMetadata {
+    fn from_event_id(value: &str) -> Option<Self> {
+        Self::from_bounded(value, 256, b"-_.:")
+    }
+
+    fn from_atom(value: &str) -> Option<Self> {
+        Self::from_bounded(value, MAX_ID_BYTES, b"._:-")
+    }
+
+    fn from_build_id(value: &str) -> Option<Self> {
+        Self::from_bounded(value, MAX_ID_BYTES, b"._:-+")
+    }
+
+    fn from_version(value: &str) -> Option<Self> {
+        Self::from_bounded(value, MAX_ID_BYTES, b".+_-")
+    }
+
+    fn from_bounded(value: &str, max_bytes: usize, punctuation: &[u8]) -> Option<Self> {
+        if value.is_empty()
+            || value.len() > max_bytes
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || punctuation.contains(&byte))
+        {
+            return None;
+        }
+        Some(Self(value.to_owned()))
+    }
+}
+
 /// Input record. Optional identifiers are included only when the caller has
 /// the corresponding known value; no values are synthesized for missing IDs.
 #[derive(Clone, Debug)]
@@ -216,6 +259,7 @@ pub struct Record {
     severity: Severity,
     kind: Kind,
     phase: Phase,
+    component: Option<Component>,
     code: Option<Code>,
     client_id: Option<KnownId>,
     link_id: Option<KnownId>,
@@ -223,6 +267,13 @@ pub struct Record {
     binding_generation: Option<u64>,
     operation_id: Option<KnownId>,
     module_boot_id: Option<KnownId>,
+    event_id: Option<KnownMetadata>,
+    module_id: Option<KnownMetadata>,
+    artifact_id: Option<KnownMetadata>,
+    artifact_version: Option<KnownMetadata>,
+    build_id: Option<KnownMetadata>,
+    task_id: Option<KnownId>,
+    attempt_id: Option<KnownId>,
 }
 
 impl Record {
@@ -231,6 +282,7 @@ impl Record {
             severity,
             kind,
             phase,
+            component: None,
             code: None,
             client_id: None,
             link_id: None,
@@ -238,11 +290,22 @@ impl Record {
             binding_generation: None,
             operation_id: None,
             module_boot_id: None,
+            event_id: None,
+            module_id: None,
+            artifact_id: None,
+            artifact_version: None,
+            build_id: None,
+            task_id: None,
+            attempt_id: None,
         }
     }
 
     pub fn with_code(mut self, value: Option<Code>) -> Self {
         self.code = value;
+        self
+    }
+    pub fn with_component(mut self, value: Option<Component>) -> Self {
+        self.component = value;
         self
     }
     pub fn with_client_id(mut self, value: Option<&str>) -> Self {
@@ -270,12 +333,54 @@ impl Record {
         self.module_boot_id = value.and_then(KnownId::from_known);
         self
     }
+    pub fn with_event_id(mut self, value: Option<&str>) -> Self {
+        self.event_id = value.and_then(KnownMetadata::from_event_id);
+        self
+    }
+    pub fn with_module_id(mut self, value: Option<&str>) -> Self {
+        self.module_id = value.and_then(KnownMetadata::from_atom);
+        self
+    }
+    pub fn with_artifact_id(mut self, value: Option<&str>) -> Self {
+        self.artifact_id = value.and_then(KnownMetadata::from_atom);
+        self
+    }
+    pub fn with_artifact_version(mut self, value: Option<&str>) -> Self {
+        self.artifact_version = value.and_then(KnownMetadata::from_version);
+        self
+    }
+    pub fn with_build_id(mut self, value: Option<&str>) -> Self {
+        self.build_id = value.and_then(KnownMetadata::from_build_id);
+        self
+    }
+    pub fn with_task_id(mut self, value: Option<&str>) -> Self {
+        self.task_id = value.and_then(KnownId::from_known);
+        self
+    }
+    pub fn with_attempt_id(mut self, value: Option<&str>) -> Self {
+        self.attempt_id = value.and_then(KnownId::from_known);
+        self
+    }
+
+    fn has_extended_correlation(&self) -> bool {
+        self.event_id.is_some()
+            && self.component.is_some()
+            && self.module_id.is_some()
+            && self.artifact_id.is_some()
+            && self.artifact_version.is_some()
+            && self.binding_id.is_some()
+            && self.binding_generation.is_some()
+            && self.module_boot_id.is_some()
+            && (self.task_id.is_none() && self.attempt_id.is_none()
+                || self.operation_id.is_some()
+                    && (self.attempt_id.is_none() || self.task_id.is_some()))
+    }
 }
 
 #[derive(Serialize)]
 struct WireRecord<'a> {
-    // Schema 2 adds the optional retained binding generation. The observer
-    // still decodes the exact schema-1 shape for already-written records.
+    // Schema 2 adds the optional retained binding generation. Schema 3 is
+    // emitted only for records with the additional bounded correlation fields.
     schema_version: u8,
     // Identifies emission attempts, including dropped ones. Concurrent sends
     // can reach the writer in another order; this is not a journal cursor.
@@ -285,6 +390,8 @@ struct WireRecord<'a> {
     severity: Severity,
     kind: Kind,
     phase: Phase,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    component: Option<Component>,
     #[serde(skip_serializing_if = "Option::is_none")]
     code: Option<Code>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -299,6 +406,20 @@ struct WireRecord<'a> {
     operation_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     module_boot_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    event_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    module_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    artifact_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    artifact_version: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    build_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attempt_id: Option<&'a str>,
 }
 
 struct Queued {
@@ -374,13 +495,24 @@ impl Producer {
             return EmitResult::Disabled;
         }
         let sequence = next_sequence(&self.inner.next_sequence);
+        let schema_version = if record.has_extended_correlation() {
+            3
+        } else {
+            2
+        };
+        let include_correlation = schema_version == 3;
         let wire = WireRecord {
-            schema_version: 2,
+            schema_version,
             sequence,
             occurred_at_unix_ms: unix_time_ms(),
             severity: record.severity,
             kind: record.kind,
             phase: record.phase,
+            component: if include_correlation {
+                record.component
+            } else {
+                None
+            },
             code: record.code,
             client_id: record.client_id.as_ref().map(|id| id.0.as_str()),
             link_id: record.link_id.as_ref().map(|id| id.0.as_str()),
@@ -388,6 +520,41 @@ impl Producer {
             binding_generation: record.binding_generation,
             operation_id: record.operation_id.as_ref().map(|id| id.0.as_str()),
             module_boot_id: record.module_boot_id.as_ref().map(|id| id.0.as_str()),
+            event_id: if include_correlation {
+                record.event_id.as_ref().map(|id| id.0.as_str())
+            } else {
+                None
+            },
+            module_id: if include_correlation {
+                record.module_id.as_ref().map(|id| id.0.as_str())
+            } else {
+                None
+            },
+            artifact_id: if include_correlation {
+                record.artifact_id.as_ref().map(|id| id.0.as_str())
+            } else {
+                None
+            },
+            artifact_version: if include_correlation {
+                record.artifact_version.as_ref().map(|id| id.0.as_str())
+            } else {
+                None
+            },
+            build_id: if include_correlation {
+                record.build_id.as_ref().map(|id| id.0.as_str())
+            } else {
+                None
+            },
+            task_id: if include_correlation {
+                record.task_id.as_ref().map(|id| id.0.as_str())
+            } else {
+                None
+            },
+            attempt_id: if include_correlation {
+                record.attempt_id.as_ref().map(|id| id.0.as_str())
+            } else {
+                None
+            },
         };
         let mut bytes = match serde_json::to_vec(&wire) {
             Ok(bytes) => bytes,

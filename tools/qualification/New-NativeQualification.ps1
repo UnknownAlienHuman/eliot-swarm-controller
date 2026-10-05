@@ -19,6 +19,8 @@ param(
     [Parameter(Mandatory)][string] $ModuleOwnerHelperPath,
     [Parameter(Mandatory)][ValidatePattern('^[A-Fa-f0-9]{64}$')][string] $ExpectedModuleOwnerHelperSha256,
     [ValidateSet('OpenCode', 'Command', 'Codex', 'Antigravity', 'Claude')][string] $Adapter = 'OpenCode',
+    [ValidatePattern('^[A-Za-z0-9._-]+/[A-Za-z0-9._:-]+$')]
+    [string] $OpenCodeCommandTestModelRef = 'inclusionai/ling-3.1-flash',
     [ValidateRange(30, 300)][int] $TimeoutSeconds = 180,
     [ValidateRange(1, 2147483647)][int] $CodexAppServerPid,
     [string] $CodexAppServerImagePath,
@@ -418,7 +420,7 @@ function Get-AdapterContract {
                 build_package = 'swarm-adapter-opencode'; build_target = 'swarm-adapter-opencode';
                 capabilities = @('agent.open', 'agent.reconcile', 'agent.result', 'agent.send/next_turn', 'task.dispatch');
                 model_provider_field = 'providerID'; model_field = 'id'; effort_field = 'variant';
-                expected_provider = 'opencode-go'; expected_model = 'space-bunny-free'; expected_effort = $null
+                expected_provider = $OpenCodeCommandTestModelRef.Split('/', 2)[0]; expected_model = $OpenCodeCommandTestModelRef.Split('/', 2)[1]; expected_effort = $null
             }
         }
         'Command' {
@@ -427,7 +429,7 @@ function Get-AdapterContract {
                 build_package = 'swarm-adapter-command'; build_target = 'swarm-adapter-command';
                 capabilities = @('agent.open', 'agent.reconcile', 'agent.refresh', 'task.dispatch');
                 model_provider_field = $null; model_field = 'modelId'; effort_field = $null;
-                expected_provider = $null; expected_model = 'stealth/space-bunny-alpha'; expected_effort = $null
+                expected_provider = $null; expected_model = $OpenCodeCommandTestModelRef; expected_effort = $null
             }
         }
         'Codex' {

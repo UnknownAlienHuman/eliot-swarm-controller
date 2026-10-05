@@ -60,6 +60,17 @@ opencode-fixtures:
 build TARGET=shared_target: (_shared-target TARGET)
     cargo build --locked --release --bin swarm --target-dir "{{TARGET}}"
 
+# Create one provenance package at a time. The package builders require a
+# caller-owned external shared target and a fresh, separate output directory.
+package-module package profile target output: (_shared-target target)
+    pwsh -NoProfile -File tools/ci/build-module-package.ps1 -Package "{{package}}" -Profile "{{profile}}" -TargetDir "{{target}}" -OutputDir "{{output}}"
+
+package-frontend package target output: (_shared-target target)
+    pwsh -NoProfile -File tools/ci/Build-SwarmFrontendProvenance.ps1 -Package "{{package}}" -TargetDir "{{target}}" -OutputDir "{{output}}"
+
+package-host target output: (_shared-target target)
+    pwsh -NoProfile -File tools/ci/Build-SwarmHostProvenance.ps1 -TargetDir "{{target}}" -OutputDir "{{output}}"
+
 full-rust TARGET=shared_target:
     pwsh -NoProfile -File tools/ci/package-scope.ps1 -Stage FullRust -TargetDir "{{TARGET}}"
 

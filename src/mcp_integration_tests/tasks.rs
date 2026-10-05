@@ -1,222 +1,21 @@
-//! S7 (R20 §17.1): MCP Tasks projection of Operations.
-//!
-//! Unit tests cover the pure projection (Operation record →
-//! `DetailedTask`), the pending-input filter and the cancel decision;
-//! integration tests run the real stack — StoreOwner, IPC listener and
-//! facade — behind a real RMCP client over a duplex transport, with
-//! and without the tasks extension declared.
+//! Real root Store/IPC integration through the extracted public MCP handler.
 
-use super::*;
 use crate::{
-    config::{Config, Route},
+    config::{Config, McpToolProfile, Route},
+    error::Result,
     ipc,
+    model::{self, Credential},
     platform::{DataRoot, bootstrap_credential},
     store::StoreOwner,
 };
-use rmcp::model::TaskStatus;
+use rmcp::ServiceExt;
+use serde_json::{Value, json};
 use std::{path::PathBuf, sync::Arc, time::Duration};
+use swarm_mcp::config::{McpConfig, McpProfileConfig, Storage};
 use tokio::sync::watch;
 
-// ---------------------------------------------------------------------
-// Pure projection
-// ---------------------------------------------------------------------
+use super::public_facade;
 
-fn operation(state: &str) -> Value {
-    json!({
-        "operation_id": "op-1",
-        "caller_id": "operator",
-        "method": "agent.send",
-        "state": state,
-        "task_id": null,
-        "attempt_id": null,
-        "binding_id": "b1",
-        "binding_generation": 1,
-        "result": null,
-        "created_at_ms": 1_700_000_000_123i64,
-        "updated_at_ms": 1_700_000_060_000i64,
-    })
-}
-
-#[test]
-fn iso8601_utc_formats_epoch_milliseconds() {
-    assert_eq!(iso8601_utc(0), "1970-01-01T00:00:00.000Z");
-    assert_eq!(iso8601_utc(1_700_000_000_123), "2023-11-14T22:13:20.123Z");
-    // Leap day and a far-future date exercise the civil conversion.
-    assert_eq!(iso8601_utc(1_709_164_800_000), "2024-02-29T00:00:00.000Z");
-    assert_eq!(iso8601_utc(4_102_444_800_000), "2100-01-01T00:00:00.000Z");
-    assert_eq!(iso8601_utc(-1), "1969-12-31T23:59:59.999Z");
-}
-
-#[test]
-fn projection_maps_every_operation_state() {
-    // In-flight states stay working; the exact ELIOT state is named in
-    // the status message, and outcome_unknown is never dressed up as a
-    // failure or a success.
-    for state in ["queued", "sending", "native_accepted", "outcome_unknown"] {
-        let detailed = project_operation(&operation(state), InputRequests::new());
-        assert_eq!(detailed.status(), TaskStatus::Working, "{state}");
-        assert!(matches!(detailed.payload, TaskPayload::Working));
-        assert_eq!(detailed.task.task_id, "op-1");
-        assert_eq!(detailed.task.created_at, "2023-11-14T22:13:20.123Z");
-        assert_eq!(detailed.task.last_updated_at, "2023-11-14T22:14:20.000Z");
-        assert_eq!(detailed.task.ttl_ms, None);
-        assert_eq!(detailed.task.poll_interval_ms, Some(TASK_POLL_INTERVAL_MS));
-        assert_eq!(
-            detailed.task.status_message.as_deref(),
-            Some(format!("agent.send operation is {state}").as_str())
-        );
-    }
-
-    // Settled: completed, carrying the Operation's recorded result as
-    // the tool result a non-Tasks client would read.
-    let mut settled = operation("settled");
-    settled["result"] = json!({"operation_id": "op-1", "state": "settled", "answer": 42});
-    let detailed = project_operation(&settled, InputRequests::new());
-    assert_eq!(detailed.status(), TaskStatus::Completed);
-    let TaskPayload::Completed { result } = detailed.payload else {
-        panic!("settled must complete");
-    };
-    assert_eq!(result["structuredContent"]["answer"], json!(42));
-    assert_eq!(result["isError"], json!(false));
-
-    // Rejected: failed, with the exact ELIOT error preserved in data.
-    let mut rejected = operation("rejected");
-    rejected["result"] = json!({"code": "BINDING_NOT_READY", "message": "not ready"});
-    let detailed = project_operation(&rejected, InputRequests::new());
-    assert_eq!(detailed.status(), TaskStatus::Failed);
-    let TaskPayload::Failed { error } = detailed.payload else {
-        panic!("rejected must fail");
-    };
-    assert_eq!(error["message"], json!("not ready"));
-    assert_eq!(
-        error["data"],
-        json!({"code": "BINDING_NOT_READY", "message": "not ready"})
-    );
-
-    // Cancelled.
-    let detailed = project_operation(&operation("cancelled"), InputRequests::new());
-    assert_eq!(detailed.status(), TaskStatus::Cancelled);
-    assert!(matches!(detailed.payload, TaskPayload::Cancelled));
-}
-
-#[test]
-fn projection_prefers_pending_input_over_working() {
-    fn one_request() -> InputRequests {
-        let mut requests = InputRequests::new();
-        requests.insert(
-            "req-1".to_string(),
-            InputRequest::Elicitation(ElicitRequest::new(
-                ElicitRequestParams::FormElicitationParams {
-                    meta: None,
-                    message: "waiting".to_string(),
-                    requested_schema: ElicitationSchema::new(Default::default()),
-                },
-            )),
-        );
-        requests
-    }
-    let detailed = project_operation(&operation("native_accepted"), one_request());
-    assert_eq!(detailed.status(), TaskStatus::InputRequired);
-    let TaskPayload::InputRequired { input_requests } = detailed.payload else {
-        panic!("pending input must require input");
-    };
-    assert_eq!(input_requests.len(), 1);
-    // Terminal states never report input, even if items were supplied.
-    let detailed = project_operation(&operation("cancelled"), one_request());
-    assert_eq!(detailed.status(), TaskStatus::Cancelled);
-}
-
-fn attention_item(kind: &str, binding: &str, generation: i64, request_id: &str) -> Value {
-    json!({
-        "kind": kind,
-        "scope_key": "scope",
-        "binding_id": binding,
-        "generation": generation,
-        "address": {
-            "binding_id": binding,
-            "generation": generation,
-            "session_id": "ses_1",
-            "request_id": request_id,
-            "request_kind": "permission",
-            "fingerprint": "fp-1",
-        },
-        "source": {"kind": "binding_observation", "observed_at_ms": 1, "stale": false},
-        "suggested_action": {"method": "agent.reply"},
-        "manager_actionable": true,
-    })
-}
-
-#[test]
-fn pending_inputs_mirror_exactly_the_operations_attention_items() {
-    let op = operation("native_accepted");
-    let items = vec![
-        attention_item("waiting_for_native_request", "b1", 1, "req-1"),
-        attention_item("waiting_for_native_request", "b1", 1, "req-2"),
-        // Another binding's request is not this Operation's.
-        attention_item("waiting_for_native_request", "b2", 1, "req-foreign"),
-        // Another generation of the same binding is not this Operation's.
-        attention_item("waiting_for_native_request", "b1", 2, "req-old-generation"),
-        // Other attention kinds are not input requests.
-        attention_item("input_queued_not_consumed", "b1", 1, "req-queued"),
-        attention_item("waiting_for_child_result", "b1", 1, "req-child"),
-    ];
-    let requests = pending_input_requests(&op, &items);
-    let keys: Vec<&String> = requests.keys().collect();
-    assert_eq!(keys, [&"req-1".to_string(), &"req-2".to_string()]);
-    // The wire shape is an elicitation carrying the exact native
-    // address and the reply path; no form schema is invented.
-    let wire = serde_json::to_value(&requests["req-1"]).unwrap();
-    assert_eq!(wire["method"], json!("elicitation/create"));
-    let message = wire["params"]["message"].as_str().unwrap();
-    assert!(
-        message.contains("permission request req-1 in session ses_1"),
-        "{message}"
-    );
-    assert!(message.contains("fingerprint fp-1"), "{message}");
-    assert!(message.contains("agent_reply"), "{message}");
-    assert!(
-        wire["params"]["requestedSchema"]["properties"]
-            .as_object()
-            .unwrap()
-            .is_empty()
-    );
-    // An unbound Operation has no pending native input.
-    let mut unbound = operation("queued");
-    unbound["binding_id"] = Value::Null;
-    unbound["binding_generation"] = Value::Null;
-    assert!(pending_input_requests(&unbound, &items).is_empty());
-}
-
-#[test]
-fn cancel_action_mirrors_operation_cancel() {
-    for state in ["settled", "rejected", "cancelled"] {
-        assert_eq!(cancel_action(state), CancelAction::Ack, "{state}");
-    }
-    assert_eq!(cancel_action("queued"), CancelAction::Submit);
-    for state in [
-        "sending",
-        "native_accepted",
-        "outcome_unknown",
-        "anything-else",
-    ] {
-        assert_eq!(cancel_action(state), CancelAction::Refuse, "{state}");
-    }
-}
-
-#[test]
-fn server_advertises_the_tasks_extension() {
-    let facade = McpFacade::new(
-        PathBuf::from("/nonexistent"),
-        Credential {
-            client_id: "test".into(),
-            token: "test".into(),
-        },
-        Arc::new(Config::default().ipc),
-    );
-    assert!(facade.get_info().capabilities.supports_tasks());
-}
-
-// ---------------------------------------------------------------------
 // Full stack: StoreOwner + IPC listener + facade over a duplex
 // transport, driven by a raw JSON-RPC client (the crate builds rmcp
 // server-only, and the wire shape is what this slice contracts on).
@@ -291,11 +90,12 @@ async fn start_stack() -> Stack {
 }
 
 impl Stack {
-    fn facade(&self) -> McpFacade {
-        McpFacade::new(
+    fn facade(&self) -> swarm_mcp::ProfiledFacade {
+        public_facade(
             self.dir.clone(),
             self.credential.clone(),
-            Arc::new(self.config.ipc.clone()),
+            self.config.ipc.clone(),
+            McpToolProfile::Full,
         )
     }
 
@@ -622,92 +422,5 @@ async fn tasks_get_projects_settled_failed_and_unknown_operations() {
     assert_eq!(error["data"]["code"], json!("NOT_FOUND"));
 
     client.close().await;
-    stack.close().await;
-}
-
-#[tokio::test]
-async fn tasks_get_surfaces_the_operations_pending_native_input() {
-    let stack = start_stack().await;
-    // Fixture rows straight into the live database (the same approach
-    // the capacity tests use): a ready binding whose native observation
-    // holds one current permission request and one retained request,
-    // plus a second binding with its own request, and one in-flight
-    // Operation on the first binding.
-    let now = model::now_ms().unwrap();
-    let route = json!({
-        "alias": "oc", "runtime": "opencode_v2",
-        "module_artifact_id": "eliot-opencode-v2.http.1", "enabled": true,
-        "native_options": {"service_id": "svc-a"},
-    });
-    let db = rusqlite::Connection::open(stack.dir.join("swarm.db")).unwrap();
-    db.busy_timeout(Duration::from_secs(5)).unwrap();
-    for (binding, root, requests) in [
-        (
-            "b1",
-            "ses_root",
-            json!([
-                {"session_id": "ses_root", "request_id": "per_1", "kind": "permission", "fingerprint": "fp-1", "observed_now": true},
-                {"session_id": "ses_root", "request_id": "per_stale", "kind": "permission", "fingerprint": "fp-2", "observed_now": false},
-            ]),
-        ),
-        (
-            "b2",
-            "ses_other",
-            json!([
-                {"session_id": "ses_other", "request_id": "per_foreign", "kind": "permission", "fingerprint": "fp-3", "observed_now": true},
-            ]),
-        ),
-    ] {
-        let state = json!({
-            "execution": "observed",
-            "family_completeness": "partial",
-            "connection": "connected",
-            "observed_at_ms": now,
-            "native": {
-                "native_root_id": root,
-                "native_scope_key": "opencode-v2:svc-a",
-                "pending_requests": requests,
-                "observed_children": [],
-                "turns": [],
-            },
-        });
-        db.execute(
-            "INSERT INTO bindings(binding_id,generation,lane_id,module_instance_id,module_artifact_id,state,native_scope_key,native_root_id,route_json,state_json,created_at_ms) VALUES(?1,1,?2,'inst-1','eliot-opencode-v2.http.1','ready','opencode-v2:svc-a',?3,?4,?5,?6)",
-            rusqlite::params![
-                binding,
-                format!("lane-{binding}"),
-                root,
-                model::canonical(&route).unwrap(),
-                model::canonical(&state).unwrap(),
-                now,
-            ],
-        )
-        .unwrap();
-    }
-    db.execute(
-        "INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,effective_request_json,binding_id,binding_generation,state,due_at_ms,created_at_ms,updated_at_ms) VALUES('op-fixture','operator','req-fixture','agent.send','{}','{}','b1',1,'native_accepted',?1,?1,?1)",
-        rusqlite::params![now],
-    )
-    .unwrap();
-    drop(db);
-
-    let facade = stack.facade();
-    let detailed = facade.project_task("op-fixture").await.unwrap();
-    // Only the Operation's own current request surfaces: not the
-    // retained one the newest enumeration dropped, not the other
-    // binding's.
-    assert_eq!(detailed.status(), TaskStatus::InputRequired);
-    let TaskPayload::InputRequired { input_requests } = detailed.payload else {
-        panic!("pending native input must require input");
-    };
-    let keys: Vec<&String> = input_requests.keys().collect();
-    assert_eq!(keys, [&"per_1".to_string()]);
-    let wire = serde_json::to_value(&input_requests["per_1"]).unwrap();
-    assert!(
-        wire["params"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("permission request per_1 in session ses_root")
-    );
     stack.close().await;
 }

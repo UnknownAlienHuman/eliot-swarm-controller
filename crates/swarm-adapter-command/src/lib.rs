@@ -7,13 +7,14 @@ mod adapter;
 mod journal;
 mod module_host;
 mod native;
+mod result_page;
 
 pub use adapter::run;
 
 pub const RUNTIME: &str = "command";
 pub const ARTIFACT_ID: &str = "eliot-command.rust-headless.1";
-pub const ARTIFACT_VERSION: &str = "2";
-pub const CONTRACT_REVISION: &str = "command-headless-module-v1";
+pub const ARTIFACT_VERSION: &str = "3";
+pub const CONTRACT_REVISION: &str = "command-headless-module-v3";
 pub const EXECUTION_SHAPE: &str = "sessionless_batch";
 
 /// Canonical LF digest of the existing pinned Command mod source. The `.3`

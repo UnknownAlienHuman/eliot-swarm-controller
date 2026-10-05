@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "allowDangerouslySkipPermissions": { "type": "boolean" },
+    "claudeConfigDir": { "type": "string", "minLength": 1 },
+    "modelId": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "nativeExecutable": { "type": ["string", "null"] },
+    "nodeExecutable": { "type": "string", "minLength": 1 },
+    "permissionMode": {
+      "enum": ["default", "acceptEdits", "bypassPermissions", "plan", "dontAsk", "auto", null]
+    },
+    "sdkRuntimeRoot": { "type": "string", "minLength": 1 },
+    "workspaceRoot": { "type": "string", "minLength": 1 }
+  },
+  "required": [
+    "allowDangerouslySkipPermissions",
+    "claudeConfigDir",
+    "modelId",
+    "nativeExecutable",
+    "nodeExecutable",
+    "permissionMode",
+    "sdkRuntimeRoot",
+    "workspaceRoot"
+  ],
+  "title": "Claude Agent SDK Rust adapter native options",
+  "type": "object"
+}

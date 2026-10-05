@@ -6,8 +6,9 @@
 
 use crate::module_catalog::{
     ActivationPolicy, ArtifactId, ArtifactIdentity, ArtifactVersion, CapabilityId, CatalogError,
-    LaunchSpec, LifecycleOwnership, ModuleDescriptor, ModuleId, ProtocolRange, ProtocolVersion,
-    RestartPolicy, SchemaDescriptor, WorkspaceOptionContract, WorkspaceOptionSemantics,
+    LaunchSpec, LifecycleOwnership, ModuleDescriptor, ModuleId, PreInputOpenContract,
+    ProtocolRange, ProtocolVersion, RestartPolicy, SchemaDescriptor, WorkspaceOptionContract,
+    WorkspaceOptionSemantics,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -44,6 +45,7 @@ pub struct ModuleContractTemplate {
     pub capabilities: BTreeSet<CapabilityId>,
     pub config_schema: Option<SchemaDescriptor>,
     pub workspace_option: Option<WorkspaceOptionContract>,
+    pub pre_input_open: Option<PreInputOpenContract>,
     pub command_schemas: BTreeSet<SchemaDescriptor>,
     pub event_schemas: BTreeSet<SchemaDescriptor>,
 }
@@ -74,6 +76,7 @@ impl ModuleContractTemplate {
             capabilities,
             config_schema: None,
             workspace_option: None,
+            pre_input_open: None,
             command_schemas: BTreeSet::from([runtime_command_schema()]),
             event_schemas: BTreeSet::from([runtime_outcome_schema()]),
         })
@@ -107,6 +110,7 @@ impl ModuleContractTemplate {
             launch,
             config_schema: self.config_schema.clone(),
             workspace_option: self.workspace_option.clone(),
+            pre_input_open: self.pre_input_open,
             command_schemas: self.command_schemas.clone(),
             event_schemas: self.event_schemas.clone(),
             protocol: self.protocol,
@@ -132,6 +136,9 @@ pub struct ModuleContractClaim {
     /// Must be sorted and unique in serialized form.
     pub capabilities: Vec<CapabilityId>,
     pub config_schema: Option<SchemaDescriptor>,
+    /// Exact descriptor-pinned prepared-open behavior, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_input_open: Option<PreInputOpenContract>,
     /// Must be sorted and unique in serialized form.
     pub command_schemas: Vec<SchemaDescriptor>,
     /// Must be sorted and unique in serialized form.
@@ -157,6 +164,7 @@ impl ModuleContractClaim {
             protocol,
             capabilities: descriptor.capabilities.iter().cloned().collect(),
             config_schema: descriptor.config_schema.clone(),
+            pre_input_open: descriptor.pre_input_open,
             command_schemas: descriptor.command_schemas.iter().cloned().collect(),
             event_schemas: descriptor.event_schemas.iter().cloned().collect(),
         };
@@ -177,6 +185,13 @@ impl ModuleContractClaim {
             || !strictly_sorted(&self.event_schemas)
         {
             return Err("module contract arrays must be sorted and unique");
+        }
+        if self
+            .pre_input_open
+            .as_ref()
+            .is_some_and(|contract| contract.validate().is_err())
+        {
+            return Err("pre-input open contract is invalid");
         }
         Ok(())
     }

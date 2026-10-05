@@ -2,10 +2,10 @@ use crate::config::McpToolProfile;
 
 use super::subscriptions::Category;
 
-/// Explicit profile allowlists. A new method is unavailable to every
-/// restricted profile until it is named here; Full is the opt-in compatibility
-/// surface for the complete local tool table.
-pub(super) fn allows_method(profile: McpToolProfile, method: &str) -> bool {
+/// Frontend exposure filters. A new method is not exposed through a restricted profile
+/// until it is named here. The host independently
+/// authorizes every forwarded request from the authenticated credential.
+pub(super) fn exposes_method(profile: McpToolProfile, method: &str) -> bool {
     if profile == McpToolProfile::Full {
         return true;
     }
@@ -175,7 +175,7 @@ pub(super) fn allows_method(profile: McpToolProfile, method: &str) -> bool {
                 | "coordination.watch.cancel"
         ),
         McpToolProfile::Gm => {
-            (allows_method(McpToolProfile::Manager, method)
+            (exposes_method(McpToolProfile::Manager, method)
                 && !matches!(
                     method,
                     "automation.config.preview" | "automation.config.apply"
@@ -204,18 +204,18 @@ pub(super) fn allows_method(profile: McpToolProfile, method: &str) -> bool {
 }
 
 pub(super) fn allows_subscription_category(profile: McpToolProfile, category: Category) -> bool {
-    allows_method(profile, "report.delta")
+    exposes_method(profile, "report.delta")
         && match category {
             Category::Reports => true,
-            Category::Mailbox => allows_method(profile, "message.read"),
-            Category::Operations => allows_method(profile, "operation.get"),
+            Category::Mailbox => exposes_method(profile, "message.read"),
+            Category::Operations => exposes_method(profile, "operation.get"),
         }
 }
 
 pub(super) fn allows_task_get(profile: McpToolProfile) -> bool {
-    allows_method(profile, "operation.get") && allows_method(profile, "report.attention")
+    exposes_method(profile, "operation.get") && exposes_method(profile, "report.attention")
 }
 
 pub(super) fn allows_task_cancel(profile: McpToolProfile) -> bool {
-    allows_method(profile, "operation.get") && allows_method(profile, "operation.cancel")
+    exposes_method(profile, "operation.get") && exposes_method(profile, "operation.cancel")
 }

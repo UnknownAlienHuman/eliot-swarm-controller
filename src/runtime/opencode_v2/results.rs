@@ -388,9 +388,19 @@ impl Service {
                     let idle = interval
                         .last()
                         .ok_or_else(|| unavailable("RESULT_INTERVAL_NOT_CLOSED"))?;
-                    let mut source = json!({"kind":kind,"native_session_id":session,"input_operation_id":original.operation_id,
-                    "native_input_id":input_id(&original.operation_id),"idle_message_id":idle["id"],"idle_outcome":idle["outcome"],
-                    "message_count":interval.len(),"read_method":"session.message.list","correlation":"projected_order_only"});
+                    let mut source = json!({
+                        "kind":kind,
+                        "native_session_id":session,
+                        "input_operation_id":original.operation_id,
+                        "native_input_id":input_id(&original.operation_id),
+                        "idle_message_id":idle["id"],
+                        "idle_outcome":idle["outcome"],
+                        "message_count":interval.len(),
+                        "read_method":"session.message.list",
+                        "correlation":"projected_order_only",
+                        "completion_qualification":"not_proven",
+                        "completion_qualification_reason":"assistant_message_has_no_input_parent_in_public_projection"
+                    });
                     match diff {
                         Some(diff) => {
                             source["read_method"] = json!("session.diff");

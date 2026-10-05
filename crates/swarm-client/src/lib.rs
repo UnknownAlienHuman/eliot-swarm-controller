@@ -6,7 +6,7 @@ mod endpoint;
 mod module_link;
 
 pub use client::Client;
-pub use config::IpcConfig;
+pub use config::{HostConnectionConfig, IpcConfig};
 pub use endpoint::ipc_endpoint;
 pub use module_link::ModuleLink;
 

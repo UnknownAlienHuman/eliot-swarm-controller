@@ -70,7 +70,7 @@ pub fn run_explicit_metrics(
             child_role,
             interval_ms,
         );
-        return Ok(json!({
+        Ok(json!({
             "schema_version": 1,
             "status": "unavailable",
             "unavailable_reason": "unsupported_platform",
@@ -79,7 +79,7 @@ pub fn run_explicit_metrics(
             "store_readback": "not_performed",
             "native_family_coverage": "not_claimed",
             "samples": []
-        }));
+        }))
     }
 
     #[cfg(windows)]

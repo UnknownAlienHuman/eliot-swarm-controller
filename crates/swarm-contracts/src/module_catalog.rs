@@ -291,13 +291,24 @@ impl SchemaDescriptor {
     }
 }
 
-/// A command-line argument or environment value is either a literal or a
-/// protected reference. The descriptor never contains resolved secret bytes.
+/// A command-line argument or environment value is literal, protected, or a
+/// typed request for host-materialized launch config. The descriptor never
+/// contains resolved secret bytes or operator-selected host IPC paths.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+#[serde(
+    tag = "kind",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum LaunchValue {
     Literal(String),
     Protected(ProtectedRef),
+    /// Resolve to the private, scope-specific host connection config path
+    /// that the supervisor materializes immediately before an owned launch.
+    ModuleHostConfigPath {
+        schema_version: u16,
+    },
 }
 
 impl LaunchValue {
@@ -313,6 +324,10 @@ impl LaunchValue {
                 reference.validate()?;
                 Ok(reference.as_str().len())
             }
+            // Reserve the complete owner-plan argument bound for the path
+            // that the host substitutes at launch time.
+            Self::ModuleHostConfigPath { schema_version: 1 } => Ok(4_096),
+            Self::ModuleHostConfigPath { .. } => Err(invalid("launch.module_host_config_path")),
         }
     }
 }
@@ -385,6 +400,15 @@ impl LaunchSpec {
         }
 
         let mut total_bytes = 0usize;
+        if self
+            .argv
+            .iter()
+            .filter(|value| matches!(value, LaunchValue::ModuleHostConfigPath { .. }))
+            .count()
+            > 1
+        {
+            return Err(invalid("launch.argv.module_host_config_path"));
+        }
         for argument in &self.argv {
             total_bytes = total_bytes
                 .checked_add(argument.validate()?)
@@ -393,6 +417,9 @@ impl LaunchSpec {
 
         let mut environment_names = BTreeSet::new();
         for variable in &self.environment {
+            if matches!(&variable.value, LaunchValue::ModuleHostConfigPath { .. }) {
+                return Err(invalid("launch.environment.module_host_config_path"));
+            }
             let normalized_name = variable.name.to_ascii_uppercase();
             if !environment_names.insert(normalized_name) {
                 return Err(invalid("launch.environment.duplicate_name"));
@@ -516,6 +543,62 @@ impl WorkspaceOptionContract {
     }
 }
 
+/// Optional, descriptor-pinned contract for adapters that can prepare an
+/// executor before the native session identity exists. It describes receipt
+/// semantics only; it grants no native-effect authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreInputOpenContract {
+    pub schema_version: u16,
+    pub kind: PreInputOpenKind,
+    pub completion_condition: PreInputOpenCompletionCondition,
+    pub native_identity: PreInputNativeIdentity,
+    pub initial_identity_adoption: PreInputIdentityAdoption,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreInputOpenKind {
+    PreInputExecutorReady,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreInputOpenCompletionCondition {
+    NativeExecutorPrepared,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreInputNativeIdentity {
+    Rootless,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreInputIdentityAdoption {
+    FirstTaskDispatchExactNativeEcho,
+}
+
+impl PreInputOpenContract {
+    pub const fn first_task_dispatch_exact_native_echo() -> Self {
+        Self {
+            schema_version: 1,
+            kind: PreInputOpenKind::PreInputExecutorReady,
+            completion_condition: PreInputOpenCompletionCondition::NativeExecutorPrepared,
+            native_identity: PreInputNativeIdentity::Rootless,
+            initial_identity_adoption: PreInputIdentityAdoption::FirstTaskDispatchExactNativeEcho,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), CatalogError> {
+        if self.schema_version != 1 || *self != Self::first_task_dispatch_exact_native_echo() {
+            return Err(invalid("pre_input_open"));
+        }
+        Ok(())
+    }
+}
+
 /// Bounded local restart settings. These values control only worker recovery;
 /// restarting a worker never replays a module command or uncertain external
 /// effect.
@@ -576,6 +659,10 @@ pub struct ModuleDescriptor {
     /// workspace-backed adapters must declare it before a new launch is queued.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_option: Option<WorkspaceOptionContract>,
+    /// Exact rootless pre-input receipt and first-identity adoption contract.
+    /// Absence preserves the existing open-with-native-identity behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_input_open: Option<PreInputOpenContract>,
     #[serde(default)]
     pub command_schemas: BTreeSet<SchemaDescriptor>,
     #[serde(default)]
@@ -611,6 +698,9 @@ impl ModuleDescriptor {
         }
         if let Some(workspace_option) = &self.workspace_option {
             workspace_option.validate()?;
+        }
+        if let Some(pre_input_open) = &self.pre_input_open {
+            pre_input_open.validate()?;
         }
         for schema in &self.command_schemas {
             schema.validate("command_schemas")?;

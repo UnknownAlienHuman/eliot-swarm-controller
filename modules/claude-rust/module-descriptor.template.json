@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "module_id": "claude",
+  "artifact": {
+    "artifact_id": "claude-agent-sdk-0.3.287-rust-controller.4",
+    "version": "4",
+    "build_id": null
+  },
+  "launch": {
+    "executable": "<INSTALLER_ABSOLUTE_ADAPTER_PATH>",
+    "argv": [
+      { "kind": "literal", "value": "--config" },
+      { "kind": "module_host_config_path", "value": { "schema_version": 1 } }
+    ],
+    "environment": [],
+    "credential_ref": "host.module-binding-credential",
+    "working_directory": null,
+    "inherited_environment_allowlist": [],
+    "executable_sha256": null
+  },
+  "config_schema": null,
+  "workspace_option": {
+    "schema_version": 1,
+    "native_options_pointer": "/workspaceRoot",
+    "semantics": "replace_with_admitted_absolute_workspace"
+  },
+  "pre_input_open": {
+    "schema_version": 1,
+    "kind": "pre_input_executor_ready",
+    "completion_condition": "native_executor_prepared",
+    "native_identity": "rootless",
+    "initial_identity_adoption": "first_task_dispatch_exact_native_echo"
+  },
+  "command_schemas": [
+    { "schema_id": "swarm.runtime_command", "version": "1", "sha256": null }
+  ],
+  "event_schemas": [
+    { "schema_id": "swarm.runtime_outcome", "version": "1", "sha256": null }
+  ],
+  "protocol": {
+    "minimum": { "major": 1, "minor": 0 },
+    "maximum": { "major": 1, "minor": 0 }
+  },
+  "capabilities": [
+    "agent.open",
+    "agent.reconcile",
+    "agent.refresh",
+    "agent.send/next_turn",
+    "task.dispatch"
+  ],
+  "lifecycle": "owned_service",
+  "activation": "on_demand",
+  "enabled": false,
+  "restart": {
+    "max_starts": 5,
+    "window_ms": 60000,
+    "initial_backoff_ms": 250,
+    "max_backoff_ms": 30000,
+    "reset_after_healthy_ms": 60000,
+    "jitter": true
+  }
+}

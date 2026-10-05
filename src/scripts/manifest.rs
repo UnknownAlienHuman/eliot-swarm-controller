@@ -57,6 +57,13 @@ pub enum ScriptTrust {
 #[serde(rename_all = "snake_case")]
 pub enum ScriptControllerEffect {
     TaskOwnerMessage,
+    /// Notify the current Manager who owns an enabled event-triggered
+    /// ScriptRun. Store derives the recipient and only grants this on a
+    /// taskless system-event invocation.
+    ManagerNotification,
+    /// Create one Task in the current Manager-owned system-event project.
+    /// The Store derives both the project and the child Operation identity.
+    TaskCreate,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

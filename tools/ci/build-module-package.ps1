@@ -54,6 +54,21 @@ function Get-Sha256([string] $Path) {
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
+. (Join-Path $PSScriptRoot 'SwarmBuildProvenanceHelpers.ps1')
+
+function Get-RootGatewayLauncherArguments([object[]] $Targets) {
+    $matches = @($Targets | Where-Object { [string]$_.name -ceq 'swarm' -and @($_.kind) -contains 'bin' })
+    if ($matches.Count -ne 1) { throw 'Root host package must expose exactly one swarm binary for gateway compatibility.' }
+    $source = Get-Content -LiteralPath ([string]$matches[0].src_path) -Raw
+    $start = $source.IndexOf('async fn run_gateway_binary', [StringComparison]::Ordinal)
+    if ($start -lt 0) { throw 'Root swarm binary has no run_gateway_binary compatibility launcher.' }
+    $launcher = $source.Substring($start)
+    foreach ($literal in @('"swarm-gateway.exe"', '"swarm-gateway"', 'child.arg("--config").arg(path)', 'child.arg("--data-dir").arg(path)')) {
+        if (-not $launcher.Contains($literal)) { throw "Root gateway launcher no longer satisfies the sibling CLI contract: missing $literal" }
+    }
+    return @('--config', '--data-dir')
+}
+
 if (-not (Test-Path -LiteralPath $rootManifest -PathType Leaf) -or
     -not (Test-Path -LiteralPath $lockFile -PathType Leaf) -or
     -not (Test-Path -LiteralPath $toolchainFile -PathType Leaf)) {
@@ -92,12 +107,31 @@ if (-not $channelMatch.Success) { throw 'Could not resolve a channel from rust-t
 $toolchainChannel = $channelMatch.Groups[1].Value
 
 $policy = Get-Content -LiteralPath $policyFile -Raw | ConvertFrom-Json -AsHashtable
-if ($policy.schema_version -ne 1 -or $policy.format -cne 'eliot.module_build_policy.v1') {
+if ($policy.schema_version -ne 2 -or $policy.format -cne 'eliot.module_build_policy.v2' -or
+    $policy.approved_package_coordinates -isnot [array] -or $policy.approved_package_coordinates.Count -eq 0) {
     throw 'Unsupported module package policy format.'
 }
-if (@($policy.approved_package_names | Where-Object { [string]$_ -ceq $Package }).Count -ne 1) {
+
+$policyNames = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+foreach ($coordinate in $policy.approved_package_coordinates) {
+    if ($coordinate -isnot [System.Collections.IDictionary] -or
+        [string]$coordinate.package_name -cnotmatch '\A[A-Za-z0-9][A-Za-z0-9_-]{0,127}\z' -or
+        [string]$coordinate.manifest -cnotmatch '\A[A-Za-z0-9._/-]{1,512}\z' -or
+        [string]$coordinate.manifest -match '(^|/)\.\.(/|$)' -or
+        [string]$coordinate.binary_target -cnotmatch '\A[A-Za-z0-9][A-Za-z0-9_-]{0,99}\z' -or
+        -not $policyNames.Add([string]$coordinate.package_name)) {
+        throw 'Module package policy has a malformed or repeated package/manifest/binary coordinate.'
+    }
+}
+$selectedCoordinates = @(
+    $policy.approved_package_coordinates | Where-Object {
+        [string]$_.package_name -ceq $Package
+    }
+)
+if ($selectedCoordinates.Count -ne 1) {
     throw "Package '$Package' is not on the explicit module-package allowlist."
 }
+$selectedCoordinate = $selectedCoordinates[0]
 
 Push-Location $repoRoot
 try {
@@ -124,7 +158,7 @@ if (-not ([IO.Path]::GetFullPath($reportedRoot)).Equals(
 Push-Location $repoRoot
 try {
     $metadataText = Invoke-NativeText 'cargo' @(
-        'metadata', '--locked', '--no-deps', '--format-version', '1'
+        'metadata', '--locked', '--format-version', '1'
     )
 } finally {
     Pop-Location
@@ -143,8 +177,10 @@ if ($selectedMatches.Count -ne 1) {
 }
 $selected = $selectedMatches[0]
 $manifestPath = [IO.Path]::GetFullPath([string]$selected.manifest_path)
-if (-not (Test-PathWithin $manifestPath $repoRoot)) {
-    throw 'The selected package manifest is outside the source checkout.'
+$expectedManifestPath = [IO.Path]::GetFullPath((Join-Path $repoRoot ([string]$selectedCoordinate.manifest)))
+if (-not $manifestPath.Equals($expectedManifestPath, [StringComparison]::OrdinalIgnoreCase) -or
+    -not (Test-PathWithin $manifestPath $repoRoot)) {
+    throw "Package '$Package' resolved to a manifest other than its exact allowlisted coordinate."
 }
 $vendorRoot = Join-Path $repoRoot 'vendor'
 foreach ($target in @($selected.targets)) {
@@ -157,8 +193,33 @@ foreach ($target in @($selected.targets)) {
     }
 }
 
-$binTargets = @($selected.targets | Where-Object { @($_.kind) -contains 'bin' })
-if ($binTargets.Count -eq 0) { throw "Package '$Package' has no actual Cargo binary target." }
+$actualBinTargets = @($selected.targets | Where-Object { @($_.kind) -contains 'bin' })
+$binTargets = @(
+    $actualBinTargets | Where-Object {
+        [string]$_.name -ceq [string]$selectedCoordinate.binary_target
+    }
+)
+if ($actualBinTargets.Count -ne 1 -or $binTargets.Count -ne 1) {
+    $actualNames = @($actualBinTargets | ForEach-Object { [string]$_.name })
+    throw "Package '$Package' target drift: policy names only '$($selectedCoordinate.binary_target)' but Cargo metadata reports [$($actualNames -join ', ')]. Update the explicit coordinate policy before packaging."
+}
+$dependencyPins = Get-ResolvedDependencyPins $metadata $selected $repoRoot $lockFile
+$compatibility = $null
+if ($Package -ceq 'eliot-swarm-controller') {
+    $hostIpcProtocolVersion = Get-HostIpcProtocolVersion $repoRoot
+    $rustcHostTriple = Get-RustcHostTriple $rustcVersion
+    $gatewayArguments = Get-RootGatewayLauncherArguments @($selected.targets)
+    $compatibility = [ordered]@{
+        required_sibling_binaries = @()
+        host_ipc = [ordered]@{ protocol_version = $hostIpcProtocolVersion }
+        target = [ordered]@{ rustc_host_triple = $rustcHostTriple }
+        gateway_launcher = [ordered]@{
+            package_name = 'swarm-gateway'
+            binary_target = 'swarm-gateway'
+            required_arguments = @($gatewayArguments)
+        }
+    }
+}
 foreach ($target in $binTargets) {
     $name = [string]$target.name
     if ($name -notmatch '^[A-Za-z0-9][A-Za-z0-9_-]{0,99}$') {
@@ -177,7 +238,7 @@ if (Test-Path -LiteralPath $targetPath -PathType Container) {
 
 $buildArguments = @(
     'build', '--manifest-path', $rootManifest,
-    '--package', $Package, '--bins', '--locked',
+    '--package', $Package, '--bin', [string]$selectedCoordinate.binary_target, '--locked',
     '--profile', $Profile, '--target-dir', $targetPath
 )
 Push-Location $repoRoot
@@ -253,6 +314,12 @@ $buildManifest = [ordered]@{
         cargo_arguments = @($buildArguments)
         target_dir = $targetPath
     }
+    dependency_pins = @($dependencyPins)
+    dependency_graph_scope = [ordered]@{
+        source = 'cargo_metadata_workspace_resolve'
+        package_edges = 'reachable_from_selected_package_in_workspace_resolved_graph_may_overapprox'
+        feature_sets = 'workspace_unified_not_package_specific_build_features'
+    }
     artifacts = @($binaryRows)
     installation = [ordered]@{
         descriptor_generated = $false
@@ -262,6 +329,7 @@ $buildManifest = [ordered]@{
         activated = $false
     }
 }
+if ($null -ne $compatibility) { $buildManifest['compatibility'] = $compatibility }
 $json = ConvertTo-Json -InputObject $buildManifest -Depth 12
 $manifestPath = Join-Path $outputPath 'build-manifest.json'
 [IO.File]::WriteAllText($manifestPath, $json + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))

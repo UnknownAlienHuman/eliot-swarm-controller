@@ -1,0 +1,7 @@
+{
+  "module_artifact_id": "eliot-command.rust-headless.1",
+  "command": "<ABSOLUTE_NATIVE_COMMAND_EXECUTABLE>",
+  "command_args": [],
+  "mod_path": "<ABSOLUTE_PRESERVED_COMMAND_MOD_PATH>",
+  "run_timeout_ms": 1800000
+}

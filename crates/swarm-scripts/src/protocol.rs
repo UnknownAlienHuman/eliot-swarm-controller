@@ -86,12 +86,32 @@ pub struct ScriptResult {
 #[serde(deny_unknown_fields)]
 pub struct ScriptEffectRequest {
     pub effect: ScriptControllerEffect,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec: Option<Value>,
 }
 
 impl ScriptEffectRequest {
     pub fn validate(&self) -> Result<()> {
-        validate_effect_text(&self.text)
+        match self.effect {
+            ScriptControllerEffect::TaskOwnerMessage
+            | ScriptControllerEffect::ManagerNotification
+                if self.spec.is_none() =>
+            {
+                validate_effect_text(&self.text)
+            }
+            ScriptControllerEffect::TaskCreate
+                if self.text.is_empty() && self.spec.as_ref().is_some_and(Value::is_object) =>
+            {
+                let spec = self.spec.as_ref().expect("guard checked spec");
+                if canonical_json(spec)?.len() > MAX_INPUT_BYTES {
+                    return Err(ScriptError::new("SCRIPT_EFFECTS_INVALID"));
+                }
+                Ok(())
+            }
+            _ => Err(ScriptError::new("SCRIPT_EFFECTS_INVALID")),
+        }
     }
 }
 

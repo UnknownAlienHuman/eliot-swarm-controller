@@ -9,6 +9,11 @@
 use serde::Serialize;
 use std::{collections::VecDeque, error::Error, fmt};
 
+pub mod managed_worker_config;
+pub mod service_scope;
+
+pub use managed_worker_config::{ManagedWorkerConfigExpectation, verify_managed_worker_config};
+
 pub const MAX_SELECTOR_NAME_BYTES: usize = 256;
 pub const MAX_CONSUMER_ID_BYTES: usize = 128;
 pub const MAX_SUBSCRIPTIONS_PER_EVENT: usize = 256;

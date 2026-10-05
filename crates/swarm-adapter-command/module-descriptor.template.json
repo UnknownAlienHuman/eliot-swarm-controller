@@ -3,17 +3,19 @@
   "module_id": "runtime.command",
   "artifact": {
     "artifact_id": "eliot-command.rust-headless.1",
-    "version": "2",
+    "version": "3",
     "build_id": null
   },
   "launch": {
     "executable": "<INSTALLER_ABSOLUTE_ADAPTER_PATH>",
     "argv": [
+      { "kind": "literal", "value": "--module-host-config" },
+      { "kind": "module_host_config_path", "value": { "schema_version": 1 } },
       { "kind": "literal", "value": "--config" },
       { "kind": "literal", "value": "<INSTALLER_ABSOLUTE_ADAPTER_CONFIG_PATH>" }
     ],
     "environment": [],
-    "credential_ref": "credential:REPLACE_AT_INSTALL:command-module-binding",
+    "credential_ref": "<INSTALLER_CREDENTIAL_FILE_REF>",
     "working_directory": null,
     "inherited_environment_allowlist": [],
     "executable_sha256": null
@@ -38,6 +40,7 @@
     "agent.open",
     "agent.reconcile",
     "agent.refresh",
+    "agent.result",
     "task.dispatch"
   ],
   "lifecycle": "owned_service",

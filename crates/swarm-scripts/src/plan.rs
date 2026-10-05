@@ -163,6 +163,33 @@ pub fn plan_event_script_run(
         input,
     };
     request.validate()?;
+    let allowed_effects: Vec<ScriptControllerEffect> = match &cause {
+        TriggerIdentity::SystemEvent {
+            task_scope: Some(_),
+            ..
+        }
+        | TriggerIdentity::AppliedSubmission { .. } => {
+            vec![ScriptControllerEffect::TaskOwnerMessage]
+        }
+        TriggerIdentity::SystemEvent {
+            task_scope: None, ..
+        } => route
+            .controller_effects
+            .iter()
+            .copied()
+            .filter(|effect| {
+                matches!(
+                    effect,
+                    ScriptControllerEffect::ManagerNotification
+                        | ScriptControllerEffect::TaskCreate
+                )
+            })
+            .collect(),
+    };
+    let controller_effects = allowed_effects
+        .into_iter()
+        .filter(|effect| route.controller_effects.contains(effect))
+        .collect();
     Ok(Some(PlannedScriptRun {
         action: EventAction::ScriptRun,
         automation_id: route.automation_id.to_owned(),
@@ -172,7 +199,7 @@ pub fn plan_event_script_run(
         semantic_cause_id,
         cause,
         request,
-        controller_effects: route.controller_effects.to_vec(),
+        controller_effects,
     }))
 }
 

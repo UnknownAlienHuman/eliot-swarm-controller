@@ -380,3 +380,48 @@ adopts the message through the ordinary `message.send` Operation and retains
 its link to the `script.run`; the run readback reports the effect as applied or
 rejected. `script.activate` selects content but starts no run or trigger.
 Repeated execution requires a separately selected, enabled trigger.
+
+## O7: taskless event notification to the configured Manager
+
+A script revision may instead declare the closed `manager_notification` grant:
+
+```json
+"controller_effects": ["manager_notification"]
+```
+
+Only a taskless, event-triggered ScriptRun receives this grant. Store derives
+the recipient and sender from the exact retained automation owner; the script
+supplies only bounded text. The effect uses the ordinary `message.send` path,
+so the Manager receives it through the existing addressed mailbox. A
+Task-scoped or direct `script.run` receives no `manager_notification` authority.
+
+The event cursor commits with its durable pending trigger before the script is
+run. On completion, the child `message.send` Operation, its provenance link,
+and the parent ScriptRun outcome commit atomically. Replaying the same
+completion returns the retained result without a second delivery. If the
+Manager disables or changes the event route before completion, Store records a
+rejected effect and retains the run history without sending a new message.
+
+## Taskless event Task creation from a Manager-owned automation
+
+A script revision can instead declare the closed `task_create` grant:
+
+```json
+"controller_effects": ["task_create"]
+```
+
+Its result effect is `{"effect":"task_create","spec":{...}}`, where `spec`
+uses only the existing strict TaskSpec fields: required `objective`, `phase`,
+and `requirements`; optional/defaulted `acceptance`, `dependencies`, `scope`,
+`source_refs`, `owner_policy_id`, `source_index`, and
+`baseline_candidate_ref`. The canonical spec is capped at 256 KiB. Unknown
+fields are rejected by the Store's `deny_unknown_fields` TaskSpec parser.
+Only a taskless, event-triggered ScriptRun owned by the current registered
+Manager can receive this grant. The script cannot choose a Manager, project,
+Task ID, origin key, or request ID: the Store takes the project from the exact
+retained automation entry and derives the deterministic child request ID from
+the parent Operation, run, and effect tag. It admits the child through the
+ordinary `task.create` Operation and receipt path, without assigning an owner
+or Attempt. The child Task, effect link, and parent ScriptRun completion share
+the same transaction; exact completion replay returns the retained result.
+Task-scoped and manual `script.run` calls receive no `task_create` authority.

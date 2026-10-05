@@ -2,6 +2,78 @@
 
 ## Current state
 
+### Kernel, independent frontends and managed services — 2026-10-05
+
+Store now uses the actual bounded `KernelHost` queue and one writer thread for
+database initialization and callbacks. Authenticated `host.status` exposes its
+admission, lifecycle and fault snapshot through the existing read-only reader.
+Shutdown wakes the same writer without polling and closes its queue even when
+client facades retain sender handles. The status reader receives a Stop job
+through its existing queue; late facade submissions return `STORE_CLOSED`.
+The complete domain and host executable extraction remains unfinished.
+
+`swarm-mcp`, `swarm-cli` and `swarm-gateway` are real independent Cargo packages.
+Their resolved dependency closures contain no controller, adapter, Store, kernel
+or SQLite dependency. MCP integration fixtures use the extracted implementation.
+The CLI supports authenticated status, generic calls, Task operations and agent
+readback; HookSource retains its existing durable-ack retry contract. The public
+`swarm` executable still belongs to the controller during CLI migration. Gateway
+remains optional and disabled by default; launcher failures retain their exit
+status and installation guidance.
+
+Frontend tooling records each artifact's own source, dependency and image pins.
+Sibling compatibility checks the actual IPC protocol, target triple and launch
+arguments rather than requiring unrelated artifacts to share a repository SHA.
+Offline workspace resolution preserved all 240 existing registry checksum pins.
+No frontend installation or native invocation has qualified this source yet.
+
+The managed bus has explicit opt-in and current durable demand, a dedicated
+Module identity, a positive Store generation and protected configuration/image
+bindings. Store outages retain the existing child handle; unknown ownership
+holds the scope without replacement. Verified owner adoption after host restart
+is still being implemented. These source changes do not start the bus.
+
+Command version 3 provides exact durable status/failure readback. It continues to
+report `execution_complete=false`, `native_response_identity=unavailable` and
+`task_completion=unknown`; status alone does not qualify an assistant result.
+Module diagnostics correlate the exact event, module, artifact, build and boot.
+Task/Attempt attribution requires the retained transactional binding. Manager
+attention and observer timeline gaps preserve bounded typed metadata without raw
+payloads; telemetry schema versions 1 and 2 remain supported.
+
+The Claude version-4 standalone Rust controller source is integrated with a
+provider-neutral retained `pre_input_open` contract and exact first-dispatch
+identity adoption. Rust owns IPC and durable operation receipts; the pinned
+Node SDK shim owns its process-local query objects. The supervisor materializes
+the module IPC connection file in the exact launch state directory through the
+typed argv marker. Command version 3 uses the same host connection mechanism.
+`agent.refresh` reads a bounded cache for the exact SDK session. Claude remains
+disabled and reports partial family completeness; descendant
+lifecycle implementation and runtime qualification remain pending.
+
+The source also records a bounded cancellation-control diagnostic in the existing
+ScriptRun Operation result. It binds the private receipt to the exact run,
+worker token and process identity and preserves the safe projection through
+unknown, incomplete and completed readback. It does not prove family departure.
+
+Manager-owned system-event ScriptRuns can now apply `manager_notification` and
+`task_create` without a synthetic Task. Both effects use the existing Store
+transactions and captured project/owner authority. Task creation retains its
+child Operation and deterministic identity; effect history validates the exact
+effect kind and preserves cancellation diagnostics.
+
+Per owner direction, remaining code is completed before test and model runs.
+This source batch has not passed a current compiler gate or native qualification. CI
+[37374690883](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37374690883)
+for `6e7c2a6` passed formatting, documentation and tooling checks, then failed
+strict Clippy on two needless returns. Both are corrected in this source batch;
+that failed run did not execute integration tests.
+
+New OpenCode and Command Code qualification runs select
+`inclusionai/ling-3.1-flash`. Bunny is disabled for new runs. Provider/model
+availability must be verified for each harness before invocation; historical
+Bunny receipts remain dated evidence of their original runs.
+
 ### PR #25 controller effects and exact failure readback — 2026-10-05
 
 An automatic ScriptRun can apply the existing `task_owner_message` effect through

@@ -12,7 +12,7 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
-use swarm_client::{IpcConfig, ModuleLink};
+use swarm_client::{HostConnectionConfig, ModuleLink};
 use swarm_contracts::{
     Credential, EffectOutcome, RuntimeCommand, RuntimeOutcome,
     error::{Error, Result},
@@ -28,12 +28,13 @@ const MAX_FIXED_ARG_BYTES: usize = 4096;
 #[serde(deny_unknown_fields)]
 struct Config {
     module_artifact_id: String,
-    controller_root: PathBuf,
     command: PathBuf,
     #[serde(default)]
     command_args: Vec<String>,
     mod_path: PathBuf,
     run_timeout_ms: u64,
+    #[serde(skip)]
+    host_connection: Option<HostConnectionConfig>,
 }
 
 struct Owner {
@@ -52,9 +53,12 @@ struct Link {
 }
 
 pub async fn run() -> Result<()> {
-    let config_path = config_argument()?;
+    let (host_config_path, config_path) = config_arguments()?;
     let config = load_config(&config_path)?;
     let owner = load_owner()?;
+    let host_connection = load_host_connection_config(&host_config_path, &owner.state_dir)?;
+    let mut config = config;
+    config.host_connection = Some(host_connection);
     let credential = load_credential(&owner.host.credential_file)?;
     if credential.client_id != owner.host.module_client_id {
         return Err(Error::new(
@@ -165,6 +169,44 @@ pub async fn run() -> Result<()> {
             )
             .await?;
         }
+        for (params, hash) in store.pending_result_pages()? {
+            result_page::validate_saved(
+                &params,
+                &owner.host.claim,
+                &link.binding_id,
+                link.generation,
+            )?;
+            let operation_id = params["operation_id"]
+                .as_str()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    Error::new("ADAPTER_EVIDENCE_INVALID", "result Operation is missing")
+                })?
+                .to_owned();
+            let (_, admitted) = store.admit(
+                &operation_id,
+                None,
+                &link.binding_id,
+                link.generation,
+                &link.route,
+            )?;
+            if !admitted {
+                return Err(Error::new(
+                    "ADAPTER_EVIDENCE_INVALID",
+                    "pending result page has no matching immutable admission",
+                ));
+            }
+            deliver_result_page(
+                &mut link,
+                &config,
+                &credential,
+                &owner,
+                &store,
+                params,
+                hash,
+            )
+            .await?;
+        }
 
         loop {
             let next = match link.client.next().await {
@@ -195,7 +237,7 @@ pub async fn run() -> Result<()> {
                 })?;
             validate_command(&command, &link)?;
             let (receipts, stop_bridge) =
-                process_command(&config, &owner, &store, &command).await?;
+                process_command(&config, &owner, &store, &mut link, &credential, &command).await?;
             stop_after_observation |= stop_bridge;
             for mut outcome in receipts {
                 module_host::attach_receipt_identity(&mut outcome, &command, &owner.host.claim)?;
@@ -255,6 +297,8 @@ async fn process_command(
     config: &Config,
     owner: &Owner,
     store: &RunStore,
+    link: &mut Link,
+    credential: &Credential,
     command: &RuntimeCommand,
 ) -> Result<(Vec<RuntimeOutcome>, bool)> {
     match command.method.as_str() {
@@ -419,6 +463,48 @@ async fn process_command(
             Ok((vec![outcome], false))
         }
         "agent.reconcile" => reconcile(store, command).await,
+        "agent.result" => {
+            let (_, _existing) = store.admit(
+                &command.operation_id,
+                None,
+                &command.binding_id,
+                command.generation,
+                &command.route,
+            )?;
+            let (params, hash) =
+                if let Some(saved) = store.read_result_page(&command.operation_id)? {
+                    result_page::validate_saved(
+                        &saved.0,
+                        &owner.host.claim,
+                        &command.binding_id,
+                        command.generation,
+                    )?;
+                    saved
+                } else {
+                    // A result-page Operation has no native effect. When the
+                    // first page was not sealed before a crash, regenerate it
+                    // from the exact current Store snapshot in this command.
+                    let params = result_page::build(command, &owner.host.claim)?;
+                    let hash = store.save_result_page(&command.operation_id, &params)?;
+                    store
+                        .read_result_page(&command.operation_id)?
+                        .filter(|(_, saved_hash)| saved_hash == &hash)
+                        .ok_or_else(|| {
+                            Error::new(
+                                "ADAPTER_EVIDENCE_INVALID",
+                                "saved Command status page disappeared",
+                            )
+                        })?
+                };
+            result_page::validate_saved(
+                &params,
+                &owner.host.claim,
+                &link.binding_id,
+                link.generation,
+            )?;
+            deliver_result_page(link, config, credential, owner, store, params, hash).await?;
+            Ok((Vec::new(), false))
+        }
         _ => Err(Error::new(
             "CAPABILITY_UNAVAILABLE",
             "Command headless module received an unsupported operation",
@@ -682,9 +768,66 @@ async fn deliver_outcome(
     }
 }
 
+async fn deliver_result_page(
+    link: &mut Link,
+    config: &Config,
+    credential: &Credential,
+    owner: &Owner,
+    store: &RunStore,
+    params: Value,
+    hash: String,
+) -> Result<()> {
+    let operation_id = params["operation_id"]
+        .as_str()
+        .ok_or_else(|| Error::new("ADAPTER_EVIDENCE_INVALID", "result Operation is missing"))?
+        .to_owned();
+    result_page::validate_saved(
+        &params,
+        &owner.host.claim,
+        &link.binding_id,
+        link.generation,
+    )?;
+    if !store.result_page_pending(&operation_id, &hash)? {
+        return Ok(());
+    }
+    let payload = params.clone();
+    match link.client.result(payload.clone()).await {
+        Ok(ack) => store.acknowledge_result_page(&operation_id, &hash, ack),
+        Err(error) if is_transport_uncertain(&error) => {
+            // A module.result retry resends only the exact sealed page. It
+            // never reruns the native Command invocation.
+            let mut replacement = connect_module(config, credential, owner).await?;
+            if replacement.binding_id != link.binding_id
+                || replacement.generation != link.generation
+                || replacement.route != link.route
+            {
+                return Err(Error::new(
+                    "NATIVE_IDENTITY_MISMATCH",
+                    "binding route changed before exact result-page retry",
+                ));
+            }
+            let ack = replacement.client.result(payload).await?;
+            store.acknowledge_result_page(&operation_id, &hash, ack)?;
+            *link = replacement;
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
 async fn connect_module(config: &Config, credential: &Credential, owner: &Owner) -> Result<Link> {
-    let mut client =
-        ModuleLink::connect(&config.controller_root, credential, &IpcConfig::default()).await?;
+    let host_connection = config.host_connection.as_ref().ok_or_else(|| {
+        Error::new(
+            "MODULE_HOST_CONFIG_INVALID",
+            "supervisor-provided host connection config is unavailable",
+        )
+    })?;
+    let mut client = ModuleLink::connect(
+        &host_connection.host_data_dir,
+        credential,
+        &host_connection.ipc,
+    )
+    .await?;
     let hello = client
         .hello(
             json!({
@@ -787,7 +930,7 @@ fn module_state(
                 "task_dispatch":"one_shot_sessionless_batch",
                 "reconcile":"saved_evidence_readback_only",
                 "refresh":"module_snapshot_read_only",
-                "result_pages":"unavailable_command_agent_result_not_admitted",
+                "result_pages":"bounded_exact_command_status_pages",
                 "send":"unavailable_sessionless_batch",
                 "configure":"unavailable",
                 "goal":"unavailable",
@@ -818,11 +961,26 @@ fn validate_command(command: &RuntimeCommand, link: &Link) -> Result<()> {
     }
     if !matches!(
         command.method.as_str(),
-        "agent.open" | "task.dispatch" | "agent.refresh" | "agent.reconcile"
+        "agent.open" | "task.dispatch" | "agent.refresh" | "agent.reconcile" | "agent.result"
     ) {
         return Err(Error::new(
             "CAPABILITY_UNAVAILABLE",
             "Command sessionless module received an unsupported method",
+        ));
+    }
+    if command.method == "agent.result"
+        && (command.input["selector"]["kind"] != "command_status"
+            || command
+                .target_input_sha256
+                .as_deref()
+                .is_none_or(|digest| !is_sha256(digest))
+            || command.input["target_operation_status"]
+                .as_object()
+                .is_none())
+    {
+        return Err(Error::new(
+            "CAPABILITY_UNAVAILABLE",
+            "Command result requires an exact Store status snapshot",
         ));
     }
     route_model(command)?;
@@ -868,7 +1026,6 @@ fn load_config(path: &Path) -> Result<Config> {
     let config: Config = serde_json::from_slice(&bytes)
         .map_err(|_| Error::new("CONFIG_INVALID", "adapter config JSON is invalid"))?;
     if config.module_artifact_id != ARTIFACT_ID
-        || !config.controller_root.is_absolute()
         || !config.command.is_absolute()
         || !config.mod_path.is_absolute()
         || !(100..=86_400_000).contains(&config.run_timeout_ms)
@@ -894,13 +1051,83 @@ fn load_config(path: &Path) -> Result<Config> {
             "native executable path cannot select a shell wrapper",
         ));
     }
-    if !config.controller_root.is_dir() {
+    Ok(config)
+}
+
+fn load_host_connection_config(path: &Path, state_dir: &Path) -> Result<HostConnectionConfig> {
+    if !path.is_absolute()
+        || path.file_name().and_then(|name| name.to_str()) != Some("module-host-connection.json")
+    {
         return Err(Error::new(
-            "CONFIG_INVALID",
-            "controller data root is unavailable",
+            "MODULE_HOST_CONFIG_INVALID",
+            "supervisor-provided host config path has an invalid location",
         ));
     }
-    Ok(config)
+    let parent = path.parent().ok_or_else(|| {
+        Error::new(
+            "MODULE_HOST_CONFIG_INVALID",
+            "supervisor-provided host config path has no parent directory",
+        )
+    })?;
+    let path_parent = fs::canonicalize(parent).map_err(|_| {
+        Error::new(
+            "MODULE_HOST_CONFIG_INVALID",
+            "supervisor-provided host config directory is unavailable",
+        )
+    })?;
+    if path_parent != state_dir {
+        return Err(Error::new(
+            "MODULE_HOST_CONFIG_INVALID",
+            "supervisor-provided host config must be inside this binding's private state directory",
+        ));
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|_| {
+        Error::new(
+            "MODULE_HOST_CONFIG_UNAVAILABLE",
+            "supervisor-provided host config file is unavailable",
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > MAX_CONFIG_BYTES
+    {
+        return Err(Error::new(
+            "MODULE_HOST_CONFIG_INVALID",
+            "supervisor-provided host config is not a bounded regular file",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    File::open(path)?
+        .take(MAX_CONFIG_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_CONFIG_BYTES {
+        return Err(Error::new(
+            "MODULE_HOST_CONFIG_INVALID",
+            "supervisor-provided host config exceeds its size limit",
+        ));
+    }
+    let host: HostConnectionConfig = serde_json::from_slice(&bytes).map_err(|_| {
+        Error::new(
+            "MODULE_HOST_CONFIG_INVALID",
+            "supervisor-provided host config JSON is invalid",
+        )
+    })?;
+    host.validate().map_err(|_| {
+        Error::new(
+            "MODULE_HOST_CONFIG_INVALID",
+            "supervisor-provided host config is outside schema version 1",
+        )
+    })?;
+    if !host.host_data_dir.is_dir()
+        || host.ipc.max_connections == 0
+        || host.ipc.max_inflight_per_connection == 0
+        || host.ipc.max_frame_bytes < 1024
+        || host.ipc.write_timeout_seconds == 0
+    {
+        return Err(Error::new(
+            "MODULE_HOST_CONFIG_INVALID",
+            "supervisor-provided host data or IPC settings are invalid",
+        ));
+    }
+    Ok(host)
 }
 
 fn load_owner() -> Result<Owner> {
@@ -1010,20 +1237,29 @@ fn load_credential(path: &Path) -> Result<Credential> {
         .map_err(|_| Error::new("CREDENTIAL_INVALID", "module credential JSON is invalid"))
 }
 
-fn config_argument() -> Result<PathBuf> {
+fn config_arguments() -> Result<(PathBuf, PathBuf)> {
     let mut args = std::env::args_os().skip(1);
-    let flag = args.next();
-    let path = args.next();
-    if flag.as_deref() != Some(std::ffi::OsStr::new("--config")) || args.next().is_some() {
+    let host_flag = args.next();
+    let host_path = args.next();
+    let config_flag = args.next();
+    let config_path = args.next();
+    if host_flag.as_deref() != Some(std::ffi::OsStr::new("--module-host-config"))
+        || config_flag.as_deref() != Some(std::ffi::OsStr::new("--config"))
+        || args.next().is_some()
+    {
         return Err(Error::invalid(
-            "usage: swarm-adapter-command --config <local-json>",
+            "usage: swarm-adapter-command --module-host-config <supervisor-json> --config <native-json>",
         ));
     }
-    let path = PathBuf::from(path.ok_or_else(|| Error::invalid("config path is required"))?);
-    if !path.is_absolute() {
-        return Err(Error::invalid("adapter config path must be absolute"));
+    let host_path = PathBuf::from(
+        host_path.ok_or_else(|| Error::invalid("module host config path is required"))?,
+    );
+    let config_path =
+        PathBuf::from(config_path.ok_or_else(|| Error::invalid("config path is required"))?);
+    if !host_path.is_absolute() || !config_path.is_absolute() {
+        return Err(Error::invalid("adapter config paths must be absolute"));
     }
-    Ok(path)
+    Ok((host_path, config_path))
 }
 
 fn reserved_argument(argument: &str) -> bool {

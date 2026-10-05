@@ -1,0 +1,32 @@
+[package]
+name = "swarm-gateway"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+publish = false
+description = "Optional loopback Streamable HTTP frontend for the local Swarm host"
+
+[lib]
+name = "swarm_gateway"
+path = "src/lib.rs"
+
+[[bin]]
+name = "swarm-gateway"
+path = "src/main.rs"
+
+[dependencies]
+bytes = "=1.12.1"
+clap = { version = "4.5", features = ["derive"] }
+http-body-util = "=0.1.5"
+hyper = { version = "=1.11.1", default-features = false, features = ["http1", "server"] }
+hyper-util = { version = "=0.1.21", default-features = false, features = ["http1", "server", "tokio"] }
+rmcp = { version = "=3.5.0", default-features = false, features = ["server", "transport-streamable-http-server"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+swarm-client = { path = "../swarm-client" }
+swarm-contracts = { path = "../swarm-contracts" }
+swarm-mcp = { path = "../swarm-mcp" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+toml = "0.9"
+tower-service = "=0.3.3"

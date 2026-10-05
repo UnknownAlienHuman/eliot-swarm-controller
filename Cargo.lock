@@ -397,16 +397,12 @@ version = "0.1.0"
 dependencies = [
  "atlas-redact",
  "base64 0.22.1",
- "bytes",
  "chrono",
  "chrono-tz",
  "clap",
  "croner",
  "eventsource-stream",
  "futures-util",
- "http-body-util",
- "hyper",
- "hyper-util",
  "libc",
  "reqwest",
  "rmcp",
@@ -419,6 +415,7 @@ dependencies = [
  "swarm-client",
  "swarm-contracts",
  "swarm-kernel",
+ "swarm-mcp",
  "swarm-observer",
  "swarm-process",
  "swarm-script-worker",
@@ -430,7 +427,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "toml",
- "tower-service",
  "uuid",
  "windows-sys 0.61.2",
 ]
@@ -1613,6 +1609,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
+name = "swarm-adapter-claude"
+version = "0.2.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "swarm-client",
+ "swarm-contracts",
+ "swarm-process",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "swarm-adapter-codex"
 version = "0.1.0"
 dependencies = [
@@ -1705,6 +1715,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "swarm-cli"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "serde_json",
+ "swarm-client",
+ "swarm-contracts",
+ "swarm-mcp",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "swarm-client"
 version = "0.1.0"
 dependencies = [
@@ -1739,10 +1762,49 @@ dependencies = [
 ]
 
 [[package]]
+name = "swarm-gateway"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "clap",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "swarm-client",
+ "swarm-contracts",
+ "swarm-mcp",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tower-service",
+]
+
+[[package]]
 name = "swarm-kernel"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "swarm-mcp"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "clap",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "sha2",
+ "swarm-client",
+ "swarm-contracts",
+ "tokio",
+ "toml",
+ "uuid",
 ]
 
 [[package]]
@@ -1972,6 +2034,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "libc",
  "pin-project-lite",
  "tokio",

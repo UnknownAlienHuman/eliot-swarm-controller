@@ -11,14 +11,15 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
+use swarm_bus::service_scope::{managed_service_state_path, managed_worker_config_path};
 use swarm_client::{Client, IpcConfig};
 use swarm_contracts::{
-    Credential,
+    Credential, DeclaredServicePurpose, DeclaredServiceScope,
     error::{Error, Result},
 };
 #[cfg(windows)]
 use swarm_process::private_permissions;
-use swarm_process::write_private_new;
+use swarm_process::{Group, process_image_identity, write_private_new};
 use tokio::time::sleep;
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
@@ -39,6 +40,8 @@ struct WorkerConfig {
     register_request_id: String,
     poll_interval_ms: u64,
     credential: Credential,
+    #[serde(default)]
+    managed_service: bool,
 }
 
 impl Drop for WorkerConfig {
@@ -131,8 +134,18 @@ async fn enroll(options: &std::collections::BTreeMap<String, String>) -> Result<
             "--automation",
             "--worker-config",
             "--poll-ms",
+            "--managed-service",
+            "--consumer-client-id",
         ],
     )?;
+    if parse_bool_option(options.get("--managed-service"), false)? {
+        return enroll_managed(options).await;
+    }
+    if options.contains_key("--consumer-client-id") {
+        return Err(Error::invalid(
+            "--consumer-client-id is available only with --managed-service true",
+        ));
+    }
     let root = PathBuf::from(required(options, "--root")?);
     let project_id = required(options, "--project")?.to_owned();
     let automation_id = required(options, "--automation")?.to_owned();
@@ -152,6 +165,7 @@ async fn enroll(options: &std::collections::BTreeMap<String, String>) -> Result<
     let mut worker = if output_path.exists() {
         let worker = read_worker_config(&output_path)?;
         if worker.schema_version != 1
+            || worker.managed_service
             || worker.store_root != root
             || worker.manager_id != manager.0.client_id
             || worker.project_id != project_id
@@ -180,6 +194,7 @@ async fn enroll(options: &std::collections::BTreeMap<String, String>) -> Result<
                 client_id: consumer_client_id,
                 token,
             },
+            managed_service: false,
         };
         write_worker_config(&output_path, &worker)?;
         worker
@@ -191,6 +206,7 @@ async fn enroll(options: &std::collections::BTreeMap<String, String>) -> Result<
         "automation_id":worker.automation_id,
         "consumer_client_id":worker.credential.client_id,
         "token_hash":token_hash,
+        "managed_service":false,
     });
     let result = call_once(
         &worker.store_root,
@@ -212,6 +228,204 @@ async fn enroll(options: &std::collections::BTreeMap<String, String>) -> Result<
         )),
         Err(error) => Err(error),
     }
+}
+
+/// Create an opt-in enrollment under a host-derived private path. The selected
+/// consumer receives the same exact two-method Module scope as a normal
+/// enrollment; only its lifecycle demand bit and pinned config digest differ.
+async fn enroll_managed(options: &std::collections::BTreeMap<String, String>) -> Result<()> {
+    reject_unknown_options(
+        options,
+        &[
+            "--root",
+            "--manager-credential",
+            "--project",
+            "--automation",
+            "--poll-ms",
+            "--managed-service",
+            "--consumer-client-id",
+        ],
+    )?;
+    let root = fs::canonicalize(required(options, "--root")?)?;
+    let project_id = required(options, "--project")?.to_owned();
+    let automation_id = required(options, "--automation")?.to_owned();
+    let poll_interval_ms = options
+        .get("--poll-ms")
+        .map(|value| value.parse::<u64>())
+        .transpose()
+        .map_err(|_| Error::invalid("poll interval is invalid"))?
+        .unwrap_or(DEFAULT_POLL_MS);
+    if !(MIN_POLL_MS..=MAX_POLL_MS).contains(&poll_interval_ms) {
+        return Err(Error::invalid("poll interval must be 100..=60000 ms"));
+    }
+
+    let manager_path = PathBuf::from(required(options, "--manager-credential")?);
+    let mut manager = SecretCredential(read_credential(&manager_path)?);
+    let consumer_client_id = options
+        .get("--consumer-client-id")
+        .cloned()
+        .unwrap_or_else(|| format!("bus-script-{}", Uuid::new_v4().simple()));
+    validate_consumer_client_id(&consumer_client_id)?;
+    let output_path = managed_worker_config_path(&root, &consumer_client_id)?;
+    ensure_private_directory(
+        &root,
+        output_path
+            .parent()
+            .ok_or_else(|| Error::invalid("managed worker config path has no parent directory"))?,
+    )?;
+
+    let mut worker = if output_path.exists() {
+        let worker = read_worker_config(&output_path)?;
+        if worker.schema_version != 1
+            || !worker.managed_service
+            || fs::canonicalize(&worker.store_root)? != root
+            || worker.manager_id != manager.0.client_id
+            || worker.project_id != project_id
+            || worker.automation_id != automation_id
+            || worker.credential.client_id != consumer_client_id
+            || worker.poll_interval_ms != poll_interval_ms
+        {
+            return Err(Error::new(
+                "BUS_WORKER_CONFIG_CONFLICT",
+                "existing managed private config does not match the requested scope",
+            ));
+        }
+        worker
+    } else {
+        let worker = WorkerConfig {
+            schema_version: 1,
+            store_root: root.clone(),
+            manager_id: manager.0.client_id.clone(),
+            project_id,
+            automation_id,
+            register_request_id: format!(
+                "bus-register-{}",
+                hex_sha256(consumer_client_id.as_bytes())
+            ),
+            poll_interval_ms,
+            credential: Credential {
+                client_id: consumer_client_id.clone(),
+                token: format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple()),
+            },
+            managed_service: true,
+        };
+        write_worker_config(&output_path, &worker)?;
+        worker
+    };
+    let worker_config_sha256 = worker_file_sha256(&output_path)?;
+    let token_hash = hex_sha256(worker.credential.token.as_bytes());
+    let params = json!({
+        "client_request_id":worker.register_request_id,
+        "project_id":worker.project_id,
+        "automation_id":worker.automation_id,
+        "consumer_client_id":worker.credential.client_id,
+        "token_hash":token_hash,
+        "managed_service":true,
+        "worker_config_sha256":worker_config_sha256,
+    });
+    let result = call_once(&root, &manager.0, "bus.consumer.register", params).await;
+    manager.0.token.zeroize();
+    match result {
+        Ok(value) if value["registered"] == true => {
+            let generation = value["service_generation"].as_u64().ok_or_else(|| {
+                Error::new(
+                    "BUS_SERVICE_RECEIPT_INVALID",
+                    "managed enrollment omitted its persisted generation",
+                )
+            })?;
+            println!(
+                "managed consumer {} enrolled as service generation {}; private config: {}",
+                worker.credential.client_id,
+                generation,
+                output_path.display()
+            );
+            worker.credential.token.zeroize();
+            Ok(())
+        }
+        Ok(_) => Err(Error::new(
+            "BUS_REGISTER_RECEIPT_INVALID",
+            "kernel returned no registered consumer receipt",
+        )),
+        Err(error) => Err(error),
+    }
+}
+
+fn validate_consumer_client_id(value: &str) -> Result<()> {
+    if !value.starts_with("bus-script-")
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._:-/@".contains(&byte))
+    {
+        return Err(Error::invalid("consumer client ID is invalid"));
+    }
+    Ok(())
+}
+
+fn parse_bool_option(value: Option<&String>, default: bool) -> Result<bool> {
+    match value.map(String::as_str) {
+        None => Ok(default),
+        Some("true") => Ok(true),
+        Some("false") => Ok(false),
+        Some(_) => Err(Error::invalid("managed-service must be true or false")),
+    }
+}
+
+fn ensure_private_directory(root: &Path, path: &Path) -> Result<()> {
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| Error::invalid("managed worker directory must stay under the Store root"))?;
+    if !root.is_absolute() || !path.is_absolute() || relative.as_os_str().is_empty() {
+        return Err(Error::invalid("managed worker directory must be absolute"));
+    }
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(Error::invalid("managed worker directory path is invalid"));
+        };
+        current.push(name);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if !metadata.is_dir() || is_link_or_reparse(&metadata) => {
+                return Err(Error::new(
+                    "BUS_WORKER_CONFIG_INVALID",
+                    "managed worker directory traverses a link or non-directory",
+                ));
+            }
+            Ok(metadata) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if metadata.permissions().mode() & 0o077 != 0 {
+                        return Err(Error::new(
+                            "BUS_WORKER_CONFIG_NOT_PRIVATE",
+                            "managed worker directory is not owner-only",
+                        ));
+                    }
+                }
+                #[cfg(windows)]
+                private_permissions(&current, true)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&current)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&current, fs::Permissions::from_mode(0o700))?;
+                }
+                #[cfg(windows)]
+                private_permissions(&current, true)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn worker_file_sha256(path: &Path) -> Result<String> {
+    let mut bytes = read_private_file(path)?;
+    let digest = hex_sha256(&bytes);
+    bytes.zeroize();
+    Ok(digest)
 }
 
 async fn revoke(options: &std::collections::BTreeMap<String, String>) -> Result<()> {
@@ -250,7 +464,14 @@ async fn revoke(options: &std::collections::BTreeMap<String, String>) -> Result<
 }
 
 async fn run_worker(options: &std::collections::BTreeMap<String, String>) -> Result<()> {
-    reject_unknown_options(options, &["--worker-config"])?;
+    reject_unknown_options(
+        options,
+        &[
+            "--worker-config",
+            "--managed-owner-dir",
+            "--service-generation",
+        ],
+    )?;
     let worker = read_worker_config(Path::new(required(options, "--worker-config")?))?;
     if worker.schema_version != 1
         || !(MIN_POLL_MS..=MAX_POLL_MS).contains(&worker.poll_interval_ms)
@@ -266,6 +487,35 @@ async fn run_worker(options: &std::collections::BTreeMap<String, String>) -> Res
         ));
     }
 
+    let owner_dir = options.get("--managed-owner-dir").map(PathBuf::from);
+    let generation = options
+        .get("--service-generation")
+        .map(|value| value.parse::<u64>())
+        .transpose()
+        .map_err(|_| Error::invalid("service generation is invalid"))?;
+    match (worker.managed_service, owner_dir, generation) {
+        (true, Some(owner_dir), Some(generation)) if generation > 0 => {
+            return run_managed_worker(worker, owner_dir, generation).await;
+        }
+        (true, _, _) => {
+            return Err(Error::new(
+                "BUS_SERVICE_OWNER_REQUIRED",
+                "managed worker requires its host-provided owner directory and generation",
+            ));
+        }
+        (false, None, None) => {}
+        (false, _, _) => {
+            return Err(Error::new(
+                "BUS_SERVICE_OWNER_UNEXPECTED",
+                "unmanaged worker cannot join a host-owned service scope",
+            ));
+        }
+    }
+
+    run_unmanaged_worker(worker).await
+}
+
+async fn run_unmanaged_worker(worker: WorkerConfig) -> Result<()> {
     loop {
         match poll_once(&worker).await {
             Ok(true) => continue,
@@ -279,6 +529,93 @@ async fn run_worker(options: &std::collections::BTreeMap<String, String>) -> Res
             }
             Err(error) => return Err(error),
         }
+    }
+}
+
+async fn run_managed_worker(
+    worker: WorkerConfig,
+    owner_dir: PathBuf,
+    generation: u64,
+) -> Result<()> {
+    let scope = DeclaredServiceScope::new(
+        DeclaredServicePurpose::BusConsumer,
+        worker.credential.client_id.clone(),
+        generation,
+    )?;
+    let expected_owner_dir = managed_service_state_path(&worker.store_root, &scope)?;
+    if owner_dir != expected_owner_dir {
+        return Err(Error::new(
+            "BUS_SERVICE_OWNER_SCOPE_MISMATCH",
+            "managed owner directory does not match the declared service scope",
+        ));
+    }
+    let metadata = fs::symlink_metadata(&owner_dir)?;
+    if !metadata.is_dir() || is_link_or_reparse(&metadata) {
+        return Err(Error::new(
+            "BUS_SERVICE_OWNER_DIRECTORY_INVALID",
+            "managed service owner directory is not a regular directory",
+        ));
+    }
+    let owner_path = owner_dir.join("owner.json");
+    if owner_path.exists() {
+        return Err(Error::new(
+            "BUS_SERVICE_OWNER_EXISTS",
+            "managed service owner receipt must be reconciled before start",
+        ));
+    }
+    let token = Uuid::new_v4().simple().to_string();
+    let group = Group::enter_service(&token, scope.purpose)?;
+    let worker_image = process_image_identity(std::process::id())?;
+    let receipt = json!({
+        "schema_version":1,
+        "scope":scope,
+        "owner":{"version":1,"token":token,"process":group.identity},
+        "worker_image":worker_image,
+    });
+    write_private_new(
+        &owner_path,
+        Zeroizing::new(serde_json::to_vec(&receipt)?).as_slice(),
+    )?;
+
+    loop {
+        if stop_requested(&owner_dir)? {
+            if !group.children_empty()? {
+                return Err(Error::new(
+                    "BUS_SERVICE_DESCENDANTS_ACTIVE",
+                    "managed dispatcher still has an untracked process-family member",
+                ));
+            }
+            return Ok(());
+        }
+        match poll_once(&worker).await {
+            Ok(true) => continue,
+            Ok(false) => sleep(Duration::from_millis(worker.poll_interval_ms)).await,
+            Err(error) if retryable_transport_code(&error.code) => {
+                eprintln!(
+                    "swarm-bus-dispatcher: {}; retrying by rereading cursor",
+                    error.code
+                );
+                sleep(Duration::from_millis(worker.poll_interval_ms)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn stop_requested(owner_dir: &Path) -> Result<bool> {
+    let path = owner_dir.join("stop.request");
+    match fs::symlink_metadata(&path) {
+        Ok(metadata)
+            if metadata.is_file() && !is_link_or_reparse(&metadata) && metadata.len() == 0 =>
+        {
+            Ok(true)
+        }
+        Ok(_) => Err(Error::new(
+            "BUS_SERVICE_STOP_REQUEST_INVALID",
+            "managed service stop marker is not a private empty file",
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
     }
 }
 

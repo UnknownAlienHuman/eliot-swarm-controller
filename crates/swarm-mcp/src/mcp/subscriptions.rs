@@ -77,12 +77,7 @@
 //! store side effects. All pollers of the session serialize their
 //! short page reads on that one pump connection.
 
-use crate::{
-    config::Ipc,
-    error::{Error, Result},
-    ipc,
-    model::{self, Credential},
-};
+use crate::config::Ipc;
 use rmcp::{
     model::{CustomNotification, ServerNotification},
     service::{Peer, RoleServer},
@@ -94,7 +89,13 @@ use std::{
     sync::{Arc, Mutex as StdMutex, Weak},
     time::Duration,
 };
+use swarm_client::Client;
+use swarm_contracts::{
+    Credential,
+    error::{Error, Result},
+};
 use tokio::sync::{Mutex, mpsc, watch};
+use uuid::Uuid;
 
 /// Extension identifier advertised in the server capabilities
 /// (SEP-1724 extensions map), alongside the Tasks extension.
@@ -248,7 +249,7 @@ pub struct PumpSource {
     root: PathBuf,
     credential: Credential,
     ipc_config: Arc<Ipc>,
-    client: Arc<Mutex<Option<ipc::Client>>>,
+    client: Arc<Mutex<Option<Client>>>,
     client_id: String,
 }
 
@@ -257,7 +258,7 @@ impl PumpSource {
         root: PathBuf,
         credential: Credential,
         ipc_config: Arc<Ipc>,
-        client: Arc<Mutex<Option<ipc::Client>>>,
+        client: Arc<Mutex<Option<Client>>>,
     ) -> Self {
         let client_id = credential.client_id.clone();
         Self {
@@ -334,7 +335,7 @@ impl SubscriptionHub {
                 ));
             }
         }
-        let id = model::new_id();
+        let id = Uuid::new_v4().to_string();
         let (queue_tx, queue_rx) = mpsc::channel::<CustomNotification>(self.queue_depth);
         let (stop_tx, stop_rx) = watch::channel(false);
         let poller = tokio::spawn(poll_loop(

@@ -3,6 +3,7 @@
 pub mod credential;
 pub mod declared_service_scope;
 pub mod error;
+pub mod mcp_frontend;
 pub mod module_catalog;
 pub mod module_contract;
 pub mod rpc;

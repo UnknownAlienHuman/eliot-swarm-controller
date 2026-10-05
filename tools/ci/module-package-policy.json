@@ -1,17 +1,18 @@
 {
-  "schema_version": 1,
-  "format": "eliot.module_build_policy.v1",
-  "approved_package_names": [
-    "swarm-adapter-codex",
-    "swarm-adapter-command",
-    "swarm-antigravity-adapter",
-    "swarm-adapter-opencode",
-    "swarm-process",
-    "swarm-script-worker",
-    "swarm-observer",
-    "swarm-checks",
-    "swarm-forge-worker",
-    "swarm-bus",
-    "eliot-swarm-controller"
+  "schema_version": 2,
+  "format": "eliot.module_build_policy.v2",
+  "approved_package_coordinates": [
+    { "package_name": "swarm-adapter-codex", "manifest": "crates/swarm-adapter-codex/Cargo.toml", "binary_target": "swarm-codex-adapter" },
+    { "package_name": "swarm-adapter-command", "manifest": "crates/swarm-adapter-command/Cargo.toml", "binary_target": "swarm-adapter-command" },
+    { "package_name": "swarm-adapter-claude", "manifest": "crates/swarm-adapter-claude/Cargo.toml", "binary_target": "swarm-adapter-claude" },
+    { "package_name": "swarm-antigravity-adapter", "manifest": "modules/antigravity-rust/Cargo.toml", "binary_target": "swarm-antigravity" },
+    { "package_name": "swarm-adapter-opencode", "manifest": "crates/swarm-adapter-opencode/Cargo.toml", "binary_target": "swarm-adapter-opencode" },
+    { "package_name": "swarm-process", "manifest": "crates/swarm-process/Cargo.toml", "binary_target": "swarm-module-owner" },
+    { "package_name": "swarm-script-worker", "manifest": "crates/swarm-script-worker/Cargo.toml", "binary_target": "swarm-script-worker" },
+    { "package_name": "swarm-observer", "manifest": "crates/swarm-observer/Cargo.toml", "binary_target": "swarm-observer" },
+    { "package_name": "swarm-checks", "manifest": "crates/swarm-checks/Cargo.toml", "binary_target": "swarm-checks" },
+    { "package_name": "swarm-forge-worker", "manifest": "crates/swarm-forge-worker/Cargo.toml", "binary_target": "swarm-forge-worker" },
+    { "package_name": "swarm-bus", "manifest": "crates/swarm-bus/Cargo.toml", "binary_target": "swarm-bus-dispatcher" },
+    { "package_name": "eliot-swarm-controller", "manifest": "Cargo.toml", "binary_target": "swarm" }
   ]
 }

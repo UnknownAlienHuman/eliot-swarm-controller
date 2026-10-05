@@ -60,6 +60,25 @@ struct AckRecord {
     acknowledgement: Value,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResultPageRecord {
+    schema: u8,
+    module_artifact_id: String,
+    operation_id: String,
+    result_page_sha256: String,
+    params: Value,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResultPageAckRecord {
+    schema: u8,
+    operation_id: String,
+    result_page_sha256: String,
+    acknowledgement: Value,
+}
+
 #[derive(Debug, Clone)]
 pub struct RunStore {
     root: PathBuf,
@@ -68,7 +87,10 @@ pub struct RunStore {
 impl RunStore {
     pub fn new(module_state: &Path) -> Result<Self> {
         let state = fs::canonicalize(module_state)?;
-        let root = state.join("command-adapter-runs");
+        // Version 3 has a new result-page receipt contract. Keep its
+        // immutable outbox separate from preserved v2 evidence rather than
+        // interpreting historical journal records under a new descriptor.
+        let root = state.join("command-adapter-runs-v3");
         match fs::symlink_metadata(&root) {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
                 return Err(Error::new(
@@ -315,6 +337,181 @@ impl RunStore {
             }
             if self.outcome_pending(&saved.operation_id, &hash)? {
                 pending.push((saved.outcome, hash));
+            }
+        }
+        Ok(pending)
+    }
+
+    /// Save the exact authenticated `module.result` request before delivery.
+    /// A retry may resend these same bytes only; a changed page conflicts.
+    pub fn save_result_page(&self, operation_id: &str, params: &Value) -> Result<String> {
+        if params["operation_id"].as_str() != Some(operation_id)
+            || params["page"].as_object().is_none()
+        {
+            return Err(Error::new(
+                "ADAPTER_RESULT_INVALID",
+                "result page request differs from its exact Operation",
+            ));
+        }
+        let dir = self.directory(operation_id)?;
+        let admission: AdmissionRecord = read_json(&dir.join("admission.json"))?;
+        if admission.schema != 1
+            || admission.module_artifact_id != ARTIFACT_ID
+            || admission.identity.operation_id != operation_id
+            || !admission_checksum_valid(&admission)
+        {
+            return Err(Error::new(
+                "ADAPTER_EVIDENCE_INVALID",
+                "result page has no matching immutable Operation admission",
+            ));
+        }
+        let hash = digest(canonical(params)?.as_bytes());
+        let path = dir.join("result-page.json");
+        if path.exists() {
+            let (saved, saved_hash) = self
+                .read_result_page(operation_id)?
+                .ok_or_else(|| Error::new("ADAPTER_EVIDENCE_INVALID", "page disappeared"))?;
+            if saved_hash != hash || canonical(&saved)? != canonical(params)? {
+                return Err(Error::new(
+                    "ADAPTER_EVIDENCE_CONFLICT",
+                    "a different result page is already saved for this Operation",
+                ));
+            }
+            return Ok(hash);
+        }
+        write_new_json(
+            &path,
+            &ResultPageRecord {
+                schema: 1,
+                module_artifact_id: ARTIFACT_ID.to_owned(),
+                operation_id: operation_id.to_owned(),
+                result_page_sha256: hash.clone(),
+                params: params.clone(),
+            },
+        )?;
+        Ok(hash)
+    }
+
+    pub fn read_result_page(&self, operation_id: &str) -> Result<Option<(Value, String)>> {
+        let dir = self.directory(operation_id)?;
+        let path = dir.join("result-page.json");
+        if !path.exists() {
+            return Ok(None);
+        }
+        let saved: ResultPageRecord = read_json(&path)?;
+        let hash = digest(canonical(&saved.params)?.as_bytes());
+        let expected_name = format!("op-{}", digest(operation_id.as_bytes()));
+        if saved.schema != 1
+            || saved.module_artifact_id != ARTIFACT_ID
+            || saved.operation_id != operation_id
+            || saved.params["operation_id"].as_str() != Some(operation_id)
+            || saved.result_page_sha256 != hash
+            || dir.file_name().and_then(|name| name.to_str()) != Some(expected_name.as_str())
+        {
+            return Err(Error::new(
+                "ADAPTER_EVIDENCE_INVALID",
+                "saved result page failed its identity or digest check",
+            ));
+        }
+        Ok(Some((saved.params, hash)))
+    }
+
+    pub fn acknowledge_result_page(
+        &self,
+        operation_id: &str,
+        result_page_sha256: &str,
+        acknowledgement: Value,
+    ) -> Result<()> {
+        if acknowledgement["recorded"] != true
+            || acknowledgement["artifact_ref"]
+                .as_str()
+                .is_none_or(str::is_empty)
+        {
+            return Err(Error::new(
+                "MODULE_RESULT_ACK_INVALID",
+                "module.result did not confirm an immutable artifact reference",
+            ));
+        }
+        let (params, saved_hash) = self
+            .read_result_page(operation_id)?
+            .ok_or_else(|| Error::new("ADAPTER_EVIDENCE_INVALID", "saved result page missing"))?;
+        if saved_hash != result_page_sha256 || params["operation_id"] != operation_id {
+            return Err(Error::new(
+                "ADAPTER_EVIDENCE_INVALID",
+                "result acknowledgement differs from its saved page",
+            ));
+        }
+        let dir = self.directory(operation_id)?;
+        write_replace_json(
+            &dir.join("result-page-ack.json"),
+            &ResultPageAckRecord {
+                schema: 1,
+                operation_id: operation_id.to_owned(),
+                result_page_sha256: result_page_sha256.to_owned(),
+                acknowledgement,
+            },
+        )
+    }
+
+    pub fn result_page_pending(&self, operation_id: &str, hash: &str) -> Result<bool> {
+        let dir = self.directory(operation_id)?;
+        if !dir.join("result-page.json").exists() {
+            return Err(Error::new(
+                "ADAPTER_EVIDENCE_INVALID",
+                "result page has no durable outbox record",
+            ));
+        }
+        let path = dir.join("result-page-ack.json");
+        if !path.exists() {
+            return Ok(true);
+        }
+        let ack: ResultPageAckRecord = read_json(&path)?;
+        if ack.schema != 1
+            || ack.operation_id != operation_id
+            || ack.result_page_sha256 != hash
+            || ack.acknowledgement["recorded"] != true
+            || ack.acknowledgement["artifact_ref"]
+                .as_str()
+                .is_none_or(str::is_empty)
+        {
+            return Err(Error::new(
+                "ADAPTER_EVIDENCE_INVALID",
+                "saved result acknowledgement does not match its immutable page",
+            ));
+        }
+        Ok(false)
+    }
+
+    pub fn pending_result_pages(&self) -> Result<Vec<(Value, String)>> {
+        let mut dirs = fs::read_dir(&self.root)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        dirs.sort();
+        let mut pending = Vec::new();
+        for dir in dirs {
+            let metadata = fs::symlink_metadata(&dir)?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(Error::new(
+                    "ADAPTER_EVIDENCE_INVALID",
+                    "run store contains a non-directory entry",
+                ));
+            }
+            let path = dir.join("result-page.json");
+            if !path.exists() {
+                continue;
+            }
+            let saved: ResultPageRecord = read_json(&path)?;
+            if saved.params["operation_id"].as_str() != Some(saved.operation_id.as_str()) {
+                return Err(Error::new(
+                    "ADAPTER_EVIDENCE_INVALID",
+                    "pending result page does not name its exact Operation",
+                ));
+            }
+            let Some((params, hash)) = self.read_result_page(&saved.operation_id)? else {
+                continue;
+            };
+            if self.result_page_pending(&saved.operation_id, &hash)? {
+                pending.push((params, hash));
             }
         }
         Ok(pending)

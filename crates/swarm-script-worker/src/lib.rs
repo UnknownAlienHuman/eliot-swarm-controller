@@ -29,7 +29,10 @@ use swarm_scripts::{
     MAX_CONTROLLER_EFFECTS, MAX_ENVIRONMENT_BYTES, MAX_ENVIRONMENT_VALUE_BYTES,
     MAX_INHERITED_ENVIRONMENT, MAX_INVOCATION_BYTES, MAX_RESULT_BYTES, MAX_SCRIPT_DURATION_MS,
     MAX_STDERR_BYTES,
-    process::{ProcessPlan, plan_process},
+    process::{
+        MAX_PROCESS_CONTROL_FAILURE_BYTES, PROCESS_CONTROL_FAILURE_FILE, ProcessControlFailure,
+        ProcessPlan, plan_process,
+    },
     protocol::{ScriptEffectRequest, ScriptInvocation, validate_invocation_size},
     result::{ProcessExit, ProcessOutcome, project_completion},
     schema::{
@@ -703,12 +706,10 @@ fn verify_ready_worker(work: &ScriptWork, dir: &Path) -> Result<()> {
     }
     let lock = OpenOptions::new().read(true).write(true).open(lock_path)?;
     match lock.try_lock() {
-        Ok(()) => {
-            return Err(Error::new(
-                "SCRIPT_WORKER_LOST",
-                "worker lock is free before Go",
-            ));
-        }
+        Ok(()) => Err(Error::new(
+            "SCRIPT_WORKER_LOST",
+            "worker lock is free before Go",
+        )),
         Err(std::fs::TryLockError::WouldBlock) => Ok(()),
         Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
     }
@@ -909,11 +910,17 @@ fn execute(
     }
     let started_at_ms = now_ms()?;
     let mut child = command.spawn()?;
+    let mut cancellation_failure_reported = false;
     if let Err(error) = write_once(
         &dir.join("started.json"),
         &canonical_json(&json!({"pid":child.id(),"started_at_ms":started_at_ms,"run_id":work.run_id,"operation_id":work.operation_id,"token":work.token}))?.into_bytes(),
     ) {
-        let _ = group.cancel_children();
+        cancel_children_and_record(
+            work,
+            group,
+            identity,
+            &mut cancellation_failure_reported,
+        );
         return Err(Error::new("SCRIPT_CHILD_STARTED", error.to_string()));
     }
     let overflow = Arc::new(AtomicBool::new(false));
@@ -947,7 +954,7 @@ fn execute(
     let mut status = None;
     loop {
         if overflow.load(Ordering::Acquire) {
-            let _ = group.cancel_children();
+            cancel_children_and_record(work, group, identity, &mut cancellation_failure_reported);
             break;
         }
         match child.try_wait() {
@@ -957,13 +964,18 @@ fn execute(
             }
             Ok(None) => {}
             Err(error) => {
-                let _ = group.cancel_children();
+                cancel_children_and_record(
+                    work,
+                    group,
+                    identity,
+                    &mut cancellation_failure_reported,
+                );
                 return Err(error.into());
             }
         }
         if Instant::now() >= deadline {
             timed_out = true;
-            let _ = group.cancel_children();
+            cancel_children_and_record(work, group, identity, &mut cancellation_failure_reported);
             break;
         }
         thread::sleep(POLL_INTERVAL);
@@ -972,7 +984,7 @@ fn execute(
         status = Some(child.wait()?);
     }
     while !group.children_empty()? {
-        let _ = group.cancel_children();
+        cancel_children_and_record(work, group, identity, &mut cancellation_failure_reported);
         thread::sleep(POLL_INTERVAL);
     }
     group.disarm()?;
@@ -1024,8 +1036,9 @@ fn finish_worker_error(
     error_code: String,
     state: &str,
 ) -> Result<()> {
-    let _ = group.cancel_children();
+    let mut cancellation_failure_reported = false;
     while !group.children_empty()? {
+        cancel_children_and_record(work, group, identity, &mut cancellation_failure_reported);
         thread::sleep(POLL_INTERVAL);
     }
     group.disarm()?;
@@ -1510,6 +1523,74 @@ fn write_once(path: &Path, bytes: &[u8]) -> Result<()> {
     })();
     let _ = fs::remove_file(&temp);
     result
+}
+
+fn write_process_control_failure(
+    work: &ScriptWork,
+    identity: &Value,
+    error_code: &str,
+) -> Result<()> {
+    let failure = ProcessControlFailure::cancel_children(
+        work.run_id.clone(),
+        work.operation_id.clone(),
+        work.token.clone(),
+        identity["process"].clone(),
+        error_code,
+    );
+    failure
+        .validate_for(
+            &work.run_id,
+            &work.operation_id,
+            &work.token,
+            &identity["process"],
+        )
+        .map_err(script_error)?;
+    let bytes = canonical_json(&json!(failure))?.into_bytes();
+    if bytes.len() > MAX_PROCESS_CONTROL_FAILURE_BYTES {
+        return Err(Error::new(
+            "SCRIPT_PROCESS_CONTROL_DIAGNOSTIC_INVALID",
+            "script cancellation diagnostic exceeds its size limit",
+        ));
+    }
+    let path = directory(&work.data_dir, &work.run_id)?.join(PROCESS_CONTROL_FAILURE_FILE);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata)
+            if is_link_or_reparse(&metadata)
+                || !metadata.is_file()
+                || metadata.len() > MAX_PROCESS_CONTROL_FAILURE_BYTES as u64 =>
+        {
+            Err(Error::new(
+                "SCRIPT_PROCESS_CONTROL_DIAGNOSTIC_INVALID",
+                "retained script cancellation diagnostic is not bounded and regular",
+            ))
+        }
+        Ok(_) => {
+            let retained = read_bytes(&path, MAX_PROCESS_CONTROL_FAILURE_BYTES as u64)?;
+            if retained == bytes {
+                Ok(())
+            } else {
+                Err(Error::conflict(
+                    "retained script cancellation diagnostic differs",
+                ))
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => write_once(&path, &bytes),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn cancel_children_and_record(
+    work: &ScriptWork,
+    group: &Group,
+    identity: &Value,
+    failure_reported: &mut bool,
+) {
+    if let Err(error) = group.cancel_children()
+        && !*failure_reported
+    {
+        *failure_reported = true;
+        let _ = write_process_control_failure(work, identity, &error.code);
+    }
 }
 
 fn read_json(path: &Path) -> Result<Value> {

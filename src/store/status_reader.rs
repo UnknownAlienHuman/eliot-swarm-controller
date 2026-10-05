@@ -10,23 +10,38 @@ struct StatusRequest {
     reply: oneshot::Sender<Result<Value>>,
 }
 
+enum StatusJob {
+    Read(StatusRequest),
+    Stop,
+}
+
 #[derive(Clone)]
-pub(super) struct Sender(mpsc::Sender<StatusRequest>);
+pub(super) struct Sender(mpsc::Sender<StatusJob>);
 
 impl Sender {
     pub(super) async fn host_status(&self, principal: Principal, params: Value) -> Result<Value> {
         let (reply, response) = oneshot::channel();
         self.0
-            .send(StatusRequest {
+            .send(StatusJob::Read(StatusRequest {
                 principal,
                 params,
                 reply,
-            })
+            }))
             .await
             .map_err(|_| Error::new("STORE_CLOSED", "status reader stopped"))?;
         response
             .await
             .map_err(|_| Error::new("STORE_CLOSED", "status read lost its response"))?
+    }
+
+    /// Close the existing reader FIFO even while Store clones retain senders.
+    /// Requests before this marker finish normally; later queued replies are
+    /// dropped when the receiver exits and report STORE_CLOSED to their callers.
+    pub(super) async fn shutdown(&self) -> Result<()> {
+        self.0
+            .send(StatusJob::Stop)
+            .await
+            .map_err(|_| Error::new("STORE_CLOSED", "status reader stopped before shutdown"))
     }
 }
 
@@ -42,7 +57,7 @@ pub(super) async fn start(
         ));
     }
 
-    let (tx, mut rx) = mpsc::channel::<StatusRequest>(queue_capacity);
+    let (tx, mut rx) = mpsc::channel::<StatusJob>(queue_capacity);
     let (ready_tx, ready_rx) = oneshot::channel();
     let thread = std::thread::Builder::new()
         .name("swarm-status-reader".into())
@@ -57,7 +72,10 @@ pub(super) async fn start(
             if ready_tx.send(Ok(())).is_err() {
                 return;
             }
-            while let Some(request) = rx.blocking_recv() {
+            while let Some(job) = rx.blocking_recv() {
+                let StatusJob::Read(request) = job else {
+                    break;
+                };
                 let result = read_status(&mut db, request.principal, request.params, &config);
                 let _ = request.reply.send(result);
             }

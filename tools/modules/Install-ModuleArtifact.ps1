@@ -155,6 +155,14 @@ function Get-ValidatedInteger {
     return [long] $number
 }
 
+function Assert-NoInstallerPlaceholder {
+    param([string] $Value, [string] $Field)
+    if ($Value -match '(?i)<INSTALLER_[A-Z0-9_-]+>' -or
+        $Value -match '(?i)(?:\A|:)REPLACE_AT_INSTALL(?::|\z)') {
+        throw "Unresolved installer placeholder: $Field"
+    }
+}
+
 function Assert-ProtectedReference {
     param([object] $Value, [string] $Field)
     if ($Value -isnot [string] -or $Value.Length -eq 0 -or
@@ -162,23 +170,39 @@ function Assert-ProtectedReference {
         $Value -match '[\x00-\x1f\x7f]') {
         throw "Invalid protected reference: $Field"
     }
+    Assert-NoInstallerPlaceholder -Value $Value -Field $Field
 }
 
 function Assert-LaunchValue {
-    param([object] $Value, [string] $Field)
+    param(
+        [object] $Value,
+        [string] $Field,
+        [bool] $AllowModuleHostConfigPath = $false
+    )
     Assert-OnlyKeys -Value $Value -Allowed @('kind', 'value') -Name $Field
     if (-not $Value.Contains('kind') -or -not $Value.Contains('value')) {
         throw "$Field must contain kind and value."
     }
-    switch ([string] $Value.kind) {
+    switch -CaseSensitive ([string] $Value.kind) {
         'literal' {
             if ($Value.value -isnot [string] -or
                 [System.Text.Encoding]::UTF8.GetByteCount([string] $Value.value) -gt 16384 -or
                 ([string] $Value.value).Contains([char] 0)) {
                 throw "Invalid literal launch value: $Field"
             }
+            Assert-NoInstallerPlaceholder -Value ([string] $Value.value) -Field $Field
         }
         'protected' { Assert-ProtectedReference -Value $Value.value -Field $Field }
+        'module_host_config_path' {
+            if (-not $AllowModuleHostConfigPath) {
+                throw "The supervisor-generated module host config path is accepted only in launch.argv: $Field"
+            }
+            Assert-OnlyKeys -Value $Value.value -Allowed @('schema_version') -Name "$Field.value"
+            if (-not $Value.value.Contains('schema_version') -or
+                (Get-ValidatedInteger -Value $Value.value.schema_version -Field "$Field.value.schema_version" -Minimum 1 -Maximum 1) -ne 1) {
+                throw "Unsupported supervisor-generated module host config path schema: $Field"
+            }
+        }
         default { throw "Invalid launch value kind: $Field" }
     }
 }
@@ -249,13 +273,34 @@ function Assert-WorkspaceOption {
     }
 }
 
+function Assert-PreInputOpen {
+    param([Parameter(Mandatory = $true)] [object] $Value)
+
+    Assert-OnlyKeys -Value $Value -Allowed @(
+        'schema_version', 'kind', 'completion_condition', 'native_identity',
+        'initial_identity_adoption'
+    ) -Name 'pre_input_open'
+    foreach ($field in @('schema_version', 'kind', 'completion_condition', 'native_identity', 'initial_identity_adoption')) {
+        if (-not $Value.Contains($field)) { throw "pre_input_open.$field is required." }
+    }
+    [void] (Get-ValidatedInteger -Value $Value.schema_version -Field 'pre_input_open.schema_version' -Minimum 1 -Maximum 1)
+    if ($Value.kind -isnot [string] -or $Value.kind -cne 'pre_input_executor_ready' -or
+        $Value.completion_condition -isnot [string] -or $Value.completion_condition -cne 'native_executor_prepared' -or
+        $Value.native_identity -isnot [string] -or $Value.native_identity -cne 'rootless' -or
+        $Value.initial_identity_adoption -isnot [string] -or
+        $Value.initial_identity_adoption -cne 'first_task_dispatch_exact_native_echo') {
+        throw 'Unsupported pre_input_open semantics.'
+    }
+}
+
 function Assert-DescriptorTemplate {
     param([System.Collections.IDictionary] $Descriptor)
 
     Assert-OnlyKeys -Value $Descriptor -Allowed @(
         'schema_version', 'module_id', 'artifact', 'launch', 'config_schema',
         'command_schemas', 'event_schemas', 'protocol', 'capabilities',
-        'lifecycle', 'activation', 'enabled', 'restart', 'workspace_option'
+        'lifecycle', 'activation', 'enabled', 'restart', 'workspace_option',
+        'pre_input_open'
     ) -Name 'descriptor'
 
     foreach ($required in @('module_id', 'artifact', 'launch', 'protocol', 'lifecycle', 'activation', 'enabled')) {
@@ -292,11 +337,27 @@ function Assert-DescriptorTemplate {
     if ($Descriptor.launch.argv -isnot [array] -or $Descriptor.launch.argv.Count -gt 256) {
         throw 'launch.argv must be an array of at most 256 values.'
     }
+    $moduleHostConfigPathCount = 0
+    foreach ($argument in $Descriptor.launch.argv) {
+        if ($argument -is [System.Collections.IDictionary] -and
+            $argument.Contains('kind') -and
+            [string] $argument.kind -ceq 'module_host_config_path') {
+            $moduleHostConfigPathCount++
+        }
+    }
+    if ($moduleHostConfigPathCount -gt 1) {
+        throw 'launch.argv may contain at most one supervisor-generated module host config path.'
+    }
     $launchBytes = 0
     for ($index = 0; $index -lt $Descriptor.launch.argv.Count; $index++) {
         $argument = $Descriptor.launch.argv[$index]
-        Assert-LaunchValue -Value $argument -Field "launch.argv[$index]"
-        $launchBytes += [System.Text.Encoding]::UTF8.GetByteCount([string] $argument.value)
+        Assert-LaunchValue -Value $argument -Field "launch.argv[$index]" -AllowModuleHostConfigPath $true
+        if ($argument.kind -eq 'module_host_config_path') {
+            $launchBytes += 4096
+        }
+        else {
+            $launchBytes += [System.Text.Encoding]::UTF8.GetByteCount([string] $argument.value)
+        }
         if ($argument.kind -eq 'literal' -and ([string] $argument.value) -match '(?i)\A--?(token|secret|password|credential|api[-_]?key)(=|\z)') {
             throw 'Secret-bearing argv literals must use a protected reference.'
         }
@@ -360,6 +421,9 @@ function Assert-DescriptorTemplate {
     }
     if ($Descriptor.Contains('workspace_option') -and $null -ne $Descriptor.workspace_option) {
         Assert-WorkspaceOption -Value $Descriptor.workspace_option
+    }
+    if ($Descriptor.Contains('pre_input_open') -and $null -ne $Descriptor.pre_input_open) {
+        Assert-PreInputOpen -Value $Descriptor.pre_input_open
     }
 
     foreach ($capability in $Descriptor.capabilities) {

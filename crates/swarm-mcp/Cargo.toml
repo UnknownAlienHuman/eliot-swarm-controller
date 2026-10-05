@@ -1,0 +1,28 @@
+[package]
+name = "swarm-mcp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+publish = false
+description = "Independent MCP frontend for the local Eliot Swarm host"
+
+[lib]
+name = "swarm_mcp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "swarm-mcp"
+path = "src/main.rs"
+
+[dependencies]
+base64 = "=0.22.1"
+clap = { version = "4.5", features = ["derive"] }
+rmcp = { version = "=3.5.0", default-features = false, features = ["server", "transport-io"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+swarm-client = { path = "../swarm-client" }
+swarm-contracts = { path = "../swarm-contracts" }
+tokio = { version = "1", features = ["rt", "macros", "io-util", "sync", "time"] }
+toml = "0.9"
+uuid = { version = "1", features = ["v4"] }

@@ -22,6 +22,8 @@ pub enum InterpreterKind {
 #[serde(rename_all = "snake_case")]
 pub enum ScriptControllerEffect {
     TaskOwnerMessage,
+    ManagerNotification,
+    TaskCreate,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]

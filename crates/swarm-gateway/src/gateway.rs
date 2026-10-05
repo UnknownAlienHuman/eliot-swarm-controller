@@ -6,12 +6,7 @@
 //! credential checks remain authoritative; HTTP metadata never selects an
 //! identity or profile.
 
-use crate::{
-    config::{Config, McpToolProfile},
-    error::{Error, Result},
-    mcp,
-    model::Credential,
-};
+use crate::config::{Config, MAX_GATEWAY_BODY_BYTES};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::{
@@ -26,6 +21,11 @@ use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
 use std::{convert::Infallible, future::poll_fn, net::SocketAddr, sync::Arc, time::Duration};
+use swarm_contracts::{
+    Credential,
+    error::{Error, Result},
+};
+use swarm_mcp::config::McpToolProfile;
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::Semaphore,
@@ -36,7 +36,6 @@ use tokio_util::sync::CancellationToken;
 use tower_service::Service;
 
 const MCP_PATH: &str = "/mcp";
-const MAX_GATEWAY_BODY_BYTES: usize = 1_048_576;
 const MIN_BEARER_TOKEN_BYTES: usize = 32;
 const MAX_BEARER_TOKEN_BYTES: usize = 512;
 const MAX_HTTP_HEADER_BYTES: usize = 16 * 1024;
@@ -75,7 +74,7 @@ pub async fn run(config: Config, credential: Credential, bearer_token: String) -
     }
     if config.gateway.max_body_bytes < 1024
         || config.gateway.max_body_bytes > MAX_GATEWAY_BODY_BYTES
-        || config.gateway.max_body_bytes > config.ipc.max_frame_bytes
+        || config.gateway.max_body_bytes > config.frontend.ipc.max_frame_bytes
         || !(1..=300).contains(&config.gateway.request_timeout_seconds)
     {
         return Err(Error::new(
@@ -87,6 +86,7 @@ pub async fn run(config: Config, credential: Credential, bearer_token: String) -
 
     let profile_name = config.gateway.profile.clone();
     let profile = config
+        .frontend
         .mcp
         .selected_tool_profile(Some(&profile_name), &credential.client_id)?;
     if profile == McpToolProfile::Full {
@@ -97,8 +97,8 @@ pub async fn run(config: Config, credential: Credential, bearer_token: String) -
     }
 
     // Validate the fixed credential/profile binding before opening the socket.
-    drop(mcp::profiled_facade(
-        &config,
+    drop(swarm_mcp::profiled_facade(
+        &config.frontend,
         credential.clone(),
         Some(&profile_name),
     )?);
@@ -113,11 +113,11 @@ pub async fn run(config: Config, credential: Credential, bearer_token: String) -
     let bearer_token: Arc<[u8]> = Arc::from(bearer_token.into_bytes());
     let shutdown = CancellationToken::new();
 
-    let factory_config = config.clone();
+    let factory_config = config.frontend.clone();
     let factory_credential = credential;
     let factory_profile = profile_name;
     let service_factory = move || {
-        mcp::profiled_facade(
+        swarm_mcp::profiled_facade(
             &factory_config,
             factory_credential.clone(),
             Some(&factory_profile),
@@ -191,7 +191,7 @@ pub async fn run(config: Config, credential: Credential, bearer_token: String) -
 
 async fn serve_connection(
     stream: TcpStream,
-    mcp_service: StreamableHttpService<mcp::ProfiledFacade, LocalSessionManager>,
+    mcp_service: StreamableHttpService<swarm_mcp::ProfiledFacade, LocalSessionManager>,
     bearer_token: Arc<[u8]>,
     request_timeout: Duration,
 ) {

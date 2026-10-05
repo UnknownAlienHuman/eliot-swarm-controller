@@ -241,7 +241,9 @@ fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
 
 /// A host-validated binding-specific configuration value set. Config schema
 /// validation remains with the host admission path; this type preserves the
-/// literal/protected-reference split through process construction.
+/// literal/protected-reference split through process construction. Typed
+/// module host config paths are forbidden here because these values become
+/// environment entries, while the marker is valid only in descriptor argv.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BindingLaunchConfig {
@@ -253,6 +255,11 @@ impl BindingLaunchConfig {
     pub fn validate(&self) -> Result<()> {
         for (key, value) in &self.values {
             validate_environment_name(key)?;
+            if matches!(value, LaunchValue::ModuleHostConfigPath { .. }) {
+                return Err(Error::invalid(
+                    "module host config path markers are valid only in descriptor argv",
+                ));
+            }
             validate_launch_value(value)?;
         }
         Ok(())
@@ -628,5 +635,9 @@ pub(crate) fn validate_launch_value(value: &LaunchValue) -> Result<()> {
             Err(Error::invalid("protected launch reference is invalid"))
         }
         LaunchValue::Protected(_) => Ok(()),
+        LaunchValue::ModuleHostConfigPath { schema_version: 1 } => Ok(()),
+        LaunchValue::ModuleHostConfigPath { .. } => Err(Error::invalid(
+            "module host config path schema is unsupported",
+        )),
     }
 }

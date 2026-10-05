@@ -3,13 +3,17 @@ on:
   workflow_dispatch:
     inputs:
       package:
-        description: Select one exact approved package and its single binary target; host package is release-only.
+        description: Select one exact package coordinate; host and frontend packages are release-only.
         type: choice
         options:
           - swarm-adapter-codex
           - swarm-adapter-command
+          - swarm-adapter-claude
           - swarm-antigravity-adapter
           - swarm-adapter-opencode
+          - swarm-mcp
+          - swarm-cli
+          - swarm-gateway
           - swarm-process
           - swarm-script-worker
           - swarm-observer
@@ -19,7 +23,7 @@ on:
           - eliot-swarm-controller
         required: true
       profile:
-        description: Workspace build profile for the selected package.
+        description: Module packages support iterate/release; host and frontend packages are release-only.
         type: choice
         options:
           - iterate
@@ -30,7 +34,7 @@ permissions:
   contents: read
 jobs:
   package:
-    name: Build one selected Windows module package
+    name: Build one selected Windows package
     runs-on: windows-latest
     timeout-minutes: 90
     steps:
@@ -49,20 +53,24 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo --version --verbose
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Resolve one package from Cargo metadata and build only its binaries
+      - name: Resolve one explicit package coordinate and build its binary
         shell: pwsh
         env:
           MODULE_PACKAGE: ${{ inputs.package }}
           MODULE_PROFILE: ${{ inputs.profile }}
         run: |
-          $modulePackages = @(
-            'swarm-adapter-codex', 'swarm-adapter-command',
-            'swarm-antigravity-adapter', 'swarm-adapter-opencode',
-            'swarm-process', 'swarm-script-worker', 'swarm-observer',
-            'swarm-checks', 'swarm-forge-worker', 'swarm-bus'
-          )
+          $modulePolicy = Get-Content -Raw 'tools/ci/module-package-policy.json' | ConvertFrom-Json -AsHashtable
+          if ($modulePolicy.schema_version -ne 2 -or $modulePolicy.format -cne 'eliot.module_build_policy.v2') {
+            throw 'Unsupported module package policy in the selected source revision.'
+          }
           $hostPackage = 'eliot-swarm-controller'
-          if ($env:MODULE_PACKAGE -cnotin ($modulePackages + $hostPackage)) {
+          $modulePackages = @(
+            $modulePolicy.approved_package_coordinates |
+              Where-Object { [string]$_.package_name -cne $hostPackage } |
+              ForEach-Object { [string]$_.package_name }
+          )
+          $frontendPackages = @('swarm-mcp', 'swarm-cli', 'swarm-gateway')
+          if ($env:MODULE_PACKAGE -cnotin ($modulePackages + $frontendPackages + $hostPackage)) {
             throw 'Choose exactly one package from the declared workflow input list.'
           }
           $sharedTargetDir = Join-Path $env:RUNNER_TEMP 'eliot-module-shared-target'
@@ -73,7 +81,14 @@ jobs:
           if (Test-Path -LiteralPath $artifactDir) {
             throw 'The selected package output directory must be fresh.'
           }
-          if ($env:MODULE_PACKAGE -ceq $hostPackage) {
+          if ($env:MODULE_PACKAGE -cin $frontendPackages) {
+            if ($env:MODULE_PROFILE -cne 'release') {
+              throw 'Frontend provenance packages are release-only.'
+            }
+            & pwsh -NoProfile -File 'tools/ci/Build-SwarmFrontendProvenance.ps1' `
+              -Package $env:MODULE_PACKAGE -TargetDir $sharedTargetDir -OutputDir $artifactDir
+          }
+          elseif ($env:MODULE_PACKAGE -ceq $hostPackage) {
             if ($env:MODULE_PROFILE -cne 'release') {
               throw 'The host provenance package is release-only.'
             }
@@ -88,7 +103,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: module-${{ inputs.package }}-${{ inputs.profile }}-${{ github.sha }}
+          name: package-${{ inputs.package }}-${{ inputs.profile }}-${{ github.sha }}
           path: ${{ runner.temp }}/eliot-module-package/
           if-no-files-found: error
           retention-days: 14

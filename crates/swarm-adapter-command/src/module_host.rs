@@ -132,18 +132,30 @@ fn optional_env(name: &str) -> Result<Option<String>> {
 }
 
 fn command_capabilities_match(claim: &ModuleContractClaim) -> bool {
-    const EXPECTED: [&str; 4] = [
+    const V2: [&str; 4] = [
         "agent.open",
         "agent.reconcile",
         "agent.refresh",
         "task.dispatch",
     ];
-    claim.capabilities.len() == EXPECTED.len()
+    const V3: [&str; 5] = [
+        "agent.open",
+        "agent.reconcile",
+        "agent.refresh",
+        "agent.result",
+        "task.dispatch",
+    ];
+    let expected: &[&str] = match claim.artifact.version.as_str() {
+        "2" => &V2,
+        "3" => &V3,
+        _ => return false,
+    };
+    claim.capabilities.len() == expected.len()
         && claim
             .capabilities
             .iter()
-            .zip(EXPECTED)
-            .all(|(actual, expected)| actual.as_str() == expected)
+            .zip(expected)
+            .all(|(actual, expected)| actual.as_str() == *expected)
 }
 
 fn schemas_match(claim: &ModuleContractClaim) -> bool {

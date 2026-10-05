@@ -59,6 +59,7 @@ pub fn template() -> Result<ModuleContractTemplate> {
             native_options_pointer: "/workspaceRoot".to_owned(),
             semantics: WorkspaceOptionSemantics::ReplaceWithAdmittedAbsoluteWorkspace,
         }),
+        pre_input_open: None,
         command_schemas: BTreeSet::from([runtime_command_schema()]),
         event_schemas: BTreeSet::from([runtime_outcome_schema()]),
     })

@@ -172,6 +172,12 @@ async fn run_until(
     let module_supervisor_handle = optional_module_supervisor
         .as_ref()
         .map(|actor| actor.handle.clone());
+    let optional_bus_supervisor = crate::host_bus_supervisor::spawn_isolated_managed_bus_supervisor(
+        owner.store.clone(),
+        root_path.clone(),
+        config.bus_supervisor.clone(),
+        stopping.clone(),
+    );
     let mut supervisors: JoinSet<(&'static str, Result<()>)> = JoinSet::new();
     // A JoinError contains the task ID but no output label; retain only each
     // fixed supervisor name so a panic can be attributed without its payload.
@@ -232,6 +238,9 @@ async fn run_until(
     if let Some(actor) = optional_module_supervisor {
         actor.join().await;
     }
+    if let Some(actor) = optional_bus_supervisor {
+        actor.join().await;
+    }
     // Await host-owned workers. Dropping the IPC caller or beginning shutdown
     // must not detach or replay an already admitted external publication.
     while let Some(result) = supervisors.join_next_with_id().await {
@@ -257,6 +266,12 @@ async fn run_until(
             }
         }
     }
+    if let Some(error_code) = kernel_admission_error_code(owner.store.kernel_snapshot()) {
+        eprintln!("host kernel admission: {error_code}");
+        if exit.is_ok() {
+            exit = Err(Error::new(error_code, "kernel durable admission is closed"));
+        }
+    }
     if let Err(error) = owner
         .store
         .record_host_exit(
@@ -280,6 +295,24 @@ async fn run_until(
     }
     report_observer_shutdown(&observer, Some(producer_stats), producer_drained);
     exit
+}
+
+fn kernel_admission_error_code(snapshot: swarm_kernel::KernelHostSnapshot) -> Option<&'static str> {
+    match snapshot.admission {
+        swarm_kernel::KernelAdmissionState::Closed { fault } => Some(match fault {
+            swarm_kernel::KernelAdmissionFault::InitializationFailed => {
+                "KERNEL_INITIALIZATION_FAILED"
+            }
+            swarm_kernel::KernelAdmissionFault::StoreUnavailable => "KERNEL_STORE_UNAVAILABLE",
+            swarm_kernel::KernelAdmissionFault::DurableJournalUnavailable => {
+                "KERNEL_JOURNAL_UNAVAILABLE"
+            }
+            swarm_kernel::KernelAdmissionFault::ShuttingDown => "KERNEL_SHUTTING_DOWN",
+        }),
+        swarm_kernel::KernelAdmissionState::Starting | swarm_kernel::KernelAdmissionState::Open => {
+            None
+        }
+    }
 }
 
 fn cleanup_host_image_receipt(

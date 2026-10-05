@@ -1,360 +1,22 @@
-use super::subscriptions::Category;
-use super::*;
+//! Real Store/IPC authorization tests through the extracted MCP facade.
+
 use crate::{
-    config::{McpConfig, McpProfileConfig},
-    ipc,
+    config::{Config, McpToolProfile},
+    error::Result,
+    ipc, model,
     platform::{DataRoot, bootstrap_credential},
     store::StoreOwner,
 };
+use rmcp::ServiceExt;
+use serde_json::{Value, json};
 use std::{path::PathBuf, sync::Arc, time::Duration};
+use swarm_mcp::config::{McpConfig, McpProfileConfig, Storage};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream},
     sync::watch,
 };
 
-#[test]
-fn profile_tables_are_closed_and_keep_gm_authority_separate() {
-    let expected_observer: std::collections::BTreeSet<&str> = [
-        "swarm.tools.search",
-        "swarm.dashboard",
-        "host.status",
-        "task.get",
-        "task.list",
-        "task.submission",
-        "task.acceptance",
-        "attempt.get",
-        "operation.get",
-        "operation.list",
-        "agent.state",
-        "agent.list",
-        "agent.family",
-        "check.get",
-        "check.profiles",
-        "artifact.get",
-        "artifact.read",
-        "artifact.parts",
-        "report.delta",
-        "report.attention",
-        "report.capacity",
-        "message.read",
-    ]
-    .into_iter()
-    .collect();
-    let actual_observer: std::collections::BTreeSet<&str> = TOOLS
-        .iter()
-        .filter(|(_, spec)| profiles::allows_method(McpToolProfile::Observer, spec.method))
-        .map(|(_, spec)| spec.method)
-        .collect();
-    assert_eq!(actual_observer, expected_observer);
-    for method in &actual_observer {
-        assert!(find_tool(&tool_name(method)).unwrap().0, "{method}");
-    }
-
-    for (_, spec) in TOOLS.iter().filter(|(read_only, _)| !*read_only) {
-        assert!(
-            !profiles::allows_method(McpToolProfile::Observer, spec.method),
-            "observer unexpectedly exposes mutation {}",
-            spec.method
-        );
-    }
-    assert!(profiles::allows_method(
-        McpToolProfile::Reviewer,
-        "task.request_changes"
-    ));
-    assert!(!profiles::allows_method(
-        McpToolProfile::Reviewer,
-        "task.accept"
-    ));
-    assert!(profiles::allows_method(
-        McpToolProfile::Manager,
-        "message.cancel"
-    ));
-    assert!(profiles::allows_method(
-        McpToolProfile::Manager,
-        "schedule.run_now"
-    ));
-    assert!(profiles::allows_method(
-        McpToolProfile::Gm,
-        "schedule.run_now"
-    ));
-    for profile in [
-        McpToolProfile::Observer,
-        McpToolProfile::Reviewer,
-        McpToolProfile::Participant,
-    ] {
-        assert!(!profiles::allows_method(profile, "schedule.run_now"));
-    }
-    assert!(profiles::allows_method(
-        McpToolProfile::Manager,
-        "agent.background"
-    ));
-    assert!(profiles::allows_method(
-        McpToolProfile::Manager,
-        "swarm.launch.preview"
-    ));
-    assert!(profiles::allows_method(
-        McpToolProfile::Manager,
-        "swarm.launch"
-    ));
-    assert!(profiles::allows_method(
-        McpToolProfile::Manager,
-        "coordination.watch.create"
-    ));
-    assert!(profiles::allows_method(
-        McpToolProfile::Manager,
-        "github.effect.managed_label"
-    ));
-    assert!(profiles::allows_method(
-        McpToolProfile::Gm,
-        "github.effect.managed_label"
-    ));
-    assert!(profiles::allows_method(
-        McpToolProfile::Gm,
-        "github.effect.reconcile_managed_label"
-    ));
-    for profile in [
-        McpToolProfile::Manager,
-        McpToolProfile::Observer,
-        McpToolProfile::Reviewer,
-        McpToolProfile::Participant,
-        McpToolProfile::AssignedReviewer,
-    ] {
-        assert!(
-            !profiles::allows_method(profile, "github.effect.reconcile_managed_label"),
-            "{profile:?} must not expose the GM-only effect recovery method"
-        );
-    }
-    assert!(profiles::allows_method(
-        McpToolProfile::Manager,
-        "github.pull_request.update_description"
-    ));
-    assert!(profiles::allows_method(
-        McpToolProfile::Gm,
-        "github.pull_request.update_description"
-    ));
-    assert!(profiles::allows_method(
-        McpToolProfile::Manager,
-        "github.pull_request.reconcile_description"
-    ));
-    assert!(profiles::allows_method(
-        McpToolProfile::Gm,
-        "github.pull_request.reconcile_description"
-    ));
-    for profile in [
-        McpToolProfile::Observer,
-        McpToolProfile::Reviewer,
-        McpToolProfile::Participant,
-        McpToolProfile::AssignedReviewer,
-    ] {
-        assert!(
-            !profiles::allows_method(profile, "github.effect.managed_label"),
-            "{profile:?} must not expose a GitHub write effect"
-        );
-        assert!(
-            !profiles::allows_method(profile, "github.pull_request.update_description"),
-            "{profile:?} must not expose a GitHub pull-request write effect"
-        );
-        assert!(
-            !profiles::allows_method(profile, "github.pull_request.reconcile_description"),
-            "{profile:?} must not expose a GitHub pull-request reconciliation effect"
-        );
-    }
-    assert!(profiles::allows_method(
-        McpToolProfile::Manager,
-        "swarm.overlap.check"
-    ));
-    assert!(!profiles::allows_method(
-        McpToolProfile::Manager,
-        "coordination.sync_integration"
-    ));
-    assert!(!profiles::allows_method(
-        McpToolProfile::Manager,
-        "client.register"
-    ));
-    assert!(!profiles::allows_method(
-        McpToolProfile::Manager,
-        "host.mode"
-    ));
-    assert!(profiles::allows_method(McpToolProfile::Gm, "gm.handover"));
-    assert!(profiles::allows_method(
-        McpToolProfile::Gm,
-        "automation.config.get"
-    ));
-    assert!(profiles::allows_method(
-        McpToolProfile::Gm,
-        "automation.config.explain"
-    ));
-    assert!(profiles::allows_method(
-        McpToolProfile::Gm,
-        "automation.config.transfer"
-    ));
-    assert!(!profiles::allows_method(
-        McpToolProfile::Gm,
-        "automation.config.apply"
-    ));
-    assert!(profiles::allows_method(
-        McpToolProfile::Participant,
-        "coordination.work_card.publish"
-    ));
-    assert!(profiles::allows_method(
-        McpToolProfile::Participant,
-        "coordination.consult"
-    ));
-    assert!(profiles::allows_method(
-        McpToolProfile::Participant,
-        "coordination.sync_integration"
-    ));
-    assert!(profiles::allows_method(
-        McpToolProfile::Participant,
-        "swarm.overlap.check"
-    ));
-    assert!(profiles::allows_method(
-        McpToolProfile::Participant,
-        "coordination.watch.create"
-    ));
-    assert!(profiles::allows_method(
-        McpToolProfile::Participant,
-        "coordination.watch.list"
-    ));
-    assert!(!profiles::allows_method(
-        McpToolProfile::Participant,
-        "task.get"
-    ));
-    assert!(!profiles::allows_method(
-        McpToolProfile::Participant,
-        "swarm.launch"
-    ));
-    assert!(!profiles::allows_method(
-        McpToolProfile::Participant,
-        "coordination.participant.list"
-    ));
-    assert!(profiles::allows_method(
-        McpToolProfile::AssignedReviewer,
-        "review.submit"
-    ));
-    assert!(!profiles::allows_method(
-        McpToolProfile::AssignedReviewer,
-        "task.get"
-    ));
-    assert!(!profiles::allows_method(
-        McpToolProfile::AssignedReviewer,
-        "task.request_changes"
-    ));
-    assert!(!profiles::allows_method(
-        McpToolProfile::AssignedReviewer,
-        "coordination.consult"
-    ));
-    assert!(!profiles::allows_method(
-        McpToolProfile::AssignedReviewer,
-        "coordination.watch.create"
-    ));
-    assert!(!profiles::allows_method(
-        McpToolProfile::AssignedReviewer,
-        "swarm.launch"
-    ));
-    assert!(!profiles::allows_method(
-        McpToolProfile::AssignedReviewer,
-        "coordination.sync_integration"
-    ));
-    assert!(!profiles::allows_method(
-        McpToolProfile::AssignedReviewer,
-        "swarm.overlap.check"
-    ));
-    assert!(profiles::allows_method(
-        McpToolProfile::Gm,
-        "client.register"
-    ));
-    assert!(profiles::allows_method(
-        McpToolProfile::Full,
-        "source.capture"
-    ));
-    assert!(!profiles::allows_method(
-        McpToolProfile::Observer,
-        "not.a.public.method"
-    ));
-    for profile in [
-        McpToolProfile::Observer,
-        McpToolProfile::Reviewer,
-        McpToolProfile::Manager,
-        McpToolProfile::Gm,
-        McpToolProfile::Full,
-    ] {
-        assert!(profiles::allows_subscription_category(
-            profile,
-            Category::Reports
-        ));
-        assert!(profiles::allows_subscription_category(
-            profile,
-            Category::Mailbox
-        ));
-        assert!(profiles::allows_subscription_category(
-            profile,
-            Category::Operations
-        ));
-    }
-}
-
-#[test]
-fn local_profile_binding_is_explicit_and_restricted_principals_are_distinct() {
-    let config = McpConfig::default();
-    config.validate().unwrap();
-    assert_eq!(
-        config.selected_tool_profile(None, "operator").unwrap(),
-        McpToolProfile::Observer
-    );
-    assert_eq!(
-        config
-            .selected_tool_profile(Some("local-full"), "operator")
-            .unwrap(),
-        McpToolProfile::Full
-    );
-    assert_eq!(
-        config
-            .selected_tool_profile(Some("local-full"), "another-client")
-            .unwrap_err()
-            .code,
-        "PROFILE_MISMATCH"
-    );
-
-    let mut duplicated = McpConfig::default();
-    duplicated.profiles.insert(
-        "dot-observer".into(),
-        McpProfileConfig {
-            tool_profile: McpToolProfile::Observer,
-            expected_client_id: "same-principal".into(),
-            surface: None,
-            deferred_groups: Vec::new(),
-            manual_tools: Vec::new(),
-        },
-    );
-    duplicated.profiles.insert(
-        "muse-observer".into(),
-        McpProfileConfig {
-            tool_profile: McpToolProfile::Observer,
-            expected_client_id: "same-principal".into(),
-            surface: None,
-            deferred_groups: Vec::new(),
-            manual_tools: Vec::new(),
-        },
-    );
-    assert_eq!(duplicated.validate().unwrap_err().code, "CONFIG_ERROR");
-}
-
-#[test]
-fn application_error_projection_preserves_stale_and_digest_failures() {
-    for (code, message) in [
-        ("STALE_REVISION", "expected revision is no longer current"),
-        ("DIGEST_MISMATCH", "payload digest does not match"),
-        ("UNSUPPORTED_RUNTIME", "runtime operation is unavailable"),
-    ] {
-        let result = tool_error(crate::error::Error::new(code, message));
-        assert_eq!(result.is_error, Some(true));
-        let text = result.content[0].as_text().unwrap().text.as_str();
-        let payload: Value = serde_json::from_str(text).unwrap();
-        assert_eq!(payload["error"]["code"], json!(code));
-        assert_eq!(payload["error"]["message"], json!(message));
-    }
-}
+use super::public_facade;
 
 struct ProfileClient {
     reader: BufReader<tokio::io::ReadHalf<DuplexStream>>,
@@ -364,7 +26,7 @@ struct ProfileClient {
 }
 
 impl ProfileClient {
-    async fn connect(facade: ProfiledFacade, tasks: bool) -> Self {
+    async fn connect(facade: swarm_mcp::ProfiledFacade, tasks: bool) -> Self {
         let (server_io, client_io) = tokio::io::duplex(256 * 1024);
         let (server_read, server_write) = tokio::io::split(server_io);
         let server = tokio::spawn(async move {
@@ -451,27 +113,14 @@ impl ProfileClient {
     }
 }
 
-fn test_facade(profile: McpToolProfile, root: PathBuf) -> ProfiledFacade {
-    let credential = Credential {
-        client_id: "profile-test".into(),
-        token: "not-used-before-profile-gate".into(),
-    };
-    ProfiledFacade::new(
-        McpFacade::new(root, credential, Arc::new(Config::default().ipc)),
-        profile,
-    )
-}
-
 #[tokio::test]
 async fn observer_hides_mutation_and_rejects_manual_tool_and_task_cancel_before_ipc() {
     let host = start_manager_host().await;
     let operator_credential = bootstrap_credential(&host.dir).unwrap();
-    let facade = ProfiledFacade::new(
-        McpFacade::new(
-            host.dir.clone(),
-            operator_credential,
-            Arc::new(Config::default().ipc),
-        ),
+    let facade = public_facade(
+        host.dir.clone(),
+        operator_credential,
+        Config::default().ipc,
         McpToolProfile::Observer,
     );
     let mut client = ProfileClient::connect(facade, true).await;
@@ -488,7 +137,6 @@ async fn observer_hides_mutation_and_rejects_manual_tool_and_task_cancel_before_
             .iter()
             .any(|tool| tool["name"] == json!("operation_get"))
     );
-    assert!(tools.len() <= catalog::MAX_PAGE_ITEMS);
     assert!(
         tools
             .iter()
@@ -525,12 +173,10 @@ async fn observer_hides_mutation_and_rejects_manual_tool_and_task_cancel_before_
 async fn restricted_mutations_require_caller_ids_before_ipc() {
     let host = start_manager_host().await;
     let mut manager = ProfileClient::connect(
-        ProfiledFacade::new(
-            McpFacade::new(
-                host.dir.clone(),
-                host.manager_credential.clone(),
-                Arc::new(Config::default().ipc),
-            ),
+        public_facade(
+            host.dir.clone(),
+            host.manager_credential.clone(),
+            Config::default().ipc,
             McpToolProfile::Manager,
         ),
         true,
@@ -572,12 +218,10 @@ async fn restricted_mutations_require_caller_ids_before_ipc() {
     manager.close().await;
 
     let mut full = ProfileClient::connect(
-        ProfiledFacade::new(
-            McpFacade::new(
-                host.dir.clone(),
-                host.manager_credential.clone(),
-                Arc::new(Config::default().ipc),
-            ),
+        public_facade(
+            host.dir.clone(),
+            host.manager_credential.clone(),
+            Config::default().ipc,
             McpToolProfile::Full,
         ),
         false,
@@ -691,12 +335,10 @@ impl ManagerHost {
 async fn gm_profile_does_not_elevate_a_manager_credential() {
     let host = start_manager_host().await;
     let mut client = ProfileClient::connect(
-        ProfiledFacade::new(
-            McpFacade::new(
-                host.dir.clone(),
-                host.manager_credential.clone(),
-                Arc::new(Config::default().ipc),
-            ),
+        public_facade(
+            host.dir.clone(),
+            host.manager_credential.clone(),
+            Config::default().ipc,
             McpToolProfile::Gm,
         ),
         false,

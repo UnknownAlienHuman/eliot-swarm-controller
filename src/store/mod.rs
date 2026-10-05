@@ -19,6 +19,7 @@ mod c33_restart_diagnosis_fixture;
 mod c34_workspace_start_diagnosis_fixture;
 pub(crate) mod capacity;
 mod checks;
+mod command_results;
 mod coordination;
 mod coordination_watch;
 mod forge;
@@ -109,9 +110,11 @@ const APPLICATION_ID: i64 = 0x45534331;
 const LOCAL_OPERATOR_CLIENT_ID_KEY: &str = "local_operator_client_id";
 type RunJob = Box<dyn FnOnce(&mut Connection) + Send>;
 type Job = swarm_kernel::WriterJob<RunJob, message_batch::Request>;
+type KernelHost = swarm_kernel::KernelHost<RunJob, message_batch::Request, Error>;
+type KernelHostHandle = swarm_kernel::KernelHostHandle<RunJob, message_batch::Request>;
 #[derive(Clone)]
 pub struct Store {
-    tx: swarm_kernel::WriterSender<RunJob, message_batch::Request>,
+    kernel: KernelHostHandle,
     status_reader: status_reader::Sender,
     config: Arc<Config>,
     changed: watch::Sender<u64>,
@@ -121,7 +124,7 @@ pub struct Store {
     telemetry: swarm_telemetry::Producer,
 }
 pub struct StoreOwner {
-    thread: JoinHandle<()>,
+    kernel: KernelHost,
     status_thread: JoinHandle<()>,
     module_supervisor_credential: Credential,
     pub store: Store,
@@ -162,30 +165,29 @@ impl StoreOwner {
         let writer_root = root.path.clone();
         let writer_lock = root.lock;
         let writer_config = config.clone();
-        let swarm_kernel::WriterActor {
-            sender: tx,
-            thread,
-            ready: ready_rx,
-        } = swarm_kernel::spawn_writer_actor(
-            "swarm-store",
-            config.storage.queue_capacity,
-            message_batch::MAX_BATCH_SIZE,
+        let mut kernel = swarm_kernel::spawn_kernel_host(
+            swarm_kernel::KernelHostConfig {
+                queue_capacity: config.storage.queue_capacity,
+                batch_capacity: message_batch::MAX_BATCH_SIZE,
+            },
             writer_lock,
             move || open_database(&writer_root, &credential, &writer_supervisor_credential),
             |db, job: RunJob| job(db),
             move |db, batch| message_batch::process(db, batch, &writer_config),
-        )?;
-        match ready_rx.await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                join_store_thread(thread, "database owner").await?;
+        )
+        .map_err(map_kernel_spawn_error)?;
+        match kernel.wait_ready().await {
+            Ok(()) => {}
+            Err(swarm_kernel::KernelHostReadyError::Initialization(error)) => {
+                join_kernel_host(kernel, "database owner").await?;
                 return Err(error);
             }
             Err(_) => {
-                join_store_thread(thread, "database owner").await?;
+                join_kernel_host(kernel, "database owner").await?;
                 return Err(Error::new("STORE_CLOSED", "initialization thread ended"));
             }
         }
+        let kernel_handle = kernel.handle();
         let (status_reader, status_thread) = match status_reader::start(
             data_dir.join("swarm.db"),
             config.storage.queue_capacity,
@@ -195,17 +197,17 @@ impl StoreOwner {
         {
             Ok(reader) => reader,
             Err(error) => {
-                drop(tx);
-                join_store_thread(thread, "database owner").await?;
+                drop(kernel_handle);
+                join_kernel_host(kernel, "database owner").await?;
                 return Err(error);
             }
         };
         Ok(Self {
-            thread,
+            kernel,
             status_thread,
             module_supervisor_credential,
             store: Store {
-                tx,
+                kernel: kernel_handle,
                 status_reader,
                 config,
                 changed: watch::channel(0).0,
@@ -221,13 +223,18 @@ impl StoreOwner {
     }
     pub async fn close(self) -> Result<()> {
         let StoreOwner {
-            thread,
+            kernel,
             status_thread,
             module_supervisor_credential: _,
             store,
         } = self;
+        kernel.close_admission(swarm_kernel::KernelAdmissionFault::ShuttingDown);
+        let status_shutdown = store.status_reader.shutdown().await;
         drop(store);
-        join_store_threads(status_thread, thread).await
+        // Join both owners even if the reader already failed. Retained Store
+        // handles must not keep an idle reader or writer alive after close.
+        join_store_threads(status_thread, kernel).await?;
+        status_shutdown
     }
 
     /// Return this host's credential for the trusted local module supervisor.
@@ -237,12 +244,9 @@ impl StoreOwner {
         self.module_supervisor_credential.clone()
     }
 }
-async fn join_store_threads(
-    status_thread: JoinHandle<()>,
-    database_thread: JoinHandle<()>,
-) -> Result<()> {
+async fn join_store_threads(status_thread: JoinHandle<()>, kernel: KernelHost) -> Result<()> {
     let status_result = join_store_thread(status_thread, "status reader").await;
-    let database_result = join_store_thread(database_thread, "database owner").await;
+    let database_result = join_kernel_host(kernel, "database owner").await;
     status_result?;
     database_result
 }
@@ -252,6 +256,89 @@ async fn join_store_thread(thread: JoinHandle<()>, name: &'static str) -> Result
         .map_err(|error| Error::new("STORE_CLOSED", format!("{name} join failed: {error}")))?
         .map_err(|_| Error::new("STORE_PANIC", format!("{name} panicked")))
 }
+
+async fn join_kernel_host(kernel: KernelHost, name: &'static str) -> Result<()> {
+    tokio::task::spawn_blocking(move || kernel.join())
+        .await
+        .map_err(|error| Error::new("STORE_CLOSED", format!("{name} join failed: {error}")))?
+        .map_err(|_| Error::new("STORE_PANIC", format!("{name} panicked")))
+}
+
+fn map_kernel_spawn_error(error: swarm_kernel::KernelHostSpawnError) -> Error {
+    match error {
+        swarm_kernel::KernelHostSpawnError::InvalidConfig(error) => {
+            Error::new("STORE_CONFIG", error.to_string())
+        }
+        swarm_kernel::KernelHostSpawnError::Thread(_) => Error::new(
+            "KERNEL_THREAD_START_FAILED",
+            "kernel writer thread could not start",
+        ),
+    }
+}
+
+fn map_kernel_submit_error(error: swarm_kernel::KernelSubmitError) -> Error {
+    match error {
+        swarm_kernel::KernelSubmitError::NotReady => {
+            Error::new("STORE_NOT_READY", "kernel writer is not ready")
+        }
+        swarm_kernel::KernelSubmitError::AdmissionClosed { fault } => Error::new(
+            kernel_admission_error_code(fault),
+            "kernel durable admission is closed",
+        ),
+        swarm_kernel::KernelSubmitError::WriterClosed => {
+            Error::new("KERNEL_WRITER_CLOSED", "kernel writer stopped")
+        }
+    }
+}
+
+fn kernel_admission_error_code(fault: swarm_kernel::KernelAdmissionFault) -> &'static str {
+    match fault {
+        swarm_kernel::KernelAdmissionFault::InitializationFailed => "KERNEL_INITIALIZATION_FAILED",
+        swarm_kernel::KernelAdmissionFault::StoreUnavailable => "KERNEL_STORE_UNAVAILABLE",
+        swarm_kernel::KernelAdmissionFault::DurableJournalUnavailable => {
+            "KERNEL_JOURNAL_UNAVAILABLE"
+        }
+        swarm_kernel::KernelAdmissionFault::ShuttingDown => "STORE_CLOSED",
+    }
+}
+
+fn kernel_host_status_value(snapshot: swarm_kernel::KernelHostSnapshot) -> Value {
+    let (admission, fault) = match snapshot.admission {
+        swarm_kernel::KernelAdmissionState::Starting => ("starting", None),
+        swarm_kernel::KernelAdmissionState::Open => ("open", None),
+        swarm_kernel::KernelAdmissionState::Closed { fault } => {
+            ("closed", Some(kernel_admission_fault_name(fault)))
+        }
+    };
+    json!({
+        "admission": admission,
+        "fault": fault,
+        "lifecycle": kernel_lifecycle_name(snapshot.lifecycle),
+    })
+}
+
+fn kernel_admission_fault_name(fault: swarm_kernel::KernelAdmissionFault) -> &'static str {
+    match fault {
+        swarm_kernel::KernelAdmissionFault::InitializationFailed => "initialization_failed",
+        swarm_kernel::KernelAdmissionFault::StoreUnavailable => "store_unavailable",
+        swarm_kernel::KernelAdmissionFault::DurableJournalUnavailable => {
+            "durable_journal_unavailable"
+        }
+        swarm_kernel::KernelAdmissionFault::ShuttingDown => "shutting_down",
+    }
+}
+
+fn kernel_lifecycle_name(lifecycle: swarm_kernel::KernelHostLifecycle) -> &'static str {
+    match lifecycle {
+        swarm_kernel::KernelHostLifecycle::Starting => "starting",
+        swarm_kernel::KernelHostLifecycle::Ready => "ready",
+        swarm_kernel::KernelHostLifecycle::AdmissionClosed { .. } => "admission_closed",
+        swarm_kernel::KernelHostLifecycle::Stopping => "stopping",
+        swarm_kernel::KernelHostLifecycle::Stopped => "stopped",
+        swarm_kernel::KernelHostLifecycle::Failed => "failed",
+    }
+}
+
 impl Store {
     /// A periodic durable snapshot covers missed change notifications and restarts.
     pub(crate) fn subscribe_module_demand_changes(&self) -> watch::Receiver<u64> {
@@ -305,6 +392,57 @@ impl Store {
         .await
     }
 
+    /// Demand comes from explicitly managed, durable consumer registrations and
+    /// their exact selected ScriptRun scope. Catalog inspection never starts a worker.
+    pub(crate) async fn managed_bus_service_snapshot(
+        &self,
+    ) -> Result<Vec<bus_kernel::ManagedBusServiceDemand>> {
+        self.run(bus_kernel::managed_service_demands).await
+    }
+
+    pub(crate) fn subscribe_managed_bus_service_changes(&self) -> watch::Receiver<u64> {
+        self.changed.subscribe()
+    }
+
+    pub(crate) async fn record_managed_bus_service_health(
+        &self,
+        scope: swarm_contracts::DeclaredServiceScope,
+        state: String,
+        consecutive_failures: u32,
+        error_code: Option<String>,
+        retry_in_ms: Option<u64>,
+    ) -> Result<()> {
+        self.run(move |db| {
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            bus_kernel::record_managed_service_health(
+                &tx,
+                &scope,
+                &state,
+                consecutive_failures,
+                error_code.as_deref(),
+                retry_in_ms,
+                model::now_ms()?,
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Reserve the durable rolling start slot before spawning the dispatcher.
+    pub(crate) async fn record_managed_bus_service_start(
+        &self,
+        scope: swarm_contracts::DeclaredServiceScope,
+    ) -> Result<()> {
+        self.run(move |db| {
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            bus_kernel::record_managed_service_start(&tx, &scope, model::now_ms()?)?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
     /// Trusted status readback before releasing a stale scope's final demand lease.
     pub(crate) async fn module_scope_readback(
         &self,
@@ -345,10 +483,16 @@ impl Store {
         self.telemetry.stats()
     }
 
+    pub(crate) fn kernel_snapshot(&self) -> swarm_kernel::KernelHostSnapshot {
+        self.kernel.snapshot()
+    }
+
     pub(crate) async fn record_host_start(&self) -> Result<()> {
         self.run(move |db| {
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            host_lifecycle::start(&tx, model::now_ms()?)?;
+            let now_ms = model::now_ms()?;
+            host_lifecycle::start(&tx, now_ms)?;
+            bus_kernel::reset_managed_service_health_for_host_start(&tx, now_ms)?;
             tx.commit()?;
             Ok(())
         })
@@ -824,12 +968,12 @@ impl Store {
         f: impl FnOnce(&mut Connection) -> Result<T> + Send + 'static,
     ) -> Result<T> {
         let (tx, rx) = oneshot::channel();
-        self.tx
-            .send(Job::Run(Box::new(move |db| {
+        self.kernel
+            .submit(Job::Run(Box::new(move |db| {
                 let _ = tx.send(f(db));
             })))
             .await
-            .map_err(|_| Error::new("STORE_CLOSED", "database owner stopped"))?;
+            .map_err(map_kernel_submit_error)?;
         rx.await
             .map_err(|_| Error::new("STORE_CLOSED", "database operation lost its response"))?
     }
@@ -840,15 +984,15 @@ impl Store {
         params: Value,
     ) -> Result<Value> {
         let (response, receive) = oneshot::channel();
-        self.tx
-            .send(Job::Batch(message_batch::Request {
+        self.kernel
+            .submit(Job::Batch(message_batch::Request {
                 principal,
                 method,
                 params,
                 response,
             }))
             .await
-            .map_err(|_| Error::new("STORE_CLOSED", "database owner stopped"))?;
+            .map_err(map_kernel_submit_error)?;
         receive
             .await
             .map_err(|_| Error::new("STORE_CLOSED", "database operation lost its response"))?
@@ -908,7 +1052,18 @@ impl Store {
             ));
         }
         if method == "host.status" {
-            return self.status_reader.host_status(principal, params).await;
+            let mut status = self.status_reader.host_status(principal, params).await?;
+            let status_object = status.as_object_mut().ok_or_else(|| {
+                Error::new(
+                    "STORE_STATUS_INVALID",
+                    "host status response is not an object",
+                )
+            })?;
+            status_object.insert(
+                "kernel_host".into(),
+                kernel_host_status_value(self.kernel.snapshot()),
+            );
+            return Ok(status);
         }
         if method.starts_with("script.") {
             return self.script_call(principal, method, params).await;
@@ -1286,8 +1441,15 @@ impl Store {
         let page: ResultPage = serde_json::from_value(params["page"].clone())?;
         let p = principal.clone();
         let source = page.source.clone();
+        let command_status_page = page.source["kind"] == "command_status";
         let mut metadata = self
-            .run(move |db| results::prepare(db, &p, &op, &source))
+            .run(move |db| {
+                if command_status_page {
+                    command_results::prepare(db, &p, &op, &source)
+                } else {
+                    results::prepare(db, &p, &op, &source)
+                }
+            })
             .await?;
         let bytes = page.decode()?;
         if metadata["selector"]["kind"] == "input_status" {
@@ -1334,6 +1496,24 @@ impl Store {
                     "Antigravity status bytes do not match the validated Operation receipt",
                 ));
             }
+        } else if metadata["selector"]["kind"] == "command_status" {
+            let status_bytes = command_results::page_bytes(&page.source)?;
+            let offset = usize::try_from(page.offset_bytes)
+                .map_err(|_| Error::invalid("result offset is too large"))?;
+            let length = usize::try_from(page.byte_length)
+                .map_err(|_| Error::invalid("result length is too large"))?;
+            let end = offset
+                .checked_add(length)
+                .ok_or_else(|| Error::invalid("result byte range overflow"))?;
+            if page.total_bytes != status_bytes.len() as u64
+                || end > status_bytes.len()
+                || bytes.as_slice() != &status_bytes[offset..end]
+            {
+                return Err(Error::new(
+                    "RESULT_PROVENANCE_INVALID",
+                    "Command status bytes do not match the retained terminal Operation receipt",
+                ));
+            }
         }
         if metadata["requested_offset"].as_u64() != Some(page.offset_bytes)
             || page.byte_length > metadata["requested_length"].as_u64().unwrap_or(0)
@@ -1355,8 +1535,15 @@ impl Store {
         let saved = record.clone();
         self.file_io(move |files| files.publish(&saved, &bytes))
             .await?;
+        let command_status_page = record.metadata["selector"]["kind"] == "command_status";
         let result = self
-            .run(move |db| results::record(db, &principal, &record))
+            .run(move |db| {
+                if command_status_page {
+                    command_results::record(db, &principal, &record)
+                } else {
+                    results::record(db, &principal, &record)
+                }
+            })
             .await?;
         self.changed.send_modify(|n| *n = n.wrapping_add(1));
         Ok(result)
@@ -3306,7 +3493,7 @@ fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config
                 |r| r.get(0),
             )?;
             Ok(
-                json!({"version":env!("CARGO_PKG_VERSION"),"controller_id":meta(db,"controller_id")?,"host_epoch":meta(db,"host_epoch")?,"host_lifecycle":host_lifecycle::status(db)?,"gm":gm::record(db)?,"gm_wake_mode":gm::WAKE_MODE,"sqlite":rusqlite::version(),"tasks":tasks,"unreleased_attempts":owners,"queued_operations":queued,"execution_mode":meta(db,"execution_mode")?,"native_modules_connected":db.query_row("SELECT count(*) FROM bindings WHERE released_at_ms IS NULL AND json_extract(state_json, '$.connection')='connected'",[],|r|r.get::<_,i64>(0))?,"native_execution":"scoped_runtime_protocol","schedules":schedules::status(db,&config.schedules,model::now_ms()?)?}),
+                json!({"version":env!("CARGO_PKG_VERSION"),"controller_id":meta(db,"controller_id")?,"host_epoch":meta(db,"host_epoch")?,"host_lifecycle":host_lifecycle::status(db)?,"gm":gm::record(db)?,"gm_wake_mode":gm::WAKE_MODE,"sqlite":rusqlite::version(),"tasks":tasks,"unreleased_attempts":owners,"queued_operations":queued,"execution_mode":meta(db,"execution_mode")?,"native_modules_connected":db.query_row("SELECT count(*) FROM bindings WHERE released_at_ms IS NULL AND json_extract(state_json, '$.connection')='connected'",[],|r|r.get::<_,i64>(0))?,"native_execution":"scoped_runtime_protocol","schedules":schedules::status(db,&config.schedules,model::now_ms()?)?,"managed_bus_services":bus_kernel::managed_health_projection(db)?}),
             )
         }
         "agent.family" => producers::family(db, v),
@@ -3881,13 +4068,13 @@ fn mutate_in_transaction_with_authority(
         context.require_current_for_admission(tx, now)?;
     }
     if let MutationAuthority::ScriptEffect(admission) = &authority {
-        if method != "message.send"
+        if !matches!(method, "message.send" | "task.create")
             || plan.check_plan.is_some()
             || plan.launch_operation_id.is_some()
         {
             return Err(Error::new(
                 "FORBIDDEN",
-                "ScriptRun effect authority permits only its exact Task-owner message",
+                "ScriptRun effect authority permits only its exact message or taskless task.create action",
             ));
         }
         admission.require_current(tx, config, method, v)?;
@@ -4127,10 +4314,18 @@ fn mutate_in_transaction_with_authority(
                 plan,
             },
         ),
-        MutationAuthority::ScriptEffect(admission) => {
-            apply_message_send(tx, admission.effective_manager_id(), v, &id)
-                .map(|value| (value, false))
-        }
+        MutationAuthority::ScriptEffect(admission) => match method {
+            "message.send" => apply_message_send(tx, admission.effective_manager_id(), v, &id)
+                .map(|value| (value, false)),
+            "task.create" => {
+                tasks::create_for_script_effect(tx, admission.project_id(), v, &id, now)
+                    .map(|value| (value, false))
+            }
+            _ => Err(Error::new(
+                "FORBIDDEN",
+                "ScriptRun effect authority cannot dispatch this method",
+            )),
+        },
     };
     let result = result.and_then(|(value, queued)| {
         if let MutationAuthority::ScriptEffect(admission) = &authority {

@@ -11,6 +11,16 @@ use crate::{
 use rusqlite::{Connection, Transaction};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use swarm_contracts::DeclaredServiceScope;
+
+#[path = "bus_service.rs"]
+mod managed_service;
+pub(crate) use managed_service::{
+    ManagedBusServiceDemand, health_projection as managed_health_projection,
+    managed_demands as managed_service_demands, record_health as record_managed_service_health,
+    record_start as record_managed_service_start,
+    reset_for_host_start as reset_managed_service_health_for_host_start,
+};
 
 const MAX_ID_BYTES: usize = 128;
 const MAX_SELECTOR_BYTES: usize = 256;
@@ -28,6 +38,12 @@ pub(crate) struct ScriptRunConsumerBinding {
     scope_digest: String,
     method_scope: Vec<String>,
     created_at_ms: i64,
+    #[serde(default)]
+    managed_service: bool,
+    #[serde(default)]
+    service_generation: u64,
+    #[serde(default)]
+    worker_config_sha256: Option<String>,
 }
 
 impl ScriptRunConsumerBinding {
@@ -45,6 +61,28 @@ impl ScriptRunConsumerBinding {
 
     pub(crate) fn scope_digest(&self) -> &str {
         &self.scope_digest
+    }
+
+    pub(crate) fn managed_service(&self) -> bool {
+        self.managed_service
+    }
+
+    pub(crate) fn service_scope(&self) -> Result<DeclaredServiceScope> {
+        if !self.managed_service {
+            return Err(Error::new(
+                "BUS_SERVICE_NOT_MANAGED",
+                "consumer has no managed service scope",
+            ));
+        }
+        DeclaredServiceScope::new(
+            swarm_contracts::DeclaredServicePurpose::BusConsumer,
+            self.consumer_client_id.clone(),
+            self.service_generation,
+        )
+    }
+
+    pub(crate) fn worker_config_sha256(&self) -> Option<&str> {
+        self.worker_config_sha256.as_deref()
     }
 
     fn require_method(&self, method: &str) -> Result<()> {
@@ -76,6 +114,13 @@ impl ScriptRunConsumerBinding {
                 .all(|byte| byte.is_ascii_hexdigit())
             || self.method_scope.iter().map(String::as_str).ne(BUS_METHODS)
             || self.created_at_ms < 0
+            || (self.managed_service
+                && (self.service_generation == 0
+                    || self.worker_config_sha256.as_deref().is_none_or(|value| {
+                        value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    })))
+            || (!self.managed_service
+                && (self.service_generation != 0 || self.worker_config_sha256.is_some()))
         {
             return Err(Error::new(
                 "BUS_CONSUMER_REGISTRATION_CORRUPT",
@@ -144,6 +189,8 @@ pub(crate) fn validate_mutation(method: &str, params: &Value) -> Result<()> {
             "automation_id",
             "consumer_client_id",
             "token_hash",
+            "managed_service",
+            "worker_config_sha256",
         ][..],
         "bus.consumer.revoke" => &[
             "client_request_id",
@@ -192,6 +239,24 @@ pub(crate) fn validate_mutation(method: &str, params: &Value) -> Result<()> {
             let token_hash = model::text(params, "token_hash")?;
             if token_hash.len() != 64 || !token_hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
                 return Err(Error::invalid("token_hash must be a SHA-256 hex digest"));
+            }
+            let managed_service = match params.get("managed_service") {
+                None => false,
+                Some(Value::Bool(value)) => *value,
+                Some(_) => return Err(Error::invalid("managed_service must be boolean")),
+            };
+            if managed_service {
+                let file_hash = model::text(params, "worker_config_sha256")?;
+                if file_hash.len() != 64 || !file_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                {
+                    return Err(Error::invalid(
+                        "managed worker_config_sha256 must be a SHA-256 hex digest",
+                    ));
+                }
+            } else if params.get("worker_config_sha256").is_some() {
+                return Err(Error::invalid(
+                    "worker_config_sha256 requires managed_service=true",
+                ));
             }
         }
         return Ok(());
@@ -422,6 +487,15 @@ fn register(
     }
     let scope_digest =
         crate::store::automation_dispatch::bus_kernel::script_run_consumer_scope_digest(&entry)?;
+    let managed_service = params
+        .get("managed_service")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let service_generation = if managed_service {
+        next_service_generation(tx, principal, project_id, automation_id)?
+    } else {
+        0
+    };
     let binding = ScriptRunConsumerBinding {
         schema_version: 1,
         owner_manager_id: principal.client_id.clone(),
@@ -434,6 +508,13 @@ fn register(
             .map(|method| (*method).to_owned())
             .collect(),
         created_at_ms: now_ms,
+        managed_service,
+        service_generation,
+        worker_config_sha256: if managed_service {
+            Some(model::text(params, "worker_config_sha256")?.to_ascii_lowercase())
+        } else {
+            None
+        },
     };
     binding.validate(consumer_client_id)?;
     let registration = json!({
@@ -455,9 +536,45 @@ fn register(
             "automation_id":automation_id,
             "method_scope":BUS_METHODS,
             "credential_retained":"sha256_only",
+            "managed_service":managed_service,
+            "service_generation":if managed_service {json!(service_generation)} else {Value::Null},
         }),
         false,
     ))
+}
+
+fn next_service_generation(
+    tx: &Transaction<'_>,
+    principal: &Principal,
+    project_id: &str,
+    automation_id: &str,
+) -> Result<u64> {
+    let identity = model::canonical(&json!({
+        "owner_manager_id":principal.client_id,
+        "project_id":project_id,
+        "automation_id":automation_id,
+    }))?;
+    let key = format!(
+        "bus:service-generation:v1:{}",
+        model::digest(identity.as_bytes())
+    );
+    let current = match crate::store::meta(tx, &key)? {
+        None => 0,
+        Some(value) => value.as_u64().ok_or_else(|| {
+            Error::new(
+                "BUS_SERVICE_GENERATION_CORRUPT",
+                "persisted managed service generation is invalid",
+            )
+        })?,
+    };
+    let next = current.checked_add(1).ok_or_else(|| {
+        Error::new(
+            "BUS_SERVICE_GENERATION_EXHAUSTED",
+            "managed bus service generation exhausted",
+        )
+    })?;
+    crate::store::set_meta(tx, &key, &json!(next))?;
+    Ok(next)
 }
 
 fn revoke(

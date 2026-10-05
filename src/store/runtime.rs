@@ -16,6 +16,20 @@ use std::{
 };
 use tokio::{sync::watch, task::JoinHandle};
 
+fn descriptor_pre_input_open(
+    db: &Connection,
+    binding: &Value,
+) -> Result<Option<swarm_contracts::module_catalog::PreInputOpenContract>> {
+    let Some(selector) = binding["observation"].get("module_contract_selector") else {
+        return Ok(None);
+    };
+    super::module_handshake::retained_pre_input_open(
+        db,
+        model::text(binding, "module_artifact_id")?,
+        Some(selector),
+    )
+}
+
 fn batch_bindings(db: &Connection) -> Result<Vec<Value>> {
     let mut stmt = db.prepare(
         "SELECT binding_id,generation FROM bindings WHERE released_at_ms IS NULL AND route_json IS NOT NULL ORDER BY created_at_ms,binding_id",
@@ -226,6 +240,7 @@ pub(super) fn hello(
     let artifact = model::text(v, "module_artifact_id")?;
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let (id, generation, b) = scope(&tx, p, false)?;
+    let pre_input_open = descriptor_pre_input_open(&tx, &b)?;
     if b["route"]["module_artifact_id"] != artifact {
         return Err(Error::new(
             "ARTIFACT_MISMATCH",
@@ -348,7 +363,8 @@ pub(super) fn hello(
         tx.execute("UPDATE bindings SET state_json=json_set(state_json,'$.managed_owner',json(?3)) WHERE binding_id=?1 AND generation=?2",params![id,generation,model::canonical(owner)?])?;
     }
     let prepared_rootless_resume = if old_boot == Some(boot)
-        && crate::runtime::prepared::is_prepared_claude_route(&b["route"])
+        && (pre_input_open.is_some()
+            || crate::runtime::prepared::is_prepared_claude_route(&b["route"]))
         && b["native_root_id"].is_null()
         && b["native_scope_key"].is_null()
         && v["native_ready"] == true
@@ -402,6 +418,7 @@ fn next_internal(
 ) -> Result<Value> {
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let (id, generation, b) = scope(&tx, p, true)?;
+    let pre_input_open = descriptor_pre_input_open(&tx, &b)?;
     if crate::runtime::batch::is_legacy_command_route(&b["route"]) {
         // Artifact .2 is retained for historical operation reads only. Never
         // hand queued work to an old bridge after the .3 receipt contract ships.
@@ -757,6 +774,7 @@ fn next_internal(
         input["task_snapshot"] = a["task_snapshot"].clone();
         if crate::runtime::codex::is_controller_route(&b["route"])
             || crate::runtime::prepared::is_prepared_claude_route(&b["route"])
+            || pre_input_open.is_some()
             || crate::runtime::batch::is_command_route(&b["route"])
         {
             input["task_snapshot_canonical"] = json!(model::canonical(&a["task_snapshot"])?);
@@ -816,11 +834,15 @@ fn next_internal(
         method == "agent.result" && input["selector"]["kind"] == "input_status";
     let antigravity_status_result =
         method == "agent.result" && input["selector"]["kind"] == "antigravity_status";
+    let command_status_result =
+        method == "agent.result" && input["selector"]["kind"] == "command_status";
     let target_input_sha256 = if method == "agent.reconcile"
         || input_status_result
         || antigravity_status_result
+        || command_status_result
     {
-        let target_id = if input_status_result || antigravity_status_result {
+        let target_id = if input_status_result || antigravity_status_result || command_status_result
+        {
             model::text(&input["selector"], "input_operation_id")?
         } else {
             model::text(&input, "operation_id")?
@@ -854,6 +876,11 @@ fn next_internal(
                 &tx, &id, generation, &b, target_id, session_id,
             )?;
             let digest = model::text(&snapshot, "target_input_sha256")?.to_owned();
+            input["target_operation_status"] = snapshot;
+            Some(digest)
+        } else if command_status_result {
+            let snapshot = super::command_results::target_snapshot(&tx, &b, target_id)?;
+            let digest = model::text(&snapshot, "input_sha256")?.to_owned();
             input["target_operation_status"] = snapshot;
             Some(digest)
         } else {
@@ -1314,6 +1341,7 @@ pub(super) fn outcome_with_artifacts(
     let r: RuntimeOutcome = serde_json::from_value(v.clone())?;
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let (id, generation, b) = scope(&tx, p, true)?;
+    let pre_input_open = descriptor_pre_input_open(&tx, &b)?;
     let o = operations::get_operation(&tx, &r.operation_id)?;
     if o["binding_id"] != id || o["binding_generation"] != generation {
         return Err(Error::new(
@@ -1439,13 +1467,18 @@ pub(super) fn outcome_with_artifacts(
             }
         }
     }
-    let prepared_first_dispatch = crate::runtime::prepared::is_prepared_claude_route(&b["route"])
+    let prepared_first_dispatch = (pre_input_open.is_some()
+        || crate::runtime::prepared::is_prepared_claude_route(&b["route"]))
         && o["method"] == "task.dispatch"
         && b["native_root_id"].is_null()
         && b["native_scope_key"].is_null()
         && (r.native_root_id.is_some() || r.native_scope_key.is_some());
     if prepared_first_dispatch {
-        crate::runtime::prepared::adopt_first_input_identity(&tx, &b, &r)?;
+        if let Some(contract) = pre_input_open.as_ref() {
+            crate::runtime::prepared::adopt_pre_input_identity(&tx, &b, &r, contract)?;
+        } else {
+            crate::runtime::prepared::adopt_first_input_identity(&tx, &b, &r)?;
+        }
     } else if o["method"] != "agent.open"
         && (r
             .native_root_id
@@ -1482,7 +1515,7 @@ pub(super) fn outcome_with_artifacts(
             expected_turn,
         )?;
     }
-    if crate::runtime::prepared::is_prepared_claude_route(&b["route"])
+    if (pre_input_open.is_some() || crate::runtime::prepared::is_prepared_claude_route(&b["route"]))
         && o["method"] == "agent.send"
         && matches!(r.outcome, EffectOutcome::Applied)
     {
@@ -1492,13 +1525,32 @@ pub(super) fn outcome_with_artifacts(
             |row| row.get(0),
         )?;
         let request: Value = serde_json::from_str(&raw)?;
-        if request["delivery"] != "next_turn" {
-            return Err(Error::new(
-                "NATIVE_IDENTITY_MISMATCH",
-                "prepared Claude only verifies next-turn send receipts",
-            ));
+        if let Some(contract) = pre_input_open.as_ref() {
+            if request["delivery"] != "next_turn" {
+                return Err(Error::new(
+                    "NATIVE_IDENTITY_MISMATCH",
+                    "prepared module only verifies next-turn send receipts",
+                ));
+            }
+            crate::runtime::prepared::validate_pre_input_send_receipt(
+                &b,
+                &r,
+                model::text(&request, "text")?,
+                contract,
+            )?;
+        } else {
+            if request["delivery"] != "next_turn" {
+                return Err(Error::new(
+                    "NATIVE_IDENTITY_MISMATCH",
+                    "prepared Claude only verifies next-turn send receipts",
+                ));
+            }
+            crate::runtime::prepared::validate_send_receipt(
+                &b,
+                &r,
+                model::text(&request, "text")?,
+            )?;
         }
-        crate::runtime::prepared::validate_send_receipt(&b, &r, model::text(&request, "text")?)?;
     }
     let encoded = model::canonical(&json!(r))?;
     let stream = format!("module:{}", p.client_id);
@@ -1662,7 +1714,10 @@ pub(super) fn outcome_with_artifacts(
     }
     if matches!(r.outcome, EffectOutcome::Applied) {
         if o["method"] == "agent.open" {
-            if crate::runtime::prepared::is_prepared_claude_route(&b["route"]) {
+            if let Some(contract) = pre_input_open.as_ref() {
+                crate::runtime::prepared::validate_pre_input_open(&b, &r, contract)?;
+                tx.execute("UPDATE bindings SET state=CASE WHEN json_extract(state_json,'$.recovery_required')=1 OR EXISTS(SELECT 1 FROM operations WHERE binding_id=?1 AND binding_generation=?2 AND operation_id<>?3 AND state IN ('sending','native_accepted','outcome_unknown') AND method IN ('agent.open','task.dispatch')) THEN 'reconciling' ELSE 'ready' END,state_json=json_set(state_json,'$.waiting_for',NULL,'$.opening_evidence',json(?4)) WHERE binding_id=?1 AND generation=?2",params![id,generation,r.operation_id,model::canonical(&r.details)?])?;
+            } else if crate::runtime::prepared::is_prepared_claude_route(&b["route"]) {
                 crate::runtime::prepared::validate_prepared_open(&b, &r)?;
                 tx.execute("UPDATE bindings SET state=CASE WHEN json_extract(state_json,'$.recovery_required')=1 OR EXISTS(SELECT 1 FROM operations WHERE binding_id=?1 AND binding_generation=?2 AND operation_id<>?3 AND state IN ('sending','native_accepted','outcome_unknown') AND method IN ('agent.open','task.dispatch')) THEN 'reconciling' ELSE 'ready' END,state_json=json_set(state_json,'$.waiting_for',NULL,'$.opening_evidence',json(?4)) WHERE binding_id=?1 AND generation=?2",params![id,generation,r.operation_id,model::canonical(&r.details)?])?;
             } else if sessionless_batch {
@@ -1696,7 +1751,8 @@ pub(super) fn outcome_with_artifacts(
                 let mut producer = json!({"assignment_id":r.operation_id,"native_session_id":b["native_root_id"],"disposition":"admitted"});
                 match (r.turn_id.as_deref(), r.native_input_id.as_deref()) {
                     _ if crate::runtime::codex::is_controller_route(&b["route"])
-                        || crate::runtime::prepared::is_prepared_claude_route(&b["route"]) =>
+                        || crate::runtime::prepared::is_prepared_claude_route(&b["route"])
+                        || pre_input_open.is_some() =>
                     {
                         let a = tasks::get_attempt(&tx, attempt)?;
                         let raw: String = tx.query_row(
@@ -1705,22 +1761,29 @@ pub(super) fn outcome_with_artifacts(
                             |row| row.get(0),
                         )?;
                         let request: Value = serde_json::from_str(&raw)?;
-                        producer =
-                            if crate::runtime::prepared::is_prepared_claude_route(&b["route"]) {
-                                crate::runtime::prepared::dispatch_producer(
-                                    &b,
-                                    &r,
-                                    &a["task_snapshot"],
-                                    model::text(&request, "text")?,
-                                )?
-                            } else {
-                                crate::runtime::codex::dispatch_producer(
-                                    &b,
-                                    &r,
-                                    &a["task_snapshot"],
-                                    model::text(&request, "text")?,
-                                )?
-                            };
+                        producer = if let Some(contract) = pre_input_open.as_ref() {
+                            crate::runtime::prepared::pre_input_dispatch_producer(
+                                &b,
+                                &r,
+                                &a["task_snapshot"],
+                                model::text(&request, "text")?,
+                                contract,
+                            )?
+                        } else if crate::runtime::prepared::is_prepared_claude_route(&b["route"]) {
+                            crate::runtime::prepared::dispatch_producer(
+                                &b,
+                                &r,
+                                &a["task_snapshot"],
+                                model::text(&request, "text")?,
+                            )?
+                        } else {
+                            crate::runtime::codex::dispatch_producer(
+                                &b,
+                                &r,
+                                &a["task_snapshot"],
+                                model::text(&request, "text")?,
+                            )?
+                        };
                     }
                     (Some(turn), None) if !turn.is_empty() => {
                         producer["native_run_id"] = json!(turn)
@@ -3085,7 +3148,9 @@ fn user_command_with_actor(
     let id = model::text(v, "binding_id")?;
     let generation = model::positive(v, "generation")?;
     let b = operations::get_binding(tx, id, generation)?;
-    if crate::runtime::batch::is_sessionless_route(&b["route"]) {
+    let strict_command_status =
+        method == "agent.result" && crate::runtime::batch::is_rust_command_route(&b["route"]);
+    if crate::runtime::batch::is_sessionless_route(&b["route"]) && !strict_command_status {
         crate::runtime::batch::validate_command(&b["route"], method, v)?;
     }
     let rootless_open_reconcile =
@@ -3254,7 +3319,13 @@ fn user_command_with_actor(
         let session_id = model::text(&v["selector"], "session_id")?;
         super::results::antigravity_status_snapshot(tx, id, generation, &b, target_id, session_id)?;
     }
-    if method == "agent.result" && crate::runtime::batch::is_sessionless_route(&b["route"]) {
+    if strict_command_status {
+        super::command_results::validate_request(tx, &b, v)?;
+    }
+    if method == "agent.result"
+        && crate::runtime::batch::is_sessionless_route(&b["route"])
+        && !strict_command_status
+    {
         let target = operations::get_operation(tx, model::text(&v["selector"], "operation_id")?)?;
         if target["method"] != "task.dispatch"
             || target["binding_id"] != id

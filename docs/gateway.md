@@ -37,6 +37,13 @@ Run the gateway in the foreground:
 swarm --config <private-config.toml> gateway
 ```
 
+The compatibility command forwards to the separately built `swarm-gateway`
+binary installed beside `swarm`; it passes only `--config` and `--data-dir`.
+You can launch that binary directly with the same two options. It reads the
+existing `[gateway]`, `[storage].data_dir`, `[ipc]`, and `[mcp]` TOML fields;
+unrelated controller configuration is ignored. The gateway stays disabled
+unless `gateway.enabled = true`.
+
 The running command refuses a disabled configuration, a non-loopback bind,
 the `full` MCP profile, a missing credential or bearer file, or a credential
 whose client ID does not match the configured profile. It also rejects the

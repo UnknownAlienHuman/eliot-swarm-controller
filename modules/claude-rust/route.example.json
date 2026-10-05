@@ -1,0 +1,17 @@
+{
+  "alias": "<operator-selected-route-alias>",
+  "runtime": "module",
+  "module_artifact_id": "claude-agent-sdk-0.3.287-rust-controller.4",
+  "enabled": false,
+  "workspace_option": "workspaceRoot",
+  "native_options": {
+    "workspaceRoot": "<absolute-workspace-placeholder-replaced-at-admission>",
+    "sdkRuntimeRoot": "<absolute-existing-sdk-runtime-root>",
+    "nodeExecutable": "<absolute-node-executable>",
+    "nativeExecutable": null,
+    "claudeConfigDir": "<absolute-claude-config-directory>",
+    "modelId": "<operator-selected-claude-sonnet-model-id>",
+    "permissionMode": null,
+    "allowDangerouslySkipPermissions": false
+  }
+}

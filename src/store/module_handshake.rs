@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use swarm_contracts::module_catalog::{
     ArtifactIdentity, ArtifactVersion, CapabilityId, ModuleCatalog, ModuleDescriptor, ModuleId,
-    ProtocolVersion, WorkspaceOptionContract,
+    PreInputOpenContract, ProtocolVersion, WorkspaceOptionContract,
 };
 use swarm_contracts::module_contract::{MODULE_PROTOCOL_V1, ModuleContractClaim};
 
@@ -485,6 +485,7 @@ fn public_descriptor(entry: &RegisteredDescriptor) -> Value {
         "capabilities":descriptor.capabilities,
         "config_schema":descriptor.config_schema,
         "workspace_option":descriptor.workspace_option,
+        "pre_input_open":descriptor.pre_input_open,
         "command_schemas":descriptor.command_schemas,
         "event_schemas":descriptor.event_schemas,
         "lifecycle":descriptor.lifecycle,
@@ -610,6 +611,7 @@ pub(super) fn negotiate_hello(
         || claim.protocol != retained.protocol
         || claim.capabilities != expected_capabilities
         || claim.config_schema != descriptor.config_schema
+        || claim.pre_input_open != descriptor.pre_input_open
         || claim.command_schemas != expected_commands
         || claim.event_schemas != expected_events
     {
@@ -627,6 +629,7 @@ pub(super) fn negotiate_hello(
         "protocol":claim.protocol,
         "capabilities":expected_capabilities,
         "config_schema":descriptor.config_schema,
+        "pre_input_open":descriptor.pre_input_open,
         "command_schemas":expected_commands,
         "event_schemas":expected_events,
         "effects_authorized_by_descriptor":false,
@@ -787,6 +790,19 @@ pub(super) fn retained_descriptor(
         })
 }
 
+/// Resolve pre-input semantics only from this binding's retained trusted
+/// descriptor; a module's hello claim or route payload is not authoritative.
+pub(super) fn retained_pre_input_open(
+    db: &Connection,
+    binding_artifact_id: &str,
+    selector: Option<&Value>,
+) -> Result<Option<PreInputOpenContract>> {
+    let Some(identity) = retained_contract_identity(db, binding_artifact_id, selector)? else {
+        return Ok(None);
+    };
+    Ok(retained_descriptor(db, &identity)?.pre_input_open)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -820,6 +836,7 @@ mod tests {
             },
             config_schema: None,
             workspace_option: None,
+            pre_input_open: None,
             command_schemas: Default::default(),
             event_schemas: Default::default(),
             protocol: swarm_contracts::module_catalog::ProtocolRange::exact(HOST_PROTOCOL),

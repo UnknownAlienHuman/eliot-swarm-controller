@@ -9,6 +9,7 @@ use crate::{
 };
 use rusqlite::{Transaction, params};
 use serde_json::{Value, json};
+use swarm_contracts::module_catalog::PreInputOpenContract;
 
 pub const CLAUDE_RUNTIME: &str = "claude";
 pub const CLAUDE_ARTIFACT_ID: &str = "claude-agent-sdk-0.3.287-bridge.3";
@@ -204,6 +205,254 @@ pub fn validate_send_receipt(binding: &Value, outcome: &RuntimeOutcome, text: &s
     Ok(())
 }
 
+fn validate_pre_input_contract(contract: &PreInputOpenContract) -> Result<()> {
+    contract.validate().map_err(|_| {
+        Error::new(
+            "MODULE_PRE_INPUT_CONTRACT_INVALID",
+            "retained module pre-input contract is unsupported",
+        )
+    })
+}
+
+fn module_boot_id(binding: &Value) -> Result<&str> {
+    nonempty(
+        binding["observation"]["bridge_boot_id"].as_str(),
+        "active module boot id",
+    )
+}
+
+/// Validate a descriptor-authorized rootless `agent.open`. The retained
+/// descriptor is resolved by Store before this helper is called; the module
+/// hello reply is only evidence of the current authenticated boot.
+pub fn validate_pre_input_open(
+    binding: &Value,
+    outcome: &RuntimeOutcome,
+    contract: &PreInputOpenContract,
+) -> Result<()> {
+    validate_pre_input_contract(contract)?;
+    let boot = module_boot_id(binding)?;
+    if binding["route"]["runtime"] != "module"
+        || binding["observation"]["module_contract_selector"]
+            .as_object()
+            .is_none()
+        || binding["route"]["module_artifact_id"] != binding["module_artifact_id"]
+        || !matches!(outcome.outcome, EffectOutcome::Applied)
+        || outcome.native_root_id.is_some()
+        || outcome.native_scope_key.is_some()
+        || outcome.turn_id.is_some()
+        || outcome.native_input_id.is_some()
+        || outcome.details["completion_condition"] != "native_executor_prepared"
+        || outcome.details["native_session_state"] != "prepared"
+        || outcome.details["pre_input_executor_ready"] != true
+        || outcome.details["bridge_boot_id"] != boot
+        || !outcome.details["describe"]["session_id"].is_null()
+    {
+        return Err(Error::new(
+            "NATIVE_IDENTITY_MISMATCH",
+            "selected module open must prove a rootless prepared executor on this boot",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_pre_input_identity(
+    binding: &Value,
+    outcome: &RuntimeOutcome,
+    initial: bool,
+    contract: &PreInputOpenContract,
+) -> Result<()> {
+    validate_pre_input_contract(contract)?;
+    let boot = module_boot_id(binding)?;
+    let open = &binding["observation"]["opening_evidence"];
+    let root = nonempty(outcome.native_root_id.as_deref(), "native session id")?;
+    let scope = nonempty(outcome.native_scope_key.as_deref(), "native session scope")?;
+    let input = nonempty(outcome.native_input_id.as_deref(), "native input id")?;
+    let rootless = binding["native_root_id"].is_null() && binding["native_scope_key"].is_null();
+    let identity_matches = if initial {
+        rootless
+    } else {
+        binding["native_root_id"] == root && binding["native_scope_key"] == scope
+    };
+    if binding["route"]["runtime"] != "module"
+        || binding["observation"]["module_contract_selector"]
+            .as_object()
+            .is_none()
+        || binding["route"]["module_artifact_id"] != binding["module_artifact_id"]
+        || binding["state"] != "ready"
+        || !identity_matches
+        || binding["observation"]["recovery_required"] == true
+        || !matches!(outcome.outcome, EffectOutcome::Applied)
+        || outcome.turn_id.is_some()
+        || open["completion_condition"] != "native_executor_prepared"
+        || open["native_session_state"] != "prepared"
+        || open["bridge_boot_id"] != boot
+        || outcome.details["bridge_boot_id"] != boot
+        || outcome.details["completion_condition"] != "native_input_admitted"
+        || outcome.details["initial_task_dispatch"] != initial
+        || outcome.details["evidence"] != "native_frame_echo"
+        || outcome.details["execution_complete"] != false
+        || outcome.details["user_message_uuid"] != input
+        || outcome.details["native_frame_session_id"] != root
+        || (initial && outcome.details["system_init_session_id"] != root)
+        || outcome.details["native_scope_key"] != scope
+    {
+        return Err(Error::new(
+            "NATIVE_IDENTITY_MISMATCH",
+            "first Task input must be admitted by the selected prepared module on its original boot",
+        ));
+    }
+    Ok(())
+}
+
+/// Atomically adopt the first exact native echo for a descriptor whose
+/// retained pre-input contract permits rootless open. The SQL predicate pins
+/// the same selected descriptor snapshot checked by `module_handshake`.
+pub fn adopt_pre_input_identity(
+    tx: &Transaction<'_>,
+    binding: &Value,
+    outcome: &RuntimeOutcome,
+    contract: &PreInputOpenContract,
+) -> Result<()> {
+    validate_pre_input_identity(binding, outcome, true, contract)?;
+    let boot = module_boot_id(binding)?;
+    let root = outcome.native_root_id.as_deref().expect("validated root");
+    let scope = outcome
+        .native_scope_key
+        .as_deref()
+        .expect("validated scope");
+    let selector = &binding["observation"]["module_contract_selector"];
+    let route_runtime = nonempty(binding["route"]["runtime"].as_str(), "route runtime")?;
+    let artifact_id = nonempty(
+        binding["route"]["module_artifact_id"].as_str(),
+        "route module artifact",
+    )?;
+    let module_id = nonempty(selector["module_id"].as_str(), "selected module id")?;
+    let artifact = &selector["artifact"];
+    let selector_artifact_id = nonempty(artifact["artifact_id"].as_str(), "selected artifact id")?;
+    let artifact_version = nonempty(artifact["version"].as_str(), "selected artifact version")?;
+    let registered_revision = selector["registered_revision"]
+        .as_u64()
+        .and_then(|revision| i64::try_from(revision).ok())
+        .filter(|revision| *revision > 0)
+        .ok_or_else(|| {
+            Error::new(
+                "MODULE_ROUTE_CORRUPT",
+                "selected descriptor revision is invalid",
+            )
+        })?;
+    let selected_revision = selector["selected_revision"]
+        .as_u64()
+        .and_then(|revision| i64::try_from(revision).ok())
+        .filter(|revision| *revision >= registered_revision)
+        .ok_or_else(|| Error::new("MODULE_ROUTE_CORRUPT", "selected route revision is invalid"))?;
+    if selector["schema_version"] != 1 || artifact_id != selector_artifact_id {
+        return Err(Error::new(
+            "MODULE_ROUTE_CORRUPT",
+            "selected descriptor does not match the binding route",
+        ));
+    }
+    let artifact_build_id = artifact["build_id"].as_str();
+    let changed = tx.execute(
+        "UPDATE bindings SET native_root_id=?3,native_scope_key=?4,state_json=json_set(state_json,'$.first_dispatch_adoption',json(?13)) WHERE binding_id=?1 AND generation=?2 AND state='ready' AND native_root_id IS NULL AND native_scope_key IS NULL AND json_extract(route_json,'$.runtime')=?5 AND json_extract(route_json,'$.module_artifact_id')=?6 AND json_extract(state_json,'$.module_contract_selector.schema_version')=1 AND json_extract(state_json,'$.module_contract_selector.module_id')=?7 AND json_extract(state_json,'$.module_contract_selector.registered_revision')=?8 AND json_extract(state_json,'$.module_contract_selector.selected_revision')=?9 AND json_extract(state_json,'$.module_contract_selector.artifact.artifact_id')=?6 AND json_extract(state_json,'$.module_contract_selector.artifact.version')=?10 AND json_extract(state_json,'$.module_contract_selector.artifact.build_id') IS ?11 AND json_extract(state_json,'$.bridge_boot_id')=?12 AND json_extract(state_json,'$.opening_evidence.completion_condition')='native_executor_prepared' AND json_extract(state_json,'$.opening_evidence.bridge_boot_id')=?12 AND COALESCE(json_extract(state_json,'$.recovery_required'),0)=0",
+        params![
+            binding["binding_id"].as_str().unwrap_or_default(),
+            binding["generation"].as_i64().unwrap_or_default(),
+            root,
+            scope,
+            route_runtime,
+            artifact_id,
+            module_id,
+            registered_revision,
+            selected_revision,
+            artifact_version,
+            artifact_build_id,
+            boot,
+            model::canonical(&json!({
+                "operation_id": outcome.operation_id,
+                "native_root_id": root,
+                "native_scope_key": scope,
+                "native_input_id": outcome.native_input_id,
+                "bridge_boot_id": boot,
+                "module_contract_selector": selector
+            }))?
+        ],
+    )?;
+    if changed != 1 {
+        return Err(Error::conflict(
+            "selected prepared-module binding changed before first-session adoption",
+        ));
+    }
+    Ok(())
+}
+
+/// Create an unresolved producer only after validating the exact immutable
+/// Task snapshot, text and echoed native input identity.
+pub fn pre_input_dispatch_producer(
+    binding: &Value,
+    outcome: &RuntimeOutcome,
+    task_snapshot: &Value,
+    text: &str,
+    contract: &PreInputOpenContract,
+) -> Result<Value> {
+    let initial = binding["native_root_id"].is_null() && binding["native_scope_key"].is_null();
+    validate_pre_input_identity(binding, outcome, initial, contract)?;
+    if !task_snapshot.is_object() || text.trim().is_empty() || outcome.operation_id.is_empty() {
+        return Err(Error::invalid(
+            "first Task dispatch requires its exact Task snapshot, text and Operation id",
+        ));
+    }
+    let snapshot = model::canonical(task_snapshot)?;
+    let instruction = format!("Task specification: {snapshot}\n\n{text}");
+    let input = outcome
+        .native_input_id
+        .as_deref()
+        .expect("validated native input");
+    let root = outcome.native_root_id.as_deref().expect("validated root");
+    if outcome.details["prompt_sha256"] != model::digest(instruction.as_bytes())
+        || outcome.details["prompt_bytes"].as_u64() != Some(instruction.len() as u64)
+        || outcome.details["task_snapshot_sha256"] != model::digest(snapshot.as_bytes())
+    {
+        return Err(Error::new(
+            "NATIVE_IDENTITY_MISMATCH",
+            "native input receipt does not bind the exact frozen Task prompt",
+        ));
+    }
+    Ok(json!({
+        "assignment_id": outcome.operation_id,
+        "native_session_id": root,
+        "native_run_id": Value::Null,
+        "native_input_id": input,
+        "client_user_message_id": input,
+        "native_scope_key": outcome.native_scope_key,
+        "bridge_boot_id": outcome.details["bridge_boot_id"],
+        "admission_kind": "prepared_native_input",
+        "disposition": "admitted"
+    }))
+}
+
+pub fn validate_pre_input_send_receipt(
+    binding: &Value,
+    outcome: &RuntimeOutcome,
+    text: &str,
+    contract: &PreInputOpenContract,
+) -> Result<()> {
+    validate_pre_input_identity(binding, outcome, false, contract)?;
+    if text.trim().is_empty()
+        || outcome.details["prompt_sha256"] != model::digest(text.as_bytes())
+        || outcome.details["prompt_bytes"].as_u64() != Some(text.len() as u64)
+        || outcome
+            .details
+            .get("task_snapshot_sha256")
+            .is_none_or(|digest| !digest.is_null())
+    {
+        return Err(Error::new(
+            "NATIVE_IDENTITY_MISMATCH",
+            "next-turn receipt must bind the exact request text without a Task snapshot",
+        ));
+    }
+    Ok(())
+}
+
 fn sdk_result_terminal_status(event: &Value) -> Option<&'static str> {
     let subtype = event["result_subtype"].as_str()?;
     let is_error = event["is_error"].as_bool()?;
@@ -224,8 +473,10 @@ pub fn apply_input_execution(producer: &mut Value, state: &Value, observation_id
     let Some(observation_id) = observation_id.filter(|id| *id > 0) else {
         return;
     };
-    if producer["admission_kind"] != "claude_native_input"
-        || producer["native_run_id"].as_str().is_some()
+    if !matches!(
+        producer["admission_kind"].as_str(),
+        Some("claude_native_input" | "prepared_native_input")
+    ) || producer["native_run_id"].as_str().is_some()
         || matches!(
             producer["disposition"].as_str(),
             Some("completed" | "failed" | "cancelled")

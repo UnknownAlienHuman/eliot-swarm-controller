@@ -29,14 +29,6 @@ const START_FAILURE_V2_KEYS: [&str; 7] = [
     "request_phase",
     "http_status",
 ];
-const DISPATCH_FAILURE_KEYS: [&str; 6] = [
-    "schema_version",
-    "status",
-    "stage",
-    "error_code",
-    "native_effect",
-    "retry_authorized",
-];
 
 pub(super) fn get_operation(db: &Connection, id: &str) -> Result<Value> {
     let raw:Option<String>=db.query_row("SELECT json_object('operation_id',operation_id,'caller_id',caller_id,'method',method,'state',state,'task_id',task_id,'attempt_id',attempt_id,'binding_id',binding_id,'binding_generation',binding_generation,'prerequisite_operation_id',prerequisite_operation_id,'operation_contract',json_extract(effective_request_json,'$.operation_contract'),'native_refs',json(native_refs_json),'result',json(result_json),'created_at_ms',created_at_ms,'updated_at_ms',updated_at_ms) FROM operations WHERE operation_id=?1",[id],|r|r.get(0)).optional()?;
@@ -797,14 +789,12 @@ pub(super) fn record_owned_open_dispatch_failure(
     if !valid_case || !safe_start_failure_error_code(error_code) {
         return Ok(false);
     }
-    let payload = model::canonical(&json!({
-        "schema_version":1,
-        "status":status,
-        "stage":stage,
-        "error_code":error_code,
-        "native_effect":"not_dispatched",
-        "retry_authorized":false,
-    }))?;
+    let Some(payload_value) =
+        swarm_kernel::dispatch::not_dispatched_payload(status, stage, error_code).ok()
+    else {
+        return Ok(false);
+    };
+    let payload = model::canonical(&payload_value)?;
     if payload.len() > MAX_OWNED_SERVICE_DISPATCH_FAILURE_BYTES {
         return Ok(false);
     }
@@ -1611,34 +1601,12 @@ fn owned_service_dispatch_action_for_operation_inner(
 }
 
 fn validate_owned_service_dispatch_failure(payload: &Value) -> Result<Value> {
-    let object = payload
-        .as_object()
-        .ok_or_else(owned_service_dispatch_diagnostic_corrupt)?;
-    if object.len() != DISPATCH_FAILURE_KEYS.len()
-        || DISPATCH_FAILURE_KEYS
-            .iter()
-            .any(|key| !object.contains_key(*key))
-        || payload["schema_version"].as_i64() != Some(1)
-        || payload["native_effect"] != "not_dispatched"
-        || payload["retry_authorized"] != false
-    {
-        return Err(owned_service_dispatch_diagnostic_corrupt());
-    }
-    let status = payload["status"].as_str().unwrap_or_default();
-    let stage = payload["stage"].as_str().unwrap_or_default();
-    let valid_pair = matches!(
-        (status, stage),
-        ("selection_error", "runtime_command_select")
-            | ("rejected_before_dispatch", "opening_actor_validate")
-    );
-    let error_code = payload["error_code"].as_str().unwrap_or_default();
-    if !valid_pair || !safe_start_failure_error_code(error_code) {
-        return Err(owned_service_dispatch_diagnostic_corrupt());
-    }
+    let failure = swarm_kernel::dispatch::validate(payload)
+        .map_err(|_| owned_service_dispatch_diagnostic_corrupt())?;
     Ok(json!({
-        "status":status,
-        "stage":stage,
-        "error_code":error_code,
+        "status":failure.status(),
+        "stage":failure.stage(),
+        "error_code":failure.error_code(),
     }))
 }
 

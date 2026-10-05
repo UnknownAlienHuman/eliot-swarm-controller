@@ -13,7 +13,7 @@ use crate::{
 use rusqlite::{OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use swarm_telemetry::{Code, Kind, Phase, Record, Severity};
+use swarm_telemetry::{Code, Component, Kind, Phase, Record, Severity};
 
 impl super::Store {
     /// Retain a bounded host-only status transition from the dedicated module
@@ -389,8 +389,8 @@ pub(super) fn record(
     }
     let transition = lifecycle_transition(current, observation);
     let nonterminal = nonterminal_transition(observation);
-    let diagnostic = diagnostic_for_transition(current, observation);
-    validate_operation_ids(tx, observation, generation)?;
+    let operation_link = validate_operation_ids(tx, observation, generation)?;
+    let diagnostic = diagnostic_for_transition(current, observation, operation_link.as_ref());
 
     tx.execute(
         "INSERT INTO observations(\
@@ -632,6 +632,7 @@ fn nonterminal_occurrence_id(
 fn diagnostic_for_transition(
     previous: &Value,
     observation: &ModuleSupervisorObservation,
+    operation_link: Option<&ValidatedOperationLink>,
 ) -> Option<Record> {
     let boot_id = observation.boot_id.as_deref()?;
     let same_boot = previous["schema_version"] == 1
@@ -685,18 +686,24 @@ fn diagnostic_for_transition(
         }
         _ => return None,
     };
-    let operation_id = (observation.unknown_operation_count == 1
-        && observation.unknown_operation_ids.len() == 1
-        && !observation.unknown_operation_ids_truncated)
-        .then(|| observation.unknown_operation_ids[0].as_str());
-    Some(
-        Record::new(severity, kind, phase)
-            .with_code(code)
-            .with_binding_id(Some(&observation.scope.binding_id))
-            .with_binding_generation(Some(observation.scope.generation))
-            .with_operation_id(operation_id)
-            .with_module_boot_id(Some(boot_id)),
-    )
+    let mut record = Record::new(severity, kind, phase)
+        .with_component(Some(Component::ModuleSupervisor))
+        .with_code(code)
+        .with_binding_id(Some(&observation.scope.binding_id))
+        .with_binding_generation(Some(observation.scope.generation))
+        .with_operation_id(operation_link.map(|link| link.operation_id.as_str()))
+        .with_module_boot_id(Some(boot_id))
+        .with_event_id(Some(&observation.event_id))
+        .with_module_id(Some(&observation.module_id))
+        .with_artifact_id(Some(&observation.artifact_id))
+        .with_artifact_version(Some(&observation.artifact_version))
+        .with_build_id(observation.build_id.as_deref());
+    if let Some(link) = operation_link {
+        record = record
+            .with_task_id(link.task_id.as_deref())
+            .with_attempt_id(link.attempt_id.as_deref());
+    }
+    Some(record)
 }
 
 fn record_lifecycle_trigger(
@@ -1478,21 +1485,36 @@ fn validate_binding_identity(
     Ok(())
 }
 
+#[derive(Debug)]
+struct ValidatedOperationLink {
+    operation_id: String,
+    task_id: Option<String>,
+    attempt_id: Option<String>,
+}
+
 fn validate_operation_ids(
     tx: &Transaction<'_>,
     observation: &ModuleSupervisorObservation,
     generation: i64,
-) -> Result<()> {
+) -> Result<Option<ValidatedOperationLink>> {
+    let has_single_exact_operation = observation.unknown_operation_count == 1
+        && observation.unknown_operation_ids.len() == 1
+        && !observation.unknown_operation_ids_truncated;
+    let mut exact_link = None;
     for operation_id in &observation.unknown_operation_ids {
-        let state: Option<String> = tx
+        let row: Option<(String, Option<String>, Option<String>, Option<String>)> = tx
             .query_row(
-                "SELECT state FROM operations WHERE operation_id=?1 AND binding_id=?2 \
-                 AND binding_generation=?3",
+                "SELECT o.state,o.task_id,o.attempt_id,a.task_id \
+                 FROM operations o LEFT JOIN attempts a \
+                   ON a.attempt_id=o.attempt_id AND a.binding_id=o.binding_id \
+                     AND a.binding_generation=o.binding_generation \
+                 WHERE o.operation_id=?1 AND o.binding_id=?2 \
+                   AND o.binding_generation=?3",
                 params![operation_id, observation.scope.binding_id, generation],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()?;
-        let Some(state) = state else {
+        let Some((state, operation_task_id, attempt_id, attempt_task_id)) = row else {
             return Err(Error::new(
                 "MODULE_OBSERVATION_OPERATION_SCOPE",
                 "listed Operation is absent or outside the exact binding generation",
@@ -1507,8 +1529,34 @@ fn validate_operation_ids(
                 "listed Operation in the exact binding generation is no longer pending",
             ));
         }
+        if has_single_exact_operation {
+            let (task_id, attempt_id) = match (
+                operation_task_id.as_deref(),
+                attempt_id.as_deref(),
+                attempt_task_id.as_deref(),
+            ) {
+                (Some(task_id), Some(attempt_id), Some(attempt_task_id))
+                    if task_id == attempt_task_id =>
+                {
+                    (Some(task_id.to_owned()), Some(attempt_id.to_owned()))
+                }
+                (None, Some(attempt_id), Some(attempt_task_id)) => (
+                    Some(attempt_task_id.to_owned()),
+                    Some(attempt_id.to_owned()),
+                ),
+                (Some(task_id), None, _) | (Some(task_id), Some(_), None) => {
+                    (Some(task_id.to_owned()), None)
+                }
+                (Some(_), Some(_), Some(_)) | (None, _, _) => (None, None),
+            };
+            exact_link = Some(ValidatedOperationLink {
+                operation_id: operation_id.clone(),
+                task_id,
+                attempt_id,
+            });
+        }
     }
-    Ok(())
+    Ok(exact_link)
 }
 
 fn payload(observation: &ModuleSupervisorObservation, generation: i64) -> Value {
@@ -1732,7 +1780,9 @@ pub(super) fn manager_attention_item(
         "module_id":observation["module_id"],
         "artifact_id":observation["artifact_id"],
         "artifact_version":observation["artifact_version"],
+        "build_id":observation["build_id"],
         "event_id":observation["event_id"],
+        "boot_id":observation["boot_id"],
         "phase":phase,
         "effect_certainty":observation["effect_certainty"],
         "certainty_scope":"latest_helper_attempt_only",

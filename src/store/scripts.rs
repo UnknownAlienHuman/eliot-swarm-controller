@@ -82,6 +82,7 @@ struct ScriptRunArtifactLinks {
 
 struct RunnerObservation {
     completion: Option<runner::Completion>,
+    process_control_failure: Option<swarm_scripts::process::ProcessControlFailure>,
     ready: Option<Value>,
     launch: Option<Value>,
     launch_departed: bool,
@@ -133,8 +134,8 @@ struct ScriptRunTriggerGrant {
 /// Store-derived permission to commit the one controller effect currently
 /// declared by the immutable script manifest. This is intentionally not a
 /// Principal: the technical caller remains the automation service, while the
-/// registered Manager, current entry, source and live Task/Attempt are
-/// revalidated at each Store boundary.
+/// registered Manager, current entry, source and exact event or Task/Attempt
+/// scope are revalidated at each Store boundary.
 #[derive(Debug, Clone)]
 pub(super) struct ScriptEffectAdmission {
     context: automation_dispatch::script_trigger_authority::ScriptRunConsumerContext,
@@ -143,12 +144,14 @@ pub(super) struct ScriptEffectAdmission {
     run_id: String,
     script_id: String,
     script_revision: i64,
-    task_id: String,
-    task_revision: i64,
-    attempt_id: String,
+    effect: manifest::ScriptControllerEffect,
+    task_id: Option<String>,
+    task_revision: Option<i64>,
+    attempt_id: Option<String>,
     request_id: String,
-    recipient: String,
-    text: String,
+    recipient: Option<String>,
+    text: Option<String>,
+    task_spec: Option<Value>,
 }
 
 struct ScriptEffectRunInput<'a> {
@@ -159,9 +162,9 @@ struct ScriptEffectRunInput<'a> {
     run_id: &'a str,
     script_id: &'a str,
     script_revision: i64,
-    task_id: &'a str,
-    task_revision: i64,
-    attempt_id: &'a str,
+    task_id: Option<&'a str>,
+    task_revision: Option<i64>,
+    attempt_id: Option<&'a str>,
     request_id: &'a str,
     effect: &'a protocol::ScriptEffectRequest,
     expected_manager_id: &'a str,
@@ -174,6 +177,7 @@ struct ScriptEffectLinkInput<'a> {
     effect_operation_id: &'a str,
     request: &'a Value,
     cause: &'a Value,
+    effect: manifest::ScriptControllerEffect,
     automatic_admission: Option<&'a ScriptEffectAdmission>,
     now_ms: i64,
 }
@@ -227,38 +231,86 @@ impl ScriptEffectAdmission {
         let entry = context.require_current_entry(db)?;
         let source = context.require_current_source(db, config, &entry, &link.cause)?;
         let (task, attempt) = context.require_live_subject(db, &source)?;
-        if source.task_id.as_deref() != Some(task_id)
-            || source.task_revision != Some(task_revision)
-            || source.attempt_id.as_deref() != Some(attempt_id)
-            || task.as_ref().and_then(|value| value["task_id"].as_str()) != Some(task_id)
-            || task.as_ref().and_then(|value| value["revision"].as_i64()) != Some(task_revision)
-            || attempt
-                .as_ref()
-                .and_then(|value| value["attempt_id"].as_str())
-                != Some(attempt_id)
-        {
-            return Err(Error::new(
-                "SCRIPT_SCOPE_CHANGED",
-                "automatic effect no longer has the exact current Manager-owned Task/Attempt",
-            ));
-        }
         effect.validate()?;
-        if effect.effect != manifest::ScriptControllerEffect::TaskOwnerMessage {
-            return Err(Error::new(
-                "SCRIPT_EFFECT_UNSUPPORTED",
-                "script controller effect is not in the supported effect set",
-            ));
-        }
-        let recipient = attempt
-            .as_ref()
-            .and_then(|value| value["owner_id"].as_str())
-            .ok_or_else(|| {
-                Error::new(
-                    "SCRIPT_SCOPE_CHANGED",
-                    "current effect Attempt has no registered Task owner",
+        let (recipient, text, task_spec) = match effect.effect {
+            manifest::ScriptControllerEffect::TaskOwnerMessage => {
+                if source.task_id.as_deref() != task_id
+                    || source.task_revision != task_revision
+                    || source.attempt_id.as_deref() != attempt_id
+                    || task.as_ref().and_then(|value| value["task_id"].as_str()) != task_id
+                    || task.as_ref().and_then(|value| value["revision"].as_i64()) != task_revision
+                    || attempt
+                        .as_ref()
+                        .and_then(|value| value["attempt_id"].as_str())
+                        != attempt_id
+                    || task_id.is_none()
+                    || task_revision.is_none()
+                    || attempt_id.is_none()
+                {
+                    return Err(Error::new(
+                        "SCRIPT_SCOPE_CHANGED",
+                        "Task-owner effect no longer has the exact current Manager-owned Task/Attempt",
+                    ));
+                }
+                let recipient = attempt
+                    .as_ref()
+                    .and_then(|value| value["owner_id"].as_str())
+                    .ok_or_else(|| {
+                        Error::new(
+                            "SCRIPT_SCOPE_CHANGED",
+                            "current effect Attempt has no registered Task owner",
+                        )
+                    })?
+                    .to_owned();
+                (Some(recipient), Some(effect.text.clone()), None)
+            }
+            manifest::ScriptControllerEffect::ManagerNotification => {
+                if link.cause["kind"] != "system_event"
+                    || task_id.is_some()
+                    || task_revision.is_some()
+                    || attempt_id.is_some()
+                    || source.task_id.is_some()
+                    || source.task_revision.is_some()
+                    || source.attempt_id.is_some()
+                    || task.is_some()
+                    || attempt.is_some()
+                {
+                    return Err(Error::new(
+                        "SCRIPT_SCOPE_CHANGED",
+                        "Manager notification requires this exact taskless system-event invocation",
+                    ));
+                }
+                (
+                    Some(context.owner_manager_id().to_owned()),
+                    Some(effect.text.clone()),
+                    None,
                 )
-            })?
-            .to_owned();
+            }
+            manifest::ScriptControllerEffect::TaskCreate => {
+                if link.cause["kind"] != "system_event"
+                    || task_id.is_some()
+                    || task_revision.is_some()
+                    || attempt_id.is_some()
+                    || source.task_id.is_some()
+                    || source.task_revision.is_some()
+                    || source.attempt_id.is_some()
+                    || task.is_some()
+                    || attempt.is_some()
+                {
+                    return Err(Error::new(
+                        "SCRIPT_SCOPE_CHANGED",
+                        "task_create requires this exact taskless system-event invocation",
+                    ));
+                }
+                let spec = effect
+                    .spec
+                    .clone()
+                    .ok_or_else(|| Error::invalid("task_create requires one strict TaskSpec"))?;
+                let parsed: model::TaskSpec = serde_json::from_value(spec.clone())?;
+                parsed.validate()?;
+                (None, None, Some(spec))
+            }
+        };
         let admission = Self {
             context,
             source_cause: link.cause,
@@ -266,19 +318,17 @@ impl ScriptEffectAdmission {
             run_id: run_id.to_owned(),
             script_id: script_id.to_owned(),
             script_revision,
-            task_id: task_id.to_owned(),
+            effect: effect.effect,
+            task_id: task_id.map(str::to_owned),
             task_revision,
-            attempt_id: attempt_id.to_owned(),
+            attempt_id: attempt_id.map(str::to_owned),
             request_id: request_id.to_owned(),
             recipient,
-            text: effect.text.clone(),
+            text,
+            task_spec,
         };
-        let request = json!({
-            "client_request_id":admission.request_id,
-            "recipient":admission.recipient,
-            "text":admission.text,
-        });
-        admission.require_current(db, config, "message.send", &request)?;
+        let request = admission.request_value();
+        admission.require_current(db, config, admission.method(), &request)?;
         Ok(admission)
     }
 
@@ -302,6 +352,30 @@ impl ScriptEffectAdmission {
         self.context.project_id()
     }
 
+    fn method(&self) -> &'static str {
+        match self.effect {
+            manifest::ScriptControllerEffect::TaskCreate => "task.create",
+            manifest::ScriptControllerEffect::TaskOwnerMessage
+            | manifest::ScriptControllerEffect::ManagerNotification => "message.send",
+        }
+    }
+
+    fn request_value(&self) -> Value {
+        match self.effect {
+            manifest::ScriptControllerEffect::TaskOwnerMessage
+            | manifest::ScriptControllerEffect::ManagerNotification => json!({
+                "client_request_id":self.request_id,
+                "recipient":self.recipient,
+                "text":self.text,
+            }),
+            manifest::ScriptControllerEffect::TaskCreate => json!({
+                "client_request_id":self.request_id,
+                "project_id":self.project_id(),
+                "spec":self.task_spec,
+            }),
+        }
+    }
+
     pub(super) fn require_current(
         &self,
         db: &Connection,
@@ -309,12 +383,7 @@ impl ScriptEffectAdmission {
         method: &str,
         params: &Value,
     ) -> Result<()> {
-        if method != "message.send"
-            || params.as_object().is_none_or(|object| object.len() != 3)
-            || model::text(params, "client_request_id")? != self.request_id
-            || model::text(params, "recipient")? != self.recipient
-            || model::text(params, "text")? != self.text
-        {
+        if method != self.method() || params != &self.request_value() {
             return Err(Error::new(
                 "SCRIPT_EFFECT_AUTHORITY_CHANGED",
                 "automatic script effect differs from its closed admitted request",
@@ -329,28 +398,34 @@ impl ScriptEffectAdmission {
             &self.run_id,
             &self.script_id,
             self.script_revision,
-            &self.task_id,
+            self.effect,
+            self.task_id.as_deref(),
             self.task_revision,
-            &self.attempt_id,
+            self.attempt_id.as_deref(),
         )
     }
 
     fn link_cause(&self, request: &Value) -> Result<Value> {
-        Ok(json!({
+        let mut cause = json!({
             "kind":"script_controller_effect",
             "id":self.request_id,
             "script_run_operation_id":self.parent_operation_id,
             "script_run_id":self.run_id,
             "script_id":self.script_id,
             "script_revision":self.script_revision,
-            "effect":"task_owner_message",
-            "task_id":self.task_id,
-            "task_revision":self.task_revision,
-            "attempt_id":self.attempt_id,
-            "recipient":self.recipient,
+            "effect":self.effect,
             "request_sha256":model::digest(model::canonical(request)?.as_bytes()),
             "effective_manager_id":self.effective_manager_id(),
-        }))
+        });
+        if let Some(recipient) = self.recipient.as_deref() {
+            cause["recipient"] = json!(recipient);
+        }
+        if self.effect == manifest::ScriptControllerEffect::TaskOwnerMessage {
+            cause["task_id"] = json!(self.task_id);
+            cause["task_revision"] = json!(self.task_revision);
+            cause["attempt_id"] = json!(self.attempt_id);
+        }
+        Ok(cause)
     }
 
     fn retain_operation_link(
@@ -369,7 +444,7 @@ impl ScriptEffectAdmission {
             automation_id: self.automation_id().to_owned(),
             automation_revision: self.automation_revision(),
             project_id: self.project_id().to_owned(),
-            action: "message.send".to_owned(),
+            action: self.method().to_owned(),
             cause,
             linked_at_ms: now_ms,
         };
@@ -410,9 +485,10 @@ fn validate_script_effect_authority(
     run_id: &str,
     script_id: &str,
     script_revision: i64,
-    task_id: &str,
-    task_revision: i64,
-    attempt_id: &str,
+    effect: manifest::ScriptControllerEffect,
+    task_id: Option<&str>,
+    task_revision: Option<i64>,
+    attempt_id: Option<&str>,
 ) -> Result<()> {
     let link = authorization::operation_link(db, parent_operation_id)?.ok_or_else(|| {
         Error::new(
@@ -438,21 +514,41 @@ fn validate_script_effect_authority(
     let entry = context.require_current_entry(db)?;
     let source = context.require_current_source(db, config, &entry, &link.cause)?;
     let (task, attempt) = context.require_live_subject(db, &source)?;
+    let scope_matches = match effect {
+        manifest::ScriptControllerEffect::TaskOwnerMessage => {
+            task_id.is_some()
+                && task_revision.is_some()
+                && attempt_id.is_some()
+                && source.task_id.as_deref() == task_id
+                && source.task_revision == task_revision
+                && source.attempt_id.as_deref() == attempt_id
+                && task.as_ref().and_then(|value| value["task_id"].as_str()) == task_id
+                && task.as_ref().and_then(|value| value["revision"].as_i64()) == task_revision
+                && attempt
+                    .as_ref()
+                    .and_then(|value| value["attempt_id"].as_str())
+                    == attempt_id
+        }
+        manifest::ScriptControllerEffect::ManagerNotification
+        | manifest::ScriptControllerEffect::TaskCreate => {
+            link.cause["kind"] == "system_event"
+                && task_id.is_none()
+                && task_revision.is_none()
+                && attempt_id.is_none()
+                && source.task_id.is_none()
+                && source.task_revision.is_none()
+                && source.attempt_id.is_none()
+                && task.is_none()
+                && attempt.is_none()
+        }
+    };
     if entry.owner_manager_id != context.owner_manager_id()
         || entry.project_id != context.project_id()
-        || source.task_id.as_deref() != Some(task_id)
-        || source.task_revision != Some(task_revision)
-        || source.attempt_id.as_deref() != Some(attempt_id)
-        || task.as_ref().and_then(|value| value["task_id"].as_str()) != Some(task_id)
-        || task.as_ref().and_then(|value| value["revision"].as_i64()) != Some(task_revision)
-        || attempt
-            .as_ref()
-            .and_then(|value| value["attempt_id"].as_str())
-            != Some(attempt_id)
+        || !scope_matches
     {
         return Err(Error::new(
             "SCRIPT_SCOPE_CHANGED",
-            "automatic effect no longer has the exact current Manager-owned Task/Attempt",
+            "automatic effect no longer has its exact current Manager-owned scope",
         ));
     }
     let parent: Option<ScriptEffectParentOperationRow> = db
@@ -492,12 +588,12 @@ fn validate_script_effect_authority(
     })?;
     if caller != authorization::AUTOMATION_TECHNICAL_REQUESTER_ID
         || method != "script.run"
-        || operation_task.as_deref() != Some(task_id)
-        || operation_attempt.as_deref() != Some(attempt_id)
+        || operation_task.as_deref() != task_id
+        || operation_attempt.as_deref() != attempt_id
         || original["script_id"] != script_id
         || original["expected_script_revision"] != script_revision
-        || original["attempt_id"] != attempt_id
-        || original["expected_task_revision"] != task_revision
+        || original["attempt_id"].as_str() != attempt_id
+        || original["expected_task_revision"].as_i64() != task_revision
     {
         return Err(Error::new(
             "SCRIPT_RUN_DAMAGED",
@@ -539,9 +635,9 @@ fn validate_script_effect_authority(
     };
     if run_script != script_id
         || run_revision != script_revision
-        || run_task.as_deref() != Some(task_id)
-        || run_task_revision != Some(task_revision)
-        || run_attempt.as_deref() != Some(attempt_id)
+        || run_task.as_deref() != task_id
+        || run_task_revision != task_revision
+        || run_attempt.as_deref() != attempt_id
     {
         return Err(Error::new(
             "SCRIPT_RUN_DAMAGED",
@@ -563,7 +659,7 @@ fn validate_script_effect_authority(
     let bundle_record = registry::bundle_record(db, script_id, script_revision)?;
     if bundle_record.artifact_id != bundle_ref
         || artifact_controller_effects(&bundle_record.metadata)? != capabilities
-        || !capabilities.contains(&manifest::ScriptControllerEffect::TaskOwnerMessage)
+        || !capabilities.contains(&effect)
     {
         return Err(Error::new(
             "SCRIPT_RUN_DAMAGED",
@@ -1299,8 +1395,31 @@ impl Store {
         let operation_id = model::new_id();
         let run_id = model::new_id();
         let token = model::new_id();
-        let invocation_effects = if task.is_some() {
-            bundle.controller_effects.clone()
+        let invocation_effects = if task.is_some() && attempt.is_some() {
+            bundle
+                .controller_effects
+                .iter()
+                .copied()
+                .filter(|effect| *effect == manifest::ScriptControllerEffect::TaskOwnerMessage)
+                .collect()
+        } else if task.is_none()
+            && attempt.is_none()
+            && trigger
+                .as_ref()
+                .is_some_and(|grant| grant.cause["kind"] == "system_event")
+        {
+            bundle
+                .controller_effects
+                .iter()
+                .copied()
+                .filter(|effect| {
+                    matches!(
+                        effect,
+                        manifest::ScriptControllerEffect::ManagerNotification
+                            | manifest::ScriptControllerEffect::TaskCreate
+                    )
+                })
+                .collect()
         } else {
             Vec::new()
         };
@@ -1746,6 +1865,10 @@ impl Store {
                     continue;
                 }
             };
+            if let Some(failure) = observed.process_control_failure.as_ref() {
+                self.record_process_control_failure(&pending, failure)
+                    .await?;
+            }
             if let Some(completion) = observed.completion {
                 if !completion_matches_retained_worker(&pending, &completion) {
                     let code = "SCRIPT_COMPLETION_DAMAGED";
@@ -1961,6 +2084,23 @@ impl Store {
         let code = code.to_owned();
         self.run(move |db| mark_unknown(db, &run_id, &code)).await?;
         if pending.operation_state != "outcome_unknown" {
+            self.changed
+                .send_modify(|revision| *revision = revision.wrapping_add(1));
+        }
+        Ok(())
+    }
+
+    async fn record_process_control_failure(
+        &self,
+        pending: &PendingRun,
+        failure: &swarm_scripts::process::ProcessControlFailure,
+    ) -> Result<()> {
+        let pending = pending.clone();
+        let failure = failure.clone();
+        let changed = self
+            .run(move |db| record_process_control_failure(db, &pending, &failure))
+            .await?;
+        if changed {
             self.changed
                 .send_modify(|revision| *revision = revision.wrapping_add(1));
         }
@@ -2591,10 +2731,13 @@ fn completion_matches_retained_worker(
 }
 
 fn observe(work: &runner::Work, files: &ArtifactFiles) -> Result<RunnerObservation> {
+    // A damaged optional diagnostic must not block a valid terminal receipt.
+    let process_control_failure = runner::process_control_failure(work).ok().flatten();
     if let Some(completion) = runner::completion(work, files)? {
         let launch_departed = runner::completion_family_departed(work, &completion)?;
         return Ok(RunnerObservation {
             completion: Some(completion),
+            process_control_failure,
             ready: None,
             launch: None,
             launch_departed,
@@ -2609,11 +2752,221 @@ fn observe(work: &runner::Work, files: &ArtifactFiles) -> Result<RunnerObservati
     };
     Ok(RunnerObservation {
         completion: None,
+        process_control_failure,
         ready,
         launch,
         launch_departed,
         has_go: runner::has_start_gate(work)?,
     })
+}
+
+fn record_process_control_failure(
+    db: &mut Connection,
+    pending: &PendingRun,
+    failure: &swarm_scripts::process::ProcessControlFailure,
+) -> Result<bool> {
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let row: Option<(
+        String,
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+        String,
+    )> = tx
+        .query_row(
+            "SELECT r.operation_id,r.state,r.process_identity_json,o.state,o.result_json,o.method \
+             FROM script_runs r JOIN operations o ON o.operation_id=r.operation_id \
+             WHERE r.run_id=?1",
+            [&pending.run_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        operation_id,
+        run_state,
+        process_identity_json,
+        operation_state,
+        previous_result_json,
+        operation_method,
+    )) = row
+    else {
+        tx.commit()?;
+        return Ok(false);
+    };
+    if operation_id != pending.operation_id
+        || operation_method != "script.run"
+        || !matches!(
+            run_state.as_str(),
+            "running" | "reconciling" | "outcome_unknown"
+        )
+        || !matches!(
+            operation_state.as_str(),
+            "native_accepted" | "outcome_unknown"
+        )
+    {
+        tx.commit()?;
+        return Ok(false);
+    }
+    let (Some(process_identity_json), Some(pending_identity_json)) = (
+        process_identity_json,
+        pending.worker_identity_json.as_deref(),
+    ) else {
+        // The receipt is retained and will be reconsidered after the exact
+        // ready identity has been durably acknowledged.
+        tx.commit()?;
+        return Ok(false);
+    };
+    if process_identity_json != pending_identity_json {
+        return Err(Error::new(
+            "SCRIPT_WORKER_IDENTITY_DAMAGED",
+            "pending and current ScriptRun worker identities differ",
+        ));
+    }
+    let identity: Value = serde_json::from_str(&process_identity_json).map_err(|_| {
+        Error::new(
+            "SCRIPT_WORKER_IDENTITY_DAMAGED",
+            "retained ScriptRun process identity cannot be parsed",
+        )
+    })?;
+    let token = identity["token"].as_str().ok_or_else(|| {
+        Error::new(
+            "SCRIPT_WORKER_IDENTITY_DAMAGED",
+            "retained ScriptRun token is missing",
+        )
+    })?;
+    if identity["run_id"] != pending.run_id
+        || identity["operation_id"] != pending.operation_id
+        || failure
+            .validate_for(
+                &pending.run_id,
+                &pending.operation_id,
+                token,
+                &identity["process"],
+            )
+            .is_err()
+    {
+        return Err(Error::new(
+            "SCRIPT_PROCESS_CONTROL_DIAGNOSTIC_INVALID",
+            "cancellation diagnostic differs from the Store-retained worker identity",
+        ));
+    }
+    let diagnostic = failure.manager_projection().map_err(|_| {
+        Error::new(
+            "SCRIPT_PROCESS_CONTROL_DIAGNOSTIC_INVALID",
+            "cancellation diagnostic cannot be safely projected",
+        )
+    })?;
+    let mut result: Value = previous_result_json
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|_| {
+            Error::new(
+                "SCRIPT_RESULT_DAMAGED",
+                "script Operation result is invalid",
+            )
+        })?
+        .unwrap_or_else(|| json!({}));
+    let object = result.as_object_mut().ok_or_else(|| {
+        Error::new(
+            "SCRIPT_RESULT_DAMAGED",
+            "script Operation result is not an object",
+        )
+    })?;
+    if let Some(previous) = object.get("process_control_diagnostic") {
+        if previous == &diagnostic {
+            tx.commit()?;
+            return Ok(false);
+        }
+        return Err(Error::new(
+            "SCRIPT_PROCESS_CONTROL_DIAGNOSTIC_CONFLICT",
+            "ScriptRun already retains a different cancellation diagnostic",
+        ));
+    }
+    object.insert("process_control_diagnostic".into(), diagnostic);
+    let now = model::now_ms()?;
+    let changed = tx.execute(
+        "UPDATE operations SET result_json=?2,updated_at_ms=?3 WHERE operation_id=?1 AND state=?4",
+        params![
+            operation_id,
+            model::canonical(&result)?,
+            now,
+            operation_state
+        ],
+    )?;
+    if changed != 1 {
+        return Err(Error::conflict(
+            "ScriptRun Operation changed while recording process control evidence",
+        ));
+    }
+    tx.commit()?;
+    Ok(true)
+}
+
+fn retain_process_control_diagnostic(
+    source_result_json: Option<&str>,
+    target: &mut Value,
+) -> Result<()> {
+    let Some(source_result_json) = source_result_json else {
+        return Ok(());
+    };
+    let source: Value = serde_json::from_str(source_result_json).map_err(|_| {
+        Error::new(
+            "SCRIPT_RESULT_DAMAGED",
+            "script Operation result is invalid",
+        )
+    })?;
+    let Some(diagnostic) = source.get("process_control_diagnostic") else {
+        return Ok(());
+    };
+    let object = diagnostic.as_object().ok_or_else(|| {
+        Error::new(
+            "SCRIPT_RESULT_DAMAGED",
+            "script process-control diagnostic is not an object",
+        )
+    })?;
+    let digest = diagnostic["process_identity_sha256"]
+        .as_str()
+        .unwrap_or_default();
+    if object.len() != 7
+        || diagnostic["schema_version"] != 1
+        || diagnostic["code"] != "SCRIPT_PROCESS_CANCEL_FAILED"
+        || diagnostic["phase"] != "cancel_children"
+        || diagnostic["status"] != "control_error_observed"
+        || !matches!(
+            diagnostic["failure_class"].as_str(),
+            Some("os_control" | "process_inventory" | "process_identity" | "other")
+        )
+        || !matches!(
+            diagnostic["process_scope"].as_str(),
+            Some("windows_job" | "linux_process_group")
+        )
+        || digest.len() != 64
+        || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(Error::new(
+            "SCRIPT_RESULT_DAMAGED",
+            "script process-control diagnostic has an invalid shape",
+        ));
+    }
+    let target = target.as_object_mut().ok_or_else(|| {
+        Error::new(
+            "SCRIPT_RESULT_DAMAGED",
+            "script Operation result is not an object",
+        )
+    })?;
+    target.insert("process_control_diagnostic".into(), diagnostic.clone());
+    Ok(())
 }
 
 fn begin_run(
@@ -3071,14 +3424,14 @@ fn settle_incomplete(
     execution_may_have_started: bool,
 ) -> Result<()> {
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let row: Option<(String, String, String)> = tx
+    let row: Option<(String, String, String, Option<String>)> = tx
         .query_row(
-            "SELECT r.operation_id,r.state,o.state FROM script_runs r JOIN operations o ON o.operation_id=r.operation_id WHERE r.run_id=?1",
+            "SELECT r.operation_id,r.state,o.state,o.result_json FROM script_runs r JOIN operations o ON o.operation_id=r.operation_id WHERE r.run_id=?1",
             [run_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?;
-    let Some((operation_id, run_state, operation_state)) = row else {
+    let Some((operation_id, run_state, operation_state, previous_result_json)) = row else {
         tx.commit()?;
         return Ok(());
     };
@@ -3090,7 +3443,7 @@ fn settle_incomplete(
         return Ok(());
     }
     let now = model::now_ms()?;
-    let result = json!({
+    let mut result = json!({
         "operation_id":operation_id,
         "run_id":run_id,
         "outcome":"incomplete",
@@ -3100,6 +3453,7 @@ fn settle_incomplete(
         "result_read_method":"operation.get",
         "controller_effects":[],
     });
+    retain_process_control_diagnostic(previous_result_json.as_deref(), &mut result)?;
     tx.execute(
         "UPDATE script_runs SET state='incomplete',finished_at_ms=?2 WHERE run_id=?1 AND state IN ('queued','sending','running','reconciling','outcome_unknown')",
         params![run_id, now],
@@ -3149,7 +3503,7 @@ fn mark_unknown_tx(tx: &Transaction<'_>, run_id: &str, code: &str, now: i64) -> 
     {
         return Ok(());
     }
-    let result = json!({
+    let mut result = json!({
         "operation_id":operation_id,
         "run_id":run_id,
         "outcome":"unknown",
@@ -3158,6 +3512,7 @@ fn mark_unknown_tx(tx: &Transaction<'_>, run_id: &str, code: &str, now: i64) -> 
         "execution_may_have_started":true,
         "controller_effects":[],
     });
+    retain_process_control_diagnostic(previous_result.as_deref(), &mut result)?;
     tx.execute(
         "UPDATE script_runs SET state='outcome_unknown' WHERE run_id=?1 AND state IN ('sending','running','reconciling','outcome_unknown')",
         [run_id],
@@ -3368,8 +3723,30 @@ fn finish(
             "retained script invocation grant is invalid",
         )
     })?;
+    let taskless_event_run = !has_task_scope
+        && caller_id == authorization::AUTOMATION_TECHNICAL_REQUESTER_ID
+        && authorization::operation_link(&tx, &operation_id)?.is_some_and(|link| {
+            link.action == "script.run" && link.cause["kind"] == "system_event"
+        });
+    let bundle_effects = artifact_controller_effects(&work_record.metadata)?;
     let expected_effects = if has_task_scope {
-        artifact_controller_effects(&work_record.metadata)?
+        bundle_effects
+            .iter()
+            .copied()
+            .filter(|effect| *effect == manifest::ScriptControllerEffect::TaskOwnerMessage)
+            .collect::<Vec<_>>()
+    } else if taskless_event_run {
+        bundle_effects
+            .iter()
+            .copied()
+            .filter(|effect| {
+                matches!(
+                    effect,
+                    manifest::ScriptControllerEffect::ManagerNotification
+                        | manifest::ScriptControllerEffect::TaskCreate
+                )
+            })
+            .collect::<Vec<_>>()
     } else {
         Vec::new()
     };
@@ -3436,19 +3813,11 @@ fn finish(
     for artifact in artifacts {
         register_output_artifact(&tx, artifact, now)?;
     }
-    let controller_effects = if completion.state == "completed" && has_task_scope {
+    let controller_effects = if completion.state == "completed" {
         completion
             .controller_effects
             .iter()
             .map(|effect| {
-                let (Some(task_id), Some(task_revision), Some(attempt_id)) =
-                    (task_id.as_deref(), task_revision, attempt_id.as_deref())
-                else {
-                    return Err(Error::new(
-                        "SCRIPT_COMPLETION_DAMAGED",
-                        "Task-owner effect has no exact Task/Attempt scope",
-                    ));
-                };
                 apply_controller_effect(
                     &tx,
                     &caller_id,
@@ -3457,9 +3826,9 @@ fn finish(
                     run_id,
                     &script_id,
                     revision,
-                    task_id,
+                    task_id.as_deref(),
                     task_revision,
-                    attempt_id,
+                    attempt_id.as_deref(),
                     effect,
                     config,
                     now,
@@ -3478,7 +3847,12 @@ fn finish(
         "incomplete" => "incomplete",
         _ => "failed",
     };
-    let result = json!({
+    let previous_result_json: Option<String> = tx.query_row(
+        "SELECT result_json FROM operations WHERE operation_id=?1",
+        [&operation_id],
+        |row| row.get(0),
+    )?;
+    let mut result = json!({
         "operation_id":operation_id,
         "run_id":run_id,
         "outcome":outcome,
@@ -3493,6 +3867,7 @@ fn finish(
         "task_revision":task_revision,
         "controller_effects":controller_effects,
     });
+    retain_process_control_diagnostic(previous_result_json.as_deref(), &mut result)?;
     tx.execute(
         "UPDATE script_runs SET state=?2,result_ref=?3,stdout_ref=?4,stderr_ref=?5,exit_code=?6,started_at_ms=COALESCE(?7,started_at_ms),finished_at_ms=?8 WHERE run_id=?1",
         params![run_id, completion.state, completion.result.artifact_id, completion.stdout.artifact_id, completion.stderr.artifact_id, completion.exit_code, completion.started_at_ms, now],
@@ -3518,17 +3893,14 @@ fn apply_controller_effect(
     run_id: &str,
     script_id: &str,
     script_revision: i64,
-    task_id: &str,
-    task_revision: i64,
-    attempt_id: &str,
+    task_id: Option<&str>,
+    task_revision: Option<i64>,
+    attempt_id: Option<&str>,
     effect: &protocol::ScriptEffectRequest,
     config: &Config,
     now: i64,
 ) -> Result<Value> {
     effect.validate()?;
-    match effect.effect {
-        manifest::ScriptControllerEffect::TaskOwnerMessage => {}
-    }
     let request_id = script_effect_request_id(operation_id, run_id, effect)?;
     let automatic_admission = if caller_id == authorization::AUTOMATION_TECHNICAL_REQUESTER_ID {
         match ScriptEffectAdmission::from_run(ScriptEffectRunInput {
@@ -3555,6 +3927,7 @@ fn apply_controller_effect(
                     run_id,
                     script_id,
                     script_revision,
+                    effect.effect,
                     task_id,
                     task_revision,
                     attempt_id,
@@ -3568,6 +3941,20 @@ fn apply_controller_effect(
     };
     let direct_actor = if automatic_admission.is_none() {
         match (|| -> Result<(Principal, Value)> {
+            if effect.effect != manifest::ScriptControllerEffect::TaskOwnerMessage {
+                return Err(Error::new(
+                    "FORBIDDEN",
+                    "Manager notification is limited to an admitted taskless event ScriptRun",
+                ));
+            }
+            let (Some(task_id), Some(task_revision), Some(attempt_id)) =
+                (task_id, task_revision, attempt_id)
+            else {
+                return Err(Error::new(
+                    "SCRIPT_SCOPE_CHANGED",
+                    "Task-owner effect requires the exact Task and Attempt scope",
+                ));
+            };
             let actor = registered_actor(tx, caller_id)?;
             if actor.role != Role::Manager {
                 return Err(Error::new(
@@ -3615,6 +4002,7 @@ fn apply_controller_effect(
                     run_id,
                     script_id,
                     script_revision,
+                    effect.effect,
                     task_id,
                     task_revision,
                     attempt_id,
@@ -3628,18 +4016,12 @@ fn apply_controller_effect(
     };
     let recipient = automatic_admission
         .as_ref()
-        .map(|admission| admission.recipient.clone())
+        .and_then(|admission| admission.recipient.clone())
         .or_else(|| {
             direct_actor
                 .as_ref()
                 .and_then(|(_, attempt)| attempt["owner_id"].as_str().map(str::to_owned))
-        })
-        .ok_or_else(|| {
-            Error::new(
-                "SCRIPT_SCOPE_CHANGED",
-                "controller effect has no current Task owner recipient",
-            )
-        })?;
+        });
     let request_exists: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM operations WHERE caller_id=?1 AND client_request_id=?3) \
          OR EXISTS(SELECT 1 FROM operations WHERE caller_id=?2 AND client_request_id=?3)",
@@ -3654,6 +4036,7 @@ fn apply_controller_effect(
             run_id,
             script_id,
             script_revision,
+            effect.effect,
             task_id,
             task_revision,
             attempt_id,
@@ -3663,16 +4046,41 @@ fn apply_controller_effect(
             ),
         ));
     }
-    let request = json!({
-        "client_request_id":request_id,
-        "recipient":recipient,
-        "text":effect.text,
-    });
+    let action_method = match effect.effect {
+        manifest::ScriptControllerEffect::TaskCreate => "task.create",
+        manifest::ScriptControllerEffect::TaskOwnerMessage
+        | manifest::ScriptControllerEffect::ManagerNotification => "message.send",
+    };
+    let request = if effect.effect == manifest::ScriptControllerEffect::TaskCreate {
+        let admission = automatic_admission.as_ref().ok_or_else(|| {
+            Error::new(
+                "SCRIPT_EFFECT_DAMAGED",
+                "task_create lost its taskless event admission",
+            )
+        })?;
+        json!({
+            "client_request_id":request_id,
+            "project_id":admission.project_id(),
+            "spec":effect.spec,
+        })
+    } else {
+        let recipient = recipient.as_deref().ok_or_else(|| {
+            Error::new(
+                "SCRIPT_SCOPE_CHANGED",
+                "message effect has no Store-derived recipient",
+            )
+        })?;
+        json!({
+            "client_request_id":request_id,
+            "recipient":recipient,
+            "text":effect.text,
+        })
+    };
     let action = match automatic_admission.as_ref() {
         Some(admission) => super::mutate_script_effect_in_transaction(
             tx,
             admission,
-            "message.send",
+            action_method,
             &request,
             config,
             now,
@@ -3684,7 +4092,7 @@ fn apply_controller_effect(
                     "direct script effect lost its authenticated Manager",
                 )
             })?;
-            super::mutate_in_transaction(tx, actor, "message.send", &request, config, now)
+            super::mutate_in_transaction(tx, actor, action_method, &request, config, now)
         }
     };
     let (action_value, action_error) = match action {
@@ -3699,8 +4107,8 @@ fn apply_controller_effect(
         .unwrap_or(caller_id);
     let action_operation_id: Option<String> = tx
         .query_row(
-            "SELECT operation_id FROM operations WHERE caller_id=?1 AND client_request_id=?2 AND method='message.send'",
-            params![action_caller_id, request_id],
+            "SELECT operation_id FROM operations WHERE caller_id=?1 AND client_request_id=?2 AND method=?3",
+            params![action_caller_id, request_id, action_method],
             |row| row.get(0),
         )
         .optional()?;
@@ -3710,6 +4118,7 @@ fn apply_controller_effect(
         run_id,
         script_id,
         script_revision,
+        effect.effect,
         task_id,
         task_revision,
         attempt_id,
@@ -3724,22 +4133,43 @@ fn apply_controller_effect(
                 effect_operation_id,
                 request: &request,
                 cause: &cause,
+                effect: effect.effect,
                 automatic_admission: automatic_admission.as_ref(),
                 now_ms: now,
             },
         )?;
     }
     match (action_value, action_error) {
-        (Some(value), None) => Ok(json!({
-            "effect":"task_owner_message",
-            "status":"applied",
-            "operation_id":action_operation_id,
-            "message_id":value["message_id"],
-            "recipient":recipient,
-            "cause":cause,
-        })),
+        (Some(value), None) => {
+            if effect.effect == manifest::ScriptControllerEffect::TaskCreate {
+                Ok(json!({
+                    "effect":effect.effect,
+                    "status":"applied",
+                    "operation_id":action_operation_id,
+                    "task_id":value["task_id"],
+                    "task_revision":value["revision"],
+                    "created":value["created"],
+                    "cause":cause,
+                }))
+            } else {
+                let recipient = recipient.as_deref().ok_or_else(|| {
+                    Error::new(
+                        "SCRIPT_EFFECT_DAMAGED",
+                        "message effect lost its Store-derived recipient",
+                    )
+                })?;
+                Ok(json!({
+                    "effect":effect.effect,
+                    "status":"applied",
+                    "operation_id":action_operation_id,
+                    "message_id":value["message_id"],
+                    "recipient":recipient,
+                    "cause":cause,
+                }))
+            }
+        }
         (_, Some(error)) => Ok(json!({
-            "effect":"task_owner_message",
+            "effect":effect.effect,
             "status":"rejected",
             "operation_id":action_operation_id,
             "error":{"code":error.code,"message":error.message},
@@ -3760,9 +4190,10 @@ fn controller_effect_rejection(
     run_id: &str,
     script_id: &str,
     script_revision: i64,
-    task_id: &str,
-    task_revision: i64,
-    attempt_id: &str,
+    effect_kind: manifest::ScriptControllerEffect,
+    task_id: Option<&str>,
+    task_revision: Option<i64>,
+    attempt_id: Option<&str>,
     error: &Error,
 ) -> Value {
     json!({
@@ -3770,7 +4201,7 @@ fn controller_effect_rejection(
         "status":"rejected",
         "operation_id":Value::Null,
         "error":{"code":error.code,"message":error.message},
-        "cause":script_effect_cause(effective_manager_id,operation_id,run_id,script_id,script_revision,task_id,task_revision,attempt_id),
+        "cause":script_effect_cause(effective_manager_id,operation_id,run_id,script_id,script_revision,effect_kind,task_id,task_revision,attempt_id),
     })
 }
 
@@ -3781,24 +4212,28 @@ fn script_effect_cause(
     run_id: &str,
     script_id: &str,
     script_revision: i64,
-    task_id: &str,
-    task_revision: i64,
-    attempt_id: &str,
+    effect: manifest::ScriptControllerEffect,
+    task_id: Option<&str>,
+    task_revision: Option<i64>,
+    attempt_id: Option<&str>,
 ) -> Value {
-    json!({
+    let mut cause = json!({
         "kind":"script_invocation",
         "id":operation_id,
         "script_run_operation_id":operation_id,
         "script_run_id":run_id,
         "identity":{
             "script_id":script_id,
-            "script_revision":script_revision,
-            "task_id":task_id,
-            "task_revision":task_revision,
-            "attempt_id":attempt_id,
+            "script_revision":script_revision
         },
         "effective_manager_id":manager_id,
-    })
+    });
+    if effect == manifest::ScriptControllerEffect::TaskOwnerMessage {
+        cause["identity"]["task_id"] = json!(task_id);
+        cause["identity"]["task_revision"] = json!(task_revision);
+        cause["identity"]["attempt_id"] = json!(attempt_id);
+    }
+    cause
 }
 
 fn script_effect_request_id(
@@ -3821,6 +4256,7 @@ fn retain_script_effect_link(tx: &Transaction<'_>, input: ScriptEffectLinkInput<
         effect_operation_id,
         request,
         cause,
+        effect,
         automatic_admission,
         now_ms,
     } = input;
@@ -3850,7 +4286,12 @@ fn retain_script_effect_link(tx: &Transaction<'_>, input: ScriptEffectLinkInput<
             "effect Operation disappeared before its script link was retained",
         ));
     };
-    if method != "message.send"
+    let action_method = match effect {
+        manifest::ScriptControllerEffect::TaskCreate => "task.create",
+        manifest::ScriptControllerEffect::TaskOwnerMessage
+        | manifest::ScriptControllerEffect::ManagerNotification => "message.send",
+    };
+    if method != action_method
         || caller != caller_id
         || model::canonical(&serde_json::from_str::<Value>(&original)?)?
             != model::canonical(request)?
@@ -3866,13 +4307,14 @@ fn retain_script_effect_link(tx: &Transaction<'_>, input: ScriptEffectLinkInput<
         "operation_id":effect_operation_id,
         "technical_requester_id":caller_id,
         "effective_manager_id":effective_manager_id,
-        "action":"message.send",
-        "grant":"task_owner_message",
+        "action":action_method,
+        "grant":effect,
         "cause":cause,
     });
     if let Some(admission) = automatic_admission {
         if caller_id != admission.technical_requester_id()
             || effective_manager_id != admission.effective_manager_id()
+            || effect != admission.effect
         {
             return Err(Error::new(
                 "SCRIPT_EFFECT_DAMAGED",
@@ -4219,6 +4661,7 @@ mod controller_effect_tests {
         protocol::ScriptEffectRequest {
             effect: manifest::ScriptControllerEffect::TaskOwnerMessage,
             text: "The bounded fixture finished.".to_owned(),
+            spec: None,
         }
     }
 

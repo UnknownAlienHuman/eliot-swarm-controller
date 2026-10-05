@@ -43,8 +43,10 @@ const MAX_SEGMENT_BYTES: u64 = 1_073_741_824;
 const MAX_RETENTION_BYTES: u64 = 8_589_934_592;
 const MAX_RETENTION_DAYS: u64 = 3650;
 
-/// Exact wire shapes emitted by `swarm-telemetry` schemas 1 and 2. Unknown
-/// fields are rejected so the observer cannot silently claim newer coverage.
+/// Exact wire shapes emitted by `swarm-telemetry` schemas 1 through 3.
+/// Unknown fields are rejected so the observer cannot silently claim newer
+/// coverage; schemas 1 and 2 remain readable without the schema-3 correlation
+/// identities.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DiagnosticRecord {
@@ -55,6 +57,8 @@ pub struct DiagnosticRecord {
     pub severity: String,
     pub kind: String,
     pub phase: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -71,6 +75,20 @@ pub struct DiagnosticRecord {
     pub operation_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub module_boot_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub module_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<String>,
 }
 
 pub fn decode_line(line: &[u8]) -> Result<DiagnosticRecord> {
@@ -86,16 +104,30 @@ pub fn decode_line(line: &[u8]) -> Result<DiagnosticRecord> {
             "diagnostic line is not the supported metadata schema",
         )
     })?;
-    if !matches!(record.schema_version, 1 | 2) {
+    if !matches!(record.schema_version, 1 | 2 | 3) {
         return Err(Error::new(
             "OBSERVER_SCHEMA_UNSUPPORTED",
             "diagnostic schema version is unsupported",
         ));
     }
-    if record.schema_version == 1 && record.binding_generation.is_some() {
+    let has_schema3_identity = record.event_id.is_some()
+        || record.component.is_some()
+        || record.module_id.is_some()
+        || record.artifact_id.is_some()
+        || record.artifact_version.is_some()
+        || record.build_id.is_some()
+        || record.task_id.is_some()
+        || record.attempt_id.is_some();
+    if record.schema_version == 1 && (record.binding_generation.is_some() || has_schema3_identity) {
         return Err(Error::new(
             "OBSERVER_SCHEMA_UNSUPPORTED",
-            "diagnostic schema-1 record contains a schema-2 field",
+            "diagnostic schema-1 record contains a newer-schema field",
+        ));
+    }
+    if record.schema_version == 2 && has_schema3_identity {
+        return Err(Error::new(
+            "OBSERVER_SCHEMA_UNSUPPORTED",
+            "diagnostic schema-2 record contains a schema-3 field",
         ));
     }
     validate_record(&record)?;
@@ -176,6 +208,24 @@ fn validate_record(record: &DiagnosticRecord) -> Result<()> {
             ));
         }
     }
+    for (value, max_bytes, punctuation) in [
+        (record.event_id.as_deref(), 256, &b"-_.:"[..]),
+        (record.module_id.as_deref(), 128, &b"._:-"[..]),
+        (record.artifact_id.as_deref(), 128, &b"._:-"[..]),
+        (record.artifact_version.as_deref(), 128, &b".+_-"[..]),
+        (record.build_id.as_deref(), 128, &b"._:-+"[..]),
+        (record.task_id.as_deref(), 128, &b"-_.:"[..]),
+        (record.attempt_id.as_deref(), 128, &b"-_.:"[..]),
+    ] {
+        if let Some(value) = value
+            && !valid_metadata_identity(value, max_bytes, punctuation)
+        {
+            return Err(Error::new(
+                "OBSERVER_RECORD_INVALID",
+                "diagnostic correlation identity is outside the bounded metadata vocabulary",
+            ));
+        }
+    }
     if record.schema_version == 2
         && matches!(record.kind.as_str(), "module_started" | "module_stopped")
         && (record.binding_id.is_none()
@@ -187,7 +237,36 @@ fn validate_record(record: &DiagnosticRecord) -> Result<()> {
             "schema-2 module diagnostics require exact binding, generation, and boot identities",
         ));
     }
+    if record.schema_version == 3 {
+        let is_module = matches!(record.kind.as_str(), "module_started" | "module_stopped");
+        if !is_module
+            || record.component.as_deref() != Some("module_supervisor")
+            || record.event_id.is_none()
+            || record.module_id.is_none()
+            || record.artifact_id.is_none()
+            || record.artifact_version.is_none()
+            || record.binding_id.is_none()
+            || record.binding_generation.is_none()
+            || record.module_boot_id.is_none()
+            || (record.attempt_id.is_some() && record.task_id.is_none())
+            || ((record.task_id.is_some() || record.attempt_id.is_some())
+                && record.operation_id.is_none())
+        {
+            return Err(Error::new(
+                "OBSERVER_RECORD_INVALID",
+                "schema-3 module diagnostics require exact event, module, artifact, binding, and boot identities",
+            ));
+        }
+    }
     Ok(())
+}
+
+fn valid_metadata_identity(value: &str, max_bytes: usize, punctuation: &[u8]) -> bool {
+    !value.is_empty()
+        && value.len() <= max_bytes
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || punctuation.contains(&byte))
 }
 
 #[derive(Clone, Debug)]
@@ -1086,6 +1165,33 @@ pub struct TimelineItemMetadata {
     pub operation_id: Option<String>,
     pub payload_present: bool,
     pub gap_present: bool,
+    /// Exact bounded loss metadata from the authorized Store page. No source
+    /// payload is copied into the observer snapshot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gap: Option<TimelineGapMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TimelineGapMetadata {
+    pub reason: &'static str,
+    pub item_serialized_bytes: u64,
+    pub payload_serialized_bytes: u64,
+    pub max_single_item_bytes: u64,
+    pub payload_digest: String,
+    pub detached_reference: TimelineDetachedReference,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TimelineDetachedReference {
+    Observation {
+        observation_id: u64,
+    },
+    Artifact {
+        artifact_id: String,
+        range_reads: &'static str,
+        observation_id: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1096,7 +1202,33 @@ pub struct AttentionItemMetadata {
     pub generation: Option<i64>,
     pub manager_actionable: Option<bool>,
     pub source: Option<AttentionSourceMetadata>,
+    /// Closed, identity-preserving view of a Manager-visible supervisor
+    /// failure. The raw Store address and diagnostic payload are never copied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub module_supervisor: Option<ModuleSupervisorFailureMetadata>,
     pub gap_present: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ModuleSupervisorFailureMetadata {
+    pub component: &'static str,
+    pub event_id: String,
+    pub module_id: String,
+    pub artifact_id: String,
+    pub artifact_version: String,
+    pub build_id: Option<String>,
+    pub binding_id: String,
+    pub generation: i64,
+    pub boot_id: Option<String>,
+    pub phase: String,
+    pub effect_certainty: String,
+    pub certainty_scope: &'static str,
+    pub stage: Option<String>,
+    pub error_code: Option<String>,
+    pub unknown_operation_ids: Vec<String>,
+    pub unknown_operation_count: u64,
+    pub unknown_operation_ids_truncated: bool,
+    pub retry_authorized: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1288,6 +1420,166 @@ fn checked_token(token: &str) -> Result<String> {
     Ok(token.to_owned())
 }
 
+fn checked_identity(value: &Value, key: &str, max_len: usize, extra: &[u8]) -> Result<String> {
+    let identity = value
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|identity| {
+            !identity.is_empty()
+                && identity.len() <= max_len
+                && identity
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || extra.contains(&byte))
+        })
+        .ok_or_else(schema_error)?;
+    Ok(identity.to_owned())
+}
+
+fn optional_identity(
+    value: &Value,
+    key: &str,
+    max_len: usize,
+    extra: &[u8],
+) -> Result<Option<String>> {
+    match value.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(identity))
+            if !identity.is_empty()
+                && identity.len() <= max_len
+                && identity
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || extra.contains(&byte)) =>
+        {
+            Ok(Some(identity.clone()))
+        }
+        _ => Err(schema_error()),
+    }
+}
+
+fn project_module_supervisor_failure(
+    item: &Value,
+    binding_id: &str,
+    generation: i64,
+) -> Result<ModuleSupervisorFailureMetadata> {
+    const TOKEN_EXTRA: &[u8] = b"-_.:";
+    const ATOM_EXTRA: &[u8] = b"._:-";
+    const BUILD_EXTRA: &[u8] = b"._:-+";
+    const VERSION_EXTRA: &[u8] = b".+_-";
+    const MAX_OPERATION_IDS: usize = 256;
+    const MAX_OPERATION_COUNT: u64 = 1_000_000;
+
+    let address = item
+        .get("address")
+        .and_then(Value::as_object)
+        .map(|_| &item["address"])
+        .ok_or_else(schema_error)?;
+    let projected_binding_id = checked_identity(address, "binding_id", 128, TOKEN_EXTRA)?;
+    let projected_generation = address
+        .get("generation")
+        .and_then(Value::as_i64)
+        .filter(|value| *value > 0)
+        .ok_or_else(schema_error)?;
+    if projected_binding_id != binding_id || projected_generation != generation {
+        return Err(schema_error());
+    }
+
+    let phase = required_token(address, "phase")?;
+    if !matches!(
+        phase.as_str(),
+        "waiting_for_demand"
+            | "waiting_for_kernel"
+            | "starting"
+            | "ready"
+            | "restart_backoff"
+            | "exited"
+            | "exited_proven"
+            | "owner_retained"
+            | "identity_unknown"
+            | "completed"
+            | "isolated"
+    ) {
+        return Err(schema_error());
+    }
+    let effect_certainty = required_token(address, "effect_certainty")?;
+    if !matches!(effect_certainty.as_str(), "unknown" | "not_started")
+        || address["certainty_scope"] != "latest_helper_attempt_only"
+        || required_bool(address, "retry_authorized")?
+    {
+        return Err(schema_error());
+    }
+
+    let stage = optional_token(address, "stage")?;
+    if stage.as_deref().is_some_and(|stage| {
+        !matches!(
+            stage,
+            "resolve_refs" | "validate_launch" | "spawn" | "worker" | "owner" | "store" | "journal"
+        )
+    }) {
+        return Err(schema_error());
+    }
+    let error_code = optional_identity(address, "error_code", 128, b"_")?;
+    if error_code.as_deref().is_some_and(|code| {
+        !code
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+    }) || (stage.is_some() && error_code.is_none())
+        || (effect_certainty == "not_started"
+            && !stage
+                .as_deref()
+                .is_some_and(|stage| matches!(stage, "resolve_refs" | "validate_launch")))
+    {
+        return Err(schema_error());
+    }
+
+    let ids = address
+        .get("unknown_operation_ids")
+        .and_then(Value::as_array)
+        .filter(|ids| ids.len() <= MAX_OPERATION_IDS)
+        .ok_or_else(schema_error)?;
+    let mut unknown_operation_ids = Vec::with_capacity(ids.len());
+    for id in ids {
+        let id = id.as_str().ok_or_else(schema_error)?;
+        unknown_operation_ids.push(checked_token(id)?);
+    }
+    if unknown_operation_ids
+        .windows(2)
+        .any(|pair| pair[0] >= pair[1])
+    {
+        return Err(schema_error());
+    }
+    let unknown_operation_count = required_u64(address, "unknown_operation_count")?;
+    let unknown_operation_ids_truncated =
+        required_bool(address, "unknown_operation_ids_truncated")?;
+    if unknown_operation_count > MAX_OPERATION_COUNT
+        || unknown_operation_count < unknown_operation_ids.len() as u64
+        || unknown_operation_ids_truncated
+            != (unknown_operation_count > unknown_operation_ids.len() as u64)
+    {
+        return Err(schema_error());
+    }
+
+    Ok(ModuleSupervisorFailureMetadata {
+        component: "module_supervisor",
+        event_id: checked_identity(address, "event_id", 256, TOKEN_EXTRA)?,
+        module_id: checked_identity(address, "module_id", 128, ATOM_EXTRA)?,
+        artifact_id: checked_identity(address, "artifact_id", 128, ATOM_EXTRA)?,
+        artifact_version: checked_identity(address, "artifact_version", 128, VERSION_EXTRA)?,
+        build_id: optional_identity(address, "build_id", 128, BUILD_EXTRA)?,
+        binding_id: projected_binding_id,
+        generation: projected_generation,
+        boot_id: optional_identity(address, "boot_id", 128, TOKEN_EXTRA)?,
+        phase,
+        effect_certainty,
+        certainty_scope: "latest_helper_attempt_only",
+        stage,
+        error_code,
+        unknown_operation_ids,
+        unknown_operation_count,
+        unknown_operation_ids_truncated,
+        retry_authorized: false,
+    })
+}
+
 fn project_report_page<T>(
     raw: Value,
     limit: u64,
@@ -1347,17 +1639,89 @@ fn project_timeline_item(item: &Value) -> Result<TimelineItemMetadata> {
         .and_then(Value::as_i64)
         .ok_or_else(schema_error)?;
     let item_object = item.as_object().ok_or_else(schema_error)?;
+    let gap = match item.get("gap") {
+        None => None,
+        Some(gap) => Some(project_timeline_gap(gap, cursor)?),
+    };
     Ok(TimelineItemMetadata {
         cursor,
         kind: required_token(item, "kind")?,
         recorded_at_ms,
         operation_id: optional_token(item, "operation_id")?,
         payload_present: item_object.contains_key("payload"),
-        gap_present: item.get("gap").is_some(),
+        gap_present: gap.is_some(),
+        gap,
+    })
+}
+
+fn project_timeline_gap(gap: &Value, cursor: u64) -> Result<TimelineGapMetadata> {
+    let reason = match required_token(gap, "reason")?.as_str() {
+        "item_exceeds_single_item_bytes" => "item_exceeds_single_item_bytes",
+        "item_exceeds_page_byte_budget" => "item_exceeds_page_byte_budget",
+        _ => return Err(schema_error()),
+    };
+    let item_serialized_bytes = required_u64(gap, "item_serialized_bytes")?;
+    let payload_serialized_bytes = required_u64(gap, "payload_serialized_bytes")?;
+    let max_single_item_bytes = required_u64(gap, "max_single_item_bytes")?;
+    if item_serialized_bytes == 0
+        || payload_serialized_bytes == 0
+        || payload_serialized_bytes > item_serialized_bytes
+        || max_single_item_bytes == 0
+        || (reason == "item_exceeds_single_item_bytes"
+            && item_serialized_bytes <= max_single_item_bytes)
+        || (reason == "item_exceeds_page_byte_budget"
+            && item_serialized_bytes > max_single_item_bytes)
+    {
+        return Err(schema_error());
+    }
+
+    let payload_digest = required_token(gap, "payload_digest")?;
+    if payload_digest.len() != 64
+        || !payload_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(schema_error());
+    }
+    let detached_reference = gap
+        .get("detached_reference")
+        .filter(|value| value.is_object())
+        .ok_or_else(schema_error)?;
+    let observation_id = required_u64(detached_reference, "observation_id")?;
+    if observation_id != cursor {
+        return Err(schema_error());
+    }
+    let detached_reference = match required_token(detached_reference, "kind")?.as_str() {
+        "observation" if gap.get("artifact_ref").is_none() => {
+            TimelineDetachedReference::Observation { observation_id }
+        }
+        "artifact" => {
+            let artifact_id = required_token(detached_reference, "artifact_id")?;
+            if gap.get("artifact_ref").and_then(Value::as_str) != Some(artifact_id.as_str())
+                || required_token(detached_reference, "range_reads")? != "artifact.read"
+            {
+                return Err(schema_error());
+            }
+            TimelineDetachedReference::Artifact {
+                artifact_id,
+                range_reads: "artifact.read",
+                observation_id,
+            }
+        }
+        _ => return Err(schema_error()),
+    };
+    Ok(TimelineGapMetadata {
+        reason,
+        item_serialized_bytes,
+        payload_serialized_bytes,
+        max_single_item_bytes,
+        payload_digest,
+        detached_reference,
     })
 }
 
 fn project_attention_item(item: &Value) -> Result<AttentionItemMetadata> {
+    let kind = required_token(item, "kind")?;
     let source = match item.get("source") {
         None | Some(Value::Null) => None,
         Some(source) => Some(AttentionSourceMetadata {
@@ -1370,13 +1734,30 @@ fn project_attention_item(item: &Value) -> Result<AttentionItemMetadata> {
     if generation.is_some_and(|generation| generation < 0) {
         return Err(schema_error());
     }
+    let binding_id = optional_token(item, "binding_id")?;
+    let module_supervisor = if kind == "module_supervisor_failure" {
+        let source = source.as_ref().ok_or_else(schema_error)?;
+        if source.kind != "module_supervisor" {
+            return Err(schema_error());
+        }
+        let binding_id = binding_id.as_deref().ok_or_else(schema_error)?;
+        let generation = generation
+            .filter(|generation| *generation > 0)
+            .ok_or_else(schema_error)?;
+        Some(project_module_supervisor_failure(
+            item, binding_id, generation,
+        )?)
+    } else {
+        None
+    };
     Ok(AttentionItemMetadata {
-        kind: required_token(item, "kind")?,
+        kind,
         scope_key: optional_token(item, "scope_key")?,
-        binding_id: optional_token(item, "binding_id")?,
+        binding_id,
         generation,
         manager_actionable: optional_bool(item, "manager_actionable")?,
         source,
+        module_supervisor,
         gap_present: item.get("gap").is_some(),
     })
 }

@@ -1,7 +1,8 @@
 //! Static MCP catalogue metadata and session-local discovery projections.
 //!
-//! Hard method authorization remains in `profiles::allows_method` and the
-//! application. This module adds presentation only: role cores, bounded
+//! Profile filters limit this frontend's presentation and dispatch. The
+//! authenticated Store remains authoritative for each application method.
+//! This module adds presentation only: role cores, bounded
 //! `tools/list` pages, and a catalog-only search result that never dispatches
 //! an application method.
 
@@ -134,8 +135,8 @@ impl LoadTier {
 }
 
 /// Search and presentation information for one implemented application
-/// method. `audiences` describes intended fit; `profiles::allows_method`
-/// remains the hard method boundary.
+/// method. `audiences` describes intended fit; the Store checks the selected
+/// credential's actual scope after any frontend profile filter.
 #[derive(Debug, Clone, Copy)]
 pub struct ToolMetadata {
     pub method: &'static str,
@@ -2266,7 +2267,7 @@ impl Surface {
         }
         for method in exact_manual_methods {
             let method = canonical_method(method).ok_or(CatalogError::InvalidSurface)?;
-            if !profiles::allows_method(profile, method)
+            if !profiles::exposes_method(profile, method)
                 || metadata_for(method).map(|metadata| metadata.load_tier)
                     != Some(LoadTier::ManualOnly)
             {
@@ -2672,7 +2673,7 @@ where
     validate_registry_metadata()?;
     let mut entries: Vec<_> = TOOL_METADATA
         .iter()
-        .filter(|metadata| profiles::allows_method(profile, metadata.method))
+        .filter(|metadata| profiles::exposes_method(profile, metadata.method))
         .filter(|metadata| object_authorized(metadata.method, search_context))
         .collect();
     entries.sort_by(|left, right| metadata_order(left, right));

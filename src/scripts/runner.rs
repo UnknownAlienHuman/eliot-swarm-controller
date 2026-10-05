@@ -33,6 +33,9 @@ use super::{
     protocol::{ScriptEffectRequest, ScriptInvocation, ScriptResult},
     registry,
 };
+use swarm_scripts::process::{
+    MAX_PROCESS_CONTROL_FAILURE_BYTES, PROCESS_CONTROL_FAILURE_FILE, ProcessControlFailure,
+};
 
 const CONTROL_LIMIT: usize = 16 * 1024 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -433,6 +436,64 @@ pub fn ready(work: &Work) -> Result<Option<Value>> {
         ));
     }
     Ok(Some(identity))
+}
+
+/// Read the worker's single bounded cancellation-control diagnostic. This is
+/// advisory evidence and never proves process departure or completion.
+pub fn process_control_failure(work: &Work) -> Result<Option<ProcessControlFailure>> {
+    let dir = directory(&work.data_dir, &work.run_id)?;
+    let path = dir.join(PROCESS_CONTROL_FAILURE_FILE);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > MAX_PROCESS_CONTROL_FAILURE_BYTES as u64
+    {
+        return Err(Error::new(
+            "SCRIPT_PROCESS_CONTROL_DIAGNOSTIC_INVALID",
+            "script cancellation diagnostic is not a bounded regular file",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(MAX_PROCESS_CONTROL_FAILURE_BYTES);
+    OpenOptions::new()
+        .read(true)
+        .open(&path)?
+        .take((MAX_PROCESS_CONTROL_FAILURE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_PROCESS_CONTROL_FAILURE_BYTES {
+        return Err(Error::new(
+            "SCRIPT_PROCESS_CONTROL_DIAGNOSTIC_INVALID",
+            "script cancellation diagnostic exceeds its size limit",
+        ));
+    }
+    let failure: ProcessControlFailure = serde_json::from_slice(&bytes).map_err(|_| {
+        Error::new(
+            "SCRIPT_PROCESS_CONTROL_DIAGNOSTIC_INVALID",
+            "script cancellation diagnostic cannot be parsed",
+        )
+    })?;
+    let worker = read_json(&dir.join("worker.json"))?;
+    if worker["run_id"] != work.run_id
+        || worker["operation_id"] != work.operation_id
+        || worker["token"] != work.token
+        || failure
+            .validate_for(
+                &work.run_id,
+                &work.operation_id,
+                &work.token,
+                &worker["process"],
+            )
+            .is_err()
+    {
+        return Err(Error::new(
+            "SCRIPT_PROCESS_CONTROL_DIAGNOSTIC_INVALID",
+            "script cancellation diagnostic differs from its exact worker",
+        ));
+    }
+    Ok(Some(failure))
 }
 
 pub fn allow(work: &Work) -> Result<()> {
@@ -1022,11 +1083,17 @@ fn execute(work: &Work, dir: &Path, group: &Group, identity: &Value) -> Result<(
     }
     let started_at_ms = model::now_ms()?;
     let mut child = command.spawn()?;
+    let mut cancellation_failure_reported = false;
     if let Err(error) = write_once(
         &dir.join("started.json"),
         &model::canonical(&json!({"pid":child.id(),"started_at_ms":started_at_ms,"run_id":work.run_id,"operation_id":work.operation_id,"token":work.token}))?.into_bytes(),
     ) {
-        let _ = group.cancel_children();
+        cancel_children_and_record(
+            work,
+            group,
+            identity,
+            &mut cancellation_failure_reported,
+        );
         return Err(Error::new("SCRIPT_CHILD_STARTED", error.to_string()));
     }
     let overflow = Arc::new(AtomicBool::new(false));
@@ -1059,7 +1126,7 @@ fn execute(work: &Work, dir: &Path, group: &Group, identity: &Value) -> Result<(
     let mut status = None;
     loop {
         if overflow.load(Ordering::Acquire) {
-            let _ = group.cancel_children();
+            cancel_children_and_record(work, group, identity, &mut cancellation_failure_reported);
             break;
         }
         match child.try_wait() {
@@ -1069,13 +1136,18 @@ fn execute(work: &Work, dir: &Path, group: &Group, identity: &Value) -> Result<(
             }
             Ok(None) => {}
             Err(error) => {
-                let _ = group.cancel_children();
+                cancel_children_and_record(
+                    work,
+                    group,
+                    identity,
+                    &mut cancellation_failure_reported,
+                );
                 return Err(error.into());
             }
         }
         if Instant::now() >= deadline {
             timed_out = true;
-            let _ = group.cancel_children();
+            cancel_children_and_record(work, group, identity, &mut cancellation_failure_reported);
             break;
         }
         thread::sleep(POLL_INTERVAL);
@@ -1084,7 +1156,7 @@ fn execute(work: &Work, dir: &Path, group: &Group, identity: &Value) -> Result<(
         status = Some(child.wait()?);
     }
     while !group.children_empty()? {
-        let _ = group.cancel_children();
+        cancel_children_and_record(work, group, identity, &mut cancellation_failure_reported);
         thread::sleep(POLL_INTERVAL);
     }
     group.disarm()?;
@@ -1300,11 +1372,12 @@ fn finish_worker_error(
     error_code: String,
     state: &str,
 ) -> Result<()> {
+    let mut cancellation_failure_reported = false;
     while !group.children_empty()? {
         // A member can spawn another exact-group child while the previous
         // cancellation scan is in progress. Keep rescanning until the same
         // group is empty, as the normal execution drain path does.
-        let _ = group.cancel_children();
+        cancel_children_and_record(work, group, identity, &mut cancellation_failure_reported);
         thread::sleep(POLL_INTERVAL);
     }
     group.disarm()?;
@@ -1532,6 +1605,80 @@ fn write_once(path: &Path, bytes: &[u8]) -> Result<()> {
         platform::private_permissions(path, false)?;
     }
     result
+}
+
+fn write_process_control_failure(work: &Work, identity: &Value, error_code: &str) -> Result<()> {
+    let failure = ProcessControlFailure::cancel_children(
+        work.run_id.clone(),
+        work.operation_id.clone(),
+        work.token.clone(),
+        identity["process"].clone(),
+        error_code,
+    );
+    failure
+        .validate_for(
+            &work.run_id,
+            &work.operation_id,
+            &work.token,
+            &identity["process"],
+        )
+        .map_err(|_| {
+            Error::new(
+                "SCRIPT_PROCESS_CONTROL_DIAGNOSTIC_INVALID",
+                "script worker process identity cannot be recorded",
+            )
+        })?;
+    let bytes = model::canonical(&json!(failure))?.into_bytes();
+    if bytes.len() > MAX_PROCESS_CONTROL_FAILURE_BYTES {
+        return Err(Error::new(
+            "SCRIPT_PROCESS_CONTROL_DIAGNOSTIC_INVALID",
+            "script cancellation diagnostic exceeds its size limit",
+        ));
+    }
+    let path = directory(&work.data_dir, &work.run_id)?.join(PROCESS_CONTROL_FAILURE_FILE);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata)
+            if metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || metadata.len() > MAX_PROCESS_CONTROL_FAILURE_BYTES as u64 =>
+        {
+            Err(Error::new(
+                "SCRIPT_PROCESS_CONTROL_DIAGNOSTIC_INVALID",
+                "retained script cancellation diagnostic is not bounded and regular",
+            ))
+        }
+        Ok(_) => {
+            let mut retained = Vec::with_capacity(MAX_PROCESS_CONTROL_FAILURE_BYTES);
+            OpenOptions::new()
+                .read(true)
+                .open(&path)?
+                .take((MAX_PROCESS_CONTROL_FAILURE_BYTES + 1) as u64)
+                .read_to_end(&mut retained)?;
+            if retained.len() <= MAX_PROCESS_CONTROL_FAILURE_BYTES && retained == bytes {
+                Ok(())
+            } else {
+                Err(Error::conflict(
+                    "retained script cancellation diagnostic differs",
+                ))
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => write_once(&path, &bytes),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn cancel_children_and_record(
+    work: &Work,
+    group: &Group,
+    identity: &Value,
+    failure_reported: &mut bool,
+) {
+    if let Err(error) = group.cancel_children()
+        && !*failure_reported
+    {
+        *failure_reported = true;
+        let _ = write_process_control_failure(work, identity, &error.code);
+    }
 }
 
 fn read_json(path: &Path) -> Result<Value> {

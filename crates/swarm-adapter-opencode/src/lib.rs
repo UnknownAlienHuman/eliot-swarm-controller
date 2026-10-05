@@ -416,6 +416,9 @@ async fn queue_unknown_result(
     unknown.details["completion_condition"] = json!("input_status_unavailable");
     unknown.details["input_operation_id"] = json!(target.input_operation_id);
     unknown.details["target_module_receipt"] = json!(target.target_module_receipt);
+    unknown.details["assistant_result_correlation"] = json!("not_exposed");
+    unknown.details["assistant_result_correlation_reason"] =
+        json!("assistant_message_has_no_input_parent_in_public_projection");
     unknown.details["task_completion"] = json!("unknown");
     unknown.details["execution_complete"] = json!(false);
     unknown.details["native_replay"] = json!(false);
@@ -452,6 +455,8 @@ fn input_status_result_page(
         "native_session_id":target_status.native_session_id,
         "native_input_id":target_status.native_input_id,
         "input_message_sha256":input_message_sha256,
+        "assistant_result_correlation":"not_exposed",
+        "assistant_result_correlation_reason":"assistant_message_has_no_input_parent_in_public_projection",
         "task_completion":"unknown",
         "execution_complete":false
     }))?;
@@ -494,6 +499,8 @@ fn input_status_result_page(
         "native_input_id":target_status.native_input_id,
         "input_message_sha256":input_message_sha256,
         "evidence":"exact_user_message_projection",
+        "assistant_result_correlation":"not_exposed",
+        "assistant_result_correlation_reason":"assistant_message_has_no_input_parent_in_public_projection",
         "read_method":"session.message.get",
         "read_consistency":"repeated_equal_projection_not_atomic_snapshot",
         "task_completion":"unknown",
@@ -618,6 +625,8 @@ async fn handle_send(
                 "completion_condition":"native_input_admitted",
                 "delivery":"queue",
                 "evidence":"prompt_response",
+                "assistant_result_correlation":"not_exposed",
+                "assistant_result_correlation_reason":"assistant_message_has_no_input_parent_in_public_projection",
                 "execution_complete":false,
                 "native_replay":false
             }),
