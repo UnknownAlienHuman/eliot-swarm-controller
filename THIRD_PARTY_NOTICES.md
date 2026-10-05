@@ -14,7 +14,7 @@ The existing Muse module uses the complete `@muse-code/sdk` 1.3.0 package throug
 
 ## rmcp — MCP facade dependency
 
-The C02 MCP facade uses the official `rmcp` 3.5.0 crate (modelcontextprotocol/rust-sdk, Apache-2.0) as an ordinary Cargo dependency with only the `server` and `transport-io` (stdio) features enabled; it is not vendored or modified, and no optional MCP features are enabled by default. The exact version and checksum are locked in `Cargo.lock`.
+The C02 MCP facade uses the official `rmcp` 3.5.0 crate (modelcontextprotocol/rust-sdk, Apache-2.0) as an ordinary Cargo dependency with `server`, `transport-io` (stdio), and `transport-streamable-http-server` features explicitly enabled in the current root manifest (`default-features = false`). It is not vendored or modified. Enabling the HTTP feature for the optional gateway does not itself open a listener. The exact version and checksum are locked in `Cargo.lock`.
 
 ## Codex Python SDK — pinned donor unit under `modules/codex/vendor_bridge`
 

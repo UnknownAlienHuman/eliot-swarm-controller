@@ -31,15 +31,33 @@ Launch either named profile with `swarm mcp --profile dot-observer` or `swarm mc
 
 ## Closed tool surfaces
 
-The implementation currently has 53 exact tools: 22 reads and 31 mutations. The `full` profile exposes this entire table. Restricted profiles use explicit method allowlists; adding a tool to the table does not make it visible or callable through a restricted profile.
+At source `2aec51bb` (2026-10-05), the implementation has 120 exact tools: 54 reads and 66 mutations. These counts describe the closed `TOOLS` registry in `src/mcp.rs`, not the number injected into every model session; deferred loading is described in [Tool Catalog](mcp-tool-catalog-and-loading.md). The `full` profile exposes this entire table. Restricted profiles use explicit method allowlists; adding a tool to the table does not make it visible or callable through a restricted profile.
 
-| Profile | Additional methods | Surface |
-|---|---|---|
-| `observer` | None | `host.status`; Task, Attempt, and Operation reads; agent state/list/family; check reads; bounded artifact reads; `report.delta`, `report.attention`, `report.capacity`, and `message.read`. |
-| `reviewer` | `task.request_changes` | Observer plus the explicitly addressed review/request-changes method. Acceptance and agent-control methods remain unavailable. |
-| `manager` | `task.create`, `task.revise`, `task.claim`, `task.dispatch`, `task.submit`, `task.request_changes`, `attempt.release`, `attempt.bind_producer`, `operation.cancel`; typed `agent.open`, `agent.send`, `agent.reply`, `agent.configure`, `agent.goal`, `agent.background`, `agent.refresh`, `agent.reconcile`, `agent.recover`, `agent.result`; `message.send`, `message.cancel` | Observer plus selected Task, Attempt, agent, Operation, and mailbox operations. It excludes client administration, host admission mode, acceptance/invalidation, checks as mutations, source capture, artifact assembly, and shell/forge/module tools. |
-| `gm` | `client.list`, `client.register`, `host.mode`, `task.accept`, `task.invalidate_acceptance`, `forge.publish_ref`, `gm.handover` | Manager plus the current GM-controlled surface. Forge publication additionally requires local allowlists and the exact accepted source candidate. Calls remain subject to the current application role and GM epoch. |
-| `full` | Complete tool table | Explicit local compatibility for all currently exposed tools. Application checks remain authoritative. |
+**Known authorization defect, reproduced at that source:** although the manager
+surface includes `task.create` and `task.revise`, both Store handlers still call
+`require_operator()`. A registered manager and the designated GM are rejected.
+The [modular-runtime correction](agent-operations/modularity.md#4-less-authorization-ceremony-one-effective-policy)
+removes this unintended gate without distributing the operator credential or
+widening Participant/Module/Observer rights. This documentation update does not
+fix the executable. Treat the table below as profile scope, not successful-call
+qualification; exact current public names and assigned-reviewer scope are owned
+by [Canonical MCP Surfaces](mcp-canonical-surfaces-and-topologies.md).
+
+| Profile | Current method scope (summary, not an exhaustive registry) |
+|---|---|
+| `observer` | Search/dashboard/status and selected Task, Attempt, Operation, family, check, artifact, report and mailbox reads. |
+| `reviewer` | Legacy observer-plus-`task.request_changes` profile. This is not the assignment-bound auditor role. |
+| `participant` | Scoped context, peer/card/inbox/watch/consultation/integration and selected review/evidence methods. Application assignment checks remain authoritative. |
+| `assigned_reviewer` | Selected review context/get/list/submit and linked submission/check/artifact/Operation reads. After release, only the exact retained reads permitted by the canonical assignment contract remain available. |
+| `manager` | Observer plus Task/Attempt/agent control, messages, participant administration, review assignment, manager-owned automation configuration, manual scheduled invocation, hooks, Goal, scripts, queue/launch/overlap, scoped watches and selected GitHub effects. No generic shell passthrough or automatic acceptance rights. |
+| `gm` | Most manager methods plus client/host/acceptance/Forge, GitHub source/work-pool and recovery methods, and GM handover. **Current code excludes `automation.config.preview` and `automation.config.apply` from this profile**; it is not an unconditional superset of manager. Application role/GM epoch checks still apply. |
+| `full` | Entire closed tool registry; opt-in local compatibility. It does not bypass application checks or prove native capability. |
+
+The exact allowlist is [`src/mcp/profiles.rs`](../src/mcp/profiles.rs); public names
+and deferred groups are specified by the canonical surfaces/catalog documents.
+The intended simplification is one effective method policy with explicit profile
+narrowing, not multiple contradictory tables or extra approvals. Do not silently
+broaden a remote profile while fixing a local manager's application rights.
 
 Every `tools/list` result is filtered by the selected profile. The `tools/call` pre-dispatch check independently rejects hidden methods before opening or writing local IPC, including a tool name sent manually. Tool annotations mark only read methods as read-only.
 
