@@ -186,10 +186,15 @@ pub(crate) fn validate_address(watch_kind: &str, address: &Value) -> Result<()> 
             let _ = model::positive(address, "expected_deadline_ms")?;
             Ok(())
         }
+        "submission_reviewed" => {
+            model::fields(address, &["submission_ref", "candidate_ref"])?;
+            let _ = identifier(model::text(address, "submission_ref")?, "submission_ref")?;
+            let _ = identifier(model::text(address, "candidate_ref")?, "candidate_ref")?;
+            Ok(())
+        }
         "ask_answered"
         | "integration_cell_changed"
         | "scope_released_or_changed"
-        | "submission_reviewed"
         | "owner_available" => Err(Error::new(
             "WATCH_KIND_UNSUPPORTED",
             format!("watch kind {watch_kind:?} has no authoritative Store fact source"),

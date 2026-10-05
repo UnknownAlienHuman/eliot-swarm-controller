@@ -1,6 +1,6 @@
 # Agent Operations — Rust Architecture and Execution Contracts
 
-Revision 5 · 2026-10-03 · source baseline `504199d14135c030ad3951a3c5023a098a3d03f0`.
+Revision 6 · 2026-10-04 · source baseline `e060c2118a9fb2aa1731d85e0a70cca16a80a0a3`.
 
 [Configuration](configuration.md) owns editable settings; [Delivery](delivery.md) owns work transitions; [Donor map](donor-map.md) separates source evidence from proposals. These contracts are not implementation claims.
 
@@ -9,6 +9,52 @@ Revision 5 · 2026-10-03 · source baseline `504199d14135c030ad3951a3c5023a098a3
 All owned host/Store, authorization, configuration, native transport/adapters, supervision, monitoring, GitHub, hooks, distribution/review, cron, Goal, MCP/gateway and script-runner logic is Rust. Python/PowerShell are optional external extensions. Vendor binaries and native Git remain external tools reached through typed Rust boundaries.
 
 Reuse maintained complete Rust libraries where suitable; qualify installed protocols/capabilities rather than prescribe a fixed release. Existing owned non-Rust bridges are migration inputs. Unsupported non-Rust-only integration remains an explicit gap, not invented parity or copied private vendor internals. New adapter settings do not restart existing work implicitly.
+
+### 1.1 Universal transactional kernel and adapters
+
+The system is a general transactional framework: a kernel, durable event bus,
+commands, actions and messages. Agent work is one application of that framework.
+The kernel must not depend on a particular provider, harness, model, session or
+Task workflow to persist and route an occurrence or report an action outcome.
+
+An event records an occurrence with stable source and occurrence identity,
+kind, version, time, applicable scope and causal links. A command requests an
+action; its durable Operation records admission, retained input and observed
+outcome. A message is scoped communication carried by the same kernel. A
+notification or accepted command is not evidence that its action completed.
+Task, review, hook, script and provider lifecycle events are applications of
+these contracts, not separate execution engines.
+
+Each provider/harness has an adapter that translates common commands into its
+concrete API, protocol or CLI instructions and translates native observations
+back into common events and outcome facts. Preserve native identity and
+capability evidence where required, but keep scheduling, ownership, action
+deduplication and recovery in the shared kernel. An unsupported translation
+returns a bounded capability/error result through that same contract.
+
+### 1.2 Transaction and load boundaries
+
+Admission, semantic reservation, committed event identity and the associated
+cursor/pending state share the relevant short Store transaction. Perform native
+or network I/O outside it; then persist its confirmed or uncertain outcome with
+the applicable identity and authority checks. An uncertain remote effect stays
+uncertain until exact readback; restarting a host or changing managers does not
+authorize a second effect or rewrite its original actor.
+
+Notifications wake readers of committed records. They are not delivery
+authority. Bounded pages, fair dispatch, output limits and explicit backpressure
+must prevent a slow adapter or consumer from blocking unrelated subjects.
+Preserve exact held occurrences across restart and authorized ownership
+transfer. No in-memory-only handoff, global effect lock, per-provider workflow
+engine or inferred exactly-once remote execution is part of this contract.
+
+Script triggers use this same bus: the manager may select any system event
+kind, including future kinds. Event visibility and the action's current rights
+are checked independently. A safe projection preserves occurrence/causal
+identity without passing private message bodies or credentials to scripts.
+Legacy and normalized views of one occurrence must not produce duplicate
+actions. These are requirements; current implementation and qualification
+boundaries remain in [Implementation Status](../implementation-status.md).
 
 ## 2. Same action handler for both callers
 

@@ -35,6 +35,8 @@ mod launcher_native_mcp;
 mod launcher_owned_service;
 mod launcher_participant;
 mod message_batch;
+#[cfg(test)]
+mod module_bridge_recovery_tests;
 mod native_mcp;
 mod opencode;
 mod operations;

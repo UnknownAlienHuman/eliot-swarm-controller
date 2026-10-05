@@ -44,8 +44,9 @@ pub(super) fn get_operation(db: &Connection, id: &str) -> Result<Value> {
     })?)?)
 }
 
-/// Current-manager readback adds bounded startup and native-MCP diagnostics.
-/// Other Operation readers keep the existing projection and visibility boundary.
+/// Current-manager readback adds bounded startup, bridge-recovery and
+/// native-MCP diagnostics. Other Operation readers keep the existing
+/// projection and visibility boundary.
 pub(super) fn get_operation_for_current_manager(
     db: &Connection,
     p: &Principal,
@@ -61,6 +62,9 @@ pub(super) fn get_operation_for_current_manager(
     if current_manager && let Some(action) = owned_service_dispatch_action_for_operation(db, id)? {
         operation["runtime_dispatch_action_required"] = action;
     }
+    if current_manager && let Some(action) = module_bridge_recovery_action_for_operation(db, id)? {
+        operation["module_recovery_action_required"] = action;
+    }
     if current_manager && let Some(readback) = native_mcp_readback_for_operation(db, id)? {
         operation["native_mcp_readback"] = readback;
     }
@@ -74,6 +78,209 @@ pub(super) fn get_operation_for_current_manager(
         operation["participant_issuance"] = issuance;
     }
     Ok(operation)
+}
+
+/// A verified module-owner departure can leave the original Operation unknown
+/// after a new bridge boot. Preserve that Operation and offer its exact
+/// adapter-supported readback only to the current Manager or local Operator.
+fn module_bridge_recovery_action_for_operation(
+    db: &Connection,
+    operation_id: &str,
+) -> Result<Option<Value>> {
+    let operation = get_operation(db, operation_id)?;
+    if operation["state"] != "outcome_unknown" {
+        return Ok(None);
+    }
+    let Some(binding_id) = public_token(&operation["binding_id"]) else {
+        return Ok(None);
+    };
+    let Some(generation) = operation["binding_generation"]
+        .as_i64()
+        .filter(|generation| *generation > 0)
+    else {
+        return Ok(None);
+    };
+    let Some(target_method) = operation["method"].as_str() else {
+        return Ok(None);
+    };
+    let binding = get_binding(db, binding_id, generation)?;
+    if binding["observation"]["recovery_required"] != true {
+        return Ok(None);
+    }
+    let Some((runtime, artifact_id, readback_boundary)) =
+        exact_module_recovery_contract(&binding["route"], target_method)
+    else {
+        return Ok(None);
+    };
+    let operation_id = public_token(&operation["operation_id"]);
+    let Some(operation_id) = operation_id else {
+        return Ok(Some(module_recovery_identity_gap(
+            "BRIDGE_RECOVERY_OPERATION_ID_INVALID",
+            None,
+            binding_id,
+            generation,
+        )));
+    };
+    if binding["module_artifact_id"] != binding["route"]["module_artifact_id"] {
+        return Ok(Some(module_recovery_conflict(
+            "BRIDGE_RECOVERY_ARTIFACT_MISMATCH",
+            operation_id,
+            binding_id,
+            generation,
+        )));
+    }
+    if !binding["released_at_ms"].is_null() {
+        return Ok(Some(module_recovery_conflict(
+            "BRIDGE_RECOVERY_BINDING_RELEASED",
+            operation_id,
+            binding_id,
+            generation,
+        )));
+    }
+    if binding["state"] != "reconciling" {
+        return Ok(Some(module_recovery_conflict(
+            "BRIDGE_RECOVERY_BINDING_STATE_MISMATCH",
+            operation_id,
+            binding_id,
+            generation,
+        )));
+    }
+
+    let previous_boot_id = public_token(&binding["observation"]["previous_bridge_boot_id"]);
+    let current_boot_id = public_token(&binding["observation"]["bridge_boot_id"]);
+    let (Some(previous_boot_id), Some(current_boot_id)) = (previous_boot_id, current_boot_id)
+    else {
+        return Ok(Some(module_recovery_identity_gap(
+            "BRIDGE_RECOVERY_BOOT_ID_INVALID",
+            Some(operation_id),
+            binding_id,
+            generation,
+        )));
+    };
+    if previous_boot_id == current_boot_id {
+        return Ok(Some(module_recovery_identity_gap(
+            "BRIDGE_RECOVERY_BOOT_TRANSITION_INVALID",
+            Some(operation_id),
+            binding_id,
+            generation,
+        )));
+    }
+
+    Ok(Some(json!({
+        "schema_version":1,
+        "state":"readback_required",
+        "operation_id":operation_id,
+        "operation_method":target_method,
+        "operation_state":"outcome_unknown",
+        "binding_id":binding_id,
+        "binding_generation":generation,
+        "runtime":runtime,
+        "module_artifact_id":artifact_id,
+        "verified_transition":{
+            "previous_owner_departed":true,
+            "from_bridge_boot_id":previous_boot_id,
+            "to_bridge_boot_id":current_boot_id,
+        },
+        "cause":"unknown",
+        "native_effect":"unknown",
+        "retry_authorized":false,
+        "next_step":"Read back this exact Operation before deciding whether any new input is appropriate.",
+        "readback":{
+            "method":"agent.reconcile",
+            "supported_on_exact_route":true,
+            "binding_id":binding_id,
+            "generation":generation,
+            "operation_id":operation_id,
+            "request_template":{
+                "binding_id":binding_id,
+                "generation":generation,
+                "operation_id":operation_id,
+            },
+            "fresh_client_request_id_required":true,
+            "native_replay":false,
+            "unresolved_outcome":"leave_the_original_operation_outcome_unknown_if_readback_cannot_resolve_it",
+            "adapter_boundary":readback_boundary,
+        },
+    })))
+}
+
+/// Only advertise a reconciliation target implemented by this exact route.
+/// Command is narrower than the persistent native-session adapters.
+pub(super) fn exact_module_recovery_contract<'a>(
+    route: &'a Value,
+    target_method: &str,
+) -> Option<(&'static str, &'a str, &'static str)> {
+    if crate::runtime::batch::is_command_route(route)
+        && crate::runtime::batch::supports(route, "agent.reconcile")
+        && matches!(target_method, "agent.open" | "task.dispatch")
+    {
+        return Some((
+            crate::runtime::batch::COMMAND_RUNTIME,
+            route["module_artifact_id"].as_str()?,
+            "saved command run artifacts; missing or inconsistent evidence remains unknown",
+        ));
+    }
+    if crate::runtime::codex::is_controller_route(route)
+        && matches!(target_method, "agent.open" | "task.dispatch" | "agent.send")
+    {
+        return Some((
+            crate::runtime::codex::RUNTIME,
+            crate::runtime::codex::ARTIFACT_ID,
+            "saved controller checkpoint and exact native-history readback; gaps remain unknown",
+        ));
+    }
+    if crate::runtime::warm_stream::is_route(route)
+        && matches!(target_method, "agent.open" | "task.dispatch" | "agent.send")
+    {
+        return Some((
+            crate::runtime::warm_stream::RUNTIME,
+            crate::runtime::warm_stream::ARTIFACT_ID,
+            "current bridge operation journal; a missing prior-boot entry remains unknown",
+        ));
+    }
+    None
+}
+
+fn module_recovery_conflict(
+    code: &str,
+    operation_id: &str,
+    binding_id: &str,
+    generation: i64,
+) -> Value {
+    json!({
+        "schema_version":1,
+        "state":"blocked",
+        "code":code,
+        "operation_id":operation_id,
+        "operation_state":"outcome_unknown",
+        "binding_id":binding_id,
+        "binding_generation":generation,
+        "native_effect":"unknown",
+        "retry_authorized":false,
+        "next_step":"Resolve the retained binding conflict; do not resend the original input.",
+    })
+}
+
+fn module_recovery_identity_gap(
+    code: &str,
+    operation_id: Option<&str>,
+    binding_id: &str,
+    generation: i64,
+) -> Value {
+    json!({
+        "schema_version":1,
+        "state":"blocked",
+        "code":code,
+        "operation_id":operation_id,
+        "binding_id":binding_id,
+        "binding_generation":generation,
+        "operation_state":"outcome_unknown",
+        "verified_transition":false,
+        "cause":"unknown",
+        "native_effect":"unknown",
+        "retry_authorized":false,
+        "next_step":"Inspect the original Operation and retained binding state; do not resend the input.",
+    })
 }
 
 fn participant_issuance_failure_for_operation(db: &Connection, id: &str) -> Result<Option<Value>> {

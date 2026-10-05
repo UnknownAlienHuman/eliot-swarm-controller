@@ -2856,6 +2856,10 @@ async fn typed_applied_submission_rule_uses_review_operation_and_live_entry_auth
 }
 
 #[cfg(test)]
+#[path = "program_tests/coordination_watch_submission_reviewed_tests.rs"]
+mod coordination_watch_submission_reviewed_tests;
+
+#[cfg(test)]
 #[path = "o7_repair_cycle_tests.rs"]
 mod o7_repair_cycle_tests;
 

@@ -415,7 +415,29 @@ Fallback is opt-in by cause and candidate. Unknown delivery, authentication fail
 
 ## 10. Scripts, Goal and MCP
 
-Script activation chooses future runnable content, not a trigger. An authorized `script.run` is one invocation. A manager enables a specific cron/hook entry to repeat it. Captured bundles/environment preserve admitted-run meaning; an invocation gets only declared API effects, not manager credentials or the right to enable more automations.
+Script activation selects future runnable content. An authorized `script.run`
+is one invocation. The manager can configure a script action on **any system
+event**, including submissions, hooks, answers, messages, completion, errors
+and detected interruption, as well as a calendar occurrence. These examples
+are not a trigger whitelist. Event rules select exact source and kind with
+optional supported status filtering; a future configured kind waits for an
+authorized occurrence instead of requiring a new per-kind execution engine.
+
+All triggers use the same durable event reader, enabled entry, action admission
+and script runner. Captured bundles/environment preserve admitted-run meaning;
+an invocation gets only declared API effects, not manager credentials or the
+right to enable more automations. Explicitly empty script rules disable those
+automatic invocations while direct authorized runs remain available.
+
+An event need not have a Task or Attempt. Pass real scope when one exists;
+never fabricate a Task to run a hook or handle a host interruption. Task-owner
+effects require an actual authorized Task/Attempt. Event inputs are bounded
+authorized metadata and references, not raw message bodies, native results or
+secrets. A detected interruption with unknown cause must not be reported as a
+verified crash. Pending exact occurrences survive restart and explicit entry
+transfer; starting them rechecks the current owner, settings, script and scope.
+See [Implementation Status](../implementation-status.md) for the delivered
+subset; this paragraph specifies the complete configuration requirement.
 
 Goal tracking starts no work. Its selected progression uses one enabled manager entry and one actual continuation owner. Requested one-shot watches are available without recurring automation; a notice is not a task or approval-prompt answer.
 

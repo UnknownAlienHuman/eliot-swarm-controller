@@ -226,13 +226,17 @@ src/store/scripts.rs
 
 - Reuse artifact/process owners; add complete bounded bundle publication rather than untracked filesystem writes. Validate support files, paths and input/result schemas.
 - Content activation is not execution. Authorized direct runs and manager-enabled triggers use one runner.
+- Manager-configured event triggers accept any exact source/kind, including new kinds, with optional supported status predicates. Submissions, hooks, messages, answers, completion and detected failures are examples, not a fixed whitelist. Reuse the committed event ledger, per-entry cursor, pending records and normal action admission; no script-specific bus or second scheduler.
+- Support events without Task/Attempt using a versioned invocation context and additive verified schema migration. Preserve deployed migration digests and real Task scope; Task-owner API effects remain unavailable without an actual authorized Attempt.
+- Project closed authorized event metadata and causal references. Never forward legacy payload bodies, native detail or credentials; normalized and legacy views of one occurrence share action deduplication identity.
+- Commit exact pending intent with cursor progress; retain it across restart and explicit owner transfer. Before starting, recheck current entry, owner, script and applicable scope. Empty rules disable automatic runs without disabling manual invocation.
 - Resolve prepared installed interpreters and capture effective bundle/environment for each admission; no callback installer, fixed release or mid-run mutable dependency substitution.
 - JSON stdin/separate argv, bounded output, actual descendant ownership and evidence validation. Exit zero alone is not complete success.
 - Scope invocation API rights and on-behalf/cause identity. No manager token or permission to enable arbitrary workflows.
 - Distinguish trusted-local OS rights from actual isolation. Job Objects are lifecycle tools, not sandboxes. No silent trust downgrade.
 - Disable prevents future independent actions, not fictional cancellation of already running OS code.
 
-Done: user/authorized agent scripts are optional; normal native delivery never depends on their interpreters.
+Done: user/authorized agent scripts are optional; normal native delivery never depends on their interpreters. Qualify real Store paths for Task-scoped and event-only invocation, restart after commit before signalling, configuration changes, pending-owner transfer and duplicate event views. A submission-only trigger does not complete O6.
 
 ## 9. O7 — Local reviewed delivery and selected automation
 
@@ -268,6 +272,7 @@ Extend existing scheduler/Store; do not import a parallel durable engine.
 - Cursor/occurrence disposition and action/pending record commit together. Dependence on volatile notification delivery is forbidden.
 - Direct run-now is one manual action with recurrence still disabled. Restart reconciles saved enabled intent; intentional re-enable uses its chosen inclusion policy.
 - Typed rule validation plus domain progress/causality checks; a failed notification does not spawn an explanation agent. Respect real capability and account backoff rather than retrying every tick.
+- Keep generic event selection separate from typed action validation. New provider/harness adapters translate the common command/event contracts; they do not acquire a separate automation engine or redefine shared action correctness.
 
 Done: schedules/rules can be saved, enabled once by their manager, stopped and recovered without lost occurrences, burst replay or duplicate effects.
 

@@ -1621,7 +1621,8 @@ fn refine_input_schema(method: &str, schema: &mut Value) {
                     "contract_revision_changed",
                     "task_revision_changed",
                     "attempt_disposition_changed",
-                    "exact_deadline_reached"
+                    "exact_deadline_reached",
+                    "submission_reviewed"
                 ]
             });
             properties["address"] = json!({"type":"object"});
@@ -2020,13 +2021,23 @@ fn watch_address_union() -> Value {
         "required":["operation_id","deadline_field","expected_deadline_ms"],
         "additionalProperties":false
     });
+    let submission_reviewed = json!({
+        "type":"object",
+        "properties":{
+            "submission_ref":{"type":"string","minLength":1,"maxLength":128},
+            "candidate_ref":{"type":"string","minLength":1,"maxLength":128}
+        },
+        "required":["submission_ref","candidate_ref"],
+        "additionalProperties":false
+    });
     json!({
         "oneOf":[
             {"properties":{"watch_kind":{"const":"operation_terminal"},"address":operation_terminal}},
             {"properties":{"watch_kind":{"const":"contract_revision_changed"},"address":contract_revision_changed}},
             {"properties":{"watch_kind":{"const":"task_revision_changed"},"address":task_revision_changed}},
             {"properties":{"watch_kind":{"const":"attempt_disposition_changed"},"address":attempt_disposition_changed}},
-            {"properties":{"watch_kind":{"const":"exact_deadline_reached"},"address":exact_deadline_reached}}
+            {"properties":{"watch_kind":{"const":"exact_deadline_reached"},"address":exact_deadline_reached}},
+            {"properties":{"watch_kind":{"const":"submission_reviewed"},"address":submission_reviewed}}
         ]
     })
 }

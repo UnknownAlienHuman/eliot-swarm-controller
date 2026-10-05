@@ -90,7 +90,7 @@ All reads are scoped and bounded. GM/operator uses the manager core, with rare a
 |---|---|
 | `swarm.context.get` | Task/Attempt/cards; supersedes old `coordination.context.get` examples. |
 | `coordination.consult` | Card field lookup, exact owner discovery and addressed ask; `ask_owner` is not a competing eager alias. |
-| `coordination.watch.create/list/cancel` | One passive shared watch service; current kinds are `operation_terminal`, `contract_revision_changed`, `task_revision_changed`, `attempt_disposition_changed` and `exact_deadline_reached`. Availability is not a separate `notify_when_available` API. |
+| `coordination.watch.create/list/cancel` | One passive shared watch service; current kinds are `operation_terminal`, `contract_revision_changed`, `task_revision_changed`, `attempt_disposition_changed`, `exact_deadline_reached` and `submission_reviewed`. Availability is not a separate `notify_when_available` API. |
 | `coordination.sync_integration` | Store-derived scoped integration sync; advisory coordination does not accept work or wake a model. |
 | `coordination.send` | Typed peer delivery over coordination/raw mailbox primitives. |
 | `swarm.overlap.check` | Recomputed ELIOT ownership, scope and bounded Git evidence; history is not current ownership. |

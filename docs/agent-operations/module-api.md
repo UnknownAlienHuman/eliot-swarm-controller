@@ -5,6 +5,46 @@ script grant, hook source or Goal record does not itself enable a background
 action. Automation remains manager-owned and must select an enabled entry and
 its typed step; see [automation configuration](configuration.md).
 
+## O2: one passive notice for an exact reviewed submission
+
+`coordination.watch.create` accepts `watch_kind: "submission_reviewed"` with
+this closed address:
+
+```json
+{"submission_ref": "submission-17", "candidate_ref": "candidate-17"}
+```
+
+A Manager supplies the exact `task_id`, `task_revision`, and `attempt_id`;
+a Participant is constrained to its authenticated scope. Admission requires
+that exact current applied submission and candidate. The request also requires
+`delivery: "mailbox_header"`, `one_shot: true`, a `client_request_id`, and
+`expires_at_ms` in the future, at most 30 days ahead.
+
+Matching verifies the retained assignment and settled `review.assign` and
+`review.submit` Operations for that same subject. The notice contains only the
+assignment ID, verdict and review time. An authorized watch can collect the
+exact late result after the subject becomes historical; a new Task revision
+does not turn an already assigned review into a different subject. Existing
+credential and watch-scope revocation still apply. Reconciliation after a host
+restart recovers the retained result and coalesces the one-shot notice. This
+queues no Task, native input, model call or automation.
+
+## O3: readback after a verified bridge-owner departure
+
+Current-GM or local-Operator `operation.get` can return
+`module_recovery_action_required` for an unresolved Operation after a verified
+bridge-owner departure and new boot. It identifies the original Operation,
+exact binding generation, module artifact and old/new boot IDs. A successor GM
+can inspect the same action; the original caller and receipt remain intact.
+
+The cause and native effect remain unknown. The action gives an exact
+`agent.reconcile` request template and sets `retry_authorized: false`;
+readback does not replay the input. Command bridges `.3` and `.4` support only
+`agent.open` and `task.dispatch` targets. Codex controller bridge `.3` and
+Antigravity bridge `.2` also support `agent.send` targets. Antigravity's missing
+prior-boot journal entry can remain unknown. See [host recovery](../host-recovery.md)
+for the other durable error receipts and recovery boundaries.
+
 ## O4: one source-mapped GitHub Issue label
 
 `github.effect.managed_label` is a manual-only method in the Manager and GM MCP

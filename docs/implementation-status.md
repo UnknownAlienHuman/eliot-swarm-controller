@@ -2,6 +2,45 @@
 
 ## Current state
 
+### Kernel recovery and review-result watches — 2026-10-04
+
+The current integration adds `submission_reviewed` one-shot watches for the
+exact Task revision, Attempt, submission and candidate. Admission checks the
+current subject; a subsequently released Attempt or superseded Task does not
+discard the authenticated late result for that retained subject. The notice
+contains bounded review metadata and creates no model turn or new work.
+
+For verified module bridge boot changes, current/successor Manager
+`operation.get` exposes `module_recovery_action_required` with the exact
+reconciliation request for Command Code .3/.4, Codex .3 and Antigravity .2.
+Original caller, request and result remain intact. Unknown native effects stay
+unknown and the projection never authorizes replay or infers a crash cause.
+
+Formatting, strict production Clippy and library compilation passed. Gate
+`66653236-c426-4939-8f80-10e570546839` passed the closed MCP schema check,
+the module recovery/manager handover fixture and the historical late-review
+fixture. After correcting only an invalid Participant fixture override, final
+gate `0fe637cb-ab4a-486b-92ec-81d9540fb920` passed restart/deduplication
+readback and debug build with unchanged source. These are four distinct new
+passing library checks. The review fixtures seed the settled submission facts;
+the recovery fixture uses a synthetic departed-owner proof. Neither establishes
+new native provider execution.
+
+The Windows output-limit/deadline/descendant fixture passed separately in
+gate `79cd72e4-e94f-4909-8380-adad9b559664`. Its overflow source is now the
+already-built native CLI, avoiding unrelated PowerShell cold-start time while
+preserving product deadlines and cleanup assertions. Full CI for this revision
+is still pending. The complete program remains **PARTIAL_PROGRESS**.
+
+The owner clarified the universal transactional kernel and adapter contract in
+[Architecture](agent-operations/architecture.md). Manager-configured scripts on
+**any system event**, including events without Tasks, are required. The general
+selector, invocation context, additive migration and safe event producers are
+being implemented in private Luna overlays; the currently published
+submission/review rule is not full any-event script support. Exact PR-write and
+successor label recovery are also in progress. Linux/WSL and local models remain
+deferred on the operator's computer.
+
 ### Five-module integration — 2026-10-04
 
 The integrated source adds five independently authored Luna slices:
@@ -38,10 +77,14 @@ distinct focused checks, including MCP contracts, script grants and collision
 rejection, and ambiguous GitHub write recovery without resending. The Goal
 fixture's sealed-record corrections passed an independent source audit; no
 production guard was weakened and the 45 other passing checks were retained.
-Full CI for this new batch and live native qualification remain pending. These
-slices remain **PARTIAL_PROGRESS** for the complete program. Next Luna code
-work covers PR description updates, event-driven script invocation, passive
-review-result watches and startup diagnostics in Windows adapters.
+Full CI run `37244945925` passed on remote Ubuntu. On Windows, formatting,
+Clippy, build and all 282 library tests passed; the output-overflow integration
+fixture timed out starting PowerShell before emitting output. A test-only
+correction uses the already-built CLI as the output source; product deadlines
+and process cleanup remain unchanged. These slices remain **PARTIAL_PROGRESS**
+for the complete program. Subsequent recovery and review-watch work is recorded
+above; remaining Luna implementation covers PR description updates and general
+event-driven script invocation.
 
 ### Native RPC schema compatibility and actionable errors — 2026-10-04
 
@@ -82,9 +125,19 @@ replayed. The service returned nine observed MCP tools and a valid inventory
 digest. Both model-dependent hook statuses were unknown, so their sequence was
 correctly zero; the harness had incorrectly required a positive sequence.
 The fresh C31 preparation corrects that predicate and namespace labels and
-passes its bounded offline regression and independent source review. C31 has
-not run. Full native lifecycle and hosted Bunny execution remain unqualified.
-The installed launcher and protected Codex processes were unchanged.
+passes its bounded offline regression and independent source review. C31
+ended at `launch_readback` with `LAUNCH_STARTUP_ONLY_STATE_NOT_RETAINED`.
+Run `8278392b-5e9d-4362-8b51-beb7a665178d` is consumed and must not be replayed.
+Independent read-only inspection found the launch still queued with a ready
+binding, `launch_state: "awaiting_native_mcp"`,
+`native_mcp_capability_state: "unknown"`, `task_dispatch: "not_started"`, and
+`dispatch_permitted: false`. Those fields match the producer; the harness
+expected the obsolete `awaiting_capability` / `capability_state` shape and
+stopped before its intended Manager readbacks. This establishes a harness
+contract mismatch, not a completed native lifecycle or model execution. Fresh
+preparation must check the remaining assertions against current contracts.
+Full native lifecycle and hosted Bunny execution remain unqualified. All ten
+protected Codex process identities and the installed launcher were unchanged.
 
 Full Windows and remote Ubuntu CI succeeded for this RPC source increment,
 `f338d4ed2cbf6a463b0de8d0ea377bef49391bc3`, in

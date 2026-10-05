@@ -3,7 +3,7 @@
 //! Watch notifications are metadata headers. They never become peer messages,
 //! Operations that start work, or runtime/model wake requests.
 
-use super::{coordination, meta, operations, set_meta, tasks};
+use super::{coordination, meta, operations, set_meta, submissions, tasks};
 use crate::{
     coordination::{self as keys, watch},
     error::{Error, Result},
@@ -659,6 +659,20 @@ fn validate_target(
                 "released_at_ms":null,
             }))
         }
+        "submission_reviewed" => {
+            if !submission_subject_is_current(db, scope, address)? {
+                return Err(Error::new(
+                    "WATCH_SUBJECT_MISMATCH",
+                    "watch must name the exact applied submission and candidate in this current Attempt",
+                ));
+            }
+            let cursor = submission_review_cursor(db, scope, address)?;
+            Ok(json!({
+                "submission_ref":address["submission_ref"],
+                "candidate_ref":address["candidate_ref"],
+                "state":if cursor.is_some() { "reviewed" } else { "awaiting_review" },
+            }))
+        }
         "exact_deadline_reached" => {
             let operation_id = model::text(address, "operation_id")?;
             let _ = visible_operation(db, principal, scope, operation_id)?;
@@ -696,6 +710,7 @@ fn validate_address_scope(watch_kind: &str, address: &Value, scope: &ExactScope)
                 && address["expected_revision"] == scope.task_revision
         }
         "attempt_disposition_changed" => address["attempt_id"] == scope.attempt_id,
+        "submission_reviewed" => true,
         "operation_terminal" | "exact_deadline_reached" => true,
         _ => false,
     };
@@ -794,6 +809,15 @@ fn event_cursor(tx: &Transaction<'_>, record: &Value, now: i64) -> Result<EventC
                 "released_at_ms":released_at_ms,
             })))
         }
+        "submission_reviewed" => {
+            if !submission_subject_is_retained_exact(tx, &scope, address)? {
+                return Ok(EventCursor::StaleSubject);
+            }
+            match submission_review_cursor(tx, &scope, address)? {
+                Some(cursor) => Ok(EventCursor::Matched(cursor)),
+                None => Ok(EventCursor::Pending),
+            }
+        }
         "exact_deadline_reached" => {
             let operation_id = model::text(address, "operation_id")?;
             let operation = match operations::get_operation(tx, operation_id) {
@@ -825,6 +849,174 @@ fn event_cursor(tx: &Transaction<'_>, record: &Value, now: i64) -> Result<EventC
         }
         _ => Err(damaged("watch record names an unsupported kind")),
     }
+}
+
+fn submission_subject_is_current(
+    db: &Connection,
+    scope: &ExactScope,
+    address: &Value,
+) -> Result<bool> {
+    let Some((task, attempt)) = retained_submission_subject(db, scope, address)? else {
+        return Ok(false);
+    };
+    Ok(attempt["released_at_ms"].is_null()
+        && matches!(
+            attempt["state"].as_str(),
+            Some("submitted" | "needs_correction")
+        )
+        && task["state"].as_str() == Some("open")
+        && task["revision"].as_i64() == Some(scope.task_revision)
+        && task["current_attempt_id"].as_str() == Some(scope.attempt_id.as_str()))
+}
+
+fn submission_subject_is_retained_exact(
+    db: &Connection,
+    scope: &ExactScope,
+    address: &Value,
+) -> Result<bool> {
+    Ok(retained_submission_subject(db, scope, address)?.is_some())
+}
+
+/// Resolve only the immutable Task/Attempt/submission/candidate identity.
+/// Unlike admission, event delivery remains valid after the Attempt is released
+/// or the Task advances, provided its retained applied submission still matches.
+fn retained_submission_subject(
+    db: &Connection,
+    scope: &ExactScope,
+    address: &Value,
+) -> Result<Option<(Value, Value)>> {
+    let submission_ref = model::text(address, "submission_ref")?;
+    let candidate_ref = model::text(address, "candidate_ref")?;
+    let attempt = match tasks::get_attempt(db, &scope.attempt_id) {
+        Ok(attempt) => attempt,
+        Err(error) if error.code == "NOT_FOUND" => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let task = match tasks::get_task(db, &scope.task_id) {
+        Ok(task) => task,
+        Err(error) if error.code == "NOT_FOUND" => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if attempt["task_id"].as_str() != Some(scope.task_id.as_str())
+        || attempt["task_revision"].as_i64() != Some(scope.task_revision)
+        || attempt["submission_ref"].as_str() != Some(submission_ref)
+        || attempt["candidate_ref"].as_str() != Some(candidate_ref)
+    {
+        return Ok(None);
+    }
+    let document = submissions::document(db, submission_ref)?;
+    if document["task_id"].as_str() != Some(scope.task_id.as_str())
+        || document["attempt_id"].as_str() != Some(scope.attempt_id.as_str())
+        || document["task_revision"].as_i64() != Some(scope.task_revision)
+        || document["candidate_ref"].as_str() != Some(candidate_ref)
+    {
+        return Ok(None);
+    }
+    Ok(Some((task, attempt)))
+}
+
+fn submission_review_cursor(
+    db: &Connection,
+    scope: &ExactScope,
+    address: &Value,
+) -> Result<Option<Value>> {
+    let submission_ref = model::text(address, "submission_ref")?;
+    let candidate_ref = model::text(address, "candidate_ref")?;
+    let row: Option<(String, String, String, i64)> = db
+        .query_row(
+            "SELECT source_event_key,operation_id,payload_json,recorded_at_ms FROM observations \
+             WHERE source_stream_id='controller:review' AND kind='review.result' \
+               AND source_event_key GLOB 'result:*' \
+               AND json_extract(payload_json,'$.identity.task_id')=?1 \
+               AND json_extract(payload_json,'$.identity.task_revision')=?2 \
+               AND json_extract(payload_json,'$.identity.attempt_id')=?3 \
+               AND json_extract(payload_json,'$.identity.submission_ref')=?4 \
+               AND json_extract(payload_json,'$.identity.candidate_ref')=?5 \
+             ORDER BY observation_id LIMIT 1",
+            params![
+                scope.task_id,
+                scope.task_revision,
+                scope.attempt_id,
+                submission_ref,
+                candidate_ref,
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((event_key, result_operation_id, result_raw, reviewed_at_ms)) = row else {
+        return Ok(None);
+    };
+    let assignment_id = event_key
+        .strip_prefix("result:")
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| damaged("review result event key has no assignment identity"))?;
+    let result_record: Value = serde_json::from_str(&result_raw)?;
+    let assignment_event_key = format!("assignment:{assignment_id}");
+    let assignment_row: Option<(String, String)> = db
+        .query_row(
+            "SELECT operation_id,payload_json FROM observations \
+             WHERE source_stream_id='controller:review' AND source_event_key=?1 AND kind='review.assignment'",
+            [&assignment_event_key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((assignment_operation_id, assignment_raw)) = assignment_row else {
+        return Err(damaged("review result has no retained assignment fact"));
+    };
+    let assignment: Value = serde_json::from_str(&assignment_raw)?;
+    let identity: crate::review::ReviewSlotIdentity =
+        serde_json::from_value(assignment["identity"].clone())?;
+    if assignment["review_assignment_id"] != assignment_id
+        || assignment["operation_id"] != assignment_operation_id
+        || result_record["schema_version"] != 1
+        || result_record["review_assignment_id"] != assignment_id
+        || result_record["operation_id"] != result_operation_id
+        || result_record["identity"] != assignment["identity"]
+        || result_record["result"]["review_assignment_id"] != assignment_id
+        || identity.task_id.as_str() != scope.task_id.as_str()
+        || identity.task_revision != scope.task_revision
+        || identity.attempt_id.as_str() != scope.attempt_id.as_str()
+        || address["submission_ref"].as_str() != Some(identity.submission_ref.as_str())
+        || address["candidate_ref"].as_str() != Some(identity.candidate_ref.as_str())
+        || reviewed_at_ms <= 0
+    {
+        return Err(damaged(
+            "review result differs from the exact watch subject",
+        ));
+    }
+    let assignment_operation = operations::get_operation(db, &assignment_operation_id)?;
+    let result_operation = operations::get_operation(db, &result_operation_id)?;
+    if assignment_operation["method"] != "review.assign"
+        || assignment_operation["state"] != "settled"
+        || assignment_operation["task_id"].as_str() != Some(scope.task_id.as_str())
+        || assignment_operation["attempt_id"].as_str() != Some(scope.attempt_id.as_str())
+        || assignment_operation["result"]["review_assignment_id"] != assignment_id
+        || assignment_operation["result"]["identity"] != assignment["identity"]
+        || result_operation["method"] != "review.submit"
+        || result_operation["state"] != "settled"
+        || result_operation["task_id"].as_str() != Some(scope.task_id.as_str())
+        || result_operation["attempt_id"].as_str() != Some(scope.attempt_id.as_str())
+        || result_operation["caller_id"] != assignment["reviewer_client_id"]
+        || result_operation["result"] != result_record["result"]
+        || result_operation["result"]["task_id"].as_str() != Some(scope.task_id.as_str())
+        || result_operation["result"]["attempt_id"].as_str() != Some(scope.attempt_id.as_str())
+        || result_operation["result"]["task_revision"].as_i64() != Some(scope.task_revision)
+        || result_operation["result"]["submission_ref"].as_str() != Some(submission_ref)
+        || result_operation["result"]["candidate_ref"].as_str() != Some(candidate_ref)
+        || !matches!(
+            result_operation["result"]["verdict"].as_str(),
+            Some("pass" | "changes_requested")
+        )
+    {
+        return Err(damaged(
+            "review result has no matching settled assigned-review Operations",
+        ));
+    }
+    Ok(Some(json!({
+        "review_assignment_id":assignment_id,
+        "verdict":result_operation["result"]["verdict"],
+        "reviewed_at_ms":reviewed_at_ms,
+    })))
 }
 
 fn contract_revision_cursor(
@@ -902,6 +1094,7 @@ fn notification_facts(watch_kind: &str, address: &Value, cursor: &Value) -> Valu
         "contract_revision_changed" => cursor.clone(),
         "task_revision_changed" => cursor.clone(),
         "attempt_disposition_changed" => cursor.clone(),
+        "submission_reviewed" => cursor.clone(),
         "exact_deadline_reached" => cursor.clone(),
         _ => Value::Null,
     }
@@ -1080,6 +1273,7 @@ fn verify_record(record: &Value, expected_id: &str) -> Result<()> {
                     | "contract_revision_changed"
                     | "task_revision_changed"
                     | "attempt_disposition_changed"
+                    | "submission_reviewed"
                     | "exact_deadline_reached"
             )
         )

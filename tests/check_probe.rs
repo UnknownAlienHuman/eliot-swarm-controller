@@ -201,29 +201,19 @@ fn owned_probe_bounds_output_deadline_and_descendant_lifetime() {
             response_summary(&success)
         );
 
+        // The already-built CLI emits over 1 KiB for --help. This keeps the
+        // overflow probe inside a deterministic native leaf and avoids a
+        // cold PowerShell startup consuming the five-second probe deadline.
+        let overflow = run_probe(&leaf, &["--help"], 5_000, 1024);
+        assert!(
+            !overflow.success && overflow.output_limited && overflow.group_empty,
+            "overflow response: {}",
+            response_summary(&overflow)
+        );
+
         let powershell = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
             .join("System32\\WindowsPowerShell\\v1.0\\powershell.exe");
         if powershell.is_file() {
-            let overflow = run_probe(
-                &powershell,
-                &[
-                    "-NoProfile",
-                    "-Command",
-                    // Write one bounded-size block directly instead of
-                    // formatting 10,000 pipeline objects. The former can
-                    // exceed the five-second probe deadline on a cold Windows
-                    // runner before stdout reaches the configured byte cap.
-                    "[Console]::Out.Write('x' * 65536)",
-                ],
-                5_000,
-                1024,
-            );
-            assert!(
-                !overflow.success && overflow.output_limited && overflow.group_empty,
-                "overflow response: {}",
-                response_summary(&overflow)
-            );
-
             let timeout = run_probe(
                 &powershell,
                 &["-NoProfile", "-Command", "Start-Sleep -Seconds 30"],

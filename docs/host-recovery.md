@@ -19,6 +19,19 @@ reconcile request, or replay the original input. A completed readback can still
 report `resolved: false`; that describes the actual read attempt and leaves the
 original target unresolved.
 
+For supported Command, Codex-controller and Antigravity bindings, a verified
+module-owner departure followed by a different bridge boot marks in-flight
+Operations unknown. Current-GM or local-Operator `operation.get` exposes
+`module_recovery_action_required` for the exact Operation and binding
+generation, including the verified old/new boot IDs and an adapter-supported
+`agent.reconcile` template. A successor GM receives the same action without
+rewriting historical actors. The cause and native effect stay unknown;
+`retry_authorized` and `native_replay` are false. Command `.3`/`.4` reconciliation
+targets only `agent.open` or `task.dispatch`; Codex-controller `.3` and
+Antigravity `.2` also accept `agent.send`. Missing prior-boot evidence can leave
+the original Operation unknown, especially Antigravity's process-local journal.
+No native input is replayed by this projection.
+
 `agent.state.observation.latest_native_failure` retains the latest safe native
 connection or snapshot failure as `code` and `recorded_at_ms`. A later successful
 connection check, snapshot, disconnect or host restart does not erase it. The
