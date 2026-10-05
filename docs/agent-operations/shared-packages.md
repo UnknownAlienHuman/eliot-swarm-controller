@@ -117,6 +117,11 @@ Full tests, release packaging and native interoperability remain separate.
 The writer actor correction `025282a` also passed scoped format and strict
 production Clippy on Windows and remote Ubuntu in
 [run 37322606976](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37322606976).
+The scoped module-owner bootstrap `cd88746` passed formatting and strict
+production Clippy on Windows and remote Ubuntu in
+[run 37326559091](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37326559091).
+This is compiler evidence for the helper source, not installed-process or
+native-family qualification. Its scoped gate ran no integration targets.
 Full tests, release packaging and native qualification remain pending.
 These six packages do not complete the Store/kernel, bus, supervisor or adapter
 split. They create the shared boundary those modules can consume independently.

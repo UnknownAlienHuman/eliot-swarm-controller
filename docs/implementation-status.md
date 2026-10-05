@@ -16,8 +16,11 @@ namespace before supplying the exact selected scope.
 Before-spawn resolver/validation failures publish a scoped negative launch
 receipt after an empty-family check. Replacement still requires exact wrapper
 departure; absent or post-spawn proof remains unknown and cannot replay input.
-Source mapping and explicit formatting pass; the new scoped compiler gate is
-pending. Installation, live process ownership, dynamic registration and actual
+Source mapping and explicit formatting pass. Source `cd88746` passed scoped
+formatting and strict production Clippy on Windows and remote Ubuntu in
+[run 37326559091](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37326559091).
+The gate did not run full tests or produce a release binary.
+Installation, live process ownership, dynamic registration and actual
 supervisor/adapter wiring remain unfinished. The current Codex process and
 installed launcher have not been replaced or restarted.
 
