@@ -209,6 +209,24 @@ enum ObserverCommand {
         #[arg(long)]
         once: bool,
     },
+    /// Sample only explicit private process receipts; performs no Store read or process control.
+    Metrics {
+        /// Exact four-field Windows process-image receipt; accepts no PID scalar.
+        #[arg(long)]
+        host_identity: Option<PathBuf>,
+        /// Existing module-owner envelope; must be paired with --module-worker.
+        #[arg(long)]
+        module_owner: Option<PathBuf>,
+        /// Existing module worker receipt from the same private state directory.
+        #[arg(long)]
+        module_worker: Option<PathBuf>,
+        /// Descriptive child label; OS membership is verified independently.
+        #[arg(long, value_parser = ["helper", "adapter"])]
+        child_role: Option<String>,
+        /// Optional single interval (10–2000 ms) for exactly two samples.
+        #[arg(long)]
+        interval_ms: Option<u64>,
+    },
 }
 #[derive(Subcommand)]
 enum SourceCommand {
@@ -842,6 +860,39 @@ async fn run(cli: Cli) -> Result<()> {
             !*once,
             &mut std::io::stdout(),
         )?;
+        return Ok(());
+    }
+    if let Command::Observer {
+        command:
+            ObserverCommand::Metrics {
+                host_identity,
+                module_owner,
+                module_worker,
+                child_role,
+                interval_ms,
+            },
+    } = &cli.command
+    {
+        if cli.request_id.is_some() || cli.credential.is_some() {
+            return Err(Error::invalid(
+                "observer metrics is a local read-only command and accepts no request or credential override",
+            ));
+        }
+        let child_role = match child_role.as_deref() {
+            Some("helper") => Some(swarm_observer::process_metrics::ProcessRole::Helper),
+            Some("adapter") => Some(swarm_observer::process_metrics::ProcessRole::Adapter),
+            None => None,
+            _ => return Err(Error::invalid("unsupported observer child role")),
+        };
+        let report = swarm_observer::metrics_cli::run_explicit_metrics(
+            config.observability.enabled,
+            host_identity.as_deref(),
+            module_owner.as_deref(),
+            module_worker.as_deref(),
+            child_role,
+            *interval_ms,
+        )?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
     let credential = platform::load_credential(

@@ -8,9 +8,11 @@ mod native;
 pub use config::{ARTIFACT_ID, ARTIFACT_VERSION, AdapterConfig, ModelRef, NativeOptions, RUNTIME};
 pub use module_runtime::OwnedBootstrap;
 
-use journal::{Journal, OperationIntent, digest_json};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use journal::{Journal, OperationIntent, ResultInputStatusIntent, digest_json};
 use native::{InputEvidence, NativeClient, input_id, intent_for, root_id};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{sync::Mutex, time::Duration};
 use swarm_contracts::{
     Credential,
@@ -153,6 +155,9 @@ async fn handle_command(host: &HostSession<'_>, command: &RuntimeCommand) -> Res
             .outcome
             .as_ref()
             .is_some_and(|saved| saved["details"]["module_receipt"] != expected_receipt_value)
+        || history.result_params.as_ref().is_some_and(|saved| {
+            saved["page"]["source"]["result_module_receipt"] != expected_receipt_value
+        })
     {
         return Err(Error::new(
             "ADAPTER_INTENT_MISMATCH",
@@ -168,6 +173,7 @@ async fn handle_command(host: &HostSession<'_>, command: &RuntimeCommand) -> Res
         return flush_outbox(host).await;
     }
     if command.method != "agent.reconcile"
+        && command.method != "agent.result"
         && let Some(intent) = history.intent.as_ref()
     {
         // A durable pre-send intent without a saved outcome is ambiguous. It
@@ -199,6 +205,7 @@ async fn handle_command(host: &HostSession<'_>, command: &RuntimeCommand) -> Res
         "agent.open" => handle_open(host, command, &options).await,
         "task.dispatch" | "agent.send" => handle_send(host, command, &options).await,
         "agent.reconcile" => handle_reconcile(host, command, &options).await,
+        "agent.result" => handle_result(host, command, &options).await,
         _ => {
             let error = Error::new(
                 "UNSUPPORTED_CAPABILITY",
@@ -217,6 +224,295 @@ async fn handle_command(host: &HostSession<'_>, command: &RuntimeCommand) -> Res
             flush_outbox(host).await
         }
     }
+}
+
+async fn handle_result(
+    host: &HostSession<'_>,
+    command: &RuntimeCommand,
+    options: &NativeOptions,
+) -> Result<()> {
+    let selector = &command.input["selector"];
+    let selector_fields = ["kind", "input_operation_id", "session_id"];
+    if selector.as_object().is_none_or(|object| {
+        object.len() != selector_fields.len()
+            || object
+                .keys()
+                .any(|field| !selector_fields.contains(&field.as_str()))
+    }) || selector["kind"] != "input_status"
+    {
+        return queue_rejected(
+            host,
+            command,
+            options,
+            command.native_root_id.clone(),
+            &Error::new(
+                "UNSUPPORTED_RESULT_SELECTOR",
+                "OpenCode result delivery supports only exact input_status selectors",
+            ),
+        )
+        .await;
+    }
+    let input_operation_id = selector["input_operation_id"]
+        .as_str()
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| Error::invalid("input_status selector lacks its Operation ID"))?;
+    let session_id = selector["session_id"]
+        .as_str()
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| Error::invalid("input_status selector lacks its native session ID"))?;
+    let root = command.native_root_id.as_deref().ok_or_else(|| {
+        Error::new(
+            "NATIVE_ROOT_MISSING",
+            "input status requires the exact binding session",
+        )
+    })?;
+    if session_id != root {
+        return queue_rejected(
+            host,
+            command,
+            options,
+            Some(root.into()),
+            &Error::new(
+                "NATIVE_IDENTITY_MISMATCH",
+                "input_status selector names another native session",
+            ),
+        )
+        .await;
+    }
+
+    let target_history = host.journal.load(input_operation_id)?;
+    let Some(target_intent) = target_history.intent.as_ref() else {
+        return queue_rejected(
+            host,
+            command,
+            options,
+            Some(root.into()),
+            &Error::new(
+                "RESULT_TARGET_INTENT_MISSING",
+                "exact input status requires the saved dispatch or send intent",
+            ),
+        )
+        .await;
+    };
+    if !matches!(
+        target_intent.method.as_str(),
+        "task.dispatch" | "agent.send"
+    ) {
+        return queue_rejected(
+            host,
+            command,
+            options,
+            Some(root.into()),
+            &Error::new(
+                "RESULT_TARGET_METHOD",
+                "input status target must be a saved dispatch or send Operation",
+            ),
+        )
+        .await;
+    }
+    let target_receipt = module_receipt::for_target_intent(
+        host.claim,
+        target_intent,
+        input_operation_id,
+        command.target_input_sha256.as_deref(),
+        &command.binding_id,
+        command.generation,
+    )?;
+    let target_native_input_id = input_id(input_operation_id);
+    if target_intent.native_root_id.as_deref() != Some(root)
+        || target_intent.native_input_id.as_deref() != Some(target_native_input_id.as_str())
+        || target_intent.native_scope_key != options.scope_key()
+    {
+        return queue_rejected(
+            host,
+            command,
+            options,
+            Some(root.into()),
+            &Error::new(
+                "NATIVE_IDENTITY_MISMATCH",
+                "saved target intent differs from the exact selected session or input",
+            ),
+        )
+        .await;
+    }
+
+    let mut result_intent = intent_for(command, host.claim, options, None, None)?;
+    result_intent.result_input_status = Some(ResultInputStatusIntent {
+        input_operation_id: input_operation_id.into(),
+        native_session_id: session_id.into(),
+        native_input_id: target_native_input_id.clone(),
+        target_module_receipt: target_receipt.clone(),
+    });
+    let own_history = host.journal.load(&command.operation_id)?;
+    if let Some(saved_intent) = own_history.intent.as_ref() {
+        if saved_intent != &result_intent {
+            return Err(Error::new(
+                "ADAPTER_INTENT_MISMATCH",
+                "saved result selector differs from the exact admitted readback request",
+            ));
+        }
+    } else {
+        // Persist the exact target/session/receipt before any native read.
+        host.journal.write_intent(&result_intent)?;
+    }
+
+    if let Some(saved) = own_history.result_params.as_ref() {
+        if saved["page"]["source"]["input_operation_id"] != input_operation_id
+            || saved["page"]["source"]["target_module_receipt"]
+                != serde_json::to_value(&target_receipt)?
+            || saved["page"]["source"]["native_session_id"] != session_id
+            || saved["page"]["source"]["native_input_id"] != target_native_input_id
+        {
+            return Err(Error::new(
+                "ADAPTER_INTENT_MISMATCH",
+                "saved result page differs from its exact target receipt or selector",
+            ));
+        }
+        let digest = digest_json(saved)?;
+        if own_history.result_acknowledged_sha256.as_deref() == Some(digest.as_str()) {
+            return Ok(());
+        }
+        host.journal.queue_result(saved)?;
+        return flush_outbox(host).await;
+    }
+
+    let native = match NativeClient::connect(options).await {
+        Ok((native, _)) => native,
+        Err(error) => return queue_unknown_result(host, &result_intent, &error).await,
+    };
+    let evidence = match native.read_input_status(target_intent, options).await {
+        Ok(evidence) => evidence,
+        Err(error) => return queue_unknown_result(host, &result_intent, &error).await,
+    };
+    let params = match input_status_result_page(
+        command,
+        &result_intent,
+        target_intent,
+        &target_receipt,
+        &evidence.input_message_sha256,
+    ) {
+        Ok(params) => params,
+        Err(error) => {
+            return queue_rejected(host, command, options, Some(root.into()), &error).await;
+        }
+    };
+    host.journal.queue_result(&params)?;
+    flush_outbox(host).await
+}
+
+async fn queue_unknown_result(
+    host: &HostSession<'_>,
+    intent: &OperationIntent,
+    error: &Error,
+) -> Result<()> {
+    let target = intent.result_input_status.as_ref().ok_or_else(|| {
+        Error::new(
+            "ADAPTER_INTENT_MISMATCH",
+            "result status intent is missing its exact target",
+        )
+    })?;
+    let mut unknown = unknown_from_intent(intent, &error.code)?;
+    unknown.details["completion_condition"] = json!("input_status_unavailable");
+    unknown.details["input_operation_id"] = json!(target.input_operation_id);
+    unknown.details["target_module_receipt"] = json!(target.target_module_receipt);
+    unknown.details["task_completion"] = json!("unknown");
+    unknown.details["execution_complete"] = json!(false);
+    unknown.details["native_replay"] = json!(false);
+    host.journal.queue_outcome(&unknown)?;
+    flush_outbox(host).await
+}
+
+fn input_status_result_page(
+    command: &RuntimeCommand,
+    result_intent: &OperationIntent,
+    target_intent: &OperationIntent,
+    target_receipt: &swarm_contracts::runtime::ModuleReceiptIdentity,
+    input_message_sha256: &str,
+) -> Result<Value> {
+    let result_receipt = &result_intent.module_receipt;
+    let target_status = result_intent.result_input_status.as_ref().ok_or_else(|| {
+        Error::new(
+            "ADAPTER_INTENT_MISMATCH",
+            "saved result intent has no input status target",
+        )
+    })?;
+    if target_status.target_module_receipt != *target_receipt
+        || target_status.input_operation_id != target_intent.operation_id
+        || target_status.native_input_id != input_id(&target_intent.operation_id)
+    {
+        return Err(Error::new(
+            "ADAPTER_INTENT_MISMATCH",
+            "result page target differs from its saved Operation receipt",
+        ));
+    }
+    let content = serde_json::to_vec(&json!({
+        "status":"native_input_admitted",
+        "input_operation_id":target_intent.operation_id,
+        "native_session_id":target_status.native_session_id,
+        "native_input_id":target_status.native_input_id,
+        "input_message_sha256":input_message_sha256,
+        "task_completion":"unknown",
+        "execution_complete":false
+    }))?;
+    let total = content.len();
+    let offset = match command.input.get("offset_bytes") {
+        None => 0,
+        Some(value) => usize::try_from(
+            value
+                .as_u64()
+                .ok_or_else(|| Error::invalid("result offset must be a nonnegative integer"))?,
+        )
+        .map_err(|_| Error::invalid("result offset is too large"))?,
+    };
+    let length = match command.input.get("length_bytes") {
+        None => 65_536usize,
+        Some(value) => usize::try_from(
+            value
+                .as_u64()
+                .ok_or_else(|| Error::invalid("result length must be a nonnegative integer"))?,
+        )
+        .ok()
+        .filter(|value| (1..=65_536).contains(value))
+        .ok_or_else(|| Error::invalid("result length must be 1..65536"))?,
+    };
+    if offset > total {
+        return Err(Error::invalid("result offset exceeds status page length"));
+    }
+    let end = total.min(offset.saturating_add(length));
+    let page = &content[offset..end];
+    let source = json!({
+        "kind":"input_status",
+        "result_operation_id":command.operation_id,
+        "result_input_sha256":result_receipt.input_sha256,
+        "result_module_receipt":result_receipt,
+        "input_operation_id":target_intent.operation_id,
+        "target_method":target_intent.method,
+        "target_input_sha256":target_receipt.input_sha256,
+        "target_module_receipt":target_receipt,
+        "native_session_id":target_status.native_session_id,
+        "native_input_id":target_status.native_input_id,
+        "input_message_sha256":input_message_sha256,
+        "evidence":"exact_user_message_projection",
+        "read_method":"session.message.get",
+        "read_consistency":"repeated_equal_projection_not_atomic_snapshot",
+        "task_completion":"unknown",
+        "execution_complete":false,
+        "native_replay":false
+    });
+    let page_sha256 = format!("{:x}", Sha256::digest(page));
+    Ok(json!({
+        "operation_id":command.operation_id,
+        "page":{
+            "source":source,
+            "offset_bytes":offset,
+            "byte_length":page.len(),
+            "total_bytes":total,
+            "eof":end==total,
+            "media_type":"application/json",
+            "content_base64":STANDARD.encode(page),
+            "page_sha256":page_sha256
+        }
+    }))
 }
 
 async fn handle_open(
@@ -801,6 +1097,23 @@ async fn flush_outbox(host: &HostSession<'_>) -> Result<()> {
                 "observation" => {
                     host.call_recorded_retry("module.observe", item.payload.clone())
                         .await?;
+                    journal.remove_pending(&path)?;
+                }
+                "result" => {
+                    let operation_id = item.payload["operation_id"].as_str().ok_or_else(|| {
+                        Error::new("ADAPTER_OUTBOX", "saved result page has no operation ID")
+                    })?;
+                    let digest = digest_json(&item.payload)?;
+                    let history = journal.load(operation_id)?;
+                    if history.result_acknowledged_sha256.as_deref() != Some(digest.as_str()) {
+                        host.call_recorded_retry("module.result", item.payload.clone())
+                            .await?;
+                        journal.acknowledge_result(&item.payload)?;
+                    }
+                    if let Some(root) = item.payload["page"]["source"]["native_session_id"].as_str()
+                    {
+                        host.set_root_hint(root)?;
+                    }
                     journal.remove_pending(&path)?;
                 }
                 _ => {

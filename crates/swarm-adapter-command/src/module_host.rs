@@ -64,7 +64,7 @@ pub fn load_claim_and_verify_owner(owner_record: &Value) -> Result<ModuleHostIde
 
     if module != "runtime.command"
         || artifact_id != crate::ARTIFACT_ID
-        || artifact_version != "1"
+        || artifact_version != crate::ARTIFACT_VERSION
         || claim.module_id.as_str() != module
         || claim.artifact.artifact_id.as_str() != artifact_id
         || claim.artifact.version.as_str() != artifact_version

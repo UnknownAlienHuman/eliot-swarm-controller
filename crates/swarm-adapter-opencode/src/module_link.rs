@@ -31,6 +31,7 @@ pub async fn call(link: &mut ModuleLink, method: &str, params: Value) -> Result<
         "module.next" => link.next().await,
         "module.outcome" => link.outcome(params).await,
         "module.observe" => link.observe(params).await,
+        "module.result" => link.result(params).await,
         _ => Err(Error::new(
             "ADAPTER_RPC_UNSUPPORTED",
             "adapter may call only the fixed module RPC surface",

@@ -2,6 +2,44 @@
 
 ## Current state
 
+### PR #25 Forge, ScriptRun and explicit native readback — 2026-10-05
+
+Forge Git/GitHub effects now use a separate one-shot `swarm-forge-worker`
+process. Store admission and the durable pre-effect authorization still own
+the write boundary. The worker enters the retained process group, reports its
+exact identity and waits for authorization. Uncertain native effects are not
+resent. A create-only installer places the validated worker beside an explicitly
+selected host executable.
+
+The workspace includes shared `swarm-bus` and `swarm-scripts` contracts and a
+standalone `swarm-script-worker`. An optional `[scripts.executor]` image pin is
+retained in each new ScriptRun receipt. The worker waits for ACK/Go and verifies
+the plan materialized after Go; an invalid selected image cannot fall back to
+the legacy worker. Durable bus enrollment and host wiring remain in progress.
+
+Selected adapter descriptors declare a bounded JSON Pointer for the admitted
+workspace path. Old selected descriptors can use their explicit configured
+route field. New descriptor versions are Codex 2, Command 2, Antigravity 2 and
+OpenCode 0.2.0; retained installed coordinates keep their existing identities.
+
+OpenCode `agent.result` supports exact `input_status` readback for a retained
+Operation and native input identity. Its durable result page reports only
+`native_input_admitted`, `execution_complete:false` and unknown Task completion.
+The native source does not provide a proven assistant identity linked to that
+input. C8 provider/context metadata is projected into bounded schemas and the
+immutable Task packet; model consumption remains unverified.
+
+The explicit observer metrics command samples exact Windows process receipts
+after identity and process-group checks. It does not enumerate processes or
+change process state. Automatic host receipt production is still in progress.
+
+Combined-source CI [37353200179](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37353200179)
+failed on three observer strict Clippy diagnostics. Those diagnostics are fixed
+in this source update. Formatting and dependency resolution passed locally with
+all 240 prior registry version/checksum pins preserved; the new compiler gate,
+full core failure checks and current-source native qualification remain pending.
+No local build, model call or current Codex restart was performed for this update.
+
 ### PR #25 adapter processes, supervisor and diagnostics — 2026-10-05
 
 The workspace now contains independent production binaries for Codex,
@@ -23,8 +61,9 @@ uncommitted transition. This actor is outside the required host worker set;
 the remaining legacy optional worker extraction is still unfinished.
 
 The checks executable uses the existing CheckRun admission, process group and
-ACK/Go barrier. An explicitly configured executable must match its pinned image
-and artifact; an invalid selected executor cannot fall back to another worker.
+ACK/Go barrier. An explicitly configured executable must match its pinned image;
+artifact labels are retained configuration metadata. An invalid selected executor
+cannot fall back to another worker.
 Plans resolve only after Store Go, and pending output readers retain the run.
 
 `swarm-observer` adds lazy, bounded diagnostic recording and the CLI commands

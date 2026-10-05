@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use swarm_contracts::module_catalog::{
     ArtifactIdentity, ArtifactVersion, CapabilityId, ModuleCatalog, ModuleDescriptor, ModuleId,
-    ProtocolVersion,
+    ProtocolVersion, WorkspaceOptionContract,
 };
 use swarm_contracts::module_contract::{MODULE_PROTOCOL_V1, ModuleContractClaim};
 
@@ -73,6 +73,12 @@ struct RouteSelection {
     artifact: ArtifactIdentity,
     registered_revision: u64,
     selected_revision: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct NewBindingDescriptorContract {
+    pub selector: Value,
+    pub workspace_option: Option<WorkspaceOptionContract>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -271,9 +277,29 @@ pub(super) fn selection_for_new_binding(
     db: &Connection,
     owner_manager_id: &str,
     route_alias: &str,
-    _route_runtime: &str,
+    route_runtime: &str,
     configured_artifact_id: &str,
 ) -> Result<Option<Value>> {
+    Ok(descriptor_for_new_binding(
+        db,
+        owner_manager_id,
+        route_alias,
+        route_runtime,
+        configured_artifact_id,
+    )?
+    .map(|contract| contract.selector))
+}
+
+/// Resolve the Manager's exact selected descriptor for a future binding.
+/// Workspace launch admission consumes only this trusted descriptor metadata;
+/// the descriptor never grants Store or native-effect authority.
+pub(super) fn descriptor_for_new_binding(
+    db: &Connection,
+    owner_manager_id: &str,
+    route_alias: &str,
+    _route_runtime: &str,
+    configured_artifact_id: &str,
+) -> Result<Option<NewBindingDescriptorContract>> {
     let registry = load_registry(db)?;
     let Some(selection) = registry
         .selections
@@ -288,7 +314,24 @@ pub(super) fn selection_for_new_binding(
             "configured route artifact differs from its selected module descriptor",
         ));
     }
-    Ok(Some(serde_json::to_value(selection)?))
+    let descriptor = registry
+        .descriptors
+        .iter()
+        .find(|entry| {
+            entry.registered_revision == selection.registered_revision
+                && entry.descriptor.module_id == selection.module_id
+                && entry.descriptor.artifact == selection.artifact
+        })
+        .ok_or_else(|| {
+            Error::new(
+                "MODULE_DESCRIPTOR_MISSING",
+                "selected module descriptor is unavailable for a new binding",
+            )
+        })?;
+    Ok(Some(NewBindingDescriptorContract {
+        selector: serde_json::to_value(selection)?,
+        workspace_option: descriptor.descriptor.workspace_option.clone(),
+    }))
 }
 
 /// Manager-scoped mutation: select an already trusted exact descriptor for the
@@ -441,6 +484,7 @@ fn public_descriptor(entry: &RegisteredDescriptor) -> Value {
         "protocol":descriptor.protocol,
         "capabilities":descriptor.capabilities,
         "config_schema":descriptor.config_schema,
+        "workspace_option":descriptor.workspace_option,
         "command_schemas":descriptor.command_schemas,
         "event_schemas":descriptor.event_schemas,
         "lifecycle":descriptor.lifecycle,
@@ -775,6 +819,7 @@ mod tests {
                 executable_sha256: Some(Sha256Digest::new("a".repeat(64)).unwrap()),
             },
             config_schema: None,
+            workspace_option: None,
             command_schemas: Default::default(),
             event_schemas: Default::default(),
             protocol: swarm_contracts::module_catalog::ProtocolRange::exact(HOST_PROTOCOL),

@@ -1238,8 +1238,38 @@ impl Store {
         let op = model::text(&params, "operation_id")?.to_string();
         let page: ResultPage = serde_json::from_value(params["page"].clone())?;
         let p = principal.clone();
-        let mut metadata = self.run(move |db| results::prepare(db, &p, &op)).await?;
+        let source = page.source.clone();
+        let mut metadata = self
+            .run(move |db| results::prepare(db, &p, &op, &source))
+            .await?;
         let bytes = page.decode()?;
+        if metadata["selector"]["kind"] == "input_status" {
+            let status_bytes = serde_json::to_vec(&json!({
+                "status":"native_input_admitted",
+                "input_operation_id":metadata["target_operation_id"],
+                "native_session_id":metadata["selector"]["session_id"],
+                "native_input_id":page.source["native_input_id"],
+                "input_message_sha256":page.source["input_message_sha256"],
+                "task_completion":"unknown",
+                "execution_complete":false
+            }))?;
+            let offset = usize::try_from(page.offset_bytes)
+                .map_err(|_| Error::invalid("result offset is too large"))?;
+            let length = usize::try_from(page.byte_length)
+                .map_err(|_| Error::invalid("result length is too large"))?;
+            let end = offset
+                .checked_add(length)
+                .ok_or_else(|| Error::invalid("result byte range overflow"))?;
+            if page.total_bytes != status_bytes.len() as u64
+                || end > status_bytes.len()
+                || bytes.as_slice() != &status_bytes[offset..end]
+            {
+                return Err(Error::new(
+                    "RESULT_PROVENANCE_INVALID",
+                    "input status bytes do not match the validated source metadata",
+                ));
+            }
+        }
         if metadata["requested_offset"].as_u64() != Some(page.offset_bytes)
             || page.byte_length > metadata["requested_length"].as_u64().unwrap_or(0)
         {

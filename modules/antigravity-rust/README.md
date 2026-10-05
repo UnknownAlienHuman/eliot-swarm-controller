@@ -1,8 +1,10 @@
 # Standalone Antigravity Rust adapter `.1`
 
-Status: private source overlay based on the preserved `b7201c1` Rust draft plus the current shared contracts, client, process-owner, handshake, and Store-receipt proposals. Root owns the only tracked-source integration. This package has not been built, tested, installed, or run against Antigravity.
+Status: integrated production source in the controller workspace. The current
+descriptor update still requires its compiler gate and native Antigravity
+qualification; source integration does not establish installed or live behavior.
 
-The binary is `swarm-antigravity`; its immutable artifact identity is `eliot-antigravity.rust-headless.1`, version `1`. It is a separate crate with no root-library, Store, database, provider, or MCP-server dependency. Its Cargo paths target the shared `swarm-client`, `swarm-contracts`, and `swarm-process` crates after the listed PR25 package merge.
+The binary is `swarm-antigravity`; its immutable artifact identity is `eliot-antigravity.rust-headless.1`, version `2`. Version 1 descriptors remain retained and immutable. It is a separate crate with no root-library, Store, database, provider, or MCP-server dependency. Its Cargo paths target the shared `swarm-client`, `swarm-contracts`, and `swarm-process` crates after the listed PR25 package merge.
 
 ## Identity, admission, and rights
 
@@ -22,7 +24,7 @@ Unsupported permission/configuration replies, goals, background work, result pag
 
 ## Trusted registration and route
 
-`src/contract.rs::template` declares the descriptor contract: module `antigravity`; artifact `eliot-antigravity.rust-headless.1` version `1`; protocol `1.0`; capabilities `agent.open`, `agent.refresh`, `agent.reconcile`, `agent.send`, `task.dispatch`; and the shared runtime command/outcome schemas. The local `claim()` reads the exact manager-provided contract and rejects any capability/schema drift. A trusted installer or supervisor must register the descriptor and select it for new bindings; the adapter claim cannot register or select itself. The optional `build_id` is taken from the trusted launcher claim and participates in Store negotiation and receipts.
+`src/contract.rs::template` declares the descriptor contract: module `antigravity`; artifact `eliot-antigravity.rust-headless.1` version `2`; protocol `1.0`; capabilities `agent.open`, `agent.refresh`, `agent.reconcile`, `agent.send`, `task.dispatch`; the shared runtime command/outcome schemas; and workspace option `/workspaceRoot` with `replace_with_admitted_absolute_workspace` semantics. The local `claim()` reads the exact manager-provided contract and rejects any capability/schema drift. A trusted installer or supervisor must register the descriptor and select it for new bindings; the adapter claim cannot register or select itself. The optional `build_id` is taken from the trusted launcher claim and participates in Store negotiation and receipts.
 
 The existing `.2` artifact, route, and binary are left intact. `root-integration/warm-stream-compat.patch` adds `.1` to the same validated terminal warm-stream contract and returns the exact route artifact from recovery metadata. The transaction-bus receipt validator must be merged before this crate; its selector-pinned call validates each typed `.1` outcome and leaves legacy `.2` unversioned behavior unchanged.
 

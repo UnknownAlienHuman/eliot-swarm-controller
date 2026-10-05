@@ -19,9 +19,10 @@ use swarm_process::module_owner::{VerifiedModuleWorker, verify_current_adapter_f
 const MAX_LAUNCH_VALUE_BYTES: usize = 64 * 1024;
 const NATIVE_OPTIONS_SCHEMA_SHA256: &str =
     "d597be6bae80dc82535b658b5daaf3037a09976e5704d799a6715a673a62f662";
-const CAPABILITIES: [&str; 4] = [
+const CAPABILITIES: [&str; 5] = [
     "agent.open",
     "agent.reconcile",
+    "agent.result",
     "agent.send/next_turn",
     "task.dispatch",
 ];

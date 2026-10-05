@@ -6,6 +6,7 @@ use swarm_contracts::{
     error::{Error, Result},
     module_catalog::{
         ArtifactId, ArtifactIdentity, ArtifactVersion, CapabilityId, ModuleId, ProtocolRange,
+        WorkspaceOptionContract, WorkspaceOptionSemantics,
     },
     module_contract::{
         MODULE_PROTOCOL_V1, ModuleContractClaim, ModuleContractTemplate, runtime_command_schema,
@@ -52,6 +53,11 @@ pub fn template() -> Result<ModuleContractTemplate> {
         protocol: ProtocolRange::exact(MODULE_PROTOCOL_V1),
         capabilities,
         config_schema: None,
+        workspace_option: Some(WorkspaceOptionContract {
+            schema_version: 1,
+            native_options_pointer: "/workspaceRoot".to_owned(),
+            semantics: WorkspaceOptionSemantics::ReplaceWithAdmittedAbsoluteWorkspace,
+        }),
         command_schemas: BTreeSet::from([runtime_command_schema()]),
         event_schemas: BTreeSet::from([runtime_outcome_schema()]),
     })

@@ -34,6 +34,8 @@ swarm-client = { path = "crates/swarm-client" }
 swarm-contracts = { path = "crates/swarm-contracts" }
 swarm-kernel = { path = "crates/swarm-kernel" }
 swarm-process = { path = "crates/swarm-process" }
+swarm-script-worker = { path = "crates/swarm-script-worker" }
+swarm-scripts = { path = "crates/swarm-scripts" }
 swarm-store = { path = "crates/swarm-store" }
 swarm-supervisor = { path = "crates/swarm-supervisor" }
 swarm-telemetry = { path = "crates/swarm-telemetry" }
@@ -77,8 +79,12 @@ members = [
     "crates/swarm-client",
     "crates/swarm-checks",
     "crates/swarm-observer",
+    "crates/swarm-forge-worker",
+    "crates/swarm-bus",
     "crates/swarm-kernel",
     "crates/swarm-process",
+    "crates/swarm-script-worker",
+    "crates/swarm-scripts",
     "crates/swarm-store",
     "crates/swarm-supervisor",
     "crates/swarm-telemetry",

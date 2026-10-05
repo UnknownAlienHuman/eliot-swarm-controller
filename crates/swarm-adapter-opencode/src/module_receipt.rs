@@ -46,10 +46,9 @@ pub fn for_command(
     )
 }
 
-/// Reconcile emits the target Operation receipt independently from the
-/// reconcile Operation receipt. The digest comes from the host's exact target
-/// Operation snapshot and must match the durable target intent before any
-/// readback-derived result can be queued.
+/// A readback operation emits the target Operation receipt independently from
+/// its own receipt. The digest comes from the host's exact target Operation
+/// snapshot and must match the durable target intent before readback proceeds.
 pub fn for_target_intent(
     claim: &ModuleContractClaim,
     target: &OperationIntent,
@@ -63,7 +62,7 @@ pub fn for_target_intent(
         .ok_or_else(|| {
             Error::new(
                 "HOST_COMMAND_IDENTITY",
-                "reconcile command lacks the canonical target Operation digest",
+                "readback command lacks the canonical target Operation digest",
             )
         })?;
     let saved = &target.module_receipt;

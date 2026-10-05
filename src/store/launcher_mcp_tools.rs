@@ -20,7 +20,7 @@ use crate::{
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::{Value, json};
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 const RECORD_KEY_PREFIX: &str = "launcher:native_mcp_tools:v1:";
 const SUPERVISOR_KEY_PREFIX: &str = "launcher:native_mcp_tools:supervisor:v1:";
@@ -1940,6 +1940,18 @@ pub(crate) fn require_current_connection(
         ));
     }
 
+    // Keep the three observation stages separate. The session-context hook
+    // can show which schemas OpenCode supplied to a context build; a
+    // before-transport provider hook can show schemas in a request. Neither
+    // says that a model consumed a schema, and neither changes dispatch
+    // authority. Project only bounded schema metadata from the authenticated
+    // C8 readback; never retain request bodies or provider headers here.
+    let session_context = project_session_context(&tools["session_context"], metadata)?;
+    let provider_request =
+        project_provider_request(&tools["provider_request"], metadata, &facts.options.model)?;
+    let session_context_digest = digest_json(&session_context)?;
+    let provider_request_digest = digest_json(&provider_request)?;
+
     let assignment_value = assignment.as_value();
     let assignment_digest = digest_json(&assignment_value)?;
     let mut evidence_without_digest = (*tools).clone();
@@ -1993,6 +2005,8 @@ pub(crate) fn require_current_connection(
         "assignment_digest":assignment_digest,
         "evidence_digest":evidence_digest,
         "native_discovered_digest":native_discovered_digest,
+        "session_context_digest":session_context_digest,
+        "provider_request_digest":provider_request_digest,
         "assignment":{
             "task_id":assignment_value["task_id"],
             "task_revision":assignment_value["task_revision"],
@@ -2022,6 +2036,8 @@ pub(crate) fn require_current_connection(
             "identity_digest":identity_digest,
             "evidence_digest":evidence_digest,
             "native_discovered_digest":native_discovered_digest,
+            "session_context_digest":session_context_digest,
+            "provider_request_digest":provider_request_digest,
             "service_id":service_id,
             "service_version":service_version,
             "plugin_id":plugin_id,
@@ -2032,6 +2048,8 @@ pub(crate) fn require_current_connection(
             "observed_at_ms":observed_at_ms,
             "tools":scoped_tools,
         },
+        "session_context":session_context,
+        "provider_request":provider_request,
         "dispatch_permitted":false,
         "model_consumed":"unknown",
     });
@@ -2100,6 +2118,205 @@ fn digest_json(value: &Value) -> Result<String> {
         "sha256:{}",
         model::digest(model::canonical(value)?.as_bytes())
     ))
+}
+
+fn project_session_context(raw: &Value, challenge: &Value) -> Result<Value> {
+    model::fields(
+        raw,
+        &[
+            "status",
+            "stage",
+            "observed_at_ms",
+            "agent",
+            "tools",
+            "reason_code",
+        ],
+    )?;
+    let status = model::text(raw, "status")?;
+    if status == "unknown"
+        && raw["stage"].is_null()
+        && raw["observed_at_ms"].is_null()
+        && raw["agent"].is_null()
+        && raw["reason_code"].is_null()
+        && raw["tools"].as_array().is_some_and(Vec::is_empty)
+    {
+        return Ok(json!({
+            "status":"unknown",
+            "stage":Value::Null,
+            "observed_at_ms":Value::Null,
+            "tools":[],
+        }));
+    }
+    let observed_at_ms = raw["observed_at_ms"]
+        .as_i64()
+        .filter(|time| {
+            *time >= challenge["issued_at_ms"].as_i64().unwrap_or(i64::MAX)
+                && *time <= challenge["expires_at_ms"].as_i64().unwrap_or(0)
+        })
+        .ok_or_else(|| record_error("session-context observation time is invalid"))?;
+    if raw["stage"] != "session_context_hook"
+        || raw["agent"]
+            .as_str()
+            .is_none_or(|agent| !bounded_tool_label(agent))
+    {
+        return Err(record_error("session-context observation stage is invalid"));
+    }
+    match status {
+        "observed" if raw["reason_code"].is_null() => Ok(json!({
+            "status":"observed",
+            "stage":"session_context_hook",
+            "observed_at_ms":observed_at_ms,
+            "tools":project_context_tools(&raw["tools"])? ,
+        })),
+        "unsupported"
+            if raw["reason_code"] == "context_schema_unrecognized"
+                && raw["tools"].as_array().is_some_and(Vec::is_empty) =>
+        {
+            Ok(json!({
+                "status":"unsupported",
+                "stage":"session_context_hook",
+                "observed_at_ms":observed_at_ms,
+                "tools":[],
+            }))
+        }
+        _ => Err(record_error(
+            "session-context observation status is invalid",
+        )),
+    }
+}
+
+fn project_provider_request(
+    raw: &Value,
+    challenge: &Value,
+    expected_model: &Value,
+) -> Result<Value> {
+    model::fields(
+        raw,
+        &[
+            "status",
+            "transport",
+            "stage",
+            "kind",
+            "observed_at_ms",
+            "agent",
+            "model",
+            "tools",
+            "reason_code",
+        ],
+    )?;
+    let status = model::text(raw, "status")?;
+    if status == "unknown"
+        && raw["transport"].is_null()
+        && raw["stage"].is_null()
+        && raw["kind"].is_null()
+        && raw["observed_at_ms"].is_null()
+        && raw["agent"].is_null()
+        && raw["model"].is_null()
+        && raw["reason_code"].is_null()
+        && raw["tools"].as_array().is_some_and(Vec::is_empty)
+    {
+        return Ok(json!({
+            "status":"unknown",
+            "transport":Value::Null,
+            "stage":Value::Null,
+            "observed_at_ms":Value::Null,
+            "tools":[],
+        }));
+    }
+    let transport = model::text(raw, "transport")?;
+    if !matches!(transport, "http" | "websocket")
+        || raw["stage"] != "before_transport"
+        || raw["kind"] != "primary"
+        || model::canonical(&raw["model"])? != model::canonical(expected_model)?
+        || raw["agent"]
+            .as_str()
+            .is_none_or(|agent| !bounded_tool_label(agent))
+    {
+        return Err(record_error(
+            "provider-request observation scope is invalid",
+        ));
+    }
+    let observed_at_ms = raw["observed_at_ms"]
+        .as_i64()
+        .filter(|time| {
+            *time >= challenge["issued_at_ms"].as_i64().unwrap_or(i64::MAX)
+                && *time <= challenge["expires_at_ms"].as_i64().unwrap_or(0)
+        })
+        .ok_or_else(|| record_error("provider-request observation time is invalid"))?;
+    match status {
+        "observed" if raw["reason_code"].is_null() => Ok(json!({
+            "status":"observed",
+            "transport":transport,
+            "stage":"before_transport",
+            "observed_at_ms":observed_at_ms,
+            "tools":project_context_tools(&raw["tools"])? ,
+        })),
+        "unsupported"
+            if raw["reason_code"]
+                .as_str()
+                .is_some_and(valid_provider_reason_code)
+                && raw["tools"].as_array().is_some_and(Vec::is_empty) =>
+        {
+            Ok(json!({
+                "status":"unsupported",
+                "transport":transport,
+                "stage":"before_transport",
+                "observed_at_ms":observed_at_ms,
+                "tools":[],
+            }))
+        }
+        _ => Err(record_error(
+            "provider-request observation status is invalid",
+        )),
+    }
+}
+
+fn project_context_tools(raw: &Value) -> Result<Value> {
+    let tools = raw
+        .as_array()
+        .filter(|tools| tools.len() <= 512)
+        .ok_or_else(|| record_error("observed context tool list is invalid"))?;
+    let mut names = BTreeSet::new();
+    let mut projected = Vec::with_capacity(tools.len());
+    for tool in tools {
+        model::fields(tool, &["name", "description", "input_schema"])?;
+        let name = model::text(tool, "name")?;
+        if !bounded_tool_label(name)
+            || !names.insert(name)
+            || tool["description"]
+                .as_str()
+                .is_none_or(|description| description.len() > 16 * 1024)
+            || !tool["input_schema"].is_object()
+            || model::canonical(&tool["input_schema"])?.len() > 512 * 1024
+        {
+            return Err(record_error("observed context tool entry is invalid"));
+        }
+        projected.push(json!({
+            "name":name,
+            "input_schema":tool["input_schema"],
+        }));
+    }
+    Ok(Value::Array(projected))
+}
+
+fn bounded_tool_label(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 256 && !value.bytes().any(|byte| byte.is_ascii_control())
+}
+
+fn valid_provider_reason_code(value: &str) -> bool {
+    matches!(
+        value,
+        "request_not_object"
+            | "tools_field_unrecognized"
+            | "tool_count_limit"
+            | "tool_schema_limit"
+            | "tool_schema_unrecognized"
+            | "request_body_limit"
+            | "request_json_invalid"
+            | "request_unreadable"
+            | "frame_limit"
+            | "frame_json_invalid"
+    )
 }
 
 fn validate_record(
@@ -2895,6 +3112,15 @@ fn native_mcp_tools_diagnostic_corrupt() -> Value {
 fn public_summary(record: &Value) -> Value {
     let tools = &record["tools_readback"];
     let has_readback = tools.is_object();
+    let schema_digest = |evidence: &Value| {
+        if evidence["status"] == "observed" {
+            digest_json(&evidence["tools"])
+                .map(Value::String)
+                .unwrap_or(Value::Null)
+        } else {
+            Value::Null
+        }
+    };
     json!({
         "operation_id":record["operation_id"],
         "state":if has_readback {"observed_partial"} else {"pending"},
@@ -2903,7 +3129,9 @@ fn public_summary(record: &Value) -> Value {
         "observer_state":record["challenge"]["state"],
         "native_discovered":if has_readback {tools["native_discovered"]["status"].clone()} else {Value::String("unknown".to_owned())},
         "session_context":if has_readback {tools["session_context"]["status"].clone()} else {Value::String("unknown".to_owned())},
+        "session_context_schema_digest":if has_readback {schema_digest(&tools["session_context"])} else {Value::Null},
         "provider_request":if has_readback {tools["provider_request"]["status"].clone()} else {Value::String("unknown".to_owned())},
+        "provider_request_schema_digest":if has_readback {schema_digest(&tools["provider_request"])} else {Value::Null},
         "model_consumed":"unknown",
         "last_error":record["last_error"],
         "dispatch_permitted":false,

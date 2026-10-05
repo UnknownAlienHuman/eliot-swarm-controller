@@ -22,6 +22,8 @@ cargo build --manifest-path $Manifest --package $Package --release --locked --ta
 
 Use the resulting `$Target/release/<binary>.exe` as the installer source. Build the owner helper separately from `crates/swarm-process/Cargo.toml` (`--package swarm-process --bin swarm-module-owner`) and keep its installed absolute path and lowercase SHA-256 for local host config.
 
+The host writes the private scoped launch plan and resolver map below its storage data directory after durable module demand. It invokes the pinned helper as `swarm-module-owner <absolute-plan-path> <absolute-resolver-map-path>`. The helper accepts exactly these two paths; its per-launch files are produced by the host.
+
 Copy the selected descriptor template outside the checkout. Set `enabled` to `true` only when ready to make that version selectable, and replace any `<INSTALLER_CREDENTIAL_FILE_REF>` with an opaque protected-reference name. Keep adapter identity, protocol, schema, command/event schemas, capabilities, lifecycle and restart policy aligned with that adapter's template. Do not put credential bytes or provider tokens in the descriptor. The installer fills `launch.executable` and `launch.executable_sha256` from the built file.
 
 Use an existing dedicated absolute install root outside the controller/Codex/OpenCode trees. The root must already exist, remain within the installer's path limit, and contain no reparse-point traversal. Preview first, then repeat without `-WhatIf`:
@@ -95,8 +97,34 @@ After restarting with the local config, read `module.catalog.get`, note `catalog
 
 Call `module.route.select` with that object. Use the exact values and revision returned by the catalog; a stale revision must be reread. Selection applies only to that identity's future bindings. It does not change existing bindings or start a worker. A later admitted pending Operation creates module demand; the host provisions and verifies the binding-scoped IPC credential, then launches the adapter under the descriptor and owner-helper checks. `external_attach` on Codex/OpenCode does not grant control of their native service. `owned_service` on Command/Antigravity describes the adapter module lifecycle; it does not install or qualify their native CLI.
 
+## Package and install the Forge worker
+
+Build `swarm-forge-worker` from a clean, committed checkout with
+`tools/ci/build-module-package.ps1 -Package swarm-forge-worker -Profile release`,
+supplying the existing shared `-TargetDir` and an explicit package `-OutputDir`.
+The output contains `bin/swarm-forge-worker.exe` and `build-manifest.json`.
+
+Pass that absolute executable path and the chosen host executable to
+`tools/modules/Install-ForgeWorker.ps1 -HostExecutable <absolute-swarm.exe>
+-PackageExecutable <absolute-worker.exe>`. `-WhatIf` previews placement.
+The installer validates the exact package manifest, clean source revision,
+binary target, length and SHA-256, then places the worker beside that host.
+Identical installed bytes are a no-op; different bytes are not overwritten.
+It does not configure or launch either process. The unsigned build manifest
+provides consistency evidence; it is not a signature.
+
 ## Optional checks and local observer
 
-The checks executor is a separate optional process pin, not a module descriptor. `[checks].enabled` defaults to `false`, and `executor` defaults absent. Its actual fields are `executable` (absolute path), `sha256` (lowercase 64-hex), `artifact_id`, and `version`. On each selected launch the host rejects link/reparse/non-file paths and verifies the executable digest. A bad pin fails that launch; it does not fall back to the in-process worker.
+The checks executor is a separate optional process pin, not a module descriptor. Build package `swarm-checks` and configure its binary using `[checks.executor]`. Checks default disabled, and the executor pin defaults absent:
+
+```toml
+[checks.executor]
+executable = 'D:\eliot\bin\swarm-checks.exe'
+sha256 = '<64-lowercase-hex-sha256-of-that-file>'
+artifact_id = 'swarm-checks'
+version = '0.1.0'
+```
+
+The host verifies the executable path and image digest, including before Store Go. `artifact_id` and `version` are retained evidence labels; they are not read from binary metadata. A bad path or digest fails that launch without switching to the legacy worker.
 
 The host `[observability]` recorder also defaults disabled. Its current fields are `enabled`, optional `directory` and `live_config_file`, `queue_records`, `queue_bytes`, `max_record_bytes`, `file_segment_bytes`, `retention_bytes`, and `retention_days`; omitted values use the current config defaults. Relative paths resolve beside the controller config. The optional pinned JSON live-config file sets diagnostic severity/category filters and retention when the lazy recorder runs. This is bounded metadata recording, not prompt, tool-argument, environment, or credential capture. The standalone `swarm-observer` binary takes an absolute private directory and optional `--queue-records`, `--queue-bytes`, `--max-record-bytes`, `--segment-bytes`, `--retention-bytes`, and `--retention-days`; it reads newline-delimited diagnostic records from stdin.

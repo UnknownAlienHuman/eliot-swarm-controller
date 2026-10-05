@@ -3,7 +3,7 @@ use serde_json::Value;
 use swarm_contracts::runtime::{ModuleReceiptIdentity, RuntimeCommand};
 
 pub const ARTIFACT_ID: &str = "eliot-antigravity.rust-headless.1";
-pub const ARTIFACT_VERSION: &str = "1";
+pub const ARTIFACT_VERSION: &str = "2";
 pub const REQUIRED_MODEL_ID: &str = "gemini-3.8-flash-high";
 
 #[derive(Debug, Clone, PartialEq, Eq)]

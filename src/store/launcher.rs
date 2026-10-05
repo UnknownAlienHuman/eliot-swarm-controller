@@ -4650,8 +4650,11 @@ pub(super) fn reconcile_launch(
         return Ok(result);
     }
 
-    // No current Store path records harness-acknowledged native MCP schema
-    // loading. A static profile or server tools/list is not that evidence.
+    // This reconciliation branch has no capability receipt of its own. The
+    // separate C8 host worker retains exact-scope native inventory,
+    // session-context, and provider-request observations; dispatch admission
+    // reads that current receipt without treating provider-before-transport
+    // as model consumption or changing this branch's authority.
     manifest["state"] = json!("awaiting_capability");
     let result = json!({
         "operation_id":operation_id,

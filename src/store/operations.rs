@@ -2325,33 +2325,59 @@ pub(super) fn open_for_launch_for_actor(
             "binding lease or route differs from the admitted launch",
         ));
     }
-    let mut route = config.route(model::text(v, "route")?)?.clone();
-    let workspace_field = route
-        .workspace_option
-        .as_deref()
-        .or({
-            // Compatibility mapping for legacy built-in routes. New standalone
-            // artifacts declare their own exact field in the route contract.
-            match route.runtime.as_str() {
-                crate::runtime::opencode_v2::RUNTIME => Some("directory"),
-                "zed" => Some("workdir"),
-                "codex" | "command" | "claude" | "antigravity" | "muse" => Some("workspaceRoot"),
-                _ => None,
-            }
-        })
-        .ok_or_else(|| {
-            Error::new(
+    let route_alias = model::text(v, "route")?;
+    let mut route = config.route(route_alias)?.clone();
+    let selected_descriptor = super::module_handshake::descriptor_for_new_binding(
+        tx,
+        effective_manager_id,
+        route_alias,
+        &route.runtime,
+        &route.module_artifact_id,
+    )?;
+    if let Some(selected_descriptor) = selected_descriptor {
+        if let Some(workspace_option) = selected_descriptor.workspace_option.as_ref() {
+            inject_admitted_workspace(&mut route, workspace_option, &workspace_path)?;
+        } else if let Some(workspace_field) = route.workspace_option.as_deref() {
+            // Retained descriptors predate workspace_option. Their explicit,
+            // already-validated route field remains sufficient for this exact
+            // admitted path; selected legacy routes never infer by runtime.
+            inject_configured_workspace(&mut route, workspace_field, &workspace_path)?;
+        } else {
+            return Err(Error::new(
                 "CAPABILITY_GAP",
-                "runtime has no registered workspace-bound launch contract",
+                "selected descriptor and route declare no workspace-bound launch option",
+            ));
+        }
+    } else {
+        // Compatibility path for unselected legacy routes. The descriptor
+        // contract above is authoritative whenever a Manager selected a module.
+        let workspace_field = route
+            .workspace_option
+            .as_deref()
+            .or({
+                match route.runtime.as_str() {
+                    crate::runtime::opencode_v2::RUNTIME => Some("directory"),
+                    "zed" => Some("workdir"),
+                    "codex" | "command" | "claude" | "antigravity" | "muse" => {
+                        Some("workspaceRoot")
+                    }
+                    _ => None,
+                }
+            })
+            .ok_or_else(|| {
+                Error::new(
+                    "CAPABILITY_GAP",
+                    "runtime has no registered workspace-bound launch contract",
+                )
+            })?;
+        let options = route.native_options.as_object_mut().ok_or_else(|| {
+            Error::new(
+                "CONFIG_ERROR",
+                "launch route requires explicit native options",
             )
         })?;
-    let options = route.native_options.as_object_mut().ok_or_else(|| {
-        Error::new(
-            "CONFIG_ERROR",
-            "launch route requires explicit native options",
-        )
-    })?;
-    options.insert(workspace_field.into(), json!(workspace_path));
+        options.insert(workspace_field.into(), json!(workspace_path));
+    }
     reserve_open_route(
         tx,
         effective_manager_id,
@@ -2360,6 +2386,94 @@ pub(super) fn open_for_launch_for_actor(
         id,
         now,
     )
+}
+
+fn inject_admitted_workspace(
+    route: &mut crate::config::Route,
+    contract: &swarm_contracts::module_catalog::WorkspaceOptionContract,
+    workspace_path: &str,
+) -> Result<()> {
+    validate_admitted_workspace(workspace_path)?;
+    let segments = contract.native_options_segments().map_err(|_| {
+        Error::new(
+            "MODULE_DESCRIPTOR_INVALID",
+            "selected module workspace option pointer is invalid",
+        )
+    })?;
+    let (leaf, parents) = segments.split_last().ok_or_else(|| {
+        Error::new(
+            "MODULE_DESCRIPTOR_INVALID",
+            "selected module workspace option pointer is empty",
+        )
+    })?;
+    let mut cursor = &mut route.native_options;
+    for segment in parents {
+        cursor = cursor
+            .as_object_mut()
+            .and_then(|object| object.get_mut(segment))
+            .ok_or_else(|| {
+                Error::new(
+                    "CONFIG_ERROR",
+                    "selected module workspace option path is absent from native options",
+                )
+            })?;
+    }
+    let value = cursor
+        .as_object_mut()
+        .and_then(|object| object.get_mut(leaf))
+        .ok_or_else(|| {
+            Error::new(
+                "CONFIG_ERROR",
+                "selected module workspace option path is absent from native options",
+            )
+        })?;
+    if !value.is_string() {
+        return Err(Error::new(
+            "CONFIG_ERROR",
+            "selected module workspace option must target an existing string",
+        ));
+    }
+    *value = json!(workspace_path);
+    route.workspace_option = Some(leaf.clone());
+    Ok(())
+}
+
+fn inject_configured_workspace(
+    route: &mut crate::config::Route,
+    workspace_field: &str,
+    workspace_path: &str,
+) -> Result<()> {
+    validate_admitted_workspace(workspace_path)?;
+    let value = route
+        .native_options
+        .as_object_mut()
+        .and_then(|options| options.get_mut(workspace_field))
+        .ok_or_else(|| {
+            Error::new(
+                "CONFIG_ERROR",
+                "configured workspace option is absent from native options",
+            )
+        })?;
+    if !value.is_string() {
+        return Err(Error::new(
+            "CONFIG_ERROR",
+            "configured workspace option must target an existing string",
+        ));
+    }
+    *value = json!(workspace_path);
+    Ok(())
+}
+
+fn validate_admitted_workspace(workspace_path: &str) -> Result<()> {
+    if !std::path::Path::new(workspace_path).is_absolute()
+        || workspace_path.chars().any(char::is_control)
+    {
+        return Err(Error::new(
+            "WORKSPACE_LEASE_INVALID",
+            "selected module requires an absolute admitted workspace path",
+        ));
+    }
+    Ok(())
 }
 
 fn reserve_open(

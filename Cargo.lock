@@ -420,6 +420,8 @@ dependencies = [
  "swarm-kernel",
  "swarm-observer",
  "swarm-process",
+ "swarm-script-worker",
+ "swarm-scripts",
  "swarm-store",
  "swarm-supervisor",
  "swarm-telemetry",
@@ -1674,6 +1676,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "swarm-bus"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "swarm-client",
+ "swarm-contracts",
+ "swarm-process",
+ "tokio",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
 name = "swarm-checks"
 version = "0.1.0"
 dependencies = [
@@ -1710,6 +1727,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "swarm-forge-worker"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "swarm-contracts",
+ "swarm-process",
+]
+
+[[package]]
 name = "swarm-kernel"
 version = "0.1.0"
 dependencies = [
@@ -1727,6 +1755,7 @@ dependencies = [
  "swarm-process",
  "swarm-telemetry",
  "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1739,6 +1768,30 @@ dependencies = [
  "swarm-contracts",
  "uuid",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "swarm-script-worker"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "serde",
+ "serde_json",
+ "sha2",
+ "swarm-contracts",
+ "swarm-process",
+ "swarm-scripts",
+ "uuid",
+]
+
+[[package]]
+name = "swarm-scripts"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "swarm-bus",
 ]
 
 [[package]]

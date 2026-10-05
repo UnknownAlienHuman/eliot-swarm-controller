@@ -7,7 +7,7 @@
 use crate::module_catalog::{
     ActivationPolicy, ArtifactId, ArtifactIdentity, ArtifactVersion, CapabilityId, CatalogError,
     LaunchSpec, LifecycleOwnership, ModuleDescriptor, ModuleId, ProtocolRange, ProtocolVersion,
-    RestartPolicy, SchemaDescriptor,
+    RestartPolicy, SchemaDescriptor, WorkspaceOptionContract, WorkspaceOptionSemantics,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -43,6 +43,7 @@ pub struct ModuleContractTemplate {
     pub protocol: ProtocolRange,
     pub capabilities: BTreeSet<CapabilityId>,
     pub config_schema: Option<SchemaDescriptor>,
+    pub workspace_option: Option<WorkspaceOptionContract>,
     pub command_schemas: BTreeSet<SchemaDescriptor>,
     pub event_schemas: BTreeSet<SchemaDescriptor>,
 }
@@ -72,9 +73,23 @@ impl ModuleContractTemplate {
             protocol: ProtocolRange::exact(MODULE_PROTOCOL_V1),
             capabilities,
             config_schema: None,
+            workspace_option: None,
             command_schemas: BTreeSet::from([runtime_command_schema()]),
             event_schemas: BTreeSet::from([runtime_outcome_schema()]),
         })
+    }
+
+    /// Workspace-contract release for the standalone Rust Codex adapter.
+    /// Version 1 remains available for already retained descriptors.
+    pub fn codex_rust_controller_v2() -> Result<Self, CatalogError> {
+        let mut template = Self::codex_rust_controller_v1()?;
+        template.artifact.version = ArtifactVersion::new("2")?;
+        template.workspace_option = Some(WorkspaceOptionContract {
+            schema_version: 1,
+            native_options_pointer: "/workspaceRoot".to_owned(),
+            semantics: WorkspaceOptionSemantics::ReplaceWithAdmittedAbsoluteWorkspace,
+        });
+        Ok(template)
     }
 
     pub fn descriptor(
@@ -91,6 +106,7 @@ impl ModuleContractTemplate {
             artifact: self.artifact.clone(),
             launch,
             config_schema: self.config_schema.clone(),
+            workspace_option: self.workspace_option.clone(),
             command_schemas: self.command_schemas.clone(),
             event_schemas: self.event_schemas.clone(),
             protocol: self.protocol,

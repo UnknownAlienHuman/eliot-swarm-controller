@@ -9,7 +9,12 @@ use crate::{
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};
 
-pub(super) fn prepare(db: &Connection, p: &Principal, operation_id: &str) -> Result<Value> {
+pub(super) fn prepare(
+    db: &Connection,
+    p: &Principal,
+    operation_id: &str,
+    source: &Value,
+) -> Result<Value> {
     let (id, generation, b) = runtime::scope(db, p, true)?;
     let op = operations::get_operation(db, operation_id)?;
     if op["method"] != "agent.result"
@@ -35,10 +40,145 @@ pub(super) fn prepare(db: &Connection, p: &Principal, operation_id: &str) -> Res
         |r| r.get(0),
     )?;
     let request: Value = serde_json::from_str(&raw)?;
-    Ok(
-        json!({"operation_id":operation_id,"binding_id":id,"generation":generation,
-        "native_root_id":b["native_root_id"],"native_scope_key":b["native_scope_key"],"selector":request["selector"],"requested_offset":request["offset_bytes"].as_u64().unwrap_or(0),"requested_length":request["length_bytes"].as_u64().unwrap_or(crate::artifacts::MAX_PAGE_BYTES as u64)}),
-    )
+    let mut context = json!({
+        "operation_id":operation_id,
+        "binding_id":id,
+        "generation":generation,
+        "native_root_id":b["native_root_id"],
+        "native_scope_key":b["native_scope_key"],
+        "selector":request["selector"],
+        "requested_offset":request["offset_bytes"].as_u64().unwrap_or(0),
+        "requested_length":request["length_bytes"].as_u64().unwrap_or(crate::artifacts::MAX_PAGE_BYTES as u64)
+    });
+    if request["selector"]["kind"] == "input_status" {
+        model::fields(
+            &request["selector"],
+            &["kind", "input_operation_id", "session_id"],
+        )?;
+        let target_id = model::text(&request["selector"], "input_operation_id")?;
+        let session_id = model::text(&request["selector"], "session_id")?;
+        let target = operations::get_operation(db, target_id)?;
+        if target["binding_id"] != id
+            || target["binding_generation"] != generation
+            || !matches!(
+                target["method"].as_str(),
+                Some("task.dispatch" | "agent.send")
+            )
+            || b["native_root_id"].as_str() != Some(session_id)
+        {
+            return Err(Error::new(
+                "FORBIDDEN",
+                "input status must name a dispatch or send on this exact binding session",
+            ));
+        }
+        let target_raw: String = db.query_row(
+            "SELECT original_request_json FROM operations WHERE operation_id=?1 AND binding_id=?2 AND binding_generation=?3",
+            params![target_id, id, generation],
+            |row| row.get(0),
+        )?;
+        let target_request: Value = serde_json::from_str(&target_raw)?;
+        let target_input_sha256 = model::digest(model::canonical(&target_request)?.as_bytes());
+        context["result_input_sha256"] =
+            json!(model::digest(model::canonical(&request)?.as_bytes()));
+        context["target_operation_id"] = json!(target_id);
+        context["target_method"] = target["method"].clone();
+        context["target_input_sha256"] = json!(target_input_sha256);
+        validate_input_status_source(db, &id, generation, &b, &request, source, &context)?;
+    }
+    Ok(context)
+}
+
+fn validate_input_status_source(
+    db: &Connection,
+    binding_id: &str,
+    generation: i64,
+    binding: &Value,
+    request: &Value,
+    source: &Value,
+    context: &Value,
+) -> Result<()> {
+    model::fields(
+        source,
+        &[
+            "kind",
+            "result_operation_id",
+            "result_input_sha256",
+            "result_module_receipt",
+            "input_operation_id",
+            "target_method",
+            "target_input_sha256",
+            "target_module_receipt",
+            "native_session_id",
+            "native_input_id",
+            "input_message_sha256",
+            "evidence",
+            "read_method",
+            "read_consistency",
+            "task_completion",
+            "execution_complete",
+            "native_replay",
+        ],
+    )?;
+    if source["kind"] != "input_status"
+        || source["result_operation_id"] != context["operation_id"]
+        || source["result_input_sha256"] != context["result_input_sha256"]
+        || source["input_operation_id"] != context["target_operation_id"]
+        || source["target_method"] != context["target_method"]
+        || source["target_input_sha256"] != context["target_input_sha256"]
+        || source["native_session_id"] != binding["native_root_id"]
+        || source["native_session_id"] != request["selector"]["session_id"]
+        || source["native_input_id"]
+            != format!(
+                "msg_swarm_{}",
+                model::digest(model::text(context, "target_operation_id")?.as_bytes())
+            )
+        || !valid_prefixed_digest(&source["input_message_sha256"], "sha256:")
+        || source["evidence"] != "exact_user_message_projection"
+        || source["read_method"] != "session.message.get"
+        || source["read_consistency"] != "repeated_equal_projection_not_atomic_snapshot"
+        || source["task_completion"] != "unknown"
+        || source["execution_complete"] != false
+        || source["native_replay"] != false
+    {
+        return Err(Error::new(
+            "RESULT_PROVENANCE_INVALID",
+            "input status page differs from the exact retained Operation context",
+        ));
+    }
+    for (operation_id, receipt_key) in [
+        (
+            model::text(context, "operation_id")?,
+            "result_module_receipt",
+        ),
+        (
+            model::text(context, "target_operation_id")?,
+            "target_module_receipt",
+        ),
+    ] {
+        let outcome = RuntimeOutcome {
+            operation_id: operation_id.to_owned(),
+            outcome: EffectOutcome::Unknown,
+            native_scope_key: binding["native_scope_key"].as_str().map(str::to_owned),
+            native_root_id: binding["native_root_id"].as_str().map(str::to_owned),
+            turn_id: None,
+            native_input_id: None,
+            details: json!({"module_receipt":source[receipt_key]}),
+        };
+        super::runtime::validate_module_receipt_for_operation(
+            db, binding_id, generation, binding, &outcome,
+        )?;
+    }
+    Ok(())
+}
+
+fn valid_prefixed_digest(value: &Value, prefix: &str) -> bool {
+    let Some(value) = value.as_str().and_then(|value| value.strip_prefix(prefix)) else {
+        return false;
+    };
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 pub(super) fn record(
@@ -51,8 +191,8 @@ pub(super) fn record(
         .ok_or_else(|| Error::invalid("validated result page metadata is missing its EOF flag"))?;
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let operation_id = model::text(&artifact.metadata, "operation_id")?;
-    let context = prepare(&tx, p, operation_id)?;
-    for key in [
+    let context = prepare(&tx, p, operation_id, &artifact.metadata["source"])?;
+    let mut context_keys = vec![
         "binding_id",
         "generation",
         "native_root_id",
@@ -60,7 +200,16 @@ pub(super) fn record(
         "selector",
         "requested_offset",
         "requested_length",
-    ] {
+    ];
+    if artifact.metadata["selector"]["kind"] == "input_status" {
+        context_keys.extend([
+            "result_input_sha256",
+            "target_operation_id",
+            "target_method",
+            "target_input_sha256",
+        ]);
+    }
+    for key in context_keys {
         if context[key] != artifact.metadata[key] {
             return Err(Error::conflict(
                 "result context changed before file registration",

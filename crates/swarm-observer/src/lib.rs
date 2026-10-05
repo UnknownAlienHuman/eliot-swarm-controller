@@ -9,6 +9,8 @@
 pub mod follow;
 pub mod host;
 pub mod live_config;
+pub mod metrics_cli;
+pub mod process_metrics;
 pub use live_config::LiveConfigSource;
 
 use crate::live_config::{Kind as DiagnosticKind, LiveSettings, Severity as DiagnosticSeverity};
@@ -117,8 +119,8 @@ fn validate_record(record: &DiagnosticRecord) -> Result<()> {
             "diagnostic vocabulary is unsupported",
         ));
     }
-    if let Some(code) = &record.code {
-        if !matches!(
+    if let Some(code) = &record.code
+        && !matches!(
             code.as_str(),
             "disconnect_persistence_failed"
                 | "store_operation_failed"
@@ -126,12 +128,12 @@ fn validate_record(record: &DiagnosticRecord) -> Result<()> {
                 | "native_exit_observed"
                 | "agent_delivery_failed"
                 | "recorder_write_failed"
-        ) {
-            return Err(Error::new(
-                "OBSERVER_RECORD_INVALID",
-                "diagnostic code is unsupported",
-            ));
-        }
+        )
+    {
+        return Err(Error::new(
+            "OBSERVER_RECORD_INVALID",
+            "diagnostic code is unsupported",
+        ));
     }
     for value in [
         record.client_id.as_deref(),
@@ -139,19 +141,20 @@ fn validate_record(record: &DiagnosticRecord) -> Result<()> {
         record.binding_id.as_deref(),
         record.operation_id.as_deref(),
         record.module_boot_id.as_deref(),
-    ] {
-        if let Some(value) = value {
-            if value.is_empty()
-                || value.len() > 128
-                || !value.bytes().all(|byte| {
-                    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')
-                })
-            {
-                return Err(Error::new(
-                    "OBSERVER_RECORD_INVALID",
-                    "diagnostic identity is outside the bounded metadata vocabulary",
-                ));
-            }
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if value.is_empty()
+            || value.len() > 128
+            || !value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')
+            })
+        {
+            return Err(Error::new(
+                "OBSERVER_RECORD_INVALID",
+                "diagnostic identity is outside the bounded metadata vocabulary",
+            ));
         }
     }
     Ok(())

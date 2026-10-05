@@ -3,7 +3,7 @@
   "module_id": "eliot.opencode.v2",
   "artifact": {
     "artifact_id": "eliot-opencode-v2.rust-http.1",
-    "version": "0.1.0",
+    "version": "0.2.0",
     "build_id": null
   },
   "launch": {
@@ -23,6 +23,11 @@
     "version": "1",
     "sha256": "d597be6bae80dc82535b658b5daaf3037a09976e5704d799a6715a673a62f662"
   },
+  "workspace_option": {
+    "schema_version": 1,
+    "native_options_pointer": "/directory",
+    "semantics": "replace_with_admitted_absolute_workspace"
+  },
   "command_schemas": [
     {"schema_id": "swarm.runtime_command", "version": "1"}
   ],
@@ -36,6 +41,7 @@
   "capabilities": [
     "agent.open",
     "agent.reconcile",
+    "agent.result",
     "agent.send/next_turn",
     "task.dispatch"
   ],

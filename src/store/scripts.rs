@@ -864,6 +864,7 @@ impl Store {
             environment_sha256: runner::environment_sha256(&environment)?,
             environment,
             invocation,
+            executor: self.config.scripts.executor.clone(),
         };
         let work_for_write = work.clone();
         let (receipt_path, work_digest) = self

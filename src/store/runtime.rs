@@ -812,15 +812,38 @@ fn next_internal(
             input["target_command_method"] = target["method"].clone();
         }
     }
-    let target_input_sha256 = if method == "agent.reconcile" {
-        let target_id = model::text(&input, "operation_id")?;
+    let input_status_result =
+        method == "agent.result" && input["selector"]["kind"] == "input_status";
+    let target_input_sha256 = if method == "agent.reconcile" || input_status_result {
+        let target_id = if input_status_result {
+            model::text(&input["selector"], "input_operation_id")?
+        } else {
+            model::text(&input, "operation_id")?
+        };
+        let target = operations::get_operation(&tx, target_id)?;
+        if target["binding_id"] != id || target["binding_generation"] != generation {
+            return Err(Error::new(
+                "FORBIDDEN",
+                "readback target belongs to another binding generation",
+            ));
+        }
+        if input_status_result
+            && !matches!(
+                target["method"].as_str(),
+                Some("task.dispatch" | "agent.send")
+            )
+        {
+            return Err(Error::invalid(
+                "input_status must name an exact dispatch or send Operation",
+            ));
+        }
         let raw: String = tx.query_row(
             "SELECT original_request_json FROM operations WHERE operation_id=?1 AND binding_id=?2 AND binding_generation=?3",
             params![target_id, id, generation],
             |row| row.get(0),
         ).optional()?.ok_or_else(|| Error::new(
             "FORBIDDEN",
-            "reconcile target is not an operation on this binding generation",
+            "readback target is not an operation on this binding generation",
         ))?;
         let target_request: Value = serde_json::from_str(&raw)?;
         Some(model::digest(model::canonical(&target_request)?.as_bytes()))

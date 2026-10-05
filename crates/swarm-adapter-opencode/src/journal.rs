@@ -32,9 +32,22 @@ pub struct OperationIntent {
     pub prompt_bytes: Option<u64>,
     #[serde(default)]
     pub reconcile_target_operation_id: Option<String>,
+    /// Exact admitted result selector and target receipt used for the
+    /// readback-only input-status page. Missing on older journal records.
+    #[serde(default)]
+    pub result_input_status: Option<ResultInputStatusIntent>,
     pub route_sha256: String,
     pub model: Value,
     pub marker: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ResultInputStatusIntent {
+    pub input_operation_id: String,
+    pub native_session_id: String,
+    pub native_input_id: String,
+    pub target_module_receipt: swarm_contracts::runtime::ModuleReceiptIdentity,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -49,6 +62,10 @@ struct JournalRecord {
     outcome: Option<Value>,
     #[serde(default)]
     outcome_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    result_params: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    result_sha256: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -57,6 +74,9 @@ pub struct OperationHistory {
     pub outcome: Option<Value>,
     pub outcome_sha256: Option<String>,
     pub acknowledged_sha256: Option<String>,
+    pub result_params: Option<Value>,
+    pub result_sha256: Option<String>,
+    pub result_acknowledged_sha256: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -271,6 +291,8 @@ impl Journal {
                 intent: Some(intent.clone()),
                 outcome: None,
                 outcome_sha256: None,
+                result_params: None,
+                result_sha256: None,
             },
         )
     }
@@ -296,6 +318,8 @@ impl Journal {
                     intent: None,
                     outcome: Some(value.clone()),
                     outcome_sha256: Some(digest.clone()),
+                    result_params: None,
+                    result_sha256: None,
                 },
             )?;
         }
@@ -312,6 +336,70 @@ impl Journal {
             key: event_id.into(),
             payload: params,
         })
+    }
+
+    /// Save an immutable module.result request before sending it to Store.
+    /// Reconnection retries must replay these exact bytes and provenance.
+    pub fn queue_result(&self, params: &Value) -> Result<()> {
+        let operation_id = params["operation_id"].as_str().ok_or_else(|| {
+            Error::new("ADAPTER_JOURNAL", "saved result page has no operation ID")
+        })?;
+        let digest = digest_json(params)?;
+        let history = self.load(operation_id)?;
+        if let Some(previous) = history.result_sha256.as_deref() {
+            if previous != digest {
+                return Err(Error::new(
+                    "ADAPTER_JOURNAL",
+                    "result page conflicts with the immutable saved page",
+                ));
+            }
+        } else {
+            self.append(
+                operation_id,
+                &JournalRecord {
+                    version: 2,
+                    operation_id: operation_id.into(),
+                    kind: "result_page".into(),
+                    intent: None,
+                    outcome: None,
+                    outcome_sha256: None,
+                    result_params: Some(params.clone()),
+                    result_sha256: Some(digest.clone()),
+                },
+            )?;
+        }
+        self.write_pending(PendingItem {
+            kind: "result".into(),
+            key: operation_id.into(),
+            payload: params.clone(),
+        })
+    }
+
+    pub fn acknowledge_result(&self, params: &Value) -> Result<()> {
+        let operation_id = params["operation_id"].as_str().ok_or_else(|| {
+            Error::new("ADAPTER_OUTBOX", "acknowledged result has no operation ID")
+        })?;
+        let digest = digest_json(params)?;
+        let history = self.load(operation_id)?;
+        if history.result_sha256.as_deref() != Some(digest.as_str()) {
+            return Err(Error::new(
+                "ADAPTER_JOURNAL",
+                "result acknowledgement differs from the saved page",
+            ));
+        }
+        self.append(
+            operation_id,
+            &JournalRecord {
+                version: 2,
+                operation_id: operation_id.into(),
+                kind: "result_acknowledged".into(),
+                intent: None,
+                outcome: None,
+                outcome_sha256: None,
+                result_params: None,
+                result_sha256: Some(digest),
+            },
+        )
     }
 
     pub fn pending_items(&self) -> Result<Vec<(PathBuf, PendingItem)>> {
@@ -368,6 +456,24 @@ impl Journal {
                     payload: outcome,
                 })?;
             }
+            if let (Some(params), Some(digest)) = (history.result_params, history.result_sha256)
+                && history.result_acknowledged_sha256.as_deref() != Some(digest.as_str())
+            {
+                let operation_id = params["operation_id"].as_str().ok_or_else(|| {
+                    Error::new("ADAPTER_JOURNAL", "result page operation ID is missing")
+                })?;
+                if name != operation_key(operation_id) {
+                    return Err(Error::new(
+                        "ADAPTER_JOURNAL",
+                        "result page filename does not match its identity",
+                    ));
+                }
+                self.write_pending(PendingItem {
+                    kind: "result".into(),
+                    key: operation_id.into(),
+                    payload: params,
+                })?;
+            }
         }
         Ok(())
     }
@@ -393,6 +499,8 @@ impl Journal {
                 intent: None,
                 outcome: None,
                 outcome_sha256: Some(digest),
+                result_params: None,
+                result_sha256: None,
             },
         )
     }
@@ -579,12 +687,11 @@ impl Journal {
     }
 
     fn write_pending(&self, item: PendingItem) -> Result<()> {
-        let prefix = if item.kind == "outcome" {
-            "outcome"
-        } else if item.kind == "observation" {
-            "observation"
-        } else {
-            return Err(Error::new("ADAPTER_OUTBOX", "unsupported pending item"));
+        let prefix = match item.kind.as_str() {
+            "outcome" => "outcome",
+            "observation" => "observation",
+            "result" => "result",
+            _ => return Err(Error::new("ADAPTER_OUTBOX", "unsupported pending item")),
         };
         let path = self
             .outbox
@@ -694,10 +801,56 @@ impl Journal {
                     }
                     history.acknowledged_sha256 = Some(digest);
                 }
+                "result_page" => {
+                    let params = record.result_params.ok_or_else(|| {
+                        Error::new("ADAPTER_JOURNAL", "saved result page is missing")
+                    })?;
+                    if params["operation_id"] != record.operation_id {
+                        return Err(Error::new(
+                            "ADAPTER_JOURNAL",
+                            "saved result page identity changed",
+                        ));
+                    }
+                    let digest = digest_json(&params)?;
+                    if record.result_sha256.as_deref() != Some(digest.as_str()) {
+                        return Err(Error::new(
+                            "ADAPTER_JOURNAL",
+                            "saved result page digest mismatch",
+                        ));
+                    }
+                    if history
+                        .result_sha256
+                        .as_deref()
+                        .is_some_and(|old| old != digest)
+                    {
+                        return Err(Error::new(
+                            "ADAPTER_JOURNAL",
+                            "result page changed after being saved",
+                        ));
+                    }
+                    history.result_params = Some(params);
+                    history.result_sha256 = Some(digest);
+                }
+                "result_acknowledged" => {
+                    let digest = record.result_sha256.ok_or_else(|| {
+                        Error::new(
+                            "ADAPTER_JOURNAL",
+                            "result acknowledgement digest is missing",
+                        )
+                    })?;
+                    if history.result_sha256.as_deref() != Some(digest.as_str()) {
+                        return Err(Error::new(
+                            "ADAPTER_JOURNAL",
+                            "result acknowledgement does not match the saved page",
+                        ));
+                    }
+                    history.result_acknowledged_sha256 = Some(digest);
+                }
                 _ => return Err(Error::new("ADAPTER_JOURNAL", "unknown journal record")),
             }
         }
-        if history.intent.is_none() && history.outcome.is_none() {
+        if history.intent.is_none() && history.outcome.is_none() && history.result_params.is_none()
+        {
             return Err(Error::new("ADAPTER_JOURNAL", "empty operation journal"));
         }
         Ok(history)

@@ -654,6 +654,10 @@ fn build_packet(
             "identity_digest":capability_identity_digest,
             "evidence_digest":proof["capability"]["evidence_digest"],
             "native_discovered_digest":proof["capability"]["native_discovered_digest"],
+            "session_context_digest":proof["capability"]["session_context_digest"],
+            "provider_request_digest":proof["capability"]["provider_request_digest"],
+            "session_context_state":proof["session_context"]["status"],
+            "provider_request_state":proof["provider_request"]["status"],
             "service_id":proof["capability"]["service_id"],
             "service_version":proof["capability"]["service_version"],
             "plugin_id":proof["capability"]["plugin_id"],
@@ -661,6 +665,102 @@ fn build_packet(
             "required_core_schemas":required_names,
         },
     }))
+}
+
+fn validate_session_context_proof(evidence: &Value) -> Result<()> {
+    let status = model::text(evidence, "status")?;
+    let tools = evidence["tools"]
+        .as_array()
+        .ok_or_else(|| stale_capability("session-context tool projection is missing"))?;
+    match status {
+        "unknown"
+            if evidence["stage"].is_null()
+                && evidence["observed_at_ms"].is_null()
+                && tools.is_empty() =>
+        {
+            Ok(())
+        }
+        "unsupported"
+            if evidence["stage"] == "session_context_hook"
+                && evidence["observed_at_ms"]
+                    .as_i64()
+                    .is_some_and(|time| time > 0)
+                && tools.is_empty() =>
+        {
+            Ok(())
+        }
+        "observed"
+            if evidence["stage"] == "session_context_hook"
+                && evidence["observed_at_ms"]
+                    .as_i64()
+                    .is_some_and(|time| time > 0) =>
+        {
+            validate_projected_hook_tools(tools)
+        }
+        _ => Err(stale_capability(
+            "session-context observation status is invalid",
+        )),
+    }
+}
+
+fn validate_provider_request_proof(evidence: &Value) -> Result<()> {
+    let status = model::text(evidence, "status")?;
+    let tools = evidence["tools"]
+        .as_array()
+        .ok_or_else(|| stale_capability("provider-request tool projection is missing"))?;
+    match status {
+        "unknown"
+            if evidence["transport"].is_null()
+                && evidence["stage"].is_null()
+                && evidence["observed_at_ms"].is_null()
+                && tools.is_empty() =>
+        {
+            Ok(())
+        }
+        "unsupported" | "observed"
+            if matches!(evidence["transport"].as_str(), Some("http" | "websocket"))
+                && evidence["stage"] == "before_transport"
+                && evidence["observed_at_ms"]
+                    .as_i64()
+                    .is_some_and(|time| time > 0) =>
+        {
+            if status == "unsupported" {
+                if tools.is_empty() {
+                    Ok(())
+                } else {
+                    Err(stale_capability(
+                        "unsupported provider-request evidence contains tools",
+                    ))
+                }
+            } else {
+                validate_projected_hook_tools(tools)
+            }
+        }
+        _ => Err(stale_capability(
+            "provider-request observation status is invalid",
+        )),
+    }
+}
+
+fn validate_projected_hook_tools(tools: &[Value]) -> Result<()> {
+    if tools.len() > 512 {
+        return Err(stale_capability(
+            "observed hook tool list exceeds its bound",
+        ));
+    }
+    let mut names = BTreeSet::new();
+    for tool in tools {
+        model::fields(tool, &["name", "input_schema"])?;
+        let name = model::text(tool, "name")?;
+        if !name_is_bounded(name)
+            || !names.insert(name)
+            || !tool["input_schema"].is_object()
+            || model::canonical(&tool["input_schema"])?.len() > 512 * 1024
+        {
+            return Err(stale_capability("observed hook tool entry is invalid"));
+        }
+    }
+    Ok(())
 }
 
 fn validate_capability_proof(
@@ -686,6 +786,10 @@ fn validate_capability_proof(
             "install",
             "capability",
             "native_discovered",
+            "session_context",
+            "session_context_digest",
+            "provider_request",
+            "provider_request_digest",
             "dispatch_permitted",
             "model_consumed",
             "provider_auth",
@@ -726,6 +830,8 @@ fn validate_capability_proof(
             "identity_digest",
             "evidence_digest",
             "native_discovered_digest",
+            "session_context_digest",
+            "provider_request_digest",
             "service_id",
             "service_version",
             "plugin_id",
@@ -735,6 +841,14 @@ fn validate_capability_proof(
     model::fields(
         &proof["native_discovered"],
         &["status", "observed_at_ms", "tools"],
+    )?;
+    model::fields(
+        &proof["session_context"],
+        &["status", "stage", "observed_at_ms", "tools"],
+    )?;
+    model::fields(
+        &proof["provider_request"],
+        &["status", "transport", "stage", "observed_at_ms", "tools"],
     )?;
 
     let expected_assignment = json!({
@@ -770,6 +884,8 @@ fn validate_capability_proof(
         || proof["assignment_digest"].as_str().is_none()
         || proof["evidence_digest"].as_str().is_none()
         || proof["native_discovered_digest"].as_str().is_none()
+        || proof["session_context_digest"].as_str().is_none()
+        || proof["provider_request_digest"].as_str().is_none()
         || proof["dispatch_permitted"] != false
         || proof["model_consumed"] != "unknown"
         || proof["native_discovered"]["status"] != "observed"
@@ -838,6 +954,8 @@ fn validate_capability_proof(
         "identity_digest",
         "evidence_digest",
         "native_discovered_digest",
+        "session_context_digest",
+        "provider_request_digest",
         "module_sha256",
     ] {
         if !valid_digest(capability[field].as_str().unwrap_or_default()) {
@@ -849,6 +967,8 @@ fn validate_capability_proof(
         "assignment_digest",
         "evidence_digest",
         "native_discovered_digest",
+        "session_context_digest",
+        "provider_request_digest",
         "service.process_identity_digest",
         "install.command_sha256",
         "install.location_sha256",
@@ -861,11 +981,25 @@ fn validate_capability_proof(
             return Err(stale_capability("C8 readback digest is invalid"));
         }
     }
-    for field in ["evidence_digest", "native_discovered_digest"] {
+    for field in [
+        "evidence_digest",
+        "native_discovered_digest",
+        "session_context_digest",
+        "provider_request_digest",
+    ] {
         if proof[field] != capability[field] {
             return Err(stale_capability("C8 capability digests disagree"));
         }
     }
+    if digest_value(&proof["session_context"])? != proof["session_context_digest"]
+        || digest_value(&proof["provider_request"])? != proof["provider_request_digest"]
+    {
+        return Err(stale_capability(
+            "C8 hook readback digest does not match its projected evidence",
+        ));
+    }
+    validate_session_context_proof(&proof["session_context"])?;
+    validate_provider_request_proof(&proof["provider_request"])?;
     for field in [
         "identity_digest",
         "evidence_digest",

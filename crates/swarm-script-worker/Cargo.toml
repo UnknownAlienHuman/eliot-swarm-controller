@@ -1,0 +1,21 @@
+[package]
+name = "swarm-script-worker"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+publish = false
+description = "Standalone bounded ScriptRun process owner"
+
+[dependencies]
+base64 = "=0.22.1"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+sha2 = "=0.10.9"
+swarm-contracts = { path = "../swarm-contracts" }
+swarm-process = { path = "../swarm-process" }
+swarm-scripts = { path = "../swarm-scripts" }
+uuid = { version = "=1.26.1", features = ["v4"] }
+
+[[bin]]
+name = "swarm-script-worker"
+path = "src/main.rs"

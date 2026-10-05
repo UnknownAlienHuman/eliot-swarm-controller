@@ -44,7 +44,7 @@ struct Target {
 }
 
 pub(super) async fn call(store: &Store, principal: Principal, value: Value) -> Result<Value> {
-    call_with_api_inner(store, principal, value, &GhCli).await
+    call_with_api_inner(store, principal, value, &GhCli, true).await
 }
 
 #[cfg(test)]
@@ -54,7 +54,7 @@ pub(super) async fn call_with_api<A: GitHubPullRequestApi + ?Sized>(
     value: Value,
     api: &A,
 ) -> Result<Value> {
-    call_with_api_inner(store, principal, value, api).await
+    call_with_api_inner(store, principal, value, api, false).await
 }
 
 async fn call_with_api_inner<A: GitHubPullRequestApi + ?Sized>(
@@ -62,6 +62,7 @@ async fn call_with_api_inner<A: GitHubPullRequestApi + ?Sized>(
     principal: Principal,
     value: Value,
     api: &A,
+    use_native_worker: bool,
 ) -> Result<Value> {
     let value = protocol::validate_mutation(METHOD, &value)?;
     let request = PullRequestDescriptionUpdateRequest::parse(&value)?;
@@ -78,12 +79,34 @@ async fn call_with_api_inner<A: GitHubPullRequestApi + ?Sized>(
         })
         .await?;
     let operation_id = model::text(&receipt, "operation_id")?.to_owned();
-    let operation = store
+    let mut operation = store
         .run({
             let operation_id = operation_id.clone();
             move |db| operations::get_operation(db, &operation_id)
         })
         .await?;
+
+    if operation["state"] == "sending"
+        && operation["result"]["native_worker"]["kind"] == "github_pr_description"
+    {
+        if store
+            .prior_native_worker_departed(&operation_id)
+            .await
+            .is_err()
+        {
+            return Err(Error::new(
+                "GITHUB_PR_UPDATE_IN_PROGRESS",
+                "the authorized GitHub worker may still be active; inspect the retained Operation",
+            ));
+        }
+        mark_sending_unknown(store, &principal, &operation_id).await?;
+        operation = store
+            .run({
+                let operation_id = operation_id.clone();
+                move |db| operations::get_operation(db, &operation_id)
+            })
+            .await?;
+    }
 
     match operation["state"].as_str() {
         Some("settled") => return Ok(operation["result"].clone()),
@@ -118,6 +141,20 @@ async fn call_with_api_inner<A: GitHubPullRequestApi + ?Sized>(
         }
         Err(error) => return Err(error),
     };
+    if readback_only {
+        if let Err(error) = store.prior_native_worker_departed(&operation_id).await {
+            return record_unknown(
+                store,
+                &principal,
+                &operation_id,
+                &target,
+                &request,
+                "native_worker_process_tree_unconfirmed",
+                Some(&error),
+            )
+            .await;
+        }
+    }
     let repository = RepositoryRef::new(&target.host, &target.owner, &target.repo)?;
     let initial = match read_remote(api, &repository, &target).await {
         Ok(readback) => readback,
@@ -177,7 +214,42 @@ async fn call_with_api_inner<A: GitHubPullRequestApi + ?Sized>(
         .await;
     }
 
-    if let Err(error) = begin_write(store, &principal, &operation_id, &request, &config).await {
+    let native_worker = if use_native_worker {
+        match store
+            .prepare_github_description_worker(
+                &operation_id,
+                &target.host,
+                &target.owner,
+                &target.repo,
+                target.pull_request_number,
+                &request.title,
+                &request.body,
+            )
+            .await
+        {
+            Ok(worker) => Some(worker),
+            Err(error) => {
+                reject_before_write(store, &principal, &operation_id, &request, &error).await?;
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
+    let native_worker_receipt = native_worker.as_ref().map(|worker| worker.receipt());
+    if let Err(error) = begin_write(
+        store,
+        &principal,
+        &operation_id,
+        &request,
+        &config,
+        native_worker_receipt.as_ref(),
+    )
+    .await
+    {
+        if let Some(worker) = native_worker {
+            let _ = store.finish_github_description_worker(worker, false).await;
+        }
         // begin_write is the durable effect boundary. No PATCH is issued unless
         // it commits `sending`; reject only the exact Operation if it is still
         // queued. A concurrent writer, cancellation, or unknown outcome wins
@@ -197,15 +269,51 @@ async fn call_with_api_inner<A: GitHubPullRequestApi + ?Sized>(
     }
     // One PATCH at most. Even a transport error is ambiguous after the durable
     // sending transition, so every path below performs only exact readback.
-    let write_error = api
-        .update_description(
+    let write_error = if let Some(worker) = native_worker {
+        match store.finish_github_description_worker(worker, true).await {
+            Ok(worker_result) => {
+                if let Err(error) = validate_github_worker_outcome(&worker_result) {
+                    return record_unknown(
+                        store,
+                        &principal,
+                        &operation_id,
+                        &target,
+                        &request,
+                        "native_worker_completion_unconfirmed",
+                        Some(&error),
+                    )
+                    .await;
+                }
+                match persist_native_worker_result(store, &principal, &operation_id, &worker_result)
+                    .await
+                {
+                    Ok(()) => github_worker_write_error(&worker_result),
+                    Err(error) => Some(error),
+                }
+            }
+            Err(error) => {
+                return record_unknown(
+                    store,
+                    &principal,
+                    &operation_id,
+                    &target,
+                    &request,
+                    "native_worker_completion_unconfirmed",
+                    Some(&error),
+                )
+                .await;
+            }
+        }
+    } else {
+        api.update_description(
             &repository,
             target.pull_request_number,
             &request.title,
             &request.body,
         )
         .await
-        .err();
+        .err()
+    };
     match read_remote(api, &repository, &target).await {
         Ok(readback) if desired_is_observed(&readback, &request) => {
             settle(
@@ -256,6 +364,55 @@ pub(super) async fn reconcile_call(
     value: Value,
 ) -> Result<Value> {
     reconcile_call_with_api_inner(store, principal, value, &GhCli).await
+}
+
+async fn mark_sending_unknown(
+    store: &Store,
+    principal: &Principal,
+    operation_id: &str,
+) -> Result<()> {
+    let principal = principal.clone();
+    let operation_id = operation_id.to_owned();
+    store
+        .run(move |db| {
+            let now = model::now_ms()?;
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let current = current_principal(&tx, principal)?;
+            let operation = operations::get_operation(&tx, &operation_id)?;
+            if operation["method"] != METHOD
+                || operation["caller_id"] != current.client_id
+                || operation["state"] != "sending"
+                || operation["result"]["native_worker"]["kind"] != "github_pr_description"
+            {
+                return Err(Error::conflict(
+                    "the exact GitHub worker Operation is no longer in its sending state",
+                ));
+            }
+            let mut result = operation["result"].clone();
+            result["outcome"] = json!("worker_exit_requires_exact_readback");
+            result["write_attempted"] = json!(true);
+            result["readback"] = json!("unknown");
+            result["current_state_read_method"] = json!("operation.get");
+            let changed = tx.execute(
+                "UPDATE operations SET state='outcome_unknown',result_json=?2,settled_at_ms=NULL,updated_at_ms=?3 WHERE operation_id=?1 AND method=?4 AND state='sending'",
+                params![
+                    operation_id,
+                    model::canonical(&result)?,
+                    now,
+                    METHOD
+                ],
+            )?;
+            if changed != 1 {
+                return Err(Error::conflict(
+                    "the GitHub worker Operation changed before unknown-outcome recovery",
+                ));
+            }
+            capacity::sync_operation(&tx, &operation_id, now)?;
+            super::record_operation_failure_event(&tx, &operation_id, "outcome_unknown", now)?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
 }
 
 #[cfg(test)]
@@ -320,6 +477,24 @@ async fn reconcile_call_with_api_inner<A: GitHubPullRequestApi + ?Sized>(
 
     let (target, desired) =
         begin_reconcile_readback(store, &principal, &reconciliation_operation_id, &request).await?;
+    if let Err(error) = store
+        .prior_native_worker_departed(&request.operation_id)
+        .await
+    {
+        return persist_reconcile_readback(
+            store,
+            &principal,
+            &reconciliation_operation_id,
+            &request,
+            &target,
+            &desired,
+            "outcome_unknown",
+            "native_worker_process_tree_unconfirmed",
+            None,
+            Some(&error),
+        )
+        .await;
+    }
     let repository = RepositoryRef::new(&target.host, &target.owner, &target.repo)?;
     match read_remote(api, &repository, &target).await {
         Ok(readback) => {
@@ -926,17 +1101,84 @@ fn desired_is_observed(
     pull.title == request.title && pull.body.as_deref().unwrap_or("") == request.body
 }
 
+fn validate_github_worker_outcome(result: &Value) -> Result<()> {
+    let reason = result.get("reason").and_then(Value::as_str).unwrap_or("");
+    let stderr_digest = result.get("stderr_sha256");
+    if result["kind"] != "github_pr_description"
+        || result["phase"] != "patch_once"
+        || result["authorized"] != true
+        || result["outcome"] != "unknown"
+        || result["remote_ref"] != Value::Null
+        || result["process_tree_empty"] != true
+        || result["process_tree_unconfirmed"] != false
+        || !matches!(
+            reason,
+            "github_write_completed_readback_required"
+                | "github_cli_failed_readback_required"
+                | "github_cli_timed_out"
+                | "github_request_body_delivery_failed"
+                | "github_cli_unavailable"
+                | "github_cli_image_changed"
+        )
+        || !result.get("timed_out").is_some_and(Value::is_boolean)
+        || (!stderr_digest.is_none_or(Value::is_null)
+            && !stderr_digest
+                .and_then(Value::as_str)
+                .is_some_and(valid_worker_digest))
+        || (!result["stderr_bytes"].is_null() && !result["stderr_bytes"].is_u64())
+        || (!result["push_exit_code"].is_null() && !result["push_exit_code"].is_i64())
+    {
+        return Err(Error::new(
+            "GITHUB_WORKER_RESULT_INVALID",
+            "GitHub worker result did not match its bounded write outcome contract",
+        ));
+    }
+    Ok(())
+}
+
+fn github_worker_write_error(result: &Value) -> Option<Error> {
+    match result["reason"].as_str().unwrap_or_default() {
+        "github_write_completed_readback_required" => None,
+        "github_cli_unavailable" => Some(Error::new(
+            "GITHUB_CLI_UNAVAILABLE",
+            "the installed GitHub CLI could not be started",
+        )),
+        "github_cli_image_changed" => Some(Error::new(
+            "GITHUB_CLI_UNAVAILABLE",
+            "the configured GitHub CLI image changed before the write",
+        )),
+        "github_cli_timed_out" => Some(Error::new(
+            "GITHUB_CLI_TIMEOUT",
+            "the bounded GitHub write timed out; exact readback is required",
+        )),
+        "github_request_body_delivery_failed" => Some(Error::new(
+            "GITHUB_CLI_FAILED",
+            "the GitHub request body was not fully delivered; exact readback is required",
+        )),
+        _ => Some(Error::new(
+            "GITHUB_CLI_FAILED",
+            "the GitHub CLI write failed; exact readback is required",
+        )),
+    }
+}
+
+fn valid_worker_digest(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 async fn begin_write(
     store: &Store,
     principal: &Principal,
     operation_id: &str,
     request: &PullRequestDescriptionUpdateRequest,
     config: &Config,
+    native_worker_receipt: Option<&Value>,
 ) -> Result<()> {
     let principal = principal.clone();
     let operation_id = operation_id.to_owned();
     let request = request.clone();
     let config = config.clone();
+    let native_worker_receipt = native_worker_receipt.cloned();
     store
         .run(move |db| {
             let now = model::now_ms()?;
@@ -965,10 +1207,17 @@ async fn begin_write(
                     "the exact PR resource slot, retained head, or queued Operation changed before write",
                 ));
             }
-            let changed = tx.execute(
-                "UPDATE operations SET state='sending',sent_at_ms=?2,updated_at_ms=?2 WHERE operation_id=?1 AND state='queued'",
-                params![operation_id, now],
-            )?;
+            let changed = if let Some(worker_receipt) = native_worker_receipt {
+                tx.execute(
+                    "UPDATE operations SET state='sending',result_json=json_set(COALESCE(result_json,'{}'),'$.native_worker',json(?2)),sent_at_ms=?3,updated_at_ms=?3 WHERE operation_id=?1 AND state='queued'",
+                    params![operation_id, model::canonical(&worker_receipt)?, now],
+                )?
+            } else {
+                tx.execute(
+                    "UPDATE operations SET state='sending',sent_at_ms=?2,updated_at_ms=?2 WHERE operation_id=?1 AND state='queued'",
+                    params![operation_id, now],
+                )?
+            };
             if changed != 1 {
                 return Err(Error::conflict(
                     "the PR description Operation changed before write",
@@ -1292,7 +1541,7 @@ async fn persist(
     store: &Store,
     principal: &Principal,
     operation_id: &str,
-    result: Value,
+    mut result: Value,
     state: &'static str,
 ) -> Result<()> {
     let principal = principal.clone();
@@ -1308,6 +1557,11 @@ async fn persist(
                     "GITHUB_PR_OPERATION_MISMATCH",
                     "the retained Operation does not belong to the current caller",
                 ));
+            }
+            for field in ["native_worker", "native_worker_result"] {
+                if let Some(value) = operation["result"].get(field) {
+                    result[field] = value.clone();
+                }
             }
             let allowed_from = match state {
                 "settled" => "'queued','sending','outcome_unknown'",
@@ -1349,6 +1603,55 @@ async fn persist(
                     "INSERT OR IGNORE INTO observations(source_stream_id,source_event_key,operation_id,kind,payload_json,recorded_at_ms) VALUES('github:pull-request',?1,?2,'github.pull_request.update_description',?3,?4)",
                     params![event_key, operation_id, model::canonical(&result)?, now],
                 )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+}
+
+async fn persist_native_worker_result(
+    store: &Store,
+    principal: &Principal,
+    operation_id: &str,
+    worker_result: &Value,
+) -> Result<()> {
+    let principal = principal.clone();
+    let operation_id = operation_id.to_owned();
+    let worker_result = worker_result.clone();
+    store
+        .run(move |db| {
+            let now = model::now_ms()?;
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let current = current_principal(&tx, principal)?;
+            let operation = operations::get_operation(&tx, &operation_id)?;
+            let receipt = &operation["result"]["native_worker"];
+            if operation["method"] != METHOD
+                || operation["caller_id"] != current.client_id
+                || operation["state"] != "sending"
+                || receipt["kind"] != "github_pr_description"
+                || receipt["operation_id"] != operation_id
+                || receipt["job_id"] != worker_result["job_id"]
+                || receipt["owner_token"] != worker_result["owner_token"]
+                || receipt["plan_sha256"] != worker_result["plan_sha256"]
+            {
+                return Err(Error::conflict(
+                    "the exact authorized GitHub worker no longer matches the sending Operation",
+                ));
+            }
+            let changed = tx.execute(
+                "UPDATE operations SET result_json=json_set(COALESCE(result_json,'{}'),'$.native_worker_result',json(?2)),updated_at_ms=?4 WHERE operation_id=?1 AND method=?3 AND state='sending'",
+                params![
+                    operation_id,
+                    model::canonical(&worker_result)?,
+                    METHOD,
+                    now
+                ],
+            )?;
+            if changed != 1 {
+                return Err(Error::conflict(
+                    "the GitHub worker outcome could not be retained on its sending Operation",
+                ));
             }
             tx.commit()?;
             Ok(())

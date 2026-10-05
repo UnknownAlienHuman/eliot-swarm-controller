@@ -16,8 +16,8 @@ pub struct RuntimeCommand {
     /// enrichment of `input`. Legacy routes may omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_sha256: Option<String>,
-    /// For agent.reconcile, the canonical digest of the exact target
-    /// Operation's original request. This is distinct from the reconcile
+    /// For readback operations, the canonical digest of the exact target
+    /// Operation's original request. This is distinct from the current
     /// command's own digest and is supplied by the Store.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_input_sha256: Option<String>,

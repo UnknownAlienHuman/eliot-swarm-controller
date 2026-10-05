@@ -64,6 +64,11 @@ pub enum InputEvidence {
     ProjectedMessageReadback,
 }
 
+#[derive(Debug, Clone)]
+pub struct InputStatusEvidence {
+    pub input_message_sha256: String,
+}
+
 pub struct NativeClient {
     client: Client,
     endpoint: Url,
@@ -348,6 +353,103 @@ impl NativeClient {
             "NATIVE_EVIDENCE_UNAVAILABLE",
             "exact saved input was not observed",
         ))
+    }
+
+    /// Prove only that the exact admitted user input was projected into its
+    /// saved OpenCode session. This does not locate or infer an assistant turn.
+    pub async fn read_input_status(
+        &self,
+        intent: &OperationIntent,
+        options: &NativeOptions,
+    ) -> Result<InputStatusEvidence> {
+        if !matches!(intent.method.as_str(), "task.dispatch" | "agent.send")
+            || intent.native_scope_key != options.scope_key()
+            || intent.route_sha256 != digest_json(&serde_json::to_value(options)?)?
+        {
+            return Err(Error::new(
+                "NATIVE_IDENTITY_MISMATCH",
+                "saved input intent differs from the exact binding route",
+            ));
+        }
+        let root = intent.native_root_id.as_deref().ok_or_else(|| {
+            Error::new(
+                "NATIVE_EVIDENCE_UNAVAILABLE",
+                "saved input intent has no exact session ID",
+            )
+        })?;
+        let input = intent.native_input_id.as_deref().ok_or_else(|| {
+            Error::new(
+                "NATIVE_EVIDENCE_UNAVAILABLE",
+                "saved input intent has no exact message ID",
+            )
+        })?;
+        if root != root_id(&intent.binding_id, intent.generation)
+            || input != input_id(&intent.operation_id)
+        {
+            return Err(Error::new(
+                "NATIVE_IDENTITY_MISMATCH",
+                "saved session or input ID differs from its immutable Operation identity",
+            ));
+        }
+        valid_id(root, "ses")?;
+        valid_id(input, "msg_swarm_")?;
+
+        let session = self.session(root).await?;
+        let location = self.location(options).await?;
+        if !session_identity_matches(
+            &session,
+            root,
+            options,
+            &location,
+            &intent.binding_id,
+            intent.generation,
+        ) || session["metadata"]["eliot"]["binding"] != intent.binding_id
+            || session["metadata"]["eliot"]["generation"] != intent.generation
+        {
+            return Err(Error::new(
+                "NATIVE_EVIDENCE_UNAVAILABLE",
+                "exact saved session identity was not observed",
+            ));
+        }
+        self.check_route_model_available(options).await?;
+        self.require_durable_root_creation_for_intent(root, intent, options)
+            .await?;
+
+        let first = self
+            .get(&format!("/api/session/{root}/message/{input}"), &[])
+            .await?;
+        let message = first.get("data").ok_or_else(|| {
+            Error::new(
+                "NATIVE_SCHEMA_ERROR",
+                "native input-message response lacks data",
+            )
+        })?;
+        if message["sessionID"] != root
+            || !saved_message_matches(message, root, input, &intent.marker, intent)
+        {
+            return Err(Error::new(
+                "NATIVE_EVIDENCE_UNAVAILABLE",
+                "exact saved user input was not observed in its native session",
+            ));
+        }
+        let second = self
+            .get(&format!("/api/session/{root}/message/{input}"), &[])
+            .await?;
+        let second_message = second.get("data").ok_or_else(|| {
+            Error::new(
+                "NATIVE_SCHEMA_ERROR",
+                "repeated native input-message response lacks data",
+            )
+        })?;
+        if second_message != message {
+            return Err(Error::new(
+                "NATIVE_EVIDENCE_UNAVAILABLE",
+                "exact native input projection changed during readback",
+            ));
+        }
+        Ok(InputStatusEvidence {
+            input_message_sha256: digest_json(message)?,
+        })
     }
 
     async fn verify_binding_model(
@@ -849,6 +951,7 @@ pub fn intent_for(
         prompt_sha256,
         prompt_bytes: text.map(|text| text.len() as u64),
         reconcile_target_operation_id,
+        result_input_status: None,
         route_sha256,
         model: serde_json::to_value(&options.model)?,
         marker: marker(command),

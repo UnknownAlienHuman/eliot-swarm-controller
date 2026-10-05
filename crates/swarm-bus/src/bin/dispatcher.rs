@@ -1,0 +1,482 @@
+//! Standalone ScriptRun consumer. It keeps only its scoped Module credential
+//! while polling; the Manager credential is used by `enroll`/`revoke` only.
+
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::{
+    env,
+    fs::{self, OpenOptions},
+    io::Read,
+    path::{Path, PathBuf},
+    time::Duration,
+};
+use swarm_client::{Client, IpcConfig};
+use swarm_contracts::{
+    Credential,
+    error::{Error, Result},
+};
+#[cfg(windows)]
+use swarm_process::private_permissions;
+use swarm_process::write_private_new;
+use tokio::time::sleep;
+use uuid::Uuid;
+use zeroize::{Zeroize, Zeroizing};
+
+const MAX_CONFIG_BYTES: u64 = 8 * 1024;
+const DEFAULT_POLL_MS: u64 = 1_000;
+const MIN_POLL_MS: u64 = 100;
+const MAX_POLL_MS: u64 = 60_000;
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerConfig {
+    schema_version: u32,
+    store_root: PathBuf,
+    manager_id: String,
+    project_id: String,
+    automation_id: String,
+    register_request_id: String,
+    poll_interval_ms: u64,
+    credential: Credential,
+}
+
+impl Drop for WorkerConfig {
+    fn drop(&mut self) {
+        self.credential.token.zeroize();
+    }
+}
+
+struct SecretCredential(Credential);
+
+impl Drop for SecretCredential {
+    fn drop(&mut self) {
+        self.0.token.zeroize();
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    if let Err(error) = run_cli().await {
+        eprintln!("swarm-bus-dispatcher: {}", error.code);
+        std::process::exit(2);
+    }
+}
+
+async fn run_cli() -> Result<()> {
+    let mut args = env::args_os().skip(1);
+    let mode = args
+        .next()
+        .and_then(|value| value.into_string().ok())
+        .ok_or_else(|| Error::invalid("expected enroll, run, or revoke"))?;
+    let options = parse_options(args.collect())?;
+    match mode.as_str() {
+        "enroll" => enroll(&options).await,
+        "run" => run_worker(&options).await,
+        "revoke" => revoke(&options).await,
+        _ => Err(Error::invalid("expected enroll, run, or revoke")),
+    }
+}
+
+fn parse_options(
+    args: Vec<std::ffi::OsString>,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut result = std::collections::BTreeMap::new();
+    let mut index = 0;
+    while index < args.len() {
+        let key = args[index]
+            .to_str()
+            .filter(|value| value.starts_with("--"))
+            .ok_or_else(|| Error::invalid("options must use --name value form"))?;
+        let value = args
+            .get(index + 1)
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| Error::invalid("option is missing its value"))?;
+        if result.insert(key.to_owned(), value.to_owned()).is_some() {
+            return Err(Error::invalid("duplicate option"));
+        }
+        index += 2;
+    }
+    Ok(result)
+}
+
+fn required<'a>(
+    options: &'a std::collections::BTreeMap<String, String>,
+    name: &str,
+) -> Result<&'a str> {
+    options
+        .get(name)
+        .map(String::as_str)
+        .ok_or_else(|| Error::invalid(format!("missing {name}")))
+}
+
+fn reject_unknown_options(
+    options: &std::collections::BTreeMap<String, String>,
+    allowed: &[&str],
+) -> Result<()> {
+    if options.keys().any(|key| !allowed.contains(&key.as_str())) {
+        return Err(Error::invalid("unknown command option"));
+    }
+    Ok(())
+}
+
+async fn enroll(options: &std::collections::BTreeMap<String, String>) -> Result<()> {
+    reject_unknown_options(
+        options,
+        &[
+            "--root",
+            "--manager-credential",
+            "--project",
+            "--automation",
+            "--worker-config",
+            "--poll-ms",
+        ],
+    )?;
+    let root = PathBuf::from(required(options, "--root")?);
+    let project_id = required(options, "--project")?.to_owned();
+    let automation_id = required(options, "--automation")?.to_owned();
+    let output_path = PathBuf::from(required(options, "--worker-config")?);
+    let poll_interval_ms = options
+        .get("--poll-ms")
+        .map(|value| value.parse::<u64>())
+        .transpose()
+        .map_err(|_| Error::invalid("poll interval is invalid"))?
+        .unwrap_or(DEFAULT_POLL_MS);
+    if !(MIN_POLL_MS..=MAX_POLL_MS).contains(&poll_interval_ms) {
+        return Err(Error::invalid("poll interval must be 100..=60000 ms"));
+    }
+
+    let manager_path = PathBuf::from(required(options, "--manager-credential")?);
+    let mut manager = SecretCredential(read_credential(&manager_path)?);
+    let mut worker = if output_path.exists() {
+        let worker = read_worker_config(&output_path)?;
+        if worker.schema_version != 1
+            || worker.store_root != root
+            || worker.manager_id != manager.0.client_id
+            || worker.project_id != project_id
+            || worker.automation_id != automation_id
+            || worker.poll_interval_ms != poll_interval_ms
+        {
+            return Err(Error::new(
+                "BUS_WORKER_CONFIG_CONFLICT",
+                "existing private worker config does not match the requested scope",
+            ));
+        }
+        worker
+    } else {
+        let consumer_client_id = format!("bus-script-{}", Uuid::new_v4().simple());
+        let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let register_request_id = format!("bus-register-{consumer_client_id}");
+        let worker = WorkerConfig {
+            schema_version: 1,
+            store_root: root,
+            manager_id: manager.0.client_id.clone(),
+            project_id,
+            automation_id,
+            register_request_id,
+            poll_interval_ms,
+            credential: Credential {
+                client_id: consumer_client_id,
+                token,
+            },
+        };
+        write_worker_config(&output_path, &worker)?;
+        worker
+    };
+    let token_hash = hex_sha256(worker.credential.token.as_bytes());
+    let params = json!({
+        "client_request_id":worker.register_request_id,
+        "project_id":worker.project_id,
+        "automation_id":worker.automation_id,
+        "consumer_client_id":worker.credential.client_id,
+        "token_hash":token_hash,
+    });
+    let result = call_once(
+        &worker.store_root,
+        &manager.0,
+        "bus.consumer.register",
+        params,
+    )
+    .await;
+    manager.0.token.zeroize();
+    match result {
+        Ok(value) if value["registered"] == true => {
+            println!("consumer registered; private credential saved at the requested path");
+            worker.credential.token.zeroize();
+            Ok(())
+        }
+        Ok(_) => Err(Error::new(
+            "BUS_REGISTER_RECEIPT_INVALID",
+            "kernel returned no registered consumer receipt",
+        )),
+        Err(error) => Err(error),
+    }
+}
+
+async fn revoke(options: &std::collections::BTreeMap<String, String>) -> Result<()> {
+    reject_unknown_options(
+        options,
+        &["--root", "--manager-credential", "--worker-config"],
+    )?;
+    let root = PathBuf::from(required(options, "--root")?);
+    let manager_path = PathBuf::from(required(options, "--manager-credential")?);
+    let worker_path = PathBuf::from(required(options, "--worker-config")?);
+    let manager = SecretCredential(read_credential(&manager_path)?);
+    let worker = read_worker_config(&worker_path)?;
+    if worker.store_root != root || worker.manager_id != manager.0.client_id {
+        return Err(Error::new(
+            "BUS_WORKER_CONFIG_CONFLICT",
+            "manager credential does not own this worker config",
+        ));
+    }
+    let params = json!({
+        "client_request_id":format!("bus-revoke-{}", worker.credential.client_id),
+        "project_id":worker.project_id,
+        "automation_id":worker.automation_id,
+        "consumer_client_id":worker.credential.client_id,
+    });
+    let result = call_once(&root, &manager.0, "bus.consumer.revoke", params).await;
+    manager.0.token.zeroize();
+    let value = result?;
+    if value["revoked"] != true {
+        return Err(Error::new(
+            "BUS_REVOKE_RECEIPT_INVALID",
+            "kernel returned no revoked consumer receipt",
+        ));
+    }
+    println!("scoped bus consumer revoked");
+    Ok(())
+}
+
+async fn run_worker(options: &std::collections::BTreeMap<String, String>) -> Result<()> {
+    reject_unknown_options(options, &["--worker-config"])?;
+    let worker = read_worker_config(Path::new(required(options, "--worker-config")?))?;
+    if worker.schema_version != 1
+        || !(MIN_POLL_MS..=MAX_POLL_MS).contains(&worker.poll_interval_ms)
+        || worker.manager_id.is_empty()
+        || worker.project_id.is_empty()
+        || worker.automation_id.is_empty()
+        || !worker.credential.client_id.starts_with("bus-script-")
+        || worker.credential.token.is_empty()
+    {
+        return Err(Error::new(
+            "BUS_WORKER_CONFIG_INVALID",
+            "private worker config identity or bounds are invalid",
+        ));
+    }
+
+    loop {
+        match poll_once(&worker).await {
+            Ok(true) => continue,
+            Ok(false) => sleep(Duration::from_millis(worker.poll_interval_ms)).await,
+            Err(error) if retryable_transport_code(&error.code) => {
+                eprintln!(
+                    "swarm-bus-dispatcher: {}; retrying by rereading cursor",
+                    error.code
+                );
+                sleep(Duration::from_millis(worker.poll_interval_ms)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Returns true when a page cut was attempted, so the next turn immediately
+/// rereads the authoritative cursor instead of assuming the reply committed.
+async fn poll_once(worker: &WorkerConfig) -> Result<bool> {
+    let page = call_once(
+        &worker.store_root,
+        &worker.credential,
+        "bus.events.page",
+        json!({
+            "project_id":worker.project_id,
+            "consumer_id":worker.automation_id,
+            "limit":32,
+        }),
+    )
+    .await?;
+    let expected_cursor = page["expected_cursor"]
+        .as_i64()
+        .filter(|value| *value >= 0)
+        .ok_or_else(|| Error::new("BUS_PAGE_INVALID", "page cursor is invalid"))?;
+    let through = page["scanned_through"]
+        .as_i64()
+        .filter(|value| *value >= 0)
+        .ok_or_else(|| Error::new("BUS_PAGE_INVALID", "page scan cut is invalid"))?;
+    if through <= expected_cursor {
+        return Ok(false);
+    }
+    let revision = page["automation_revision"]
+        .as_i64()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| Error::new("BUS_PAGE_INVALID", "automation revision is invalid"))?;
+    let occurrences = page["items"]
+        .as_array()
+        .ok_or_else(|| Error::new("BUS_PAGE_INVALID", "page items are invalid"))?;
+    let request_id = admission_request_id(
+        &worker.credential.client_id,
+        &worker.project_id,
+        &worker.automation_id,
+        revision,
+        expected_cursor,
+        through,
+        occurrences,
+    )?;
+    let params = json!({
+        "client_request_id":request_id,
+        "project_id":worker.project_id,
+        "consumer_id":worker.automation_id,
+        "automation_revision":revision,
+        "expected_cursor":expected_cursor,
+        "through_observation_id":through,
+        "occurrences":occurrences,
+    });
+    // The Store commits the durable cursor and pending journal together. If
+    // the reply is unknown, the next loop rereads the cursor first; an unchanged
+    // page reuses this canonical request ID, while a committed cursor produces
+    // a different page and is never admitted twice.
+    match call_once(
+        &worker.store_root,
+        &worker.credential,
+        "bus.consumer.admit",
+        params,
+    )
+    .await
+    {
+        Ok(_) => Ok(true),
+        Err(error)
+            if matches!(
+                error.code.as_str(),
+                "OUTCOME_UNKNOWN" | "BUS_CURSOR_CONFLICT" | "BUS_AUTOMATION_REVISION_CONFLICT"
+            ) =>
+        {
+            Ok(false)
+        }
+        // A full shared pending journal is backpressure, not a terminal
+        // worker error. Keep the cursor unchanged and reread after the normal
+        // poll delay so the existing ScriptRun continuation can drain it.
+        Err(error) if error.code == "BUS_PENDING_CAPACITY" => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+async fn call_once(
+    root: &Path,
+    credential: &Credential,
+    method: &str,
+    params: Value,
+) -> Result<Value> {
+    let mut client = Client::connect(root, credential, &IpcConfig::default()).await?;
+    client.request(method, params).await
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn admission_request_id(
+    consumer_client_id: &str,
+    project_id: &str,
+    automation_id: &str,
+    automation_revision: i64,
+    expected_cursor: i64,
+    through: i64,
+    occurrences: &[Value],
+) -> Result<String> {
+    let canonical = serde_json::to_vec(&json!({
+        "consumer_client_id":consumer_client_id,
+        "project_id":project_id,
+        "automation_id":automation_id,
+        "automation_revision":automation_revision,
+        "expected_cursor":expected_cursor,
+        "through_observation_id":through,
+        "occurrences":occurrences,
+    }))?;
+    Ok(format!("bus-admit-{}", hex_sha256(&canonical)))
+}
+
+fn read_credential(path: &Path) -> Result<Credential> {
+    let mut bytes = read_private_file(path)?;
+    let parsed = serde_json::from_slice(&bytes);
+    bytes.zeroize();
+    let credential: Credential =
+        parsed.map_err(|_| Error::invalid("credential file is malformed"))?;
+    if credential.client_id.is_empty() || credential.token.is_empty() {
+        return Err(Error::invalid("credential file is incomplete"));
+    }
+    Ok(credential)
+}
+
+fn read_worker_config(path: &Path) -> Result<WorkerConfig> {
+    let mut bytes = read_private_file(path)?;
+    let parsed = serde_json::from_slice(&bytes);
+    bytes.zeroize();
+    parsed.map_err(|_| Error::invalid("private worker config is malformed"))
+}
+
+fn write_worker_config(path: &Path, worker: &WorkerConfig) -> Result<()> {
+    if path.file_name().is_none() {
+        return Err(Error::invalid("worker config path must name a file"));
+    }
+    let bytes = Zeroizing::new(serde_json::to_vec(worker)?);
+    write_private_new(path, bytes.as_slice())
+}
+
+fn read_private_file(path: &Path) -> Result<Vec<u8>> {
+    let before = fs::symlink_metadata(path)?;
+    if !before.is_file() || is_link_or_reparse(&before) || before.len() > MAX_CONFIG_BYTES {
+        return Err(Error::new(
+            "BUS_CONFIG_FILE_INVALID",
+            "credential/config must be a bounded regular private file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if before.permissions().mode() & 0o077 != 0 {
+            return Err(Error::new(
+                "BUS_CONFIG_FILE_NOT_PRIVATE",
+                "credential/config file permissions must be owner-only",
+            ));
+        }
+    }
+    #[cfg(windows)]
+    private_permissions(path, false)?;
+
+    let file = OpenOptions::new().read(true).open(path)?;
+    let opened = file.metadata()?;
+    if !opened.is_file() || opened.len() > MAX_CONFIG_BYTES {
+        return Err(Error::new(
+            "BUS_CONFIG_FILE_INVALID",
+            "credential/config must be a bounded regular file",
+        ));
+    }
+    let mut bytes = Zeroizing::new(Vec::with_capacity(opened.len() as usize));
+    file.take(MAX_CONFIG_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_CONFIG_BYTES {
+        return Err(Error::new(
+            "BUS_CONFIG_FILE_TOO_LARGE",
+            "credential/config exceeds the bounded file size",
+        ));
+    }
+    Ok(std::mem::take(&mut *bytes))
+}
+
+#[cfg(windows)]
+fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    metadata.file_attributes() & 0x400 != 0
+}
+
+#[cfg(not(windows))]
+fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+fn retryable_transport_code(code: &str) -> bool {
+    matches!(
+        code,
+        "HOST_UNAVAILABLE" | "IO_ERROR" | "OUTCOME_UNKNOWN" | "STORE_CLOSED" | "DISCONNECTED"
+    )
+}

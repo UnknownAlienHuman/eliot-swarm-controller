@@ -51,6 +51,11 @@ pub struct Work {
     pub environment: BTreeMap<String, String>,
     pub environment_sha256: String,
     pub invocation: ScriptInvocation,
+    /// `None` preserves receipts admitted before the optional standalone
+    /// executor migration. A selected pin is durable per run and never falls
+    /// back to this root-binary worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor: Option<swarm_script_worker::ExecutorPin>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -291,14 +296,27 @@ pub fn prepare_and_spawn(work: &Work, work_digest: &str) -> Result<Value> {
             "configured interpreter changed after admission",
         ));
     }
-    let executable = std::env::current_exe()?;
-    let mut command = Command::new(executable);
+    let mut command = if let Some(pin) = &work.executor {
+        let executable = swarm_script_worker::verify_pinned_executor_file(pin)?;
+        let mut command = Command::new(executable);
+        command.arg("--file").arg(dir.join("receipt.json"));
+        command
+    } else {
+        let mut command = Command::new(std::env::current_exe()?);
+        command
+            .arg("script-worker")
+            .arg("--file")
+            .arg(dir.join("receipt.json"));
+        command
+    };
+    let launch_environment = if work.executor.is_some() {
+        standalone_worker_environment()
+    } else {
+        worker_environment()
+    };
     command
-        .arg("script-worker")
-        .arg("--file")
-        .arg(dir.join("receipt.json"))
         .env_clear()
-        .envs(worker_environment())
+        .envs(launch_environment)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -432,7 +450,12 @@ pub fn allow(work: &Work) -> Result<()> {
             &json!({"run_id":work.run_id,"operation_id":work.operation_id,"token":work.token}),
         )?
         .into_bytes(),
-    )
+    )?;
+    if work.executor.is_some() {
+        let receipt = directory(&work.data_dir, &work.run_id)?.join("receipt.json");
+        swarm_script_worker::materialize_after_go(&receipt)?;
+    }
+    Ok(())
 }
 
 pub fn deny(work: &Work, error_code: &str) -> Result<()> {
@@ -686,6 +709,12 @@ pub fn worker_departed(work: &Work, launch: &Value) -> Result<bool> {
 
 pub fn run_worker(receipt_path: &Path) -> Result<()> {
     let work = read_work(receipt_path)?;
+    if work.executor.is_some() {
+        return Err(Error::new(
+            "SCRIPT_EXECUTOR_MISMATCH",
+            "a standalone-selected ScriptRun cannot use the legacy root worker",
+        ));
+    }
     let dir = directory(&work.data_dir, &work.run_id)?;
     let lock_path = dir.join("worker.lock");
     let lock = OpenOptions::new()
@@ -1398,6 +1427,9 @@ fn validate_work(work: &Work) -> Result<()> {
         ));
     }
     work.bundle.validate()?;
+    if let Some(executor) = &work.executor {
+        swarm_script_worker::validate_executor_pin(executor)?;
+    }
     if work.bundle_record.byte_length
         > (manifest::MAX_BUNDLE_REQUEST_BYTES + manifest::MAX_SCHEMA_BYTES) as u64
         || !work.bundle_record.artifact_id.starts_with("script-")
@@ -1430,6 +1462,16 @@ fn worker_environment() -> BTreeMap<String, String> {
     names.extend(["SystemRoot", "WINDIR", "TEMP", "TMP"]);
     #[cfg(unix)]
     names.extend(["HOME", "TMPDIR", "LANG", "LC_ALL", "TMP", "TEMP"]);
+    std::env::vars()
+        .filter(|(key, _)| names.iter().any(|name| key.eq_ignore_ascii_case(name)))
+        .collect()
+}
+
+fn standalone_worker_environment() -> BTreeMap<String, String> {
+    #[cfg(windows)]
+    let names = ["SystemRoot", "WINDIR", "ComSpec", "TEMP", "TMP"];
+    #[cfg(not(windows))]
+    let names: [&str; 0] = [];
     std::env::vars()
         .filter(|(key, _)| names.iter().any(|name| key.eq_ignore_ascii_case(name)))
         .collect()

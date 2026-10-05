@@ -17,9 +17,13 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
-    path::Path,
+    fs,
+    io::Read,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock, Weak},
+    time::Duration,
 };
+use tokio::process::{Child as TokioChild, Command as TokioCommand};
 
 /// Physical ownership follows the durable publication resource, rather than
 /// the project or local remote alias.  `canonical_repository` is normalized
@@ -100,6 +104,31 @@ enum DispatchAuthorization {
         admitted_gm_epoch: i64,
         current_gm_epoch: i64,
     },
+}
+
+#[derive(Debug, Clone)]
+struct NativeWorkerJob {
+    kind: &'static str,
+    phase_name: &'static str,
+    job_id: String,
+    operation_id: String,
+    owner_token: String,
+    plan_sha256: String,
+    directory: PathBuf,
+    plan_path: PathBuf,
+    owner_path: PathBuf,
+    authorization_path: PathBuf,
+    result_path: PathBuf,
+    executable: PathBuf,
+    executable_sha256: String,
+    timeout_seconds: u64,
+}
+
+struct NativeWorkerRun {
+    job: NativeWorkerJob,
+    child: TokioChild,
+    owner_record: Value,
+    _process_permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 #[derive(Debug, Clone)]
@@ -1122,6 +1151,8 @@ fn dispatch_authorized(
     db: &Connection,
     work: &ForgeWork,
     config: &Config,
+    worker_job: &NativeWorkerJob,
+    owner_record: &Value,
 ) -> Result<DispatchAuthorization> {
     let operation = operations::get_operation(db, &work.intent.operation_id)?;
     let actor = actor_for_operation(db, &work.intent.operation_id, &operation)?;
@@ -1184,9 +1215,23 @@ fn dispatch_authorized(
         }
     }
     let now = model::now_ms()?;
+    let worker_receipt = json!({
+        "version":1,
+        "kind":worker_job.kind,
+        "job_id":worker_job.job_id,
+        "operation_id":worker_job.operation_id,
+        "phase":worker_job.phase_name,
+        "owner_token":worker_job.owner_token,
+        "plan_sha256":worker_job.plan_sha256,
+        "owner":owner_record
+    });
     let changed = db.execute(
-        "UPDATE operations SET result_json=json_set(COALESCE(result_json,'{}'),'$.publication_may_have_started',json('true')),updated_at_ms=?2 WHERE operation_id=?1 AND method='forge.publish_ref' AND state='sending'",
-        params![&work.intent.operation_id, now],
+        "UPDATE operations SET result_json=json_set(COALESCE(result_json,'{}'),'$.publication_may_have_started',json('true'),'$.native_worker',json(?2)),updated_at_ms=?3 WHERE operation_id=?1 AND method='forge.publish_ref' AND state='sending'",
+        params![
+            &work.intent.operation_id,
+            model::canonical(&worker_receipt)?,
+            now
+        ],
     )?;
     if changed != 1 {
         return Err(Error::conflict(
@@ -1194,6 +1239,797 @@ fn dispatch_authorized(
         ));
     }
     Ok(DispatchAuthorization::Authorized)
+}
+
+fn forge_worker_executable() -> Result<PathBuf> {
+    let host = std::env::current_exe()?.canonicalize()?;
+    let name = if cfg!(windows) {
+        "swarm-forge-worker.exe"
+    } else {
+        "swarm-forge-worker"
+    };
+    let candidate = host.with_file_name(name);
+    reject_forge_link(&candidate)?;
+    let executable = candidate.canonicalize()?;
+    if !executable.is_file() {
+        return Err(Error::new(
+            "FORGE_WORKER_UNAVAILABLE",
+            "the installed Forge worker is not a regular executable",
+        ));
+    }
+    Ok(executable)
+}
+
+fn reject_forge_link(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Err(Error::new(
+            "FORGE_WORKER_PATH_INVALID",
+            "Forge worker files and directories cannot be symbolic links",
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return Err(Error::new(
+                "FORGE_WORKER_PATH_INVALID",
+                "Forge worker files and directories cannot be reparse points",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_private_forge_directory(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            reject_forge_link(path)?;
+            if !metadata.is_dir() {
+                return Err(Error::new(
+                    "FORGE_WORKER_PATH_INVALID",
+                    "Forge worker state path is not a directory",
+                ));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => match fs::create_dir(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let metadata = fs::symlink_metadata(path)?;
+                reject_forge_link(path)?;
+                if !metadata.is_dir() {
+                    return Err(Error::new(
+                        "FORGE_WORKER_PATH_INVALID",
+                        "Forge worker state path is not a directory",
+                    ));
+                }
+            }
+            Err(error) => return Err(error.into()),
+        },
+        Err(error) => return Err(error.into()),
+    }
+    crate::platform::private_permissions(path, true)
+}
+
+fn hash_bounded_file(path: &Path, max_bytes: u64) -> Result<String> {
+    let file = fs::File::open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > max_bytes {
+        return Err(Error::new(
+            "FORGE_WORKER_IMAGE_INVALID",
+            "Forge worker image exceeds its bounded file size",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(max_bytes + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(Error::new(
+            "FORGE_WORKER_IMAGE_INVALID",
+            "Forge worker image exceeds its bounded file size",
+        ));
+    }
+    Ok(model::digest(&bytes))
+}
+
+fn create_forge_worker_job(
+    data_dir: &Path,
+    work: &ForgeWork,
+    config: &ForgeConfig,
+    push_endpoint: Option<&str>,
+) -> Result<NativeWorkerJob> {
+    if work.mode == WorkMode::PushOnce && push_endpoint.is_none()
+        || work.mode == WorkMode::ReadbackOnly && push_endpoint.is_some()
+    {
+        return Err(Error::invalid(
+            "Forge worker phase and push endpoint do not match",
+        ));
+    }
+    let data_dir = data_dir.canonicalize()?;
+    let jobs_root = data_dir.join("forge-worker-runs");
+    ensure_private_forge_directory(&jobs_root)?;
+    let jobs_root = jobs_root.canonicalize()?;
+    if !jobs_root.starts_with(&data_dir) {
+        return Err(Error::new(
+            "FORGE_WORKER_PATH_INVALID",
+            "Forge worker state directory escaped the DataRoot",
+        ));
+    }
+    let job_id = model::new_id();
+    let directory = jobs_root.join(&job_id);
+    fs::create_dir(&directory)?;
+    crate::platform::private_permissions(&directory, true)?;
+    let directory = directory.canonicalize()?;
+    if !directory.starts_with(&jobs_root) {
+        return Err(Error::new(
+            "FORGE_WORKER_PATH_INVALID",
+            "Forge worker job directory escaped its private root",
+        ));
+    }
+    let owner_token = model::new_id();
+    let executable = forge_worker_executable()?;
+    let executable_sha256 = hash_bounded_file(&executable, 128 * 1024 * 1024)?;
+    let phase = match work.mode {
+        WorkMode::PushOnce => "push_once",
+        WorkMode::ReadbackOnly => "readback_only",
+    };
+    let plan = json!({
+        "schema_version":1,
+        "kind":"forge_publish",
+        "job_id":job_id,
+        "operation_id":work.intent.operation_id,
+        "owner_token":owner_token,
+        "phase":phase,
+        "intent":work.intent,
+        "git_executable":config.git_executable,
+        "timeout_seconds":config.timeout_seconds,
+        "max_output_bytes":config.max_output_bytes,
+        "project":work.project,
+        "push_endpoint":push_endpoint
+    });
+    let plan_bytes = serde_json::to_vec(&plan)?;
+    if plan_bytes.len() > 1_048_576 {
+        return Err(Error::invalid("Forge worker plan exceeds its envelope"));
+    }
+    let plan_sha256 = model::digest(&plan_bytes);
+    let plan_path = directory.join("plan.json");
+    let owner_path = directory.join("owner.json");
+    let authorization_path = directory.join("authorization.json");
+    let result_path = directory.join("result.json");
+    crate::platform::write_private_new(&plan_path, &plan_bytes)?;
+    Ok(NativeWorkerJob {
+        kind: "forge_publish",
+        phase_name: phase,
+        job_id,
+        operation_id: work.intent.operation_id.clone(),
+        owner_token,
+        plan_sha256,
+        directory,
+        plan_path,
+        owner_path,
+        authorization_path,
+        result_path,
+        executable,
+        executable_sha256,
+        timeout_seconds: config.timeout_seconds,
+    })
+}
+
+fn github_cli_executable() -> Result<PathBuf> {
+    let path = std::env::var_os("PATH").ok_or_else(|| {
+        Error::new(
+            "GITHUB_CLI_UNAVAILABLE",
+            "the configured GitHub CLI could not be resolved",
+        )
+    })?;
+    let name = if cfg!(windows) { "gh.exe" } else { "gh" };
+    for directory in std::env::split_paths(&path) {
+        let candidate = directory.join(name);
+        let Ok(metadata) = fs::symlink_metadata(&candidate) else {
+            continue;
+        };
+        if metadata.is_file() {
+            reject_forge_link(&candidate)?;
+            return candidate.canonicalize().map_err(Into::into);
+        }
+    }
+    Err(Error::new(
+        "GITHUB_CLI_UNAVAILABLE",
+        "the configured GitHub CLI could not be resolved",
+    ))
+}
+
+fn create_github_description_worker_job(
+    data_dir: &Path,
+    operation_id: &str,
+    host: &str,
+    owner: &str,
+    repository: &str,
+    pull_request_number: i64,
+    title: &str,
+    body: &str,
+) -> Result<NativeWorkerJob> {
+    let data_dir = data_dir.canonicalize()?;
+    let jobs_root = data_dir.join("forge-worker-runs");
+    ensure_private_forge_directory(&jobs_root)?;
+    let jobs_root = jobs_root.canonicalize()?;
+    if !jobs_root.starts_with(&data_dir) {
+        return Err(Error::new(
+            "FORGE_WORKER_PATH_INVALID",
+            "native worker state directory escaped the DataRoot",
+        ));
+    }
+    let job_id = model::new_id();
+    let directory = jobs_root.join(&job_id);
+    fs::create_dir(&directory)?;
+    crate::platform::private_permissions(&directory, true)?;
+    let directory = directory.canonicalize()?;
+    if !directory.starts_with(&jobs_root) {
+        return Err(Error::new(
+            "FORGE_WORKER_PATH_INVALID",
+            "native worker job directory escaped its private root",
+        ));
+    }
+    let owner_token = model::new_id();
+    let executable = forge_worker_executable()?;
+    let executable_sha256 = hash_bounded_file(&executable, 128 * 1024 * 1024)?;
+    let gh_executable = github_cli_executable()?;
+    let gh_executable_sha256 = hash_bounded_file(&gh_executable, 128 * 1024 * 1024)?;
+    let timeout_seconds = 45;
+    let max_output_bytes = 4 * 1024 * 1024;
+    let plan = json!({
+        "schema_version":1,
+        "kind":"github_pr_description",
+        "job_id":job_id,
+        "operation_id":operation_id,
+        "owner_token":owner_token,
+        "phase":"patch_once",
+        "gh_executable":gh_executable,
+        "gh_executable_sha256":gh_executable_sha256,
+        "timeout_seconds":timeout_seconds,
+        "max_output_bytes":max_output_bytes,
+        "host":host,
+        "owner":owner,
+        "repository":repository,
+        "pull_request_number":pull_request_number,
+        "title":title,
+        "body":body
+    });
+    let plan_bytes = serde_json::to_vec(&plan)?;
+    if plan_bytes.len() > 1_048_576 {
+        return Err(Error::invalid("GitHub worker plan exceeds its envelope"));
+    }
+    let plan_sha256 = model::digest(&plan_bytes);
+    let plan_path = directory.join("plan.json");
+    let owner_path = directory.join("owner.json");
+    let authorization_path = directory.join("authorization.json");
+    let result_path = directory.join("result.json");
+    crate::platform::write_private_new(&plan_path, &plan_bytes)?;
+    Ok(NativeWorkerJob {
+        kind: "github_pr_description",
+        phase_name: "patch_once",
+        job_id,
+        operation_id: operation_id.to_owned(),
+        owner_token,
+        plan_sha256,
+        directory,
+        plan_path,
+        owner_path,
+        authorization_path,
+        result_path,
+        executable,
+        executable_sha256,
+        timeout_seconds,
+    })
+}
+
+fn read_worker_json(path: &Path, max_bytes: u64) -> Result<Value> {
+    reject_forge_link(path)?;
+    let file = fs::File::open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > max_bytes {
+        return Err(Error::invalid("Forge worker receipt exceeds its envelope"));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(max_bytes + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(Error::invalid("Forge worker receipt exceeds its envelope"));
+    }
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn validate_worker_owner(job: &NativeWorkerJob, pid: u32, owner: &Value) -> Result<()> {
+    let fields = owner
+        .as_object()
+        .ok_or_else(|| Error::invalid("Forge worker owner record is invalid"))?;
+    if fields.len() != 3
+        || !fields.contains_key("version")
+        || !fields.contains_key("token")
+        || !fields.contains_key("process")
+        || owner["version"] != 1
+        || owner["token"] != job.owner_token
+        || owner["process"]["purpose"] != "module"
+        || owner["process"]["pid"].as_u64() != Some(u64::from(pid))
+    {
+        return Err(Error::new(
+            "FORGE_WORKER_OWNER_INVALID",
+            "Forge worker owner receipt did not match its direct process",
+        ));
+    }
+    let image = swarm_process::process_image_identity(pid)?;
+    let image_path = image
+        .get("image_path")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .ok_or_else(|| Error::new("FORGE_WORKER_OWNER_INVALID", "worker image is absent"))?
+        .canonicalize()?;
+    if image_path != job.executable
+        || image.get("image_sha256").and_then(Value::as_str) != Some(job.executable_sha256.as_str())
+    {
+        return Err(Error::new(
+            "FORGE_WORKER_OWNER_INVALID",
+            "Forge worker image differs from the installed executable",
+        ));
+    }
+    #[cfg(windows)]
+    {
+        let recorded_birth = owner["process"]["creation_filetime"]
+            .as_u64()
+            .ok_or_else(|| Error::invalid("worker owner birth identity is invalid"))?;
+        let observed_birth = image["creation_filetime"]
+            .as_str()
+            .and_then(|value| value.parse::<u64>().ok());
+        if observed_birth != Some(recorded_birth) {
+            return Err(Error::new(
+                "FORGE_WORKER_OWNER_INVALID",
+                "Forge worker process birth differs from its owner receipt",
+            ));
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if owner["process"]["start_ticks"] != image["start_ticks"]
+            || owner["process"]["boot_id"] != image["boot_id"]
+            || owner["process"]["pgid"].as_i64() != Some(i64::from(pid))
+        {
+            return Err(Error::new(
+                "FORGE_WORKER_OWNER_INVALID",
+                "Forge worker process birth differs from its owner receipt",
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn wait_worker_owner(child: &mut TokioChild, job: &NativeWorkerJob) -> Result<Value> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if job.owner_path.try_exists()? {
+            let owner = read_worker_json(&job.owner_path, 65_536)?;
+            let pid = child
+                .id()
+                .ok_or_else(|| Error::new("FORGE_WORKER_OWNER_INVALID", "worker PID is absent"))?;
+            let expected = job.clone();
+            tokio::task::spawn_blocking(move || validate_worker_owner(&expected, pid, &owner))
+                .await
+                .map_err(|_| {
+                    Error::new(
+                        "FORGE_WORKER_OWNER_INVALID",
+                        "worker image identity check did not complete",
+                    )
+                })??;
+            return Ok(owner);
+        }
+        if child.try_wait()?.is_some() {
+            return Err(Error::new(
+                "FORGE_WORKER_START_FAILED",
+                "Forge worker exited before publishing its owner receipt",
+            ));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(Error::new(
+                "FORGE_WORKER_START_UNCONFIRMED",
+                "Forge worker owner receipt did not arrive within its startup bound",
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn native_worker_receipt(job: &NativeWorkerJob, owner: &Value) -> Value {
+    json!({
+        "version":1,
+        "kind":job.kind,
+        "job_id":job.job_id,
+        "operation_id":job.operation_id,
+        "phase":job.phase_name,
+        "owner_token":job.owner_token,
+        "plan_sha256":job.plan_sha256,
+        "owner":owner
+    })
+}
+
+fn write_worker_authorization(job: &NativeWorkerJob, authorized: bool) -> Result<()> {
+    let authorization = json!({
+        "schema_version":1,
+        "kind":job.kind,
+        "job_id":job.job_id,
+        "operation_id":job.operation_id,
+        "owner_token":job.owner_token,
+        "plan_sha256":job.plan_sha256,
+        "phase":job.phase_name,
+        "authorized":authorized
+    });
+    crate::platform::write_private_new(
+        &job.authorization_path,
+        &serde_json::to_vec(&authorization)?,
+    )
+}
+
+async fn wait_worker_exit(
+    child: &mut TokioChild,
+    timeout: Duration,
+) -> Result<std::process::ExitStatus> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Ok(None) => {
+                return Err(Error::new(
+                    "FORGE_GIT_TREE_TERMINATION",
+                    "native worker did not exit within its bounded wait",
+                ));
+            }
+            Err(_) => {
+                return Err(Error::new(
+                    "FORGE_GIT_TREE_TERMINATION",
+                    "native worker exit status could not be confirmed",
+                ));
+            }
+        }
+    }
+}
+
+async fn wait_forge_worker(run: NativeWorkerRun, expected_authorized: bool) -> Result<Value> {
+    let NativeWorkerRun {
+        job,
+        mut child,
+        owner_record,
+        _process_permit,
+    } = run;
+    let status = wait_worker_exit(
+        &mut child,
+        Duration::from_secs(job.timeout_seconds.saturating_add(60)),
+    )
+    .await?;
+    let owner_process = owner_record["process"].clone();
+    let token = job.owner_token.clone();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let process = owner_process.clone();
+        let token = token.clone();
+        let departed = match tokio::task::spawn_blocking(move || {
+            swarm_process::departed_empty(&process, &token)
+        })
+        .await
+        {
+            Ok(Ok(departed)) => departed,
+            _ => {
+                return Err(Error::new(
+                    "FORGE_GIT_TREE_TERMINATION",
+                    "Forge worker family departure check could not be confirmed",
+                ));
+            }
+        };
+        if departed {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(Error::new(
+                "FORGE_GIT_TREE_TERMINATION",
+                "Forge worker process family did not depart within its bounded wait",
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    if !status.success() {
+        return Err(Error::new(
+            "FORGE_WORKER_EXITED",
+            "Forge worker exited without a successful bounded result",
+        ));
+    }
+    let result = read_worker_json(&job.result_path, 262_144)?;
+    let fields = result
+        .as_object()
+        .ok_or_else(|| Error::new("FORGE_WORKER_RESULT_INVALID", "worker result is invalid"))?;
+    const RESULT_FIELDS: [&str; 17] = [
+        "schema_version",
+        "kind",
+        "job_id",
+        "operation_id",
+        "owner_token",
+        "plan_sha256",
+        "phase",
+        "authorized",
+        "outcome",
+        "reason",
+        "remote_ref",
+        "push_exit_code",
+        "timed_out",
+        "stderr_sha256",
+        "stderr_bytes",
+        "process_tree_empty",
+        "process_tree_unconfirmed",
+    ];
+    if fields.len() != RESULT_FIELDS.len()
+        || RESULT_FIELDS
+            .iter()
+            .any(|field| !fields.contains_key(*field))
+        || result["schema_version"] != 1
+        || result["kind"] != job.kind
+        || result["job_id"] != job.job_id
+        || result["operation_id"] != job.operation_id
+        || result["owner_token"] != job.owner_token
+        || result["plan_sha256"] != job.plan_sha256
+        || result["phase"] != job.phase_name
+        || result["authorized"].as_bool() != Some(expected_authorized)
+    {
+        return Err(Error::new(
+            "FORGE_WORKER_RESULT_INVALID",
+            "Forge worker result did not match its exact authorized job",
+        ));
+    }
+    if result["process_tree_empty"] != true
+        || result["process_tree_unconfirmed"].as_bool() != Some(false)
+    {
+        return Err(Error::new(
+            "FORGE_GIT_TREE_TERMINATION",
+            "Forge worker reported unconfirmed native process departure",
+        ));
+    }
+    Ok(result)
+}
+
+fn valid_worker_uuid(value: &str) -> bool {
+    value.len() == 36
+        && [8, 13, 18, 23]
+            .into_iter()
+            .all(|index| value.as_bytes()[index] == b'-')
+        && value
+            .bytes()
+            .enumerate()
+            .all(|(index, byte)| [8, 13, 18, 23].contains(&index) || byte.is_ascii_hexdigit())
+}
+
+fn validate_github_worker_readback_receipt(
+    operation: &Value,
+    receipt: &Value,
+    result: &Value,
+) -> Result<()> {
+    const RESULT_FIELDS: [&str; 17] = [
+        "schema_version",
+        "kind",
+        "job_id",
+        "operation_id",
+        "owner_token",
+        "plan_sha256",
+        "phase",
+        "authorized",
+        "outcome",
+        "reason",
+        "remote_ref",
+        "push_exit_code",
+        "timed_out",
+        "stderr_sha256",
+        "stderr_bytes",
+        "process_tree_empty",
+        "process_tree_unconfirmed",
+    ];
+    let fields = result.as_object().ok_or_else(|| {
+        Error::new(
+            "FORGE_GIT_TREE_TERMINATION",
+            "retained GitHub worker result is invalid",
+        )
+    })?;
+    let reason = result.get("reason").and_then(Value::as_str).unwrap_or("");
+    let authorized = result.get("authorized").and_then(Value::as_bool);
+    let authorized_outcome_valid = match authorized {
+        Some(true) => {
+            result["outcome"] == "unknown"
+                && matches!(
+                    reason,
+                    "github_write_completed_readback_required"
+                        | "github_cli_failed_readback_required"
+                        | "github_cli_timed_out"
+                        | "github_request_body_delivery_failed"
+                        | "github_cli_unavailable"
+                        | "github_cli_image_changed"
+                )
+        }
+        Some(false) => {
+            (result["outcome"] == "not_authorized" && reason == "authorization_denied")
+                || (result["outcome"] == "unknown" && reason == "authorization_not_received")
+        }
+        None => false,
+    };
+    let result_matches = fields.len() == RESULT_FIELDS.len()
+        && RESULT_FIELDS
+            .iter()
+            .all(|field| fields.contains_key(*field))
+        && result["schema_version"] == 1
+        && result["kind"] == "github_pr_description"
+        && result["job_id"] == receipt["job_id"]
+        && result["operation_id"] == operation["operation_id"]
+        && result["owner_token"] == receipt["owner_token"]
+        && result["plan_sha256"] == receipt["plan_sha256"]
+        && result["phase"] == "patch_once"
+        && authorized_outcome_valid
+        && result["remote_ref"].is_null()
+        && result["process_tree_empty"] == true
+        && result["process_tree_unconfirmed"] == false
+        && result["timed_out"].is_boolean()
+        && (result["stderr_sha256"].is_null()
+            || result["stderr_sha256"]
+                .as_str()
+                .is_some_and(valid_worker_digest))
+        && (result["stderr_bytes"].is_null() || result["stderr_bytes"].is_u64())
+        && (result["push_exit_code"].is_null() || result["push_exit_code"].is_i64());
+    if !result_matches {
+        return Err(Error::new(
+            "FORGE_GIT_TREE_TERMINATION",
+            "retained GitHub worker result does not prove exact completed process ownership",
+        ));
+    }
+    if let Some(stored_result) = operation["result"].get("native_worker_result")
+        && model::canonical(stored_result)? != model::canonical(result)?
+    {
+        return Err(Error::new(
+            "FORGE_GIT_TREE_TERMINATION",
+            "retained GitHub worker result differs from its manager readback",
+        ));
+    }
+    Ok(())
+}
+
+fn worker_ref_readback(value: &Value) -> Option<RefReadback> {
+    let fields = value.as_object()?;
+    match value.get("present").and_then(Value::as_bool)? {
+        false if fields.len() == 1 && fields.contains_key("present") => Some(RefReadback::Missing),
+        true if fields.len() == 2 && fields.contains_key("present") => {
+            let commit = value.get("commit").and_then(Value::as_str)?;
+            if crate::forge::valid_object_id(commit) {
+                Some(RefReadback::At(commit.to_ascii_lowercase()))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn map_forge_worker_result(
+    job: &NativeWorkerJob,
+    work: &ForgeWork,
+    result: &Value,
+) -> ForgeOutcome {
+    let readback = worker_ref_readback(&result["remote_ref"]);
+    let reason = result["reason"].as_str().unwrap_or_default();
+    let timed_out = result["timed_out"].as_bool().unwrap_or(true);
+    let push_exit_code = result["push_exit_code"]
+        .as_i64()
+        .and_then(|value| i32::try_from(value).ok());
+    let stderr_digest = result["stderr_sha256"]
+        .as_str()
+        .filter(|value| valid_worker_digest(value))
+        .map(str::to_owned);
+    let stderr_bytes = result["stderr_bytes"].as_u64();
+    if result["authorized"] != true
+        || result["job_id"] != job.job_id
+        || result["operation_id"] != work.intent.operation_id
+        || result["plan_sha256"] != job.plan_sha256
+    {
+        return worker_unknown(
+            "worker_result_invalid",
+            readback,
+            timed_out,
+            stderr_digest,
+            stderr_bytes,
+            false,
+        );
+    }
+    if result["process_tree_unconfirmed"] == true {
+        return worker_unknown(
+            "git_process_tree_unconfirmed",
+            readback,
+            timed_out,
+            stderr_digest,
+            stderr_bytes,
+            true,
+        );
+    }
+    match result["outcome"].as_str() {
+        Some("applied")
+            if readback
+                .as_ref()
+                .is_some_and(|value| value.matches_intent(&work.intent)) =>
+        {
+            ForgeOutcome::Applied {
+                readback: readback.expect("validated exact candidate readback"),
+                push_exit_code,
+                timed_out,
+                stderr_digest,
+                stderr_bytes,
+            }
+        }
+        Some("failed")
+            if reason == "git_rejected_and_expected_ref_remains"
+                && !timed_out
+                && push_exit_code.is_some_and(|code| code != 0)
+                && readback
+                    .as_ref()
+                    .is_some_and(|value| value.matches_expected(&work.intent)) =>
+        {
+            ForgeOutcome::Failed(Error::new(
+                "FORGE_PUSH_REJECTED",
+                "native Git rejected publication and exact remote ref remains unchanged",
+            ))
+        }
+        _ => worker_unknown(
+            worker_reason(reason),
+            readback,
+            timed_out,
+            stderr_digest,
+            stderr_bytes,
+            false,
+        ),
+    }
+}
+
+fn worker_unknown(
+    reason: &'static str,
+    readback: Option<RefReadback>,
+    timed_out: bool,
+    stderr_digest: Option<String>,
+    stderr_bytes: Option<u64>,
+    process_tree_unconfirmed: bool,
+) -> ForgeOutcome {
+    ForgeOutcome::Unknown {
+        reason,
+        readback,
+        timed_out,
+        stderr_digest,
+        stderr_bytes,
+        process_tree_unconfirmed,
+    }
+}
+
+fn worker_reason(reason: &str) -> &'static str {
+    match reason {
+        "authorization_not_received" | "authorization_denied" => "worker_authorization_missing",
+        "trusted_remote_unavailable"
+        | "trusted_remote_identity_mismatch"
+        | "trusted_remote_configuration_unsafe_or_unavailable" => {
+            "trusted_remote_unavailable_for_reconciliation"
+        }
+        "remote_ref_readback_invalid" => "remote_ref_readback_invalid",
+        "expected_ref_changed_before_push" => "expected_ref_changed_before_push",
+        "push_process_unobservable" => "push_worker_failed",
+        "push_endpoint_changed_after_authorization" => "push_endpoint_changed_after_authorization",
+        "readback_failed_after_push" => "readback_failed_after_push",
+        "restart_readback_did_not_prove_publication" => {
+            "restart_readback_did_not_prove_publication"
+        }
+        "push_outcome_not_confirmed_by_exact_readback" => {
+            "push_outcome_not_confirmed_by_exact_readback"
+        }
+        _ => "worker_result_invalid",
+    }
+}
+
+fn valid_worker_digest(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn runner_error_outcome(error: Error) -> ForgeOutcome {
@@ -1504,126 +2340,6 @@ fn prepare_push(config: &ForgeConfig, work: &ForgeWork) -> Result<String> {
     Ok(push_url)
 }
 
-fn execute_push(config: &ForgeConfig, work: &ForgeWork, push_url: &str) -> ForgeOutcome {
-    let refspec = format!("{}:{}", work.intent.commit, work.intent.target_ref);
-    let args = [
-        "push".to_owned(),
-        "--porcelain".to_owned(),
-        "--no-verify".to_owned(),
-        "--no-follow-tags".to_owned(),
-        "--recurse-submodules=no".to_owned(),
-        "--receive-pack=git-receive-pack".to_owned(),
-        push_url.to_owned(),
-        refspec,
-    ];
-    let push = run_git(config, &work.project, &args);
-    let process_tree_unconfirmed =
-        matches!(&push, Err(error) if error.code == "FORGE_GIT_TREE_TERMINATION");
-    let (exit_code, timed_out, stderr_digest, stderr_bytes) = match push.as_ref() {
-        Ok(output) => (
-            output.status.code(),
-            output.timed_out,
-            Some(output.stderr_digest.clone()),
-            Some(output.stderr_bytes),
-        ),
-        // A runner error does not prove that the native command itself timed
-        // out. Preserve the distinct process-tree diagnosis below instead.
-        Err(_) => (None, false, None, None),
-    };
-    if process_tree_unconfirmed {
-        // Do not read back and call this Applied: the child tree may still be
-        // capable of finishing the push after the bounded cleanup deadline.
-        return ForgeOutcome::Unknown {
-            reason: "git_process_tree_unconfirmed",
-            readback: None,
-            timed_out,
-            stderr_digest,
-            stderr_bytes,
-            process_tree_unconfirmed: true,
-        };
-    }
-    let readback = match remote_ref(config, &work.project, &work.intent, push_url) {
-        Ok(value) => value,
-        Err(error) => {
-            let process_tree_unconfirmed = error.code == "FORGE_GIT_TREE_TERMINATION";
-            return ForgeOutcome::Unknown {
-                reason: if process_tree_unconfirmed {
-                    "git_process_tree_unconfirmed"
-                } else {
-                    "readback_failed_after_push"
-                },
-                readback: None,
-                timed_out,
-                stderr_digest,
-                stderr_bytes,
-                process_tree_unconfirmed,
-            };
-        }
-    };
-    if readback.matches_intent(&work.intent) {
-        return ForgeOutcome::Applied {
-            readback,
-            push_exit_code: exit_code,
-            timed_out,
-            stderr_digest,
-            stderr_bytes,
-        };
-    }
-    let definite_rejection = push
-        .as_ref()
-        .is_ok_and(|output| !output.timed_out && !output.status.success());
-    if definite_rejection && readback.matches_expected(&work.intent) {
-        return ForgeOutcome::Failed(Error::new(
-            "FORGE_PUSH_REJECTED",
-            "native Git rejected publication and exact remote ref remains unchanged",
-        ));
-    }
-    ForgeOutcome::Unknown {
-        reason: "push_outcome_not_confirmed_by_exact_readback",
-        readback: Some(readback),
-        timed_out,
-        stderr_digest,
-        stderr_bytes,
-        process_tree_unconfirmed: false,
-    }
-}
-
-fn execute_readback(config: &ForgeConfig, work: &ForgeWork) -> ForgeOutcome {
-    let push_url = match validate_remote(config, &work.project, &work.intent) {
-        Ok(push_url) => push_url,
-        Err(error) => {
-            let process_tree_unconfirmed = error.code == "FORGE_GIT_TREE_TERMINATION";
-            return ForgeOutcome::Unknown {
-                reason: if process_tree_unconfirmed {
-                    "git_process_tree_unconfirmed"
-                } else {
-                    "trusted_remote_unavailable_for_reconciliation"
-                },
-                readback: None,
-                timed_out: false,
-                stderr_digest: None,
-                stderr_bytes: None,
-                process_tree_unconfirmed,
-            };
-        }
-    };
-    match remote_ref(config, &work.project, &work.intent, &push_url) {
-        Ok(readback) => restart_readback_outcome(&work.intent, readback),
-        Err(error) => ForgeOutcome::Unknown {
-            reason: if error.code == "FORGE_GIT_TREE_TERMINATION" {
-                "git_process_tree_unconfirmed"
-            } else {
-                "restart_readback_failed"
-            },
-            readback: None,
-            timed_out: false,
-            stderr_digest: None,
-            stderr_bytes: None,
-            process_tree_unconfirmed: error.code == "FORGE_GIT_TREE_TERMINATION",
-        },
-    }
-}
-
 fn restart_readback_outcome(intent: &PublicationIntent, readback: RefReadback) -> ForgeOutcome {
     if readback.matches_intent(intent) {
         ForgeOutcome::Applied {
@@ -1767,6 +2483,9 @@ fn finish(db: &mut Connection, id: &str, outcome: ForgeOutcome) -> Result<()> {
     let (mut result, mut state) = outcome_value(id, &outcome);
     result["publication_may_have_started"] =
         json!(publication_may_have_started(&operation["result"]));
+    if let Some(worker_receipt) = operation["result"].get("native_worker") {
+        result["native_worker"] = worker_receipt.clone();
+    }
     preserve_process_tree_hold(&operation["result"], &mut result, &mut state);
     if state == "settled" && !matches!(outcome, ForgeOutcome::Coalesced { .. }) {
         let intent = saved_intent(&tx, id)?;
@@ -2762,6 +3481,65 @@ fn queued_pending(db: &mut Connection, limit: usize) -> Result<Vec<ForgePendingO
     pending_for_state(db, false, limit)
 }
 
+pub(super) struct GitHubDescriptionWorkerRun {
+    run: NativeWorkerRun,
+}
+
+impl GitHubDescriptionWorkerRun {
+    pub(super) fn receipt(&self) -> Value {
+        native_worker_receipt(&self.run.job, &self.run.owner_record)
+    }
+}
+
+async fn spawn_native_worker(
+    job: NativeWorkerJob,
+    process_permit: tokio::sync::OwnedSemaphorePermit,
+) -> Result<NativeWorkerRun> {
+    let mut command = TokioCommand::new(&job.executable);
+    command
+        .arg("--plan")
+        .arg(&job.plan_path)
+        .arg("--owner")
+        .arg(&job.owner_path)
+        .arg("--authorization")
+        .arg(&job.authorization_path)
+        .arg("--result")
+        .arg(&job.result_path)
+        .current_dir(&job.directory)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(false);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.as_std_mut().creation_flags(0x08000000);
+    }
+    let mut child = command.spawn().map_err(|_| {
+        Error::new(
+            "FORGE_WORKER_START_FAILED",
+            "the installed native worker could not be started",
+        )
+    })?;
+    let owner_record = match wait_worker_owner(&mut child, &job).await {
+        Ok(owner) => owner,
+        Err(error) => {
+            let _ = wait_worker_exit(
+                &mut child,
+                Duration::from_secs(job.timeout_seconds.saturating_add(60)),
+            )
+            .await;
+            return Err(error);
+        }
+    };
+    Ok(NativeWorkerRun {
+        job,
+        child,
+        owner_record,
+        _process_permit: process_permit,
+    })
+}
+
 impl super::Store {
     /// Durably admit one request and return its receipt. The host-owned forge
     /// supervisor performs all Git work, so cancellation of the IPC future
@@ -2808,6 +3586,86 @@ impl super::Store {
         reconcile_result?;
         dispatch_result?;
         Ok(())
+    }
+
+    pub(super) async fn prepare_github_description_worker(
+        &self,
+        operation_id: &str,
+        host: &str,
+        owner: &str,
+        repository: &str,
+        pull_request_number: i64,
+        title: &str,
+        body: &str,
+    ) -> Result<GitHubDescriptionWorkerRun> {
+        let data_dir = self.data_dir.clone();
+        let operation_id = operation_id.to_owned();
+        let host = host.to_owned();
+        let owner = owner.to_owned();
+        let repository = repository.to_owned();
+        let title = title.to_owned();
+        let body = body.to_owned();
+        let job = self
+            .file_io(move |_| {
+                create_github_description_worker_job(
+                    &data_dir,
+                    &operation_id,
+                    &host,
+                    &owner,
+                    &repository,
+                    pull_request_number,
+                    &title,
+                    &body,
+                )
+            })
+            .await?;
+        let process_permit = self
+            .artifact_io
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::new("STORE_CLOSED", "native worker capacity is closed"))?;
+        Ok(GitHubDescriptionWorkerRun {
+            run: spawn_native_worker(job, process_permit).await?,
+        })
+    }
+
+    pub(super) async fn finish_github_description_worker(
+        &self,
+        worker: GitHubDescriptionWorkerRun,
+        authorized: bool,
+    ) -> Result<Value> {
+        tokio::spawn(async move {
+            let job = worker.run.job.clone();
+            let authorization_result = match tokio::task::spawn_blocking(move || {
+                write_worker_authorization(&job, authorized)
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(Error::new(
+                    "FORGE_WORKER_AUTHORIZATION_FAILED",
+                    "worker authorization write did not complete",
+                )),
+            };
+            let result = wait_forge_worker(worker.run, authorized).await;
+            if let Err(error) = authorization_result {
+                if let Err(tree_error) = result {
+                    if tree_error.code == "FORGE_GIT_TREE_TERMINATION" {
+                        return Err(tree_error);
+                    }
+                }
+                return Err(error);
+            }
+            result
+        })
+        .await
+        .map_err(|_| {
+            Error::new(
+                "FORGE_WORKER_TASK_FAILED",
+                "native worker completion task did not return a result",
+            )
+        })?
     }
 
     async fn run_forge_page(
@@ -2891,22 +3749,17 @@ impl super::Store {
     async fn drive_forge(&self, work: ForgeWork) {
         let id = work.intent.operation_id.clone();
         let outcome = if work.mode == WorkMode::ReadbackOnly {
-            let config = self.config.forge.clone();
-            let scan = work.clone();
-            self.forge_file_io(&work.lane, move |_| Ok(execute_readback(&config, &scan)))
-                .await
-                .unwrap_or_else(|error| ForgeOutcome::Unknown {
-                    reason: if error.code == "FORGE_GIT_TREE_TERMINATION" {
-                        "git_process_tree_unconfirmed"
-                    } else {
-                        "readback_worker_lifecycle_unconfirmed"
-                    },
+            match self.prior_native_worker_departed(&id).await {
+                Ok(()) => self.run_forge_worker(&work, None).await,
+                Err(_) => ForgeOutcome::Unknown {
+                    reason: "git_process_tree_unconfirmed",
                     readback: None,
                     timed_out: false,
                     stderr_digest: None,
                     stderr_bytes: None,
                     process_tree_unconfirmed: true,
-                })
+                },
+            }
         } else {
             let config = self.config.forge.clone();
             let prep = work.clone();
@@ -2925,43 +3778,7 @@ impl super::Store {
                         .await
                     {
                         Err(error) => runner_error_outcome(error),
-                        Ok(push_url) => {
-                            let auth_work = work.clone();
-                            let config = self.config.clone();
-                            match self
-                                .run(move |db| dispatch_authorized(db, &auth_work, &config))
-                                .await
-                            {
-                                Err(error) => runner_error_outcome(error),
-                                Ok(DispatchAuthorization::StaleGmEpoch {
-                                    admitted_gm_epoch,
-                                    current_gm_epoch,
-                                }) => ForgeOutcome::StaleGmEpoch {
-                                    admitted_gm_epoch,
-                                    current_gm_epoch,
-                                },
-                                Ok(DispatchAuthorization::Authorized) => {
-                                    let config = self.config.forge.clone();
-                                    let push_work = work.clone();
-                                    let push_url = push_url.clone();
-                                    self.forge_file_io(&work.lane, move |_| {
-                                        Ok(execute_push(&config, &push_work, &push_url))
-                                    })
-                                    .await
-                                    .unwrap_or_else(|error| ForgeOutcome::Unknown {
-                                        reason: "push_worker_failed",
-                                        readback: None,
-                                        timed_out: false,
-                                        stderr_digest: Some(model::digest(error.code.as_bytes())),
-                                        stderr_bytes: None,
-                                        process_tree_unconfirmed: true,
-                                    })
-                                }
-                                Ok(DispatchAuthorization::Coalesced { owner_operation_id }) => {
-                                    ForgeOutcome::Coalesced { owner_operation_id }
-                                }
-                            }
-                        }
+                        Ok(push_url) => self.run_forge_worker(&work, Some(&push_url)).await,
                     }
                 }
             }
@@ -2969,6 +3786,221 @@ impl super::Store {
         let _ = self.run(move |db| finish(db, &id, outcome)).await;
         self.changed
             .send_modify(|value| *value = value.wrapping_add(1));
+    }
+
+    async fn run_forge_worker(
+        &self,
+        work: &ForgeWork,
+        push_endpoint: Option<&str>,
+    ) -> ForgeOutcome {
+        let process_permit = match work.lane.process.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                return runner_error_outcome(Error::new(
+                    "FORGE_PROCESS_CLOSED",
+                    "forge process slot stopped",
+                ));
+            }
+        };
+        let data_dir = self.data_dir.clone();
+        let job_work = work.clone();
+        let forge_config = self.config.forge.clone();
+        let endpoint = push_endpoint.map(str::to_owned);
+        let job = match self
+            .file_io(move |_| {
+                create_forge_worker_job(&data_dir, &job_work, &forge_config, endpoint.as_deref())
+            })
+            .await
+        {
+            Ok(job) => job,
+            Err(error) => return runner_error_outcome(error),
+        };
+        let run = match spawn_native_worker(job.clone(), process_permit).await {
+            Ok(run) => run,
+            Err(error) => {
+                return runner_error_outcome(error);
+            }
+        };
+        let owner_record = run.owner_record.clone();
+
+        let mut deferred_outcome = None;
+        let authorized = if work.mode == WorkMode::ReadbackOnly {
+            true
+        } else {
+            let auth_work = work.clone();
+            let config = self.config.clone();
+            let auth_job = job.clone();
+            let auth_owner = owner_record.clone();
+            match self
+                .run(move |db| dispatch_authorized(db, &auth_work, &config, &auth_job, &auth_owner))
+                .await
+            {
+                Ok(DispatchAuthorization::Authorized) => true,
+                Ok(DispatchAuthorization::StaleGmEpoch {
+                    admitted_gm_epoch,
+                    current_gm_epoch,
+                }) => {
+                    deferred_outcome = Some(ForgeOutcome::StaleGmEpoch {
+                        admitted_gm_epoch,
+                        current_gm_epoch,
+                    });
+                    false
+                }
+                Ok(DispatchAuthorization::Coalesced { owner_operation_id }) => {
+                    deferred_outcome = Some(ForgeOutcome::Coalesced { owner_operation_id });
+                    false
+                }
+                Err(error) => {
+                    deferred_outcome = Some(runner_error_outcome(error));
+                    false
+                }
+            }
+        };
+        let job_for_auth = job.clone();
+        let authorization_result = self
+            .file_io(move |_| write_worker_authorization(&job_for_auth, authorized))
+            .await;
+        let result = wait_forge_worker(run, authorized).await;
+        if let Some(outcome) = deferred_outcome {
+            return match result {
+                Ok(_) => outcome,
+                Err(error) if error.code == "FORGE_GIT_TREE_TERMINATION" => ForgeOutcome::Unknown {
+                    reason: "git_process_tree_unconfirmed",
+                    readback: None,
+                    timed_out: false,
+                    stderr_digest: None,
+                    stderr_bytes: None,
+                    process_tree_unconfirmed: true,
+                },
+                Err(_) => outcome,
+            };
+        }
+        if authorization_result.is_err() {
+            return match result {
+                Err(error) if error.code == "FORGE_GIT_TREE_TERMINATION" => ForgeOutcome::Unknown {
+                    reason: "git_process_tree_unconfirmed",
+                    readback: None,
+                    timed_out: false,
+                    stderr_digest: None,
+                    stderr_bytes: None,
+                    process_tree_unconfirmed: true,
+                },
+                _ => ForgeOutcome::Unknown {
+                    reason: "worker_authorization_delivery_failed",
+                    readback: None,
+                    timed_out: false,
+                    stderr_digest: None,
+                    stderr_bytes: None,
+                    process_tree_unconfirmed: false,
+                },
+            };
+        }
+        match result {
+            Ok(result) => map_forge_worker_result(&job, work, &result),
+            Err(error) => ForgeOutcome::Unknown {
+                reason: if error.code == "FORGE_GIT_TREE_TERMINATION" {
+                    "git_process_tree_unconfirmed"
+                } else {
+                    "push_worker_failed"
+                },
+                readback: None,
+                timed_out: false,
+                stderr_digest: Some(model::digest(error.code.as_bytes())),
+                stderr_bytes: None,
+                process_tree_unconfirmed: error.code == "FORGE_GIT_TREE_TERMINATION",
+            },
+        }
+    }
+
+    pub(super) async fn prior_native_worker_departed(&self, operation_id: &str) -> Result<()> {
+        let id = operation_id.to_owned();
+        let operation = self
+            .run(move |db| operations::get_operation(db, &id))
+            .await?;
+        let Some(receipt) = operation["result"].get("native_worker") else {
+            return Ok(());
+        };
+        let receipt_fields = receipt
+            .as_object()
+            .ok_or_else(|| Error::new("FORGE_GIT_TREE_TERMINATION", "worker receipt is invalid"))?;
+        let owner_token = receipt
+            .get("owner_token")
+            .and_then(Value::as_str)
+            .filter(|value| valid_worker_uuid(value))
+            .ok_or_else(|| Error::new("FORGE_GIT_TREE_TERMINATION", "owner token is invalid"))?;
+        let owner = receipt
+            .get("owner")
+            .filter(|owner| {
+                receipt_fields.len() == 8
+                    && receipt["version"] == 1
+                    && matches!(
+                        receipt.get("kind").and_then(Value::as_str),
+                        Some("forge_publish" | "github_pr_description")
+                    )
+                    && receipt
+                        .get("job_id")
+                        .and_then(Value::as_str)
+                        .is_some_and(valid_worker_uuid)
+                    && receipt.get("operation_id").and_then(Value::as_str) == Some(operation_id)
+                    && matches!(
+                        (receipt["kind"].as_str(), receipt["phase"].as_str()),
+                        (Some("forge_publish"), Some("push_once" | "readback_only"))
+                            | (Some("github_pr_description"), Some("patch_once"))
+                    )
+                    && receipt
+                        .get("plan_sha256")
+                        .and_then(Value::as_str)
+                        .is_some_and(valid_worker_digest)
+                    && owner["version"] == 1
+                    && owner["token"] == owner_token
+                    && owner["process"]["purpose"] == "module"
+            })
+            .ok_or_else(|| Error::new("FORGE_GIT_TREE_TERMINATION", "owner receipt is invalid"))?;
+        if !swarm_process::departed_empty(&owner["process"], owner_token)? {
+            return Err(Error::new(
+                "FORGE_GIT_TREE_TERMINATION",
+                "previous Forge worker process family remains active",
+            ));
+        }
+        if receipt["kind"] == "github_pr_description" {
+            if receipt
+                .get("process_tree_unconfirmed")
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                return Err(Error::new(
+                    "FORGE_GIT_TREE_TERMINATION",
+                    "previous GitHub worker recorded an unconfirmed process family",
+                ));
+            }
+            let job_id = receipt["job_id"]
+                .as_str()
+                .ok_or_else(|| Error::invalid("GitHub worker job ID is absent"))?
+                .to_owned();
+            let data_dir = self.data_dir.clone();
+            let owner_directory = job_id;
+            let result = self
+                .file_io(move |_| {
+                    let data_dir = data_dir.canonicalize()?;
+                    let jobs_root = data_dir.join("forge-worker-runs");
+                    reject_forge_link(&jobs_root)?;
+                    let jobs_root = jobs_root.canonicalize()?;
+                    let job_directory = jobs_root.join(owner_directory);
+                    reject_forge_link(&job_directory)?;
+                    let job_directory = job_directory.canonicalize()?;
+                    if !job_directory.starts_with(&jobs_root) {
+                        return Err(Error::new(
+                            "FORGE_GIT_TREE_TERMINATION",
+                            "GitHub worker result path escaped its private state root",
+                        ));
+                    }
+                    let result_path = job_directory.join("result.json");
+                    read_worker_json(&result_path, 262_144)
+                })
+                .await?;
+            validate_github_worker_readback_receipt(&operation, receipt, &result)?;
+        }
+        Ok(())
     }
 
     async fn forge_file_io<T: Send + 'static>(

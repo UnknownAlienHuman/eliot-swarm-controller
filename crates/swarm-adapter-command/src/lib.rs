@@ -12,6 +12,7 @@ pub use adapter::run;
 
 pub const RUNTIME: &str = "command";
 pub const ARTIFACT_ID: &str = "eliot-command.rust-headless.1";
+pub const ARTIFACT_VERSION: &str = "2";
 pub const CONTRACT_REVISION: &str = "command-headless-module-v1";
 pub const EXECUTION_SHAPE: &str = "sessionless_batch";
 

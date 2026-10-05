@@ -3,7 +3,7 @@
   "module_id": "runtime.command",
   "artifact": {
     "artifact_id": "eliot-command.rust-headless.1",
-    "version": "1",
+    "version": "2",
     "build_id": null
   },
   "launch": {
@@ -19,6 +19,11 @@
     "executable_sha256": null
   },
   "config_schema": null,
+  "workspace_option": {
+    "schema_version": 1,
+    "native_options_pointer": "/workspaceRoot",
+    "semantics": "replace_with_admitted_absolute_workspace"
+  },
   "command_schemas": [
     { "schema_id": "swarm.runtime_command", "version": "1", "sha256": null }
   ],

@@ -3,7 +3,7 @@
   "module_id": "codex",
   "artifact": {
     "artifact_id": "codex-rust-controller.1",
-    "version": "1",
+    "version": "2",
     "build_id": null
   },
   "launch": {
@@ -21,6 +21,11 @@
     "executable_sha256": null
   },
   "config_schema": null,
+  "workspace_option": {
+    "schema_version": 1,
+    "native_options_pointer": "/workspaceRoot",
+    "semantics": "replace_with_admitted_absolute_workspace"
+  },
   "command_schemas": [
     {
       "schema_id": "swarm.runtime_command",

@@ -31,7 +31,7 @@ use url::Url;
 use uuid::Uuid;
 
 pub const ARTIFACT_ID: &str = "codex-rust-controller.1";
-pub const ARTIFACT_VERSION: &str = "1";
+pub const ARTIFACT_VERSION: &str = "2";
 pub const MODULE_ID: &str = "codex";
 const MAX_FRAME_BYTES: usize = 1_048_576;
 const MAX_HISTORY_PAGES: usize = 100;

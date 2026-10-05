@@ -14,3 +14,11 @@ swarm-contracts = { path = "../swarm-contracts" }
 swarm-process = { path = "../swarm-process" }
 swarm-telemetry = { path = "../swarm-telemetry" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "=0.61.2"
+features = [
+    "Win32_Foundation",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+]

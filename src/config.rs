@@ -36,6 +36,26 @@ pub struct ObservabilityConfig {
     pub retention_days: u64,
 }
 
+/// Optional operator-pinned standalone ScriptRun process adapter. A selected
+/// pin is copied into each new immutable Work receipt; old runs retain their
+/// legacy backend discriminator through upgrade.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ScriptConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor: Option<swarm_script_worker::ExecutorPin>,
+}
+
+impl ScriptConfig {
+    pub fn validate(&self) -> Result<()> {
+        if let Some(executor) = &self.executor {
+            swarm_script_worker::validate_executor_pin(executor)
+                .map_err(|error| Error::new("CONFIG_ERROR", error.message))?;
+        }
+        Ok(())
+    }
+}
+
 impl Default for ObservabilityConfig {
     fn default() -> Self {
         Self {
@@ -73,6 +93,8 @@ pub struct Config {
     /// by Config serialization or copied into Store state.
     #[serde(default, skip_serializing)]
     pub opencode_provider_auth_sources: BTreeMap<String, OwnedProviderAuthSourceConfig>,
+    #[serde(default)]
+    pub scripts: ScriptConfig,
     pub checks: crate::checks::model::CheckConfig,
     pub mcp: McpConfig,
     pub gateway: GatewayConfig,
@@ -516,6 +538,7 @@ impl Default for Config {
             ipc: Ipc::default(),
             routes: Vec::new(),
             opencode_provider_auth_sources: BTreeMap::new(),
+            scripts: ScriptConfig::default(),
             checks: crate::checks::model::CheckConfig::default(),
             mcp: McpConfig::default(),
             gateway: GatewayConfig::default(),
@@ -878,6 +901,7 @@ impl Config {
                 ));
             }
         }
+        cfg.scripts.validate()?;
         cfg.checks.validate()?;
         Ok(cfg)
     }

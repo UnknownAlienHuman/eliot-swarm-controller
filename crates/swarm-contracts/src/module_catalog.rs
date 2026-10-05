@@ -444,6 +444,78 @@ pub enum ActivationPolicy {
     Continuous,
 }
 
+/// A trusted descriptor's exact location and meaning for the workspace path
+/// admitted by the host. `native_options_pointer` uses RFC 6901 JSON Pointer
+/// syntax and resolves only through existing JSON objects to an existing
+/// string value; it cannot create or replace unrelated native options.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceOptionContract {
+    pub schema_version: u16,
+    pub native_options_pointer: String,
+    pub semantics: WorkspaceOptionSemantics,
+}
+
+/// Workspace path semantics supported by host admission version 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceOptionSemantics {
+    ReplaceWithAdmittedAbsoluteWorkspace,
+}
+
+impl WorkspaceOptionContract {
+    pub fn validate(&self) -> Result<(), CatalogError> {
+        if self.schema_version != 1
+            || self.semantics != WorkspaceOptionSemantics::ReplaceWithAdmittedAbsoluteWorkspace
+        {
+            return Err(invalid("workspace_option"));
+        }
+        self.native_options_segments().map(|_| ())
+    }
+
+    /// Decode the bounded JSON Pointer after descriptor validation. Host
+    /// mutation still requires every segment to name an existing object key.
+    pub fn native_options_segments(&self) -> Result<Vec<String>, CatalogError> {
+        const MAX_POINTER_BYTES: usize = 1024;
+        const MAX_POINTER_SEGMENTS: usize = 8;
+        const MAX_SEGMENT_BYTES: usize = 128;
+
+        let pointer = self.native_options_pointer.as_str();
+        if pointer.is_empty() || pointer.len() > MAX_POINTER_BYTES || !pointer.starts_with('/') {
+            return Err(invalid("workspace_option.native_options_pointer"));
+        }
+        let encoded_segments = pointer[1..].split('/').collect::<Vec<_>>();
+        if encoded_segments.is_empty() || encoded_segments.len() > MAX_POINTER_SEGMENTS {
+            return Err(invalid("workspace_option.native_options_pointer"));
+        }
+        encoded_segments
+            .into_iter()
+            .map(|segment| {
+                if segment.is_empty() || segment.len() > MAX_SEGMENT_BYTES {
+                    return Err(invalid("workspace_option.native_options_pointer"));
+                }
+                let mut decoded = String::with_capacity(segment.len());
+                let mut chars = segment.chars();
+                while let Some(ch) = chars.next() {
+                    if ch == '~' {
+                        match chars.next() {
+                            Some('0') => decoded.push('~'),
+                            Some('1') => decoded.push('/'),
+                            _ => return Err(invalid("workspace_option.native_options_pointer")),
+                        }
+                    } else {
+                        decoded.push(ch);
+                    }
+                }
+                if decoded.is_empty() || decoded.chars().any(char::is_control) {
+                    return Err(invalid("workspace_option.native_options_pointer"));
+                }
+                Ok(decoded)
+            })
+            .collect()
+    }
+}
+
 /// Bounded local restart settings. These values control only worker recovery;
 /// restarting a worker never replays a module command or uncertain external
 /// effect.
@@ -499,6 +571,11 @@ pub struct ModuleDescriptor {
     pub launch: LaunchSpec,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_schema: Option<SchemaDescriptor>,
+    /// Optional, versioned location for host-admitted workspace injection.
+    /// Absence preserves compatibility for legacy descriptors; selected
+    /// workspace-backed adapters must declare it before a new launch is queued.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_option: Option<WorkspaceOptionContract>,
     #[serde(default)]
     pub command_schemas: BTreeSet<SchemaDescriptor>,
     #[serde(default)]
@@ -531,6 +608,9 @@ impl ModuleDescriptor {
         self.restart.validate()?;
         if let Some(schema) = &self.config_schema {
             schema.validate("config_schema")?;
+        }
+        if let Some(workspace_option) = &self.workspace_option {
+            workspace_option.validate()?;
         }
         for schema in &self.command_schemas {
             schema.validate("command_schemas")?;
