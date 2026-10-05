@@ -217,7 +217,7 @@ fn module_bridge_recovery_action_for_operation(
         return Ok(None);
     }
     let Some((runtime, artifact_id, readback_boundary)) =
-        exact_module_recovery_contract(&binding["route"], target_method)
+        module_recovery_contract_for_binding(db, &binding, target_method)?
     else {
         return Ok(None);
     };
@@ -345,7 +345,7 @@ fn module_outcome_readback_action_for_operation(
         return Ok(None);
     }
     let Some((runtime, artifact_id, readback_boundary)) =
-        exact_module_recovery_contract(&binding["route"], target_method)
+        module_recovery_contract_for_binding(db, &binding, target_method)?
     else {
         return Ok(None);
     };
@@ -461,6 +461,80 @@ pub(super) fn exact_module_recovery_contract<'a>(
     None
 }
 
+/// Resolve recovery compatibility from the immutable descriptor selected by
+/// this exact binding. Capability names gate only whether the installed
+/// adapter version implements this readback shape; they grant no Store or
+/// native-effect authority. Bindings without a descriptor keep the legacy
+/// exact-route table above.
+pub(super) fn module_recovery_contract_for_binding(
+    db: &Connection,
+    binding: &Value,
+    target_method: &str,
+) -> Result<Option<(String, String, &'static str)>> {
+    if binding["observation"]
+        .get("module_contract_selector")
+        .is_some()
+    {
+        return registered_module_recovery_contract(db, binding, target_method);
+    }
+
+    Ok(
+        exact_module_recovery_contract(&binding["route"], target_method).map(
+            |(runtime, artifact_id, boundary)| {
+                (runtime.to_owned(), artifact_id.to_owned(), boundary)
+            },
+        ),
+    )
+}
+
+/// Return a readback contract only when the retained descriptor declares both
+/// the reconcile command and the exact target operation kind. The selected
+/// capability set is compatibility metadata, never authorization.
+pub(super) fn registered_module_recovery_contract(
+    db: &Connection,
+    binding: &Value,
+    target_method: &str,
+) -> Result<Option<(String, String, &'static str)>> {
+    if !matches!(target_method, "agent.open" | "task.dispatch" | "agent.send") {
+        return Ok(None);
+    }
+    let Some(selector) = binding["observation"].get("module_contract_selector") else {
+        return Ok(None);
+    };
+    let artifact_id = model::text(binding, "module_artifact_id")?;
+    if binding["route"]["module_artifact_id"].as_str() != Some(artifact_id) {
+        return Ok(None);
+    }
+    let Some(retained) =
+        super::module_handshake::retained_contract_identity(db, artifact_id, Some(selector))?
+    else {
+        return Ok(None);
+    };
+    let retained_artifact_id = retained.artifact.artifact_id.as_str();
+    if retained_artifact_id != artifact_id {
+        return Ok(None);
+    }
+    let supports = |capability: &str| {
+        retained
+            .capabilities
+            .iter()
+            .any(|id| id.as_str() == capability)
+    };
+    if !supports("agent.reconcile") || !supports(target_method) {
+        return Ok(None);
+    }
+    let Some(runtime) = binding["route"]["runtime"]
+        .as_str()
+        .filter(|runtime| !runtime.is_empty())
+    else {
+        return Ok(None);
+    };
+    Ok(Some((
+        runtime.to_owned(),
+        retained_artifact_id.to_owned(),
+        "registered adapter readback; missing or inconsistent evidence remains unknown",
+    )))
+}
 fn module_recovery_conflict(
     code: &str,
     operation_id: &str,

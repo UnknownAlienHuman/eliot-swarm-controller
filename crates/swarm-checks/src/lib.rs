@@ -501,24 +501,21 @@ fn wait_until_empty(
                 .is_none_or(|last: Instant| last.elapsed() >= Duration::from_secs(1))
         {
             last_diagnostic_attempt = Some(Instant::now());
-            match control.process_group_drain_pending(
+            if let Ok(()) = control.process_group_drain_pending(
                 owner,
                 drain_started.elapsed(),
                 *state.process_observation_unknown,
                 *state.control_read_unknown,
             ) {
-                Ok(()) => {
-                    if *state.process_observation_unknown {
-                        observation_diagnostic_published = true;
-                    }
-                    if *state.control_read_unknown {
-                        control_diagnostic_published = true;
-                    }
-                    if !*state.process_observation_unknown && !*state.control_read_unknown {
-                        drain_diagnostic_published = true;
-                    }
+                if *state.process_observation_unknown {
+                    observation_diagnostic_published = true;
                 }
-                Err(_) => {}
+                if *state.control_read_unknown {
+                    control_diagnostic_published = true;
+                }
+                if !*state.process_observation_unknown && !*state.control_read_unknown {
+                    drain_diagnostic_published = true;
+                }
             }
         }
         if !*state.control_read_unknown {

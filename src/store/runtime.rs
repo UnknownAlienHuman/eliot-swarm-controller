@@ -520,6 +520,31 @@ fn next_internal(
             caller
         };
         let reconcile_starts_work = if method == "agent.reconcile"
+            && b["observation"].get("module_contract_selector").is_some()
+        {
+            let target = operations::get_operation(&tx, model::text(&input, "operation_id")?)?;
+            if target["binding_id"] != id
+                || target["binding_generation"] != generation
+                || !matches!(
+                    target["state"].as_str(),
+                    Some("sending" | "native_accepted" | "outcome_unknown")
+                )
+                || operations::registered_module_recovery_contract(
+                    &tx,
+                    &b,
+                    model::text(&target, "method")?,
+                )?
+                .is_none()
+            {
+                return Err(Error::new(
+                    "MODULE_RECONCILIATION_INVALID",
+                    "strict module reconciliation requires an eligible unresolved target on this binding generation",
+                ));
+            }
+            // The strict v1 adapter contract is readback-only. Store admission
+            // of this reconciliation never authorizes another native effect.
+            false
+        } else if method == "agent.reconcile"
             && !crate::runtime::batch::is_sessionless_route(&b["route"])
             && b["route"]["runtime"] != crate::runtime::opencode_v2::RUNTIME
         {
@@ -1036,6 +1061,149 @@ pub(super) fn validate_module_receipt_for_operation(
     Ok(receipt)
 }
 
+fn exact_reconcile_target_id(
+    db: &Connection,
+    operation_id: &str,
+    binding_id: &str,
+    binding_generation: i64,
+) -> Result<String> {
+    let raw: String = db.query_row(
+        "SELECT original_request_json FROM operations WHERE operation_id=?1 AND binding_id=?2 AND binding_generation=?3",
+        params![operation_id, binding_id, binding_generation],
+        |row| row.get(0),
+    )?;
+    let request: Value = serde_json::from_str(&raw).map_err(|_| {
+        Error::new(
+            "MODULE_RECONCILIATION_INVALID",
+            "stored reconciliation request is malformed",
+        )
+    })?;
+    Ok(model::text(&request, "operation_id")?.to_owned())
+}
+
+/// Bind strict-module reconciliation receipts to the exact admitted request.
+/// A target outcome carries `details.reconcile_operation_id`; the reconcile
+/// outcome carries `details.target_operation_id`. Ordinary durable outbox
+/// outcomes have no reconciliation link and retain the normal reporting path.
+fn validate_registered_module_recovery_link(
+    db: &Connection,
+    binding_id: &str,
+    binding_generation: i64,
+    binding: &Value,
+    operation: &Value,
+    outcome: &RuntimeOutcome,
+) -> Result<()> {
+    if binding["observation"]
+        .get("module_contract_selector")
+        .is_none()
+    {
+        return Ok(());
+    }
+
+    if model::text(operation, "method")? == "agent.reconcile" {
+        let target_id = exact_reconcile_target_id(
+            db,
+            model::text(operation, "operation_id")?,
+            binding_id,
+            binding_generation,
+        )?;
+        if outcome.details["target_operation_id"].as_str() != Some(target_id.as_str()) {
+            return Err(Error::new(
+                "MODULE_RECONCILIATION_INVALID",
+                "reconcile outcome does not name its exact requested Operation",
+            ));
+        }
+        let target = operations::get_operation(db, &target_id)?;
+        if target["binding_id"] != binding_id
+            || target["binding_generation"] != binding_generation
+            || !matches!(
+                target["state"].as_str(),
+                Some("sending" | "native_accepted" | "outcome_unknown" | "settled" | "rejected")
+            )
+            || operations::registered_module_recovery_contract(
+                db,
+                binding,
+                model::text(&target, "method")?,
+            )?
+            .is_none()
+        {
+            return Err(Error::new(
+                "MODULE_RECONCILIATION_INVALID",
+                "reconcile target is not an eligible Operation on this exact binding generation",
+            ));
+        }
+        if outcome.details["resolved"] == true
+            && !matches!(target["state"].as_str(), Some("settled" | "rejected"))
+        {
+            return Err(Error::new(
+                "MODULE_RECONCILIATION_INVALID",
+                "reconcile cannot report resolution before the target Operation is terminal",
+            ));
+        }
+        if outcome.details["native_replay"] == true {
+            return Err(Error::new(
+                "MODULE_RECONCILIATION_INVALID",
+                "strict module reconciliation must remain readback-only",
+            ));
+        }
+    }
+
+    if let Some(link) = outcome.details.get("reconcile_operation_id") {
+        let reconcile_id = link
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                Error::new(
+                    "MODULE_RECONCILIATION_INVALID",
+                    "target outcome reconciliation link is malformed",
+                )
+            })?;
+        if model::text(operation, "method")? == "agent.reconcile" {
+            return Err(Error::new(
+                "MODULE_RECONCILIATION_INVALID",
+                "reconcile summary cannot also claim to be its target outcome",
+            ));
+        }
+        let reconcile = operations::get_operation(db, reconcile_id)?;
+        if reconcile["binding_id"] != binding_id
+            || reconcile["binding_generation"] != binding_generation
+            || reconcile["method"] != "agent.reconcile"
+            || !matches!(
+                reconcile["state"].as_str(),
+                Some("sending" | "native_accepted" | "outcome_unknown")
+            )
+            || exact_reconcile_target_id(db, reconcile_id, binding_id, binding_generation)?
+                != outcome.operation_id
+            || operations::registered_module_recovery_contract(
+                db,
+                binding,
+                model::text(operation, "method")?,
+            )?
+            .is_none()
+        {
+            return Err(Error::new(
+                "MODULE_RECONCILIATION_INVALID",
+                "target outcome is not linked to an admitted reconcile for this exact Operation",
+            ));
+        }
+        if !matches!(
+            operation["state"].as_str(),
+            Some("sending" | "native_accepted" | "outcome_unknown")
+        ) {
+            return Err(Error::new(
+                "MODULE_RECONCILIATION_INVALID",
+                "reconcile-linked target outcome cannot replace a terminal Operation",
+            ));
+        }
+        if outcome.details["native_replay"] == true {
+            return Err(Error::new(
+                "MODULE_RECONCILIATION_INVALID",
+                "strict module target reconciliation must remain readback-only",
+            ));
+        }
+    }
+    Ok(())
+}
 pub(super) fn outcome_with_artifacts(
     db: &mut Connection,
     p: &Principal,
@@ -1238,6 +1406,8 @@ pub(super) fn outcome_with_artifacts(
     if previous {
         return Ok(json!({"recorded":true,"replayed":true,"state":o["state"]}));
     }
+    validate_registered_module_recovery_link(&tx, &id, generation, &b, &o, &r)?;
+
     if crate::runtime::batch::is_legacy_command_route(&b["route"]) {
         return Err(Error::new(
             "ARTIFACT_RETIRED",
@@ -2630,7 +2800,7 @@ fn allows_rootless_open_reconcile(
             target["state"].as_str(),
             Some("sending" | "native_accepted" | "outcome_unknown")
         )
-        && operations::exact_module_recovery_contract(&binding["route"], "agent.open").is_some())
+        && operations::module_recovery_contract_for_binding(db, binding, "agent.open")?.is_some())
 }
 
 fn is_recovery_control(
@@ -3040,6 +3210,18 @@ fn user_command_with_actor(
         {
             return Err(Error::invalid(
                 "reconcile requires an unresolved operation on this exact binding",
+            ));
+        }
+        if b["observation"].get("module_contract_selector").is_some()
+            && operations::registered_module_recovery_contract(
+                tx,
+                &b,
+                model::text(&target, "method")?,
+            )?
+            .is_none()
+        {
+            return Err(Error::invalid(
+                "selected module descriptor does not support readback for this exact operation kind",
             ));
         }
         if crate::runtime::batch::is_sessionless_route(&b["route"])

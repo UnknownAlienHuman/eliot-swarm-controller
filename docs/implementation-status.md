@@ -17,8 +17,14 @@ Shared runtime commands carry the canonical retained Operation request digest.
 Every outcome for a versioned binding must carry its own matching typed receipt,
 including a reconcile target's separate Operation digest. Legacy bindings retain
 their explicit unverified handshake and previous receipt behavior. Root still
-owns admission and domain handlers; standalone adapter registration, activation
-and generic recovery admission remain separate integration work.
+owns admission and domain handlers; standalone adapter registration and
+activation remain separate integration work.
+
+Registered bindings now expose readback for the exact unresolved Operation when
+their retained descriptor supports reconcile and that operation kind. Admission
+and fresh target receipts verify the binding, generation and admitted reconcile
+request; reconciliation stays readback-only. Each outcome has its own receipt,
+and an already accepted terminal receipt can be retransmitted unchanged.
 
 The existing CheckRun worker now consumes `swarm-checks`. It publishes its exact
 process owner and waits for Store's Go before resolving source inputs or launching

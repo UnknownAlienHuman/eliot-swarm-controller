@@ -54,9 +54,13 @@ Runtime commands include the canonical original Operation request digest before
 dynamic enrichment. For selected bindings, one Store validator checks every
 outcome's `ModuleReceiptIdentity` against the retained descriptor and exact
 Operation/binding/generation. A reconcile target has its own receipt and digest,
-distinct from the reconcile Operation. This seam alone does not make a new
-adapter's methods reachable; adapter registration, admission and supervisor
-activation still need their real host integrations.
+distinct from the reconcile Operation. Registered recovery uses the retained
+descriptor's reconcile and target-method capabilities as compatibility gates.
+Store checks the exact admitted request before accepting a fresh reconcile-linked
+target outcome, after its byte-identical duplicate path. Reconcile cannot report
+resolution before the target is terminal and cannot authorize another native
+effect. Adapter registration and supervisor activation still need their real
+host integrations.
 
 The client retains the existing named-pipe/Unix-socket discovery convention,
 hello handshake and bounded request/reply exchange. Establishment retry happens
