@@ -137,6 +137,40 @@ impl ModuleContractTemplate {
         Ok(template)
     }
 
+    /// Descriptor for the current normalized Codex controller contract.
+    /// Version 3 remains available to existing registrations; version 4 adds
+    /// exact normalized result-page schemas and the matching result capability.
+    pub fn codex_rust_controller_v3() -> Result<Self, CatalogError> {
+        let mut template = Self::codex_rust_controller_v2()?;
+        template.artifact.version = ArtifactVersion::new("3")?;
+        template.command_schemas =
+            BTreeSet::from([runtime_command_schema(), task_dispatch_context_schema()]);
+        template.event_schemas =
+            BTreeSet::from([runtime_outcome_schema(), task_dispatch_admission_schema()]);
+        Ok(template)
+    }
+
+    /// Descriptor for the current Codex adapter artifact, including its
+    /// descriptor-gated normalized result selector and paged result schema.
+    pub fn codex_rust_controller_v4() -> Result<Self, CatalogError> {
+        let mut template = Self::codex_rust_controller_v3()?;
+        template.artifact.version = ArtifactVersion::new("4")?;
+        template
+            .capabilities
+            .insert(CapabilityId::new("agent.result")?);
+        template.command_schemas = BTreeSet::from([
+            runtime_command_schema(),
+            task_dispatch_context_schema(),
+            normalized_result_context_schema(),
+        ]);
+        template.event_schemas = BTreeSet::from([
+            runtime_outcome_schema(),
+            task_dispatch_admission_schema(),
+            normalized_result_page_schema(),
+        ]);
+        Ok(template)
+    }
+
     pub fn descriptor(
         &self,
         launch: LaunchSpec,

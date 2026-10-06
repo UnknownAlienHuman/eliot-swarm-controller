@@ -10,6 +10,7 @@ use std::{
 pub use swarm_contracts::mcp_frontend::{McpConfig, McpProfileConfig, McpToolProfile};
 
 const MAX_GATEWAY_BODY_BYTES: usize = 1_048_576;
+// Stable route ID; Store selection pins the concrete descriptor version for new bindings.
 const CODEX_RUST_ARTIFACT_ID: &str = "codex-rust-controller.1";
 const OPENCODE_RUST_ARTIFACT_ID: &str = "eliot-opencode-v2.rust-http.1";
 const COMMAND_RUST_ARTIFACT_ID: &str = "eliot-command.rust-headless.1";
@@ -730,7 +731,7 @@ impl Config {
             {
                 return Err(Error::new(
                     "CONFIG_ERROR",
-                    "Codex routes require the pinned bridge.3 controller or standalone Rust observer.1 artifact",
+                    "Codex routes require the pinned bridge.3 controller or standalone Rust adapter artifact",
                 ));
             }
         }

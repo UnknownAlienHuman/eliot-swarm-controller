@@ -120,6 +120,8 @@ Each route must use the exact Rust artifact ID and workspace field enforced by `
 | Command | `command` | `eliot-command.rust-headless.1` | `workspaceRoot` | exactly `modelId`, `workspaceRoot` |
 | Antigravity | `antigravity` | `eliot-antigravity.rust-headless.1` | `workspaceRoot` | `modelId = 'gemini-3.8-flash-high'`, `workspaceRoot`; optional `reasoningEffort`, `agent`, `dangerouslySkipPermissions` |
 
+The standalone Rust Codex source descriptor template declares version `4` under the stable artifact ID `codex-rust-controller.1`. Keep that ID in the route; choose version `4` as the exact catalog coordinate in `module.route.select`. Version 4 retains the normalized dispatch contract and opts new bindings into normalized result pages with `swarm.normalized_result_context@1` and `swarm.normalized_result_page@1`. The result selector is exactly `{ "kind": "codex_assistant_result", "input_operation_id": "<exact task.dispatch operation ID>" }`; Store validates and seals that producer identity. Older selected descriptor versions and existing bindings are not upgraded by this selection. The generic installer copies the supplied descriptor version without translating or enabling it.
+
 For example, the route tables use the normal controller TOML shape:
 
 ```toml
