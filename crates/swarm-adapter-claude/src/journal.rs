@@ -651,7 +651,7 @@ fn ensure_regular(path: &Path) -> Result<()> {
 }
 
 fn read_limited(path: &Path, maximum: usize) -> Result<Vec<u8>> {
-    let mut file = File::open(path)
+    let file = File::open(path)
         .map_err(|_| Error::new("ADAPTER_STATE", "state identity cannot be read"))?;
     let mut bytes = Vec::new();
     file.take((maximum + 1) as u64)

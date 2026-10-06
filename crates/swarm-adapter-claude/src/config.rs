@@ -224,8 +224,7 @@ fn read_bounded_file(path: &Path, maximum: usize, code: &'static str) -> Result<
             "configured file must be a bounded regular file",
         ));
     }
-    let mut file =
-        File::open(path).map_err(|_| Error::new(code, "configured file cannot be read"))?;
+    let file = File::open(path).map_err(|_| Error::new(code, "configured file cannot be read"))?;
     if !file
         .metadata()
         .is_ok_and(|value| value.is_file() && value.len() <= maximum as u64)

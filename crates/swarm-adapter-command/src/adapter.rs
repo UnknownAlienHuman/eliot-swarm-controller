@@ -2,7 +2,7 @@ use crate::module_host::{self, ModuleHostIdentity};
 use crate::{ARTIFACT_ID, CONTRACT_REVISION, EXECUTION_SHAPE, RUNTIME};
 use crate::{
     journal::{DispatchIdentity, RunStore, digest},
-    native,
+    native, result_page,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};

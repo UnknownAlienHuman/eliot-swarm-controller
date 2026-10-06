@@ -52,7 +52,7 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
         native_root: None,
     })
     .await?;
-    let config = host_config.with_native_options(native_options);
+    let config = host_config.clone().with_native_options(native_options);
     config.validate()?;
     let route_sha256 = digest_json(&serde_json::to_value(&config.native_options)?)?;
     let journal = OperationJournal::open(

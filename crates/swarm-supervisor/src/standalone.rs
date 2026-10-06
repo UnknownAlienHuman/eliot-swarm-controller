@@ -537,7 +537,7 @@ fn open_code_route_config(
             || owner.model.id != model_id
             || owner.model.provider_id != provider_id
             || owner.model.variant != variant
-            || !valid_provider_id(provider_id)
+            || !valid_provider_id(&provider_id)
             || !valid_service_id(&owner.service_id)
             || !matches!(owner.model_catalog.as_str(), "offline" | "refresh")
             || !absolute_plain_path(&owner.bun_executable)
@@ -596,7 +596,7 @@ fn open_code_route_config(
             values.insert(key.to_owned(), LaunchValue::Literal(value));
         }
         if let Some(credential_ref) = owner.credential_ref {
-            if !valid_provider_id(provider_id) || !valid_credential_ref(&credential_ref) {
+            if !valid_provider_id(&provider_id) || !valid_credential_ref(&credential_ref) {
                 return Err(Error::new(
                     "MODULE_CONFIG_INVALID",
                     "owned OpenCode credential reference is not valid for the selected provider",

@@ -36,6 +36,7 @@ param(
     [ValidateRange(30, 300)][int] $TimeoutSeconds = 180,
     [ValidateRange(1, 2147483647)][int] $CodexAppServerPid,
     [string] $CodexAppServerImagePath,
+    [string] $ClaudeTestModelId,
     [switch] $EnableClaude
 )
 
@@ -674,7 +675,7 @@ function Get-AdapterContract {
         }
         'Claude' {
             return [pscustomobject]@{
-                module_id = 'claude'; artifact_id = 'claude-agent-sdk-0.3.287-rust-controller.4'; version = '4'; runtime = 'claude';
+                module_id = 'claude'; artifact_id = 'claude-agent-sdk-0.3.287-rust-controller.4'; version = '4'; runtime = 'module';
                 build_package = 'swarm-adapter-claude'; build_target = 'swarm-adapter-claude';
                 capabilities = @('agent.open', 'agent.reconcile', 'agent.result', 'agent.refresh', 'agent.send/next_turn', 'task.dispatch');
                 command_schemas = @('swarm.runtime_command@1:', 'swarm.task_dispatch_context@1:');
@@ -684,7 +685,7 @@ function Get-AdapterContract {
                 expected_provider = $null; expected_model = $null; expected_model_ref = $null; expected_effort = $null
             }
         }
-        default { Stop-Qualification 'CLAUDE_ADAPTER_UNAVAILABLE' }
+        default { Stop-Qualification 'ADAPTER_UNSUPPORTED' }
     }
 }
 
@@ -886,6 +887,19 @@ function Get-InstalledModuleFacts {
 function Get-AdapterConfigPath {
     param([Parameter(Mandatory)] $Descriptor)
     $arguments = @($Descriptor.launch.argv)
+    if ($Descriptor.module_id -ceq 'claude') {
+        if ($arguments.Count -ne 2 -or
+            -not (Test-ExactObjectKeys -Value $arguments[0] -ExpectedKeys @('kind', 'value')) -or
+            -not (Test-ExactObjectKeys -Value $arguments[1] -ExpectedKeys @('kind', 'value')) -or
+            $arguments[0].kind -cne 'literal' -or $arguments[0].value -cne '--config' -or
+            $arguments[1].kind -cne 'module_host_config_path' -or
+            -not (Test-ExactObjectKeys -Value $arguments[1].value -ExpectedKeys @('schema_version')) -or
+            ($arguments[1].value.schema_version -isnot [int] -and $arguments[1].value.schema_version -isnot [long]) -or
+            $arguments[1].value.schema_version -ne 1) {
+            Stop-Qualification 'CLAUDE_DESCRIPTOR_LAUNCH_CONTRACT_MISMATCH'
+        }
+        return $null
+    }
     if ($Descriptor.module_id -ceq 'runtime.command') {
         if ($arguments.Count -ne 4 -or
             -not (Test-ExactObjectKeys -Value $arguments[0] -ExpectedKeys @('kind', 'value')) -or
@@ -895,7 +909,8 @@ function Get-AdapterConfigPath {
             $arguments[0].kind -cne 'literal' -or $arguments[0].value -cne '--module-host-config' -or
             $arguments[1].kind -cne 'module_host_config_path' -or
             -not (Test-ExactObjectKeys -Value $arguments[1].value -ExpectedKeys @('schema_version')) -or
-            $arguments[1].value.schema_version -isnot [int] -or $arguments[1].value.schema_version -ne 1 -or
+            ($arguments[1].value.schema_version -isnot [int] -and $arguments[1].value.schema_version -isnot [long]) -or
+            $arguments[1].value.schema_version -ne 1 -or
             $arguments[2].kind -cne 'literal' -or $arguments[2].value -cne '--config' -or
             $arguments[3].kind -cne 'literal' -or -not ($arguments[3].value -is [string]) -or
             -not [System.IO.Path]::IsPathFullyQualified([string]$arguments[3].value)) {
@@ -1178,7 +1193,10 @@ try {
     if ($PSVersionTable.PSVersion.Major -lt 7 -or -not $IsWindows) { Stop-Qualification 'POWERSHELL_7_WINDOWS_REQUIRED' }
     if ($Adapter -eq 'Claude') {
         if (-not $EnableClaude) { Stop-Qualification 'CLAUDE_OPT_IN_REQUIRED' }
-        Stop-Qualification 'CLAUDE_ADAPTER_UNAVAILABLE'
+        if ([string]::IsNullOrWhiteSpace($ClaudeTestModelId)) { Stop-Qualification 'CLAUDE_TEST_MODEL_ID_REQUIRED' }
+        if ([System.Text.Encoding]::UTF8.GetByteCount($ClaudeTestModelId) -gt 256 -or $ClaudeTestModelId -match '[\x00-\x1F\x7F]') {
+            Stop-Qualification 'CLAUDE_TEST_MODEL_ID_INVALID'
+        }
     }
     $contract = Get-AdapterContract
     $script:HostPath = Assert-ExistingFile $HostExecutable
@@ -1406,6 +1424,7 @@ try {
     if ($routes.Count -ne 1) { Stop-Qualification 'EXACT_ENABLED_ROUTE_NOT_UNIQUE' }
     $route = $routes[0]
     $routeModel = Get-RouteModelFacts -Route $route -Contract $contract
+    if ($Adapter -eq 'Claude' -and $routeModel.model_id -cne $ClaudeTestModelId) { Stop-Qualification 'CLAUDE_TEST_MODEL_DIFFERS_FROM_ROUTE' }
     if ($null -ne $launchSettings.requested_model -and $launchSettings.requested_model -cne $routeModel.model_id) { Stop-Qualification 'REQUESTED_MODEL_DIFFERS_FROM_ROUTE' }
     if ($null -eq $launchSettings.requested_model -and $null -ne $routeModel.model_id) { Stop-Qualification 'REQUESTED_MODEL_MUST_MATCH_ROUTE' }
     if ($null -ne $launchSettings.requested_effort -and ($null -eq $routeModel.variant -or $launchSettings.requested_effort -cne $routeModel.variant)) { Stop-Qualification 'REQUESTED_EFFORT_DIFFERS_FROM_ROUTE' }
@@ -1417,6 +1436,10 @@ try {
         $module.config_path = Get-AdapterConfigPath -Descriptor $module.descriptor
         $codexProcessFacts = Assert-CodexProcessAttachment -AdapterConfigPath $module.config_path
         $script:Report.safe_facts.codex_attachment = $codexProcessFacts
+    }
+    elseif ($Adapter -eq 'Claude') {
+        $module.config_path = Get-AdapterConfigPath -Descriptor $module.descriptor
+        $script:Report.safe_facts.adapter_config_source = 'typed_module_host_config_path; host_resolved_binding_scoped_file'
     }
     else {
         $module.config_path = Get-AdapterConfigPath -Descriptor $module.descriptor
@@ -1660,9 +1683,6 @@ try {
 }
 catch {
     if ($null -eq $script:FailureCode) { $script:FailureCode = 'HARNESS_FAILED' }
-    if ($script:FailureCode -eq 'CLAUDE_ADAPTER_UNAVAILABLE') {
-        $script:Report.limits.unsupported = @($script:Report.limits.unsupported) + 'no_claude_adapter_artifact_or_route_contract'
-    }
     if ($script:Report.status -eq 'running') { $script:Report.status = 'blocked' }
     if ($script:Stages.Count -eq 0 -or $script:Stages[$script:Stages.Count - 1].status -notin @('blocked', 'unknown')) {
         Add-Stage -Name $script:CurrentStage -Status 'blocked' -Code $script:FailureCode

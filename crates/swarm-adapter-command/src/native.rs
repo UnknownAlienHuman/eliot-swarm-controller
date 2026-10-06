@@ -5,6 +5,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString},
+    io::Read,
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
     time::Duration,
@@ -135,7 +136,7 @@ pub async fn invoke(
     }
 
     let native_args = native_arguments(config, &identity.requested_model, &pinned_mod_path, prompt);
-    if !native_argument_length_supported(&config.program, &native_args) {
+    if !native_argument_length_supported(config.program.as_os_str(), &native_args) {
         let mut outcome = launch_rejected(
             command,
             identity,

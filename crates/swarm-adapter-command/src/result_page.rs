@@ -96,9 +96,9 @@ pub fn build(command: &RuntimeCommand, claim: &ModuleContractClaim) -> Result<Va
     let end = offset.checked_add(requested).unwrap_or(u64::MAX).min(total);
     let start = usize::try_from(offset)
         .map_err(|_| Error::new("RESULT_RANGE_INVALID", "page offset is too large"))?;
-    let end = usize::try_from(end)
+    let end_index = usize::try_from(end)
         .map_err(|_| Error::new("RESULT_RANGE_INVALID", "page end is too large"))?;
-    let selected = &bytes[start..end];
+    let selected = &bytes[start..end_index];
     let params = json!({
         "operation_id":command.operation_id,
         "page":{

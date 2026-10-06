@@ -17,8 +17,11 @@ provider/model/variant. If the native catalog does not contain the selected
 model, the operation fails before the harness sends its single task input.
 Bunny is disabled for new runs; historical receipts retain their original
 model identity. Command retains exact whole-string model matching. Claude's
-version-4 source is present, but the current native qualification entrypoint
-still blocks Claude until its route-specific contract is integrated.
+version-4 qualification path uses its `module` runtime and exact typed host
+configuration marker. Run it after the other routes with `-EnableClaude` and
+`-ClaudeTestModelId` set to the configured Sonnet route's exact model ID. It
+submits one input and reports readiness/dispatch readback separately from
+productive completion; the harness does not infer a provider or completion.
 
 Build only the selected package, using a caller-owned shared target directory. The package/binary pairs are:
 
@@ -378,6 +381,13 @@ must match the retained build-set contract. The harness creates a fresh
 DataRoot, protects unrelated/current Codex processes and submits one native
 input. Unknown effects use bounded readback. Source/manifest consistency and
 runtime outcome are recorded separately.
+
+Claude version 4 uses a host-resolved binding-scoped configuration file. Its
+descriptor retains `--config` plus the schema-1 `module_host_config_path` marker;
+the harness records this configuration source without inventing an operator
+file path or hash. `-ClaudeTestModelId`, route `native_options.modelId` and
+launch `requested_model` must match exactly. A successful dispatch readback
+does not establish Task completion or independent acceptance.
 
 Core failure qualification uses a fresh private DataRoot for lost-caller-ACK,
 request-conflict and optional HookSource deduplication. Readback proves admission

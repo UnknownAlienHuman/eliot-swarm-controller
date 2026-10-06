@@ -396,22 +396,6 @@ impl LiveSettings {
         }
     }
 
-    pub(crate) fn allows(
-        &self,
-        now_unix_ms: u64,
-        severity: Severity,
-        kind: Kind,
-        module_id: Option<&str>,
-        client_id: Option<&str>,
-        operation_id: Option<&str>,
-    ) -> bool {
-        if !self.included_kinds.contains(&kind) {
-            return false;
-        }
-        self.effective_level(now_unix_ms, module_id, client_id, operation_id)
-            .allows(severity)
-    }
-
     pub(crate) fn allows_with_manager_override(
         &self,
         now_unix_ms: u64,

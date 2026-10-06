@@ -4,7 +4,7 @@
 
 ### Source delivery and remaining qualification — 2026-10-05
 
-Main source is published through `01e37558a1f1a27564a5c55959f909bc40ee487f`.
+Main source is published through `f67e1abc3b5fd94f1ba7e216cb9f613f281f19ff`.
 The owner requires finishing the source changes before tests and native/model
 execution. Production-only Clippy reached the extracted packages and reported
 compile defects; the current source delivery repairs that batch in Command,
@@ -62,9 +62,10 @@ The required product source integrations listed in the preceding code-phase
 checkpoint are delivered. The native qualification script now validates the
 public CLI, host wrapper, actual Kernel and supervisor coordinates separately,
 records the actual Kernel PID, and closes only its own Kernel stdin for shutdown.
-Claude's qualification entrypoint is still being aligned with its existing
-version-4 typed host-config route. Remaining acceptance work follows source
-closure: a scoped compiler gate, then core failure/recovery and adapter runs.
+Claude's qualification entrypoint now uses its existing version-4 typed
+host-config route and requires an explicit exact model ID for its single input.
+Remaining acceptance work follows compiler source closure: a scoped compiler
+gate, then core failure/recovery and adapter runs.
 The selected model is `inclusionai/ling-3.1-flash`; Bunny is disabled. Local
 models, Linux/WSL and Zed remain deferred. The active desktop Codex/OpenCodex
 process and configuration are preserved; Claude qualification follows the other
