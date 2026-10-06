@@ -16,6 +16,8 @@ fn profile_tables_are_closed_and_keep_gm_authority_separate() {
         "attempt.get",
         "operation.get",
         "operation.list",
+        "concilium.get",
+        "concilium.list",
         "agent.state",
         "agent.list",
         "agent.family",
@@ -281,6 +283,10 @@ fn profile_tables_are_closed_and_keep_gm_authority_separate() {
         assert!(profiles::allows_subscription_category(
             profile,
             Category::Operations
+        ));
+        assert!(profiles::allows_subscription_category(
+            profile,
+            Category::Concilium
         ));
     }
 }

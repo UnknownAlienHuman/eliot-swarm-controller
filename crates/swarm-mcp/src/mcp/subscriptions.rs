@@ -12,7 +12,7 @@
 //! same style as the Tasks projection (protocol methods on the
 //! handler, never tools, never a second store of state).
 //!
-//! Categories derive ONLY from committed facts. All three are exact
+//! Categories derive ONLY from committed facts. All four are exact
 //! filters over the one committed observation stream that
 //! `report.delta` reads, so every category shares the stream's single
 //! cursor space and a cursor from any notification resyncs through any
@@ -35,12 +35,17 @@
 //!   bounded failure fact with its Operation receipt. It is notified
 //!   only to clients authorized to read that Operation; an exact
 //!   request replay creates no additional fact or notification.
+//! - `concilium` — committed `concilium.*` Operation facts. Notifications
+//!   carry only the cursor, method kind, Operation ID, and Concilium ID;
+//!   clients resync the authorized projection through `concilium.get` or
+//!   `concilium.list`.
 //!
 //! Nothing is sourced from a volatile or native live stream, and a
 //! subscription never creates facts: it forwards reads of the durable
 //! stream only. The categories expose nothing the facade's credential
 //! cannot already read through the `report_delta` / `message_read` /
-//! `operation_get` tools.
+//! `operation_get` tools; a Concilium subscription also names its exact
+//! `concilium.get` / `concilium.list` resync reads.
 //!
 //! Bounds: each subscription owns a queue of at most
 //! [`MAX_QUEUE_DEPTH`] undelivered notifications and the session holds
@@ -53,7 +58,9 @@
 //! Nothing is ever lost silently and nothing is buffered without
 //! bound. Authority is never the notification tail: resync is
 //! `report.delta` / `message.read` / `operation.get` from
-//! `from_cursor`, and the lagged notification names exactly that.
+//! `from_cursor`, adding `concilium.get` / `concilium.list` for a
+//! `concilium` subscription, and the lagged notification names exactly
+//! those reads.
 //!
 //! Reconnect is not replay continuity. Subscriptions live and die with
 //! the MCP session: a reconnected client finds no subscription under
@@ -124,9 +131,10 @@ const PAGE_LIMIT: i64 = 50;
 /// yielding to the next tick — a busy stream cannot starve the
 /// session, and the queue bound still applies within the tick.
 const MAX_PAGES_PER_TICK: usize = 8;
-/// The exact reads a subscriber resyncs through, named in the
-/// subscribe acknowledgement and in every lagged notification.
+/// Base exact reads for every category; Concilium-specific reads are
+/// appended for subscriptions that include `Category::Concilium`.
 const RESYNC_READS: [&str; 3] = ["report.delta", "message.read", "operation.get"];
+const CONCILIUM_RESYNC_READS: [&str; 2] = ["concilium.get", "concilium.list"];
 /// The committed kinds `message.read` returns, mirrored from the
 /// store's mailbox filter: the pump applies the same predicate to the
 /// same stream the store filters server-side.
@@ -144,6 +152,8 @@ pub enum Category {
     /// Committed entries carrying an Operation ID: admissions and
     /// recorded outcomes.
     Operations,
+    /// Committed Concilium Operation facts, projected as IDs and cursor only.
+    Concilium,
 }
 
 impl Category {
@@ -152,6 +162,7 @@ impl Category {
             Category::Reports => "reports",
             Category::Mailbox => "mailbox",
             Category::Operations => "operations",
+            Category::Concilium => "concilium",
         }
     }
 
@@ -160,6 +171,7 @@ impl Category {
             "reports" => Some(Category::Reports),
             "mailbox" => Some(Category::Mailbox),
             "operations" => Some(Category::Operations),
+            "concilium" => Some(Category::Concilium),
             _ => None,
         }
     }
@@ -168,12 +180,31 @@ impl Category {
         match self {
             Category::Reports => true,
             Category::Operations => item["operation_id"].is_string(),
+            Category::Concilium => is_concilium_fact(item),
             Category::Mailbox => {
                 MAILBOX_KINDS.contains(&item["kind"].as_str().unwrap_or_default())
                     && item["payload"]["recipient"].as_str() == Some(client_id)
             }
         }
     }
+}
+
+fn is_concilium_fact(item: &Value) -> bool {
+    item["kind"]
+        .as_str()
+        .is_some_and(|kind| kind.starts_with("concilium."))
+}
+
+fn notification_item(item: &Value) -> Value {
+    if is_concilium_fact(item) {
+        return json!({
+            "cursor": item["cursor"],
+            "kind": item["kind"],
+            "operation_id": item["operation_id"],
+            "concilium_id": item["payload"]["concilium_id"]
+        });
+    }
+    item.clone()
 }
 
 /// The subset of `categories` one committed stream entry belongs to.
@@ -186,6 +217,23 @@ pub fn matched_categories(categories: &[Category], item: &Value, client_id: &str
         .copied()
         .filter(|category| category.matches(item, client_id))
         .collect()
+}
+
+fn resync_reads(categories: &[Category]) -> Vec<&'static str> {
+    let mut reads = RESYNC_READS.to_vec();
+    // Reports includes every committed fact and Operations includes every
+    // receipt, so both can carry a Concilium cursor even without the narrow
+    // Concilium category. Preserve exact state resync for any category that
+    // can surface one of these ID-only notifications.
+    if categories.iter().any(|category| {
+        matches!(
+            category,
+            Category::Reports | Category::Operations | Category::Concilium
+        )
+    }) {
+        reads.extend(CONCILIUM_RESYNC_READS);
+    }
+    reads
 }
 
 /// One lagged episode: the matching entries in
@@ -221,7 +269,7 @@ pub fn committed_notification(
             "subscription_id": subscription_id,
             "categories": matched.iter().map(|c| c.name()).collect::<Vec<_>>(),
             "cursor": item["cursor"],
-            "item": item,
+            "item": notification_item(item),
             "frame": frame,
         })),
     )
@@ -229,6 +277,23 @@ pub fn committed_notification(
 
 /// The single lagged marker for one overflow episode.
 pub fn lagged_notification(subscription_id: &str, gap: &LaggedGap) -> CustomNotification {
+    lagged_notification_with_reads(subscription_id, gap, &RESYNC_READS)
+}
+
+fn lagged_notification_for_categories(
+    subscription_id: &str,
+    gap: &LaggedGap,
+    categories: &[Category],
+) -> CustomNotification {
+    let reads = resync_reads(categories);
+    lagged_notification_with_reads(subscription_id, gap, &reads)
+}
+
+fn lagged_notification_with_reads(
+    subscription_id: &str,
+    gap: &LaggedGap,
+    reads: &[&str],
+) -> CustomNotification {
     CustomNotification::new(
         LAGGED_NOTIFICATION,
         Some(json!({
@@ -236,7 +301,7 @@ pub fn lagged_notification(subscription_id: &str, gap: &LaggedGap) -> CustomNoti
             "dropped_items": gap.dropped_items,
             "from_cursor": gap.from_cursor,
             "through_cursor": gap.through_cursor,
-            "resync": {"after": gap.from_cursor, "reads": RESYNC_READS},
+            "resync": {"after": gap.from_cursor, "reads": reads},
         })),
     )
 }
@@ -369,7 +434,7 @@ impl SubscriptionHub {
             },
             "resync": {
                 "after": after,
-                "reads": RESYNC_READS,
+                "reads": resync_reads(&categories),
                 "note": "notifications are a bounded freshness hint over committed facts, \
                          never complete history; a lagged notification marks an explicit \
                          gap, and the exact reads from the last delivered cursor are the \
@@ -544,7 +609,11 @@ async fn poll_loop(
         // A pending lagged marker precedes any newer item. Until it
         // is queued, no post-episode item is delivered ahead of it.
         if lagged.is_some() {
-            match queue.try_send(lagged_notification(&id, lagged.as_ref().expect("checked"))) {
+            match queue.try_send(lagged_notification_for_categories(
+                &id,
+                lagged.as_ref().expect("checked"),
+                &categories,
+            )) {
                 Ok(()) => lagged = None,
                 Err(mpsc::error::TrySendError::Full(_)) => {}
                 Err(mpsc::error::TrySendError::Closed(_)) => break,

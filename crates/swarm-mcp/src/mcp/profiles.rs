@@ -25,6 +25,8 @@ pub(super) fn exposes_method(profile: McpToolProfile, method: &str) -> bool {
             | "attempt.get"
             | "operation.get"
             | "operation.list"
+            | "concilium.get"
+            | "concilium.list"
             | "agent.state"
             | "agent.list"
             | "agent.family"
@@ -61,6 +63,13 @@ pub(super) fn exposes_method(profile: McpToolProfile, method: &str) -> bool {
         McpToolProfile::Reviewer => method == "task.request_changes",
         McpToolProfile::Participant => {
             method == "swarm.tools.search"
+                || matches!(
+                    method,
+                    "concilium.propose"
+                        | "concilium.position.submit"
+                        | "concilium.get"
+                        | "concilium.list"
+                )
                 || swarm_contracts::method_policy::participant_allowed(method)
         }
         McpToolProfile::AssignedReviewer => matches!(
@@ -74,6 +83,8 @@ pub(super) fn exposes_method(profile: McpToolProfile, method: &str) -> bool {
                 | "check.get"
                 | "artifact.read"
                 | "operation.get"
+                | "concilium.get"
+                | "concilium.list"
         ),
         McpToolProfile::Manager => matches!(
             method,
@@ -154,6 +165,13 @@ pub(super) fn exposes_method(profile: McpToolProfile, method: &str) -> bool {
                 | "coordination.watch.create"
                 | "coordination.watch.list"
                 | "coordination.watch.cancel"
+                | "concilium.propose"
+                | "concilium.preview"
+                | "concilium.open"
+                | "concilium.round.advance"
+                | "concilium.get"
+                | "concilium.list"
+                | "concilium.close"
         ),
         McpToolProfile::Gm => {
             (exposes_method(McpToolProfile::Manager, method)
@@ -190,6 +208,10 @@ pub(super) fn allows_subscription_category(profile: McpToolProfile, category: Ca
             Category::Reports => true,
             Category::Mailbox => exposes_method(profile, "message.read"),
             Category::Operations => exposes_method(profile, "operation.get"),
+            Category::Concilium => {
+                exposes_method(profile, "concilium.get")
+                    || exposes_method(profile, "concilium.list")
+            }
         }
 }
 

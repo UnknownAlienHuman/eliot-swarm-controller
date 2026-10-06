@@ -509,6 +509,14 @@ pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
         return Err(Error::new("METHOD_NOT_FOUND", method));
     }
     let allowed: &[&str] = match method {
+        "concilium.propose"
+        | "concilium.open"
+        | "concilium.position.submit"
+        | "concilium.round.advance"
+        | "concilium.close" => {
+            crate::coordination::concilium::validate(method, params)?;
+            return Ok(());
+        }
         "swarm.launch" => {
             crate::launcher::LaunchRequest::parse(params)?;
             return Ok(());

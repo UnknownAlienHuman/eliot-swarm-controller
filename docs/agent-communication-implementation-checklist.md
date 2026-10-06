@@ -723,6 +723,18 @@ A later separate native-execution slice may let the manager explicitly dispatch 
 
 V1 active Concilium execution invokes at most eight model participants. More stakeholders may submit written positions outside the active execution; all referenced dissent is preserved.
 
+### 14.6 Current-source note — 2026-10-06
+
+Integrated source covers the eight typed methods, shared wire bounds,
+Store-owned actor/slot authorization and blind Round 1, MCP/CLI profile gates,
+the existing controller Operation/Observation chain for the five mutation
+kinds, and finite Doctor aggregates. The source remains uncompiled and untested.
+At least one registered participant is valid, with no 64-entry participant cap; the
+eight-participant bound above applies only to active model execution.
+Participant subscriptions remain unavailable because the Participant profile
+does not expose `report.delta`. No method starts model/native work, changes Task
+state, or ratifies a contract; close is advisory.
+
 ## 15. MCP and CLI
 
 After each application method exists:

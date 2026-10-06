@@ -33,6 +33,8 @@ param(
     [ValidateSet('OpenCode', 'Command', 'Codex', 'Antigravity', 'Claude')][string] $Adapter = 'OpenCode',
     [ValidatePattern('^[A-Za-z0-9._-]+/[A-Za-z0-9._:-]+$')]
     [string] $OpenCodeCommandTestModelRef = 'inclusionai/ling-3.1-flash',
+    [ValidatePattern('^[A-Za-z0-9._-]+/[A-Za-z0-9._:-]+$')]
+    [string] $CommandTestModelId = 'inclusionai/ling-3.1-flash:free',
     [ValidateRange(30, 300)][int] $TimeoutSeconds = 180,
     [ValidateRange(1, 2147483647)][int] $CodexAppServerPid,
     [string] $CodexAppServerImagePath,
@@ -646,7 +648,7 @@ function Get-AdapterContract {
                 event_schemas = @('swarm.normalized_result_page@1:', 'swarm.runtime_outcome@1:', 'swarm.task_dispatch_admission@1:');
                 expected_config_schema_id = $null; expected_config_schema_version = $null; expected_config_schema_sha256 = $null;
                 model_provider_field = $null; model_field = 'modelId'; effort_field = $null;
-                expected_provider = $null; expected_model = $OpenCodeCommandTestModelRef; expected_model_ref = $null; expected_effort = $null
+                expected_provider = $null; expected_model = $CommandTestModelId; expected_model_ref = $null; expected_effort = $null
             }
         }
         'Codex' {

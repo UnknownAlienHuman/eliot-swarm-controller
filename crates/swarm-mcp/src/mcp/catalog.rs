@@ -216,6 +216,23 @@ const COORDINATION_READ_AUDIENCES: &[ToolAudience] = &[
     ToolAudience::GmOperator,
     ToolAudience::FullCompatibility,
 ];
+const CONCILIUM_READ_AUDIENCES: &[ToolAudience] = &[
+    ToolAudience::Observer,
+    ToolAudience::LegacyReviewer,
+    ToolAudience::AssignedReviewer,
+    ToolAudience::Participant,
+    ToolAudience::Manager,
+    ToolAudience::GmOperator,
+    ToolAudience::FullCompatibility,
+];
+const CONCILIUM_PROPOSAL_AUDIENCES: &[ToolAudience] = &[
+    ToolAudience::Participant,
+    ToolAudience::Manager,
+    ToolAudience::GmOperator,
+    ToolAudience::FullCompatibility,
+];
+const CONCILIUM_POSITION_AUDIENCES: &[ToolAudience] =
+    &[ToolAudience::Participant, ToolAudience::FullCompatibility];
 const WATCH_AUDIENCES: &[ToolAudience] = &[
     ToolAudience::Participant,
     ToolAudience::Manager,
@@ -1167,6 +1184,39 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
         "Bounded redacted roster with continuation and coverage metadata."
     ),
     entry!(
+        "concilium.preview",
+        ParticipantCoordination,
+        MANAGER_AUDIENCES,
+        Searchable,
+        "Build the deterministic, scope-checked plan for one proposed Concilium.",
+        "Use before opening a proposal to inspect exact participants, scopes, packet sizes, warnings, and the plan digest; preview starts no model or native work.",
+        &["concilium", "preview", "plan", "participants", "digest"],
+        &["proposal_operation_id", "authenticated manager scope"],
+        "Deterministic plan and digest only; it commits no plan or model turn."
+    ),
+    entry!(
+        "concilium.get",
+        ParticipantCoordination,
+        CONCILIUM_READ_AUDIENCES,
+        Searchable,
+        "Read one bounded Concilium projection under the caller's current authorized scope.",
+        "Use when the exact Concilium ID is known; participant positions are masked until the applicable round is sealed.",
+        &["concilium", "get", "position", "round", "dissent"],
+        &["concilium_id", "optional limit and after_slot_id"],
+        "Scope-filtered Concilium state with blind first-round position handling."
+    ),
+    entry!(
+        "concilium.list",
+        ParticipantCoordination,
+        CONCILIUM_READ_AUDIENCES,
+        Searchable,
+        "Page Concilium projections visible in the caller's authorized scope.",
+        "Use a bounded Task/Attempt filter when the exact Concilium ID is unknown; Store authorization is rechecked before paging.",
+        &["concilium", "list", "task", "attempt", "round"],
+        &["task_id; optional attempt_id/state and page cursor"],
+        "Scope-filtered bounded page; participant projections preserve round-one blindness."
+    ),
+    entry!(
         "coordination.peer.find",
         ParticipantCoordination,
         COORDINATION_READ_AUDIENCES,
@@ -1615,6 +1665,101 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
         &["watch", "cancel", "operation", "watch_id"],
         &["watch_id", "stored watch scope remains authorized"],
         "One guarded watch cancellation; no unrelated watch or operation is changed."
+    ),
+    entry!(
+        "concilium.propose",
+        ParticipantCoordination,
+        CONCILIUM_PROPOSAL_AUDIENCES,
+        ManualOnly,
+        "Propose one bounded Concilium and create manager attention only.",
+        "Use when current participant-owned facts establish a material contract conflict that needs independent scoped positions; an authorized participant or manager may propose, and the proposal invokes no participant or changes no Task.",
+        &[
+            "concilium",
+            "propose",
+            "contract conflict",
+            "manager attention"
+        ],
+        &[
+            "exact Task/Attempt",
+            "participants",
+            "expected output",
+            "client_request_id"
+        ],
+        "One proposal Operation and Concilium ID; no model turn, native input, or Task effect."
+    ),
+    entry!(
+        "concilium.position.submit",
+        ParticipantCoordination,
+        CONCILIUM_POSITION_AUDIENCES,
+        ManualOnly,
+        "Submit one structured position to the authenticated Participant's exact Concilium slot.",
+        "Use only with the exact slot and packet digest delivered for the current round; this does not expose another participant's unsealed round-one position.",
+        &["concilium", "position", "slot", "claim", "dissent"],
+        &[
+            "concilium_id",
+            "slot_id",
+            "packet_digest",
+            "bounded position",
+            "client_request_id"
+        ],
+        "One retained slot response Operation; malformed output is isolated to its slot."
+    ),
+    entry!(
+        "concilium.open",
+        ParticipantCoordination,
+        MANAGER_AUDIENCES,
+        ManualOnly,
+        "Commit the exact previewed Concilium plan and its slots.",
+        "Use only after reviewing the current deterministic preview and its digest; opening starts no model, agent, or native session.",
+        &["concilium", "open", "manager", "plan digest", "slots"],
+        &[
+            "proposal_operation_id",
+            "plan_digest",
+            "confirmed_reasonable=true",
+            "manager_reason",
+            "client_request_id"
+        ],
+        "One manager-authorized plan Operation; it commits slots without dispatching them."
+    ),
+    entry!(
+        "concilium.round.advance",
+        ParticipantCoordination,
+        MANAGER_AUDIENCES,
+        ManualOnly,
+        "Commit the next explicit Concilium packet and round.",
+        "Use after reading the exact current state and positions; advancing is a manager Operation and never selects or invokes a speaker.",
+        &["concilium", "round", "advance", "cross-review", "manager"],
+        &[
+            "concilium_id",
+            "expected_state_revision",
+            "next_round",
+            "manager_reason",
+            "client_request_id"
+        ],
+        "One revision-checked round Operation; Store builds and retains exact slot packet digests, and round three requires a changed merged-proposal digest."
+    ),
+    entry!(
+        "concilium.close",
+        ParticipantCoordination,
+        MANAGER_AUDIENCES,
+        ManualOnly,
+        "Record the manager's advisory result for one exact Concilium.",
+        "Use after reviewing all authorized positions and dissent; close does not ratify a contract, mutate a Task, or trigger follow-up work.",
+        &[
+            "concilium",
+            "close",
+            "advisory",
+            "minority report",
+            "dissent"
+        ],
+        &[
+            "concilium_id",
+            "expected_state_revision",
+            "result",
+            "manager_reason",
+            "client_request_id"
+        ],
+        "One manager-authorized advisory result retaining valid positions and dissent."
     ),
     entry!(
         "review.assign",

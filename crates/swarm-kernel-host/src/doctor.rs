@@ -34,6 +34,28 @@ const UNRELEASED_BINDINGS_LIMIT: i64 = 20;
 /// itself and never calls the service.
 const OPENCODEX_STALE_AFTER_MS: i64 = 900_000;
 const OPENCODEX_BINDINGS_LIMIT: i64 = 8;
+const CONCILIUM_PROJECTION_PREFIX: &str = "concilium:v1:projection:";
+const CONCILIUM_SCHEMA: &str = "eliot.concilium.v1";
+const CONCILIUM_MUTATION_METHODS: &[&str] = &[
+    "concilium.propose",
+    "concilium.open",
+    "concilium.position.submit",
+    "concilium.round.advance",
+    "concilium.close",
+];
+const CONCILIUM_PROJECTION_STATES: &[&str] = &[
+    "proposed",
+    "planned",
+    "round_1_open",
+    "round_1_ready",
+    "round_2_open",
+    "round_2_ready",
+    "merge_available",
+    "completed",
+    "unresolved",
+    "cancelled",
+    "failed",
+];
 
 /// Database/config report plus the artifact paths the caller must still
 /// cross-check against the data directory (see `attach_filesystem`).
@@ -175,6 +197,100 @@ fn forge_report(db: &Connection, config: &Config) -> Result<Value> {
         "native_qualification": {
             "status": "unknown",
             "qualification_recorded": false,
+        },
+    }))
+}
+
+/// Concilium doctor output is aggregate-only. SQL reads the five known
+/// mutation method names and the versioned projection's schema/status fields;
+/// it never selects proposal, position, manager-result, participant, or
+/// credential content.
+fn concilium_report(db: &Connection) -> Result<Value> {
+    let mut by_method = serde_json::Map::new();
+    for method in CONCILIUM_MUTATION_METHODS {
+        by_method.insert((*method).to_owned(), json!(0));
+    }
+    let mut operation_statement = db.prepare(
+        "SELECT method,count(*) FROM operations
+         WHERE method IN (
+             'concilium.propose',
+             'concilium.open',
+             'concilium.position.submit',
+             'concilium.round.advance',
+             'concilium.close'
+         )
+         GROUP BY method ORDER BY method",
+    )?;
+    let operation_rows = operation_statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut known_mutation_total = 0_i64;
+    for (method, count) in operation_rows {
+        known_mutation_total += count;
+        by_method.insert(method, json!(count));
+    }
+
+    let mut by_status = serde_json::Map::new();
+    for status in CONCILIUM_PROJECTION_STATES {
+        by_status.insert((*status).to_owned(), json!(0));
+    }
+    // The CASE returns only one of the finite documented state names or
+    // NULL. Unrecognized text in a record is never returned to Rust/report.
+    let state_literals = CONCILIUM_PROJECTION_STATES
+        .iter()
+        .map(|status| format!("'{status}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let recognized_status = format!(
+        "CASE WHEN schema_name=?3 AND projection_status IN ({state_literals}) THEN projection_status END"
+    );
+    let projection_sql = format!(
+        "WITH projection_fields AS (
+             SELECT
+                 CASE WHEN json_valid(value_json) THEN json_extract(value_json,'$.schema') END AS schema_name,
+                 CASE WHEN json_valid(value_json) THEN json_extract(value_json,'$.status') END AS projection_status
+             FROM meta WHERE substr(key,1,?1)=?2
+         )
+         SELECT {recognized_status} AS recognized_status,count(*)
+         FROM projection_fields GROUP BY recognized_status"
+    );
+    let prefix_length = CONCILIUM_PROJECTION_PREFIX.len() as i64;
+    let mut projection_statement = db.prepare(&projection_sql)?;
+    let projection_rows = projection_statement
+        .query_map(
+            params![prefix_length, CONCILIUM_PROJECTION_PREFIX, CONCILIUM_SCHEMA],
+            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?)),
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut projection_total = 0_i64;
+    let mut recognized_projection_total = 0_i64;
+    for (status, count) in projection_rows {
+        projection_total += count;
+        if let Some(status) = status {
+            recognized_projection_total += count;
+            by_status.insert(status, json!(count));
+        }
+    }
+
+    Ok(json!({
+        "status": "recorded_facts_only",
+        "advisory_only": true,
+        "native_execution": false,
+        "qualification": {
+            "status": "unknown",
+            "qualification_recorded": false,
+            "live_qualification": false,
+        },
+        "operations": {
+            "known_mutation_total": known_mutation_total,
+            "by_method": by_method,
+        },
+        "projections": {
+            "records": projection_total,
+            "by_status": by_status,
+            "unrecognized_or_malformed": projection_total - recognized_projection_total,
         },
     }))
 }
@@ -636,6 +752,11 @@ pub fn inspect(db: &Connection, config: &Config) -> Result<Inspection> {
         }
     }
 
+    // Concilium data is presented only as finite durable-operation and
+    // versioned-projection counts. This reports stored facts, not runtime or
+    // test qualification and not participant or position content.
+    let concilium = concilium_report(db)?;
+
     let mut report = json!({
         "method": "doctor.inspect",
         "version": env!("CARGO_PKG_VERSION"),
@@ -701,6 +822,7 @@ pub fn inspect(db: &Connection, config: &Config) -> Result<Inspection> {
             }))
             .collect::<Vec<_>>(),
         "forge": forge,
+        "concilium": concilium,
         "live_qualification": false,
         "config": {
             "schema_version": config.schema_version,

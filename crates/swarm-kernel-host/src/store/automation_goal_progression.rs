@@ -17,6 +17,7 @@ use crate::{
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::HashSet;
 
 const STATE_PREFIX: &str = "automation:v1:goal-progression:state:";
 const SLOT_PREFIX: &str = "goal-progression:v1:terminal-slot:";
@@ -27,6 +28,8 @@ const SLOT_SCHEMA: u32 = 1;
 const MAX_SOURCE_PAGE: usize = 32;
 const MAX_ENTRY_PAGE: usize = 16;
 const MAX_RECENT: usize = 20;
+const MAX_PENDING_SOURCE_GAPS: usize = 64;
+const MAX_SOURCE_GAP_RECHECKS: usize = 8;
 
 type ObservationRow = (i64, String, String);
 type LinkedGoalOperationRow = (
@@ -40,6 +43,14 @@ type LinkedGoalOperationRow = (
     Option<i64>,
 );
 
+struct GoalSourceRow {
+    observation_id: i64,
+    operation_id: String,
+    raw: String,
+    from_pending_source_gap: bool,
+    verified_fact: Option<Value>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct State {
@@ -51,8 +62,26 @@ struct State {
     cursor: i64,
     activation_cut: i64,
     catch_up_until: Option<i64>,
+    #[serde(default)]
+    pending_source_gaps: Vec<PendingSourceGap>,
+    #[serde(default)]
+    prefer_pending_source_retry: bool,
     recent: Vec<Value>,
     updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingSourceGap {
+    // The observation row is the immutable source cause. Keep its exact
+    // identity and payload digest in the existing per-entry ledger so a later
+    // pass can retry readback without replaying the native input.
+    source_observation_id: i64,
+    source_operation_id: String,
+    source_payload_sha256: String,
+    reason: String,
+    first_seen_at_ms: i64,
+    last_checked_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -205,6 +234,15 @@ fn load_state(db: &Connection, entry: &AutomationEntry) -> Result<Option<State>>
         || state.cursor < 0
         || state.activation_cut < 0
         || state.recent.len() > MAX_RECENT
+        || state.pending_source_gaps.len() > MAX_PENDING_SOURCE_GAPS
+        || state.pending_source_gaps.iter().any(|pending| {
+            pending.source_observation_id <= 0
+                || pending.source_operation_id.is_empty()
+                || !is_digest(&pending.source_payload_sha256)
+                || pending.reason.is_empty()
+                || pending.first_seen_at_ms < 0
+                || pending.last_checked_at_ms < pending.first_seen_at_ms
+        })
     {
         return Err(Error::new(
             "AUTOMATION_GOAL_CURSOR_CORRUPT",
@@ -304,6 +342,8 @@ pub(crate) fn configure_activation(
                 cursor: if has && include_existing { 0 } else { cut },
                 activation_cut: cut,
                 catch_up_until: (has && include_existing).then_some(cut),
+                pending_source_gaps: Vec::new(),
+                prefer_pending_source_retry: false,
                 recent: Vec::new(),
                 updated_at_ms: now_ms,
             }
@@ -370,20 +410,232 @@ fn event_page(
     Ok(rows)
 }
 
-fn source_task_revision(db: &Connection, operation: &Value) -> Result<i64> {
-    let operation_id = operation["operation_id"].as_str().ok_or_else(|| {
-        Error::new(
-            "AUTOMATION_GOAL_SOURCE_GAP",
-            "source Operation ID is missing",
-        )
-    })?;
-    let subject: Option<(String, i64, Option<String>, Option<i64>)> = db
+fn pending_source_gap_payload(db: &Connection, pending: &PendingSourceGap) -> Result<String> {
+    let row: Option<(Option<String>, Option<String>, Option<String>)> = db
         .query_row(
-            "SELECT a.task_id,a.task_revision,a.binding_id,a.binding_generation \
-             FROM operations AS op JOIN attempts AS a ON a.attempt_id=op.attempt_id \
-             WHERE op.operation_id=?1 AND op.task_id=a.task_id AND op.binding_id=a.binding_id \
-               AND op.binding_generation=a.binding_generation",
-            [operation_id],
+            "SELECT kind,operation_id,payload_json FROM observations \
+             WHERE observation_id=?1",
+            [pending.source_observation_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((kind, operation_id, raw)) = row else {
+        return Err(invalid_source(
+            "retained terminal source observation was deleted before revalidation",
+        ));
+    };
+    let (Some(kind), Some(operation_id), Some(raw)) = (kind, operation_id, raw) else {
+        return Err(invalid_source(
+            "retained terminal source observation is missing immutable identity or payload",
+        ));
+    };
+    if kind != "opencode.input_execution" {
+        return Err(invalid_source(
+            "retained terminal source observation has an immutable unexpected kind",
+        ));
+    }
+    if operation_id != pending.source_operation_id
+        || model::digest(raw.as_bytes()) != pending.source_payload_sha256
+    {
+        return Err(Error::new(
+            "AUTOMATION_GOAL_CURSOR_CORRUPT",
+            "retained terminal source observation identity or payload changed",
+        ));
+    }
+    Ok(raw)
+}
+
+fn retain_source_gap(
+    state: &mut State,
+    observation_id: i64,
+    operation_id: &str,
+    raw: &str,
+    error: &Error,
+    now_ms: i64,
+) -> Result<bool> {
+    if observation_id <= 0 || operation_id.is_empty() {
+        return Err(Error::new(
+            "AUTOMATION_GOAL_CURSOR_CORRUPT",
+            "terminal source gap has an invalid observation or Operation identity",
+        ));
+    }
+    let payload_sha256 = model::digest(raw.as_bytes());
+    let reason = error.code.to_ascii_lowercase();
+    if let Some(pending) = state
+        .pending_source_gaps
+        .iter_mut()
+        .find(|pending| pending.source_observation_id == observation_id)
+    {
+        if pending.source_operation_id != operation_id
+            || pending.source_payload_sha256 != payload_sha256
+        {
+            return Err(Error::new(
+                "AUTOMATION_GOAL_CURSOR_CORRUPT",
+                "retained terminal source payload identity differs",
+            ));
+        }
+        pending.reason = reason;
+        pending.last_checked_at_ms = next_source_gap_check_at(pending.last_checked_at_ms, now_ms);
+        return Ok(true);
+    }
+    if state.pending_source_gaps.len() >= MAX_PENDING_SOURCE_GAPS {
+        return Ok(false);
+    }
+    state.pending_source_gaps.push(PendingSourceGap {
+        source_observation_id: observation_id,
+        source_operation_id: operation_id.to_owned(),
+        source_payload_sha256: payload_sha256,
+        reason,
+        first_seen_at_ms: now_ms,
+        last_checked_at_ms: now_ms,
+    });
+    Ok(true)
+}
+
+fn next_source_gap_check_at(previous: i64, now_ms: i64) -> i64 {
+    now_ms.max(previous.saturating_add(1))
+}
+
+fn recheck_pending_source_gaps(
+    db: &Connection,
+    state: &mut State,
+    budget: usize,
+    now_ms: i64,
+) -> Result<(Vec<GoalSourceRow>, usize)> {
+    let limit = budget
+        .min(MAX_SOURCE_GAP_RECHECKS)
+        .min(state.pending_source_gaps.len());
+    let mut rows = Vec::new();
+    let mut checked = 0usize;
+    let mut visited = HashSet::new();
+    while checked < limit && !state.pending_source_gaps.is_empty() {
+        let Some(index) = state
+            .pending_source_gaps
+            .iter()
+            .enumerate()
+            .filter(|(_, pending)| !visited.contains(&pending.source_observation_id))
+            .min_by_key(|(_, pending)| {
+                (
+                    pending.last_checked_at_ms,
+                    pending.first_seen_at_ms,
+                    pending.source_observation_id,
+                )
+            })
+            .map(|(index, _)| index)
+        else {
+            break;
+        };
+        let pending = state.pending_source_gaps[index].clone();
+        visited.insert(pending.source_observation_id);
+        checked += 1;
+        let raw = match pending_source_gap_payload(db, &pending) {
+            Ok(raw) => raw,
+            Err(error) if error.code == "AUTOMATION_GOAL_SOURCE_INVALID" => {
+                state.pending_source_gaps.remove(index);
+                append_recent(
+                    state,
+                    json!({
+                        "observation_id":pending.source_observation_id,
+                        "source_operation_id":pending.source_operation_id,
+                        "disposition":"source_invalid",
+                        "reason":error.message,
+                        "retryable":false
+                    }),
+                );
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        match verified_terminal(
+            db,
+            pending.source_observation_id,
+            &pending.source_operation_id,
+            &raw,
+        ) {
+            Ok(fact) => {
+                state.pending_source_gaps.remove(index);
+                rows.push(GoalSourceRow {
+                    observation_id: pending.source_observation_id,
+                    operation_id: pending.source_operation_id,
+                    raw,
+                    from_pending_source_gap: true,
+                    verified_fact: Some(fact),
+                });
+            }
+            Err(error) if error.code == "AUTOMATION_GOAL_SOURCE_GAP" => {
+                let retained = retain_source_gap(
+                    state,
+                    pending.source_observation_id,
+                    &pending.source_operation_id,
+                    &raw,
+                    &error,
+                    now_ms,
+                )?;
+                if !retained {
+                    return Err(Error::new(
+                        "AUTOMATION_GOAL_CURSOR_CORRUPT",
+                        "pending terminal source gap disappeared at capacity",
+                    ));
+                }
+            }
+            Err(error) if error.code == "AUTOMATION_GOAL_SOURCE_INVALID" => {
+                state.pending_source_gaps.remove(index);
+                append_recent(
+                    state,
+                    json!({
+                        "observation_id":pending.source_observation_id,
+                        "source_operation_id":pending.source_operation_id,
+                        "disposition":"source_invalid",
+                        "reason":error.message,
+                        "retryable":false
+                    }),
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok((rows, checked))
+}
+
+fn advance_cursor_for_source_row(
+    state: &mut State,
+    observation_id: i64,
+    from_pending_source_gap: bool,
+) {
+    if !from_pending_source_gap {
+        state.cursor = state.cursor.max(observation_id);
+    }
+}
+
+fn source_task_revision(db: &Connection, operation: &Value) -> Result<i64> {
+    let _operation_id = operation["operation_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| invalid_source("source Operation ID is missing"))?;
+    let operation_task_id = operation["task_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| invalid_source("source Operation Task ID is missing"))?;
+    let operation_attempt_id = operation["attempt_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| invalid_source("source Operation Attempt ID is missing"))?;
+    let operation_binding_id = operation["binding_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| invalid_source("source Operation binding ID is missing"))?;
+    let operation_binding_generation = operation["binding_generation"]
+        .as_i64()
+        .filter(|generation| *generation > 0)
+        .ok_or_else(|| invalid_source("source Operation binding generation is missing"))?;
+    // Read the durable Attempt by its retained identity first. Compare the
+    // Operation tuple in Rust so a present mismatching Attempt is invalid,
+    // while an absent row remains a retryable evidence gap.
+    let subject: Option<(Option<String>, Option<i64>, Option<String>, Option<i64>)> = db
+        .query_row(
+            "SELECT task_id,task_revision,binding_id,binding_generation \
+             FROM attempts WHERE attempt_id=?1",
+            [operation_attempt_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?;
@@ -393,31 +645,50 @@ fn source_task_revision(db: &Connection, operation: &Value) -> Result<i64> {
             "terminal source is not linked to one exact Task Attempt and binding",
         ));
     };
-    if operation["task_id"].as_str() != Some(task_id.as_str())
-        || operation["binding_id"].as_str() != binding_id.as_deref()
-        || operation["binding_generation"].as_i64() != generation
+    let (Some(task_id), Some(revision), Some(binding_id), Some(generation)) =
+        (task_id, revision, binding_id, generation)
+    else {
+        return Err(invalid_source(
+            "terminal source Task Attempt has missing immutable task or binding identity",
+        ));
+    };
+    if operation_task_id != task_id.as_str()
+        || operation_binding_id != binding_id.as_str()
+        || operation_binding_generation != generation
         || revision <= 0
+        || generation <= 0
     {
-        return Err(Error::new(
-            "AUTOMATION_GOAL_SOURCE_GAP",
+        return Err(invalid_source(
             "terminal source Task Attempt identity does not match its Operation",
         ));
     }
     Ok(revision)
 }
 
+fn invalid_source(message: &str) -> Error {
+    Error::new("AUTOMATION_GOAL_SOURCE_INVALID", message)
+}
+
 fn original_request(db: &Connection, operation_id: &str) -> Result<Value> {
-    let raw: String = db.query_row(
-        "SELECT original_request_json FROM operations WHERE operation_id=?1",
-        [operation_id],
-        |row| row.get(0),
-    )?;
-    serde_json::from_str(&raw).map_err(|_| {
-        Error::new(
-            "AUTOMATION_GOAL_SOURCE_GAP",
-            "source Operation request is invalid",
+    let row: Option<Option<String>> = db
+        .query_row(
+            "SELECT original_request_json FROM operations WHERE operation_id=?1",
+            [operation_id],
+            |row| row.get(0),
         )
-    })
+        .optional()?;
+    let Some(raw) = row else {
+        return Err(Error::new(
+            "AUTOMATION_GOAL_SOURCE_GAP",
+            "source Operation request is not retained yet",
+        ));
+    };
+    let Some(raw) = raw else {
+        return Err(invalid_source(
+            "source Operation request is missing its immutable JSON",
+        ));
+    };
+    serde_json::from_str(&raw).map_err(|_| invalid_source("source Operation request is invalid"))
 }
 
 fn verified_terminal(
@@ -426,33 +697,72 @@ fn verified_terminal(
     operation_id: &str,
     raw: &str,
 ) -> Result<Value> {
-    let proof: Value = serde_json::from_str(raw).map_err(|_| {
-        Error::new(
-            "AUTOMATION_GOAL_SOURCE_GAP",
-            "terminal observation payload is invalid",
-        )
+    if operation_id.is_empty() {
+        return Err(invalid_source(
+            "terminal observation has no immutable Operation ID",
+        ));
+    }
+    let proof: Value = serde_json::from_str(raw)
+        .map_err(|_| invalid_source("terminal observation payload is invalid"))?;
+    let operation = operations::get_operation(db, operation_id).map_err(|error| {
+        if error.code == "NOT_FOUND" {
+            Error::new(
+                "AUTOMATION_GOAL_SOURCE_GAP",
+                "source Operation is not retained yet",
+            )
+        } else {
+            error
+        }
     })?;
-    let operation = operations::get_operation(db, operation_id)?;
     if operation["method"] != "task.dispatch"
         && operation["method"] != "agent.send"
         && operation["method"] != "agent.goal"
     {
-        return Err(Error::new(
-            "AUTOMATION_GOAL_SOURCE_GAP",
+        return Err(invalid_source(
             "terminal observation refers to an unsupported Operation",
         ));
+    }
+    // Only an unsettled lifecycle can still acquire the synchronized native
+    // receipt. Rejected/cancelled operations are terminal non-continuable
+    // facts; an unknown state is malformed evidence, not a retry condition.
+    match operation["state"].as_str() {
+        Some("settled") => {}
+        Some("queued" | "sending" | "native_accepted" | "outcome_unknown") => {
+            return Err(Error::new(
+                "AUTOMATION_GOAL_SOURCE_GAP",
+                "source Operation is not settled and may still acquire synchronized execution evidence",
+            ));
+        }
+        Some("rejected" | "cancelled") => {
+            return Err(invalid_source(
+                "source Operation has a terminal non-continuable disposition",
+            ));
+        }
+        Some(_) | None => {
+            return Err(invalid_source(
+                "source Operation has an unknown or malformed state",
+            ));
+        }
     }
     if operation["method"] == "agent.goal"
         && original_request(db, operation_id)?["action"] != "continue"
     {
-        return Err(Error::new(
-            "AUTOMATION_GOAL_SOURCE_GAP",
+        return Err(invalid_source(
             "only explicit Goal continuation inputs are progression sources",
         ));
     }
-    if operation["state"] != "settled"
-        || operation["native_refs"]["input_execution"] != proof
-        || proof["reader_revision"] != "opencode-execution-log-v1"
+    if operation["native_refs"]["input_execution"].is_null() {
+        return Err(Error::new(
+            "AUTOMATION_GOAL_SOURCE_GAP",
+            "settled source Operation has no synchronized execution receipt yet",
+        ));
+    }
+    if operation["native_refs"]["input_execution"] != proof {
+        return Err(invalid_source(
+            "terminal observation does not match the retained Operation execution receipt",
+        ));
+    }
+    if proof["reader_revision"] != "opencode-execution-log-v1"
         || proof["correlation"] != "durable_serialized_execution"
         || proof["disposition"] != "completed"
         || proof["uncertainty"].is_string()
@@ -476,8 +786,7 @@ fn verified_terminal(
         || proof["native_input_id"].as_str().is_none()
         || proof["native_session_id"].as_str().is_none()
     {
-        return Err(Error::new(
-            "AUTOMATION_GOAL_SOURCE_GAP",
+        return Err(invalid_source(
             "exact synchronized terminal EventRef or source Operation linkage is missing",
         ));
     }
@@ -623,7 +932,8 @@ fn target_for(
     };
     let task_id = fact["task_id"]
         .as_str()
-        .ok_or_else(|| Error::new("AUTOMATION_GOAL_SOURCE_GAP", "source Task ID is missing"))?;
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| invalid_source("source Task ID is missing"))?;
     let Some(target) = super::goals::progression_target(
         db,
         &entry.project_id,
@@ -670,13 +980,12 @@ fn prepare(
     }
     let binding_id = target["binding_id"]
         .as_str()
-        .ok_or_else(|| Error::new("AUTOMATION_GOAL_SOURCE_GAP", "Goal Attempt has no binding"))?;
-    let binding_generation = target["binding_generation"].as_i64().ok_or_else(|| {
-        Error::new(
-            "AUTOMATION_GOAL_SOURCE_GAP",
-            "Goal Attempt has no binding generation",
-        )
-    })?;
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| invalid_source("Goal Attempt has no immutable binding"))?;
+    let binding_generation = target["binding_generation"]
+        .as_i64()
+        .filter(|generation| *generation > 0)
+        .ok_or_else(|| invalid_source("Goal Attempt has no immutable binding generation"))?;
     let binding = operations::get_binding(db, binding_id, binding_generation)?;
     if !binding["released_at_ms"].is_null()
         || binding["state"] != "ready"
@@ -693,12 +1002,12 @@ fn prepare(
         binding_id,
         binding_generation,
         None,
-        target["objective"].as_str().ok_or_else(|| {
-            Error::new(
-                "AUTOMATION_GOAL_SOURCE_GAP",
-                "shared Goal objective is missing",
-            )
-        })?,
+        target["objective"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                invalid_source("shared Goal objective is missing from the retained Goal record")
+            })?,
     )?;
     let request_id = format!("o9gp:{}", slot_id);
     let request = json!({
@@ -1119,6 +1428,13 @@ fn append_recent(state: &mut State, value: Value) {
     trim_recent(&mut state.recent);
 }
 
+fn state_projection(db: &Connection, state: &State, processed: usize) -> Result<Value> {
+    let mut projection = serde_json::to_value(state)?;
+    projection["processed"] = json!(processed);
+    projection["source_high_water"] = json!(observation_high_water(db)?);
+    Ok(projection)
+}
+
 /// Transactional bounded pass. The supplied callback must route through the
 /// ordinary manager on-behalf authority, mutate/Operation receipt path, and
 /// return only after the exact `agent.goal` Operation has been admitted.
@@ -1161,30 +1477,158 @@ where
             "Goal progression entry changed before terminal admission",
         ));
     }
-    let event_budget = budget.clamp(1, MAX_SOURCE_PAGE);
-    let rows = event_page(tx, state.cursor, event_budget, state.catch_up_until)?;
-    let drained_catch_up = state.catch_up_until.is_some() && rows.len() < event_budget;
+    let source_high_water = observation_high_water(tx)?;
+    let target = state
+        .catch_up_until
+        .map_or(source_high_water, |cut| source_high_water.min(cut));
+    let pass_budget = budget.clamp(1, MAX_SOURCE_PAGE);
+    let initial_pending_source_gaps = state.pending_source_gaps.len();
+    let fresh_work_available = state.cursor < target;
+    let pending_capacity_full = initial_pending_source_gaps >= MAX_PENDING_SOURCE_GAPS;
+    let pending_recheck_budget = if initial_pending_source_gaps == 0 {
+        0
+    } else if pass_budget == 1 {
+        if pending_capacity_full || !fresh_work_available || state.prefer_pending_source_retry {
+            1
+        } else {
+            0
+        }
+    } else {
+        let pending_budget = if fresh_work_available && !pending_capacity_full {
+            pass_budget.saturating_sub(1)
+        } else {
+            pass_budget
+        };
+        pending_budget
+            .min(initial_pending_source_gaps)
+            .min(MAX_SOURCE_GAP_RECHECKS)
+    };
     let mut processed = 0usize;
-    for (observation_id, operation_id, raw) in rows {
-        processed += 1;
-        let fact = match verified_terminal(tx, observation_id, &operation_id, &raw) {
+    let (mut rows, source_gap_checks) = if pending_recheck_budget == 0 {
+        (Vec::new(), 0)
+    } else {
+        recheck_pending_source_gaps(tx, &mut state, pending_recheck_budget, now_ms)?
+    };
+    processed += source_gap_checks;
+    if pass_budget == 1 && initial_pending_source_gaps > 0 {
+        state.prefer_pending_source_retry = pending_recheck_budget == 0;
+    } else if initial_pending_source_gaps == 0 {
+        state.prefer_pending_source_retry = false;
+    }
+    let remaining_budget = pass_budget.saturating_sub(processed);
+    let page_limit = remaining_budget.min(MAX_SOURCE_PAGE);
+    let can_read_page = page_limit > 0 && state.pending_source_gaps.len() < MAX_PENDING_SOURCE_GAPS;
+    let page = if can_read_page {
+        event_page(tx, state.cursor, page_limit, state.catch_up_until)?
+    } else {
+        Vec::new()
+    };
+    let drained_catch_up =
+        can_read_page && state.catch_up_until.is_some() && page.len() < page_limit;
+    rows.extend(
+        page.into_iter()
+            .map(|(observation_id, operation_id, raw)| GoalSourceRow {
+                observation_id,
+                operation_id,
+                raw,
+                from_pending_source_gap: false,
+                verified_fact: None,
+            }),
+    );
+    let mut stopped_for_source_gap_capacity = false;
+    for GoalSourceRow {
+        observation_id,
+        operation_id,
+        raw,
+        from_pending_source_gap,
+        verified_fact,
+    } in rows
+    {
+        if !from_pending_source_gap {
+            processed += 1;
+        }
+        if !from_pending_source_gap && observation_id <= state.cursor {
+            return Err(Error::new(
+                "AUTOMATION_OBSERVATION_ORDER_INVALID",
+                "Goal progression observation page returned an ID at or before its cursor",
+            ));
+        }
+        if !from_pending_source_gap && observation_id > target {
+            state.cursor = target;
+            break;
+        }
+        let fact_result = match verified_fact {
+            Some(fact) => Ok(fact),
+            None => verified_terminal(tx, observation_id, &operation_id, &raw),
+        };
+        let fact = match fact_result {
             Ok(fact) => fact,
             Err(error) if error.code == "AUTOMATION_GOAL_SOURCE_GAP" => {
+                if !retain_source_gap(
+                    &mut state,
+                    observation_id,
+                    &operation_id,
+                    &raw,
+                    &error,
+                    now_ms,
+                )? {
+                    stopped_for_source_gap_capacity = true;
+                    break;
+                }
                 append_recent(
                     &mut state,
-                    json!({"observation_id":observation_id,"source_operation_id":operation_id,"disposition":"held","reason":"terminal_source_unverified"}),
+                    json!({"observation_id":observation_id,"source_operation_id":operation_id,"disposition":"held","reason":"terminal_source_unverified","code":error.code,"retryable":true}),
                 );
-                state.cursor = observation_id;
+                advance_cursor_for_source_row(&mut state, observation_id, from_pending_source_gap);
+                continue;
+            }
+            Err(error) if error.code == "AUTOMATION_GOAL_SOURCE_INVALID" => {
+                append_recent(
+                    &mut state,
+                    json!({"observation_id":observation_id,"source_operation_id":operation_id,"disposition":"source_invalid","reason":error.message,"retryable":false}),
+                );
+                advance_cursor_for_source_row(&mut state, observation_id, from_pending_source_gap);
                 continue;
             }
             Err(error) => return Err(error),
         };
-        let Some(target) = target_for(tx, entry, &fact, now_ms)? else {
+        let target = match target_for(tx, entry, &fact, now_ms) {
+            Ok(target) => target,
+            Err(error) if error.code == "AUTOMATION_GOAL_SOURCE_GAP" => {
+                if !retain_source_gap(
+                    &mut state,
+                    observation_id,
+                    &operation_id,
+                    &raw,
+                    &error,
+                    now_ms,
+                )? {
+                    stopped_for_source_gap_capacity = true;
+                    break;
+                }
+                append_recent(
+                    &mut state,
+                    json!({"observation_id":observation_id,"source_operation_id":operation_id,"disposition":"held","reason":"goal_target_source_unverified","code":error.code,"retryable":true}),
+                );
+                advance_cursor_for_source_row(&mut state, observation_id, from_pending_source_gap);
+                continue;
+            }
+            Err(error) if error.code == "AUTOMATION_GOAL_SOURCE_INVALID" => {
+                append_recent(
+                    &mut state,
+                    json!({"observation_id":observation_id,"source_operation_id":operation_id,"disposition":"source_invalid","reason":error.message,"retryable":false}),
+                );
+                advance_cursor_for_source_row(&mut state, observation_id, from_pending_source_gap);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let Some(target) = target else {
             append_recent(
                 &mut state,
                 json!({"observation_id":observation_id,"source_operation_id":operation_id,"disposition":"skipped","reason":"not_the_selected_goal_attempt"}),
             );
-            state.cursor = observation_id;
+            advance_cursor_for_source_row(&mut state, observation_id, from_pending_source_gap);
             continue;
         };
         let slot_id = event_slot_id(&fact)?;
@@ -1213,11 +1657,38 @@ where
                 &mut state,
                 json!({"observation_id":observation_id,"source_operation_id":operation_id,"disposition":"duplicate_event","claimed_disposition":slot.disposition,"operation_id":slot.operation_id,"claimed_by_manager_id":slot.manager_id,"goal_id":slot.goal_id,"goal_revision":slot.goal_revision}),
             );
-            state.cursor = observation_id;
+            advance_cursor_for_source_row(&mut state, observation_id, from_pending_source_gap);
             continue;
         }
         let prepared = match prepare(tx, entry, &fact, &target, &slot_id) {
             Ok(prepared) => prepared,
+            Err(error) if error.code == "AUTOMATION_GOAL_SOURCE_GAP" => {
+                if !retain_source_gap(
+                    &mut state,
+                    observation_id,
+                    &operation_id,
+                    &raw,
+                    &error,
+                    now_ms,
+                )? {
+                    stopped_for_source_gap_capacity = true;
+                    break;
+                }
+                append_recent(
+                    &mut state,
+                    json!({"observation_id":observation_id,"source_operation_id":operation_id,"disposition":"held","reason":"goal_preparation_source_unverified","code":error.code,"retryable":true}),
+                );
+                advance_cursor_for_source_row(&mut state, observation_id, from_pending_source_gap);
+                continue;
+            }
+            Err(error) if error.code == "AUTOMATION_GOAL_SOURCE_INVALID" => {
+                append_recent(
+                    &mut state,
+                    json!({"observation_id":observation_id,"source_operation_id":operation_id,"disposition":"source_invalid","reason":error.message,"retryable":false}),
+                );
+                advance_cursor_for_source_row(&mut state, observation_id, from_pending_source_gap);
+                continue;
+            }
             Err(error) => {
                 let disposition = if error.code == "GOAL_OWNER_CONFLICT"
                     || error.code == "GOAL_NATIVE_OWNERSHIP_CONFLICT"
@@ -1293,7 +1764,7 @@ where
                     &mut state,
                     json!({"observation_id":observation_id,"source_operation_id":operation_id,"goal_id":target["goal_id"],"goal_revision":target["revision"],"goal_owner_manager_id":target["created_by_manager_id"],"goal_last_reviser_manager_id":target["updated_by_manager_id"],"disposition":disposition,"code":error.code,"reason":error.message}),
                 );
-                state.cursor = observation_id;
+                advance_cursor_for_source_row(&mut state, observation_id, from_pending_source_gap);
                 continue;
             }
         };
@@ -1361,7 +1832,7 @@ where
                     &mut state,
                     json!({"observation_id":observation_id,"source_operation_id":operation_id,"terminal_event":fact["terminal_event"],"goal_id":target["goal_id"],"goal_revision":target["revision"],"goal_owner_manager_id":target["created_by_manager_id"],"goal_last_reviser_manager_id":target["updated_by_manager_id"],"disposition":disposition,"code":code,"reason":reason}),
                 );
-                state.cursor = observation_id;
+                advance_cursor_for_source_row(&mut state, observation_id, from_pending_source_gap);
                 continue;
             }
         };
@@ -1414,17 +1885,17 @@ where
             &mut state,
             json!({"observation_id":observation_id,"source_operation_id":operation_id,"terminal_event":fact["terminal_event"],"goal_id":target["goal_id"],"goal_revision":target["revision"],"goal_owner_manager_id":target["created_by_manager_id"],"goal_last_reviser_manager_id":target["updated_by_manager_id"],"disposition":disposition,"operation_id":admitted_operation_id,"semantic_slot_id":slot_id}),
         );
-        state.cursor = observation_id;
+        advance_cursor_for_source_row(&mut state, observation_id, from_pending_source_gap);
     }
-    if drained_catch_up && let Some(through) = state.catch_up_until.take() {
+    if drained_catch_up
+        && !stopped_for_source_gap_capacity
+        && let Some(through) = state.catch_up_until.take()
+    {
         state.cursor = state.cursor.max(through);
     }
     state.updated_at_ms = now_ms;
     save_state(tx, entry, &state)?;
-    let mut projection = serde_json::to_value(state)?;
-    projection["processed"] = json!(processed);
-    projection["source_high_water"] = json!(observation_high_water(tx)?);
-    Ok(projection)
+    state_projection(tx, &state, processed)
 }
 
 /// Shared pump for enabled Goal progression entries, with one global entry

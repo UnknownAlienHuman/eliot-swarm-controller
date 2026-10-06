@@ -1,5 +1,6 @@
 //! Data-only types shared across independently built Swarm processes.
 
+pub mod concilium_limits;
 pub mod credential;
 pub mod declared_service_scope;
 pub mod error;
@@ -7,9 +8,9 @@ pub mod mcp_frontend;
 pub mod method_policy;
 pub mod module_catalog;
 
+pub mod module_contract;
 /// Store-admitted native MCP command DTO and method declarations.
 pub mod native_mcp;
-pub mod module_contract;
 pub mod rpc;
 pub mod runtime;
 

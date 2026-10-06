@@ -47,14 +47,16 @@
 //! its own, `eliot/subscribe` / `eliot/unsubscribe` (custom requests,
 //! not tools). A subscription is a bounded, read-only freshness hint
 //! over committed facts only — committed report transitions, mailbox
-//! deliveries and Operation state transitions, all filtered from the
-//! one committed observation stream `report.delta` reads, never from
+//! deliveries, Operation state transitions and Concilium transitions,
+//! all filtered from the one committed observation stream `report.delta` reads, never from
 //! a volatile or native live stream. Each subscription's queue holds
 //! at most a fixed number of undelivered notifications; on overflow
 //! the subscriber receives exactly one explicit `lagged` marker for
 //! the skipped range and resyncs through the exact reads
-//! (`report.delta` / `message.read` / `operation.get`) from the last
-//! delivered cursor. Notifications carry the S2 projection frame of
+//! (`report.delta` / `message.read` / `operation.get`, plus
+//! `concilium.get` / `concilium.list` for Concilium facts) from the last
+//! delivered cursor. Concilium notification items carry IDs and cursor
+//! only. Notifications carry the S2 projection frame of
 //! the page they were read from, so a subscriber can detect gaps
 //! itself. Subscriptions die with the session: a reconnect is not
 //! replay continuity, and state is re-established by cursor + resync.
@@ -82,7 +84,7 @@ use serde_json::{Map, Value, json};
 use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
 use swarm_client::Client;
 use swarm_contracts::{
-    Credential,
+    Credential, concilium_limits as limits,
     error::{Error, Result},
 };
 use tokio::sync::Mutex;
@@ -314,6 +316,30 @@ static TOOLS: &[(bool, ToolSpec)] = &[
             f("after_client_id", S),
         ],
         &["task_id", "task_revision", "attempt_id"],
+    ),
+    read(
+        "concilium.preview",
+        "Build a deterministic scoped plan and packet digest for a proposed Concilium; preview has no model or native effect.",
+        &[f("proposal_operation_id", S)],
+        &["proposal_operation_id"],
+    ),
+    read(
+        "concilium.get",
+        "Read one bounded Concilium projection in the authenticated scope; first-round peer positions remain blind until sealed.",
+        &[f("concilium_id", S), f("limit", I), f("after_slot_id", S)],
+        &["concilium_id"],
+    ),
+    read(
+        "concilium.list",
+        "Page Concilium projections visible in the authenticated scope with bounded Task/Attempt and state filters.",
+        &[
+            f("task_id", S),
+            f("attempt_id", S),
+            f("state", S),
+            f("limit", I),
+            f("after_concilium_id", S),
+        ],
+        &["task_id"],
     ),
     read(
         "coordination.peer.find",
@@ -766,6 +792,99 @@ static TOOLS: &[(bool, ToolSpec)] = &[
         "Cancel one watch by its exact ID; the stored watch scope is reauthorized before the change.",
         &[f("watch_id", S)],
         &["watch_id"],
+    ),
+    mutation(
+        "concilium.propose",
+        "Propose one bounded Concilium under the authenticated participant or manager's current Task/Attempt scope; this creates manager attention only.",
+        &[
+            f("task_id", S),
+            f("attempt_id", S),
+            f("failed_thread_id", S),
+            f("decision_question", S),
+            f("material_conflict", S),
+            f("participants", A),
+            f("proposal_revision_ids", A),
+            f("evidence_refs", A),
+            f("expected_output", S),
+            f("suggested_max_rounds", I),
+            f("suggested_budget", O),
+            f("close_condition", S),
+        ],
+        &[
+            "task_id",
+            "attempt_id",
+            "failed_thread_id",
+            "decision_question",
+            "material_conflict",
+            "participants",
+            "proposal_revision_ids",
+            "evidence_refs",
+            "expected_output",
+            "suggested_max_rounds",
+            "suggested_budget",
+            "close_condition",
+        ],
+    ),
+    mutation(
+        "concilium.open",
+        "Commit the exact current previewed Concilium plan and slots; opening invokes no participant or model.",
+        &[
+            f("proposal_operation_id", S),
+            f("plan_digest", S),
+            f("confirmed_reasonable", B),
+            f("manager_reason", S),
+        ],
+        &[
+            "proposal_operation_id",
+            "plan_digest",
+            "confirmed_reasonable",
+            "manager_reason",
+        ],
+    ),
+    mutation(
+        "concilium.position.submit",
+        "Submit one structured response to the authenticated participant's exact Concilium slot and packet.",
+        &[
+            f("concilium_id", S),
+            f("slot_id", S),
+            f("packet_digest", S),
+            f("position", O),
+        ],
+        &["concilium_id", "slot_id", "packet_digest", "position"],
+    ),
+    mutation(
+        "concilium.round.advance",
+        "Commit the manager-selected next Concilium round with compare-and-swap; Store builds each slot packet and this selects no speaker.",
+        &[
+            f("concilium_id", S),
+            f("expected_state_revision", I),
+            f("next_round", I),
+            f("merged_proposal_digest", SN),
+            f("manager_reason", S),
+        ],
+        &[
+            "concilium_id",
+            "expected_state_revision",
+            "next_round",
+            "manager_reason",
+        ],
+    ),
+    mutation(
+        "concilium.close",
+        "Record a manager-authorized advisory Concilium outcome while preserving valid positions and dissent; no Task or contract is mutated.",
+        &[
+            f("concilium_id", S),
+            f("expected_state_revision", I),
+            f("result", S),
+            f("recommendation", SN),
+            f("manager_reason", S),
+        ],
+        &[
+            "concilium_id",
+            "expected_state_revision",
+            "result",
+            "manager_reason",
+        ],
     ),
     mutation(
         "review.assign",
@@ -1599,6 +1718,120 @@ fn tool_name(method: &str) -> String {
     method.replace('.', "_")
 }
 
+fn concilium_id_schema() -> Value {
+    json!({
+        "type":"string",
+        "minLength":1,
+        "maxLength":limits::MAX_IDENTIFIER_BYTES,
+        "pattern":"^\\S+$",
+        "description":"The wire parser enforces the UTF-8 byte limit; JSON Schema maxLength counts Unicode code points."
+    })
+}
+
+fn concilium_optional_id_schema() -> Value {
+    json!({"oneOf":[concilium_id_schema(),{"type":"null"}]})
+}
+
+fn concilium_client_id_schema() -> Value {
+    json!({
+        "type":"string",
+        "minLength":1,
+        "maxLength":limits::MAX_CLIENT_ID_BYTES,
+        "pattern":"^\\S+$",
+        "description":"The wire parser enforces the UTF-8 byte limit; JSON Schema maxLength counts Unicode code points."
+    })
+}
+
+fn concilium_text_schema(max_utf8_bytes: usize, min_length: usize) -> Value {
+    let mut schema = json!({
+        "type":"string",
+        "minLength":min_length,
+        "maxLength":max_utf8_bytes,
+        "description":"The wire parser enforces the UTF-8 byte limit; JSON Schema maxLength counts Unicode code points."
+    });
+    if min_length > 0 {
+        schema["pattern"] = json!("\\S");
+    }
+    schema
+}
+
+fn concilium_reference_schema() -> Value {
+    json!({
+        "type":"string",
+        "minLength":1,
+        "maxLength":limits::MAX_EVIDENCE_REF_BYTES,
+        "pattern":"\\S",
+        "description":"The wire parser enforces the UTF-8 byte limit; JSON Schema maxLength counts Unicode code points."
+    })
+}
+
+fn concilium_digest_schema() -> Value {
+    json!({
+        "type":"string",
+        "pattern":"^sha256:[0-9a-f]{64}$"
+    })
+}
+
+fn concilium_evidence_refs_schema() -> Value {
+    json!({
+        "type":"array",
+        "maxItems":limits::MAX_EVIDENCE_REFS,
+        "uniqueItems":true,
+        "items":concilium_reference_schema()
+    })
+}
+
+fn concilium_participant_schema() -> Value {
+    json!({
+        "type":"object",
+        "properties":{
+            "client_id":concilium_client_id_schema(),
+            "generation":{"type":["integer","null"],"minimum":1,"maximum":9223372036854775807_i64},
+            "reason":concilium_text_schema(limits::MAX_PARTICIPANT_REASON_BYTES, 1)
+        },
+        "required":["client_id","reason"],
+        "additionalProperties":false
+    })
+}
+
+fn concilium_claim_schema() -> Value {
+    json!({
+        "type":"object",
+        "properties":{
+            "claim_id":concilium_id_schema(),
+            "stance":{"type":"string","enum":["support","oppose","uncertain"]},
+            "fact":concilium_text_schema(limits::MAX_CLAIM_TEXT_BYTES, 1),
+            "evidence_refs":concilium_evidence_refs_schema(),
+            "counterexample":{"oneOf":[concilium_text_schema(limits::MAX_CLAIM_TEXT_BYTES, 1),{"type":"null"}]},
+            "falsifier":concilium_text_schema(limits::MAX_CLAIM_TEXT_BYTES, 1),
+            "assumptions":{"type":"array","items":concilium_text_schema(limits::MAX_QUESTION_BYTES, 1)},
+            "confidence":{"type":"string","enum":["low","medium","high"]}
+        },
+        "required":["claim_id","stance","fact","evidence_refs","counterexample","falsifier","assumptions","confidence"],
+        "additionalProperties":false
+    })
+}
+
+fn concilium_position_schema() -> Value {
+    json!({
+        "type":"object",
+        "properties":{
+            "position":{"type":"string","enum":["support","oppose","alternative","insufficient_evidence"]},
+            "proposal_revision_id":{"type":["string","null"],"minLength":1,"maxLength":limits::MAX_IDENTIFIER_BYTES,"pattern":"^\\S+$","description":"The wire parser enforces the UTF-8 byte limit; JSON Schema maxLength counts Unicode code points."},
+            "claims":{"type":"array","maxItems":limits::MAX_CLAIMS_PER_POSITION,"items":concilium_claim_schema()},
+            "required_change":{"type":"string","maxLength":limits::MAX_POSITION_TEXT_BYTES,"description":"The wire parser enforces the UTF-8 byte limit; JSON Schema maxLength counts Unicode code points."},
+            "unresolved_questions":{"type":"array","items":concilium_text_schema(limits::MAX_QUESTION_BYTES, 1)}
+        },
+        "required":["position","proposal_revision_id","claims","required_change","unresolved_questions"],
+        "anyOf":[
+            {"properties":{"claims":{"minItems":1}}},
+            {"properties":{"required_change":{"minLength":1,"pattern":"\\S"}}},
+            {"properties":{"unresolved_questions":{"minItems":1}}}
+        ],
+        "additionalProperties":false
+    })
+}
+
 fn input_schema(spec: &ToolSpec, read_only: bool, require_request_id: bool) -> Arc<JsonObject> {
     let mut properties = JsonObject::new();
     for field in spec.fields {
@@ -1648,8 +1881,152 @@ fn refine_input_schema(method: &str, schema: &mut Value) {
     if matches!(method, "script.register" | "script.revise") {
         schema["$defs"] = json!({"ScriptValueSchema":script_value_schema_definition()});
     }
+    if method.starts_with("concilium.") {
+        schema["description"] = json!(format!(
+            "Concilium input is limited to {} UTF-8 bytes. The wire parser enforces byte bounds because JSON Schema maxLength counts Unicode code points.",
+            limits::MAX_CONCILIUM_REQUEST_BYTES
+        ));
+    }
     let properties = &mut schema["properties"];
     match method {
+        "concilium.propose" => {
+            properties["client_request_id"] = json!({
+                "type":"string","minLength":1,"maxLength":limits::MAX_CLIENT_REQUEST_ID_BYTES,"pattern":"^\\S+$",
+                "description":"The wire parser enforces the UTF-8 byte limit; JSON Schema maxLength counts Unicode code points."
+            });
+            for name in ["task_id", "attempt_id", "failed_thread_id"] {
+                properties[name] = concilium_id_schema();
+            }
+            properties["decision_question"] = concilium_text_schema(limits::MAX_QUESTION_BYTES, 1);
+            properties["material_conflict"] = concilium_text_schema(limits::MAX_CONFLICT_BYTES, 1);
+            for name in ["expected_output", "close_condition"] {
+                properties[name] = concilium_text_schema(limits::MAX_QUESTION_BYTES, 1);
+            }
+            properties["participants"] = json!({
+                "type":"array",
+                "minItems":1,
+                "items":concilium_participant_schema()
+            });
+            properties["proposal_revision_ids"] = json!({
+                "type":"array",
+                "uniqueItems":true,
+                "items":concilium_id_schema()
+            });
+            properties["evidence_refs"] = concilium_evidence_refs_schema();
+            properties["suggested_max_rounds"] = json!({"type":"integer","minimum":1,"maximum":3});
+            properties["suggested_budget"] = json!({"type":"object"});
+        }
+        "concilium.preview" => {
+            properties["proposal_operation_id"] = concilium_id_schema();
+        }
+        "concilium.open" => {
+            properties["client_request_id"] = json!({
+                "type":"string","minLength":1,"maxLength":limits::MAX_CLIENT_REQUEST_ID_BYTES,"pattern":"^\\S+$",
+                "description":"The wire parser enforces the UTF-8 byte limit; JSON Schema maxLength counts Unicode code points."
+            });
+            properties["proposal_operation_id"] = concilium_id_schema();
+            properties["plan_digest"] = concilium_digest_schema();
+            properties["confirmed_reasonable"] = json!({"const":true});
+            properties["manager_reason"] = concilium_text_schema(limits::MAX_QUESTION_BYTES, 1);
+        }
+        "concilium.position.submit" => {
+            properties["client_request_id"] = json!({
+                "type":"string","minLength":1,"maxLength":limits::MAX_CLIENT_REQUEST_ID_BYTES,"pattern":"^\\S+$",
+                "description":"The wire parser enforces the UTF-8 byte limit; JSON Schema maxLength counts Unicode code points."
+            });
+            properties["concilium_id"] = concilium_id_schema();
+            properties["slot_id"] = concilium_id_schema();
+            properties["packet_digest"] = concilium_digest_schema();
+            properties["position"] = concilium_position_schema();
+        }
+        "concilium.round.advance" => {
+            properties["client_request_id"] = json!({
+                "type":"string","minLength":1,"maxLength":limits::MAX_CLIENT_REQUEST_ID_BYTES,"pattern":"^\\S+$",
+                "description":"The wire parser enforces the UTF-8 byte limit; JSON Schema maxLength counts Unicode code points."
+            });
+            properties["concilium_id"] = concilium_id_schema();
+            properties["expected_state_revision"] =
+                json!({"type":"integer","minimum":1,"maximum":9223372036854775807_i64});
+            properties["next_round"] = json!({"type":"integer","enum":[2,3]});
+            properties["merged_proposal_digest"] = json!({
+                "oneOf":[concilium_digest_schema(),{"type":"null"}]
+            });
+            properties["manager_reason"] = concilium_text_schema(limits::MAX_QUESTION_BYTES, 1);
+            append_all_of(
+                schema,
+                json!({
+                    "oneOf":[
+                        {
+                            "properties":{
+                                "next_round":{"const":2},
+                                "merged_proposal_digest":{"type":"null"}
+                            }
+                        },
+                        {
+                            "properties":{
+                                "next_round":{"const":3},
+                                "merged_proposal_digest":concilium_digest_schema()
+                            },
+                            "required":["merged_proposal_digest"]
+                        }
+                    ]
+                }),
+            );
+        }
+        "concilium.close" => {
+            properties["client_request_id"] = json!({
+                "type":"string","minLength":1,"maxLength":limits::MAX_CLIENT_REQUEST_ID_BYTES,"pattern":"^\\S+$",
+                "description":"The wire parser enforces the UTF-8 byte limit; JSON Schema maxLength counts Unicode code points."
+            });
+            properties["concilium_id"] = concilium_id_schema();
+            properties["expected_state_revision"] =
+                json!({"type":"integer","minimum":1,"maximum":9223372036854775807_i64});
+            properties["result"] = json!({
+                "type":"string",
+                "enum":["recommended","minority_report","insufficient_evidence","irreconcilable_contract","cancelled","failed"]
+            });
+            properties["recommendation"] = json!({
+                "oneOf":[concilium_id_schema(),{"type":"null"}]
+            });
+            properties["manager_reason"] = concilium_text_schema(limits::MAX_QUESTION_BYTES, 1);
+            append_all_of(
+                schema,
+                json!({
+                    "oneOf":[
+                        {
+                            "properties":{
+                                "result":{"const":"recommended"},
+                                "recommendation":concilium_id_schema()
+                            },
+                            "required":["recommendation"]
+                        },
+                        {
+                            "properties":{
+                                "result":{"enum":["minority_report","insufficient_evidence","irreconcilable_contract","cancelled","failed"]},
+                                "recommendation":{"type":["string","null"]}
+                            }
+                        }
+                    ]
+                }),
+            );
+        }
+        "concilium.get" => {
+            properties["concilium_id"] = concilium_id_schema();
+            properties["limit"] = json!({"type":"integer","minimum":1,"maximum":limits::MAX_READ_PAGE_SIZE,"default":limits::DEFAULT_READ_PAGE_SIZE});
+            properties["after_slot_id"] = concilium_optional_id_schema();
+        }
+        "concilium.list" => {
+            properties["task_id"] = concilium_id_schema();
+            properties["attempt_id"] = concilium_optional_id_schema();
+            properties["state"] = json!({
+                "oneOf":[
+                    {"type":"string","enum":["proposed","planned","round_1_open","round_1_ready","round_2_open","round_2_ready","merge_available","completed","unresolved","cancelled","failed"]},
+                    {"type":"null"}
+                ]
+            });
+            properties["limit"] = json!({"type":"integer","minimum":1,"maximum":limits::MAX_READ_PAGE_SIZE,"default":limits::DEFAULT_READ_PAGE_SIZE});
+            properties["after_concilium_id"] = concilium_optional_id_schema();
+        }
         "logging.get" | "logging.set" => {
             for field in [
                 "client_id",
@@ -2963,11 +3340,13 @@ impl ServerHandler for McpFacade {
              tasks/get are answered with the agent_reply tool, not tasks/update. \
              The eliot/subscribe and eliot/unsubscribe protocol methods open and \
              close a bounded subscription over committed facts (categories: \
-             reports, mailbox, operations): notifications/eliot/committed carries \
+             reports, mailbox, operations, concilium): notifications/eliot/committed carries \
              each committed transition with its projection frame, and an explicit \
              notifications/eliot/lagged marks any range the bounded queue \
              skipped. Notifications are a freshness hint, never complete history: \
-             resync through report_delta, message_read or operation_get from the \
+             Concilium notification items contain IDs and cursor only. Resync \
+             through report_delta, message_read or operation_get, and through \
+             concilium_get or concilium_list for Concilium facts, from the \
              last delivered cursor, and after a reconnect re-subscribe with that \
              cursor — subscriptions do not survive the session.",
             )

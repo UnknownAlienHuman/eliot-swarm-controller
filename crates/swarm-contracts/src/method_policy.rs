@@ -37,6 +37,54 @@ pub struct MethodPolicy {
 /// service calls. Unknown names do not acquire a default writer path.
 pub const METHOD_REGISTRY: &[MethodPolicy] = &[
     MethodPolicy {
+        method: "concilium.propose",
+        class: MethodClass::Mutation,
+        mcp: true,
+        participant: ParticipantAccess::CoordinationMutation,
+    },
+    MethodPolicy {
+        method: "concilium.preview",
+        class: MethodClass::ReadOnly,
+        mcp: true,
+        participant: ParticipantAccess::None,
+    },
+    MethodPolicy {
+        method: "concilium.open",
+        class: MethodClass::Mutation,
+        mcp: true,
+        participant: ParticipantAccess::None,
+    },
+    MethodPolicy {
+        method: "concilium.position.submit",
+        class: MethodClass::Mutation,
+        mcp: true,
+        participant: ParticipantAccess::CoordinationMutation,
+    },
+    MethodPolicy {
+        method: "concilium.round.advance",
+        class: MethodClass::Mutation,
+        mcp: true,
+        participant: ParticipantAccess::None,
+    },
+    MethodPolicy {
+        method: "concilium.get",
+        class: MethodClass::ReadOnly,
+        mcp: true,
+        participant: ParticipantAccess::CoordinationRead,
+    },
+    MethodPolicy {
+        method: "concilium.list",
+        class: MethodClass::ReadOnly,
+        mcp: true,
+        participant: ParticipantAccess::CoordinationRead,
+    },
+    MethodPolicy {
+        method: "concilium.close",
+        class: MethodClass::Mutation,
+        mcp: true,
+        participant: ParticipantAccess::None,
+    },
+    MethodPolicy {
         method: "swarm.tools.search",
         class: MethodClass::FacadeOnly,
         mcp: true,

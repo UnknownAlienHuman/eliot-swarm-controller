@@ -1763,7 +1763,36 @@ pub(crate) fn validate_retained_script_event_cause(
     } else {
         None
     };
-    if let Some(operation_id) = event.operation_id.as_deref() {
+    let retained_concilium_source = if event.source_id == "controller"
+        && matches!(
+            event.event_kind.as_str(),
+            "concilium.propose"
+                | "concilium.open"
+                | "concilium.position.submit"
+                | "concilium.round.advance"
+                | "concilium.close"
+        ) {
+        bus_kernel::validate_retained_concilium_event_source(db, &event, project_id).map_err(
+            |error| {
+                if error.code == "SCRIPT_EVENT_SOURCE_UNAUTHORIZED" {
+                    Error::new(
+                        "AUTOMATION_LINK_CORRUPT",
+                        "retained Concilium event has invalid immutable source proof",
+                    )
+                } else {
+                    error
+                }
+            },
+        )?;
+        true
+    } else {
+        false
+    };
+    if retained_concilium_source {
+        // The bus validator checked the immutable Observation, settled
+        // Concilium Operation/receipt, and originating proposal link. This
+        // retained result may outlive the Task/GM that admitted its cause.
+    } else if let Some(operation_id) = event.operation_id.as_deref() {
         let operation_scope: Option<RetainedOperationScope> = db
             .query_row(
                 "SELECT task_id,attempt_id,binding_id,binding_generation,caller_id \
@@ -4532,8 +4561,25 @@ fn script_trigger_hold_is_revalidatable(reason: Option<&str>) -> bool {
             || reason.starts_with("script_revision_")
             || reason.starts_with("task_attempt_")
             || reason.starts_with("submission_")
+            || is_event_hold_reason(reason)
             || reason.starts_with("system_event_")
     })
+}
+
+fn is_event_hold_reason(reason: &str) -> bool {
+    matches!(
+        reason.strip_prefix("event_"),
+        Some(
+            "forbidden"
+                | "unauthorized"
+                | "not_found"
+                | "stale_attempt"
+                | "attempt_scope_stale"
+                | "script_event_rule_changed"
+                | "script_event_source_revoked"
+                | "script_event_source_unauthorized"
+        )
+    )
 }
 
 const SCRIPT_REGISTRY_HOLD_PREFIX: &str =

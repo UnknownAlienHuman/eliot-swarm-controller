@@ -38,11 +38,30 @@ The product remains `PARTIAL_PROGRESS`. Installed adapter qualification and the
 complete productive workflow remain pending. Historical binaries and receipts
 retain only their recorded scope.
 
-Source work continues before further tests: durable Concilium wire, Store and
-MCP/CLI methods are being implemented, together with their shared event-bus
-translation. The automation audit also identified unrevalidated event holds and
-Goal source-gap cursor loss; those production corrections remain in progress.
-These authored lanes do not yet establish callable or compiled functionality.
+The integrated Concilium source delivery covers eight typed methods across wire,
+Store, MCP and CLI, with actor/slot authorization, blind Round 1 positions and
+shared request bounds (one participant is valid; there is no 64-actor cap).
+The five exact
+mutation kinds—`concilium.propose`, `concilium.open`,
+`concilium.position.submit`, `concilium.round.advance` and `concilium.close`—use
+the existing controller Operation/Observation provenance. Sponsor identity is
+retained provenance; mutations still check current authority.
+Scoped Managers list their exact current Attempt by default; historical sponsor
+reads remain available, while the current GM or local Operator may list the Task.
+A Round 3 merged proposal digest is a manager-attested reference, not proof of
+content. Doctor
+adds only finite method/state and malformed-projection counts. Participant
+subscriptions remain unavailable because that profile does not expose
+`report.delta`.
+
+The automation v6 source correction is integrated in the source worktree and
+passed its source audit: it revalidates exact ScriptRun event holds and repairs
+Goal source-gap retention/classification, pending/fresh fairness, and the rule
+that only incoming contiguous events advance the source cursor. The combined
+source remains uncompiled and untested, with no fresh runtime, model or provider
+qualification. Concilium methods start no model or native adapter and mutate no
+Task state; close is advisory. The historical checks above retain their narrow
+scopes, and product status remains `PARTIAL_PROGRESS`.
 
 The actual Kernel now lives in `crates/swarm-kernel-host`: it owns Store, the
 database lock and authenticated IPC. The root library is a compatibility

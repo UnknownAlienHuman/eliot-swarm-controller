@@ -21,6 +21,7 @@ mod c34_workspace_start_diagnosis_fixture;
 pub(crate) mod capacity;
 mod checks;
 mod command_results;
+mod concilium;
 mod coordination;
 mod coordination_watch;
 mod forge;
@@ -1848,6 +1849,9 @@ impl Store {
                         return mutate(db, &principal, &method, &params, &config);
                     }
                     if swarm_contracts::method_policy::participant_coordination_read(&method) {
+                        if matches!(method.as_str(), "concilium.get" | "concilium.list") {
+                            return concilium::read(db, &principal, &method, &params);
+                        }
                         if method == "swarm.overlap.check" {
                             return integration::read(db, &principal, &method, &params);
                         }
@@ -1856,6 +1860,10 @@ impl Store {
                         }
                         if method == "operation.get" {
                             let id = model::text(&params, "operation_id")?;
+                            if concilium::authorize_operation_read(db, &principal, id).is_ok() {
+                                model::fields(&params, &["operation_id"])?;
+                                return operations::get_operation(db, id);
+                            }
                             if reviews::authorize_operation_read(db, &principal, id).is_ok() {
                                 model::fields(&params, &["operation_id"])?;
                                 return operations::get_operation(db, id);
@@ -1874,6 +1882,15 @@ impl Store {
                         return read(db, &principal, &method, &params, &config);
                     }
                     if swarm_contracts::method_policy::participant_coordination_mutation(&method) {
+                        if matches!(
+                            method.as_str(),
+                            "concilium.propose" | "concilium.position.submit"
+                        ) {
+                            concilium::authorize_participant_mutation(
+                                db, &principal, &method, &params,
+                            )?;
+                            return mutate(db, &principal, &method, &params, &config);
+                        }
                         coordination::authorize_participant_mutation(db, &principal, &method)?;
                         return mutate(db, &principal, &method, &params, &config);
                     }
@@ -3077,6 +3094,7 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
         op.method NOT IN ('message.send', 'message.cancel', 'coordination.send',
             'task.request_changes', 'check.run', 'check.cancel', 'event.emit')
         AND op.method NOT LIKE 'coordination.%'
+        AND op.method NOT LIKE 'concilium.%'
         AND op.method NOT LIKE 'review.%'
         AND op.method NOT LIKE 'automation.%'
         AND op.method NOT LIKE 'script.%'
@@ -3086,6 +3104,36 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
         AND op.caller_id != 'eliot-internal-automation-v1'
     )
     OR op.caller_id = :client
+    OR (
+        op.method LIKE 'concilium.%'
+        AND EXISTS (
+            SELECT 1 FROM meta AS link
+            JOIN meta AS manager ON manager.key='client:' || :client
+            WHERE link.key='concilium:v1:operation:' || op.operation_id
+              AND json_extract(link.value_json,'$.schema_version')=1
+              AND json_extract(link.value_json,'$.task_id')=op.task_id
+              AND json_extract(link.value_json,'$.attempt_id')=op.attempt_id
+              AND json_extract(manager.value_json,'$.role')='manager'
+              AND COALESCE(json_extract(manager.value_json,'$.disabled'),0)=0
+              AND (
+                  json_extract(link.value_json,'$.manager_id')=:client
+                  OR EXISTS (
+                      SELECT 1 FROM meta AS current_gm
+                      WHERE current_gm.key='gm'
+                        AND json_extract(current_gm.value_json,'$.client_id')=:client
+                  )
+                  OR EXISTS (
+                      SELECT 1 FROM tasks AS target
+                      JOIN attempts AS current_attempt ON current_attempt.task_id=target.task_id
+                      WHERE target.task_id=op.task_id
+                        AND current_attempt.task_id=target.task_id
+                        AND current_attempt.attempt_id=op.attempt_id
+                        AND current_attempt.owner_id=:client
+                        AND current_attempt.released_at_ms IS NULL
+                  )
+              )
+        )
+    )
     OR (
         ((op.method LIKE 'script.%' AND op.method != 'script.run') OR op.method LIKE 'goal.%'
          OR op.method LIKE 'hook.%' OR op.method LIKE 'github.%')
@@ -4160,6 +4208,10 @@ fn mcp_authorization(db: &Connection, p: &Principal, value: &Value) -> Result<Va
             revision_context["grant_revision"] = registration["grant_revision"].clone();
             revision_context["participation_basis"] = registration["participation_basis"].clone();
             revision_context["scope_state"] = json!("unavailable");
+            // Retained Concilium views and own Operation receipts do not
+            // acquire a new action grant. Their handlers resolve the exact
+            // historical actor/scope even after this assignment has ended.
+            allowed.extend(["concilium.get", "concilium.list", "operation.get"]);
             match coordination::current_scope(db, p) {
                 Ok(scope) => {
                     revision_context["scope_state"] = json!("current");
@@ -4298,6 +4350,9 @@ fn mcp_authorization(db: &Connection, p: &Principal, value: &Value) -> Result<Va
 
 fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config) -> Result<Value> {
     match method {
+        "concilium.preview" | "concilium.get" | "concilium.list" => {
+            concilium::read(db, p, method, v)
+        }
         "goal.get" | "goal.list" => goals::read(db, p, method, v),
         "mcp.authorization" => mcp_authorization(db, p, v),
         "swarm.context.get"
@@ -6173,6 +6228,11 @@ fn apply(
             (value, false)
         }),
         "coordination.sync_integration" => integration::apply(tx, p, method, v, config, id, now),
+        "concilium.propose"
+        | "concilium.open"
+        | "concilium.position.submit"
+        | "concilium.round.advance"
+        | "concilium.close" => concilium::apply(tx, p, method, v, id, now),
         "swarm.launch" => launcher::launch(tx, p, v, config, id, now),
         "coordination.watch.create" | "coordination.watch.cancel" => {
             coordination_watch::apply(tx, p, method, v, id, now)

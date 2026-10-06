@@ -4,7 +4,7 @@ This runbook covers the standalone adapter packages, independent frontend binari
 
 ## Build and install one adapter
 
-New OpenCode and Command Code qualification runs use
+New OpenCode qualification runs use
 `inclusionai/ling-3.1-flash`. Pass that exact reference to
 `New-NativeQualification.ps1 -OpenCodeCommandTestModelRef inclusionai/ling-3.1-flash`
 as a selector. For OpenCode, the configured route is accepted only when its
@@ -16,7 +16,12 @@ creating a native session, `agent.open` reads the current OpenCode model catalog
 provider/model/variant. If the native catalog does not contain the selected
 model, the operation fails before the harness sends its single task input.
 Bunny is disabled for new runs; historical receipts retain their original
-model identity. Command retains exact whole-string model matching. Claude's
+model identity. For Command Code 1.74.1, use the bundled model ID
+`inclusionai/ling-3.1-flash:free` with
+`-CommandTestModelId inclusionai/ling-3.1-flash:free`. The normal bundled-model
+resolver has no bare-base-to-:free alias. The harness checks the configured
+Command modelId with exact case-sensitive whole-string equality. This selector is
+metadata only; provider-served model identity remains unverified. Claude's
 version-4 qualification path uses its `module` runtime and exact typed host
 configuration marker. Run it after the other routes with `-EnableClaude` and
 `-ClaudeTestModelId` set to the configured Sonnet route's exact model ID. It

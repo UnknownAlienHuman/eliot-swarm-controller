@@ -10,7 +10,7 @@ use std::{
 };
 use swarm_cli::{ClientConfig, call, prepare_call, validate_call_method};
 use swarm_contracts::{
-    Credential,
+    Credential, concilium_limits as limits,
     error::{Error, Result},
 };
 use swarm_process::child_error::{
@@ -104,6 +104,10 @@ enum Command {
     Coordination {
         #[command(subcommand)]
         command: CoordinationCommand,
+    },
+    Concilium {
+        #[command(subcommand)]
+        command: ConciliumCommand,
     },
     Review {
         #[command(subcommand)]
@@ -450,6 +454,58 @@ enum CoordinationCommand {
         file: PathBuf,
     },
     Context {
+        #[arg(long)]
+        file: PathBuf,
+    },
+}
+#[derive(Subcommand)]
+enum ConciliumCommand {
+    /// Submit a scoped proposal for manager review; this does not invoke participants.
+    Propose {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// Preview the deterministic plan for one proposal Operation.
+    Preview { proposal_operation_id: String },
+    /// Commit the exact reviewed preview and its participant slots.
+    Open {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// Submit the authenticated Participant's structured response to one exact slot.
+    #[command(name = "position-submit")]
+    PositionSubmit {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// Commit an explicit manager-selected next packet and round.
+    #[command(name = "round-advance")]
+    RoundAdvance {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// Read one Concilium by its exact ID.
+    Get { concilium_id: String },
+    /// Page Concilium projections visible to the authenticated scope.
+    List {
+        #[arg(long)]
+        task_id: String,
+        #[arg(long)]
+        attempt_id: Option<String>,
+        #[arg(long, value_parser = ["proposed", "planned", "round_1_open", "round_1_ready", "round_2_open", "round_2_ready", "merge_available", "completed", "unresolved", "cancelled", "failed"])]
+        state: Option<String>,
+        #[arg(long)]
+        after_concilium_id: Option<String>,
+        #[arg(
+            long,
+            default_value_t = limits::DEFAULT_READ_PAGE_SIZE,
+            value_parser = clap::value_parser!(i64).range(1..=limits::MAX_READ_PAGE_SIZE)
+        )]
+        limit: i64,
+    },
+    /// Record the manager's advisory result while preserving dissent.
+    Close {
+        concilium_id: String,
         #[arg(long)]
         file: PathBuf,
     },
@@ -1150,6 +1206,23 @@ fn read_json(file: &PathBuf) -> Result<Value> {
     Ok(serde_json::from_slice(&std::fs::read(file)?)?)
 }
 
+fn read_json_with_concilium_id(file: &PathBuf, concilium_id: &str) -> Result<Value> {
+    let mut value = read_json(file)?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| Error::invalid("Concilium close file must contain a JSON object"))?;
+    if object
+        .get("concilium_id")
+        .is_some_and(|existing| existing.as_str() != Some(concilium_id))
+    {
+        return Err(Error::invalid(
+            "Concilium close file ID does not match the command's Concilium ID",
+        ));
+    }
+    object.insert("concilium_id".into(), json!(concilium_id));
+    Ok(value)
+}
+
 fn load_credential(path: &Path) -> Result<Credential> {
     let credential: Credential = serde_json::from_slice(&std::fs::read(path)?)?;
     if credential.client_id.is_empty() || credential.token.len() < 32 {
@@ -1422,6 +1495,48 @@ fn map_command(command: Command) -> Result<(String, Value)> {
             CoordinationCommand::Context { file } => {
                 ("swarm.context.get".into(), read_json(&file)?)
             }
+        },
+        Command::Concilium { command } => match command {
+            ConciliumCommand::Propose { file } => ("concilium.propose".into(), read_json(&file)?),
+            ConciliumCommand::Preview {
+                proposal_operation_id,
+            } => (
+                "concilium.preview".into(),
+                json!({"proposal_operation_id":proposal_operation_id}),
+            ),
+            ConciliumCommand::Open { file } => ("concilium.open".into(), read_json(&file)?),
+            ConciliumCommand::PositionSubmit { file } => {
+                ("concilium.position.submit".into(), read_json(&file)?)
+            }
+            ConciliumCommand::RoundAdvance { file } => {
+                ("concilium.round.advance".into(), read_json(&file)?)
+            }
+            ConciliumCommand::Get { concilium_id } => {
+                ("concilium.get".into(), json!({"concilium_id":concilium_id}))
+            }
+            ConciliumCommand::List {
+                task_id,
+                attempt_id,
+                state,
+                after_concilium_id,
+                limit,
+            } => {
+                let mut params = json!({"task_id":task_id,"limit":limit});
+                if let Some(attempt_id) = attempt_id {
+                    params["attempt_id"] = json!(attempt_id);
+                }
+                if let Some(state) = state {
+                    params["state"] = json!(state);
+                }
+                if let Some(after_concilium_id) = after_concilium_id {
+                    params["after_concilium_id"] = json!(after_concilium_id);
+                }
+                ("concilium.list".into(), params)
+            }
+            ConciliumCommand::Close { concilium_id, file } => (
+                "concilium.close".into(),
+                read_json_with_concilium_id(&file, &concilium_id)?,
+            ),
         },
         Command::Review { command } => match command {
             ReviewCommand::Assign { file } => ("review.assign".into(), read_json(&file)?),

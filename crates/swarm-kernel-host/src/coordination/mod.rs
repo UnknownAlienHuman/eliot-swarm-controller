@@ -10,6 +10,7 @@ use crate::{
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
+pub mod concilium;
 pub mod integration;
 pub mod watch;
 

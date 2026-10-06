@@ -1196,6 +1196,109 @@ fn manager_scope(
     })
 }
 
+/// Resolve and validate the current assignment grant used by a Concilium
+/// participant. The fingerprint commits only to non-secret authority fields.
+pub(super) fn concilium_participant_scope_for_client(
+    db: &Connection,
+    client_id: &str,
+    task_id: &str,
+    task_revision: i64,
+    attempt_id: &str,
+) -> Result<Value> {
+    let scope = load_current_scope_for_client(db, client_id)?;
+    if scope.task["task_id"] != task_id
+        || scope.task["revision"] != task_revision
+        || scope.attempt["attempt_id"] != attempt_id
+    {
+        return Err(Error::new(
+            "STALE_PARTICIPANT",
+            "Concilium participant must hold the exact current Task revision and Attempt",
+        ));
+    }
+    concilium_participant_scope_projection(&scope)
+}
+
+/// Resolve a caller's current Participant grant for a Concilium proposal or
+/// position write. This helper never returns credential material.
+pub(super) fn concilium_current_participant_scope(
+    db: &Connection,
+    principal: &Principal,
+) -> Result<Value> {
+    principal.require_participant()?;
+    let scope = load_current_scope(db, principal)?;
+    concilium_participant_scope_projection(&scope)
+}
+
+fn concilium_participant_scope_projection(scope: &ScopeData) -> Result<Value> {
+    let registration = &scope.registration;
+    let client_id = registration["client_id"].as_str().unwrap_or_default();
+    let generation = registration
+        .get("binding_generation")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let authority = json!({
+        "client_id":client_id,
+        "role":registration.get("role").cloned().unwrap_or(Value::Null),
+        "disabled":registration.get("disabled").cloned().unwrap_or(Value::Null),
+        "task_id":registration.get("task_id").cloned().unwrap_or(Value::Null),
+        "task_revision":registration.get("task_revision").cloned().unwrap_or(Value::Null),
+        "attempt_id":registration.get("attempt_id").cloned().unwrap_or(Value::Null),
+        "participation_basis":registration.get("participation_basis").cloned().unwrap_or(Value::Null),
+        "binding_id":registration.get("binding_id").cloned().unwrap_or(Value::Null),
+        "binding_generation":generation,
+    });
+    let canonical = model::canonical(&authority)?;
+    let fingerprint = format!("sha256:{}", model::digest(canonical.as_bytes()));
+    Ok(json!({
+        "actor":{"client_id":client_id,"role":"participant","generation":generation},
+        "scope":{
+            "scope_id":scope.scope_id,
+            "task_id":scope.task["task_id"],
+            "task_revision":scope.task["revision"],
+            "attempt_id":scope.attempt["attempt_id"],
+            "binding_id":registration.get("binding_id").cloned().unwrap_or(Value::Null),
+            "binding_generation":generation,
+        },
+        "participation_basis":registration.get("participation_basis").cloned().unwrap_or(Value::Null),
+        "registration_fingerprint":fingerprint,
+    }))
+}
+
+/// Validate a manager's current authority over an exact Task and Attempt and
+/// return only the context needed to build a deterministic Concilium preview.
+pub(super) fn concilium_manager_scope(
+    db: &Connection,
+    principal: &Principal,
+    task_id: &str,
+    task_revision: i64,
+    attempt_id: &str,
+) -> Result<Value> {
+    let scope = manager_scope(db, principal, task_id, task_revision, attempt_id)?;
+    let attempt_digest = format!(
+        "sha256:{}",
+        model::digest(model::canonical(&scope.attempt)?.as_bytes())
+    );
+    Ok(json!({
+        "task":{
+            "task_id":scope.task["task_id"],
+            "project_id":scope.task["project_id"],
+            "revision":scope.task["revision"],
+            "state":scope.task["state"],
+            "brief":scope.task["task_brief"],
+        },
+        "attempt":{
+            "attempt_id":scope.attempt["attempt_id"],
+            "task_revision":scope.attempt["task_revision"],
+            "owner_id":scope.attempt["owner_id"],
+            "state":scope.attempt["state"],
+            "binding_id":scope.attempt["binding_id"],
+            "binding_generation":scope.attempt["binding_generation"],
+            "digest":attempt_digest,
+        },
+        "scope_id":scope.scope_id,
+    }))
+}
+
 fn register_participant(
     tx: &Transaction<'_>,
     principal: &Principal,

@@ -12,7 +12,12 @@ fn item(kind: &str, operation_id: Option<&str>, payload: Value) -> Value {
 
 #[test]
 fn categories_match_only_committed_stream_facts() {
-    let all = [Category::Reports, Category::Mailbox, Category::Operations];
+    let all = [
+        Category::Reports,
+        Category::Mailbox,
+        Category::Operations,
+        Category::Concilium,
+    ];
     // An Operation admission: a report entry and an operation
     // transition, not a mailbox delivery.
     let admission = item("task.create", Some("op-1"), json!({"task_id": "t-1"}));
@@ -20,7 +25,7 @@ fn categories_match_only_committed_stream_facts() {
         matched_categories(&all, &admission, "operator"),
         [Category::Reports, Category::Operations]
     );
-    // A mailbox delivery to the facade's own client: all three --
+    // A mailbox delivery to the facade's own client: all applicable --
     // it is a committed report entry, a delivery, and the send
     // Operation's admission.
     let mail = item(
@@ -70,11 +75,14 @@ fn categories_match_only_committed_stream_facts() {
 #[test]
 fn subscribe_params_are_strict() {
     let (categories, after) = parse_subscribe(&json!({
-        "categories": ["reports", "operations", "reports"],
+        "categories": ["reports", "operations", "concilium", "reports"],
         "after": 12,
     }))
     .unwrap();
-    assert_eq!(categories, [Category::Reports, Category::Operations]);
+    assert_eq!(
+        categories,
+        [Category::Reports, Category::Operations, Category::Concilium]
+    );
     assert_eq!(after, Some(12));
     let (_, after) = parse_subscribe(&json!({"categories": ["mailbox"]})).unwrap();
     assert_eq!(after, None);

@@ -10,6 +10,44 @@ use std::collections::BTreeSet;
 
 const MAX_BUS_SCAN: usize = crate::automation::intake::MAX_INTAKE_PAGE;
 const MAX_BUS_PAGE_ITEMS: usize = 32;
+const MAX_CONCILIUM_RECEIPT_BYTES: i64 = 4096;
+const MAX_CONCILIUM_LINK_BYTES: i64 = 2048;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConciliumEventSourceProof {
+    operation_id: String,
+    task_id: String,
+    task_revision: i64,
+    attempt_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConciliumMutationReceipt {
+    concilium_id: String,
+    proposal_operation_id: String,
+    task_id: String,
+    task_revision: i64,
+    attempt_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConciliumAuthorityLink {
+    concilium_id: String,
+    proposal_operation_id: String,
+    manager_id: String,
+    task_id: String,
+    attempt_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConciliumStoredOperation {
+    operation_id: String,
+    method: String,
+    recorded_at_ms: i64,
+    observation_id: i64,
+    receipt: ConciliumMutationReceipt,
+    link: ConciliumAuthorityLink,
+}
 
 type ConsumerSubmissionOperationRow = (String, String, Option<String>, Option<String>, String);
 type ConsumerTaskAttemptScopeRow = (
@@ -2627,12 +2665,41 @@ pub(super) fn script_event_invocation_context_for_consumer(
     } else {
         None
     };
+    let concilium_event_scope = concilium_event_source_proof(db, &event, Some(&entry.project_id))?;
     let mut task_id = None;
     let mut task_revision = None;
     let mut attempt_id = None;
     let mut project_id = entry.project_id.clone();
     let mut operation_id = None;
-    if let Some(event_operation_id) = event.operation_id.as_deref() {
+    if let Some(concilium_scope) = concilium_event_scope.as_ref() {
+        if !consumer_owner_has_current_attempt(
+            db,
+            owner_manager_id,
+            &concilium_scope.task_id,
+            concilium_scope.task_revision,
+            &concilium_scope.attempt_id,
+            &entry.project_id,
+        )? {
+            return Err(Error::new(
+                "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
+                "Concilium source Task/Attempt is outside the current ScriptRun owner scope",
+            ));
+        }
+        if concilium_event_is_script_feedback_from_same_automation(
+            db,
+            &concilium_scope.operation_id,
+            entry,
+        )? {
+            return Err(Error::new(
+                "SCRIPT_EVENT_SELF_CAUSED",
+                "same automation cannot recursively trigger from its own invocation effect",
+            ));
+        }
+        task_id = Some(concilium_scope.task_id.clone());
+        task_revision = Some(concilium_scope.task_revision);
+        attempt_id = Some(concilium_scope.attempt_id.clone());
+        operation_id = Some(concilium_scope.operation_id.clone());
+    } else if let Some(event_operation_id) = event.operation_id.as_deref() {
         let operation_scope: Option<ConsumerEventOperationRow> = db
             .query_row(
                 "SELECT task_id,attempt_id,effective_request_json,caller_id,binding_id,binding_generation \
@@ -2893,6 +2960,516 @@ pub(super) fn script_event_invocation_context_for_consumer(
         task_revision,
         attempt_id,
     })
+}
+
+fn concilium_method_for_event(
+    event: &crate::automation::intake::ObservedEvent,
+) -> Option<&'static str> {
+    if event.source_id != "controller" {
+        return None;
+    }
+    match event.event_kind.as_str() {
+        "concilium.propose" => Some("concilium.propose"),
+        "concilium.open" => Some("concilium.open"),
+        "concilium.position.submit" => Some("concilium.position.submit"),
+        "concilium.round.advance" => Some("concilium.round.advance"),
+        "concilium.close" => Some("concilium.close"),
+        _ => None,
+    }
+}
+
+fn concilium_source_unauthorized() -> Error {
+    Error::new(
+        "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
+        "Concilium event does not match its exact retained Store source proof",
+    )
+}
+
+fn valid_concilium_identity(value: &str, max_bytes: usize) -> bool {
+    !value.is_empty() && value.len() <= max_bytes && !value.chars().any(char::is_control)
+}
+
+fn valid_concilium_digest(value: &str) -> bool {
+    let Some(hex) = value.strip_prefix("sha256:") else {
+        return false;
+    };
+    hex.len() == 64
+        && hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn parse_concilium_mutation_receipt(
+    value: &Value,
+    operation_id: &str,
+    expected_method: &str,
+) -> Result<ConciliumMutationReceipt> {
+    let unauthorized = concilium_source_unauthorized;
+    let Some(object) = value.as_object() else {
+        return Err(unauthorized());
+    };
+    const REQUIRED_FIELDS: &[&str] = &[
+        "operation_id",
+        "concilium_id",
+        "proposal_operation_id",
+        "task_id",
+        "task_revision",
+        "attempt_id",
+        "status",
+        "state_revision",
+        "changed",
+    ];
+    const ALLOWED_FIELDS: &[&str] = &[
+        "operation_id",
+        "concilium_id",
+        "proposal_operation_id",
+        "task_id",
+        "task_revision",
+        "attempt_id",
+        "status",
+        "state_revision",
+        "changed",
+        "round_packet_batch_digest",
+    ];
+    if REQUIRED_FIELDS
+        .iter()
+        .any(|field| !object.contains_key(*field))
+        || object
+            .keys()
+            .any(|field| !ALLOWED_FIELDS.contains(&field.as_str()))
+    {
+        return Err(unauthorized());
+    }
+
+    let bounded_text = |field: &str, max_bytes: usize| {
+        value[field]
+            .as_str()
+            .filter(|text| valid_concilium_identity(text, max_bytes))
+            .map(ToOwned::to_owned)
+            .ok_or_else(unauthorized)
+    };
+    let receipt_operation_id = bounded_text("operation_id", 256)?;
+    let concilium_id = bounded_text("concilium_id", 256)?;
+    let proposal_operation_id = bounded_text("proposal_operation_id", 256)?;
+    let task_id = bounded_text("task_id", 256)?;
+    let attempt_id = bounded_text("attempt_id", 256)?;
+    let status = bounded_text("status", 32)?;
+    let task_revision = value["task_revision"].as_i64();
+    let state_revision = value["state_revision"].as_i64();
+    let changed = value["changed"].as_bool();
+    const STATUSES: &[&str] = &[
+        "proposed",
+        "planned",
+        "round_1_open",
+        "round_1_ready",
+        "round_2_open",
+        "round_2_ready",
+        "merge_available",
+        "completed",
+        "unresolved",
+        "cancelled",
+        "failed",
+    ];
+    if receipt_operation_id != operation_id
+        || !STATUSES.contains(&status.as_str())
+        || task_revision.is_none_or(|revision| revision <= 0)
+        || state_revision.is_none_or(|revision| revision <= 0)
+        || changed.is_none()
+    {
+        return Err(unauthorized());
+    }
+    match (expected_method, object.get("round_packet_batch_digest")) {
+        ("concilium.round.advance", Some(Value::String(digest)))
+            if valid_concilium_digest(digest) => {}
+        ("concilium.round.advance", _) => return Err(unauthorized()),
+        (_, None | Some(Value::Null)) => {}
+        _ => return Err(unauthorized()),
+    }
+
+    Ok(ConciliumMutationReceipt {
+        concilium_id,
+        proposal_operation_id,
+        task_id,
+        task_revision: task_revision.ok_or_else(unauthorized)?,
+        attempt_id,
+    })
+}
+
+fn parse_concilium_authority_link(value: &Value) -> Result<ConciliumAuthorityLink> {
+    let unauthorized = concilium_source_unauthorized;
+    let Some(object) = value.as_object() else {
+        return Err(unauthorized());
+    };
+    const FIELDS: &[&str] = &[
+        "schema_version",
+        "concilium_id",
+        "proposal_operation_id",
+        "manager_id",
+        "task_id",
+        "attempt_id",
+    ];
+    if object.len() != FIELDS.len()
+        || FIELDS.iter().any(|field| !object.contains_key(*field))
+        || object.keys().any(|field| !FIELDS.contains(&field.as_str()))
+        || value["schema_version"].as_i64() != Some(1)
+    {
+        return Err(unauthorized());
+    }
+    let bounded_text = |field: &str, max_bytes: usize| {
+        value[field]
+            .as_str()
+            .filter(|text| valid_concilium_identity(text, max_bytes))
+            .map(ToOwned::to_owned)
+            .ok_or_else(unauthorized)
+    };
+    Ok(ConciliumAuthorityLink {
+        concilium_id: bounded_text("concilium_id", 256)?,
+        proposal_operation_id: bounded_text("proposal_operation_id", 256)?,
+        manager_id: bounded_text("manager_id", 128)?,
+        task_id: bounded_text("task_id", 256)?,
+        attempt_id: bounded_text("attempt_id", 256)?,
+    })
+}
+
+fn load_concilium_authority_link(
+    db: &Connection,
+    operation_id: &str,
+) -> Result<ConciliumAuthorityLink> {
+    let unauthorized = concilium_source_unauthorized;
+    let key = format!("concilium:v1:operation:{operation_id}");
+    let link_bytes: Option<i64> = db
+        .query_row(
+            "SELECT length(CAST(value_json AS BLOB)) FROM meta WHERE key=?1",
+            [&key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if link_bytes.is_none_or(|bytes| !(0..=MAX_CONCILIUM_LINK_BYTES).contains(&bytes)) {
+        return Err(unauthorized());
+    }
+    let value = super::meta(db, &key)?.ok_or_else(unauthorized)?;
+    parse_concilium_authority_link(&value)
+}
+
+fn load_concilium_stored_operation(
+    db: &Connection,
+    operation_id: &str,
+    expected_method: &str,
+) -> Result<ConciliumStoredOperation> {
+    let unauthorized = concilium_source_unauthorized;
+    if !valid_concilium_identity(operation_id, 256) {
+        return Err(unauthorized());
+    }
+
+    type OperationRow = (
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+    );
+    let operation: Option<OperationRow> = db
+        .query_row(
+            "SELECT method,state,task_id,attempt_id,settled_at_ms,\
+                    CASE WHEN result_json IS NOT NULL AND length(CAST(result_json AS BLOB))<=?2 \
+                         THEN result_json END \
+             FROM operations WHERE operation_id=?1",
+            params![operation_id, MAX_CONCILIUM_RECEIPT_BYTES],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((method, state, task_id, attempt_id, settled_at_ms, operation_result_json)) =
+        operation
+    else {
+        return Err(unauthorized());
+    };
+    if method != expected_method
+        || state != "settled"
+        || task_id
+            .as_deref()
+            .is_none_or(|value| !valid_concilium_identity(value, 256))
+        || attempt_id
+            .as_deref()
+            .is_none_or(|value| !valid_concilium_identity(value, 256))
+        || settled_at_ms.is_none_or(|value| value < 0)
+    {
+        return Err(unauthorized());
+    }
+    let task_id = task_id.ok_or_else(unauthorized)?;
+    let attempt_id = attempt_id.ok_or_else(unauthorized)?;
+    let operation_result_json = operation_result_json.ok_or_else(unauthorized)?;
+    let operation_result: Value =
+        serde_json::from_str(&operation_result_json).map_err(|_| unauthorized())?;
+
+    type ObservationRow = (
+        i64,
+        Option<String>,
+        Option<String>,
+        String,
+        i64,
+        i64,
+        Option<String>,
+    );
+    let mut statement = db.prepare(
+        "SELECT observation_id,source_event_key,operation_id,kind,recorded_at_ms,\
+                length(CAST(payload_json AS BLOB)),\
+                CASE WHEN length(CAST(payload_json AS BLOB))<=?2 THEN payload_json END \
+         FROM observations WHERE source_stream_id='controller' AND source_event_key=?1 \
+           AND operation_id=?1 ORDER BY observation_id LIMIT 2",
+    )?;
+    let observations = statement
+        .query_map(params![operation_id, MAX_CONCILIUM_RECEIPT_BYTES], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<ObservationRow>, _>>()?;
+    if observations.len() != 1 {
+        return Err(unauthorized());
+    }
+    let (
+        observation_id,
+        source_event_key,
+        observation_operation_id,
+        observation_kind,
+        recorded_at_ms,
+        payload_bytes,
+        payload_json,
+    ) = observations.into_iter().next().ok_or_else(unauthorized)?;
+    if source_event_key.as_deref() != Some(operation_id)
+        || observation_operation_id.as_deref() != Some(operation_id)
+        || observation_kind != expected_method
+        || recorded_at_ms < 0
+        || !(0..=MAX_CONCILIUM_RECEIPT_BYTES).contains(&payload_bytes)
+    {
+        return Err(unauthorized());
+    }
+    let payload_json = payload_json.ok_or_else(unauthorized)?;
+    let payload: Value = serde_json::from_str(&payload_json).map_err(|_| unauthorized())?;
+    if model::canonical(&payload)? != model::canonical(&operation_result)? {
+        return Err(unauthorized());
+    }
+    let receipt = parse_concilium_mutation_receipt(&payload, operation_id, expected_method)?;
+    if receipt.task_id != task_id || receipt.attempt_id != attempt_id {
+        return Err(unauthorized());
+    }
+    let link = load_concilium_authority_link(db, operation_id)?;
+    if link.concilium_id != receipt.concilium_id
+        || link.proposal_operation_id != receipt.proposal_operation_id
+        || link.task_id != receipt.task_id
+        || link.attempt_id != receipt.attempt_id
+    {
+        return Err(unauthorized());
+    }
+
+    Ok(ConciliumStoredOperation {
+        operation_id: operation_id.to_owned(),
+        method: method.to_owned(),
+        recorded_at_ms,
+        observation_id,
+        receipt,
+        link,
+    })
+}
+
+fn concilium_event_source_proof(
+    db: &Connection,
+    event: &crate::automation::intake::ObservedEvent,
+    expected_project_id: Option<&str>,
+) -> Result<Option<ConciliumEventSourceProof>> {
+    let Some(method) = concilium_method_for_event(event) else {
+        return Ok(None);
+    };
+    let unauthorized = concilium_source_unauthorized;
+    let operation_id = event
+        .operation_id
+        .as_deref()
+        .filter(|value| valid_concilium_identity(value, 256))
+        .ok_or_else(unauthorized)?;
+    let stored = load_concilium_stored_operation(db, operation_id, method)?;
+    if stored.operation_id != operation_id
+        || stored.observation_id != event.observation_id
+        || stored.recorded_at_ms != event.recorded_at_ms
+        || stored.method != event.event_kind
+    {
+        return Err(unauthorized());
+    }
+
+    // Every mutation receipt points to the immutable proposal Operation that
+    // established this Concilium. Reopen that exact header receipt and link;
+    // current Concilium state is intentionally irrelevant to source history.
+    let proposal = load_concilium_stored_operation(
+        db,
+        &stored.receipt.proposal_operation_id,
+        "concilium.propose",
+    )?;
+    if proposal.receipt.proposal_operation_id != proposal.operation_id
+        || proposal.receipt.concilium_id != stored.receipt.concilium_id
+        || proposal.receipt.task_id != stored.receipt.task_id
+        || proposal.receipt.task_revision != stored.receipt.task_revision
+        || proposal.receipt.attempt_id != stored.receipt.attempt_id
+        || proposal.link.manager_id != stored.link.manager_id
+        || proposal.recorded_at_ms > stored.recorded_at_ms
+    {
+        return Err(unauthorized());
+    }
+
+    // Attempt ownership and Task state are mutable; only immutable scope
+    // identity/revision and project membership are needed for retained proof.
+    let attempt_scope: Option<(String, i64)> = db
+        .query_row(
+            "SELECT task_id,task_revision FROM attempts WHERE attempt_id=?1",
+            [&stored.receipt.attempt_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((attempt_task_id, attempt_task_revision)) = attempt_scope else {
+        return Err(unauthorized());
+    };
+    let project_id: Option<String> = db
+        .query_row(
+            "SELECT project_id FROM tasks WHERE task_id=?1",
+            [&stored.receipt.task_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(project_id) = project_id else {
+        return Err(unauthorized());
+    };
+    if attempt_task_id != stored.receipt.task_id
+        || attempt_task_revision != stored.receipt.task_revision
+        || expected_project_id.is_some_and(|expected| project_id != expected)
+    {
+        return Err(unauthorized());
+    }
+
+    Ok(Some(ConciliumEventSourceProof {
+        operation_id: operation_id.to_owned(),
+        task_id: stored.receipt.task_id,
+        task_revision: stored.receipt.task_revision,
+        attempt_id: stored.receipt.attempt_id,
+    }))
+}
+
+/// Retained ScriptRun cause validation reuses this historical proof only. It
+/// does not reopen current GM, registration, current Task revision, or Attempt liveness.
+pub(super) fn validate_retained_concilium_event_source(
+    db: &Connection,
+    event: &crate::automation::intake::ObservedEvent,
+    project_id: &str,
+) -> Result<()> {
+    let _ = concilium_event_source_proof(db, event, Some(project_id))?;
+    Ok(())
+}
+
+fn concilium_event_is_script_feedback_from_same_automation(
+    db: &Connection,
+    operation_id: &str,
+    entry: &AutomationEntry,
+) -> Result<bool> {
+    type ScriptInvocationMetadata = (
+        bool,
+        bool,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let metadata: Option<ScriptInvocationMetadata> = db
+        .query_row(
+            "WITH operation_request AS (\
+                 SELECT json_valid(effective_request_json) AS is_valid,\
+                        CASE WHEN json_valid(effective_request_json)\
+                             THEN effective_request_json ELSE '{}' END AS request_json \
+                 FROM operations WHERE operation_id=?1\
+             ) \
+             SELECT is_valid,\
+                    COALESCE(json_type(request_json,'$.script_invocation')='object',0),\
+                    CASE WHEN json_type(request_json,'$.script_invocation')='object'\
+                         THEN json_extract(request_json,'$.script_invocation.schema_version') END,\
+                    CASE WHEN json_type(request_json,'$.script_invocation')='object'\
+                              AND length(CAST(json_extract(request_json,'$.script_invocation.operation_id') AS BLOB))<=256\
+                         THEN json_extract(request_json,'$.script_invocation.operation_id') END,\
+                    CASE WHEN json_type(request_json,'$.script_invocation')='object'\
+                              AND length(CAST(json_extract(request_json,'$.script_invocation.action') AS BLOB))<=32\
+                         THEN json_extract(request_json,'$.script_invocation.action') END,\
+                    CASE WHEN json_type(request_json,'$.script_invocation')='object'\
+                              AND length(CAST(json_extract(request_json,'$.script_invocation.grant') AS BLOB))<=32\
+                         THEN json_extract(request_json,'$.script_invocation.grant') END,\
+                    CASE WHEN json_type(request_json,'$.script_invocation')='object'\
+                              AND length(CAST(json_extract(request_json,'$.script_invocation.cause.script_run_operation_id') AS BLOB))<=256\
+                         THEN json_extract(request_json,'$.script_invocation.cause.script_run_operation_id') END \
+             FROM operation_request",
+            [operation_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        valid_json,
+        has_script_invocation,
+        schema_version,
+        invocation_operation_id,
+        action,
+        grant,
+        parent_script_run_operation_id,
+    )) = metadata
+    else {
+        return Err(concilium_source_unauthorized());
+    };
+    if !valid_json {
+        return Err(concilium_source_unauthorized());
+    }
+    let parent_operation_id = if has_script_invocation {
+        if schema_version != Some(1)
+            || invocation_operation_id.as_deref() != Some(operation_id)
+            || action.as_deref() != Some("message.send")
+            || grant.as_deref() != Some("task_owner_message")
+        {
+            return Err(concilium_source_unauthorized());
+        }
+        parent_script_run_operation_id
+    } else {
+        Some(operation_id.to_owned())
+    };
+    let Some(parent_operation_id) = parent_operation_id else {
+        return Ok(false);
+    };
+    if !valid_concilium_identity(&parent_operation_id, 256) {
+        return Err(concilium_source_unauthorized());
+    }
+    let Some(parent) = authorization::operation_link(db, &parent_operation_id)? else {
+        return Ok(false);
+    };
+    Ok(parent.action == "script.run"
+        && parent.automation_id == entry.automation_id
+        && parent.project_id == entry.project_id)
 }
 
 fn require_module_lifecycle_binding_source(
