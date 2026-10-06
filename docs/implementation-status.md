@@ -67,7 +67,22 @@ host even when no request is active. Shutdown joins the original writer before
 recording its final lifecycle result through the existing Store. That sequential
 recovery retains the same locked File, opens only the existing database and
 does not replay work or advance the host epoch. Primary startup errors survive
-cleanup with bounded secondary codes.
+cleanup with at most two distinct safe secondary codes. The lifecycle receipt
+and terminal observation retain those codes without replacing the primary
+failure. A refresh racing with writer exit cannot suppress the retained watch
+notification, and initialization failures keep their original readiness/join
+identity. Host shutdown consumes module and managed-bus supervisor join errors.
+
+The public host and CLI wrappers drain a child's stderr independently of its
+inherited output sink. A bounded queue and one post-exit deadline keep blocked
+output from delaying return of the child's actual exit status. Safe structured
+failure projection survives discarded raw chunks; envelope delivery remains
+best effort and is not asserted when its acknowledgement is absent.
+
+Unadmitted pending ScriptRun causes now rebuild or clear their successor
+consumer context during automation transfer. The original producer cause,
+observation and admitted Operation identities remain unchanged; normal current
+authorization and source checks still control release.
 
 Installed OpenCode resources now have a locked npm dependency closure, atomic
 resource publication, exact package/build sidecar identity and a shared bounded
@@ -75,11 +90,17 @@ tree verifier used by Kernel and the standalone adapter. Source-tree resources
 require an explicit debug opt-in. These are source deliveries; installation and
 native launch remain unqualified.
 
-Remaining source work includes retained secondary lifecycle diagnostics, the
-standalone supervisor's full child identity/exit/stop receipt, bounded child
-stderr forwarding through public wrappers, generic Module event status
-projection and pending-event transfer. These changes must finish before tests
-or native qualification.
+Typed supervisor child identity, exit and stop receipts are integrated in
+source. The authenticated `module.event` path accepts descriptor-backed closed
+metadata and uses the existing observation/cursor transaction. Only eligible
+Module facts wait for missing source proof; release recognizes the exact
+`SYSTEM_EVENT_SOURCE_PROOF_PENDING` reason. Statusless events gain no invented
+status or occurrence. The method is internal and has no MCP exposure.
+
+Remaining source work closes exact live-child ownership and restart
+reconciliation, propagates module/bus health persistence failures, and updates
+the canonical generic Module event documentation. These changes must finish
+before compiler, tests or native qualification.
 
 The native qualification script now validates the
 public CLI, host wrapper, actual Kernel and supervisor coordinates separately,

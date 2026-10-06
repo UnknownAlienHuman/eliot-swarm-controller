@@ -2,6 +2,70 @@ use crate::module_catalog::{ArtifactIdentity, ModuleId, ProtocolVersion};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub const MODULE_EVENT_METADATA_SCHEMA_VERSION: u16 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModuleEventStatus {
+    Applied,
+    Completed,
+    Failed,
+    Incomplete,
+    Cancelled,
+    Rejected,
+    Sent,
+    Answered,
+    Invalidated,
+    Unknown,
+}
+
+/// Closed metadata-only projection supplied by an authenticated Module event
+/// producer. It deliberately has no payload, credential, Task, or Operation
+/// fields; Store binds those identities from the authenticated connection and
+/// the immutable observation row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModuleEventMetadata {
+    pub schema_id: String,
+    pub schema_version: u16,
+    pub event_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<ModuleEventStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurrence_phase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurrence_id: Option<String>,
+}
+
+impl ModuleEventMetadata {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.schema_id != crate::module_contract::MODULE_EVENT_METADATA_SCHEMA_ID
+            || self.schema_version != MODULE_EVENT_METADATA_SCHEMA_VERSION
+            || !valid_bounded_event_atom(&self.event_kind, 256)
+            || self.occurrence_phase.is_some() != self.occurrence_id.is_some()
+            || self
+                .occurrence_phase
+                .as_deref()
+                .is_some_and(|value| !valid_bounded_event_atom(value, 128))
+            || self
+                .occurrence_id
+                .as_deref()
+                .is_some_and(|value| !valid_bounded_event_atom(value, 256))
+        {
+            return Err("module event metadata is invalid");
+        }
+        Ok(())
+    }
+}
+
+fn valid_bounded_event_atom(value: &str, maximum: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= maximum
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._:-/@".contains(&byte))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeCommand {
     pub operation_id: String,
@@ -377,9 +441,7 @@ impl OwnedServiceReadyReceipt {
 }
 
 fn valid_bounded_identity(value: &str, maximum: usize) -> bool {
-    !value.is_empty()
-        && value.len() <= maximum
-        && !value.chars().any(char::is_control)
+    !value.is_empty() && value.len() <= maximum && !value.chars().any(char::is_control)
 }
 
 #[derive(Debug, Deserialize, Serialize)]

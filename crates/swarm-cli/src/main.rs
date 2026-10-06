@@ -3,13 +3,20 @@ use serde_json::{Value, json};
 use std::{
     ffi::OsString,
     path::{Path, PathBuf},
-    process::{Command as ProcessCommand, ExitCode},
+    process::{Command as ProcessCommand, ExitCode, ExitStatus, Stdio},
+    sync::mpsc::{self, Receiver, RecvTimeoutError},
+    thread,
+    time::{Duration, Instant},
 };
 use swarm_cli::{ClientConfig, call, prepare_call, validate_call_method};
 use swarm_contracts::{
     Credential,
     error::{Error, Result},
 };
+use swarm_process::child_error::{
+    BoundedStderrSink, StderrForwardResult, forward_stderr, wrapper_error_json,
+};
+const POST_EXIT_DRAIN_TIMEOUT: Duration = Duration::from_millis(300);
 #[derive(Parser)]
 #[command(
     name = "swarm",
@@ -849,12 +856,21 @@ fn command_uses_host(command: &Command) -> bool {
 }
 
 fn delegate_to_host(arguments: &[OsString]) -> ExitCode {
+    let sink = BoundedStderrSink::spawn().ok();
     let mut executable = match std::env::current_exe() {
         Ok(path) => path,
         Err(_) => {
-            eprintln!(
-                "{}",
-                json!({"error":{"code":"HOST_BINARY_PATH_FAILED","message":"could not locate the public CLI executable"}})
+            let envelope = wrapper_error_json(
+                "HOST_BINARY_PATH_FAILED",
+                "could not locate the public CLI executable",
+                false,
+                None,
+                None,
+            );
+            emit_host_wrapper_error(
+                sink.as_ref(),
+                &envelope,
+                Instant::now() + POST_EXIT_DRAIN_TIMEOUT,
             );
             return ExitCode::FAILURE;
         }
@@ -865,41 +881,165 @@ fn delegate_to_host(arguments: &[OsString]) -> ExitCode {
         "swarm-host"
     });
     let sibling_is_file = executable.is_file();
-    match ProcessCommand::new(&executable).args(arguments).status() {
-        Ok(status) if status.success() => ExitCode::SUCCESS,
-        Ok(status) => {
-            eprintln!(
-                "{}",
-                json!({"error":{"code":"HOST_COMMAND_FAILED","message":"the explicit host command exited unsuccessfully","exit_code":status.code()}})
-            );
-            // Windows exception statuses can be negative i32 values. Never
-            // clamp an unsuccessful child exit to zero and report success.
-            ExitCode::from(
-                status
-                    .code()
-                    .and_then(|code| u8::try_from(code).ok())
-                    .filter(|code| *code != 0)
-                    .unwrap_or(1),
-            )
-        }
+    let mut child = match ProcessCommand::new(&executable)
+        .args(arguments)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
         Err(error) => {
-            let (code, message) = if error.kind() == std::io::ErrorKind::NotFound
-                && !sibling_is_file
-            {
-                (
-                    "HOST_BINARY_MISSING",
-                    "install the swarm-host sibling beside the public swarm executable and retry",
-                )
-            } else {
-                (
-                    "HOST_START_FAILED",
-                    "check the host executable, runtime dependencies and launch permissions, then retry",
-                )
-            };
-            eprintln!("{}", json!({"error":{"code":code,"message":message}}));
-            ExitCode::FAILURE
+            return report_host_start_failure(sibling_is_file, error.kind(), sink.as_ref());
         }
+    };
+    let Some(stderr) = child.stderr.take() else {
+        let _ = child.kill();
+        return report_host_start_failure(
+            sibling_is_file,
+            std::io::ErrorKind::Other,
+            sink.as_ref(),
+        );
+    };
+    let (result_sender, result_receiver) = mpsc::sync_channel(1);
+    let reader_sink = sink.clone();
+    if thread::Builder::new()
+        .name("swarm-child-stderr".to_owned())
+        .spawn(move || {
+            let result = forward_stderr(stderr, reader_sink);
+            let _ = result_sender.send(result);
+        })
+        .is_err()
+    {
+        let _ = child.kill();
+        return report_host_start_failure(
+            sibling_is_file,
+            std::io::ErrorKind::Other,
+            sink.as_ref(),
+        );
     }
+    let status = match child.wait() {
+        Ok(status) => status,
+        Err(_) => {
+            let _ = child.kill();
+            return report_host_wait_failure(sibling_is_file, sink.as_ref(), &result_receiver);
+        }
+    };
+    let deadline = Instant::now() + POST_EXIT_DRAIN_TIMEOUT;
+    let stream = match result_receiver.recv_timeout(remaining(deadline)) {
+        Ok(result) => result,
+        Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
+            // A descendant may retain the pipe. Preserve the child's actual
+            // exit status without an unbounded reader join or stderr write.
+            return status_to_exit_code(status);
+        }
+    };
+    if !stream.pipe_drained {
+        return status_to_exit_code(status);
+    }
+    let Some(sink) = sink.as_ref() else {
+        return status_to_exit_code(status);
+    };
+    if !sink.flush_until(deadline) {
+        return status_to_exit_code(status);
+    }
+    if status.success() {
+        ExitCode::SUCCESS
+    } else {
+        let envelope = wrapper_error_json(
+            "HOST_COMMAND_FAILED",
+            "the explicit host command exited unsuccessfully",
+            true,
+            status.code(),
+            stream.child_error.as_ref(),
+        );
+        emit_host_wrapper_error(Some(sink), &envelope, deadline);
+        // Windows exception statuses can be negative i32 values. Never
+        // clamp an unsuccessful child exit to zero and report success.
+        status_to_exit_code(status)
+    }
+}
+
+fn remaining(deadline: Instant) -> Duration {
+    deadline.saturating_duration_since(Instant::now())
+}
+
+fn emit_host_wrapper_error(sink: Option<&BoundedStderrSink>, envelope: &str, deadline: Instant) {
+    if let Some(sink) = sink {
+        let _ = sink.write_envelope_until(envelope, deadline);
+    }
+}
+
+fn report_host_wait_failure(
+    sibling_is_file: bool,
+    sink: Option<&BoundedStderrSink>,
+    result_receiver: &Receiver<StderrForwardResult>,
+) -> ExitCode {
+    let Some(sink) = sink else {
+        return ExitCode::FAILURE;
+    };
+    let deadline = Instant::now() + POST_EXIT_DRAIN_TIMEOUT;
+    let Ok(stream) = result_receiver.recv_timeout(remaining(deadline)) else {
+        return ExitCode::FAILURE;
+    };
+    if !stream.pipe_drained || !sink.flush_until(deadline) {
+        return ExitCode::FAILURE;
+    }
+    report_host_start_failure_until(
+        sibling_is_file,
+        std::io::ErrorKind::Other,
+        Some(sink),
+        deadline,
+    )
+}
+
+fn status_to_exit_code(status: ExitStatus) -> ExitCode {
+    if status.success() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(
+            status
+                .code()
+                .and_then(|code| u8::try_from(code).ok())
+                .filter(|code| *code != 0)
+                .unwrap_or(1),
+        )
+    }
+}
+
+fn report_host_start_failure(
+    sibling_is_file: bool,
+    error_kind: std::io::ErrorKind,
+    sink: Option<&BoundedStderrSink>,
+) -> ExitCode {
+    report_host_start_failure_until(
+        sibling_is_file,
+        error_kind,
+        sink,
+        Instant::now() + POST_EXIT_DRAIN_TIMEOUT,
+    )
+}
+
+fn report_host_start_failure_until(
+    sibling_is_file: bool,
+    error_kind: std::io::ErrorKind,
+    sink: Option<&BoundedStderrSink>,
+    deadline: Instant,
+) -> ExitCode {
+    let (code, message) = if error_kind == std::io::ErrorKind::NotFound && !sibling_is_file {
+        (
+            "HOST_BINARY_MISSING",
+            "install the swarm-host sibling beside the public swarm executable and retry",
+        )
+    } else {
+        (
+            "HOST_START_FAILED",
+            "check the host executable, runtime dependencies and launch permissions, then retry",
+        )
+    };
+    let envelope = wrapper_error_json(code, message, false, None, None);
+    emit_host_wrapper_error(sink, &envelope, deadline);
+    ExitCode::FAILURE
 }
 
 fn delegate_to_mcp(cli: &Cli) -> ExitCode {

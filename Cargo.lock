@@ -397,6 +397,7 @@ version = "0.1.0"
 dependencies = [
  "serde_json",
  "swarm-kernel-host",
+ "swarm-process",
  "tokio",
  "toml",
  "uuid",
@@ -1709,6 +1710,7 @@ dependencies = [
  "serde_json",
  "swarm-client",
  "swarm-contracts",
+ "swarm-process",
  "tokio",
  "toml",
  "uuid",

@@ -117,6 +117,209 @@ pub struct ModuleBindingCredential {
     pub ready: bool,
 }
 
+/// The host-owned process receipt for the independently launched supervisor.
+/// The platform identity objects are copied exactly from swarm-process after
+/// their live PID/birth/image checks; this envelope only adds the bounded
+/// authenticated health boundary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisorChildProcessIdentity {
+    pub pid: u32,
+    pub birth: Value,
+    pub image: Value,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SupervisorChildExitCategory {
+    Exited,
+    Signaled,
+    WaitError,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisorChildExit {
+    pub category: SupervisorChildExitCategory,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SupervisorChildStopState {
+    Running,
+    NotRequested,
+    Confirmed,
+    Uncertain,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisorChildHealth {
+    pub process: SupervisorChildProcessIdentity,
+    pub stop: SupervisorChildStopState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit: Option<SupervisorChildExit>,
+}
+
+impl SupervisorChildHealth {
+    pub fn validate(&self) -> Result<()> {
+        self.process.validate()?;
+        if let Some(exit) = &self.exit {
+            exit.validate()?;
+        }
+        match self.stop {
+            SupervisorChildStopState::Running if self.exit.is_some() => {
+                Err(Error::invalid("running supervisor child has an exit receipt"))
+            }
+            SupervisorChildStopState::Confirmed if self.exit.is_none() => {
+                Err(Error::invalid("confirmed supervisor stop has no exit receipt"))
+            }
+            SupervisorChildStopState::NotRequested if self.exit.is_none() => {
+                Err(Error::invalid("departed supervisor child has no exit receipt"))
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+impl SupervisorChildProcessIdentity {
+    pub fn validate(&self) -> Result<()> {
+        if self.pid == 0
+            || serde_json::to_vec(&self.birth)
+                .map(|bytes| bytes.len() > 2048)
+                .unwrap_or(true)
+            || serde_json::to_vec(&self.image)
+                .map(|bytes| bytes.len() > 4096)
+                .unwrap_or(true)
+            || !valid_child_birth(&self.birth, self.pid)
+            || !valid_child_image(&self.image, self.pid)
+        {
+            return Err(Error::invalid(
+                "supervisor child process identity is outside its bounded receipt shape",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl SupervisorChildExit {
+    fn validate(&self) -> Result<()> {
+        let valid_code = self
+            .error_code
+            .as_deref()
+            .is_none_or(valid_health_code);
+        let valid_category = match self.category {
+            SupervisorChildExitCategory::Exited => self.code.is_some(),
+            SupervisorChildExitCategory::Signaled | SupervisorChildExitCategory::WaitError => {
+                self.code.is_none()
+            }
+        };
+        if !valid_code || !valid_category {
+            return Err(Error::invalid("supervisor child exit receipt is invalid"));
+        }
+        Ok(())
+    }
+}
+
+fn valid_health_code(code: &str) -> bool {
+    !code.is_empty()
+        && code.len() <= 64
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn exact_child_keys(value: &Value, keys: &[&str]) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    object.len() == keys.len() && keys.iter().all(|key| object.contains_key(*key))
+}
+
+fn positive_decimal(value: &Value, maximum: usize) -> bool {
+    let Some(value) = value.as_str() else {
+        return false;
+    };
+    if value.len() > maximum || value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    let Ok(number) = value.parse::<u64>() else {
+        return false;
+    };
+    number > 0 && number.to_string() == value
+}
+
+fn valid_child_uuid(value: &Value) -> bool {
+    let Some(value) = value.as_str() else {
+        return false;
+    };
+    value.len() == 36
+        && [8, 13, 18, 23]
+            .into_iter()
+            .all(|index| value.as_bytes()[index] == b'-')
+        && value.bytes().enumerate().all(|(index, byte)| {
+            [8, 13, 18, 23].contains(&index) || byte.is_ascii_hexdigit()
+        })
+}
+
+fn valid_child_birth(value: &Value, pid: u32) -> bool {
+    let Some(platform) = value.get("platform").and_then(Value::as_str) else {
+        return false;
+    };
+    let pid_matches = value.get("pid").and_then(Value::as_u64) == Some(u64::from(pid));
+    match platform {
+        "windows" => {
+            exact_child_keys(value, &["platform", "pid", "creation_filetime"])
+                && pid_matches
+                && positive_decimal(&value["creation_filetime"], 64)
+        }
+        "linux" => {
+            exact_child_keys(value, &["platform", "pid", "boot_id", "start_ticks"])
+                && pid_matches
+                && valid_child_uuid(&value["boot_id"])
+                && positive_decimal(&value["start_ticks"], 64)
+        }
+        _ => false,
+    }
+}
+
+fn valid_child_image(value: &Value, pid: u32) -> bool {
+    let pid_matches = value.get("pid").and_then(Value::as_u64) == Some(u64::from(pid));
+    let path_valid = value
+        .get("image_path")
+        .and_then(Value::as_str)
+        .is_some_and(|path| !path.is_empty() && path.len() <= 4096 && !path.chars().any(char::is_control));
+    let digest_valid = value
+        .get("image_sha256")
+        .and_then(Value::as_str)
+        .and_then(|digest| digest.strip_prefix("sha256:"))
+        .is_some_and(|digest| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        });
+    if !pid_matches || !path_valid || !digest_valid {
+        return false;
+    }
+    if value.get("start_ticks").is_some() || value.get("boot_id").is_some() {
+        exact_child_keys(
+            value,
+            &["pid", "boot_id", "image_path", "image_sha256", "start_ticks"],
+        ) && valid_child_uuid(&value["boot_id"])
+            && positive_decimal(&value["start_ticks"], 64)
+    } else {
+        exact_child_keys(
+            value,
+            &["pid", "creation_filetime", "image_path", "image_sha256"],
+        ) && positive_decimal(&value["creation_filetime"], 64)
+    }
+}
+
 /// Client for the host-owned supervisor scope.  Every method opens one
 /// authenticated transport exchange; the underlying client never replays a
 /// request after an uncertain write or reply.
@@ -245,6 +448,39 @@ impl SupervisorControlClient {
                 "consecutive_failures": consecutive_failures,
                 "error_code": error_code,
                 "retry_in_ms": retry_in_ms,
+            }),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Record the existing bounded actor health plus an optional verified
+    /// child process receipt. The legacy method above remains unchanged for
+    /// supervisor-internal health updates that have no host child process.
+    pub async fn record_health_with_child(
+        &self,
+        state: &str,
+        consecutive_failures: u32,
+        error_code: Option<&str>,
+        retry_in_ms: Option<u64>,
+        child: Option<&SupervisorChildHealth>,
+    ) -> Result<()> {
+        if let Some(child) = child {
+            child.validate()?;
+        }
+        let child = child
+            .map(|value| serde_json::to_value(value))
+            .transpose()
+            .map_err(|_| Error::invalid("supervisor child health receipt is not serializable"))?;
+        self.request_value(
+            SUPERVISOR_HEALTH_RECORD,
+            json!({
+                "name": "module-supervisor",
+                "state": state,
+                "consecutive_failures": consecutive_failures,
+                "error_code": error_code,
+                "retry_in_ms": retry_in_ms,
+                "child": child,
             }),
         )
         .await

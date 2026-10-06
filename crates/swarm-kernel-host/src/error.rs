@@ -43,7 +43,16 @@ impl Error {
             } else {
                 "ERROR_SECONDARY".to_owned()
             };
-            self.secondary_codes.push(bounded);
+            if bounded != self.code && !self.secondary_codes.contains(&bounded) {
+                self.secondary_codes.push(bounded);
+            }
+        }
+        self
+    }
+    pub fn with_secondary_error(mut self, error: Self) -> Self {
+        self = self.with_secondary_code(error.code);
+        for code in error.secondary_codes {
+            self = self.with_secondary_code(code);
         }
         self
     }

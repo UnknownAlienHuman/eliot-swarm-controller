@@ -865,6 +865,12 @@ pub const METHOD_REGISTRY: &[MethodPolicy] = &[
         participant: ParticipantAccess::None,
     },
     MethodPolicy {
+        method: "module.event",
+        class: MethodClass::Internal,
+        mcp: false,
+        participant: ParticipantAccess::None,
+    },
+    MethodPolicy {
         method: "bus.consumer.register",
         class: MethodClass::Internal,
         mcp: false,

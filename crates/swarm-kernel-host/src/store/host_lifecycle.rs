@@ -13,6 +13,8 @@ const LAST_EXIT: &str = "host:last-exit:v1";
 const LATEST_FAILURE: &str = "host:latest-failure:v1";
 const OPTIONAL_WORKER_HEALTH: &str = "host:optional-workers:v1";
 const SUPERVISORS: &[&str] = &[
+    "module-supervisor",
+    "managed-bus-supervisor",
     "legacy-workers",
     "checks",
     "scripts",
@@ -99,6 +101,8 @@ struct Exit {
     host_epoch: Option<i64>,
     observed_at_ms: i64,
     error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    secondary_codes: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     failed_supervisor: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -187,6 +191,9 @@ fn retain_exit(
             "occurrence_id":occurrence_id,
             "host_epoch":host_epoch
         });
+        if !receipt.secondary_codes.is_empty() {
+            observation["secondary_codes"] = json!(receipt.secondary_codes);
+        }
         if let Some(category) = receipt.failure_category {
             observation["failure_category"] = json!(category.as_str());
         }
@@ -249,6 +256,7 @@ pub(super) fn start(tx: &Transaction<'_>, now: i64) -> Result<()> {
                     host_epoch: Some(previous.host_epoch),
                     observed_at_ms: now,
                     error_code: Some("HOST_INTERRUPTED".into()),
+                    secondary_codes: Vec::new(),
                     failed_supervisor: None,
                     failure_category: None,
                     manager_action_required: true,
@@ -281,6 +289,7 @@ pub(super) fn start(tx: &Transaction<'_>, now: i64) -> Result<()> {
                     host_epoch: None,
                     observed_at_ms: now,
                     error_code: Some("HOST_LIFECYCLE_INVALID".into()),
+                    secondary_codes: Vec::new(),
                     failed_supervisor: None,
                     failure_category: None,
                     manager_action_required: true,
@@ -336,13 +345,17 @@ fn preserve_optional_failure_health(db: &Connection, now: i64) -> Result<Value> 
                 .is_some_and(|updated| retry >= updated && retry.saturating_sub(updated) <= 60_000)
         });
         let historical_failure = historical_failure(receipt);
+        let child_health = receipt
+            .get("child")
+            .filter(|value| !value.is_null())
+            .and_then(bounded_child_health);
         let valid_degraded = degraded
             && failures.is_some_and(|value| value <= 32)
             && updated_at_ms.is_some_and(|value| value >= 0)
             && valid_code
             && valid_retry;
         if !OPTIONAL_WORKERS.contains(&name.as_str())
-            || (!valid_degraded && historical_failure.is_none())
+            || (!valid_degraded && historical_failure.is_none() && child_health.is_none())
         {
             continue;
         }
@@ -363,6 +376,7 @@ fn preserve_optional_failure_health(db: &Connection, now: i64) -> Result<Value> 
         } else {
             now
         };
+        let retained_child = child_health.and_then(|value| restart_child_health(value, state));
         let restart_count = bounded_restart_count(receipt).unwrap_or(0);
         retained.insert(
             name.clone(),
@@ -374,6 +388,7 @@ fn preserve_optional_failure_health(db: &Connection, now: i64) -> Result<Value> 
                 "updated_at_ms":retained_updated_at,
                 "last_failure":historical_failure,
                 "restart_count":restart_count,
+                "child":retained_child,
             }),
         );
     }
@@ -442,6 +457,28 @@ fn bounded_restart_count(receipt: &Value) -> Option<u64> {
         .filter(|value| *value <= 32)
 }
 
+fn bounded_child_health(value: &Value) -> Option<Value> {
+    let child: swarm_supervisor::control::SupervisorChildHealth =
+        serde_json::from_value(value.clone()).ok()?;
+    child.validate().ok()?;
+    serde_json::to_value(child).ok()
+}
+
+fn restart_child_health(value: Value, state: Option<&str>) -> Option<Value> {
+    let mut child: swarm_supervisor::control::SupervisorChildHealth =
+        serde_json::from_value(value).ok()?;
+    if state == Some("running")
+        && matches!(
+            child.stop,
+            swarm_supervisor::control::SupervisorChildStopState::Running
+        )
+    {
+        child.stop = swarm_supervisor::control::SupervisorChildStopState::Uncertain;
+    }
+    child.validate().ok()?;
+    serde_json::to_value(child).ok()
+}
+
 pub(super) fn ready(tx: &Transaction<'_>, now: i64) -> Result<()> {
     let mut current = load(tx)?
         .ok_or_else(|| Error::new("HOST_LIFECYCLE_INVALID", "host startup receipt is missing"))?;
@@ -466,6 +503,28 @@ pub(super) fn update_optional_worker(
     consecutive_failures: u32,
     error_code: Option<&str>,
     retry_in_ms: Option<u64>,
+    now: i64,
+) -> Result<()> {
+    update_optional_worker_with_child(
+        tx,
+        name,
+        state,
+        consecutive_failures,
+        error_code,
+        retry_in_ms,
+        None,
+        now,
+    )
+}
+
+pub(super) fn update_optional_worker_with_child(
+    tx: &Transaction<'_>,
+    name: &str,
+    state: &str,
+    consecutive_failures: u32,
+    error_code: Option<&str>,
+    retry_in_ms: Option<u64>,
+    child_receipt: Option<&Value>,
     now: i64,
 ) -> Result<()> {
     if !OPTIONAL_WORKERS.contains(&name)
@@ -525,6 +584,18 @@ pub(super) fn update_optional_worker(
     } else {
         previous_failure
     };
+    let child_receipt = match child_receipt {
+        Some(value) => Some(bounded_child_health(value).ok_or_else(|| {
+            Error::new(
+                "HOST_LIFECYCLE_INVALID",
+                "optional worker child receipt is invalid",
+            )
+        })?),
+        None => previous
+            .as_ref()
+            .and_then(|value| value.get("child"))
+            .and_then(bounded_child_health),
+    };
     let retry_after_ms =
         retry_in_ms.map(|delay| now.saturating_add(i64::try_from(delay).unwrap_or(i64::MAX)));
     workers.insert(
@@ -537,6 +608,7 @@ pub(super) fn update_optional_worker(
             "updated_at_ms":now,
             "last_failure":last_failure,
             "restart_count":restart_count,
+            "child":child_receipt,
         }),
     );
     set_meta(tx, OPTIONAL_WORKER_HEALTH, &health)
@@ -586,6 +658,9 @@ fn optional_worker_health(db: &Connection) -> Result<Value> {
             || (receipt
                 .get("last_failure")
                 .is_some_and(|value| !value.is_null() && bounded_last_failure(value).is_none()))
+            || receipt
+                .get("child")
+                .is_some_and(|value| !value.is_null() && bounded_child_health(value).is_none())
         {
             return Err(Error::new(
                 "HOST_LIFECYCLE_INVALID",
@@ -599,6 +674,7 @@ fn optional_worker_health(db: &Connection) -> Result<Value> {
 pub(super) fn finish(
     tx: &Transaction<'_>,
     error_code: Option<&str>,
+    secondary_codes: &[String],
     failed_supervisor: Option<&str>,
     now: i64,
 ) -> Result<()> {
@@ -612,15 +688,19 @@ pub(super) fn finish(
             "host exit receipt is not current",
         ));
     }
+    if !valid_secondary_codes(secondary_codes)
+        || (error_code.is_none() && !secondary_codes.is_empty())
+        || error_code.is_some_and(|primary| secondary_codes.iter().any(|code| code == primary))
+    {
+        return Err(Error::new(
+            "HOST_LIFECYCLE_INVALID",
+            "host exit secondary codes are invalid",
+        ));
+    }
     // Codes are controller identifiers. Do not persist error messages, paths,
     // process output, connection strings, request bodies or credentials here.
     let error_code = error_code.map(|code| {
-        if !code.is_empty()
-            && code.len() <= 64
-            && code
-                .bytes()
-                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
-        {
+        if valid_error_code(code) {
             code.to_owned()
         } else {
             "HOST_FAILED".to_owned()
@@ -669,6 +749,7 @@ pub(super) fn finish(
             observed_at_ms: now,
             manager_action_required: error_code.is_some(),
             error_code,
+            secondary_codes: secondary_codes.to_vec(),
             failed_supervisor,
             failure_category,
             retry_authorized: false,
@@ -702,11 +783,12 @@ fn exit_receipt(db: &Connection, key: &str) -> Result<Option<Value>> {
                 })
                 || (receipt.failed_supervisor.is_some() && receipt.failure_category.is_none())
                 || receipt.error_code.as_ref().is_some_and(|code| {
-                    code.is_empty()
-                        || code.len() > 64
-                        || !code
-                            .bytes()
-                            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+                    !valid_error_code(code)
+                })
+                || !valid_secondary_codes(&receipt.secondary_codes)
+                || (receipt.error_code.is_none() && !receipt.secondary_codes.is_empty())
+                || receipt.error_code.as_ref().is_some_and(|primary| {
+                    receipt.secondary_codes.iter().any(|code| code == primary)
                 })
                 || receipt.manager_action_required != receipt.error_code.is_some()
             {
@@ -718,6 +800,20 @@ fn exit_receipt(db: &Connection, key: &str) -> Result<Option<Value>> {
             Ok(json!(receipt))
         })
         .transpose()
+}
+
+fn valid_error_code(code: &str) -> bool {
+    !code.is_empty()
+        && code.len() <= 64
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn valid_secondary_codes(codes: &[String]) -> bool {
+    codes.len() <= 2
+        && codes.iter().all(|code| valid_error_code(code))
+        && (codes.len() < 2 || codes[0] != codes[1])
 }
 
 fn status_value(value: Result<Option<Value>>) -> Result<Value> {

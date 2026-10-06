@@ -20,11 +20,13 @@ pub const TASK_DISPATCH_CONTEXT_SCHEMA_ID: &str = "swarm.task_dispatch_context";
 pub const TASK_DISPATCH_ADMISSION_SCHEMA_ID: &str = "swarm.task_dispatch_admission";
 pub const NORMALIZED_RESULT_CONTEXT_SCHEMA_ID: &str = "swarm.normalized_result_context";
 pub const NORMALIZED_RESULT_PAGE_SCHEMA_ID: &str = "swarm.normalized_result_page";
+/// Common bounded metadata envelope for descriptor-admitted operationless
+/// Module events. The descriptor still decides which event stream/schema a
+/// binding may publish; this schema only defines the closed projection fields.
+pub const MODULE_EVENT_METADATA_SCHEMA_ID: &str = "swarm.module_event_metadata";
 pub const RUNTIME_SCHEMA_VERSION: &str = "1";
 
-pub use crate::native_mcp::{
-    NATIVE_MCP_COMMAND_SCHEMA_ID, NATIVE_MCP_COMMAND_SCHEMA_VERSION,
-};
+pub use crate::native_mcp::{NATIVE_MCP_COMMAND_SCHEMA_ID, NATIVE_MCP_COMMAND_SCHEMA_VERSION};
 
 /// Descriptor declaration for the bounded native MCP command carried inside
 /// the existing authenticated RuntimeCommand transport. Native outcomes keep
@@ -87,6 +89,17 @@ pub fn normalized_result_context_schema() -> SchemaDescriptor {
 pub fn normalized_result_page_schema() -> SchemaDescriptor {
     SchemaDescriptor {
         schema_id: NORMALIZED_RESULT_PAGE_SCHEMA_ID.to_owned(),
+        version: RUNTIME_SCHEMA_VERSION.to_owned(),
+        sha256: None,
+    }
+}
+
+/// Descriptor declaration for the common bounded operationless Module-event
+/// metadata envelope. A descriptor must opt into this schema before its
+/// Module may call the generic event producer path.
+pub fn module_event_metadata_schema() -> SchemaDescriptor {
+    SchemaDescriptor {
+        schema_id: MODULE_EVENT_METADATA_SCHEMA_ID.to_owned(),
         version: RUNTIME_SCHEMA_VERSION.to_owned(),
         sha256: None,
     }

@@ -236,7 +236,7 @@ async fn run_until(
                         }
                         Err(error) => {
                             failed_supervisor = supervisor_names.remove(&error.id());
-                            Err(Error::new("SUPERVISOR_FAILED", error.to_string()))
+                            Err(Error::new("SUPERVISOR_FAILED", "host supervisor task failed"))
                         }
                     };
                 }
@@ -260,11 +260,21 @@ async fn run_until(
     drop(listener);
     let _ = shutdown.send(true);
     while connections.join_next().await.is_some() {}
-    if let Some(actor) = optional_module_supervisor {
-        actor.join().await;
+    if let Some(actor) = optional_module_supervisor
+        && let Err(error) = actor.join().await
+    {
+        if exit.is_ok() {
+            failed_supervisor = Some("module-supervisor");
+        }
+        retain_shutdown_error(&mut exit, error);
     }
-    if let Some(actor) = optional_bus_supervisor {
-        actor.join().await;
+    if let Some(actor) = optional_bus_supervisor
+        && let Err(error) = actor.join().await
+    {
+        if exit.is_ok() {
+            failed_supervisor = Some("managed-bus-supervisor");
+        }
+        retain_shutdown_error(&mut exit, error);
     }
     // Await host-owned workers. Dropping the IPC caller or beginning shutdown
     // must not detach or replay an already admitted external publication.
@@ -278,24 +288,28 @@ async fn run_until(
                 eprintln!("{name} supervisor: {}", error.code);
                 if exit.is_ok() {
                     failed_supervisor = Some(name);
-                    exit = Err(error);
                 }
+                retain_shutdown_error(&mut exit, error);
             }
             Err(error) => {
                 let name = supervisor_names.remove(&error.id());
                 eprintln!("{} supervisor join failed", name.unwrap_or("unknown"));
                 if exit.is_ok() {
                     failed_supervisor = name;
-                    exit = Err(Error::new("SUPERVISOR_FAILED", error.to_string()));
                 }
+                retain_shutdown_error(
+                    &mut exit,
+                    Error::new("SUPERVISOR_FAILED", "host supervisor task failed"),
+                );
             }
         }
     }
     if let Some(error_code) = kernel_snapshot_error_code(owner.store.kernel_snapshot()) {
         eprintln!("host kernel admission: {error_code}");
-        if exit.is_ok() {
-            exit = Err(Error::new(error_code, "kernel writer admission is closed"));
-        }
+        retain_shutdown_error(
+            &mut exit,
+            Error::new(error_code, "kernel writer admission is closed"),
+        );
     }
     let producer_drained = owner.store.drain_diagnostics(Duration::from_secs(5)).await;
     let producer_stats = owner.store.diagnostic_stats();
@@ -303,6 +317,13 @@ async fn run_until(
     exit = owner.close_with_exit(exit, failed_supervisor).await;
     report_observer_shutdown(&observer, Some(producer_stats), producer_drained);
     exit
+}
+
+fn retain_shutdown_error(exit: &mut Result<()>, error: Error) {
+    *exit = match std::mem::replace(exit, Ok(())) {
+        Ok(()) => Err(error),
+        Err(primary) => Err(primary.with_secondary_error(error)),
+    };
 }
 
 fn kernel_snapshot_error_code(snapshot: swarm_kernel::KernelHostSnapshot) -> Option<&'static str> {

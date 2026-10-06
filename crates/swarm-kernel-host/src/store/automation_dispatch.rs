@@ -33,6 +33,7 @@ const MAX_PENDING_RECHECKS: usize = 8;
 const MAX_SUBMISSION_PAGE: usize = 32;
 const MAX_INTAKE_SOURCE_PAGE: usize = 64;
 const GLOBAL_CURSOR_KEY: &str = "automation:v1:dispatch_global_cursor";
+pub(super) const SYSTEM_EVENT_SOURCE_PROOF_PENDING: &str = "system_event_source_proof_pending";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1033,9 +1034,27 @@ fn process_system_event_script_projection(
             );
         }
         Err(error) if error.code == "SCRIPT_EVENT_SOURCE_UNAUTHORIZED" => {
-            // Do not retain or project event identities that have no proven
-            // source ACL for this Manager.
-            remember_script_trigger_recent(state, json!({"disposition":"source_not_authorized"}));
+            if event_can_wait_for_source_proof(tx, event)? {
+                // The authenticated descriptor envelope is durable, but its
+                // retained Module source proof may become available only
+                // after the observation (for example, after agent.open).
+                // Keep that exact cause behind the existing pending bound.
+                queue_system_event_script_trigger(
+                    tx,
+                    entry,
+                    state,
+                    cause,
+                    script_id,
+                    Some(SYSTEM_EVENT_SOURCE_PROOF_PENDING),
+                )?;
+            } else {
+                // Unknown, foreign, or malformed operationless rows never
+                // acquire pending status from selector spelling alone.
+                remember_script_trigger_recent(
+                    state,
+                    json!({"disposition":"source_not_authorized"}),
+                );
+            }
         }
         Err(error) if script_event_revalidation_error(&error) => {
             queue_system_event_script_trigger(
@@ -1133,6 +1152,18 @@ fn event_requires_occurrence_projection(event: &crate::automation::intake::Obser
                     "hook.source.setup" | "hook.source.revoke"
                 )
         )
+}
+
+/// Only a descriptor-admitted Module metadata envelope may wait for a source
+/// proof that is committed after the observation. Source/kind spelling alone
+/// never makes an operationless row eligible for the hold.
+pub(super) fn event_can_wait_for_source_proof(
+    db: &Connection,
+    event: &crate::automation::intake::ObservedEvent,
+) -> Result<bool> {
+    Ok(event.operation_id.is_none()
+        && event.source_id.starts_with("module:")
+        && automation_intake::module_event_metadata_projection(db, event)?.is_some())
 }
 
 fn hook_source_admin_project_scope(
@@ -1385,6 +1416,16 @@ fn script_event_projections_with_alias(
     let direct = automation_intake::safe_event_projection(db, event)?;
     if direct.occurrence_phase.is_some() && direct.occurrence_id.is_some() {
         return Ok(vec![direct]);
+    }
+    if event.source_id.starts_with("module:") {
+        // An arbitrary Module kind is routable only through the common
+        // descriptor-admitted metadata envelope. Never fall back to an empty
+        // observation-only projection for an unadmitted or malformed Module.
+        return Ok(
+            automation_intake::module_event_metadata_projection(db, event)?
+                .into_iter()
+                .collect(),
+        );
     }
     let aliases = match raw_runtime_outcome_kind(db, event)? {
         Some(RawRuntimeOutcomeKind::Applied | RawRuntimeOutcomeKind::Rejected) => {
@@ -4329,6 +4370,28 @@ pub(super) fn relocate_state(
                     Some("held_on_transfer_current_actor_revalidation_required".to_owned());
             }
             pending.automation_revision = new.revision;
+            // A handover changes the current consumer authority, not the
+            // immutable producer cause. Re-seal the successor's action
+            // context only when it still selects this pending ScriptRun;
+            // otherwise leave the old cause unbound and held for ordinary
+            // revalidation if that target is selected again.
+            pending.consumer_context =
+                match script_trigger_authority::ScriptRunConsumerContext::from_entry(new) {
+                    Ok(context)
+                        if context.matches_pending_identity(
+                            &new.owner_manager_id,
+                            &new.project_id,
+                            &new.automation_id,
+                            new.revision,
+                            &pending.script_id,
+                        ) =>
+                    {
+                        Some(context)
+                    }
+                    Ok(_) => None,
+                    Err(error) if error.code == "AUTOMATION_ACTION_CHANGED" => None,
+                    Err(error) => return Err(error),
+                };
             retained_pending.push(pending);
         }
         script_state.pending = retained_pending;
@@ -4363,6 +4426,7 @@ fn revalidate_script_trigger_intents(
         }
         match script_trigger_block_reason(tx, entry, pending, app_config)? {
             None => {
+                seal_revalidated_module_event_source(tx, entry, pending, app_config)?;
                 pending.held = false;
                 pending.held_reason = None;
                 pending.automation_revision = entry.revision;
@@ -4398,6 +4462,61 @@ fn revalidate_script_trigger_intents(
     if !state.pending.is_empty() {
         state.updated_at_ms = now_ms;
     }
+    Ok(())
+}
+
+/// Complete the retained source proof for the one bounded generic Module hold
+/// before making its pending cause runnable. The source observation and its
+/// closed projection were already admitted; this step only seals the exact
+/// descriptor/binding/Task facts that the ordinary current-source gate has
+/// now revalidated. Legacy routes and transfer handling stay on their own
+/// paths.
+fn seal_revalidated_module_event_source(
+    tx: &Transaction<'_>,
+    entry: &AutomationEntry,
+    pending: &mut PendingScriptTrigger,
+    app_config: &Config,
+) -> Result<()> {
+    if pending.held_reason.as_deref() != Some(SYSTEM_EVENT_SOURCE_PROOF_PENDING)
+        || pending
+            .cause
+            .get("operation_id")
+            .is_some_and(|value| !value.is_null())
+        || pending
+            .cause
+            .get("module_source")
+            .is_some_and(Value::is_object)
+    {
+        return Ok(());
+    }
+    let Some(source_id) = pending.cause["source_id"].as_str() else {
+        return Err(Error::new(
+            "AUTOMATION_CURSOR_CORRUPT",
+            "generic Module source hold has no retained source identity",
+        ));
+    };
+    if !source_id.starts_with("module:") {
+        return Err(Error::new(
+            "AUTOMATION_CURSOR_CORRUPT",
+            "generic Module source hold names a non-Module source",
+        ));
+    }
+    let observation_id = model::positive(&pending.cause, "observation_id")?;
+    let event = automation_intake::observed_event_by_id(tx, observation_id)?.ok_or_else(|| {
+        Error::new(
+            "AUTOMATION_CURSOR_CORRUPT",
+            "generic Module source hold points to a missing observation",
+        )
+    })?;
+    let context = bus_kernel::script_event_invocation_context_for_consumer(
+        tx,
+        app_config,
+        entry,
+        &pending.cause,
+        &entry.owner_manager_id,
+    )?;
+    bus_kernel::seal_retained_module_event_source(tx, entry, &event, &mut pending.cause)?;
+    attach_event_task_scope(&mut pending.cause, &context)?;
     Ok(())
 }
 
@@ -4526,10 +4645,21 @@ fn script_trigger_block_reason(
     }
     match context.require_current_source(tx, app_config, entry, &pending.cause) {
         Ok(_) => Ok(None),
-        Err(error) if script_event_revalidation_error(&error) => Ok(Some(format!(
-            "system_event_{}",
-            error.code.to_ascii_lowercase()
-        ))),
+        Err(error) if script_event_revalidation_error(&error) => {
+            if pending.held_reason.as_deref() == Some(SYSTEM_EVENT_SOURCE_PROOF_PENDING)
+                && matches!(
+                    error.code.as_str(),
+                    "SCRIPT_EVENT_SOURCE_UNAUTHORIZED" | "SCRIPT_EVENT_SOURCE_REVOKED"
+                )
+            {
+                Ok(Some(SYSTEM_EVENT_SOURCE_PROOF_PENDING.to_owned()))
+            } else {
+                Ok(Some(format!(
+                    "system_event_{}",
+                    error.code.to_ascii_lowercase()
+                )))
+            }
+        }
         Err(error) if script_trigger_revalidation_error(&error) => Ok(Some(format!(
             "submission_{}",
             error.code.to_ascii_lowercase()

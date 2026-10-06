@@ -319,17 +319,17 @@ impl StoreOwner {
         match kernel.wait_ready().await {
             Ok(()) => {}
             Err(swarm_kernel::KernelHostReadyError::Initialization(error)) => {
-                return Err(match join_kernel_host(kernel, "database owner").await {
-                    Ok(()) => error,
-                    Err(cleanup) => error.with_secondary_code(cleanup.code),
-                });
+                return Err(merge_cleanup(
+                    error,
+                    join_kernel_host(kernel, "database owner").await,
+                ));
             }
             Err(_) => {
                 let error = Error::new("STORE_CLOSED", "initialization thread ended");
-                return Err(match join_kernel_host(kernel, "database owner").await {
-                    Ok(()) => error,
-                    Err(cleanup) => error.with_secondary_code(cleanup.code),
-                });
+                return Err(merge_cleanup(
+                    error,
+                    join_kernel_host(kernel, "database owner").await,
+                ));
             }
         }
         let kernel_handle = kernel.handle();
@@ -343,10 +343,10 @@ impl StoreOwner {
             Ok(reader) => reader,
             Err(error) => {
                 drop(kernel_handle);
-                return Err(match join_kernel_host(kernel, "database owner").await {
-                    Ok(()) => error,
-                    Err(cleanup) => error.with_secondary_code(cleanup.code),
-                });
+                return Err(merge_cleanup(
+                    error,
+                    join_kernel_host(kernel, "database owner").await,
+                ));
             }
         };
         let store = Store {
@@ -475,9 +475,14 @@ impl StoreOwner {
         if !kernel_join_confirmed {
             return exit;
         }
+        let (error_code, secondary_codes) = match exit.as_ref() {
+            Ok(()) => (None, Vec::new()),
+            Err(error) => (Some(error.code.clone()), error.secondary_codes.clone()),
+        };
         let receipt = recovery
             .record_host_exit(
-                exit.as_ref().err().map(|error| error.code.clone()),
+                error_code,
+                secondary_codes,
                 failed_supervisor,
             )
             .await;
@@ -496,13 +501,14 @@ impl StoreRecovery {
     async fn record_host_exit(
         self,
         error_code: Option<String>,
+        secondary_codes: Vec<String>,
         failed_supervisor: Option<&'static str>,
     ) -> Result<()> {
         tokio::task::spawn_blocking(move || {
             let StoreRecovery { root, lock } = self;
             let _lock = lock;
             let mut db = open_recovery_database(&root)?;
-            record_host_exit_on_connection(&mut db, error_code, failed_supervisor)
+            record_host_exit_on_connection(&mut db, error_code, secondary_codes, failed_supervisor)
         })
         .await
         .map_err(|error| {
@@ -525,14 +531,14 @@ fn merge_results(primary: Result<()>, secondary: Result<()>) -> Result<()> {
         (Ok(()), Ok(())) => Ok(()),
         (Ok(()), Err(error)) => Err(error),
         (Err(error), Ok(())) => Err(error),
-        (Err(primary), Err(secondary)) => Err(primary.with_secondary_code(secondary.code)),
+        (Err(primary), Err(secondary)) => Err(primary.with_secondary_error(secondary)),
     }
 }
 
 fn merge_cleanup(primary: Error, cleanup: Result<()>) -> Error {
     match cleanup {
         Ok(()) => primary,
-        Err(cleanup) => primary.with_secondary_code(cleanup.code),
+        Err(cleanup) => primary.with_secondary_error(cleanup),
     }
 }
 async fn join_store_thread(thread: JoinHandle<()>, name: &'static str) -> Result<()> {
@@ -838,15 +844,36 @@ impl Store {
         error_code: Option<String>,
         retry_in_ms: Option<u64>,
     ) -> Result<()> {
+        self.record_legacy_worker_status_with_child(
+            name,
+            state,
+            consecutive_failures,
+            error_code,
+            retry_in_ms,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn record_legacy_worker_status_with_child(
+        &self,
+        name: &'static str,
+        state: &'static str,
+        consecutive_failures: u32,
+        error_code: Option<String>,
+        retry_in_ms: Option<u64>,
+        child_receipt: Option<Value>,
+    ) -> Result<()> {
         self.run(move |db| {
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            host_lifecycle::update_optional_worker(
+            host_lifecycle::update_optional_worker_with_child(
                 &tx,
                 name,
                 state,
                 consecutive_failures,
                 error_code.as_deref(),
                 retry_in_ms,
+                child_receipt.as_ref(),
                 model::now_ms()?,
             )?;
             tx.commit()?;
@@ -1021,8 +1048,10 @@ impl Store {
         error_code: Option<String>,
         failed_supervisor: Option<&'static str>,
     ) -> Result<()> {
-        self.run(move |db| record_host_exit_on_connection(db, error_code, failed_supervisor))
-            .await
+        self.run(move |db| {
+            record_host_exit_on_connection(db, error_code, Vec::new(), failed_supervisor)
+        })
+        .await
     }
     pub(crate) async fn reconcile_workspace_lifecycle_once(&self) -> Result<Value> {
         // Exact owned-process departure is observed outside the DB owner
@@ -1767,6 +1796,7 @@ impl Store {
                 | "agent.recover"
                 | "host.mode"
                 | "module.outcome"
+                | "module.event"
                 | "bus.consumer.admit"
                 | "swarm.launch"
                 | "coordination.watch.create"
@@ -1793,6 +1823,7 @@ impl Store {
                 if principal.role == Role::Module {
                     return match method.as_str() {
                         "module.outcome" => runtime::outcome(db, &principal, &params),
+                        "module.event" => runtime::event(db, &principal, &params),
                         "module.observe" => runtime::observe(db, &principal, &params),
                         "bus.events.page" => {
                             bus_kernel::read(db, &principal, &method, &params, &config)
@@ -2026,6 +2057,7 @@ impl Store {
                         "consecutive_failures",
                         "error_code",
                         "retry_in_ms",
+                        "child",
                     ],
                 )?;
                 if model::text(&params, "name")? != "module-supervisor" {
@@ -2056,12 +2088,28 @@ impl Store {
                             .ok_or_else(|| Error::invalid("retry_in_ms must be a u64 or null"))?,
                     ),
                 };
-                self.record_legacy_worker_status(
+                let child_receipt = match params.get("child") {
+                    None | Some(Value::Null) => None,
+                    Some(value) => {
+                        let child: swarm_supervisor::control::SupervisorChildHealth =
+                            serde_json::from_value(value.clone()).map_err(|_| {
+                                Error::invalid("child health receipt has an invalid typed shape")
+                            })?;
+                        child.validate().map_err(|_| {
+                            Error::invalid("child health receipt failed its bounded validation")
+                        })?;
+                        Some(serde_json::to_value(child).map_err(|_| {
+                            Error::invalid("child health receipt could not be retained")
+                        })?)
+                    }
+                };
+                self.record_legacy_worker_status_with_child(
                     "module-supervisor",
                     state,
                     consecutive_failures,
                     error_code,
                     retry_in_ms,
+                    child_receipt,
                 )
                 .await?;
                 Ok(json!({"recorded":true}))
@@ -2561,12 +2609,14 @@ fn require_local_operator(db: &Connection, client_id: &str) -> Result<()> {
 fn record_host_exit_on_connection(
     db: &mut Connection,
     error_code: Option<String>,
+    secondary_codes: Vec<String>,
     failed_supervisor: Option<&'static str>,
 ) -> Result<()> {
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     host_lifecycle::finish(
         &tx,
         error_code.as_deref(),
+        &secondary_codes,
         failed_supervisor,
         model::now_ms()?,
     )?;

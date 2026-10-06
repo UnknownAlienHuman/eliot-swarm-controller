@@ -759,9 +759,31 @@ fn process_scoped_system_event(
                     json!({"observation_id":event.observation_id,"disposition":"same_automation_feedback_suppressed"}),
                 );
             }
+            Err(error) if error.code == "SCRIPT_EVENT_SOURCE_UNAUTHORIZED" => {
+                if super::event_can_wait_for_source_proof(tx, event)? {
+                    // The descriptor-admitted metadata row is a valid source
+                    // fact, but its retained Module proof can be completed by
+                    // a later source admission. Keep the exact cause under
+                    // the existing pending bound.
+                    queue_system_event_script_trigger(
+                        tx,
+                        entry,
+                        state,
+                        cause,
+                        script_id.clone(),
+                        Some(super::SYSTEM_EVENT_SOURCE_PROOF_PENDING),
+                    )?;
+                } else {
+                    // Foreign or malformed operationless rows never become
+                    // pending from an arbitrary source/kind selector.
+                    remember_script_trigger_recent(
+                        state,
+                        json!({"observation_id":event.observation_id,"disposition":"source_not_authorized"}),
+                    );
+                }
+            }
             Err(error)
-                if error.code == "SCRIPT_EVENT_SOURCE_UNAUTHORIZED"
-                    || error.code == "SCRIPT_EVENT_SOURCE_REVOKED"
+                if error.code == "SCRIPT_EVENT_SOURCE_REVOKED"
                     || super::script_event_revalidation_error(&error) =>
             {
                 remember_script_trigger_recent(

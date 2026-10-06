@@ -45,6 +45,7 @@ struct WriterExitSignal<Hold> {
     _hold: Hold,
     finished: Arc<AtomicBool>,
     stop_requested: Arc<AtomicBool>,
+    initialization_succeeded: Arc<AtomicBool>,
     status: Arc<Mutex<KernelHostSnapshot>>,
     status_updates: watch::Sender<KernelHostSnapshot>,
 }
@@ -55,6 +56,12 @@ impl<Hold> Drop for WriterExitSignal<Hold> {
         if self.stop_requested.load(Ordering::Acquire) {
             return;
         }
+        // An initializer error (or panic/channel close before readiness) is
+        // reported through the ready result or the join result. It is not a
+        // writer-exit fault and must not be rewritten as cleanup failure.
+        if !self.initialization_succeeded.load(Ordering::Acquire) {
+            return;
+        }
         let mut snapshot = self
             .status
             .lock()
@@ -63,7 +70,6 @@ impl<Hold> Drop for WriterExitSignal<Hold> {
             snapshot.lifecycle,
             KernelHostLifecycle::Stopping
                 | KernelHostLifecycle::Stopped
-                | KernelHostLifecycle::Failed
                 | KernelHostLifecycle::AdmissionClosed {
                     fault: KernelAdmissionFault::ShuttingDown
                 }
@@ -711,6 +717,8 @@ where
         .map_err(KernelHostSpawnError::InvalidConfig)?;
     let writer_finished = Arc::new(AtomicBool::new(false));
     let stop_requested = Arc::new(AtomicBool::new(false));
+    let initialization_succeeded = Arc::new(AtomicBool::new(false));
+    let initialization_succeeded_for_writer = Arc::clone(&initialization_succeeded);
     let initial_status = KernelHostSnapshot {
         admission: KernelAdmissionState::Starting,
         lifecycle: KernelHostLifecycle::Starting,
@@ -730,10 +738,17 @@ where
             _hold: hold,
             finished: Arc::clone(&writer_finished),
             stop_requested: Arc::clone(&stop_requested),
+            initialization_succeeded: Arc::clone(&initialization_succeeded),
             status: Arc::clone(&status),
             status_updates: status_updates.clone(),
         },
-        initialize,
+        move || {
+            let result = initialize();
+            if result.is_ok() {
+                initialization_succeeded_for_writer.store(true, Ordering::Release);
+            }
+            result
+        },
         process_run,
         process_batch,
         Some(Arc::clone(&stop_requested)),

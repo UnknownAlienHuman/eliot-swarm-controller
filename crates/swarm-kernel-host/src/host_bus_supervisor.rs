@@ -342,8 +342,13 @@ pub(crate) struct OptionalManagedBusSupervisor {
 }
 
 impl OptionalManagedBusSupervisor {
-    pub(crate) async fn join(self) {
-        let _ = self.task.await;
+    pub(crate) async fn join(self) -> Result<()> {
+        self.task.await.map_err(|_| {
+            Error::new(
+                "BUS_SUPERVISOR_JOIN_FAILED",
+                "managed bus supervisor task failed to complete",
+            )
+        })
     }
 }
 

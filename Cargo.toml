@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 swarm-kernel-host = { path = "crates/swarm-kernel-host" }
+swarm-process = { path = "crates/swarm-process" }
 
 [dev-dependencies]
 serde_json = "1"

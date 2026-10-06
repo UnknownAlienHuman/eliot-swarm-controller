@@ -1214,6 +1214,135 @@ pub(crate) fn safe_event_projection(
     })
 }
 
+/// Project the common metadata envelope emitted by an authenticated Module
+/// that opted into `swarm.module_event_metadata@1`. The descriptor and
+/// binding are checked before any selector metadata is returned; arbitrary
+/// payload fields never participate in routing.
+pub(crate) fn module_event_metadata_projection(
+    db: &Connection,
+    event: &ObservedEvent,
+) -> Result<Option<crate::automation::intake::SafeEventProjection>> {
+    let Some(module_client_id) = event.source_id.strip_prefix("module:") else {
+        return Ok(None);
+    };
+    if module_client_id.is_empty() {
+        return Ok(None);
+    }
+    if matches!(
+        event.event_kind.as_str(),
+        "runtime.outcome" | "runtime.state"
+    ) {
+        // These legacy Module streams retain their existing operation/state
+        // codecs; the additive envelope cannot masquerade as either one.
+        return Ok(None);
+    }
+    let row: Option<(Option<String>, Option<i64>, String)> = db
+        .query_row(
+            "SELECT binding_id,binding_generation,payload_json \
+             FROM observations WHERE observation_id=?1 AND source_stream_id=?2 \
+               AND kind=?3 AND operation_id IS NULL",
+            params![event.observation_id, event.source_id, event.event_kind],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((Some(binding_id), Some(binding_generation), payload_json)) = row else {
+        return Ok(None);
+    };
+    if binding_generation <= 0 {
+        return Ok(None);
+    }
+    let binding = match super::operations::get_binding(db, &binding_id, binding_generation) {
+        Ok(binding) => binding,
+        Err(error) if module_event_projection_rejection(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if binding["route"]["runtime"] != "module"
+        || binding["observation"]["module_client_id"].as_str() != Some(module_client_id)
+    {
+        return Ok(None);
+    }
+    let Some(selector) = binding["observation"].get("module_contract_selector") else {
+        return Ok(None);
+    };
+    let Some(artifact_id) = binding["module_artifact_id"].as_str() else {
+        return Ok(None);
+    };
+    let identity = match super::module_handshake::retained_contract_identity(
+        db,
+        artifact_id,
+        Some(selector),
+    ) {
+        Ok(Some(identity)) => identity,
+        Ok(None) => return Ok(None),
+        Err(error) if module_event_projection_rejection(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !identity
+        .event_schemas
+        .iter()
+        .any(|schema| schema == &swarm_contracts::module_contract::module_event_metadata_schema())
+    {
+        return Ok(None);
+    }
+    let metadata: swarm_contracts::runtime::ModuleEventMetadata =
+        match serde_json::from_str(&payload_json) {
+            Ok(metadata) => metadata,
+            Err(_) => return Ok(None),
+        };
+    if metadata.validate().is_err() || metadata.event_kind != event.event_kind {
+        return Ok(None);
+    }
+    let status = metadata.status.map(|status| match status {
+        swarm_contracts::runtime::ModuleEventStatus::Applied => {
+            crate::automation::event_rules::EventStatus::Applied
+        }
+        swarm_contracts::runtime::ModuleEventStatus::Completed => {
+            crate::automation::event_rules::EventStatus::Completed
+        }
+        swarm_contracts::runtime::ModuleEventStatus::Failed => {
+            crate::automation::event_rules::EventStatus::Failed
+        }
+        swarm_contracts::runtime::ModuleEventStatus::Incomplete => {
+            crate::automation::event_rules::EventStatus::Incomplete
+        }
+        swarm_contracts::runtime::ModuleEventStatus::Cancelled => {
+            crate::automation::event_rules::EventStatus::Cancelled
+        }
+        swarm_contracts::runtime::ModuleEventStatus::Rejected => {
+            crate::automation::event_rules::EventStatus::Rejected
+        }
+        swarm_contracts::runtime::ModuleEventStatus::Sent => {
+            crate::automation::event_rules::EventStatus::Sent
+        }
+        swarm_contracts::runtime::ModuleEventStatus::Answered => {
+            crate::automation::event_rules::EventStatus::Answered
+        }
+        swarm_contracts::runtime::ModuleEventStatus::Invalidated => {
+            crate::automation::event_rules::EventStatus::Invalidated
+        }
+        swarm_contracts::runtime::ModuleEventStatus::Unknown => {
+            crate::automation::event_rules::EventStatus::Unknown
+        }
+    });
+    Ok(Some(crate::automation::intake::SafeEventProjection {
+        status,
+        occurrence_phase: metadata.occurrence_phase,
+        occurrence_id: metadata.occurrence_id,
+        ..Default::default()
+    }))
+}
+
+fn module_event_projection_rejection(error: &Error) -> bool {
+    matches!(
+        error.code.as_str(),
+        "NOT_FOUND"
+            | "MODULE_ROUTE_CORRUPT"
+            | "MODULE_DESCRIPTOR_MISSING"
+            | "MODULE_DISABLED"
+            | "MODULE_PROTOCOL_INCOMPATIBLE"
+    )
+}
+
 /// Project the closed failure occurrence written in the same transaction as
 /// a native MCP retry/stale marker. Payload reads are byte-bounded in SQL, and
 /// the exact observation, source key, retained launch Operation, and event link

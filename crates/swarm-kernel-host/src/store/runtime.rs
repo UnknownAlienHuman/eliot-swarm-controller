@@ -2560,6 +2560,102 @@ pub(super) fn observe(db: &mut Connection, p: &Principal, v: &Value) -> Result<V
     Ok(json!({"recorded":true,"stale":false,"observation_id":observation_id}))
 }
 
+/// Record one descriptor-admitted, operationless Module event through the
+/// existing observations stream. The authenticated binding supplies the
+/// source identity and generation; the common metadata DTO supplies only the
+/// closed selector projection. No caller payload or synthetic Operation link
+/// enters the observation row.
+pub(super) fn event(db: &mut Connection, p: &Principal, v: &Value) -> Result<Value> {
+    model::fields(v, &["event_id", "event_kind", "metadata"])?;
+    let source_event_key = model::text(v, "event_id")?;
+    let event_kind = model::text(v, "event_kind")?;
+    if !valid_module_event_key(source_event_key, 512)
+        || !valid_module_event_key(event_kind, 256)
+        || matches!(event_kind, "runtime.outcome" | "runtime.state")
+    {
+        return Err(Error::invalid(
+            "module event identity is outside its bounded selector contract",
+        ));
+    }
+    let metadata: swarm_contracts::runtime::ModuleEventMetadata =
+        serde_json::from_value(v["metadata"].clone())
+            .map_err(|_| Error::invalid("module event metadata has an invalid closed shape"))?;
+    metadata
+        .validate()
+        .map_err(|reason| Error::invalid(reason))?;
+    if metadata.event_kind != event_kind {
+        return Err(Error::invalid(
+            "module event metadata kind differs from the admitted event kind",
+        ));
+    }
+
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let (binding_id, binding_generation, binding) = scope(&tx, p, true)?;
+    let selector = binding["observation"].get("module_contract_selector");
+    let artifact_id = model::text(&binding, "module_artifact_id")?;
+    let identity = super::module_handshake::retained_contract_identity(&tx, artifact_id, selector)?
+        .ok_or_else(|| {
+            Error::new(
+                "MODULE_EVENT_UNSUPPORTED",
+                "generic Module events require a retained descriptor",
+            )
+        })?;
+    if !identity
+        .event_schemas
+        .iter()
+        .any(|schema| schema == &swarm_contracts::module_contract::module_event_metadata_schema())
+    {
+        return Err(Error::new(
+            "MODULE_EVENT_UNSUPPORTED",
+            "retained descriptor does not admit the common Module event metadata schema",
+        ));
+    }
+    let payload_json = model::canonical(&serde_json::to_value(&metadata)?)?;
+    let source_stream_id = format!("module:{}", p.client_id);
+    let previous: Option<(i64, Option<String>, i64, String)> = tx
+        .query_row(
+            "SELECT observation_id,binding_id,binding_generation,payload_json \
+             FROM observations WHERE source_stream_id=?1 AND source_event_key=?2",
+            params![source_stream_id, source_event_key],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    if let Some((observation_id, prior_binding_id, prior_generation, prior_payload)) = previous {
+        if prior_binding_id.as_deref() != Some(binding_id.as_str())
+            || prior_generation != binding_generation
+            || prior_payload != payload_json
+        {
+            return Err(Error::conflict(
+                "module event identity was reused with different retained facts",
+            ));
+        }
+        tx.commit()?;
+        return Ok(json!({"recorded":true,"replayed":true,"observation_id":observation_id}));
+    }
+    let now = model::now_ms()?;
+    tx.execute(
+        "INSERT INTO observations(source_stream_id,source_event_key,binding_id,\
+         binding_generation,kind,payload_json,recorded_at_ms) \
+         VALUES(?1,?2,?3,?4,?5,?6,?7)",
+        params![
+            source_stream_id,
+            source_event_key,
+            binding_id,
+            binding_generation,
+            event_kind,
+            payload_json,
+            now
+        ],
+    )?;
+    let observation_id = tx.last_insert_rowid();
+    tx.commit()?;
+    Ok(json!({"recorded":true,"replayed":false,"observation_id":observation_id}))
+}
+
+fn valid_module_event_key(value: &str, maximum: usize) -> bool {
+    !value.is_empty() && value.len() <= maximum && !value.chars().any(char::is_control)
+}
+
 pub(super) fn disconnected(db: &mut Connection, p: &Principal) -> Result<bool> {
     if p.role != Role::Module {
         return Ok(false);

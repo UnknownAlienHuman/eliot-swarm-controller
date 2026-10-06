@@ -10,18 +10,24 @@ use crate::{
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
-    process::Stdio,
+    process::{ExitStatus, Stdio},
     sync::Arc,
     time::Duration,
 };
+use serde_json::Value;
 use swarm_contracts::{Credential, module_catalog::ProtectedRef};
+use swarm_process::{process_birth_identity, process_image_identity};
 use swarm_supervisor::{
     ModuleOwnerExecutable, StandaloneRouteConfigMapper, StandaloneSupervisorConfig,
     SupervisorBootstrap, SupervisorControlClient,
 };
+use swarm_supervisor::control::{
+    SupervisorChildExit, SupervisorChildExitCategory, SupervisorChildHealth,
+    SupervisorChildProcessIdentity, SupervisorChildStopState,
+};
 use tokio::{
-    io::AsyncWriteExt,
-    process::{Child, ChildStdin, Command},
+    io::{AsyncReadExt, AsyncWriteExt},
+    process::{Child, ChildStderr, ChildStdin, Command},
     sync::watch,
     task::JoinHandle,
     time,
@@ -30,6 +36,7 @@ use tokio::{
 const MODULE_ACTOR_RETRY_MAX: Duration = Duration::from_secs(30);
 const MODULE_ACTOR_ISOLATED_RETRY: Duration = Duration::from_secs(60);
 const MAX_ADDITIONAL_PROTECTED_FILES: usize = 128;
+const SUPERVISOR_CHILD_DIAGNOSTIC_LIMIT: usize = 1024;
 
 #[derive(Clone)]
 pub(crate) struct ModuleSupervisorHostConfig {
@@ -161,12 +168,37 @@ impl ModuleSupervisorHostConfig {
 }
 
 pub(crate) struct OptionalModuleSupervisor {
-    task: JoinHandle<()>,
+    task: JoinHandle<Result<()>>,
+    health_control: Option<SupervisorControlClient>,
 }
 
 impl OptionalModuleSupervisor {
-    pub(crate) async fn join(self) {
-        let _ = self.task.await;
+    pub(crate) async fn join(self) -> Result<()> {
+        let OptionalModuleSupervisor {
+            task,
+            health_control,
+        } = self;
+        match task.await {
+            Ok(result) => result,
+            Err(_) => {
+                let join_error =
+                    Error::new("MODULE_SUPERVISOR_JOIN_FAILED", "module supervisor task failed");
+                if let Some(control) = health_control {
+                    if let Err(health_error) = record_module_actor_status(
+                        &control,
+                        "isolated",
+                        1,
+                        Some("MODULE_SUPERVISOR_JOIN_FAILED"),
+                        Some(MODULE_ACTOR_ISOLATED_RETRY),
+                    )
+                    .await
+                    {
+                        return Err(join_error.with_secondary_code(health_error.code));
+                    }
+                }
+                Err(join_error)
+            }
+        }
     }
 }
 
@@ -184,58 +216,68 @@ pub(crate) fn spawn_independent_module_supervisor(
     config: Arc<crate::config::Config>,
     stopping: watch::Receiver<bool>,
 ) -> OptionalModuleSupervisor {
+    let control = SupervisorControlClient::new(
+        root.clone(),
+        supervisor_credential.clone(),
+        ipc.clone(),
+    );
+    let health_control = control.as_ref().ok().cloned();
     let task = tokio::spawn(async move {
-        let control = match SupervisorControlClient::new(
-            root.clone(),
-            supervisor_credential.clone(),
-            ipc.clone(),
-        ) {
+        let control = match control {
             Ok(control) => control,
             Err(error) => {
                 eprintln!("optional module supervisor IPC unavailable: {}", error.code);
-                return;
+                return Err(error);
             }
         };
         let host_config = match ModuleSupervisorHostConfig::from_runtime_config(config.as_ref(), &root) {
             Ok(Some(value)) => value,
-            Ok(None) => return,
+            Ok(None) => return Ok(()),
             Err(error) => {
-                record_module_actor_status(
+                let error = match record_module_actor_status(
                     &control,
                     "isolated",
                     1,
                     Some(&error.code),
                     Some(MODULE_ACTOR_ISOLATED_RETRY),
                 )
-                .await;
+                .await
+                {
+                    Ok(()) => error,
+                    Err(health_error) => return Err(error.with_secondary_code(health_error.code)),
+                };
                 eprintln!(
                     "optional module supervisor configuration unavailable: {}",
                     error.code
                 );
-                return;
+                return Err(error);
             }
         };
         let bootstrap = match host_config.standalone_bootstrap(&root, ipc, supervisor_credential) {
             Ok(bootstrap) => bootstrap,
             Err(error) => {
-                record_module_actor_status(
+                let error = match record_module_actor_status(
                     &control,
                     "isolated",
                     1,
                     Some(&error.code),
                     Some(MODULE_ACTOR_ISOLATED_RETRY),
                 )
-                .await;
+                .await
+                {
+                    Ok(()) => error,
+                    Err(health_error) => return Err(error.with_secondary_code(health_error.code)),
+                };
                 eprintln!(
                     "optional module supervisor bootstrap unavailable: {}",
                     error.code
                 );
-                return;
+                return Err(error);
             }
         };
-        run_supervisor_process_loop(store, control, bootstrap, stopping).await;
+        run_supervisor_process_loop(store, control, bootstrap, stopping).await
     });
-    OptionalModuleSupervisor { task }
+    OptionalModuleSupervisor { task, health_control }
 }
 
 /// The host supplies the existing Store only as an activation oracle. No Store
@@ -262,7 +304,7 @@ async fn run_supervisor_process_loop(
     control: SupervisorControlClient,
     bootstrap: SupervisorBootstrap,
     stopping: watch::Receiver<bool>,
-) {
+) -> Result<()> {
     let mut stopping = stopping;
     let mut demand_changes = store.subscribe_module_demand_changes();
     let mut failures = 0_u32;
@@ -270,15 +312,19 @@ async fn run_supervisor_process_loop(
     let frame = match bootstrap.to_frame() {
         Ok(frame) => frame,
         Err(error) => {
-            record_module_actor_status(
+            let error = match record_module_actor_status(
                 &control,
                 "isolated",
                 1,
                 Some(&error.code),
                 Some(MODULE_ACTOR_ISOLATED_RETRY),
             )
-            .await;
-            return;
+            .await
+            {
+                Ok(()) => error,
+                Err(health_error) => return Err(error.with_secondary_code(health_error.code)),
+            };
+            return Err(error);
         }
     };
     loop {
@@ -288,23 +334,26 @@ async fn run_supervisor_process_loop(
                 Err(error) => {
                     failures = failures.saturating_add(1).min(32);
                     let (state, delay) = process_failure_state(failures, retry);
-                    record_module_actor_status(
+                    if let Err(health_error) = record_module_actor_status(
                         &control,
                         state,
                         failures,
                         Some(&error.code),
                         Some(delay),
                     )
-                    .await;
+                    .await
+                    {
+                        return Err(error.with_secondary_code(health_error.code));
+                    }
                     if !wait_for_supervisor_backoff(delay, &mut stopping).await {
-                        return;
+                        return Ok(());
                     }
                     retry = (retry * 2).min(MODULE_ACTOR_RETRY_MAX);
                     continue;
                 }
             };
         if !demanded {
-            return;
+            return Ok(());
         }
 
         let executable = match supervisor_sibling_executable() {
@@ -312,16 +361,19 @@ async fn run_supervisor_process_loop(
             Err(error) => {
                 failures = failures.saturating_add(1).min(32);
                 let (state, delay) = process_failure_state(failures, retry);
-                record_module_actor_status(
+                if let Err(health_error) = record_module_actor_status(
                     &control,
                     state,
                     failures,
                     Some(&error.code),
                     Some(delay),
                 )
-                .await;
+                .await
+                {
+                    return Err(error.with_secondary_code(health_error.code));
+                }
                 if !wait_for_supervisor_retry(delay, &mut demand_changes, &mut stopping).await {
-                    return;
+                    return Ok(());
                 }
                 retry = (retry * 2).min(MODULE_ACTOR_RETRY_MAX);
                 continue;
@@ -329,28 +381,51 @@ async fn run_supervisor_process_loop(
         };
 
         let started_at = time::Instant::now();
-        let (mut child, bootstrap_pipe) = match spawn_supervisor_child(&executable, &frame).await {
-            Ok(child) => child,
-            Err(error) => {
-                failures = failures.saturating_add(1).min(32);
-                let (state, delay) = process_failure_state(failures, retry);
-                record_module_actor_status(
-                    &control,
-                    state,
-                    failures,
-                    Some(&error.code),
-                    Some(delay),
-                )
-                .await;
-                if !wait_for_supervisor_retry(delay, &mut demand_changes, &mut stopping).await {
-                    return;
+        let (mut child, bootstrap_pipe, child_identity) =
+            match spawn_supervisor_child(&executable, &frame).await {
+                Ok(child) => child,
+                Err(error) => {
+                    failures = failures.saturating_add(1).min(32);
+                    let (state, delay) = process_failure_state(failures, retry);
+                    if let Err(health_error) = record_module_actor_status(
+                        &control,
+                        state,
+                        failures,
+                        Some(&error.code),
+                        Some(delay),
+                    )
+                    .await
+                    {
+                        return Err(error.with_secondary_code(health_error.code));
+                    }
+                    if !wait_for_supervisor_retry(delay, &mut demand_changes, &mut stopping).await {
+                        return Ok(());
+                    }
+                    retry = (retry * 2).min(MODULE_ACTOR_RETRY_MAX);
+                    continue;
                 }
-                retry = (retry * 2).min(MODULE_ACTOR_RETRY_MAX);
-                continue;
-            }
-        };
-        record_module_actor_status(&control, "running", failures, None, None).await;
+            };
+        let running_health = supervisor_child_health(
+            &child_identity,
+            None,
+            SupervisorChildStopState::Running,
+        );
+        record_module_actor_health(
+            &control,
+            "running",
+            failures,
+            None,
+            None,
+            Some(&running_health),
+        )
+        .await?;
 
+        // Keep stderr bounded and decode only the standalone's validated code;
+        // raw diagnostics never enter Store health or Manager attention.
+        let mut child_diagnostic = child
+            .stderr
+            .take()
+            .map(|stderr| tokio::spawn(read_bounded_child_diagnostic(stderr)));
         let mut bootstrap_pipe = Some(bootstrap_pipe);
         let exit = tokio::select! {
             status = child.wait() => Some(status),
@@ -360,64 +435,97 @@ async fn run_supervisor_process_loop(
                 // leases; it never broad-kills native owners or adapters.
                 drop(bootstrap_pipe.take());
                 let stopped = time::timeout(SUPERVISOR_PROCESS_STOP_TIMEOUT, child.wait()).await;
-                match stopped {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(_)) => {
-                        record_module_actor_status(
-                            &control,
-                            "isolated",
-                            1,
-                            Some("SUPERVISOR_STOP_UNKNOWN"),
-                            Some(MODULE_ACTOR_ISOLATED_RETRY),
-                        )
-                        .await;
-                    }
-                    Err(_) => {
-                        record_module_actor_status(
-                            &control,
-                            "isolated",
-                            1,
-                            Some("SUPERVISOR_STOP_TIMEOUT"),
-                            Some(MODULE_ACTOR_ISOLATED_RETRY),
-                        )
-                        .await;
-                        // kill_on_drop(false) keeps this exact child alive if
-                        // EOF did not complete in time. Dropping its handle
-                        // preserves truthful stop uncertainty without a
-                        // destructive signal or unbounded host drain.
-                    }
+                if let Some(task) = child_diagnostic.take() {
+                    task.abort();
                 }
-                return;
+                let (state, error_code, exit, stop) = match stopped {
+                    Ok(Ok(status)) => (
+                        "dormant",
+                        None,
+                        Some(child_exit_from_status(&status, None)),
+                        SupervisorChildStopState::Confirmed,
+                    ),
+                    Ok(Err(_)) => (
+                        "isolated",
+                        Some("SUPERVISOR_STOP_UNKNOWN"),
+                        Some(SupervisorChildExit {
+                            category: SupervisorChildExitCategory::WaitError,
+                            code: None,
+                            error_code: None,
+                        }),
+                        SupervisorChildStopState::Uncertain,
+                    ),
+                    Err(_) => (
+                        "isolated",
+                        Some("SUPERVISOR_STOP_TIMEOUT"),
+                        None,
+                        SupervisorChildStopState::Uncertain,
+                    ),
+                };
+                let child_health = supervisor_child_health(&child_identity, exit, stop);
+                let retry = error_code.map(|_| MODULE_ACTOR_ISOLATED_RETRY);
+                record_module_actor_health(
+                    &control,
+                    state,
+                    1,
+                    error_code,
+                    retry,
+                    Some(&child_health),
+                )
+                .await?;
+                // kill_on_drop(false) keeps this exact child alive if EOF did
+                // not complete in time. Dropping its handle preserves truthful
+                // stop uncertainty without a destructive signal or unbounded
+                // host drain.
+                return Ok(());
             }
         };
         drop(bootstrap_pipe);
-        let status_code = match exit {
-            Some(Ok(status)) if status.success() => "SUPERVISOR_STOPPED",
-            Some(Ok(_)) => "SUPERVISOR_EXITED",
-            Some(Err(_)) | None => "SUPERVISOR_STATUS_UNKNOWN",
+        let child_diagnostic = join_child_diagnostic(child_diagnostic.take()).await;
+        let child_exit = child_exit_from_result(&exit, child_diagnostic.as_deref());
+        let child_stop = match &exit {
+            Some(Ok(_)) => SupervisorChildStopState::NotRequested,
+            Some(Err(_)) | None => SupervisorChildStopState::Uncertain,
         };
+        let child_health = supervisor_child_health(
+            &child_identity,
+            Some(child_exit),
+            child_stop,
+        );
         let demanded = match module_supervisor_has_demand(&store).await {
             Ok(demanded) => demanded,
             Err(error) => {
                 failures = failures.saturating_add(1).min(32);
                 let (state, delay) = process_failure_state(failures, retry);
-                record_module_actor_status(
+                if let Err(health_error) = record_module_actor_health(
                     &control,
                     state,
                     failures,
                     Some(&error.code),
                     Some(delay),
+                    Some(&child_health),
                 )
-                .await;
+                .await
+                {
+                    return Err(error.with_secondary_code(health_error.code));
+                }
                 if !wait_for_supervisor_backoff(delay, &mut stopping).await {
-                    return;
+                    return Ok(());
                 }
                 retry = (retry * 2).min(MODULE_ACTOR_RETRY_MAX);
                 continue;
             }
         };
         if !demanded {
-            record_module_actor_status(&control, "dormant", 0, None, None).await;
+            record_module_actor_health(
+                &control,
+                "dormant",
+                0,
+                None,
+                None,
+                Some(&child_health),
+            )
+            .await?;
             failures = 0;
             retry = SUPERVISOR_PROCESS_BASE_RETRY;
             continue;
@@ -428,9 +536,22 @@ async fn run_supervisor_process_loop(
         }
         failures = failures.saturating_add(1).min(32);
         let (state, delay) = process_failure_state(failures, retry);
-        record_module_actor_status(&control, state, failures, Some(status_code), Some(delay)).await;
+        let status_code = match &exit {
+            Some(Ok(status)) if status.success() => "SUPERVISOR_STOPPED",
+            Some(Ok(_)) => "SUPERVISOR_EXITED",
+            Some(Err(_)) | None => "SUPERVISOR_STATUS_UNKNOWN",
+        };
+        record_module_actor_health(
+            &control,
+            state,
+            failures,
+            Some(status_code),
+            Some(delay),
+            Some(&child_health),
+        )
+        .await?;
         if !wait_for_supervisor_retry(delay, &mut demand_changes, &mut stopping).await {
-            return;
+            return Ok(());
         }
         retry = (retry * 2).min(MODULE_ACTOR_RETRY_MAX);
     }
@@ -551,13 +672,236 @@ fn supervisor_sibling_executable() -> Result<PathBuf> {
     Ok(executable)
 }
 
-async fn spawn_supervisor_child(executable: &Path, frame: &[u8]) -> Result<(Child, ChildStdin)> {
+#[derive(Debug)]
+struct SupervisorChildIdentity {
+    pid: u32,
+    birth: Value,
+    image: Value,
+}
+
+impl SupervisorChildIdentity {
+    fn validate(&self, executable: &Path) -> Result<()> {
+        if self.pid == 0
+            || self.birth.get("pid").and_then(Value::as_u64) != Some(u64::from(self.pid))
+            || self.image.get("pid").and_then(Value::as_u64) != Some(u64::from(self.pid))
+        {
+            return Err(Error::new(
+                "MODULE_SUPERVISOR_CHILD_IDENTITY_UNKNOWN",
+                "supervisor child PID or birth identity is not verifiable",
+            ));
+        }
+        let image_path = self
+            .image
+            .get("image_path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                Error::new(
+                    "MODULE_SUPERVISOR_CHILD_IMAGE_MISMATCH",
+                    "supervisor child image path is unavailable",
+                )
+            })?;
+        let image_digest = self
+            .image
+            .get("image_sha256")
+            .and_then(Value::as_str)
+            .and_then(|value| value.strip_prefix("sha256:"))
+            .filter(|value| value.len() == 64)
+            .filter(|value| {
+                value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            });
+        if image_digest.is_none() {
+            return Err(Error::new(
+                "MODULE_SUPERVISOR_CHILD_IMAGE_MISMATCH",
+                "supervisor child image digest is unavailable",
+            ));
+        }
+        let expected_path = executable.canonicalize().map_err(|_| {
+            Error::new(
+                "MODULE_SUPERVISOR_CHILD_IMAGE_MISMATCH",
+                "configured supervisor executable could not be canonicalized",
+            )
+        })?;
+        let observed_path = Path::new(image_path).canonicalize().map_err(|_| {
+            Error::new(
+                "MODULE_SUPERVISOR_CHILD_IMAGE_MISMATCH",
+                "running supervisor image path could not be canonicalized",
+            )
+        })?;
+        let same_path = if cfg!(windows) {
+            expected_path
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&observed_path.to_string_lossy())
+        } else {
+            expected_path == observed_path
+        };
+        if !same_path {
+            return Err(Error::new(
+                "MODULE_SUPERVISOR_CHILD_IMAGE_MISMATCH",
+                "running supervisor image does not match the installed sibling",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn capture_supervisor_child_identity(
+    child: &Child,
+    executable: &Path,
+) -> Result<SupervisorChildIdentity> {
+    let pid = child.id().ok_or_else(|| {
+        Error::new(
+            "MODULE_SUPERVISOR_CHILD_IDENTITY_UNKNOWN",
+            "supervisor child PID is unavailable",
+        )
+    })?;
+    let birth = process_birth_identity(pid)
+        .map_err(|_| {
+            Error::new(
+                "MODULE_SUPERVISOR_CHILD_IDENTITY_UNKNOWN",
+                "supervisor child birth identity could not be read",
+            )
+        })?
+        .ok_or_else(|| {
+            Error::new(
+                "MODULE_SUPERVISOR_CHILD_IDENTITY_UNKNOWN",
+                "supervisor child exited before birth identity capture",
+            )
+        })?;
+    let image = process_image_identity(pid).map_err(|_| {
+        Error::new(
+            "MODULE_SUPERVISOR_CHILD_IDENTITY_UNKNOWN",
+            "supervisor child image identity could not be read",
+        )
+    })?;
+    let after = process_birth_identity(pid)
+        .map_err(|_| {
+            Error::new(
+                "MODULE_SUPERVISOR_CHILD_IDENTITY_UNKNOWN",
+                "supervisor child birth identity could not be rechecked",
+            )
+        })?
+        .ok_or_else(|| {
+            Error::new(
+                "MODULE_SUPERVISOR_CHILD_IDENTITY_UNKNOWN",
+                "supervisor child exited during identity capture",
+            )
+        })?;
+    if birth != after {
+        return Err(Error::new(
+            "MODULE_SUPERVISOR_CHILD_BIRTH_CHANGED",
+            "supervisor child birth identity changed during image capture",
+        ));
+    }
+    let identity = SupervisorChildIdentity { pid, birth, image };
+    identity.validate(executable)?;
+    Ok(identity)
+}
+
+async fn read_bounded_child_diagnostic(mut stderr: ChildStderr) -> Option<String> {
+    let mut bytes = Vec::with_capacity(SUPERVISOR_CHILD_DIAGNOSTIC_LIMIT);
+    let mut chunk = [0_u8; 128];
+    while bytes.len() < SUPERVISOR_CHILD_DIAGNOSTIC_LIMIT {
+        let remaining = SUPERVISOR_CHILD_DIAGNOSTIC_LIMIT - bytes.len();
+        let read = stderr.read(&mut chunk[..remaining.min(chunk.len())]).await.ok()?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+        if bytes.contains(&b'\n') {
+            break;
+        }
+    }
+    let line = std::str::from_utf8(&bytes).ok()?.lines().next()?.trim();
+    let code = line.strip_prefix("standalone module supervisor: ")?.trim();
+    if is_safe_optional_worker_code(code) {
+        Some(code.to_owned())
+    } else {
+        None
+    }
+}
+
+async fn join_child_diagnostic(task: Option<JoinHandle<Option<String>>>) -> Option<String> {
+    let Some(mut task) = task else {
+        return None;
+    };
+    match time::timeout(SUPERVISOR_PROCESS_STOP_TIMEOUT, &mut task).await {
+        Ok(Ok(code)) => code,
+        Ok(Err(_)) | Err(_) => {
+            task.abort();
+            None
+        }
+    }
+}
+
+async fn reap_failed_supervisor_child(mut child: Child) {
+    drop(child.stdin.take());
+    let diagnostic = child
+        .stderr
+        .take()
+        .map(|stderr| tokio::spawn(read_bounded_child_diagnostic(stderr)));
+    let _ = time::timeout(SUPERVISOR_PROCESS_STOP_TIMEOUT, child.wait()).await;
+    if let Some(task) = diagnostic {
+        task.abort();
+    }
+}
+
+fn supervisor_child_health(
+    identity: &SupervisorChildIdentity,
+    exit: Option<SupervisorChildExit>,
+    stop: SupervisorChildStopState,
+) -> SupervisorChildHealth {
+    SupervisorChildHealth {
+        process: SupervisorChildProcessIdentity {
+            pid: identity.pid,
+            birth: identity.birth.clone(),
+            image: identity.image.clone(),
+        },
+        stop,
+        exit,
+    }
+}
+
+fn child_exit_from_status(
+    status: &ExitStatus,
+    error_code: Option<&str>,
+) -> SupervisorChildExit {
+    SupervisorChildExit {
+        category: if status.code().is_some() {
+            SupervisorChildExitCategory::Exited
+        } else {
+            SupervisorChildExitCategory::Signaled
+        },
+        code: status.code(),
+        error_code: error_code.map(str::to_owned),
+    }
+}
+
+fn child_exit_from_result(
+    exit: &Option<std::result::Result<ExitStatus, std::io::Error>>,
+    error_code: Option<&str>,
+) -> SupervisorChildExit {
+    match exit {
+        Some(Ok(status)) => child_exit_from_status(status, error_code),
+        Some(Err(_)) | None => SupervisorChildExit {
+            category: SupervisorChildExitCategory::WaitError,
+            code: None,
+            error_code: error_code.map(str::to_owned),
+        },
+    }
+}
+
+async fn spawn_supervisor_child(
+    executable: &Path,
+    frame: &[u8],
+) -> Result<(Child, ChildStdin, SupervisorChildIdentity)> {
     let mut command = Command::new(executable);
     command
         .env_clear()
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .kill_on_drop(false);
     #[cfg(windows)]
     if let Some(system_root) = std::env::var_os("SystemRoot") {
@@ -569,8 +913,15 @@ async fn spawn_supervisor_child(executable: &Path, frame: &[u8]) -> Result<(Chil
             "installed supervisor process could not be started",
         )
     })?;
+    let identity = match capture_supervisor_child_identity(&child, executable) {
+        Ok(identity) => identity,
+        Err(error) => {
+            reap_failed_supervisor_child(child).await;
+            return Err(error);
+        }
+    };
     let Some(mut stdin) = child.stdin.take() else {
-        let _ = child.wait().await;
+        reap_failed_supervisor_child(child).await;
         return Err(Error::new(
             "MODULE_SUPERVISOR_BOOTSTRAP_PIPE_UNAVAILABLE",
             "supervisor bootstrap pipe is unavailable",
@@ -578,13 +929,13 @@ async fn spawn_supervisor_child(executable: &Path, frame: &[u8]) -> Result<(Chil
     };
     if stdin.write_all(frame).await.is_err() || stdin.flush().await.is_err() {
         drop(stdin);
-        let _ = child.wait().await;
+        reap_failed_supervisor_child(child).await;
         return Err(Error::new(
             "MODULE_SUPERVISOR_BOOTSTRAP_WRITE_FAILED",
             "supervisor bootstrap frame could not be delivered",
         ));
     }
-    Ok((child, stdin))
+    Ok((child, stdin, identity))
 }
 async fn record_module_actor_status(
     control: &SupervisorControlClient,
@@ -592,31 +943,46 @@ async fn record_module_actor_status(
     failures: u32,
     error_code: Option<&str>,
     retry: Option<Duration>,
-) {
+) -> Result<()> {
+    record_module_actor_health(control, state, failures, error_code, retry, None).await
+}
+
+async fn record_module_actor_health(
+    control: &SupervisorControlClient,
+    state: &'static str,
+    failures: u32,
+    error_code: Option<&str>,
+    retry: Option<Duration>,
+    child: Option<&SupervisorChildHealth>,
+) -> Result<()> {
     let error_code = error_code.map(safe_optional_worker_code);
     let retry_in_ms = retry.map(|delay| u64::try_from(delay.as_millis()).unwrap_or(u64::MAX));
-    if let Err(error) = control
-        .record_health(state, failures, error_code.as_deref(), retry_in_ms)
+    control
+        .record_health_with_child(
+            state,
+            failures,
+            error_code.as_deref(),
+            retry_in_ms,
+            child,
+        )
         .await
-    {
-        eprintln!(
-            "module supervisor health readback unavailable: {}",
-            error.code
-        );
-    }
+        .map_err(module_error)
 }
 
 fn safe_optional_worker_code(code: &str) -> String {
-    if !code.is_empty()
-        && code.len() <= 64
-        && code
-            .bytes()
-            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
-    {
+    if is_safe_optional_worker_code(code) {
         code.to_owned()
     } else {
         "SUPERVISOR_ERROR".to_owned()
     }
+}
+
+fn is_safe_optional_worker_code(code: &str) -> bool {
+    !code.is_empty()
+        && code.len() <= 64
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
 fn validate_host_config(config: &ModuleSupervisorHostConfig) -> Result<()> {
