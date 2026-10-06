@@ -1,6 +1,6 @@
 # Agent Operations — Manager-Owned Automation
 
-Revision 7 · 2026-10-05 · source review `2aec51bb`; modularization and observability are specified, not yet implemented.
+Revision 8 · 2026-10-05 · historical source review `2aec51bb`; modularization and observability have partial source implementation.
 
 **Status: partial implementation.** Current source includes manager-owned action
 admission and transfer, durable intake and peer coordination, the reviewed
@@ -14,19 +14,22 @@ below retain the complete requirements, including work still outstanding.
 
 ## Current operability and modularization
 
-The [2026-10-05 recheck](modularity-review-2026-10-05.md) reproduced the
-operator-only Task create/revise defect for both a registered manager and the
-current GM. Optional supervisor failure still stops the host, and the application
-is not yet split into independently built runtime packages. Do not describe the
-present system as fully modular or fully provider-neutral.
+The historical [2026-10-05 recheck](modularity-review-2026-10-05.md) reproduced
+the operator-only Task create/revise defect at its recorded revision. Later
+source admits ordinary authenticated Managers to planning, retains optional
+supervisor failures, and separates CLI, MCP, gateway and module supervisor
+packages/processes. Scoped logging and monitoring are connected in source.
+OpenCode native ownership/MCP effects and physical Kernel extraction remain in
+progress. These source changes have no current runtime qualification; see the
+exact boundaries in [Implementation status](../implementation-status.md).
 
 [Modular Runtime](modularity.md) owns the requested package/process boundaries,
 demand-driven activation, simpler ordinary manager authority and local restart.
 [Observability](observability.md) owns adjustable diagnostic depth and live views.
 These are implementation contracts, not another activation ledger or approval
 phase. Existing O1–O11 work is retained; M1–M6 specifies its extraction order and
-concrete completion conditions. Begin with usable manager commands and visible
-failures, not another provider or a full dashboard.
+concrete completion conditions. Finish required source before compilation,
+tests and native qualification, as directed by the owner.
 
 ## Product rule
 
