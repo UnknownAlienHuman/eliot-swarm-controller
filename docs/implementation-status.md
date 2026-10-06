@@ -69,6 +69,12 @@ consumer, which still validates exact applied feedback, current Task/Attempt,
 candidate and manager authority before admitting a correction. This source
 repair has not been compiled or tested.
 
+MCP `automation.config.preview/apply` now describes bounded change items and the
+existing event-rule forms, including exact generic ScriptRun selectors and the
+applied-submission ReviewDispatch selector. Partial patches may reuse the entry's
+existing steps; absent, null and empty event-rule arrays retain their distinct
+Store semantics. This is input-schema source delivery, not runtime qualification.
+
 The dependency source repair moves the selected rustls lock from `0.23.44` to
 `0.23.45` for GHSA-2mjx-qc3c-rqvc. The registry checksum and unchanged dependency
 requirements were checked against official metadata; only the version and

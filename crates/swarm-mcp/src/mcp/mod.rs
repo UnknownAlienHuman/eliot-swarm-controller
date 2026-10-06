@@ -1888,6 +1888,12 @@ fn refine_input_schema(method: &str, schema: &mut Value) {
         ));
     }
     let properties = &mut schema["properties"];
+    if matches!(
+        method,
+        "automation.config.preview" | "automation.config.apply"
+    ) {
+        properties["changes"] = automation_config_changes_schema();
+    }
     match method {
         "concilium.propose" => {
             properties["client_request_id"] = json!({
@@ -2519,6 +2525,136 @@ fn refine_input_schema(method: &str, schema: &mut Value) {
         }
         _ => {}
     }
+}
+
+fn automation_config_changes_schema() -> Value {
+    json!({
+        "type":"array",
+        "minItems":1,
+        "maxItems":32,
+        "description":"One to 32 revision-checked entry changes. Store validates duplicate automation IDs and cross-field patch semantics.",
+        "items":{
+            "type":"object",
+            "properties":{
+                "automation_id":{"type":"string","minLength":1,"maxLength":64,"pattern":"^[A-Za-z0-9._-]+$"},
+                "expected_revision":{"type":"integer","minimum":0,"maximum":9223372036854775807_i64},
+                "include_existing":{"type":"boolean","description":"Optional; defaults to false for the activation cut."},
+                "patch":automation_config_patch_schema()
+            },
+            "required":["automation_id","expected_revision","patch"],
+            "additionalProperties":false
+        }
+    })
+}
+
+fn automation_config_patch_schema() -> Value {
+    json!({
+        "type":"object",
+        "properties":{
+            "enabled":{"type":"boolean"},
+            "steps":{
+                "type":"array",
+                "maxItems":16,
+                "uniqueItems":true,
+                "items":{"type":"string","enum":[
+                    "work_dispatch","review_dispatch","review_disposition","repair_dispatch",
+                    "acceptance","publication","check_run","github_projection",
+                    "goal_progression","script_run"
+                ]}
+            },
+            "script_run":{
+                "oneOf":[
+                    {"type":"null"},
+                    {
+                        "type":"object",
+                        "properties":{"script_id":script_id_schema()},
+                        "required":["script_id"],
+                        "additionalProperties":false
+                    }
+                ]
+            },
+            "event_rules":automation_event_rules_schema()
+        },
+        "additionalProperties":true,
+        "description":"The O8 enabled, steps, script_run and event_rules fields are typed here. Other existing patch settings remain accepted; Store enforces their complete allowlist and shapes."
+    })
+}
+
+fn automation_event_rules_schema() -> Value {
+    json!({
+        "oneOf":[
+            {"type":"null"},
+            {
+                "type":"array",
+                "maxItems":16,
+                "description":"Omitted leaves this setting unchanged; null restores the stored absent/legacy form; an empty array disables automatic event routes. Each action must also be selected in the entry's steps, including steps retained by a partial patch; Store rejects duplicate rules.",
+                "items":automation_event_rule_schema()
+            }
+        ]
+    })
+}
+
+fn automation_event_rule_schema() -> Value {
+    json!({
+        "oneOf":[
+            {
+                "type":"object",
+                "properties":{
+                    "source":{"const":"task.submission"},
+                    "predicate":{"const":"applied"},
+                    "source_id":{"type":"null"},
+                    "event_kind":{"type":"null"},
+                    "status":{"type":"null"},
+                    "action":{"type":"string","enum":["review_dispatch","script_run"]}
+                },
+                "required":["source","predicate","action"],
+                "additionalProperties":false
+            },
+            {
+                "type":"object",
+                "properties":{
+                    "source":{"type":"null"},
+                    "predicate":{"type":"null"},
+                    "source_id":automation_selector_name_schema(),
+                    "event_kind":automation_selector_name_schema(),
+                    "status":automation_event_status_schema(),
+                    "action":{"const":"script_run"}
+                },
+                "required":["source_id","event_kind","action"],
+                "additionalProperties":false
+            },
+            {
+                "type":"object",
+                "properties":{
+                    "source":{"type":"null"},
+                    "predicate":{"type":"null"},
+                    "source_id":{"const":"controller"},
+                    "event_kind":{"const":"task.submission"},
+                    "status":{"const":"applied"},
+                    "action":{"const":"review_dispatch"}
+                },
+                "required":["source_id","event_kind","status","action"],
+                "additionalProperties":false
+            }
+        ]
+    })
+}
+
+fn automation_selector_name_schema() -> Value {
+    json!({
+        "type":"string",
+        "minLength":1,
+        "maxLength":256,
+        "pattern":"^[A-Za-z0-9._:/@-]+$",
+        "description":"The Store parser enforces the 256-byte ASCII selector bound. Unknown but syntactically valid selectors may be saved and remain idle until a safe event source is available."
+    })
+}
+
+fn automation_event_status_schema() -> Value {
+    json!({
+        "type":["string","null"],
+        "enum":["applied","completed","failed","incomplete","cancelled","rejected","sent","answered","invalidated","unknown",null]
+    })
 }
 
 fn script_bundle_request_schema() -> Value {
