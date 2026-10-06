@@ -59,7 +59,7 @@ pub type TextCapturePolicy = Arc<
 
 /// Validated local-recorder configuration. The optional producer is local to
 /// its caller; this crate installs no global subscriber or mandatory backend.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Config {
     enabled: bool,
     queue_records: usize,
@@ -67,6 +67,22 @@ pub struct Config {
     max_record_bytes: usize,
     text_redactor: Option<TextRedactor>,
     text_capture_policy: Option<TextCapturePolicy>,
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("enabled", &self.enabled)
+            .field("queue_records", &self.queue_records)
+            .field("queue_bytes", &self.queue_bytes)
+            .field("max_record_bytes", &self.max_record_bytes)
+            .field("text_redactor_configured", &self.text_redactor.is_some())
+            .field(
+                "text_capture_policy_configured",
+                &self.text_capture_policy.is_some(),
+            )
+            .finish()
+    }
 }
 
 impl Config {
