@@ -809,10 +809,7 @@ fn next_internal(
     let effective: Value = serde_json::from_str(&effective_raw)?;
     if matches!(
         method.as_str(),
-        "native.mcp.install"
-            | "native.mcp.observe"
-            | "native.mcp.arm"
-            | "native.mcp.read"
+        "native.mcp.install" | "native.mcp.observe" | "native.mcp.arm" | "native.mcp.read"
     ) {
         // Native C8 children retain the original pre-enrichment DTO digest.
         // The private effect is injected only at this authenticated module
@@ -866,14 +863,11 @@ fn next_internal(
         let internal_native_mcp = o["caller_id"] == "swarm.internal.c8.native_mcp"
             && matches!(
                 method.as_str(),
-                "native.mcp.install"
-                    | "native.mcp.observe"
-                    | "native.mcp.arm"
-                    | "native.mcp.read"
+                "native.mcp.install" | "native.mcp.observe" | "native.mcp.arm" | "native.mcp.read"
             );
         if internal_native_mcp {
-            let registration = meta(&tx, "client:swarm.internal.c8.native_mcp")?
-                .ok_or_else(|| {
+            let registration =
+                meta(&tx, "client:swarm.internal.c8.native_mcp")?.ok_or_else(|| {
                     Error::new(
                         "INTERNAL_CLIENT_NOT_REGISTERED",
                         "native MCP phase caller is not durably registered",
@@ -889,31 +883,30 @@ fn next_internal(
                 ));
             }
         }
-        let caller =
-            if opening_actor.is_some()
-                || repair_context.is_some()
-                || normalized_result_admitted
-                || internal_native_mcp
-            {
-                // The exact opening guard above validated the retained actor in
-                // this transaction. A technical requester is not a registered
-                // client or a Principal; no synthetic profile is created here.
-                Value::Null
-            } else {
-                let caller = meta(&tx, &format!("client:{}", model::text(&o, "caller_id")?))?
-                    .ok_or_else(|| {
-                        Error::new("UNAUTHORIZED", "original caller no longer registered")
-                    })?;
-                if caller["disabled"] == true {
-                    return Err(Error::new("UNAUTHORIZED", "original caller disabled"));
-                }
-                // Existing queued work must not retain an old remote Operator's
-                // privilege after the local bootstrap identity has been anchored.
-                if caller["role"] == "operator" {
-                    super::require_local_operator(&tx, model::text(&o, "caller_id")?)?;
-                }
-                caller
-            };
+        let caller = if opening_actor.is_some()
+            || repair_context.is_some()
+            || normalized_result_admitted
+            || internal_native_mcp
+        {
+            // The exact opening guard above validated the retained actor in
+            // this transaction. A technical requester is not a registered
+            // client or a Principal; no synthetic profile is created here.
+            Value::Null
+        } else {
+            let caller = meta(&tx, &format!("client:{}", model::text(&o, "caller_id")?))?
+                .ok_or_else(|| {
+                    Error::new("UNAUTHORIZED", "original caller no longer registered")
+                })?;
+            if caller["disabled"] == true {
+                return Err(Error::new("UNAUTHORIZED", "original caller disabled"));
+            }
+            // Existing queued work must not retain an old remote Operator's
+            // privilege after the local bootstrap identity has been anchored.
+            if caller["role"] == "operator" {
+                super::require_local_operator(&tx, model::text(&o, "caller_id")?)?;
+            }
+            caller
+        };
         let reconcile_starts_work = if method == "agent.reconcile"
             && b["observation"].get("module_contract_selector").is_some()
         {
@@ -1800,6 +1793,22 @@ pub(super) fn outcome_with_artifacts(
             "operation belongs to another binding",
         ));
     }
+    let module_owned_service = b["route"]["runtime"] == "module"
+        && b["route"]["module_artifact_id"] == crate::config::OPENCODE_RUST_ARTIFACT_ID
+        && b["route"]["owned_service"].is_object();
+    let has_owned_service_ready = r
+        .details
+        .as_object()
+        .is_some_and(|details| details.contains_key("owned_service_ready"));
+    if has_owned_service_ready
+        && !(module_owned_service
+            && o["method"] == "agent.open"
+            && matches!(r.outcome, EffectOutcome::Applied))
+    {
+        return Err(Error::invalid(
+            "owned service readiness is valid only for its applied module agent.open",
+        ));
+    }
     // Versioned bindings require a typed receipt for every outcome. Legacy
     // unversioned bindings retain their existing validators and wire contract.
     let module_receipt = if b["observation"].get("module_contract_selector").is_some() {
@@ -2201,7 +2210,27 @@ pub(super) fn outcome_with_artifacts(
     }
     if matches!(r.outcome, EffectOutcome::Applied) {
         if o["method"] == "agent.open" {
-            if let Some(contract) = pre_input_open.as_ref() {
+            if module_owned_service {
+                super::launcher_owned_service::retain_module_owned_service_ready(
+                    &tx, &id, generation, &o, &r,
+                )?;
+                let native = r
+                    .native_root_id
+                    .as_deref()
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| Error::invalid("open result requires native_root_id"))?;
+                let namespace = r
+                    .native_scope_key
+                    .as_deref()
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| Error::invalid("open result requires native_scope_key"))?;
+                if !b["native_root_id"].is_null()
+                    && (b["native_root_id"] != native || b["native_scope_key"] != namespace)
+                {
+                    return Err(Error::conflict("native identity changed"));
+                }
+                tx.execute("UPDATE bindings SET native_root_id=?3,native_scope_key=?4,state=CASE WHEN json_extract(state_json,'$.recovery_required')=1 THEN 'reconciling' ELSE 'ready' END,state_json=json_set(state_json,'$.waiting_for',NULL,'$.opening_evidence',json(?5)) WHERE binding_id=?1 AND generation=?2",params![id,generation,native,namespace,model::canonical(&r.details)?])?;
+            } else if let Some(contract) = pre_input_open.as_ref() {
                 crate::runtime::prepared::validate_pre_input_open(&b, &r, contract)?;
                 tx.execute("UPDATE bindings SET state=CASE WHEN json_extract(state_json,'$.recovery_required')=1 OR EXISTS(SELECT 1 FROM operations WHERE binding_id=?1 AND binding_generation=?2 AND operation_id<>?3 AND state IN ('sending','native_accepted','outcome_unknown') AND method IN ('agent.open','task.dispatch')) THEN 'reconciling' ELSE 'ready' END,state_json=json_set(state_json,'$.waiting_for',NULL,'$.opening_evidence',json(?4)) WHERE binding_id=?1 AND generation=?2",params![id,generation,r.operation_id,model::canonical(&r.details)?])?;
             } else if crate::runtime::prepared::is_prepared_claude_route(&b["route"]) {
@@ -2403,15 +2432,14 @@ pub(super) fn outcome_with_artifacts(
         // retained Operation receipt. Carry only the closed result-diagnostic
         // vocabulary into the Manager event projection; transport uncertainty
         // remains the existing outcome_unknown path.
-        let result_failure_code = if o["method"] == "agent.result"
-            && matches!(r.outcome, EffectOutcome::Rejected)
-        {
-            r.details["diagnostic_code"]
-                .as_str()
-                .filter(|code| super::is_safe_native_result_error_code(code))
-        } else {
-            None
-        };
+        let result_failure_code =
+            if o["method"] == "agent.result" && matches!(r.outcome, EffectOutcome::Rejected) {
+                r.details["diagnostic_code"]
+                    .as_str()
+                    .filter(|code| super::is_safe_native_result_error_code(code))
+            } else {
+                None
+            };
         super::insert_safe_system_event(
             &tx,
             "controller:runtime",

@@ -16,7 +16,7 @@ The pinned MCP plugin code prepares a bounded config in the fresh owner's privat
 
 ## Normalized result boundary
 
-agent.result is declared with swarm.normalized_result_page@1 and requires an exact selector containing the dispatch operation, native session, and assistant message IDs, validated against the saved dispatch receipt. This is a bounded normalized-result consumer; the declaration and selector checks do not qualify runtime result-body causality. Dispatch-side proof that the selected body is the causal result remains pending, so this package description makes no end-to-end runtime qualification or task-completion claim.
+agent.result is declared with swarm.normalized_result_page@1 and requires an exact selector containing the dispatch operation, native session, and assistant message IDs, validated against the saved dispatch receipt. OpenCode 2.0.7 public projections omit the immutable assistant-to-input parent link, so exact assistant readback fails closed with NATIVE_ASSISTANT_PARENT_UNAVAILABLE. The adapter records an Unknown outcome with correlation unknown, task_completion=unknown, and execution_complete=false; the Store projects it as operation.outcome_unknown with OUTCOME_UNKNOWN. The adapter never substitutes the latest assistant message or infers causality from timestamps or ordering. Runtime qualification remains unrun, and no task-completion claim is made.
 
 Artifact version 0.3.0 is selected explicitly. The retained legacy v1 artifact is a separate registration target, not a fallback when v0.3.0 is disabled, unavailable, or rejected.
 

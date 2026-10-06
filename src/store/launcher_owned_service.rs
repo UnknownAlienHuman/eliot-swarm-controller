@@ -9,13 +9,16 @@ use crate::{
     config::{Config, OwnedOpenCodeServiceConfig, Route},
     error::{Error, Result},
     model,
-    runtime::opencode_v2::{
-        Options,
-        owned_service::{
-            OwnedServiceHandle, OwnedServiceIntent, OwnedServiceOrigin, OwnedServiceReadback,
-            OwnedServiceRoute, OwnedServiceSeed, OwnedServiceStartFailure, OwnedServiceStartPermit,
-            OwnedServiceStartStage, prepare_owned_service,
-            prepare_owned_service_with_provider_auth, start_foreground,
+    runtime::{
+        EffectOutcome, RuntimeOutcome,
+        opencode_v2::{
+            Options,
+            owned_service::{
+                OwnedServiceHandle, OwnedServiceIntent, OwnedServiceOrigin, OwnedServiceReadback,
+                OwnedServiceRoute, OwnedServiceSeed, OwnedServiceStartFailure,
+                OwnedServiceStartPermit, OwnedServiceStartStage, prepare_owned_service,
+                prepare_owned_service_with_provider_auth, start_foreground,
+            },
         },
     },
     workspace::LeaseAuthorityRef,
@@ -1091,15 +1094,20 @@ pub(crate) fn module_owned_route_options(
                 "owned module route options could not be projected",
             )
         })?;
-    object.insert("__eliot_owned_service".to_owned(), serde_json::to_value(owned_service)?);
-    object.insert("__eliot_owner_nonce".to_owned(), Value::String(row.owner_nonce));
+    object.insert(
+        "__eliot_owned_service".to_owned(),
+        serde_json::to_value(owned_service)?,
+    );
+    object.insert(
+        "__eliot_owner_nonce".to_owned(),
+        Value::String(row.owner_nonce),
+    );
     Ok(Value::Object(object))
 }
 
-/// Return only the typed native options for the C8 command envelope. The
-/// standalone launch mapper consumes the two private owner markers above;
-/// they are deliberately removed before a RuntimeCommand reaches the adapter,
-/// whose route decoder accepts only the registered NativeOptions shape.
+/// Derive plain native options for the C8 command envelope from the exact
+/// retained owner route. Fresh standalone launch projection remains
+/// reserved-only; a service-observed row can reuse only its verified options.
 pub(crate) fn module_owned_native_options(
     db: &Connection,
     config: &Config,
@@ -1107,23 +1115,360 @@ pub(crate) fn module_owned_native_options(
     generation: i64,
     native_options: Value,
 ) -> Result<Value> {
-    let projected =
-        module_owned_route_options(db, config, binding_id, generation, native_options)?;
-    let mut object = projected.as_object().cloned().ok_or_else(|| {
+    let supplied = native_options.as_object().ok_or_else(|| {
         Error::new(
             "MODULE_CONFIG_INVALID",
-            "owned module route options could not be projected",
+            "owned module route native options must be an object",
         )
     })?;
-    if object.remove("__eliot_owned_service").is_none()
-        || object.remove("__eliot_owner_nonce").is_none()
+    let workspace_directory = supplied
+        .get("directory")
+        .and_then(Value::as_str)
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| {
+            Error::new(
+                "MODULE_CONFIG_INVALID",
+                "owned module route has no retained workspace directory",
+            )
+        })?;
+    let row = load_start_row(db, binding_id, generation)?.ok_or_else(|| {
+        Error::new(
+            "OWNED_SERVICE_INTENT_MISSING",
+            "selected owned module has no retained Store start intent",
+        )
+    })?;
+    if !matches!(row.state.as_str(), "reserved" | "service_observed") {
+        return Err(recovery_required(&row.state));
+    }
+    let (_binding, stored_route, retained_workspace, retained_route) =
+        retained_start_route(db, binding_id, generation, &row)?;
+    if retained_workspace.to_str() != Some(workspace_directory) {
+        return Err(scope_changed());
+    }
+    let current = current_owned_route(config, &stored_route, &retained_workspace)?;
+    let service_config = current.owned_service.as_ref().ok_or_else(scope_changed)?;
+    let route = OwnedServiceRoute::from_config(service_config)?
+        .for_launch(&row.owner_nonce, &retained_workspace)?;
+    if route.service_id() != row.service_id
+        || route.version() != row.service_version
+        || route.route_digest()? != row.route_digest
+        || route.route_digest()? != retained_route.route_digest()?
     {
-        return Err(Error::new(
-            "MODULE_CONFIG_INVALID",
-            "owned module route is missing its private owner projection",
+        return Err(scope_changed());
+    }
+    match row.state.as_str() {
+        "reserved"
+            if row.proof_json == "{}"
+                && row.process_id.is_none()
+                && row.process_birth_token.is_none()
+                && row.executable_sha256.is_none() => {}
+        "service_observed" => {
+            let proof: Value = serde_json::from_str(&row.proof_json)
+                .map_err(|_| corrupt("owned service readiness proof is invalid JSON"))?;
+            verify_readback_value(&proof, &route, &row)?;
+        }
+        _ => return Err(recovery_required(&row.state)),
+    }
+    Ok(serde_json::to_value(route.options())?)
+}
+
+/// Bind the adapter-owned successful open receipt to the already admitted
+/// launch row. This records an observed process fact; it grants no later
+/// dispatch permission and performs no process or filesystem effect.
+pub(crate) fn retain_module_owned_service_ready(
+    tx: &Transaction<'_>,
+    binding_id: &str,
+    generation: i64,
+    operation: &Value,
+    outcome: &RuntimeOutcome,
+) -> Result<()> {
+    if !matches!(outcome.outcome, EffectOutcome::Applied)
+        || operation["operation_id"] != outcome.operation_id
+        || operation["method"] != "agent.open"
+        || operation["binding_id"] != binding_id
+        || operation["binding_generation"] != generation
+        || outcome.details["native_replay"] != false
+        || outcome.details["completion_condition"] != "native_session_created"
+        || outcome.details["durable_origin"] != "exact_session_created_event"
+    {
+        return Err(corrupt(
+            "owned service readiness is not an exact applied agent.open receipt",
         ));
     }
-    Ok(Value::Object(object))
+    let receipt: swarm_contracts::runtime::OwnedServiceReadyReceipt =
+        serde_json::from_value(outcome.details["owned_service_ready"].clone())
+            .map_err(|_| corrupt("owned service readiness receipt has an invalid shape"))?;
+    receipt
+        .validate()
+        .map_err(|_| corrupt("owned service readiness receipt is invalid"))?;
+    let row = load_start_row(tx, binding_id, generation)?
+        .ok_or_else(|| corrupt("owned service readiness has no retained start reservation"))?;
+    if row.state != "reserved"
+        || row.open_operation_id != outcome.operation_id
+        || row.binding_id != binding_id
+        || row.binding_generation != generation
+        || row.process_id.is_some()
+        || row.process_birth_token.is_some()
+        || row.executable_sha256.is_some()
+        || row.proof_json != "{}"
+        || receipt.service_id != row.service_id
+        || receipt.service_version != row.service_version
+        || receipt.owner_nonce != row.owner_nonce
+    {
+        return Err(corrupt(
+            "owned service readiness differs from its reserved Store intent",
+        ));
+    }
+    let (binding, stored_route, workspace_directory, route) =
+        retained_start_route(tx, binding_id, generation, &row)?;
+    let expected_scope = format!("opencode-v2:{}", row.service_id);
+    let native_root_id = outcome
+        .native_root_id
+        .as_deref()
+        .filter(|value| {
+            !value.is_empty() && value.len() <= MAX_ID_BYTES && !value.chars().any(char::is_control)
+        })
+        .ok_or_else(|| corrupt("owned service open is missing its native session identity"))?;
+    if outcome.native_scope_key.as_deref() != Some(expected_scope.as_str())
+        || binding
+            .native_root_id
+            .as_deref()
+            .is_some_and(|retained| retained != native_root_id)
+        || binding
+            .native_scope_key
+            .as_deref()
+            .is_some_and(|retained| retained != expected_scope.as_str())
+        || model::canonical(&outcome.details["model"])?
+            != model::canonical(&serde_json::to_value(route.options().model)?)?
+        || model::canonical(&outcome.details["selected_model"])?
+            != model::canonical(&serde_json::to_value(route.options().model)?)?
+        || route.service_id() != row.service_id
+        || route.version() != row.service_version
+        || route.route_digest()? != row.route_digest
+        || route.bun_sha256() != receipt.bun_sha256.as_str()
+        || route.server_program_sha256() != receipt.server_program_sha256.as_str()
+        || stored_route.native_options["directory"].as_str() != workspace_directory.to_str()
+    {
+        return Err(corrupt(
+            "owned service readiness differs from its retained route or native session",
+        ));
+    }
+    let mut proof = serde_json::to_value(&receipt)?;
+    let proof_fields = proof
+        .as_object_mut()
+        .ok_or_else(|| corrupt("owned service readiness proof is malformed"))?;
+    proof_fields.insert(
+        "route_digest".to_owned(),
+        Value::String(row.route_digest.clone()),
+    );
+    if let Some(provider_auth) = outcome.details.get("provider_auth") {
+        proof_fields.insert("provider_auth".to_owned(), provider_auth.clone());
+    }
+    let checked = OwnedServiceReadback::from_retained_value(&proof, &route)?;
+    let canonical = model::canonical(&proof)?;
+    if canonical.len() > MAX_PROOF_BYTES
+        || checked.owner_nonce() != row.owner_nonce
+        || checked.service_id() != row.service_id
+        || checked.version() != row.service_version
+        || checked.route_digest() != row.route_digest
+        || checked.pid() == 0
+        || !is_sha256(checked.birth_token())
+        || checked.binary_sha256() != route.bun_sha256()
+    {
+        return Err(corrupt(
+            "owned service readiness proof differs from its retained start intent",
+        ));
+    }
+    let changed = tx.execute(
+        "UPDATE owned_service_starts SET state='service_observed',process_id=?1,
+             process_birth_token=?2,executable_sha256=?3,proof_json=?4,updated_at_ms=?5
+         WHERE launch_operation_id=?6 AND open_operation_id=?7 AND binding_id=?8
+           AND binding_generation=?9 AND task_id=?10 AND task_revision=?11 AND attempt_id=?12
+           AND lease_id=?13 AND lease_generation=?14 AND binding_digest=?15
+           AND state='reserved' AND process_id IS NULL AND process_birth_token IS NULL
+           AND executable_sha256 IS NULL AND proof_json='{}' AND intent_nonce=?16
+           AND route_digest=?17 AND intent_digest=?18",
+        params![
+            i64::from(checked.pid()),
+            checked.birth_token(),
+            checked.binary_sha256(),
+            canonical,
+            model::now_ms()?,
+            row.launch_operation_id,
+            row.open_operation_id,
+            row.binding_id,
+            row.binding_generation,
+            row.task_id,
+            row.task_revision,
+            row.attempt_id,
+            row.lease_id,
+            row.lease_generation,
+            row.binding_digest,
+            row.owner_nonce,
+            row.route_digest,
+            row.intent_digest,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(corrupt(
+            "owned service readiness was not retained by its exact reservation",
+        ));
+    }
+    Ok(())
+}
+
+fn retained_start_route(
+    db: &Connection,
+    binding_id: &str,
+    generation: i64,
+    row: &OwnedStartRow,
+) -> Result<(BindingRow, Route, PathBuf, OwnedServiceRoute)> {
+    let binding = binding_row(db, binding_id, generation)?;
+    let stored_route = parse_route(&binding.route_json)?;
+    if binding.lane_id != format!("launch-{}", row.lease_id)
+        || binding.module_artifact_id != crate::config::OPENCODE_RUST_ARTIFACT_ID
+        || stored_route.runtime != "module"
+        || stored_route.module_artifact_id != crate::config::OPENCODE_RUST_ARTIFACT_ID
+        || row.binding_id != binding_id
+        || row.binding_generation != generation
+    {
+        return Err(corrupt("owned service retained binding route is invalid"));
+    }
+    let parent = operation_row(db, &row.launch_operation_id)?
+        .ok_or_else(|| corrupt("owned service retained launch Operation is missing"))?;
+    let open = operation_row(db, &row.open_operation_id)?
+        .ok_or_else(|| corrupt("owned service retained open Operation is missing"))?;
+    if parent.method != "swarm.launch"
+        || parent.caller_id != row.technical_requester_id
+        || parent.task_id.as_deref() != Some(row.task_id.as_str())
+        || parent.attempt_id.as_deref() != Some(row.attempt_id.as_str())
+        || parent.binding_id.as_deref() != Some(binding_id)
+        || parent.binding_generation != Some(generation)
+        || open.method != "agent.open"
+        || open.caller_id != row.technical_requester_id
+        || open.prerequisite_operation_id.as_deref() != Some(row.launch_operation_id.as_str())
+        || open.task_id.as_deref() != Some(row.task_id.as_str())
+        || open.attempt_id.as_deref() != Some(row.attempt_id.as_str())
+        || open.binding_id.as_deref() != Some(binding_id)
+        || open.binding_generation != Some(generation)
+        || !matches!(
+            open.state.as_str(),
+            "queued" | "sending" | "native_accepted" | "settled" | "outcome_unknown"
+        )
+    {
+        return Err(corrupt(
+            "owned service retained Operation linkage is invalid",
+        ));
+    }
+    let parent_request: Value = serde_json::from_str(&parent.effective_request_json)
+        .map_err(|_| corrupt("owned service retained launch manifest is invalid"))?;
+    let manifest = parent_request
+        .get("launch_manifest")
+        .ok_or_else(|| corrupt("owned service retained launch manifest is missing"))?;
+    let task_revision = manifest["task"]["observed_revision"]
+        .as_i64()
+        .filter(|revision| *revision > 0)
+        .ok_or_else(|| corrupt("owned service retained Task revision is invalid"))?;
+    if task_revision != row.task_revision
+        || manifest["task"]["task_id"] != row.task_id
+        || manifest["task"]["attempt_id"] != row.attempt_id
+        || manifest["binding"]["operation_id"] != row.open_operation_id
+        || manifest["binding"]["binding_id"] != binding_id
+        || manifest["binding"]["generation"] != generation
+        || launch_manifest_route_alias(manifest)? != stored_route.alias.as_str()
+        || manifest["workspace"]["lease_authority"]["lease_id"] != row.lease_id
+    {
+        return Err(corrupt(
+            "owned service launch manifest differs from its retained row",
+        ));
+    }
+    validate_actor_link(db, &parent, manifest, row)?;
+    let lease: LeaseAuthorityRef =
+        serde_json::from_value(manifest["workspace"]["lease_authority"].clone())
+            .map_err(|_| corrupt("owned service retained lease authority is invalid"))?;
+    if lease.lease_id != row.lease_id
+        || lease.generation != row.lease_generation
+        || lease.binding_digest != row.binding_digest
+        || lease.task_id != row.task_id
+        || lease.task_revision != row.task_revision
+        || lease.attempt_id.as_deref() != Some(row.attempt_id.as_str())
+        || lease.owner_client_id != row.effective_manager_id
+        || lease.operation_id != row.launch_operation_id
+        || lease.state != "held"
+    {
+        return Err(corrupt(
+            "owned service retained lease differs from its intent",
+        ));
+    }
+    let workspace_directory = historical_workspace_path(db, &lease)?;
+    if stored_route.native_options["directory"].as_str() != workspace_directory.to_str() {
+        return Err(corrupt("owned service retained workspace path changed"));
+    }
+    let child_original: Value = serde_json::from_str(&open.original_request_json)
+        .map_err(|_| corrupt("owned service retained open request is invalid"))?;
+    let expected_child = json!({
+        "client_request_id":format!("launch:{}:open", row.launch_operation_id),
+        "lane_id":format!("launch-{}", row.lease_id),
+        "route":stored_route.alias,
+    });
+    if model::canonical(&child_original)? != model::canonical(&expected_child)? {
+        return Err(corrupt(
+            "owned service open request differs from its launch",
+        ));
+    }
+    let child_effective: Value = serde_json::from_str(&open.effective_request_json)
+        .map_err(|_| corrupt("owned service retained open linkage is invalid"))?;
+    if child_effective["operation_contract"]["parent_launch_operation_id"]
+        != row.launch_operation_id
+        || child_effective["route"]["alias"] != stored_route.alias
+        || child_effective["workspace_lease"]["lease_id"] != row.lease_id
+        || child_effective["workspace_lease"]["generation"] != row.lease_generation
+        || child_effective["workspace_lease"]["binding_digest"] != row.binding_digest
+        || child_effective["receipt"]["value"]["operation_id"] != row.open_operation_id
+        || child_effective["receipt"]["value"]["binding_id"] != binding_id
+        || child_effective["receipt"]["value"]["generation"] != generation
+    {
+        return Err(corrupt(
+            "owned service open receipt differs from its retained row",
+        ));
+    }
+    if intent_digest(
+        &row.launch_operation_id,
+        &row.open_operation_id,
+        binding_id,
+        generation,
+        &row.task_id,
+        row.task_revision,
+        &row.attempt_id,
+        &row.lease_id,
+        row.lease_generation,
+        &row.technical_requester_id,
+        &row.effective_manager_id,
+        &row.service_id,
+        &row.service_version,
+        &row.route_digest,
+        &row.binding_digest,
+        &row.owner_nonce,
+        &manifest["actor"],
+    )? != row.intent_digest
+    {
+        return Err(corrupt("owned service intent digest is not exact"));
+    }
+    let service_config = stored_route
+        .owned_service
+        .as_ref()
+        .ok_or_else(|| corrupt("owned module route has no service declaration"))?;
+    let route = OwnedServiceRoute::from_config(service_config)?
+        .for_launch(&row.owner_nonce, &workspace_directory)?;
+    if route.service_id() != row.service_id
+        || route.version() != row.service_version
+        || route.route_digest()? != row.route_digest
+    {
+        return Err(corrupt(
+            "owned service route differs from its retained intent",
+        ));
+    }
+    Ok((binding, stored_route, workspace_directory, route))
 }
 
 fn owned_opencode_artifact(artifact: &str) -> bool {
@@ -2576,11 +2921,10 @@ fn current_owned_route(
     expected_workspace_directory: &std::path::Path,
 ) -> Result<Route> {
     let mut current = config.route(&stored.alias)?;
-    let supported_route =
-        (current.runtime == crate::runtime::opencode_v2::RUNTIME
-            && current.module_artifact_id == crate::runtime::opencode_v2::ARTIFACT_ID)
-            || (current.runtime == "module"
-                && current.module_artifact_id == crate::config::OPENCODE_RUST_ARTIFACT_ID);
+    let supported_route = (current.runtime == crate::runtime::opencode_v2::RUNTIME
+        && current.module_artifact_id == crate::runtime::opencode_v2::ARTIFACT_ID)
+        || (current.runtime == "module"
+            && current.module_artifact_id == crate::config::OPENCODE_RUST_ARTIFACT_ID);
     if !supported_route || current.owned_service.is_none() {
         return Err(scope_changed());
     }
