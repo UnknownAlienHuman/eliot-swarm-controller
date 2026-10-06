@@ -98,6 +98,9 @@ where
     )
 }
 
+// The public actor API's seven independent inputs plus an optional shutdown
+// signal retain the same single-writer ownership boundary.
+#[allow(clippy::too_many_arguments)]
 fn spawn_writer_actor_inner<
     Database,
     Run,
