@@ -3,12 +3,7 @@
 mod diffs;
 mod tool_files;
 
-use super::{
-    Options, Service,
-    effects::delivered_matches,
-    http::{Data, decode},
-    input_id, valid_id,
-};
+use super::{Options, Service, effects::delivered_matches, http::decode, input_id, valid_id};
 use crate::{
     artifacts::{MAX_PAGE_BYTES, ResultPage},
     error::{Error, Result},
@@ -153,13 +148,58 @@ impl Service {
             "location":value["location"],"model":value["model"]}),
         )
     }
+    /// The pinned 2.0.7 server exposes only the bounded session message-list
+    /// route; there is no public message-by-ID endpoint. Locate the requested
+    /// ID through that ordered projection, retaining cursor and scan bounds.
+    /// This proves the returned assistant message belongs to the session, but
+    /// it cannot prove which dispatched input caused it.
     async fn message(&self, session: &str, id: &str) -> Result<Value> {
-        let message: Data<Value> = decode(
-            self.get(&format!("/api/session/{session}/message/{id}"), &[])
-                .await?,
-        )?;
-        validate_message(&message.data, session, Some(id))?;
-        Ok(message.data)
+        let mut cursor: Option<String> = None;
+        let mut cursors = BTreeSet::new();
+        let mut ids = BTreeSet::new();
+        let mut scanned_bytes = 0usize;
+        for _ in 0..MAX_TIMELINE_PAGES {
+            let mut query = vec![("limit", PAGE_MESSAGES.to_string())];
+            if let Some(cursor) = &cursor {
+                query.push(("cursor", cursor.clone()));
+            } else {
+                query.push(("order", "desc".into()));
+            }
+            let raw = self
+                .get(&format!("/api/session/{session}/message"), &query)
+                .await?;
+            scanned_bytes = scanned_bytes.saturating_add(model::canonical(&raw)?.len());
+            if scanned_bytes > MAX_SCAN_BYTES {
+                return Err(unavailable("RESULT_SCAN_LIMIT"));
+            }
+            let page: MessagePage = decode(raw)?;
+            if page.data.len() > PAGE_MESSAGES
+                || (page.data.is_empty() && page.cursor.next.is_some())
+            {
+                return Err(unavailable("NATIVE_MESSAGE_PAGE"));
+            }
+            for message in page.data {
+                validate_message(&message, session, None)?;
+                let message_id = model::text(&message, "id")?.to_owned();
+                if !ids.insert(message_id.clone()) {
+                    return Err(unavailable("NATIVE_MESSAGE_DUPLICATE"));
+                }
+                if message_id == id {
+                    validate_message(&message, session, Some(id))?;
+                    return Ok(message);
+                }
+            }
+            match page.cursor.next {
+                None => return Err(unavailable("RESULT_MESSAGE_NOT_FOUND")),
+                Some(next)
+                    if !next.is_empty() && next.len() <= 4096 && cursors.insert(next.clone()) =>
+                {
+                    cursor = Some(next)
+                }
+                Some(_) => return Err(unavailable("NATIVE_CURSOR_CYCLE")),
+            }
+        }
+        Err(unavailable("RESULT_SCAN_LIMIT"))
     }
     /// Find the exact user ID in an unfiltered ordered projection. Moving past
     /// a newer idle replaces the candidate boundary, so an old input cannot
@@ -335,9 +375,17 @@ impl Service {
                     if self.message(session, id).await? != message {
                         return Err(unavailable("RESULT_SOURCE_CHANGED"));
                     }
-                    let source = json!({"kind":kind,"native_session_id":session,"message_id":id,
-                    "model":message["model"],"native_completed_at":message["time"]["completed"],
-                    "finish":message["finish"],"read_method":"session.message.get"});
+                    let source = json!({
+                        "kind":kind,
+                        "native_session_id":session,
+                        "message_id":id,
+                        "model":message["model"],
+                        "native_completed_at":message["time"]["completed"],
+                        "finish":message["finish"],
+                        "read_method":"session.message.list",
+                        "assistant_result_correlation":"not_exposed",
+                        "assistant_result_correlation_reason":"assistant_message_has_no_input_parent_in_public_projection"
+                    });
                     (
                         model::canonical(&message)?.into_bytes(),
                         source,

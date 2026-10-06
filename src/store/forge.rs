@@ -14,6 +14,7 @@ use crate::{
     model::{self, Principal, Role},
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
@@ -124,6 +125,73 @@ struct NativeWorkerJob {
     timeout_seconds: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ForgeExecutionPin {
+    git_executable: PathBuf,
+    git_executable_sha256: String,
+    worker_executable: PathBuf,
+    worker_executable_sha256: String,
+}
+
+impl ForgeExecutionPin {
+    fn capture(config: &ForgeConfig) -> Result<Self> {
+        let worker_executable = forge_worker_executable()?;
+        let worker_executable_sha256 = hash_bounded_file(&worker_executable, 128 * 1024 * 1024)?;
+        let git_executable = config.git_executable.clone();
+        let git_executable_sha256 = hash_bounded_file(&git_executable, 128 * 1024 * 1024)?;
+        Ok(Self {
+            git_executable,
+            git_executable_sha256,
+            worker_executable,
+            worker_executable_sha256,
+        })
+    }
+
+    fn validate(&self) -> Result<()> {
+        if !self.git_executable.is_absolute()
+            || !self.worker_executable.is_absolute()
+            || !valid_worker_digest(&self.git_executable_sha256)
+            || !valid_worker_digest(&self.worker_executable_sha256)
+        {
+            return Err(Error::new(
+                "FORGE_INTENT_INVALID",
+                "saved Forge execution pin is invalid",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The immutable executable facts are captured by the Store's file-I/O lane
+/// before the admission transaction opens.  A failed capture is carried into
+/// that transaction so direct admission retains its normal rejected receipt;
+/// automation admission returns the same error through its existing isolated
+/// reservation savepoint.
+#[derive(Debug)]
+pub(super) enum ForgeExecutionPreparation {
+    Ready(ForgeExecutionPin),
+    Failed(Error),
+    Skipped,
+}
+
+impl ForgeExecutionPreparation {
+    pub(super) fn capture(config: &ForgeConfig) -> Self {
+        match ForgeExecutionPin::capture(config) {
+            Ok(pin) => Self::Ready(pin),
+            Err(error) => Self::Failed(error),
+        }
+    }
+
+    fn pin(&self) -> Result<Option<&ForgeExecutionPin>> {
+        match self {
+            Self::Ready(pin) => Ok(Some(pin)),
+            Self::Failed(error) => Err(error.clone()),
+            Self::Skipped => Ok(None),
+        }
+    }
+}
+
 struct NativeWorkerRun {
     job: NativeWorkerJob,
     child: TokioChild,
@@ -161,6 +229,9 @@ struct ForgeWork {
     project: ForgeProject,
     candidate: Option<ArtifactRecord>,
     mode: WorkMode,
+    /// Captured with the durable publication intent. `None` is retained only
+    /// for historical Operations admitted before executable pinning existed.
+    execution: Option<ForgeExecutionPin>,
     transfer_continuation: Option<TransferContinuation>,
 }
 
@@ -547,6 +618,7 @@ pub(super) fn reserve(
     value: &Value,
     id: &str,
     config: &Config,
+    preparation: Option<&ForgeExecutionPreparation>,
 ) -> Result<Value> {
     let current = current_principal(tx, p.clone())?;
     if !matches!(current.role, Role::Operator | Role::Manager) {
@@ -562,7 +634,15 @@ pub(super) fn reserve(
     let input = PublishRefRequest::parse(value)?;
     let (mut intent, _project, _candidate) = accepted_candidate(tx, &actor, &input, &config.forge)?;
     intent.operation_id = id.to_owned();
-    persist_intent(tx, id, &input, &intent, None)?;
+    let execution = preparation
+        .ok_or_else(|| {
+            Error::new(
+                "FORGE_EXECUTION_PREPARATION_MISSING",
+                "Forge admission did not retain its executable facts",
+            )
+        })?
+        .pin()?;
+    persist_intent(tx, id, &input, &intent, execution, None)?;
     if let Some(owner) = exact_slot_owner(tx, id, &intent)? {
         return Ok(coalesced_receipt(id, &owner));
     }
@@ -576,6 +656,7 @@ pub(super) fn reserve_on_behalf(
     value: &Value,
     id: &str,
     config: &Config,
+    preparation: Option<&ForgeExecutionPreparation>,
 ) -> Result<Value> {
     let operation = operations::get_operation(tx, id)?;
     if operation["method"] != "forge.publish_ref"
@@ -591,7 +672,22 @@ pub(super) fn reserve_on_behalf(
     let input = PublishRefRequest::parse(value)?;
     let (mut intent, _project, _candidate) = accepted_candidate(tx, &actor, &input, &config.forge)?;
     intent.operation_id = id.to_owned();
-    persist_intent(tx, id, &input, &intent, Some(&context.linkage_value()))?;
+    let execution = preparation
+        .ok_or_else(|| {
+            Error::new(
+                "FORGE_EXECUTION_PREPARATION_MISSING",
+                "Forge admission did not retain its executable facts",
+            )
+        })?
+        .pin()?;
+    persist_intent(
+        tx,
+        id,
+        &input,
+        &intent,
+        execution,
+        Some(&context.linkage_value()),
+    )?;
     if let Some(owner) = exact_slot_owner(tx, id, &intent)? {
         return Ok(coalesced_receipt(id, &owner));
     }
@@ -604,10 +700,14 @@ fn persist_intent(
     id: &str,
     input: &PublishRefRequest,
     intent: &PublicationIntent,
+    execution: Option<&ForgeExecutionPin>,
     attribution: Option<&Value>,
 ) -> Result<()> {
     let task_id = model::text(&tasks::get_attempt(tx, &input.attempt_id)?, "task_id")?.to_owned();
     let mut effective = json!({"publication_intent":intent});
+    if let Some(execution) = execution {
+        effective["execution_pin"] = serde_json::to_value(execution)?;
+    }
     if let Some(attribution) = attribution {
         if attribution.is_null() {
             return Err(Error::new(
@@ -838,6 +938,26 @@ fn saved_intent(db: &Connection, id: &str) -> Result<PublicationIntent> {
     Ok(intent)
 }
 
+fn saved_execution_pin(db: &Connection, id: &str) -> Result<Option<ForgeExecutionPin>> {
+    let raw: String = db.query_row(
+        "SELECT effective_request_json FROM operations WHERE operation_id=?1",
+        [id],
+        |row| row.get(0),
+    )?;
+    let value: Value = serde_json::from_str(&raw)?;
+    let Some(pin) = value.get("execution_pin").filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let pin: ForgeExecutionPin = serde_json::from_value(pin.clone()).map_err(|_| {
+        Error::new(
+            "FORGE_INTENT_INVALID",
+            "saved Forge execution pin cannot be parsed",
+        )
+    })?;
+    pin.validate()?;
+    Ok(Some(pin))
+}
+
 fn request(db: &Connection, id: &str) -> Result<PublishRefRequest> {
     let raw: String = db.query_row(
         "SELECT original_request_json FROM operations WHERE operation_id=?1",
@@ -980,6 +1100,7 @@ fn work_from_saved(
     } else {
         None
     };
+    let execution = saved_execution_pin(db, &intent.operation_id)?;
     let target = ForgeTargetKey::from_intent(&intent)?;
     let lane = target_lane(&target);
     Ok(ForgeWork {
@@ -988,6 +1109,7 @@ fn work_from_saved(
         project,
         candidate,
         mode,
+        execution,
         transfer_continuation: None,
     })
 }
@@ -1354,6 +1476,19 @@ fn hash_bounded_file(path: &Path, max_bytes: u64) -> Result<String> {
     Ok(model::digest(&bytes))
 }
 
+fn verify_pinned_executable(path: &Path, expected: &str, reject_link: bool) -> Result<()> {
+    if reject_link {
+        reject_forge_link(path)?;
+    }
+    if hash_bounded_file(path, 128 * 1024 * 1024)? != expected {
+        return Err(Error::new(
+            "FORGE_CONFIG_CHANGED",
+            "selected Forge executable changed after admission",
+        ));
+    }
+    Ok(())
+}
+
 fn create_forge_worker_job(
     data_dir: &Path,
     work: &ForgeWork,
@@ -1389,8 +1524,29 @@ fn create_forge_worker_job(
         ));
     }
     let owner_token = model::new_id();
-    let executable = forge_worker_executable()?;
-    let executable_sha256 = hash_bounded_file(&executable, 128 * 1024 * 1024)?;
+    let (executable, executable_sha256, git_executable, git_executable_sha256) =
+        if let Some(pin) = work.execution.as_ref() {
+            pin.validate()?;
+            (
+                pin.worker_executable.clone(),
+                pin.worker_executable_sha256.clone(),
+                pin.git_executable.clone(),
+                pin.git_executable_sha256.clone(),
+            )
+        } else {
+            let executable = forge_worker_executable()?;
+            let executable_sha256 = hash_bounded_file(&executable, 128 * 1024 * 1024)?;
+            let git_executable = config.git_executable.clone();
+            let git_executable_sha256 = hash_bounded_file(&git_executable, 128 * 1024 * 1024)?;
+            (
+                executable,
+                executable_sha256,
+                git_executable,
+                git_executable_sha256,
+            )
+        };
+    verify_pinned_executable(&executable, &executable_sha256, true)?;
+    verify_pinned_executable(&git_executable, &git_executable_sha256, false)?;
     let phase = match work.mode {
         WorkMode::PushOnce => "push_once",
         WorkMode::ReadbackOnly => "readback_only",
@@ -1403,7 +1559,8 @@ fn create_forge_worker_job(
         "owner_token":owner_token,
         "phase":phase,
         "intent":work.intent,
-        "git_executable":config.git_executable,
+        "git_executable":git_executable,
+        "git_executable_sha256":git_executable_sha256,
         "timeout_seconds":config.timeout_seconds,
         "max_output_bytes":config.max_output_bytes,
         "project":work.project,
@@ -1678,6 +1835,23 @@ fn validate_worker_owner(job: &NativeWorkerJob, pid: u32, owner: &Value) -> Resu
         }
     }
     Ok(())
+}
+
+fn retained_path_matches(recorded: &str, retained: &Path) -> bool {
+    let recorded = Path::new(recorded);
+    if !recorded.is_absolute() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        recorded
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&retained.to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        recorded == retained
+    }
 }
 
 async fn wait_worker_owner(child: &mut TokioChild, job: &NativeWorkerJob) -> Result<Value> {
@@ -2062,6 +2236,7 @@ fn validate_forge_worker_plan(
         "project",
         "push_endpoint",
     ];
+    const PINNED_GIT_FIELD: &str = "git_executable_sha256";
     const PROJECT_FIELDS: [&str; 5] = [
         "canonical_repository",
         "repository_path",
@@ -2085,6 +2260,16 @@ fn validate_forge_worker_plan(
         (Ok(actual), Ok(expected)) => actual == expected,
         _ => false,
     };
+    let execution_matches =
+        match saved_execution_pin(db, operation_id).map_err(|_| worker_plan_scope_error())? {
+            Some(execution) => {
+                let expected_git_executable = serde_json::to_value(&execution.git_executable)
+                    .map_err(|_| worker_plan_scope_error())?;
+                plan["git_executable"] == expected_git_executable
+                    && plan[PINNED_GIT_FIELD] == Value::String(execution.git_executable_sha256)
+            }
+            None => true,
+        };
     let expected_phase = receipt["phase"]
         .as_str()
         .ok_or_else(worker_plan_scope_error)?;
@@ -2101,8 +2286,11 @@ fn validate_forge_worker_plan(
             operation["state"].as_str(),
             Some("sending" | "outcome_unknown")
         )
-        && fields.len() == PLAN_FIELDS.len()
-        && PLAN_FIELDS.iter().all(|field| fields.contains_key(*field))
+        && ((fields.len() == PLAN_FIELDS.len()
+            && PLAN_FIELDS.iter().all(|field| fields.contains_key(*field)))
+            || (fields.len() == PLAN_FIELDS.len() + 1
+                && PLAN_FIELDS.iter().all(|field| fields.contains_key(*field))
+                && fields.contains_key(PINNED_GIT_FIELD)))
         && project_fields.len() == PROJECT_FIELDS.len()
         && PROJECT_FIELDS
             .iter()
@@ -2114,9 +2302,14 @@ fn validate_forge_worker_plan(
         && plan["owner_token"] == receipt["owner_token"]
         && plan["phase"] == receipt["phase"]
         && intent_matches
+        && execution_matches
         && plan["git_executable"]
             .as_str()
             .is_some_and(|path| Path::new(path).is_absolute())
+        && (plan[PINNED_GIT_FIELD].is_null()
+            || plan[PINNED_GIT_FIELD]
+                .as_str()
+                .is_some_and(valid_worker_digest))
         && (1..=900).contains(&plan["timeout_seconds"].as_u64().unwrap_or_default())
         && (1..=256 * 1024).contains(&plan["max_output_bytes"].as_u64().unwrap_or_default())
         && plan["project"]["canonical_repository"] == intent.canonical_repository
@@ -3787,16 +3980,32 @@ async fn spawn_native_worker(
 }
 
 impl super::Store {
+    pub(super) async fn prepare_forge_execution(
+        &self,
+        config: Arc<Config>,
+    ) -> ForgeExecutionPreparation {
+        if !config.forge.enabled {
+            return ForgeExecutionPreparation::Skipped;
+        }
+        match self
+            .file_io(move |_| Ok(ForgeExecutionPreparation::capture(&config.forge)))
+            .await
+        {
+            Ok(preparation) => preparation,
+            Err(error) => ForgeExecutionPreparation::Failed(error),
+        }
+    }
+
     /// Durably admit one request and return its receipt. The host-owned forge
     /// supervisor performs all Git work, so cancellation of the IPC future
     /// cannot release or detach the worker that owns a publication effect.
     pub(crate) async fn publish_ref(&self, principal: Principal, params: Value) -> Result<Value> {
         PublishRefRequest::parse(&params)?;
-        let config = self.config.clone();
-        let p = principal.clone();
-        let receipt = self
+        let preflight_principal = principal.clone();
+        let preflight_value = params.clone();
+        let existing = self
             .run(move |db| {
-                let current = current_principal(db, p)?;
+                let current = current_principal(db, preflight_principal)?;
                 if !matches!(current.role, Role::Operator | Role::Manager) {
                     return Err(Error::new(
                         "FORBIDDEN",
@@ -3804,7 +4013,57 @@ impl super::Store {
                     ));
                 }
                 gm::require_authority(db, &current)?;
-                super::mutate(db, &current, "forge.publish_ref", &params, &config)
+                let request_id = model::text(&preflight_value, "client_request_id")?;
+                let original = model::canonical(&preflight_value)?;
+                let old: Option<(String, String, String)> = db
+                    .query_row(
+                        "SELECT method,original_request_json,effective_request_json FROM operations WHERE caller_id=?1 AND client_request_id=?2",
+                        params![current.client_id, request_id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .optional()?;
+                let Some((old_method, body, effective)) = old else {
+                    return Ok(None);
+                };
+                if old_method != "forge.publish_ref" || body != original {
+                    return Err(Error::new(
+                        "REQUEST_ID_CONFLICT",
+                        "request ID was used with a different method or payload",
+                    ));
+                }
+                let effective: Value = serde_json::from_str(&effective)?;
+                super::receipt_result(&effective["receipt"]).map(Some)
+            })
+            .await?;
+        if let Some(existing) = existing {
+            return Ok(existing);
+        }
+
+        let config = self.config.clone();
+        let preparation = self.prepare_forge_execution(config.clone()).await;
+        let p = principal.clone();
+        let receipt = self
+            .run(move |db| {
+                let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let current = current_principal(&tx, p)?;
+                if !matches!(current.role, Role::Operator | Role::Manager) {
+                    return Err(Error::new(
+                        "FORBIDDEN",
+                        "publication requires the operator or current GM",
+                    ));
+                }
+                gm::require_authority(&tx, &current)?;
+                let result = super::mutate_in_transaction_with_forge_execution(
+                    &tx,
+                    &current,
+                    "forge.publish_ref",
+                    &params,
+                    &config,
+                    model::now_ms()?,
+                    &preparation,
+                )?;
+                tx.commit()?;
+                result
             })
             .await?;
         self.changed
@@ -4212,6 +4471,21 @@ impl super::Store {
                     && owner["process"]["purpose"] == "module"
             })
             .ok_or_else(|| Error::new("FORGE_GIT_TREE_TERMINATION", "owner receipt is invalid"))?;
+        let id = operation_id.to_owned();
+        let execution = self.run(move |db| saved_execution_pin(db, &id)).await?;
+        if let Some(execution) = execution {
+            let owner_image_path = owner["process"]["image_path"].as_str();
+            if !owner_image_path
+                .is_some_and(|path| retained_path_matches(path, &execution.worker_executable))
+                || owner["process"]["image_sha256"].as_str()
+                    != Some(execution.worker_executable_sha256.as_str())
+            {
+                return Err(Error::new(
+                    "FORGE_WORKER_OWNER_INVALID",
+                    "retained Forge worker image differs from its admission pin",
+                ));
+            }
+        }
         if !swarm_process::departed_empty(&owner["process"], owner_token)? {
             return Err(Error::new(
                 "FORGE_GIT_TREE_TERMINATION",

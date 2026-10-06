@@ -52,6 +52,10 @@ stages through the existing observations. Attention does not authorize replay or
 claim departure. Descriptor-selected observations compare the retained module
 selector and artifact rather than equating an opaque module ID with a harness
 label.
+Optional-worker health also retains the last bounded failure and restart count
+after the actor returns to Running. A new host demotes stale readiness while
+preserving failure history and the original timing of a valid degraded row.
+Manager attention exposes this history without granting retry authority.
 
 Command version 3 provides exact durable status/failure readback. It continues to
 report `execution_complete=false`, `native_response_identity=unavailable` and
@@ -125,6 +129,11 @@ automation worker, retaining its own build and image provenance.
 CheckRun admission retains the selected standalone executor in the existing
 immutable run specification. The worker reconstructs that selection after a
 host restart instead of switching queued work to the current configuration.
+Forge publication now captures Git and worker image pins through the file-I/O
+lane before admission, and stores them in the existing immutable Operation.
+Execution rechecks those images; recovery can validate a departed worker's
+saved identity even when its installed image was removed or replaced. Direct
+and automatic publication keep the existing Store transactions and journals.
 Historical rows without an executor retain their legacy route. Supervisor
 descriptor replacements inherit the same per-service demand gate; slow
 readiness and ownership checks no longer hold the registry-wide mutex.

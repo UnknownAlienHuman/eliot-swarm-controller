@@ -650,6 +650,8 @@ impl ExecutionScan {
             "admission":admission,"delivery":self.delivery,"execution_started":self.run,
             "terminal":self.terminal,"disposition":disposition,"uncertainty":self.uncertainty,
             "log_watermark":self.watermark,"correlation":"durable_serialized_execution",
+            "assistant_result_correlation":"not_exposed",
+            "assistant_result_correlation_reason":"assistant_message_has_no_input_parent_in_public_projection",
             "family_complete":false}),
         )
     }

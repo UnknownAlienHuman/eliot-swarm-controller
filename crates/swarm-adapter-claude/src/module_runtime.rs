@@ -128,9 +128,8 @@ fn command_event_schemas_match(claim: &ModuleContractClaim) -> bool {
     fn is_schema(schema: &SchemaDescriptor, id: &str) -> bool {
         schema.schema_id == id && schema.version == "1" && schema.sha256.is_none()
     }
-    let has = |schemas: &[SchemaDescriptor], id: &str| {
-        schemas.iter().any(|schema| is_schema(schema, id))
-    };
+    let has =
+        |schemas: &[SchemaDescriptor], id: &str| schemas.iter().any(|schema| is_schema(schema, id));
     // The normalized dispatch pair is additive. Existing retained Claude
     // artifacts with only the runtime codec continue to authenticate here.
     (claim.command_schemas.len() == 1

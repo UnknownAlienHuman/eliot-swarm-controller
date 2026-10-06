@@ -372,6 +372,8 @@ fn validate_input_status_source(
             "native_session_id",
             "native_input_id",
             "input_message_sha256",
+            "assistant_result_correlation",
+            "assistant_result_correlation_reason",
             "evidence",
             "read_method",
             "read_consistency",
@@ -394,6 +396,9 @@ fn validate_input_status_source(
                 model::digest(model::text(context, "target_operation_id")?.as_bytes())
             )
         || !valid_prefixed_digest(&source["input_message_sha256"], "sha256:")
+        || source["assistant_result_correlation"] != "not_exposed"
+        || source["assistant_result_correlation_reason"]
+            != "assistant_message_has_no_input_parent_in_public_projection"
         || source["evidence"] != "exact_user_message_projection"
         || source["read_method"] != "session.message.get"
         || source["read_consistency"] != "repeated_equal_projection_not_atomic_snapshot"

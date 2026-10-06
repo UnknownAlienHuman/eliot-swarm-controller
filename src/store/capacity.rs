@@ -1201,17 +1201,30 @@ fn append_independent_module_attention(
         for name in names {
             let health = &workers[name];
             let state = health["state"].as_str();
-            let Some(error_code) = safe_health_code(&health["last_error_code"]) else {
+            let degraded = matches!(state, Some("retry_wait" | "isolated"));
+            let historical_failure = health["last_failure"].clone();
+            let Some(error_code) = safe_health_code(&health["last_error_code"])
+                .or_else(|| safe_health_code(&historical_failure["code"]))
+            else {
                 continue;
             };
-            if !matches!(state, Some("retry_wait" | "isolated")) {
+            if !degraded && !historical_failure.is_object() {
                 continue;
             }
-            let observed_at_ms = health["updated_at_ms"].as_i64();
+            let observed_at_ms = if degraded {
+                health["updated_at_ms"].as_i64()
+            } else {
+                historical_failure["observed_at_ms"].as_i64()
+            };
             let stale = observed_at_ms
                 .map(|observed| now.saturating_sub(observed) > STALE_AFTER_MS)
                 .unwrap_or(true);
             let scope_key = format!("host:optional:{name}");
+            let next_step = if degraded {
+                "read host.status for this bounded worker health and await its recorded retry or changed configuration"
+            } else {
+                "read host.status for the retained worker failure history and restart count; do not replay work from this fact"
+            };
             items.push(attention_item(
                 "optional_module_failure",
                 &scope_key,
@@ -1223,8 +1236,10 @@ fn append_independent_module_attention(
                     "error_code":error_code,
                     "consecutive_failures":health["consecutive_failures"],
                     "retry_after_ms":health["retry_after_ms"],
+                    "last_failure":historical_failure,
+                    "restart_count":health["restart_count"],
                     "retry_authorized":false,
-                    "next_step":"read host.status for this bounded worker health and await its recorded retry or changed configuration",
+                    "next_step":next_step,
                 }),
                 attention_source("host_lifecycle", observed_at_ms, stale),
                 json!({"method":"host.status"}),

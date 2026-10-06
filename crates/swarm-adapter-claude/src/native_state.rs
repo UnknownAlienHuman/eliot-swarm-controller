@@ -60,9 +60,8 @@ impl NativeControl {
             .retain(|_, pending_operation| pending_operation != operation_id);
         self.input_operations
             .retain(|_, pending_operation| pending_operation != operation_id);
-        self.input_operation_order.retain(|input_id| {
-            self.input_operations.contains_key(input_id)
-        });
+        self.input_operation_order
+            .retain(|input_id| self.input_operations.contains_key(input_id));
     }
 
     pub fn clear_pending(&mut self) {
@@ -209,7 +208,12 @@ impl NativeControl {
             self.record_result(frame, session_root.as_deref(), journal);
         }
         if !duplicate_frame {
-            self.record_family_event(frame, frame_type, frame_session.as_deref(), session_root.as_deref());
+            self.record_family_event(
+                frame,
+                frame_type,
+                frame_session.as_deref(),
+                session_root.as_deref(),
+            );
         }
         Ok(())
     }
@@ -239,10 +243,10 @@ impl NativeControl {
             && matches!(
                 subtype,
                 "task_started" | "task_progress" | "task_notification" | "task_updated"
-            )
-        {
+            ) {
             Some(subtype)
-        } else if frame_type == "hook" && matches!(subtype, "subagent_started" | "subagent_stopped") {
+        } else if frame_type == "hook" && matches!(subtype, "subagent_started" | "subagent_stopped")
+        {
             Some(subtype)
         } else if matches!(frame_type, "assistant" | "user")
             && frame["parent_tool_use_id"].is_string()
@@ -268,7 +272,10 @@ impl NativeControl {
             return;
         };
 
-        let task_id = if matches!(event_type, "task_started" | "task_progress" | "task_notification" | "task_updated") {
+        let task_id = if matches!(
+            event_type,
+            "task_started" | "task_progress" | "task_notification" | "task_updated"
+        ) {
             let Some(task_id) = safe_family_link(&frame["task_id"]) else {
                 self.family_projection_incomplete = true;
                 return;
@@ -283,7 +290,10 @@ impl NativeControl {
             None
         };
         let agent_id = safe_family_link(&frame["agent_id"]);
-        let member_identity = if matches!(event_type, "subagent_started" | "subagent_stopped" | "subagent_permission_denied") {
+        let member_identity = if matches!(
+            event_type,
+            "subagent_started" | "subagent_stopped" | "subagent_permission_denied"
+        ) {
             let Some(agent_id) = safe_family_link(&frame["agent_id"]) else {
                 self.family_projection_incomplete = true;
                 return;
@@ -347,73 +357,161 @@ impl NativeControl {
             event_type,
             "task_started" | "task_progress" | "task_notification" | "task_updated"
         ) {
-            event.as_object_mut().expect("family event is an object").remove("sdk_task_status");
-            event.as_object_mut().expect("family event is an object").remove("task_patch_status");
-            event.as_object_mut().expect("family event is an object").remove("is_backgrounded");
-            event.as_object_mut().expect("family event is an object").remove("task_patch_is_backgrounded");
-            event.as_object_mut().expect("family event is an object").remove("spawn_depth");
-            event.as_object_mut().expect("family event is an object").remove("ambient");
+            event
+                .as_object_mut()
+                .expect("family event is an object")
+                .remove("sdk_task_status");
+            event
+                .as_object_mut()
+                .expect("family event is an object")
+                .remove("task_patch_status");
+            event
+                .as_object_mut()
+                .expect("family event is an object")
+                .remove("is_backgrounded");
+            event
+                .as_object_mut()
+                .expect("family event is an object")
+                .remove("task_patch_is_backgrounded");
+            event
+                .as_object_mut()
+                .expect("family event is an object")
+                .remove("spawn_depth");
+            event
+                .as_object_mut()
+                .expect("family event is an object")
+                .remove("ambient");
         }
         if task_id.is_none() {
-            event.as_object_mut().expect("family event is an object").remove("task_id");
-            event.as_object_mut().expect("family event is an object").remove("task_type");
+            event
+                .as_object_mut()
+                .expect("family event is an object")
+                .remove("task_id");
+            event
+                .as_object_mut()
+                .expect("family event is an object")
+                .remove("task_type");
         }
         if agent_id.is_none() {
-            event.as_object_mut().expect("family event is an object").remove("agent_id");
+            event
+                .as_object_mut()
+                .expect("family event is an object")
+                .remove("agent_id");
         }
         if member_identity.is_none() {
-            event.as_object_mut().expect("family event is an object").remove("member_identity");
+            event
+                .as_object_mut()
+                .expect("family event is an object")
+                .remove("member_identity");
         }
         if agent_type.is_none() {
-            event.as_object_mut().expect("family event is an object").remove("agent_type");
+            event
+                .as_object_mut()
+                .expect("family event is an object")
+                .remove("agent_type");
         }
         if tool_use_id.is_none() {
-            event.as_object_mut().expect("family event is an object").remove("tool_use_id");
+            event
+                .as_object_mut()
+                .expect("family event is an object")
+                .remove("tool_use_id");
         }
         if hook_tool_use_id.is_none() {
-            event.as_object_mut().expect("family event is an object").remove("hook_tool_use_id");
+            event
+                .as_object_mut()
+                .expect("family event is an object")
+                .remove("hook_tool_use_id");
         }
         if event_type != "subagent_message" {
-            event.as_object_mut().expect("family event is an object").remove("parent_tool_use_id");
+            event
+                .as_object_mut()
+                .expect("family event is an object")
+                .remove("parent_tool_use_id");
         }
         if frame["uuid"].is_null() {
-            event.as_object_mut().expect("family event is an object").remove("frame_uuid");
+            event
+                .as_object_mut()
+                .expect("family event is an object")
+                .remove("frame_uuid");
         }
         if frame["prompt_id"].is_null() {
-            event.as_object_mut().expect("family event is an object").remove("prompt_id");
+            event
+                .as_object_mut()
+                .expect("family event is an object")
+                .remove("prompt_id");
         }
         if frame["user_message_uuid"].is_null() {
-            event.as_object_mut().expect("family event is an object").remove("user_message_uuid");
+            event
+                .as_object_mut()
+                .expect("family event is an object")
+                .remove("user_message_uuid");
         }
-        if event["user_message_uuids"].as_array().is_none_or(Vec::is_empty) {
-            event.as_object_mut().expect("family event is an object").remove("user_message_uuids");
+        if event["user_message_uuids"]
+            .as_array()
+            .is_none_or(Vec::is_empty)
+        {
+            event
+                .as_object_mut()
+                .expect("family event is an object")
+                .remove("user_message_uuids");
         }
         if frame["user_message_uuids_overflow"] != true {
-            event.as_object_mut().expect("family event is an object").remove("input_links_truncated");
+            event
+                .as_object_mut()
+                .expect("family event is an object")
+                .remove("input_links_truncated");
         }
         if frame["is_backgrounded"].as_bool().is_none() {
-            event.as_object_mut().expect("family event is an object").remove("is_backgrounded");
+            event
+                .as_object_mut()
+                .expect("family event is an object")
+                .remove("is_backgrounded");
         }
         if frame["task_patch_is_backgrounded"].as_bool().is_none() {
-            event.as_object_mut().expect("family event is an object").remove("task_patch_is_backgrounded");
+            event
+                .as_object_mut()
+                .expect("family event is an object")
+                .remove("task_patch_is_backgrounded");
         }
-        if frame["spawn_depth"].as_u64().filter(|depth| *depth <= 128).is_none() {
-            event.as_object_mut().expect("family event is an object").remove("spawn_depth");
+        if frame["spawn_depth"]
+            .as_u64()
+            .filter(|depth| *depth <= 128)
+            .is_none()
+        {
+            event
+                .as_object_mut()
+                .expect("family event is an object")
+                .remove("spawn_depth");
         }
         if frame["ambient"].as_bool().is_none() {
-            event.as_object_mut().expect("family event is an object").remove("ambient");
+            event
+                .as_object_mut()
+                .expect("family event is an object")
+                .remove("ambient");
         }
         if task_reason.is_none() {
-            event.as_object_mut().expect("family event is an object").remove("task_reason");
+            event
+                .as_object_mut()
+                .expect("family event is an object")
+                .remove("task_reason");
         }
         if task_last_tool_name.is_none() {
-            event.as_object_mut().expect("family event is an object").remove("task_last_tool_name");
+            event
+                .as_object_mut()
+                .expect("family event is an object")
+                .remove("task_last_tool_name");
         }
         if event["resource_links"].as_array().is_none_or(Vec::is_empty) {
-            event.as_object_mut().expect("family event is an object").remove("resource_links");
+            event
+                .as_object_mut()
+                .expect("family event is an object")
+                .remove("resource_links");
         }
         if frame["resource_links_overflow"] != true {
-            event.as_object_mut().expect("family event is an object").remove("resource_links_truncated");
+            event
+                .as_object_mut()
+                .expect("family event is an object")
+                .remove("resource_links_truncated");
         }
 
         self.family_event_count = self.family_event_count.saturating_add(1);
@@ -489,20 +587,26 @@ impl NativeControl {
                     }
                     let native = saved.intent.as_ref()?.get("native")?;
                     let admission = native.get("dispatch_admission");
-                    let payload_sha256 = safe_sha256(
-                        native
-                            .get("native_payload_sha256")
-                            .or_else(|| admission.and_then(|value| value.get("native_payload_sha256")))?,
-                    )?;
+                    let payload_sha256 =
+                        safe_sha256(native.get("native_payload_sha256").or_else(|| {
+                            admission.and_then(|value| value.get("native_payload_sha256"))
+                        })?)?;
                     let payload_bytes = native
                         .get("native_payload_bytes")
                         .or_else(|| admission.and_then(|value| value.get("native_payload_bytes")))
                         .and_then(Value::as_u64)?;
                     Some((operation_id.clone(), payload_sha256, payload_bytes))
                 })
-                .map_or((None, None, None), |(operation_id, payload_sha256, payload_bytes)| {
-                    (Some(operation_id), Some(payload_sha256), Some(payload_bytes))
-                })
+                .map_or(
+                    (None, None, None),
+                    |(operation_id, payload_sha256, payload_bytes)| {
+                        (
+                            Some(operation_id),
+                            Some(payload_sha256),
+                            Some(payload_bytes),
+                        )
+                    },
+                )
         } else {
             (None, None, None)
         };
@@ -511,8 +615,8 @@ impl NativeControl {
             .and_then(Value::as_str)
             .filter(|value| value.len() <= MAX_RESULT_BODY_BYTES.div_ceil(3) * 4 + 4)
             .map(ToOwned::to_owned);
-        let result_body_available = frame["result_body_available"] == true
-            && result_content_base64.is_some();
+        let result_body_available =
+            frame["result_body_available"] == true && result_content_base64.is_some();
         let metadata = json!({
             "native_session_id":session.clone(),
             "native_input_id":Value::Null,
@@ -546,9 +650,11 @@ impl NativeControl {
             let excess = self.input_executions.len() - MAX_INPUT_EXECUTIONS;
             self.input_executions.drain(0..excess);
         }
-        if let (Some(operation_id), Some(native_payload_sha256), Some(native_payload_bytes)) =
-            (input_operation_id, native_payload_sha256, native_payload_bytes)
-        {
+        if let (Some(operation_id), Some(native_payload_sha256), Some(native_payload_bytes)) = (
+            input_operation_id,
+            native_payload_sha256,
+            native_payload_bytes,
+        ) {
             if !self
                 .result_records
                 .iter()
@@ -667,10 +773,16 @@ pub(crate) fn safe_family_resource_links(value: &Value) -> Option<Vec<Value>> {
             let uri = safe_family_uri(object.get("uri")?)?;
             let name = safe_family_text(object.get("name")?, 256)?;
             let mut link = json!({"uri":uri,"name":name});
-            if let Some(title) = object.get("title").and_then(|value| safe_family_text(value, 256)) {
+            if let Some(title) = object
+                .get("title")
+                .and_then(|value| safe_family_text(value, 256))
+            {
                 link["title"] = json!(title);
             }
-            if let Some(mime_type) = object.get("mimeType").and_then(|value| safe_family_text(value, 128)) {
+            if let Some(mime_type) = object
+                .get("mimeType")
+                .and_then(|value| safe_family_text(value, 128))
+            {
                 link["mimeType"] = json!(mime_type);
             }
             if let Some(size) = object.get("size").and_then(Value::as_u64) {
@@ -734,8 +846,8 @@ fn save_input_admission(
         "module_receipt":receipt
     });
     if let Some(value) = native.get("dispatch_admission") {
-        let admission: TaskDispatchAdmissionReceipt =
-            serde_json::from_value(value.clone()).map_err(|_| {
+        let admission: TaskDispatchAdmissionReceipt = serde_json::from_value(value.clone())
+            .map_err(|_| {
                 Error::new(
                     "TASK_DISPATCH_ADMISSION_INVALID",
                     "saved normalized dispatch admission is malformed",

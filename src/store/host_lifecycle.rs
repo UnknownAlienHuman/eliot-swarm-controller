@@ -305,13 +305,14 @@ pub(super) fn start(tx: &Transaction<'_>, now: i64) -> Result<()> {
     )?;
     // Previous host tasks may have been interrupted before their shutdown
     // receipt. Never expose their last `running` state as current readiness;
-    // retain only a bounded retry/isolated reason until the new actor reports
-    // its own state, so a restart does not erase the last typed failure.
-    let health = preserve_optional_failure_health(tx)?;
+    // retain only bounded degraded state plus failure history until the new
+    // actor reports its own state, so a restart does not erase the last typed
+    // failure.
+    let health = preserve_optional_failure_health(tx, now)?;
     set_meta(tx, OPTIONAL_WORKER_HEALTH, &health)
 }
 
-fn preserve_optional_failure_health(db: &Connection) -> Result<Value> {
+fn preserve_optional_failure_health(db: &Connection, now: i64) -> Result<Value> {
     let mut retained = serde_json::Map::new();
     let Some(value) = meta(db, OPTIONAL_WORKER_HEALTH)? else {
         return Ok(json!({"schema_version":1,"workers":retained}));
@@ -328,38 +329,117 @@ fn preserve_optional_failure_health(db: &Connection) -> Result<Value> {
         let failures = receipt["consecutive_failures"].as_u64();
         let updated_at_ms = receipt["updated_at_ms"].as_i64();
         let retry_after_ms = receipt["retry_after_ms"].as_i64();
-        let valid_code = code.is_some_and(|code| {
-            !code.is_empty()
-                && code.len() <= 64
-                && code
-                    .bytes()
-                    .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+        let degraded = matches!(state, Some("retry_wait" | "isolated"));
+        let valid_code = code.is_some_and(valid_optional_worker_code);
+        let valid_retry = retry_after_ms.is_some_and(|retry| {
+            updated_at_ms
+                .is_some_and(|updated| retry >= updated && retry.saturating_sub(updated) <= 60_000)
         });
+        let historical_failure = historical_failure(receipt);
+        let valid_degraded = degraded
+            && failures.is_some_and(|value| value <= 32)
+            && updated_at_ms.is_some_and(|value| value >= 0)
+            && valid_code
+            && valid_retry;
         if !OPTIONAL_WORKERS.contains(&name.as_str())
-            || !matches!(state, Some("retry_wait" | "isolated"))
-            || failures.is_none_or(|value| value > 32)
-            || updated_at_ms.is_none_or(|value| value < 0)
-            || !valid_code
-            || retry_after_ms.is_none_or(|retry| {
-                updated_at_ms.is_none_or(|updated| {
-                    retry < updated || retry.saturating_sub(updated) > 60_000
-                })
-            })
+            || (!valid_degraded && historical_failure.is_none())
         {
             continue;
         }
+        let retained_state = if valid_degraded {
+            state.unwrap_or("retry_wait")
+        } else {
+            "dormant"
+        };
+        let retained_failures = if valid_degraded {
+            failures.unwrap_or(0)
+        } else {
+            0
+        };
+        let retained_code = valid_degraded.then_some(code.unwrap_or_default());
+        let retained_retry = valid_degraded.then_some(retry_after_ms.unwrap_or_default());
+        let retained_updated_at = if valid_degraded {
+            updated_at_ms.unwrap_or(now)
+        } else {
+            now
+        };
+        let restart_count = bounded_restart_count(receipt).unwrap_or(0);
         retained.insert(
             name.clone(),
             json!({
-                "state":state,
-                "consecutive_failures":failures,
-                "last_error_code":code,
-                "retry_after_ms":retry_after_ms,
-                "updated_at_ms":updated_at_ms,
+                "state":retained_state,
+                "consecutive_failures":retained_failures,
+                "last_error_code":retained_code,
+                "retry_after_ms":retained_retry,
+                "updated_at_ms":retained_updated_at,
+                "last_failure":historical_failure,
+                "restart_count":restart_count,
             }),
         );
     }
     Ok(json!({"schema_version":1,"workers":retained}))
+}
+
+fn valid_optional_worker_code(code: &str) -> bool {
+    !code.is_empty()
+        && code.len() <= 64
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn bounded_last_failure(value: &Value) -> Option<Value> {
+    let object = value.as_object()?;
+    if object
+        .keys()
+        .any(|key| !matches!(key.as_str(), "code" | "observed_at_ms" | "host_epoch"))
+    {
+        return None;
+    }
+    let code = object
+        .get("code")
+        .and_then(Value::as_str)
+        .filter(|code| valid_optional_worker_code(code))?;
+    let observed_at_ms = object
+        .get("observed_at_ms")
+        .and_then(Value::as_i64)
+        .filter(|value| *value >= 0)?;
+    let host_epoch = match object.get("host_epoch") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(value.as_i64().filter(|epoch| *epoch > 0)?),
+    };
+    Some(json!({
+        "code":code,
+        "observed_at_ms":observed_at_ms,
+        "host_epoch":host_epoch,
+    }))
+}
+
+fn historical_failure(receipt: &Value) -> Option<Value> {
+    if let Some(value) = receipt.get("last_failure").and_then(bounded_last_failure) {
+        return Some(value);
+    }
+    if !matches!(receipt["state"].as_str(), Some("retry_wait" | "isolated")) {
+        return None;
+    }
+    let code = receipt["last_error_code"]
+        .as_str()
+        .filter(|code| valid_optional_worker_code(code))?;
+    let observed_at_ms = receipt["updated_at_ms"]
+        .as_i64()
+        .filter(|value| *value >= 0)?;
+    Some(json!({
+        "code":code,
+        "observed_at_ms":observed_at_ms,
+        "host_epoch":Value::Null,
+    }))
+}
+
+fn bounded_restart_count(receipt: &Value) -> Option<u64> {
+    receipt
+        .get("restart_count")
+        .and_then(Value::as_u64)
+        .filter(|value| *value <= 32)
 }
 
 pub(super) fn ready(tx: &Transaction<'_>, now: i64) -> Result<()> {
@@ -417,6 +497,34 @@ pub(super) fn update_optional_worker(
                 "optional worker health map is invalid",
             )
         })?;
+    let previous = workers.get(name).cloned();
+    let previous_state = previous
+        .as_ref()
+        .and_then(|value| value["state"].as_str())
+        .map(str::to_owned);
+    let previous_failure = previous.as_ref().and_then(historical_failure);
+    let mut restart_count = previous
+        .as_ref()
+        .and_then(bounded_restart_count)
+        .unwrap_or(0);
+    if state == "running"
+        && previous_failure.is_some()
+        && previous_state.as_deref() != Some("running")
+    {
+        restart_count = restart_count.saturating_add(1).min(32);
+    }
+    let last_failure = if let Some(code) = error_code {
+        let host_epoch = meta(tx, "host_epoch")?
+            .and_then(|value| value.as_i64())
+            .filter(|value| *value > 0);
+        Some(json!({
+            "code":code,
+            "observed_at_ms":now,
+            "host_epoch":host_epoch,
+        }))
+    } else {
+        previous_failure
+    };
     let retry_after_ms =
         retry_in_ms.map(|delay| now.saturating_add(i64::try_from(delay).unwrap_or(i64::MAX)));
     workers.insert(
@@ -426,7 +534,9 @@ pub(super) fn update_optional_worker(
             "consecutive_failures":consecutive_failures,
             "last_error_code":error_code,
             "retry_after_ms":retry_after_ms,
-            "updated_at_ms":now
+            "updated_at_ms":now,
+            "last_failure":last_failure,
+            "restart_count":restart_count,
         }),
     );
     set_meta(tx, OPTIONAL_WORKER_HEALTH, &health)
@@ -465,15 +575,17 @@ fn optional_worker_health(db: &Connection) -> Result<Value> {
                 let updated_at_ms = updated_at_ms.unwrap_or(0);
                 value < updated_at_ms || value.saturating_sub(updated_at_ms) > 60_000
             })
-            || code.is_some_and(|value| {
-                value.is_empty()
-                    || value.len() > 64
-                    || !value.bytes().all(|byte| {
-                        byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_'
-                    })
-            })
+            || code.is_some_and(|value| !valid_optional_worker_code(value))
             || (matches!(state, "retry_wait" | "isolated")
                 && (code.is_none() || retry_after_ms.is_none()))
+            || receipt["restart_count"]
+                .as_u64()
+                .is_some_and(|value| value > 32)
+            || (receipt.get("restart_count").is_some()
+                && receipt["restart_count"].as_u64().is_none())
+            || (receipt
+                .get("last_failure")
+                .is_some_and(|value| !value.is_null() && bounded_last_failure(value).is_none()))
         {
             return Err(Error::new(
                 "HOST_LIFECYCLE_INVALID",

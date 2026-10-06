@@ -270,7 +270,10 @@ fn record(
                 turn_id: None,
                 native_input_id: Some(oc::input_id(&command.operation_id)),
                 details: json!({"completion_condition":"native_input_admitted","delivery":"queue",
-                "evidence":"durable_inbox_log","execution_complete":false}),
+                "evidence":"durable_inbox_log",
+                "assistant_result_correlation":"not_exposed",
+                "assistant_result_correlation_reason":"assistant_message_has_no_input_parent_in_public_projection",
+                "execution_complete":false}),
             }),
         )?;
     }

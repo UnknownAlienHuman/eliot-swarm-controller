@@ -1162,12 +1162,20 @@ impl Store {
 
     pub(crate) async fn reconcile_automations_once(&self) -> Result<Value> {
         let config = self.config.clone();
+        let forge_preparation = self.prepare_forge_execution(config.clone()).await;
         let mut result = self.run(move |db| {
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let now = model::now_ms()?;
             let review_dispatch = automation_dispatch::reconcile(&tx, &config, 16, 64, now)?;
             let work_dispatch = automation_work_dispatch::reconcile(&tx, &config, 16, 64, now)?;
-            let publication = automation_publication::reconcile(&tx, &config, 16, 64, now)?;
+            let publication = automation_publication::reconcile(
+                &tx,
+                &config,
+                16,
+                64,
+                now,
+                &forge_preparation,
+            )?;
             let goal_progression = automation_goal_progression::reconcile(
                 &tx,
                 16,
@@ -4174,6 +4182,7 @@ fn mutate_script_effect_in_transaction(
         MutationPlan {
             check_plan: None,
             launch_operation_id: None,
+            forge_execution: None,
         },
     )
 }
@@ -4205,6 +4214,7 @@ fn mutate_cron_check_in_transaction(
         MutationPlan {
             check_plan: Some(resolution),
             launch_operation_id: None,
+            forge_execution: None,
         },
     )?;
     let check_id = receipt
@@ -4269,6 +4279,7 @@ fn admit_goal_progression_operation(
         MutationPlan {
             check_plan: None,
             launch_operation_id: None,
+            forge_execution: None,
         },
     );
     let value = match receipt {
@@ -4336,6 +4347,31 @@ fn mutate_in_transaction_with_check_plan(
         MutationPlan {
             check_plan,
             launch_operation_id: None,
+            forge_execution: None,
+        },
+    )
+}
+
+pub(super) fn mutate_in_transaction_with_forge_execution(
+    tx: &Transaction<'_>,
+    p: &Principal,
+    method: &str,
+    v: &Value,
+    config: &Config,
+    now: i64,
+    preparation: &forge::ForgeExecutionPreparation,
+) -> Result<Result<Value>> {
+    mutate_in_transaction_with_plan(
+        tx,
+        p,
+        method,
+        v,
+        config,
+        now,
+        MutationPlan {
+            check_plan: None,
+            launch_operation_id: None,
+            forge_execution: Some(preparation),
         },
     )
 }
@@ -4366,6 +4402,7 @@ pub(crate) fn mutate_launch_child_in_transaction(
         MutationPlan {
             check_plan: None,
             launch_operation_id: Some(launch_operation_id),
+            forge_execution: None,
         },
     )
 }
@@ -4374,6 +4411,7 @@ pub(crate) fn mutate_launch_child_in_transaction(
 struct MutationPlan<'a> {
     check_plan: Option<&'a checks::CheckPlanResolution>,
     launch_operation_id: Option<&'a str>,
+    forge_execution: Option<&'a forge::ForgeExecutionPreparation>,
 }
 
 enum MutationAuthority<'a> {
@@ -5647,10 +5685,12 @@ fn apply(
         "automation.config.transfer" => {
             automation_transfer::apply(tx, p, v, id, now).map(|value| (value, false))
         }
-        "forge.publish_ref" => forge::reserve(tx, p, v, id, config).map(|value| {
-            let queued = value.get("coalesced") != Some(&Value::Bool(true));
-            (value, queued)
-        }),
+        "forge.publish_ref" => forge::reserve(tx, p, v, id, config, plan.forge_execution).map(
+            |value| {
+                let queued = value.get("coalesced") != Some(&Value::Bool(true));
+                (value, queued)
+            },
+        ),
         "source.capture" => checks::reserve_source(tx, p, v, id, config).map(|v| (v, true)),
         "check.run" => checks::reserve(tx, p, v, id, config, plan.check_plan),
         "check.cancel" => checks::cancel(tx, p, v, id).map(|v| (v, false)),

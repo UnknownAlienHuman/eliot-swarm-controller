@@ -451,7 +451,7 @@ impl Service {
                 command,
                 EffectOutcome::Applied,
                 options,
-                json!({"completion_condition":"native_input_admitted","delivery":"queue","evidence":"prompt_response","execution_complete":false}),
+                json!({"completion_condition":"native_input_admitted","delivery":"queue","evidence":"prompt_response","assistant_result_correlation":"not_exposed","assistant_result_correlation_reason":"assistant_message_has_no_input_parent_in_public_projection","execution_complete":false}),
             ),
             Ok(_) => failed(
                 command,
@@ -611,12 +611,19 @@ impl Service {
                     return Err(Error::new("NATIVE_EVIDENCE_UNAVAILABLE","exact delivered input was not observed"));
                 }
             }
-            let mut r=outcome(original,EffectOutcome::Applied,options,json!({"completion_condition":"native_input_admitted","delivery":"queue","evidence":if queued{"inbox_readback"}else{"projected_message_readback"},"execution_complete":false}));r.native_input_id=Some(id);Ok(r)
+            let mut r=outcome(original,EffectOutcome::Applied,options,json!({"completion_condition":"native_input_admitted","delivery":"queue","evidence":if queued{"inbox_readback"}else{"projected_message_readback"},"assistant_result_correlation":"not_exposed","assistant_result_correlation_reason":"assistant_message_has_no_input_parent_in_public_projection","execution_complete":false}));r.native_input_id=Some(id);Ok(r)
         }.await;
         match readback {
             Ok(r) => r,
             Err(e) => {
                 let mut r = outcome(original, EffectOutcome::Unknown, options, diagnostic(&e));
+                if matches!(original.method.as_str(), "agent.send" | "task.dispatch") {
+                    r.details["assistant_result_correlation"] = json!("not_exposed");
+                    r.details["assistant_result_correlation_reason"] =
+                        json!("assistant_message_has_no_input_parent_in_public_projection");
+                    r.details["task_completion"] = json!("unknown");
+                    r.details["execution_complete"] = json!(false);
+                }
                 if original.method == "agent.open" {
                     r.native_root_id = Some(root_id(&original.binding_id, original.generation));
                 }

@@ -36,6 +36,8 @@ struct WorkPlan {
     phase: Phase,
     intent: PublicationIntent,
     git_executable: PathBuf,
+    #[serde(default)]
+    git_executable_sha256: Option<String>,
     timeout_seconds: u64,
     max_output_bytes: usize,
     project: Project,
@@ -742,6 +744,10 @@ fn validate_plan(plan: &WorkPlan) -> Result<()> {
         || plan.operation_id != plan.intent.operation_id
         || !plan.git_executable.is_absolute()
         || !plan.git_executable.metadata()?.is_file()
+        || plan
+            .git_executable_sha256
+            .as_deref()
+            .is_some_and(|digest| !valid_digest(digest))
         || !plan.project.repository_path.is_absolute()
         || !plan.project.repository_path.metadata()?.is_dir()
         || !(1..=900).contains(&plan.timeout_seconds)
@@ -1192,6 +1198,15 @@ fn remote_ref_at(
 }
 
 fn run_git(plan: &WorkPlan, owner: &Group, args: &[String]) -> Result<NativeResult> {
+    if let Some(expected) = plan.git_executable_sha256.as_deref() {
+        let actual = digest(&read_bounded(&plan.git_executable, 128 * 1024 * 1024)?);
+        if actual != expected {
+            return Err(Error::new(
+                "FORGE_CONFIG_CHANGED",
+                "selected Git executable changed after admission",
+            ));
+        }
+    }
     let mut command = Command::new(&plan.git_executable);
     command
         .args(["--no-optional-locks", "--no-replace-objects"])

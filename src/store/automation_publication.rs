@@ -159,6 +159,7 @@ pub(crate) fn reconcile(
     entry_budget: usize,
     fact_budget: usize,
     now_ms: i64,
+    forge_preparation: &super::forge::ForgeExecutionPreparation,
 ) -> Result<Value> {
     if now_ms < 0 {
         return Err(Error::invalid("publication reconciliation time is invalid"));
@@ -179,7 +180,14 @@ pub(crate) fn reconcile(
     let mut results = Vec::with_capacity(entries.len());
     let mut total_processed = 0usize;
     for entry in &entries {
-        let result = reconcile_entry(tx, launcher_config, entry, fact_budget, now_ms)?;
+        let result = reconcile_entry(
+            tx,
+            launcher_config,
+            entry,
+            fact_budget,
+            now_ms,
+            forge_preparation,
+        )?;
         total_processed = total_processed.saturating_add(
             result["processed"]
                 .as_u64()
@@ -223,6 +231,7 @@ fn reconcile_entry(
     entry: &AutomationEntry,
     budget: usize,
     now_ms: i64,
+    forge_preparation: &super::forge::ForgeExecutionPreparation,
 ) -> Result<Value> {
     if !entry.enabled || !entry.steps.contains(&AutomationStep::Publication) {
         return Ok(json!({
@@ -277,6 +286,7 @@ fn reconcile_entry(
         &mut state,
         budget.min(MAX_PENDING_RECHECKS),
         now_ms,
+        forge_preparation,
     )?;
     let remaining_budget = budget.saturating_sub(processed);
     if remaining_budget == 0 {
@@ -384,6 +394,7 @@ fn reconcile_entry(
                 historical_replay_authorized: replay,
             },
             now_ms,
+            forge_preparation,
         )?;
         if let ReserveDisposition::Pending { .. } = disposition {
             state.pending.push(PendingAcceptance {
@@ -420,6 +431,7 @@ fn consume_event_isolated(
     entry: &AutomationEntry,
     reservation: AcceptanceReservation<'_>,
     now_ms: i64,
+    forge_preparation: &super::forge::ForgeExecutionPreparation,
 ) -> Result<ReserveDisposition> {
     let AcceptanceReservation {
         event,
@@ -453,7 +465,14 @@ fn consume_event_isolated(
     };
     let request_value = context.request_value()?;
     tx.execute_batch("SAVEPOINT automation_publication_reserve")?;
-    match reserve_automatic_publication(tx, launcher_config, &context, &request_value, now_ms) {
+    match reserve_automatic_publication(
+        tx,
+        launcher_config,
+        &context,
+        &request_value,
+        now_ms,
+        forge_preparation,
+    ) {
         Ok(result) => {
             tx.execute_batch("RELEASE automation_publication_reserve")?;
             Ok(ReserveDisposition::Reserved(result))
@@ -491,6 +510,7 @@ fn reserve_automatic_publication(
     context: &PublicationContext,
     request_value: &Value,
     now_ms: i64,
+    forge_preparation: &super::forge::ForgeExecutionPreparation,
 ) -> Result<Value> {
     let caller = context.technical_requester_id();
     let request_id = model::text(request_value, "client_request_id")?;
@@ -570,6 +590,7 @@ fn reserve_automatic_publication(
         request_value,
         &operation_id,
         launcher_config,
+        Some(forge_preparation),
     )?;
     let coalesced = reserved["coalesced"] == true
         || reserved["status"] == "coalesced"
@@ -654,6 +675,7 @@ fn recheck_pending(
     state: &mut PublicationState,
     budget: usize,
     now_ms: i64,
+    forge_preparation: &super::forge::ForgeExecutionPreparation,
 ) -> Result<usize> {
     let mut processed = 0usize;
     while processed < budget {
@@ -684,6 +706,7 @@ fn recheck_pending(
                 historical_replay_authorized: replay,
             },
             now_ms,
+            forge_preparation,
         )?;
         processed += 1;
         if let ReserveDisposition::Pending { .. } = disposition {
