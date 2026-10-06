@@ -161,6 +161,236 @@ fn valid_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+pub(super) fn validate_sealed_module_receipt(
+    descriptor: &Value,
+    value: &Value,
+    operation_id: &str,
+    binding_id: &str,
+    generation: i64,
+    input_sha256: &str,
+) -> Result<()> {
+    let receipt: swarm_contracts::runtime::ModuleReceiptIdentity =
+        serde_json::from_value(value.clone()).map_err(|_| {
+            Error::new(
+                "MODULE_RECEIPT_INVALID",
+                "sealed Claude result origin has an invalid module receipt",
+            )
+        })?;
+    receipt.validate().map_err(|_| {
+        Error::new(
+            "MODULE_RECEIPT_INVALID",
+            "sealed Claude result module receipt is outside protocol 1.0",
+        )
+    })?;
+    if receipt.binding_id != binding_id
+        || receipt.binding_generation != generation
+        || receipt.operation_id != operation_id
+        || receipt.input_sha256 != input_sha256
+        || serde_json::to_value(&receipt.module_id)? != descriptor["module_id"]
+        || serde_json::to_value(&receipt.artifact)? != descriptor["artifact"]
+        || serde_json::to_value(&receipt.protocol)? != descriptor["protocol"]
+    {
+        return Err(Error::new(
+            "MODULE_RECEIPT_INVALID",
+            "sealed Claude result module receipt differs from its admitted descriptor or Operation",
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn load_claude_result_origin(
+    db: &Connection,
+    operation_id: &str,
+    operation: &Value,
+    binding_id: &str,
+    generation: i64,
+    target_operation_id: &str,
+    target: &Value,
+) -> Result<Value> {
+    if operation["operation_id"] != operation_id
+        || operation["method"] != "agent.result"
+        || operation["binding_id"] != binding_id
+        || operation["binding_generation"] != generation
+        || target["operation_id"] != target_operation_id
+        || target["method"] != "task.dispatch"
+        || target["binding_id"] != binding_id
+        || target["binding_generation"] != generation
+        || target["state"] != "settled"
+        || target["result"]["outcome"] != "applied"
+    {
+        return Err(Error::new(
+            "RESULT_TARGET_SCOPE_INVALID",
+            "Claude result origin does not name the exact retained dispatch",
+        ));
+    }
+    let effective_raw: String = db.query_row(
+        "SELECT effective_request_json FROM operations WHERE operation_id=?1 AND binding_id=?2 AND binding_generation=?3",
+        params![operation_id, binding_id, generation],
+        |row| row.get(0),
+    )?;
+    let effective: Value = serde_json::from_str(&effective_raw)?;
+    let origin = effective["claude_result_origin"].clone();
+    if origin["schema_version"] != 1
+        || origin["kind"] != "claude_assistant_result"
+        || origin["result_operation_id"] != operation_id
+        || origin["target_operation_id"] != target_operation_id
+        || origin["target_method"] != "task.dispatch"
+        || origin["binding_id"] != binding_id
+        || origin["binding_generation"] != generation
+        || origin["result_selector"]["kind"] != "claude_assistant_result"
+        || origin["result_selector"]["input_operation_id"] != target_operation_id
+        || !origin["result_selector"]["session_id"].is_string()
+        || !origin["native_scope_key"].is_string()
+        || origin["descriptor"].is_null()
+        || origin["producer"].is_null()
+    {
+        return Err(Error::new(
+            "RESULT_TARGET_ORIGIN_INVALID",
+            "Claude result Operation has no valid sealed origin",
+        ));
+    }
+    let result_raw: String = db.query_row(
+        "SELECT original_request_json FROM operations WHERE operation_id=?1 AND binding_id=?2 AND binding_generation=?3",
+        params![operation_id, binding_id, generation],
+        |row| row.get(0),
+    )?;
+    let result_request: Value = serde_json::from_str(&result_raw)?;
+    let result_input_sha256 = model::digest(model::canonical(&result_request)?.as_bytes());
+    if origin["result_input_sha256"] != result_input_sha256
+        || origin["result_selector"] != result_request["selector"]
+    {
+        return Err(Error::new(
+            "RESULT_TARGET_ORIGIN_INVALID",
+            "sealed Claude result origin differs from its immutable request",
+        ));
+    }
+    let target_raw: String = db.query_row(
+        "SELECT original_request_json FROM operations WHERE operation_id=?1 AND binding_id=?2 AND binding_generation=?3",
+        params![target_operation_id, binding_id, generation],
+        |row| row.get(0),
+    )?;
+    let target_request: Value = serde_json::from_str(&target_raw)?;
+    let target_input_sha256 = model::digest(model::canonical(&target_request)?.as_bytes());
+    if origin["target_input_sha256"] != target_input_sha256
+        || target["task_id"] != origin["target_task_id"]
+        || target["attempt_id"] != origin["target_attempt_id"]
+    {
+        return Err(Error::new(
+            "RESULT_TARGET_ORIGIN_INVALID",
+            "sealed Claude result origin differs from the retained Task Attempt identity",
+        ));
+    }
+    let target_outcome: RuntimeOutcome =
+        serde_json::from_value(target["result"].clone()).map_err(|_| {
+            Error::new(
+                "RESULT_TARGET_RECEIPT_INVALID",
+                "Claude result target has no typed retained outcome",
+            )
+        })?;
+    if target_outcome.operation_id != target_operation_id
+        || !matches!(target_outcome.outcome, EffectOutcome::Applied)
+        || target_outcome.native_root_id.as_deref() != origin["native_session_id"].as_str()
+        || target_outcome.native_scope_key.as_deref() != origin["native_scope_key"].as_str()
+        || target_outcome.details["completion_condition"] != "native_input_admitted"
+        || target_outcome.details["execution_complete"] != false
+        || target_outcome.details["task_completion"] != "unknown"
+        || target_outcome.details["module_receipt"] != origin["target_module_receipt"]
+        || target_outcome.details["dispatch_admission"] != origin["dispatch_admission"]
+    {
+        return Err(Error::new(
+            "RESULT_TARGET_NOT_ADMITTED",
+            "Claude result target differs from the sealed native admission",
+        ));
+    }
+    let admission: swarm_contracts::runtime::TaskDispatchAdmissionReceipt =
+        serde_json::from_value(origin["dispatch_admission"].clone()).map_err(|_| {
+            Error::new(
+                "RESULT_TARGET_ORIGIN_INVALID",
+                "sealed Claude result origin has an invalid dispatch admission",
+            )
+        })?;
+    admission.validate().map_err(|_| {
+        Error::new(
+            "RESULT_TARGET_ORIGIN_INVALID",
+            "sealed Claude result dispatch admission is invalid",
+        )
+    })?;
+    if serde_json::to_value(&admission.module_receipt)? != origin["target_module_receipt"]
+        || admission.operation_id != target_operation_id
+        || admission.binding_id != binding_id
+        || admission.binding_generation != generation
+        || admission.attempt_id != origin["target_attempt_id"]
+        || admission.task_id != origin["target_task_id"]
+        || admission.task_revision != origin["target_task_revision"]
+        || admission.native_input_id != origin["native_input_id"].as_str().map(str::to_owned)
+        || admission.native_payload_sha256 != origin["native_payload_sha256"]
+        || admission.native_payload_bytes != origin["native_payload_bytes"]
+    {
+        return Err(Error::new(
+            "RESULT_TARGET_ORIGIN_INVALID",
+            "sealed Claude result origin differs from the normalized dispatch admission",
+        ));
+    }
+    let producer = &origin["producer"];
+    if producer["assignment_id"] != target_operation_id
+        || producer["dispatch_operation_id"] != target_operation_id
+        || producer["task_id"] != origin["target_task_id"]
+        || producer["attempt_id"] != origin["target_attempt_id"]
+        || producer["task_revision"] != origin["target_task_revision"]
+        || producer["native_session_id"] != origin["native_session_id"]
+        || producer["native_input_id"] != origin["native_input_id"]
+        || producer["native_payload_sha256"] != origin["native_payload_sha256"]
+        || producer["native_payload_bytes"] != origin["native_payload_bytes"]
+        || producer["completion_condition"] != "native_input_admitted"
+        || producer["execution_complete"] != false
+        || producer["task_completion"] != "unknown"
+        || producer["disposition"] != "admitted"
+        || producer["admission_kind"] != "normalized_task_dispatch"
+    {
+        return Err(Error::new(
+            "RESULT_TARGET_ORIGIN_INVALID",
+            "sealed Claude result producer identity is inconsistent",
+        ));
+    }
+    validate_sealed_module_receipt(
+        &origin["descriptor"],
+        &origin["target_module_receipt"],
+        target_operation_id,
+        binding_id,
+        generation,
+        target_input_sha256.as_str(),
+    )?;
+    if origin["target_task_revision"]
+        .as_i64()
+        .is_none_or(|revision| revision <= 0)
+        || !valid_sha256(origin["native_payload_sha256"].as_str().unwrap_or_default())
+        || origin["native_payload_bytes"]
+            .as_u64()
+            .is_none_or(|bytes| bytes == 0)
+    {
+        return Err(Error::new(
+            "RESULT_TARGET_ORIGIN_INVALID",
+            "sealed Claude result native admission identity is invalid",
+        ));
+    }
+    if let Some(result_receipt) = operation["result"]
+        .get("details")
+        .and_then(|d| d.get("module_receipt"))
+    {
+        if !result_receipt.is_null() {
+            validate_sealed_module_receipt(
+                &origin["descriptor"],
+                result_receipt,
+                operation_id,
+                binding_id,
+                generation,
+                result_input_sha256.as_str(),
+            )?;
+        }
+    }
+    Ok(origin)
+}
+
 pub(super) fn antigravity_status_page_bytes(metadata: &Value) -> Result<Vec<u8>> {
     let source = &metadata["source"];
     Ok(serde_json::to_vec(&json!({
@@ -179,13 +409,85 @@ pub(super) fn antigravity_status_page_bytes(metadata: &Value) -> Result<Vec<u8>>
     }))?)
 }
 
+/// Re-admit only an already-authenticated Claude result against its retained
+/// binding generation and sealed dispatch origin. Historical result pages may
+/// arrive after the binding or current module link has been released, so this
+/// deliberately avoids the live `runtime::scope` release/link checks. The
+/// module registration, result Operation, retained target and immutable origin
+/// still have to agree before any page is prepared or recorded.
+fn admitted_claude_result_scope(
+    db: &Connection,
+    p: &Principal,
+    operation_id: &str,
+) -> Result<Option<(String, i64, Value)>> {
+    if p.role != Role::Module {
+        return Ok(None);
+    }
+    let Some(client) = super::meta(db, &format!("client:{}", p.client_id))? else {
+        return Ok(None);
+    };
+    // The transport authenticated this carrier. This narrow completion path
+    // collects an existing result; revocation still denies new connections and
+    // new commands through their ordinary admission paths.
+    if client["role"] != "module" {
+        return Ok(None);
+    }
+
+    let operation = operations::get_operation(db, operation_id)?;
+    if operation["method"] != "agent.result" {
+        return Ok(None);
+    }
+    let raw: String = db.query_row(
+        "SELECT original_request_json FROM operations WHERE operation_id=?1",
+        [operation_id],
+        |row| row.get(0),
+    )?;
+    let request: Value = serde_json::from_str(&raw)?;
+    if request["selector"]["kind"] != "claude_assistant_result" {
+        return Ok(None);
+    }
+
+    let binding_id = model::text(&client, "binding_id")?.to_owned();
+    let generation = model::positive(&client, "binding_generation")?;
+    let binding = operations::get_binding(db, &binding_id, generation)?;
+    if binding["observation"]["module_client_id"] != p.client_id {
+        return Err(Error::new(
+            "MODULE_OWNER_MISMATCH",
+            "credential does not own the retained Claude result binding",
+        ));
+    }
+    // The Manager is the result Operation's caller; the Module is its carrier.
+    // Authenticate the carrier against the retained binding, not caller_id.
+    if operation["binding_id"] != binding_id || operation["binding_generation"] != generation {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "Claude result is not admitted under this module credential tuple",
+        ));
+    }
+    let target_id = model::text(&request["selector"], "input_operation_id")?;
+    let target = operations::get_operation(db, target_id)?;
+    load_claude_result_origin(
+        db,
+        operation_id,
+        &operation,
+        &binding_id,
+        generation,
+        target_id,
+        &target,
+    )?;
+    Ok(Some((binding_id, generation, binding)))
+}
+
 pub(super) fn prepare(
     db: &Connection,
     p: &Principal,
     operation_id: &str,
     source: &Value,
 ) -> Result<Value> {
-    let (id, generation, b) = runtime::scope(db, p, true)?;
+    let (id, generation, b) = match admitted_claude_result_scope(db, p, operation_id)? {
+        Some(scope) => scope,
+        None => runtime::scope(db, p, true)?,
+    };
     let op = operations::get_operation(db, operation_id)?;
     if op["method"] != "agent.result"
         || op["binding_id"] != id
@@ -271,8 +573,153 @@ pub(super) fn prepare(
         context["target_operation_status"] = target_status.clone();
         context["native_session_id"] = json!(session_id);
         validate_antigravity_status_source(db, &id, generation, &b, source, &context)?;
+    } else if request["selector"]["kind"] == "claude_assistant_result" {
+        model::fields(
+            &request["selector"],
+            &["kind", "input_operation_id", "session_id"],
+        )?;
+        let target_id = model::text(&request["selector"], "input_operation_id")?;
+        let session_id = model::text(&request["selector"], "session_id")?;
+        let target = operations::get_operation(db, target_id)?;
+        let origin =
+            load_claude_result_origin(db, operation_id, &op, &id, generation, target_id, &target)?;
+        if origin["native_session_id"] != session_id {
+            return Err(Error::new(
+                "RESULT_TARGET_SCOPE_INVALID",
+                "Claude result selector differs from its sealed native session",
+            ));
+        }
+        validate_sealed_module_receipt(
+            &origin["descriptor"],
+            &source["result_module_receipt"],
+            operation_id,
+            id,
+            generation,
+            origin["result_input_sha256"].as_str().unwrap_or_default(),
+        )?;
+        context["binding_id"] = origin["binding_id"].clone();
+        context["generation"] = origin["binding_generation"].clone();
+        context["native_root_id"] = origin["native_session_id"].clone();
+        context["native_scope_key"] = origin["native_scope_key"].clone();
+        context["result_input_sha256"] = origin["result_input_sha256"].clone();
+        context["result_module_receipt"] = source["result_module_receipt"].clone();
+        context["target_operation_id"] = origin["target_operation_id"].clone();
+        context["target_method"] = origin["target_method"].clone();
+        context["target_input_sha256"] = origin["target_input_sha256"].clone();
+        context["target_module_receipt"] = origin["target_module_receipt"].clone();
+        context["target_attempt_id"] = origin["target_attempt_id"].clone();
+        context["target_task_id"] = origin["target_task_id"].clone();
+        context["target_task_revision"] = origin["target_task_revision"].clone();
+        context["native_session_id"] = origin["native_session_id"].clone();
+        context["native_input_id"] = origin["native_input_id"].clone();
+        context["native_payload_sha256"] = origin["native_payload_sha256"].clone();
+        context["native_payload_bytes"] = origin["native_payload_bytes"].clone();
+        validate_claude_assistant_result_source(&request, source, &context, &origin["producer"])?;
+        for key in [
+            "result_frame_uuid",
+            "result_subtype",
+            "result_status",
+            "result_sha256",
+            "result_bytes",
+            "content_digest",
+            "native_output",
+            "evidence",
+            "native_response_identity",
+            "execution_complete",
+            "task_completion",
+            "native_replay",
+        ] {
+            context[key] = source[key].clone();
+        }
     }
     Ok(context)
+}
+
+pub(super) fn validate_claude_assistant_result_source(
+    request: &Value,
+    source: &Value,
+    context: &Value,
+    producer: &Value,
+) -> Result<()> {
+    model::fields(
+        source,
+        &[
+            "kind",
+            "result_operation_id",
+            "result_input_sha256",
+            "result_module_receipt",
+            "input_operation_id",
+            "target_method",
+            "target_input_sha256",
+            "target_module_receipt",
+            "native_session_id",
+            "native_input_id",
+            "native_payload_sha256",
+            "native_payload_bytes",
+            "result_frame_uuid",
+            "result_subtype",
+            "result_status",
+            "result_sha256",
+            "result_bytes",
+            "content_digest",
+            "native_output",
+            "evidence",
+            "native_response_identity",
+            "execution_complete",
+            "task_completion",
+            "native_replay",
+        ],
+    )?;
+    let subtype = model::text(source, "result_subtype")?;
+    let status = model::text(source, "result_status")?;
+    let result_frame_uuid = model::text(source, "result_frame_uuid")?;
+    let result_sha256 = model::text(source, "result_sha256")?;
+    let content_digest = model::text(source, "content_digest")?;
+    let result_bytes = source["result_bytes"]
+        .as_u64()
+        .filter(|bytes| *bytes <= 512_000)
+        .ok_or_else(|| Error::invalid("Claude result byte length is invalid"))?;
+    if source["kind"] != "claude_assistant_result"
+        || source["result_operation_id"] != context["operation_id"]
+        || source["result_input_sha256"] != context["result_input_sha256"]
+        || source["result_module_receipt"] != context["result_module_receipt"]
+        || source["input_operation_id"] != context["target_operation_id"]
+        || source["target_method"] != "task.dispatch"
+        || source["target_input_sha256"] != context["target_input_sha256"]
+        || source["target_module_receipt"] != context["target_module_receipt"]
+        || source["native_session_id"] != context["native_session_id"]
+        || source["native_session_id"] != request["selector"]["session_id"]
+        || source["native_input_id"] != context["native_input_id"]
+        || source["native_payload_sha256"] != context["native_payload_sha256"]
+        || source["native_payload_bytes"] != context["native_payload_bytes"]
+        || !matches!(
+            subtype,
+            "success"
+                | "error_during_execution"
+                | "error_max_turns"
+                | "error_max_budget_usd"
+                | "error_max_structured_output_retries"
+        )
+        || !matches!(status, "completed" | "failed")
+        || result_frame_uuid.len() > 128
+        || !valid_sha256(result_sha256)
+        || content_digest != format!("sha256:{result_sha256}")
+        || source["native_output"] != "claude.assistant.result"
+        || source["evidence"] != "exact_claude_sdk_assistant_result"
+        || source["native_response_identity"] != "sdk_result_frame"
+        || source["execution_complete"] != true
+        || source["task_completion"] != "unknown"
+        || source["native_replay"] != false
+        || producer["native_payload_sha256"] != source["native_payload_sha256"]
+        || producer["native_payload_bytes"] != source["native_payload_bytes"]
+    {
+        return Err(Error::new(
+            "RESULT_PROVENANCE_INVALID",
+            "Claude assistant result differs from the exact admitted input and SDK result frame",
+        ));
+    }
+    let _ = result_bytes;
+    Ok(())
 }
 
 fn validate_antigravity_status_source(
@@ -483,6 +930,34 @@ pub(super) fn record(
             "target_operation_status",
             "native_session_id",
         ]);
+    } else if artifact.metadata["selector"]["kind"] == "claude_assistant_result" {
+        context_keys.extend([
+            "result_input_sha256",
+            "result_module_receipt",
+            "target_operation_id",
+            "target_method",
+            "target_input_sha256",
+            "target_module_receipt",
+            "target_attempt_id",
+            "target_task_id",
+            "target_task_revision",
+            "native_session_id",
+            "native_input_id",
+            "native_payload_sha256",
+            "native_payload_bytes",
+            "result_frame_uuid",
+            "result_subtype",
+            "result_status",
+            "result_sha256",
+            "result_bytes",
+            "content_digest",
+            "native_output",
+            "evidence",
+            "native_response_identity",
+            "execution_complete",
+            "task_completion",
+            "native_replay",
+        ]);
     }
     for key in context_keys {
         if context[key] != artifact.metadata[key] {
@@ -490,6 +965,20 @@ pub(super) fn record(
                 "result context changed before file registration",
             ));
         }
+    }
+    if artifact.metadata["selector"]["kind"] == "claude_assistant_result"
+        && (artifact.metadata["total_bytes"] != context["result_bytes"]
+            || artifact.metadata["source"]["result_bytes"] != context["result_bytes"]
+            || artifact.metadata["source"]["content_digest"]
+                != format!(
+                    "sha256:{}",
+                    context["result_sha256"].as_str().unwrap_or_default()
+                ))
+    {
+        return Err(Error::new(
+            "RESULT_PROVENANCE_INVALID",
+            "Claude result page range differs from the retained full SDK result identity",
+        ));
     }
     let op = operations::get_operation(&tx, operation_id)?;
     if op["state"] == "settled" {

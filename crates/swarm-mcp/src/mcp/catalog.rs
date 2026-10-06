@@ -506,6 +506,19 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
         "Bounded incremental page."
     ),
     entry!(
+        "monitor.follow",
+        Monitoring,
+        MANAGER_AUDIENCES,
+        Searchable,
+        "Read one bounded retained observation page after a monitor journal cursor.",
+        "Use with the cursor from monitor.snapshot or a prior monitor.follow result.",
+        &[
+            "monitor", "follow", "journal", "cursor", "events", "lag", "gap"
+        ],
+        &["authenticated Manager", "journal cursor"],
+        "Bounded visible page with explicit retention, gap, lag, and current-coverage facts."
+    ),
+    entry!(
         "report.attention",
         Monitoring,
         OBSERVER_AUDIENCES,
@@ -981,6 +994,17 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
         ],
         &["optional limit"],
         "Bounded summary; Observer omits assignment detail and manager exceptions."
+    ),
+    entry!(
+        "monitor.snapshot",
+        Monitoring,
+        MANAGER_AUDIENCES,
+        Core,
+        "Capture one Manager-authorized current-state snapshot and an observation-journal cut for race-free follow-up.",
+        "Use before monitor.follow; updates committed after the returned cut are recoverable by its cursor.",
+        &["monitor", "snapshot", "live", "journal", "cut", "state"],
+        &["authenticated Manager"],
+        "Current Store state plus an atomic durable observation cursor; no live process probe or model polling."
     ),
     entry!(
         "swarm.queue.get",
@@ -2154,6 +2178,8 @@ const ASSIGNED_REVIEWER_CORE: &[&str] = &[
 const MANAGER_CORE: &[&str] = &[
     "swarm.tools.search",
     "swarm.dashboard",
+    "monitor.snapshot",
+    "monitor.follow",
     "swarm.queue.get",
     "swarm.agent.inspect",
     "swarm.exceptions.get",

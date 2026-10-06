@@ -6,6 +6,7 @@ use tokio::sync::{mpsc, oneshot};
 
 struct StatusRequest {
     principal: Principal,
+    method: String,
     params: Value,
     reply: oneshot::Sender<Result<Value>>,
 }
@@ -20,10 +21,24 @@ pub(super) struct Sender(mpsc::Sender<StatusJob>);
 
 impl Sender {
     pub(super) async fn host_status(&self, principal: Principal, params: Value) -> Result<Value> {
+        self.read(principal, "host.status", params).await
+    }
+
+    pub(super) async fn monitor(
+        &self,
+        principal: Principal,
+        method: String,
+        params: Value,
+    ) -> Result<Value> {
+        self.read(principal, &method, params).await
+    }
+
+    async fn read(&self, principal: Principal, method: &str, params: Value) -> Result<Value> {
         let (reply, response) = oneshot::channel();
         self.0
             .send(StatusJob::Read(StatusRequest {
                 principal,
+                method: method.to_owned(),
                 params,
                 reply,
             }))
@@ -76,8 +91,14 @@ pub(super) async fn start(
                 let StatusJob::Read(request) = job else {
                     break;
                 };
-                let result = read_status(&mut db, request.principal, request.params, &config);
-                let _ = request.reply.send(result);
+                let StatusRequest {
+                    principal,
+                    method,
+                    params,
+                    reply,
+                } = request;
+                let result = read_status(&mut db, principal, &method, params, &config);
+                let _ = reply.send(result);
             }
         })?;
 
@@ -125,6 +146,7 @@ fn open_status_database(path: &Path) -> Result<Connection> {
 fn read_status(
     db: &mut Connection,
     principal: Principal,
+    method: &str,
     params: Value,
     config: &Config,
 ) -> Result<Value> {
@@ -143,7 +165,7 @@ fn read_status(
                 "participant credentials have no host-wide status surface",
             ));
         }
-        super::read(&tx, &principal, "host.status", &params, config)
+        super::read(&tx, &principal, method, &params, config)
     })();
 
     match result {

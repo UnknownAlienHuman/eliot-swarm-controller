@@ -73,6 +73,7 @@ fn identity(page: &ArtifactRecord) -> Result<Value> {
         ));
     }
     let command_output = m["source"]["kind"] == "command_output";
+    let claude_assistant_result = m["source"]["kind"] == "claude_assistant_result";
     model::text(m, "binding_id")?;
     model::positive(m, "generation")?;
     if command_output {
@@ -93,7 +94,7 @@ fn identity(page: &ArtifactRecord) -> Result<Value> {
         .as_object_mut()
         .expect("checked object")
         .remove("whole_digest_verified");
-    if command_output {
+    if command_output || claude_assistant_result {
         let source = source.as_object_mut().expect("checked object");
         source.remove("result_operation_id");
         source.remove("result_input_sha256");

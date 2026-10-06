@@ -163,6 +163,8 @@ pub(super) fn exposes_method(profile: McpToolProfile, method: &str) -> bool {
                 | "script.run"
                 | "script.get"
                 | "script.list"
+                | "monitor.snapshot"
+                | "monitor.follow"
                 | "swarm.queue.get"
                 | "swarm.agent.inspect"
                 | "swarm.exceptions.get"

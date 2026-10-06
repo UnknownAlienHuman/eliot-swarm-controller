@@ -244,7 +244,16 @@ fn authorize_participant_candidate(
             "source snapshot belongs to another Task or Attempt",
         ));
     }
-    if attempt["binding_id"].is_null() || attempt["binding_generation"].is_null() {
+    let claude_candidate = match candidate.kind.as_str() {
+        "native_result_page" => candidate.metadata["source"]["kind"] == "claude_assistant_result",
+        "native_result" => {
+            candidate.metadata["identity"]["source"]["kind"] == "claude_assistant_result"
+        }
+        _ => false,
+    };
+    if !claude_candidate
+        && (attempt["binding_id"].is_null() || attempt["binding_generation"].is_null())
+    {
         return Err(Error::new(
             "CANDIDATE_SCOPE",
             "native result candidate is not linked to this bound Attempt",
@@ -288,10 +297,17 @@ fn authorize_participant_candidate(
         }
         validate_complete_command_output(&page)?;
         let command_output = page.metadata["source"]["kind"] == "command_output";
-        let operation_id = if command_output {
+        let claude_result = page.metadata["source"]["kind"] == "claude_assistant_result";
+        let result_operation_id = page.metadata["operation_id"].as_str().ok_or_else(|| {
+            Error::new(
+                "CANDIDATE_SCOPE",
+                "result page has no retained result operation",
+            )
+        })?;
+        let operation_id = if command_output || claude_result {
             page.metadata["source"]["input_operation_id"].as_str()
         } else {
-            page.metadata["operation_id"].as_str()
+            Some(result_operation_id)
         }
         .ok_or_else(|| {
             Error::new(
@@ -305,6 +321,18 @@ fn authorize_participant_candidate(
         } else {
             page.metadata["native_output"].as_str()
         };
+        if claude_result {
+            authorize_claude_result_candidate(
+                db,
+                &page,
+                &page.metadata["source"],
+                result_operation_id,
+                operation_id,
+                &dispatch,
+                &page_id,
+            )?;
+            continue;
+        }
         if dispatch["method"] != "task.dispatch"
             || (command_output
                 && (dispatch["state"] != "settled" || dispatch["result"]["outcome"] != "applied"))
@@ -323,6 +351,7 @@ fn authorize_participant_candidate(
                         != operation_id
                     || !matches!(native_output, Some("stdout.ndjson" | "stderr.txt"))))
             || (!command_output
+                && !claude_result
                 && !crate::runtime::batch::BATCH_OUTPUTS.contains(&native_output.unwrap_or("")))
         {
             return Err(Error::new(
@@ -381,6 +410,110 @@ fn authorize_participant_candidate(
                 "result page is not linked to an applied agent.result Operation",
             ));
         }
+    }
+    Ok(())
+}
+
+fn authorize_claude_result_candidate(
+    db: &Connection,
+    page: &ArtifactRecord,
+    source: &Value,
+    result_operation_id: &str,
+    dispatch_operation_id: &str,
+    dispatch: &Value,
+    page_id: &str,
+) -> Result<()> {
+    model::fields(
+        source,
+        &[
+            "kind",
+            "result_operation_id",
+            "result_input_sha256",
+            "result_module_receipt",
+            "input_operation_id",
+            "target_method",
+            "target_input_sha256",
+            "target_module_receipt",
+            "native_session_id",
+            "native_input_id",
+            "native_payload_sha256",
+            "native_payload_bytes",
+            "result_frame_uuid",
+            "result_subtype",
+            "result_status",
+            "result_sha256",
+            "result_bytes",
+            "content_digest",
+            "native_output",
+            "evidence",
+            "native_response_identity",
+            "execution_complete",
+            "task_completion",
+            "native_replay",
+        ],
+    )?;
+    let result_operation = operations::get_operation(db, result_operation_id)?;
+    let binding_id = model::text(&result_operation, "binding_id")?;
+    let binding_generation = result_operation["binding_generation"]
+        .as_i64()
+        .ok_or_else(|| Error::new("CANDIDATE_SCOPE", "Claude result has no binding generation"))?;
+    let origin = results::load_claude_result_origin(
+        db,
+        result_operation_id,
+        &result_operation,
+        binding_id,
+        binding_generation,
+        dispatch_operation_id,
+        dispatch,
+    )?;
+    let context = json!({
+        "operation_id":result_operation_id,
+        "result_input_sha256":origin["result_input_sha256"],
+        "result_module_receipt":source["result_module_receipt"],
+        "target_operation_id":origin["target_operation_id"],
+        "target_method":origin["target_method"],
+        "target_input_sha256":origin["target_input_sha256"],
+        "target_module_receipt":origin["target_module_receipt"],
+        "native_session_id":origin["native_session_id"],
+        "native_input_id":origin["native_input_id"],
+        "native_payload_sha256":origin["native_payload_sha256"],
+        "native_payload_bytes":origin["native_payload_bytes"]
+    });
+    let request = json!({"selector":origin["result_selector"]});
+    results::validate_sealed_module_receipt(
+        &origin["descriptor"],
+        &source["result_module_receipt"],
+        result_operation_id,
+        binding_id,
+        binding_generation,
+        origin["result_input_sha256"].as_str().unwrap_or_default(),
+    )?;
+    results::validate_claude_assistant_result_source(
+        &request,
+        source,
+        &context,
+        &origin["producer"],
+    )?;
+    if result_operation["state"] != "settled"
+        || result_operation["result"]["outcome"] != "applied"
+        || result_operation["result"]["details"]["artifact_ref"] != page_id
+        || result_operation["result"]["details"]["source"] != source.clone()
+        || page.metadata["operation_id"] != result_operation_id
+        || page.metadata["binding_id"] != binding_id
+        || page.metadata["binding_generation"].as_i64() != Some(binding_generation)
+        || page.metadata["native_root_id"] != origin["native_session_id"]
+        || page.metadata["native_scope_key"] != origin["native_scope_key"]
+        || page.metadata["total_bytes"] != source["result_bytes"]
+        || page.metadata["source"]["content_digest"] != source["content_digest"]
+        || (page.metadata["total_bytes"] == json!(page.byte_length)
+            && page.content_digest != source["result_sha256"].as_str().unwrap_or(""))
+        || source["result_operation_id"] != result_operation_id
+        || source["input_operation_id"] != dispatch_operation_id
+    {
+        return Err(Error::new(
+            "CANDIDATE_SCOPE",
+            "Claude result candidate is not the exact retained SDK frame",
+        ));
     }
     Ok(())
 }

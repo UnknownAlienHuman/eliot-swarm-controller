@@ -29,6 +29,22 @@ and extended Windows disk/UNC paths share that lexical scope. Manager and
 Operator capture retain their existing general path. Collection of an in-flight
 capture after assignment or lease release is a separate unfinished handoff.
 
+`monitor.snapshot` and `monitor.follow` use the existing status reader and
+visibility-filtered Store projections. The snapshot captures a committed
+journal cut in the same read transaction as its state; subsequent pages resume
+from that cut and report visibility, lag and gaps. Ordinary registered Managers
+use their stable client identity. The public CLI now forwards `swarm monitor
+snapshot/follow` through authenticated IPC; MCP discovery exposes both methods.
+Native metrics without retained evidence remain unavailable.
+
+Claude result admission now seals the exact dispatch, immutable Attempt,
+descriptor, SDK input and payload identity. Page collection and assembly use
+that saved origin after binding release or descriptor changes. The authenticated
+Module carrier is checked against the result's binding rather than the Manager
+who admitted its Operation. Current submission and acceptance authority remain
+separate. This implements the Store path in source; it has no current SDK or
+provider qualification.
+
 ### Kernel, independent frontends and managed services — 2026-10-05
 
 Store now uses the actual bounded `KernelHost` queue and one writer thread for
@@ -123,8 +139,8 @@ when the SDK supplies them. Cache and page limits report truncation. Claude
 remains disabled and reports partial family completeness. The adapter retains a
 bounded terminal SDK result body, correlates its actual input UUID and submitted
 payload digest to the retained dispatch, and exposes exact result pages through
-`agent.result`. Store capture and Participant submission wiring remain in
-progress. An SDK invocation result does not complete the Task or prove process
+`agent.result`. Store capture and Participant candidate provenance now validate
+the retained native admission and result pages. An SDK invocation result does not complete the Task or prove process
 family departure. The source descriptor and disabled
 route identify `claude-agent-sdk-0.3.287-rust-controller.4` (version 4).
 This status does not assert an installed image, selected version-4 route, or

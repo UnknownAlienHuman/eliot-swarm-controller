@@ -188,6 +188,12 @@ static TOOLS: &[(bool, ToolSpec)] = &[
         &[],
     ),
     read(
+        "monitor.snapshot",
+        "Capture one Manager-authorized current-state snapshot and an atomic observation-journal cut for race-free follow-up.",
+        &[f("limit", I)],
+        &[],
+    ),
+    read(
         "swarm.queue.get",
         "Page the current Task queue with optional project and state filters; queue ordering is the stored creation order, not a priority score.",
         &[
@@ -597,6 +603,12 @@ static TOOLS: &[(bool, ToolSpec)] = &[
     read(
         "report.delta",
         "Incremental report entries after a cursor.",
+        &[f("after", I), f("limit", I)],
+        &[],
+    ),
+    read(
+        "monitor.follow",
+        "Read one bounded retained observation page after a monitor journal cursor, with explicit retention, gap, lag, and current-coverage facts.",
         &[f("after", I), f("limit", I)],
         &[],
     ),

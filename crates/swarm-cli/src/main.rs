@@ -194,6 +194,11 @@ enum Command {
         #[command(subcommand)]
         command: ObserverCommand,
     },
+    /// Read the Store-backed Manager live monitor through authenticated IPC.
+    Monitor {
+        #[command(subcommand)]
+        command: MonitorCommand,
+    },
 }
 #[derive(Subcommand)]
 enum ObserverCommand {
@@ -232,6 +237,21 @@ enum ObserverCommand {
         /// Optional single interval (10–2000 ms) for exactly two samples.
         #[arg(long)]
         interval_ms: Option<u64>,
+    },
+}
+#[derive(Subcommand)]
+enum MonitorCommand {
+    /// Capture one current-state snapshot and an atomic observation-journal cut.
+    Snapshot {
+        #[arg(long, default_value_t = 5)]
+        limit: i64,
+    },
+    /// Read one bounded retained page after a monitor journal cursor.
+    Follow {
+        #[arg(long, default_value_t = 0)]
+        after: i64,
+        #[arg(long, default_value_t = 50)]
+        limit: i64,
     },
 }
 #[derive(Subcommand)]
@@ -856,22 +876,20 @@ fn delegate_to_host(arguments: &[OsString]) -> ExitCode {
             )
         }
         Err(error) => {
-            let (code, message) =
-                if error.kind() == std::io::ErrorKind::NotFound && !sibling_is_file {
-                    (
-                        "HOST_BINARY_MISSING",
-                        "install the swarm-host sibling beside the public swarm executable and retry",
-                    )
-                } else {
-                    (
-                        "HOST_START_FAILED",
-                        "check the host executable, runtime dependencies and launch permissions, then retry",
-                    )
-                };
-            eprintln!(
-                "{}",
-                json!({"error":{"code":code,"message":message}})
-            );
+            let (code, message) = if error.kind() == std::io::ErrorKind::NotFound
+                && !sibling_is_file
+            {
+                (
+                    "HOST_BINARY_MISSING",
+                    "install the swarm-host sibling beside the public swarm executable and retry",
+                )
+            } else {
+                (
+                    "HOST_START_FAILED",
+                    "check the host executable, runtime dependencies and launch permissions, then retry",
+                )
+            };
+            eprintln!("{}", json!({"error":{"code":code,"message":message}}));
             ExitCode::FAILURE
         }
     }
@@ -1029,6 +1047,15 @@ fn map_command(command: Command) -> Result<(String, Value)> {
         Command::Report { after, limit } => {
             ("report.delta".into(), json!({"after":after,"limit":limit}))
         }
+        Command::Monitor { command } => match command {
+            MonitorCommand::Snapshot { limit } => {
+                ("monitor.snapshot".into(), json!({"limit":limit}))
+            }
+            MonitorCommand::Follow { after, limit } => (
+                "monitor.follow".into(),
+                json!({"after":after,"limit":limit}),
+            ),
+        },
         Command::Task { command } => match command {
             TaskCommand::Accept { file } => ("task.accept".into(), read_json(&file)?),
             TaskCommand::Acceptance {

@@ -993,16 +993,21 @@ fn next_internal(
         method == "agent.result" && input["selector"]["kind"] == "command_status";
     let command_output_result =
         method == "agent.result" && input["selector"]["kind"] == "command_output";
+    let claude_assistant_result =
+        method == "agent.result" && input["selector"]["kind"] == "claude_assistant_result";
+    let mut sealed_claude_result_origin = None;
     let target_input_sha256 = if method == "agent.reconcile"
         || input_status_result
         || antigravity_status_result
         || command_status_result
         || command_output_result
+        || claude_assistant_result
     {
         let target_id = if input_status_result
             || antigravity_status_result
             || command_status_result
             || command_output_result
+            || claude_assistant_result
         {
             model::text(&input["selector"], "input_operation_id")?
         } else {
@@ -1024,6 +1029,32 @@ fn next_internal(
             return Err(Error::invalid(
                 "input_status must name an exact dispatch or send Operation",
             ));
+        }
+        if claude_assistant_result {
+            model::fields(
+                &input["selector"],
+                &["kind", "input_operation_id", "session_id"],
+            )?;
+            let session_id = model::text(&input["selector"], "session_id")?;
+            if !crate::runtime::prepared::is_prepared_claude_route(&b["route"])
+                || target["method"] != "task.dispatch"
+                || b["native_root_id"].as_str() != Some(session_id)
+            {
+                return Err(Error::new(
+                    "RESULT_TARGET_SCOPE_INVALID",
+                    "Claude assistant results require the exact task.dispatch and prepared session",
+                ));
+            }
+            sealed_claude_result_origin = Some(seal_claude_result_origin(
+                &tx,
+                &id,
+                generation,
+                &b,
+                &op,
+                target_id,
+                &target,
+                &input["selector"],
+            )?);
         }
         if antigravity_status_result {
             if b["route"]["runtime"] != "antigravity" {
@@ -3297,6 +3328,208 @@ fn current_attempts_for_binding(
         .collect()
 }
 
+/// Seal the exact Claude result origin while the result Operation is admitted.
+/// Later page delivery may outlive the current Attempt, GM, and descriptor
+/// registry state, so it must consume this immutable target/Attempt/descriptor
+/// and native admission identity instead of re-authorizing against live rows.
+fn seal_claude_result_origin(
+    db: &Connection,
+    binding_id: &str,
+    generation: i64,
+    binding: &Value,
+    result_operation_id: &str,
+    target_operation_id: &str,
+    target: &Value,
+    selector: &Value,
+) -> Result<Value> {
+    if !crate::runtime::prepared::is_prepared_claude_route(&binding["route"])
+        || target["method"] != "task.dispatch"
+        || target["binding_id"] != binding_id
+        || target["binding_generation"] != generation
+        || target["state"] != "settled"
+        || target["result"]["outcome"] != "applied"
+    {
+        return Err(Error::new(
+            "RESULT_TARGET_SCOPE_INVALID",
+            "Claude result must name the exact settled task.dispatch admission",
+        ));
+    }
+    model::fields(selector, &["kind", "input_operation_id", "session_id"])?;
+    if selector["input_operation_id"] != target_operation_id {
+        return Err(Error::new(
+            "RESULT_TARGET_SCOPE_INVALID",
+            "Claude result selector target differs from the retained dispatch",
+        ));
+    }
+    let target_outcome: RuntimeOutcome =
+        serde_json::from_value(target["result"].clone()).map_err(|_| {
+            Error::new(
+                "RESULT_TARGET_RECEIPT_INVALID",
+                "Claude result target has no typed task.dispatch outcome",
+            )
+        })?;
+    let native_session_id = target_outcome
+        .native_root_id
+        .clone()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            Error::new(
+                "RESULT_TARGET_NOT_ADMITTED",
+                "Claude result target has no retained native session",
+            )
+        })?;
+    if selector["session_id"] != native_session_id
+        || target_outcome.operation_id != target_operation_id
+        || target_outcome.native_root_id.as_deref() != Some(native_session_id.as_str())
+        || target_outcome.native_scope_key.as_deref() != binding["native_scope_key"].as_str()
+        || target_outcome.details["completion_condition"] != "native_input_admitted"
+        || target_outcome.details["execution_complete"] != false
+        || target_outcome.details["task_completion"] != "unknown"
+    {
+        return Err(Error::new(
+            "RESULT_TARGET_NOT_ADMITTED",
+            "Claude result target is not the retained native input admission",
+        ));
+    }
+
+    let attempt_id = model::text(target, "attempt_id")?;
+    let attempt = tasks::get_attempt(db, attempt_id)?;
+    let task = tasks::get_task(db, model::text(&attempt, "task_id")?)?;
+    if attempt["attempt_id"] != target["attempt_id"]
+        || attempt["task_id"] != target["task_id"]
+        || attempt["binding_id"] != binding_id
+        || attempt["binding_generation"] != generation
+        || attempt["start_operation_id"] != target_operation_id
+        || !attempt["released_at_ms"].is_null()
+        || !matches!(attempt["state"].as_str(), Some("reserved" | "running"))
+        || task["state"] != "open"
+        || task["revision"] != attempt["task_revision"]
+        || task["current_attempt_id"] != attempt["attempt_id"]
+    {
+        return Err(Error::new(
+            "RESULT_TARGET_SCOPE_INVALID",
+            "Claude result admission requires the current open Task Attempt",
+        ));
+    }
+    if !selected_task_dispatch_admission(db, binding)? {
+        return Err(Error::new(
+            "RESULT_TARGET_NOT_ADMITTED",
+            "Claude result target has no selected normalized dispatch contract",
+        ));
+    }
+    let target_receipt = validate_module_receipt_for_operation(
+        db,
+        binding_id,
+        generation,
+        binding,
+        &target_outcome,
+    )?;
+    let admission = validate_task_dispatch_admission(
+        db,
+        binding_id,
+        generation,
+        binding,
+        target,
+        &target_outcome,
+        &target_receipt,
+    )?;
+    let producer = attempt["producers"]
+        .as_array()
+        .and_then(|producers| {
+            let mut matches = producers.iter().filter(|producer| {
+                producer["assignment_id"] == target_operation_id
+                    && producer["dispatch_operation_id"] == target_operation_id
+            });
+            let first = matches.next()?;
+            matches.next().is_none().then_some(first)
+        })
+        .ok_or_else(|| {
+            Error::new(
+                "RESULT_TARGET_NOT_ADMITTED",
+                "Claude result target has no unique normalized producer",
+            )
+        })?;
+    if producer["native_session_id"] != native_session_id
+        || producer["native_input_id"] != json!(admission.native_input_id)
+        || producer["native_payload_sha256"] != admission.native_payload_sha256
+        || producer["native_payload_bytes"] != admission.native_payload_bytes
+        || producer["completion_condition"] != "native_input_admitted"
+        || producer["execution_complete"] != false
+        || producer["task_completion"] != "unknown"
+        || producer["disposition"] != "admitted"
+        || producer["admission_kind"] != "normalized_task_dispatch"
+    {
+        return Err(Error::new(
+            "RESULT_TARGET_NOT_ADMITTED",
+            "Claude result target producer differs from the normalized dispatch admission",
+        ));
+    }
+
+    let original_request_json: String = db.query_row(
+        "SELECT original_request_json FROM operations WHERE operation_id=?1 AND binding_id=?2 AND binding_generation=?3",
+        params![target_operation_id, binding_id, generation],
+        |row| row.get(0),
+    )?;
+    let target_request: Value = serde_json::from_str(&original_request_json)?;
+    let target_input_sha256 = model::digest(model::canonical(&target_request)?.as_bytes());
+    let result_request_json: String = db.query_row(
+        "SELECT original_request_json FROM operations WHERE operation_id=?1",
+        [result_operation_id],
+        |row| row.get(0),
+    )?;
+    let result_request: Value = serde_json::from_str(&result_request_json)?;
+    let result_input_sha256 = model::digest(model::canonical(&result_request)?.as_bytes());
+    let retained = super::module_handshake::retained_contract_identity(
+        db,
+        model::text(binding, "module_artifact_id")?,
+        binding["observation"].get("module_contract_selector"),
+    )?
+    .ok_or_else(|| {
+        Error::new(
+            "MODULE_DESCRIPTOR_MISSING",
+            "Claude result admission has no retained descriptor identity",
+        )
+    })?;
+    let descriptor = json!({
+        "descriptor_revision":retained.descriptor_revision,
+        "module_id":retained.module_id,
+        "artifact":retained.artifact,
+        "protocol":retained.protocol,
+        "capabilities":retained.capabilities,
+        "command_schemas":retained.command_schemas,
+        "event_schemas":retained.event_schemas,
+        "module_artifact_id":binding["module_artifact_id"],
+        "selector":binding["observation"]["module_contract_selector"]
+    });
+    Ok(json!({
+        "schema_version":1,
+        "kind":"claude_assistant_result",
+        "result_operation_id":result_operation_id,
+        "result_input_sha256":result_input_sha256,
+        "result_selector":selector,
+        "target_operation_id":target_operation_id,
+        "target_method":"task.dispatch",
+        "target_input_sha256":target_input_sha256,
+        "target_module_receipt":target_receipt,
+        "target_task_id":attempt["task_id"],
+        "target_attempt_id":attempt["attempt_id"],
+        "target_task_revision":attempt["task_revision"],
+        "binding_id":binding_id,
+        "binding_generation":generation,
+        "native_session_id":native_session_id,
+        "native_scope_key":binding["native_scope_key"],
+        "native_input_id":admission.native_input_id,
+        "native_payload_sha256":admission.native_payload_sha256,
+        "native_payload_bytes":admission.native_payload_bytes,
+        "task_snapshot_sha256":admission.task_snapshot_sha256,
+        "source_text_sha256":admission.source_text_sha256,
+        "source_text_bytes":admission.source_text_bytes,
+        "dispatch_admission":admission,
+        "producer":producer,
+        "descriptor":descriptor
+    }))
+}
+
 /// Derive the sole repair request from Store-validated immutable feedback.
 /// A technical requester receives no general Manager or Operator authority.
 pub(super) fn user_command_for_repair(
@@ -3694,6 +3927,9 @@ fn user_command_with_actor(
             params![id,generation,now,model::canonical(&json!({"reason":"superseded_by_goal_stop","stop_operation_id":op}))?])?;
     }
     let mut effective = json!({"route":b["route"],"native_root_id":b["native_root_id"]});
+    if let Some(origin) = sealed_claude_result_origin.as_ref() {
+        effective["claude_result_origin"] = origin.clone();
+    }
     if let Some(snapshot) = command_result_target_snapshot {
         if v["selector"]["kind"] == "command_output" {
             effective["command_output_target_snapshot"] = snapshot;
@@ -3793,6 +4029,16 @@ fn user_command_with_actor(
                 op,
                 attempt["task_id"].as_str(),
                 attempt["attempt_id"].as_str()
+            ],
+        )?;
+    }
+    if let Some(origin) = sealed_claude_result_origin.as_ref() {
+        tx.execute(
+            "UPDATE operations SET task_id=?2,attempt_id=?3 WHERE operation_id=?1",
+            params![
+                op,
+                origin["target_task_id"].as_str(),
+                origin["target_attempt_id"].as_str()
             ],
         )?;
     }

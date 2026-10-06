@@ -55,6 +55,7 @@ pub(crate) mod module_demand;
 pub(crate) use legacy_worker_demand::LegacyWorkerDemand;
 mod module_handshake;
 mod module_supervisor_observation;
+mod monitor;
 mod native_mcp;
 #[cfg(test)]
 mod o6_taskless_path_fixture;
@@ -1430,6 +1431,37 @@ impl Store {
             );
             return Ok(status);
         }
+        if matches!(method.as_str(), "monitor.snapshot" | "monitor.follow") {
+            let mut monitor = self
+                .status_reader
+                .monitor(principal, method.clone(), params)
+                .await?;
+            if method == "monitor.snapshot" {
+                let state = monitor
+                    .get_mut("state")
+                    .and_then(Value::as_object_mut)
+                    .ok_or_else(|| {
+                        Error::new(
+                            "STORE_MONITOR_INVALID",
+                            "monitor snapshot state is not an object",
+                        )
+                    })?;
+                let host = state
+                    .get_mut("host")
+                    .and_then(Value::as_object_mut)
+                    .ok_or_else(|| {
+                        Error::new(
+                            "STORE_MONITOR_INVALID",
+                            "monitor snapshot host state is not an object",
+                        )
+                    })?;
+                host.insert(
+                    "kernel_host".into(),
+                    kernel_host_status_value(self.kernel.snapshot()),
+                );
+            }
+            return Ok(monitor);
+        }
         if method.starts_with("script.") {
             return self.script_call(principal, method, params).await;
         }
@@ -2706,6 +2738,8 @@ fn is_read(method: &str) -> bool {
             | "automation.config.preview"
             | "automation.config.explain"
             | "swarm.dashboard"
+            | "monitor.snapshot"
+            | "monitor.follow"
             | "swarm.queue.get"
             | "swarm.agent.inspect"
             | "swarm.exceptions.get"
@@ -3959,6 +3993,8 @@ fn mcp_authorization(db: &Connection, p: &Principal, value: &Value) -> Result<Va
                         | "swarm.queue.get"
                         | "swarm.agent.inspect"
                         | "swarm.exceptions.get"
+                        | "monitor.snapshot"
+                        | "monitor.follow"
                         | "swarm.launch.preview"
                         | "review.get"
                         | "review.list"
@@ -4024,6 +4060,8 @@ fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config
         "automation.config.preview" => automation::preview(db, p, v),
         "automation.config.explain" => automation::explain(db, p, v),
         "swarm.dashboard" => launcher::dashboard(db, p, v),
+        "monitor.snapshot" => monitor::snapshot(db, p, v, config),
+        "monitor.follow" => monitor::follow(db, p, v, config),
         "swarm.queue.get" => launcher::queue_get(db, p, v),
         "swarm.agent.inspect" => launcher::agent_inspect(db, p, v),
         "swarm.exceptions.get" => launcher::exceptions_get(db, p, v),
