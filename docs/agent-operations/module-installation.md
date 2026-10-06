@@ -27,7 +27,7 @@ Build only the selected package, using a caller-owned shared target directory. T
 | Codex | `swarm-adapter-codex` | `swarm-codex-adapter` | `crates/swarm-adapter-codex/module-descriptor.template.json` |
 | OpenCode | `swarm-adapter-opencode` | `swarm-adapter-opencode` | `crates/swarm-adapter-opencode/registration/descriptor.template.json` |
 | Command | `swarm-adapter-command` | `swarm-adapter-command` | `crates/swarm-adapter-command/module-descriptor.template.json` (version 3; version 2 is retained separately) |
-| Antigravity | `swarm-antigravity-adapter` | `swarm-antigravity` | `modules/antigravity-rust/module-descriptor.template.json` |
+| Antigravity | `swarm-antigravity-adapter` | `swarm-antigravity` | `modules/antigravity-rust/module-descriptor.template.json` (version 4) |
 | Claude | `swarm-adapter-claude` | `swarm-adapter-claude` | `modules/claude-rust/module-descriptor.template.json` |
 
 ```powershell
@@ -44,6 +44,17 @@ The host writes the private scoped launch plan and resolver map below its storag
 Copy the selected descriptor template outside the checkout. Set `enabled` to `true` only when ready to make that version selectable, and replace the credential placeholder (`<INSTALLER_CREDENTIAL_FILE_REF>` or the retained version-2 `REPLACE_AT_INSTALL` token) with an opaque protected-reference name. Keep adapter identity, protocol, schema, command/event schemas, capabilities, lifecycle and restart policy aligned with that adapter's template. Do not put credential bytes or provider tokens in the descriptor. The installer fills `launch.executable` and `launch.executable_sha256` from the built file.
 
 For Command version 3, keep the typed `module_host_config_path` argument marker unchanged; the supervisor materializes that schema-v1 IPC config inside the exact binding's private state directory at launch. Replace only the final `--config` argument with the absolute path to the operator-maintained Command native config JSON, and make sure that file exists and is readable by the adapter. The installer rejects unresolved `<INSTALLER_...>` and `REPLACE_AT_INSTALL` placeholders, preserves the typed marker, and copies neither the native config nor the Command CLI/mod. The native config contains the native executable and preserved mod paths; it does not select the model. Version 2 keeps its original descriptor and config contract for existing installations.
+
+For Antigravity, use descriptor version 4 with the exact command schemas
+`swarm.normalized_result_context@1`, `swarm.runtime_command@1`, and
+`swarm.task_dispatch_context@1`, plus the exact event schemas
+`swarm.normalized_result_page@1`, `swarm.runtime_outcome@1`, and
+`swarm.task_dispatch_admission@1`. The `agent.result` capability admits the
+typed status/provenance path; it does not qualify productive assistant-body
+readback. The current native stream has no request, item, assistant-message,
+or turn parent, so a normalized result that reaches the adapter is answered
+with `RESULT_BODY_UNAVAILABLE`, while `antigravity_status` remains the bounded
+Store-retained status page.
 
 Use an existing dedicated absolute install root outside the controller/Codex/OpenCode trees. The root must already exist, remain within the installer's path limit, and contain no reparse-point traversal. Preview first, then repeat without `-WhatIf`:
 
@@ -118,7 +129,7 @@ Each route must use the exact Rust artifact ID and workspace field enforced by `
 | Codex | `codex` | `codex-rust-controller.1` | `workspaceRoot` | exactly `modelProvider`, `model`, `workspaceRoot` |
 | OpenCode | `module` | `eliot-opencode-v2.rust-http.1` | `directory` | `service_id`, `connection_file`, `expected_version`, `directory`, and `model = { id, providerID, variant }` |
 | Command | `command` | `eliot-command.rust-headless.1` | `workspaceRoot` | exactly `modelId`, `workspaceRoot` |
-| Antigravity | `antigravity` | `eliot-antigravity.rust-headless.1` | `workspaceRoot` | `modelId = 'gemini-3.8-flash-high'`, `workspaceRoot`; optional `reasoningEffort`, `agent`, `dangerouslySkipPermissions` |
+| Antigravity | `antigravity` | `eliot-antigravity.rust-headless.1` (select version 4) | `workspaceRoot` | `modelId = 'gemini-3.8-flash-high'`, `workspaceRoot`; optional `reasoningEffort`, `agent`, `dangerouslySkipPermissions` |
 
 The standalone Rust Codex source descriptor template declares version `4` under the stable artifact ID `codex-rust-controller.1`. Keep that ID in the route; choose version `4` as the exact catalog coordinate in `module.route.select`. Version 4 retains the normalized dispatch contract and opts new bindings into normalized result pages with `swarm.normalized_result_context@1` and `swarm.normalized_result_page@1`. The result selector is exactly `{ "kind": "codex_assistant_result", "input_operation_id": "<exact task.dispatch operation ID>" }`; Store validates and seals that producer identity. Older selected descriptor versions and existing bindings are not upgraded by this selection. The generic installer copies the supplied descriptor version without translating or enabling it.
 
@@ -153,6 +164,15 @@ After restarting with the local config, read `module.catalog.get`, note `catalog
 Call `module.route.select` with that object. Use the exact values and revision returned by the catalog; a stale revision must be reread. Selection applies only to that identity's future bindings. It does not change existing bindings or start a worker. A later admitted pending Operation creates module demand; the host provisions and verifies the binding-scoped IPC credential, then launches the adapter under the descriptor and owner-helper checks. `external_attach` on Codex/OpenCode does not grant control of their native service. `owned_service` on Command/Antigravity describes the adapter module lifecycle; it does not install or qualify their native CLI.
 
 Command descriptor version 3 adds only the bounded `agent.result` status-page capability. Its page reports retained Operation facts with `native_response_identity: "unavailable"`, `execution_complete: false`, and `task_completion: "unknown"`; it does not contain inferred assistant text or authorize Task acceptance. Existing version-2 registrations retain their four-capability claim and are not upgraded by selecting version 3 for a future binding.
+
+Antigravity descriptor version 4 adds the normalized-result schema pair to
+the existing status-page contract. Its normalized path validates the exact
+Store-sealed origin and then reports `RESULT_BODY_UNAVAILABLE` because the
+native event cannot prove that response text belongs to the admitted input.
+Its status page remains a status/diagnostic readback with
+`native_response_identity: "unavailable"`, `execution_complete: false`, and
+`task_completion: "unknown"`; version 4 is not a productive readback
+qualification.
 
 ## Package executable workspace coordinates
 

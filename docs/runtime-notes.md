@@ -93,6 +93,27 @@
 
 **Статус реализации:** warm-stream bridge реализован и проверен на fixtures; live Antigravity и Windows native launch не квалифицированы — см. [modules/antigravity/README.md](../modules/antigravity/README.md). Ниже — research по native CLI.
 
+### 6.1 Rust headless descriptor v4
+
+The standalone `swarm-antigravity` adapter uses artifact
+`eliot-antigravity.rust-headless.1` version `4`. Its trusted descriptor and
+adapter claim must carry the same exact normalized-result pair:
+`swarm.normalized_result_context@1` in `command_schemas` and
+`swarm.normalized_result_page@1` in `event_schemas`, alongside the runtime and
+task-dispatch schemas. Route configuration still names only the opaque artifact
+ID; the manager's `module.route.select` call must select version `4` from the
+registered catalog before new bindings can consume it.
+
+The version-4 `agent.result` capability is bounded and split. The
+`antigravity_status` selector returns the Store-retained Operation status page.
+The normalized selector verifies the sealed input/Attempt/dispatch/receipt
+origin and then returns `RESULT_BODY_UNAVAILABLE`: the pinned native stream
+exposes response text, conversation ID, and a local result ordinal, but no
+request, item, assistant-message, or turn parent. Conversation plus ordinal
+does not establish input causality. This source therefore provides no
+productive assistant-body readback or completion qualification; installation,
+registration, and route selection remain separate from live qualification.
+
 **AG-HEADLESS/CHILDREN:** warm CLI stream использует `event`, не Claude `type`; последовательные prompts, EOF закрывает input. Claude control messages и slash input не поддержаны рассмотренным режимом. `step_update` несёт tool/subagent сведения; exact conversation resume. SUCCESS может включать мягко отказанные tools.
 
 **Для C08:** собственный codec в adapter; next-turn delivery, пока не подтверждена более ранняя. Полные разрешения не отменяют учёт реально отказанного tool. Idle ребёнка не исключает его последующее пробуждение. Fresh/shared/branch workspace — выбор route, не автоматическая миграция наших правил.
