@@ -737,26 +737,67 @@ impl PublicationContext {
     }
 
     /// Readback after a possible Forge write uses only the immutable retained
-    /// actor and current scoped Forge mapping. It deliberately ignores the
-    /// automation entry, GM epoch, and current Task acceptance state.
+    /// Operation/link/request/pinned-origin facts and current scoped Forge
+    /// mapping. It deliberately has no live Manager, GM, Attempt or current
+    /// acceptance dependency and cannot authorize a new publication.
     pub(crate) fn require_readback_authority(
         &self,
         db: &Connection,
         launcher_config: &Config,
     ) -> Result<()> {
-        authorization::require_registered_manager(db, &self.effective_manager_id)?;
-        let project = launcher_config.forge.project(&self.project_id)?;
-        if !authorization::current_manager_id_has_task_scope(
-            db,
-            &self.effective_manager_id,
-            &self.task_id,
-            &self.project_id,
-        )? {
+        let operation_id = self.committed_operation_id.as_deref().ok_or_else(|| {
+            Error::new(
+                "AUTOMATION_LINK_CORRUPT",
+                "publication readback has no retained Operation identity",
+            )
+        })?;
+        let operation: Option<(
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+        )> = db
+            .query_row(
+                "SELECT caller_id,method,state,task_id,attempt_id,original_request_json \
+                 FROM operations WHERE operation_id=?1",
+                [operation_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((caller_id, method, state, task_id, attempt_id, original_request_json)) =
+            operation
+        else {
             return Err(Error::new(
-                "FORBIDDEN",
-                "registered manager no longer has current read scope for this Task",
+                "AUTOMATION_LINK_CORRUPT",
+                "publication readback Operation is missing",
+            ));
+        };
+        if caller_id != authorization::AUTOMATION_TECHNICAL_REQUESTER_ID
+            || method != ACTION
+            || !matches!(state.as_str(), "sending" | "outcome_unknown")
+            || task_id.as_deref() != Some(self.task_id.as_str())
+            || attempt_id.as_deref() != Some(self.attempt_id.as_str())
+        {
+            return Err(Error::new(
+                "AUTOMATION_LINK_CORRUPT",
+                "publication readback Operation no longer retains its exact state or origin",
             ));
         }
+        let request_value: Value = serde_json::from_str(&original_request_json)?;
+        let request = PublishRefRequest::parse(&request_value)?;
+        self.require_request_matches(&request)?;
+        let project = launcher_config.forge.project(&self.project_id)?;
         if forge::canonical_repository(&project.canonical_repository)? != self.canonical_repository
             || project.policy_revision != self.policy_revision
             || !launcher_config.forge.enabled

@@ -1192,20 +1192,10 @@ fn begin(db: &mut Connection, id: &str, config: &Config) -> Result<Option<ForgeW
         Some("outcome_unknown") => {
             let saved = saved_intent(&tx, id)?;
             actor.require_intent_matches(&saved)?;
-            if matches!(actor, ForgeActor::OnBehalf(_))
-                && actor.require_readback_authority(&tx, config).is_err()
-            {
-                tx.commit()?;
-                return Ok(None);
+            if matches!(actor, ForgeActor::OnBehalf(_)) {
+                actor.require_readback_authority(&tx, config)?;
             }
-            let work = match work_from_saved(&tx, saved, &config.forge, WorkMode::ReadbackOnly) {
-                Ok(work) => work,
-                Err(_) if matches!(actor, ForgeActor::OnBehalf(_)) => {
-                    tx.commit()?;
-                    return Ok(None);
-                }
-                Err(error) => return Err(error),
-            };
+            let work = work_from_saved(&tx, saved, &config.forge, WorkMode::ReadbackOnly)?;
             tx.commit()?;
             Ok(Some(work))
         }
@@ -1247,13 +1237,8 @@ fn reconcile_in_transaction(
         let Some(config) = full_config else {
             return Ok(None);
         };
-        if actor.require_readback_authority(tx, config).is_err() {
-            return Ok(None);
-        }
-        let work = match work_from_saved(tx, saved, forge_config, WorkMode::ReadbackOnly) {
-            Ok(work) => work,
-            Err(_) => return Ok(None),
-        };
+        actor.require_readback_authority(tx, config)?;
+        let work = work_from_saved(tx, saved, forge_config, WorkMode::ReadbackOnly)?;
         Ok(Some(work))
     } else {
         Ok(Some(work_from_saved(
