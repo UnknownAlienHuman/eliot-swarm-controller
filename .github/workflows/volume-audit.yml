@@ -1,0 +1,28 @@
+name: Read-only code volume audit
+on:
+  push:
+    branches: [audit/code-volume-20261006]
+    paths: ['.github/workflows/volume-audit.yml']
+permissions:
+  contents: read
+jobs:
+  inventory:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install analysis parser only
+        run: python -m pip install --quiet tree-sitter tree-sitter-rust
+      - name: Inspect immutable source snapshot without executing product code
+        run: |
+          python tools/audit/code_volume.py 5f6a94c9c9afac54cbfe5561f827e1db335b21b9 "$RUNNER_TEMP/code-volume" > "$RUNNER_TEMP/code-volume-summary.log"
+          cat "$RUNNER_TEMP/code-volume-summary.log"
+          git archive --format=tar 5f6a94c9c9afac54cbfe5561f827e1db335b21b9 | gzip > "$RUNNER_TEMP/code-volume/source-snapshot.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: code-volume-5f6a94c9
+          path: ${{ runner.temp }}/code-volume
+          retention-days: 7
