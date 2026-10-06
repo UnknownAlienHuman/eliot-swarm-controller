@@ -75,6 +75,26 @@ applied-submission ReviewDispatch selector. Partial patches may reuse the entry'
 existing steps; absent, null and empty event-rule arrays retain their distinct
 Store semantics. This is input-schema source delivery, not runtime qualification.
 
+Descriptor-backed demands now bypass the optional OpenCode owned-service
+projection when their retained route declares no such service. Their validated
+native options reach the selected adapter unchanged. Routes declaring an owned
+OpenCode service retain the existing strict service, workspace and route checks.
+This closes a source blocker for adapter-specific workspace option shapes; it
+does not qualify a new adapter.
+
+`agent.inspect` now includes a bounded projection of retained Manager attention
+for the Attempt's exact binding ID and generation. Missing bindings, source gaps,
+additional pages and detached items keep coverage explicitly incomplete and
+provide the existing `swarm.exceptions.get` requery. The public page size remains
+50 and the internal raw attention scan remains 200. These source changes have
+not been compiled or tested.
+
+Shared `coordination_limits` are present for the Thread, peer-contract and
+integration-acknowledgement source implementations in progress. They retain the
+64 KiB request bound, bounded UTF-8 fields and read pages, without adding a roster
+count cap. Their backend and frontend packets are still being implemented; the
+constants alone do not make these methods available.
+
 The dependency source repair moves the selected rustls lock from `0.23.44` to
 `0.23.45` for GHSA-2mjx-qc3c-rqvc. The registry checksum and unchanged dependency
 requirements were checked against official metadata; only the version and

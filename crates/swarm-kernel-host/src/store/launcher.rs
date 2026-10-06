@@ -22,6 +22,7 @@ const MAX_MATCHED_PATHS: usize = 8;
 const MAX_DEPENDENCIES: usize = 64;
 const MAX_SCOPE_PATH_BYTES: usize = 512;
 const ATTENTION_SCAN_LIMIT: i64 = 200;
+const MAX_ATTEMPT_BINDING_ATTENTION_ITEMS: usize = 8;
 const MAX_INSPECT_SNAPSHOT_FIELD_BYTES: usize = 12_288;
 const MAX_INSPECT_SNAPSHOT_FIELD_ITEMS: usize = 64;
 const MAX_LAUNCH_OPERATION_ROWS: i64 = 8;
@@ -2262,6 +2263,79 @@ fn task_queue_item(db: &Connection, row: &TaskRow, brief_limit: usize) -> Result
     }))
 }
 
+/// Bounded exact-pair projection of the existing Manager attention page. A
+/// partial source page or detached item never becomes a claim of no attention.
+fn exact_binding_manager_attention(
+    db: &Connection,
+    binding_id: &str,
+    generation: i64,
+) -> Result<Value> {
+    let page = manager_exceptions_page(
+        db,
+        &json!({"after":0,"limit":launcher::MAX_PAGE_SIZE}),
+        false,
+    )?;
+    let exact_items = page["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| {
+            item["binding_id"].as_str() == Some(binding_id)
+                && item["generation"].as_i64() == Some(generation)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let exact_match_count = exact_items.len();
+    let exact_items_truncated = exact_match_count > MAX_ATTEMPT_BINDING_ATTENTION_ITEMS;
+    let items = exact_items
+        .into_iter()
+        .take(MAX_ATTEMPT_BINDING_ATTENTION_ITEMS)
+        .collect::<Vec<_>>();
+    let source_has_more = page["source_attention"]["has_more"]
+        .as_bool()
+        .unwrap_or(true)
+        || page["projection"]["has_newer"] == true;
+    let source_gap_count = page["projection"]["gap_count"].as_i64().unwrap_or(0);
+    let source_coverage_complete = page["projection"]["coverage_complete"] == true
+        && source_gap_count == 0
+        && !source_has_more;
+    let source_page_coverage_complete = page["projection"]["coverage_complete"] == true;
+    let page_has_gap = !source_page_coverage_complete || source_gap_count > 0;
+    let next_after = page["next_after"].as_i64().unwrap_or(0);
+    let coverage_complete = source_coverage_complete && !exact_items_truncated;
+    let requery = if coverage_complete {
+        Value::Null
+    } else {
+        json!({
+            "method":"swarm.exceptions.get",
+            "params":{
+                "after":if exact_items_truncated || page_has_gap {0} else {next_after},
+                "limit":launcher::MAX_PAGE_SIZE,
+            },
+        })
+    };
+    Ok(json!({
+        "status":if coverage_complete {"complete_source_page"} else {"partial"},
+        "scope":{"binding_id":binding_id,"generation":generation},
+        "source":{
+            "method":"swarm.exceptions.get",
+            "view":"items",
+            "after":0,
+            "next_after":next_after,
+            "total_items":page["source_attention"]["total_items"],
+            "has_more":source_has_more,
+            "gap_count":source_gap_count,
+            "coverage_complete":source_coverage_complete,
+            "page_coverage_complete":source_page_coverage_complete,
+        },
+        "exact_match_count_on_page":exact_match_count,
+        "exact_items_truncated":exact_items_truncated,
+        "coverage_complete":coverage_complete,
+        "items":items,
+        "requery":requery,
+    }))
+}
+
 fn binding_summary(db: &Connection, binding_id: &str, generation: i64) -> Result<Value> {
     let raw: Option<BindingReadRow> = db
         .query_row(
@@ -2285,10 +2359,18 @@ fn binding_summary(db: &Connection, binding_id: &str, generation: i64) -> Result
             "binding_id":binding_id,
             "generation":generation,
             "status":"missing_recorded_binding",
+            "manager_attention":{
+                "status":"binding_record_missing",
+                "scope":{"binding_id":binding_id,"generation":generation},
+                "coverage_complete":false,
+                "items":[],
+                "requery":{"method":"swarm.exceptions.get","params":{"after":0,"limit":launcher::MAX_PAGE_SIZE}},
+            },
         }));
     };
     let route: Value = serde_json::from_str(&raw.route_json)?;
     let observation: Value = serde_json::from_str(&raw.state_json)?;
+    let manager_attention = exact_binding_manager_attention(db, binding_id, generation)?;
     Ok(json!({
         "binding_id":binding_id,
         "generation":generation,
@@ -2310,6 +2392,7 @@ fn binding_summary(db: &Connection, binding_id: &str, generation: i64) -> Result
             "waiting_for":observation["waiting_for"],
             "execution":observation["execution"].as_str(),
         },
+        "manager_attention":manager_attention,
         "gaps":["route_live_qualification_not_recorded","runtime_capability_receipt_not_recorded"],
     }))
 }
@@ -6296,7 +6379,18 @@ pub(super) fn agent_inspect(db: &Connection, p: &Principal, params_value: &Value
         "attempt_state":attempt.state,
         "unresolved_operations":operation_counts["unresolved"],
         "outcome_unknown_operations":operation_counts["outcome_unknown"],
-        "binding_scope_attention":"use swarm.exceptions.get; exact binding attention feed is not independently projected here",
+        "binding_scope_attention":"other binding attention remains available through swarm.exceptions.get",
+        // Missing and explicit-null values both mean the exact attention view is unknown.
+        "binding_manager_attention":binding
+            .get("manager_attention")
+            .cloned()
+            .filter(|value| !value.is_null())
+            .unwrap_or_else(|| json!({
+            "status":"no_exact_binding",
+            "coverage_complete":false,
+            "items":[],
+            "requery":{"method":"swarm.exceptions.get","params":{"after":0,"limit":launcher::MAX_PAGE_SIZE}},
+        })),
     });
     let mut gaps = vec![
         "workspace_write_lease_and_current_git_state_not_recorded",
@@ -6320,7 +6414,7 @@ pub(super) fn agent_inspect(db: &Connection, p: &Principal, params_value: &Value
     if overlaps["coverage"] != "complete" {
         gaps.push("git_and_nonliteral_scope_overlap_are_not_covered");
     }
-    gaps.push("exact_binding_scope_attention_uses_swarm.exceptions.get");
+    gaps.push("other_binding_scope_attention_uses_swarm.exceptions.get");
     gaps.push("relevance_ranked_peers_contracts_and_integration_cells_not_projected");
     let identity = json!({
         "task_id":attempt.task_id,

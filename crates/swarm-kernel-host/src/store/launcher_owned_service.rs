@@ -1053,6 +1053,10 @@ pub(crate) fn module_owned_route_options(
 ) -> Result<Value> {
     let binding = binding_row(db, binding_id, generation)?;
     let route = parse_route(&binding.route_json)?;
+    // Only an explicit OpenCode owner route needs this provider projection.
+    if route.owned_opencode_service()?.is_none() {
+        return Ok(native_options);
+    }
     let configured = native_options.as_object().ok_or_else(|| {
         Error::new(
             "MODULE_CONFIG_INVALID",

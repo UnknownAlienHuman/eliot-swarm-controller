@@ -1,6 +1,7 @@
 //! Data-only types shared across independently built Swarm processes.
 
 pub mod concilium_limits;
+pub mod coordination_limits;
 pub mod credential;
 pub mod declared_service_scope;
 pub mod error;
