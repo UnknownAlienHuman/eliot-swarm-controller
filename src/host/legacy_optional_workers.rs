@@ -158,6 +158,16 @@ pub(super) async fn run(store: Store, mut stopping: watch::Receiver<bool>) -> Re
             }
         }
 
+        // Keep the bounded readback/retry cadence while any worker is selected
+        // or any slot is still active (including a just-finished task that
+        // must be reaped). A stored retry time is runnable only while its
+        // demand remains selected; a later demand change wakes this watch and
+        // preserves the original backoff deadline. With no demand or active
+        // slot, the guarded tick is not polled and the coordinator is quiescent.
+        let periodic_reconciliation = Worker::ALL
+            .into_iter()
+            .any(|worker| worker.demanded(demand))
+            || slots.values().any(|slot| slot.task.is_some());
         let wake = tokio::select! {
             result = stopping.changed() => {
                 if result.is_err() || *stopping.borrow() {
@@ -171,15 +181,13 @@ pub(super) async fn run(store: Store, mut stopping: watch::Receiver<bool>) -> Re
                 }
                 true
             }
-            _ = tick.tick() => true
+            _ = tick.tick(), if periodic_reconciliation => true
         };
         if !wake {
             break 'run Ok(());
         }
     };
-    let persist_cleanup_status = !result
-        .as_ref()
-        .is_err_and(|error| error.code.starts_with("STORE_"));
+    let persist_cleanup_status = !result.as_ref().is_err_and(is_store_or_kernel_failure);
     let cleanup = stop_all(&store, &mut slots, persist_cleanup_status).await;
     match (result, cleanup) {
         (Err(error), Err(cleanup_error)) => {
@@ -500,11 +508,10 @@ async fn stop_worker(store: &Store, worker: Worker, slot: &mut Slot) -> Result<(
         .await
 }
 
-/// Persist optional errors before restarting. A Store error cannot be truthfully
-/// reported through that same Store, while a kernel error remains fatal after
-/// its bounded health receipt is written. Panics from a legacy worker are
-/// handled like any other optional failure rather than escaping to host-level
-/// supervisor failure.
+/// Persist worker-local errors before restarting. A Store error cannot be
+/// truthfully reported through that same Store, while a kernel/journal failure
+/// remains fatal. Panics from a legacy worker are handled like any other
+/// optional failure rather than escaping to host-level supervisor failure.
 async fn record_failure(
     store: &Store,
     worker: Worker,
@@ -552,7 +559,7 @@ async fn stop_all(
     persist_status: bool,
 ) -> Result<()> {
     let mut fatal = None;
-    let mut store_unavailable = false;
+    let mut persistence_unavailable = false;
     let mut updates = Vec::new();
     for slot in slots.values_mut() {
         if let Some(stop) = slot.stop.take() {
@@ -569,7 +576,7 @@ async fn stop_all(
                     updates.push((worker, "dormant", slot.failures, None, None));
                 }
                 Ok(Err(error)) if is_store_or_kernel_failure(&error) => {
-                    store_unavailable |= error.code.starts_with("STORE_");
+                    persistence_unavailable = true;
                     if !error.code.starts_with("STORE_") {
                         updates.push((
                             worker,
@@ -602,7 +609,9 @@ async fn stop_all(
             }
         }
     }
-    if persist_status && !store_unavailable {
+    // A Store/journal fault is irreducible here. Do not issue cleanup status
+    // writes that can obscure the first core failure with a secondary error.
+    if persist_status && !persistence_unavailable {
         for (worker, state, failures, error_code, retry_in_ms) in updates {
             store
                 .record_legacy_worker_status(

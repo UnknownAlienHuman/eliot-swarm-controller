@@ -234,8 +234,8 @@ async fn run_until(
                 let store=owner.store.clone();let config=ipc_config.clone();let stopping=stopping.clone();
                 connections.spawn(async move{
                     let _permit=permit;
-                    if let Err(e)=ipc::serve_with_module_supervisor(
-                        stream,store,config,stopping,None
+                    if let Err(e)=ipc::serve_connection(
+                        stream,store,config,stopping
                     ).await{eprintln!("IPC connection: {}",e.code);}
                 });
             }
