@@ -100,6 +100,14 @@ impl HostRecorder {
     /// all subsequent file writes use the recorder's nonblocking bounded
     /// record-and-byte queue.
     pub fn observe_line(&self, line: &[u8]) -> bool {
+        self.observe_line_with_manager_policy(line, None)
+    }
+
+    pub fn observe_line_with_manager_policy(
+        &self,
+        line: &[u8],
+        manager_policy: Option<swarm_telemetry::ScopedPolicyOverride>,
+    ) -> bool {
         let mut state = lock_recover(&self.state);
         if state.closed {
             state.post_shutdown_dropped_records =
@@ -134,7 +142,7 @@ impl HostRecorder {
                 .saturating_add(line.len() as u64);
             return false;
         };
-        match recorder.append_line(line) {
+        match recorder.append_line_with_manager_policy(line, manager_policy) {
             Ok(()) => true,
             Err(error) => {
                 state.callback_errors = state.callback_errors.saturating_add(1);

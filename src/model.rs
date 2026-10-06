@@ -825,6 +825,18 @@ pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
         _ => return Err(Error::new("METHOD_NOT_FOUND", method)),
     };
     fields(params, allowed)?;
+    if method == "logging.set" {
+        match text(params, "content")? {
+            "metadata" | "redacted_text" => {}
+            "native_frames" => {
+                return Err(Error::new(
+                    "LOGGING_CONTENT_UNSUPPORTED",
+                    "no bounded native-frame producer is available",
+                ));
+            }
+            _ => return Err(Error::invalid("content must be metadata or redacted_text")),
+        }
+    }
     match method {
         "hook.source.revoke" => {
             text(params, "source_id")?;

@@ -422,6 +422,8 @@ struct QueuedRecord {
     module_id: Option<String>,
     client_id: Option<String>,
     operation_id: Option<String>,
+    manager_policy: Option<swarm_telemetry::ScopedPolicyOverride>,
+    contains_redacted_text: bool,
 }
 
 enum Command {
@@ -489,6 +491,14 @@ impl Recorder {
     }
 
     pub fn append(&self, record: DiagnosticRecord) -> Result<()> {
+        self.append_with_manager_policy(record, None)
+    }
+
+    fn append_with_manager_policy(
+        &self,
+        record: DiagnosticRecord,
+        manager_policy: Option<swarm_telemetry::ScopedPolicyOverride>,
+    ) -> Result<()> {
         if let Err(error) = validate_record(&record) {
             self.drop_record(0);
             return Err(error);
@@ -566,6 +576,8 @@ impl Recorder {
             module_id: record.module_id.clone(),
             client_id: record.client_id.clone(),
             operation_id: record.operation_id.clone(),
+            manager_policy,
+            contains_redacted_text: record.redacted_text.is_some(),
         })) {
             Ok(()) => {
                 self.counters
@@ -610,6 +622,14 @@ impl Recorder {
     }
 
     pub fn append_line(&self, line: &[u8]) -> Result<()> {
+        self.append_line_with_manager_policy(line, None)
+    }
+
+    pub(crate) fn append_line_with_manager_policy(
+        &self,
+        line: &[u8],
+        manager_policy: Option<swarm_telemetry::ScopedPolicyOverride>,
+    ) -> Result<()> {
         let record = match decode_line(line) {
             Ok(record) => record,
             Err(error) => {
@@ -617,7 +637,7 @@ impl Recorder {
                 return Err(error);
             }
         };
-        self.append(record)
+        self.append_with_manager_policy(record, manager_policy)
     }
 
     pub fn stats(&self) -> RecorderStats {
@@ -954,13 +974,15 @@ fn recorder_loop(
             Command::Shutdown => break,
             Command::Append(record) => {
                 let size = record.bytes.len() as u64;
-                if !live_settings.allows(
+                if !live_settings.allows_record(
                     now_unix_ms(),
                     record.severity,
                     record.kind,
                     record.module_id.as_deref(),
                     record.client_id.as_deref(),
                     record.operation_id.as_deref(),
+                    record.manager_policy,
+                    record.contains_redacted_text,
                 ) {
                     release_pending(&counters, size);
                     record_filtered(&counters, size);

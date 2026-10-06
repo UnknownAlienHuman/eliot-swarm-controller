@@ -1,12 +1,14 @@
-//! Manager-owned, metadata-only diagnostic policy.
+//! Manager-owned diagnostic policy with metadata-only defaults and bounded
+//! Atlas-redacted text opt-in.
 //!
 //! Policies live in the existing meta table and are keyed by one stable
 //! Manager plus an optional exact Task/Attempt, Operation, binding, or module
 //! selector. A selector is useful only after the Store proves that the
 //! authenticated Manager owns the retained caller/route; Task context is
 //! inherited from a selected Operation or binding when that context exists.
-//! Recorder file selection, retention, and expiry remain owned by the
-//! swarm-observer.
+//! Recorder file selection, retention, and observer-side content gating remain
+//! owned by the swarm-observer. The Store persists only the Manager-owned
+//! scope/content policy and never accepts raw capture or native frames.
 
 use super::{meta, operations, set_meta, tasks};
 use crate::{
@@ -131,7 +133,14 @@ pub(super) fn get(db: &Connection, principal: &Principal, value: &Value) -> Resu
         "durable_source":"store_meta",
         "consumer":"swarm_telemetry_producer_before_line_observer",
         "recorder_file_policy":"swarm_observer_live_config",
-        "redaction":"unsupported",
+        "content_capabilities":{
+            "metadata":"ready",
+            "redacted_text":"ready",
+            "native_frames":"unsupported"
+        },
+        "redaction":"atlas_before_observer_queue",
+        "native_frames_reason":"no_bounded_native_frame_producer",
+        "redacted_text_boundary":"Atlas redaction completes before observer serialization and queue admission",
     }))
 }
 
@@ -144,13 +153,7 @@ pub(super) fn set(
 ) -> Result<Value> {
     let scope = resolve_scope(tx, principal, value)?;
     let level = parse_level(model::text(value, "level")?)?;
-    let content = model::text(value, "content")?;
-    if content != "metadata" {
-        return Err(Error::new(
-            "LOGGING_CONTENT_UNSUPPORTED",
-            "only metadata diagnostic content is currently supported; redacted text and native frames require an installed redactor",
-        ));
-    }
+    let content = parse_content(model::text(value, "content")?)?;
     let expires_at_ms = ttl_expiry(value, now_ms)?;
     let key = policy_key(&scope)?;
     let previous = meta(tx, &key)?
@@ -164,6 +167,7 @@ pub(super) fn set(
             "retained diagnostic policy does not match this Manager scope",
         ));
     }
+    ensure_policy_capacity(tx, previous.as_ref(), now_ms)?;
     let revision = previous
         .as_ref()
         .map(|policy| {
@@ -204,6 +208,13 @@ pub(super) fn set(
         "apply":"after_commit",
         "consumer":"swarm_telemetry_producer_before_line_observer",
         "recorder_file_policy":"swarm_observer_live_config",
+        "content_capabilities":{
+            "metadata":"ready",
+            "redacted_text":"ready",
+            "native_frames":"unsupported"
+        },
+        "native_frames_reason":"no_bounded_native_frame_producer",
+        "redacted_text_boundary":"Atlas redaction completes before observer serialization and queue admission",
     }))
 }
 
@@ -212,21 +223,8 @@ pub(super) fn set(
 /// silently widening the diagnostic surface. Expired policies stay durable
 /// for readback but are omitted from the live Producer snapshot.
 pub(super) fn load_filters(db: &Connection) -> Result<Vec<swarm_telemetry::ScopedFilter>> {
-    let prefix = format!("{POLICY_PREFIX}%");
-    let mut statement =
-        db.prepare("SELECT value_json FROM meta WHERE key LIKE ?1 ORDER BY key LIMIT ?2")?;
-    let rows = statement
-        .query_map(params![prefix, MAX_POLICIES + 1], |row| {
-            row.get::<_, String>(0)
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    if rows.len() > MAX_POLICIES as usize {
-        return Err(Error::new(
-            "LOGGING_POLICY_LIMIT",
-            "retained diagnostic policies exceed the bounded runtime limit",
-        ));
-    }
     let now_ms = model::now_ms()?;
+    let rows = active_policy_values(db, now_ms)?;
     let mut filters = Vec::with_capacity(rows.len());
     for raw in rows {
         let value: Value = serde_json::from_str(&raw)?;
@@ -255,23 +253,197 @@ pub(super) fn load_filters(db: &Connection) -> Result<Vec<swarm_telemetry::Scope
         filters.push(swarm_telemetry::ScopedFilter {
             scope,
             level: policy.level.telemetry(),
+            // The Producer owns expiry enforcement on each emission. Keeping
+            // the absolute timestamp in the immutable snapshot avoids a
+            // timer/worker and remains correct across Store restarts.
+            expires_at_ms: policy.expires_at_ms,
         });
     }
     Ok(filters)
+}
+
+/// Return only rows that could be active at `now_ms`, while retaining malformed
+/// rows as candidates for `parse_stored` to reject. Valid expired history is
+/// intentionally omitted from this bounded runtime scan so it cannot consume
+/// the live policy capacity or starve a new scope by key order.
+fn active_policy_values(db: &Connection, now_ms: i64) -> Result<Vec<String>> {
+    let prefix = format!("{POLICY_PREFIX}%");
+    let mut statement = db.prepare(
+        r#"WITH policy_rows AS (
+             SELECT key,
+                    value_json,
+                    CASE
+                        WHEN json_valid(value_json) THEN
+                            json_type(value_json, '$.expires_at_ms')
+                        ELSE 'invalid'
+                    END AS expiry_type,
+                    CASE
+                        WHEN json_valid(value_json) THEN
+                            json_extract(value_json, '$.expires_at_ms')
+                        ELSE NULL
+                    END AS expiry_value
+               FROM meta
+              WHERE key LIKE ?1
+         )
+         SELECT value_json
+           FROM policy_rows
+          WHERE expiry_type IS NULL
+             OR expiry_type <> 'integer'
+             OR expiry_value <= 0
+             OR expiry_value > ?2
+          ORDER BY key
+          LIMIT ?3"#,
+    )?;
+    let rows = statement
+        .query_map(params![prefix, now_ms, MAX_POLICIES + 1], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if rows.len() > MAX_POLICIES as usize {
+        return Err(Error::new(
+            "LOGGING_POLICY_LIMIT",
+            "active diagnostic policies exceed the bounded runtime limit",
+        ));
+    }
+    Ok(rows)
+}
+
+/// Check the active runtime bound before the durable policy write. An update
+/// to an already-active scope consumes the same slot; a new or expired scope
+/// must leave one of the existing bounded slots available.
+fn ensure_policy_capacity(
+    db: &Connection,
+    previous: Option<&StoredPolicy>,
+    now_ms: i64,
+) -> Result<()> {
+    let rows = active_policy_values(db, now_ms)?;
+    for raw in &rows {
+        let value: Value = serde_json::from_str(raw)?;
+        let policy = parse_stored(&value)?;
+        if policy
+            .expires_at_ms
+            .is_some_and(|expires_at_ms| expires_at_ms <= now_ms)
+        {
+            return Err(Error::new(
+                "LOGGING_POLICY_CORRUPT",
+                "active policy scan returned an expired diagnostic policy",
+            ));
+        }
+    }
+    let previous_active = previous.is_some_and(|policy| {
+        policy
+            .expires_at_ms
+            .is_none_or(|expires_at_ms| expires_at_ms > now_ms)
+    });
+    if rows.len() >= MAX_POLICIES as usize && !previous_active {
+        return Err(Error::new(
+            "LOGGING_POLICY_LIMIT",
+            "active diagnostic policies already occupy the bounded runtime limit",
+        ));
+    }
+    Ok(())
 }
 
 pub(super) fn producer_projection(
     producer: &swarm_telemetry::Producer,
     configured: &Value,
 ) -> Value {
+    let components = producer.text_capture_components();
+    let scope = &configured["scope"];
+    let live_policy = probe_record(scope, swarm_telemetry::Severity::Info)
+        .and_then(|record| producer.scoped_policy_for(&record));
+    let exact_policy =
+        probe_filter_scope(scope).and_then(|scope| producer.exact_scoped_policy(&scope));
+    let capture_probe_admitted = [
+        swarm_telemetry::Severity::Error,
+        swarm_telemetry::Severity::Warn,
+        swarm_telemetry::Severity::Info,
+    ]
+    .into_iter()
+    .any(|severity| {
+        probe_record(scope, severity)
+            .is_some_and(|record| producer.text_capture_admitted_for(&record))
+    });
+    let configured_policy_matches = configured["configured"] == Value::Bool(true)
+        && configured["active"] == Value::Bool(true)
+        && exact_policy.is_some_and(|live| {
+            let level_matches = configured["policy"]["level"]
+                .as_str()
+                .is_some_and(|level| level.eq_ignore_ascii_case(&format!("{:?}", live.level)));
+            let content_matches = configured["policy"]["content"]
+                .as_str()
+                .is_some_and(|content| match live.content {
+                    swarm_telemetry::FilterContent::Metadata => content == "metadata",
+                    swarm_telemetry::FilterContent::RedactedText => content == "redacted_text",
+                });
+            let expiry_matches =
+                configured["policy"]["expires_at_ms"].as_i64() == live.expires_at_ms;
+            level_matches && content_matches && expiry_matches
+        });
+    let live_policy = live_policy.map_or(Value::Null, |policy| {
+        json!({
+            "level":format!("{:?}", policy.level).to_lowercase(),
+            "content":match policy.content {
+                swarm_telemetry::FilterContent::Metadata => "metadata",
+                swarm_telemetry::FilterContent::RedactedText => "redacted_text",
+            },
+            "expires_at_ms":policy.expires_at_ms,
+        })
+    });
     json!({
-        "applied":true,
         "configured":configured["configured"],
-        "active":configured["active"],
+        "durable_policy_active":configured["active"],
+        "configured_policy_live_in_producer":configured_policy_matches,
+        "producer_selected_policy":live_policy,
         "scoped_filter_count":producer.scoped_filter_count(),
         "sink":format!("{:?}", producer.stats().sink_state).to_lowercase(),
+        "text_capture_path_ready":components.ready(),
+        "producer_enabled":components.producer_enabled,
+        "observer_callback_attached":components.observer_attached,
+        "atlas_redactor_installed":components.atlas_redactor_installed,
+        "live_text_policy_installed":components.live_policy_installed,
+        "redacted_text_admitted_for_probe":capture_probe_admitted,
+        "probe_kind":"module_stopped",
+        "probe_severities":["error","warn","info"],
+        "probe_emitted":false,
         "diagnostic_only":true,
     })
+}
+
+fn probe_record(
+    scope: &Value,
+    severity: swarm_telemetry::Severity,
+) -> Option<swarm_telemetry::Record> {
+    let client_id = scope.get("client_id")?.as_str()?;
+    let optional = |field: &str| scope.get(field).and_then(Value::as_str);
+    Some(
+        swarm_telemetry::Record::new(
+            severity,
+            swarm_telemetry::Kind::ModuleStopped,
+            swarm_telemetry::Phase::ModuleExit,
+        )
+        .with_client_id(Some(client_id))
+        .with_task_id(optional("task_id"))
+        .with_attempt_id(optional("attempt_id"))
+        .with_operation_id(optional("operation_id"))
+        .with_binding_id(optional("binding_id"))
+        .with_binding_generation(scope.get("binding_generation").and_then(Value::as_u64))
+        .with_module_id(optional("module_id")),
+    )
+}
+
+fn probe_filter_scope(scope: &Value) -> Option<swarm_telemetry::FilterScope> {
+    let client_id = scope.get("client_id")?.as_str()?;
+    let optional = |field: &str| scope.get(field).and_then(Value::as_str);
+    swarm_telemetry::FilterScope::new(
+        client_id,
+        optional("task_id"),
+        optional("attempt_id"),
+        optional("operation_id"),
+        optional("binding_id"),
+        scope.get("binding_generation").and_then(Value::as_u64),
+        optional("module_id"),
+    )
 }
 
 fn resolve_scope(db: &Connection, principal: &Principal, value: &Value) -> Result<Scope> {
@@ -697,7 +869,7 @@ fn parse_stored(value: &Value) -> Result<StoredPolicy> {
         || policy.manager_id != policy.scope.manager_id
         || policy.revision == 0
         || policy.updated_at_ms <= 0
-        || policy.content != "metadata"
+        || !matches!(policy.content.as_str(), "metadata" | "redacted_text")
     {
         return Err(Error::new(
             "LOGGING_POLICY_CORRUPT",
@@ -762,6 +934,17 @@ fn parse_level(value: &str) -> Result<Level> {
         _ => Err(Error::invalid(
             "level must be one of off, error, warn, info, debug, trace",
         )),
+    }
+}
+
+fn parse_content(value: &str) -> Result<&str> {
+    match value {
+        "metadata" | "redacted_text" => Ok(value),
+        "native_frames" => Err(Error::new(
+            "LOGGING_CONTENT_UNSUPPORTED",
+            "no bounded native-frame producer is available",
+        )),
+        _ => Err(Error::invalid("content must be metadata or redacted_text")),
     }
 }
 

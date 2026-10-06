@@ -44,8 +44,18 @@ const MAX_ID_BYTES: usize = 128;
 pub type TextRedactor = fn(&str) -> Option<String>;
 /// A bounded scope check for the current capture policy. It is evaluated
 /// before redaction, serialization, or queue admission.
-pub type TextCapturePolicy =
-    Arc<dyn Fn(Severity, Kind, Option<&str>, Option<&str>, Option<&str>) -> bool + Send + Sync>;
+pub type TextCapturePolicy = Arc<
+    dyn Fn(
+            Severity,
+            Kind,
+            Option<&str>,
+            Option<&str>,
+            Option<&str>,
+            Option<ScopedPolicyOverride>,
+        ) -> bool
+        + Send
+        + Sync,
+>;
 
 /// Validated local-recorder configuration. The optional producer is local to
 /// its caller; this crate installs no global subscriber or mandatory backend.
@@ -472,6 +482,7 @@ struct WireRecord<'a> {
 struct Queued {
     bytes: Vec<u8>,
     observer_bytes: Option<Vec<u8>>,
+    observer_policy: Option<ScopedPolicyOverride>,
 }
 
 impl Queued {
@@ -515,7 +526,7 @@ struct Inner {
 /// record. Implementations must use a nonblocking bounded handoff. The host
 /// recorder is called on this crate's diagnostic writer thread, never on a
 /// Store/kernel caller.
-pub type LineObserver = Arc<dyn Fn(&[u8]) + Send + Sync + 'static>;
+pub type LineObserver = Arc<dyn Fn(&[u8], Option<ScopedPolicyOverride>) + Send + Sync + 'static>;
 
 /// A closed metadata-only level used by the authenticated Store logging
 /// control. The scope is matched before serialization, so a diagnostic filter
@@ -544,6 +555,26 @@ impl FilterLevel {
             Self::Trace => true,
         }
     }
+}
+
+/// Content mode selected by an exact authenticated Manager logging scope.
+/// `Metadata` explicitly suppresses text for that scope; `RedactedText` may
+/// override the observer's global metadata default, subject to its fail-closed
+/// selector, explicit-off, and scoped-content restrictions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FilterContent {
+    Metadata,
+    RedactedText,
+}
+
+/// Bounded per-record policy context carried from the Producer to its
+/// existing observer callback. It contains only validated policy values and
+/// an absolute deadline; it is never serialized into either output stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScopedPolicyOverride {
+    pub level: FilterLevel,
+    pub content: FilterContent,
+    pub expires_at_ms: Option<i64>,
 }
 
 /// Exact metadata identities attached to one Manager-owned diagnostic scope.
@@ -575,16 +606,32 @@ impl FilterScope {
     ) -> Option<Self> {
         let known = |value: &str| KnownId::from_known(value).map(|id| id.0);
         let client_id = known(client_id)?;
+        let task_id = match task_id {
+            Some(value) => Some(known(value)?),
+            None => None,
+        };
+        let attempt_id = match attempt_id {
+            Some(value) => Some(known(value)?),
+            None => None,
+        };
+        let operation_id = match operation_id {
+            Some(value) => Some(known(value)?),
+            None => None,
+        };
+        let binding_id = match binding_id {
+            Some(value) => Some(known(value)?),
+            None => None,
+        };
+        let module_id = match module_id {
+            Some(value) => Some(KnownMetadata::from_atom(value)?.0),
+            None => None,
+        };
         if task_id.is_some() != attempt_id.is_some() {
             return None;
         }
-        let task_id = task_id.and_then(known);
-        let attempt_id = attempt_id.and_then(known);
-        let operation_id = operation_id.and_then(known);
-        let binding_id = binding_id.and_then(known);
-        let module_id = module_id.and_then(KnownMetadata::from_atom).map(|id| id.0);
         if binding_id.is_some() != binding_generation.is_some()
-            || binding_generation.is_some_and(|generation| generation == 0)
+            || binding_generation
+                .is_some_and(|generation| generation == 0 || generation > i64::MAX as u64)
         {
             return None;
         }
@@ -651,6 +698,8 @@ impl FilterScope {
 pub struct ScopedFilter {
     pub scope: FilterScope,
     pub level: FilterLevel,
+    pub content: FilterContent,
+    pub expires_at_ms: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -697,7 +746,8 @@ impl Producer {
         if !self.inner.config.enabled {
             return EmitResult::Disabled;
         }
-        if !self.allows(&record) {
+        let observer_policy = self.selected_policy(&record, unix_time_ms_signed());
+        if observer_policy.is_some_and(|policy| !policy.level.allows(record.severity)) {
             return EmitResult::Disabled;
         }
         let sequence = next_sequence(&self.inner.next_sequence);
@@ -713,6 +763,7 @@ impl Producer {
                     record.module_id.as_ref().map(|value| value.0.as_str()),
                     record.client_id.as_ref().map(|value| value.0.as_str()),
                     record.operation_id.as_ref().map(|value| value.0.as_str()),
+                    observer_policy,
                 )
             }))
             .unwrap_or(false)
@@ -874,6 +925,7 @@ impl Producer {
         let queued = Queued {
             bytes,
             observer_bytes,
+            observer_policy,
         };
         match sender.try_send(queued) {
             Ok(()) => {
@@ -925,6 +977,80 @@ impl Producer {
         }
     }
 
+    /// Describe whether the bounded optional text path is wired. This is a
+    /// structural snapshot only: it does not claim the observer's current
+    /// operator policy admits any particular record or that a file write has
+    /// succeeded.
+    pub fn text_capture_components(&self) -> TextCaptureComponents {
+        TextCaptureComponents {
+            producer_enabled: self.inner.config.enabled,
+            observer_attached: self.inner.line_observer.is_some(),
+            atlas_redactor_installed: self.inner.config.text_redactor.is_some(),
+            live_policy_installed: self.inner.config.text_capture_policy.is_some(),
+        }
+    }
+
+    /// Evaluate one scope-only probe against the currently loaded Manager
+    /// snapshot and live observer policy. The record is never emitted or
+    /// serialized; callers must not attach text to it.
+    pub fn text_capture_admitted_for(&self, record: &Record) -> bool {
+        let components = self.text_capture_components();
+        if !components.ready() {
+            return false;
+        }
+        let Some(manager_policy) = self.scoped_policy_for(record) else {
+            return false;
+        };
+        if manager_policy.content != FilterContent::RedactedText
+            || !manager_policy.level.allows(record.severity)
+        {
+            return false;
+        }
+        let Some(policy) = self.inner.config.text_capture_policy.as_ref() else {
+            return false;
+        };
+        catch_unwind(AssertUnwindSafe(|| {
+            policy(
+                record.severity,
+                record.kind,
+                record.module_id.as_ref().map(|value| value.0.as_str()),
+                record.client_id.as_ref().map(|value| value.0.as_str()),
+                record.operation_id.as_ref().map(|value| value.0.as_str()),
+                Some(manager_policy),
+            )
+        }))
+        .unwrap_or(false)
+    }
+
+    /// Return only the active Manager policy selected for one scope-only
+    /// record. No unrelated scopes or policy identities are exposed.
+    pub fn scoped_policy_for(&self, record: &Record) -> Option<ScopedPolicyOverride> {
+        self.selected_policy(record, unix_time_ms_signed())
+    }
+
+    /// Return an active policy only when its validated selector is exactly
+    /// the requested scope. This supports truthful post-commit projections
+    /// without exposing the rest of the Producer snapshot.
+    pub fn exact_scoped_policy(&self, scope: &FilterScope) -> Option<ScopedPolicyOverride> {
+        let now_unix_ms = unix_time_ms_signed();
+        self.inner
+            .scoped_filters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .find(|filter| {
+                &filter.scope == scope
+                    && filter
+                        .expires_at_ms
+                        .is_none_or(|expires_at_ms| expires_at_ms > now_unix_ms)
+            })
+            .map(|filter| ScopedPolicyOverride {
+                level: filter.level,
+                content: filter.content,
+                expires_at_ms: filter.expires_at_ms,
+            })
+    }
+
     /// Atomically replace the bounded set of exact Store-owned scopes. The
     /// replacement is in-memory only and therefore safe to call after the
     /// durable meta transaction commits or while a recorder is idle.
@@ -949,7 +1075,7 @@ impl Producer {
             .len()
     }
 
-    fn allows(&self, record: &Record) -> bool {
+    fn selected_policy(&self, record: &Record, now_unix_ms: i64) -> Option<ScopedPolicyOverride> {
         let filters = self
             .inner
             .scoped_filters
@@ -957,9 +1083,18 @@ impl Producer {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         filters
             .iter()
-            .filter(|filter| filter.scope.matches(record))
+            .filter(|filter| {
+                filter.scope.matches(record)
+                    && filter
+                        .expires_at_ms
+                        .is_none_or(|expires_at_ms| expires_at_ms > now_unix_ms)
+            })
             .max_by_key(|filter| filter.scope.specificity())
-            .map_or(true, |filter| filter.level.allows(record.severity))
+            .map(|filter| ScopedPolicyOverride {
+                level: filter.level,
+                content: filter.content,
+                expires_at_ms: filter.expires_at_ms,
+            })
     }
 
     /// Wait for currently admitted diagnostics and line-observer callbacks to
@@ -1130,6 +1265,23 @@ pub struct Stats {
     pub observer_panics: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TextCaptureComponents {
+    pub producer_enabled: bool,
+    pub observer_attached: bool,
+    pub atlas_redactor_installed: bool,
+    pub live_policy_installed: bool,
+}
+
+impl TextCaptureComponents {
+    pub fn ready(self) -> bool {
+        self.producer_enabled
+            && self.observer_attached
+            && self.atlas_redactor_installed
+            && self.live_policy_installed
+    }
+}
+
 fn writer_loop(
     receiver: &Receiver<Queued>,
     counters: &Counters,
@@ -1145,7 +1297,10 @@ fn writer_loop(
         *active_bytes = Some(pending_byte_count);
         if let Some(observer) = &line_observer
             && catch_unwind(AssertUnwindSafe(|| {
-                observer(item.observer_bytes.as_deref().unwrap_or(&item.bytes))
+                observer(
+                    item.observer_bytes.as_deref().unwrap_or(&item.bytes),
+                    item.observer_policy,
+                )
             }))
             .is_err()
         {
@@ -1248,4 +1403,10 @@ fn next_sequence(counter: &AtomicU64) -> u64 {
 fn unix_time_ms() -> Option<u64> {
     let elapsed = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
     u64::try_from(elapsed.as_millis()).ok()
+}
+
+fn unix_time_ms_signed() -> i64 {
+    unix_time_ms()
+        .and_then(|value| i64::try_from(value).ok())
+        .unwrap_or(i64::MAX)
 }

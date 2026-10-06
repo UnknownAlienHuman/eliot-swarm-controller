@@ -23,19 +23,32 @@ const MAX_SELECTOR_BYTES: usize = 128;
 
 #[derive(Clone, Debug)]
 pub struct LiveConfigSource {
-    path: PathBuf,
+    path: Option<PathBuf>,
     scope_id: String,
-    text_settings: Arc<RwLock<TextSettings>>,
+    text_settings: Arc<RwLock<Option<LiveSettings>>>,
 }
 
 impl LiveConfigSource {
     /// Bind the watcher to an operator-pinned file and the current canonical
     /// controller data root. `scope_id` is compared locally and never emitted.
     pub fn new(path: PathBuf, current_scope: &Path) -> Self {
+        Self::for_scope(Some(path), current_scope)
+    }
+
+    /// Keep the live policy seam available when no operator file is configured.
+    /// This exposes only the safe Info/metadata baseline, which an exact active
+    /// Manager policy may override; it does not create a watcher or file.
+    pub fn defaults_for_scope(current_scope: &Path) -> Self {
+        Self::for_scope(None, current_scope)
+    }
+
+    fn for_scope(path: Option<PathBuf>, current_scope: &Path) -> Self {
+        let default_settings = LiveSettings::initial(MAX_RETENTION_BYTES, MAX_RETENTION_DAYS);
+        let text_settings = path.is_none().then_some(default_settings);
         Self {
             path,
             scope_id: current_scope.to_string_lossy().into_owned(),
-            text_settings: Arc::new(RwLock::new(TextSettings::metadata_only())),
+            text_settings: Arc::new(RwLock::new(text_settings)),
         }
     }
 
@@ -43,45 +56,53 @@ impl LiveConfigSource {
     /// producer checks this policy before redacting or queueing any text.
     pub fn text_capture_policy(&self) -> swarm_telemetry::TextCapturePolicy {
         let settings = Arc::clone(&self.text_settings);
-        Arc::new(move |severity, kind, module_id, client_id, operation_id| {
-            let severity = match severity {
-                swarm_telemetry::Severity::Error => Severity::Error,
-                swarm_telemetry::Severity::Warn => Severity::Warn,
-                swarm_telemetry::Severity::Info => Severity::Info,
-                swarm_telemetry::Severity::Debug => Severity::Debug,
-                swarm_telemetry::Severity::Trace => Severity::Trace,
-            };
-            let kind = match kind {
-                swarm_telemetry::Kind::ClientDisconnected => Kind::ClientDisconnected,
-                swarm_telemetry::Kind::StoreOperationFailed => Kind::StoreOperationFailed,
-                swarm_telemetry::Kind::ModuleStarted => Kind::ModuleStarted,
-                swarm_telemetry::Kind::ModuleStopped => Kind::ModuleStopped,
-                swarm_telemetry::Kind::AgentDeliveryFailed => Kind::AgentDeliveryFailed,
-                swarm_telemetry::Kind::RecorderFailure => Kind::RecorderFailure,
-            };
-            settings
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .allows_text_capture(
+        Arc::new(
+            move |severity, kind, module_id, client_id, operation_id, manager_policy| {
+                let settings = settings
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let Some(settings) = settings.as_ref() else {
+                    // An operator-pinned file is fail-closed until the existing
+                    // recorder worker validates and publishes its first snapshot.
+                    return false;
+                };
+                let severity = match severity {
+                    swarm_telemetry::Severity::Error => Severity::Error,
+                    swarm_telemetry::Severity::Warn => Severity::Warn,
+                    swarm_telemetry::Severity::Info => Severity::Info,
+                    swarm_telemetry::Severity::Debug => Severity::Debug,
+                    swarm_telemetry::Severity::Trace => Severity::Trace,
+                };
+                let kind = match kind {
+                    swarm_telemetry::Kind::ClientDisconnected => Kind::ClientDisconnected,
+                    swarm_telemetry::Kind::StoreOperationFailed => Kind::StoreOperationFailed,
+                    swarm_telemetry::Kind::ModuleStarted => Kind::ModuleStarted,
+                    swarm_telemetry::Kind::ModuleStopped => Kind::ModuleStopped,
+                    swarm_telemetry::Kind::AgentDeliveryFailed => Kind::AgentDeliveryFailed,
+                    swarm_telemetry::Kind::RecorderFailure => Kind::RecorderFailure,
+                };
+                settings.allows_text_capture(
                     now_unix_ms(),
                     severity,
                     kind,
                     module_id,
                     client_id,
                     operation_id,
+                    manager_policy,
                 )
-        })
+            },
+        )
     }
 
     pub(crate) fn publish_text_settings(&self, settings: &LiveSettings) {
         *self
             .text_settings
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = settings.text_settings();
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(settings.clone());
     }
 
     pub(crate) fn validate(&self) -> Result<()> {
-        if !self.path.is_absolute()
+        if self.path.as_ref().is_some_and(|path| !path.is_absolute())
             || self.scope_id.len() > MAX_SCOPE_ID_BYTES
             || !Path::new(&self.scope_id).is_absolute()
         {
@@ -98,7 +119,10 @@ impl LiveConfigSource {
         current: &LiveSettings,
         segment_bytes: u64,
     ) -> Result<Option<LiveSettings>> {
-        let metadata = fs::symlink_metadata(&self.path).map_err(|_| unavailable())?;
+        let Some(path) = self.path.as_ref() else {
+            return Ok(None);
+        };
+        let metadata = fs::symlink_metadata(path).map_err(|_| unavailable())?;
         if !metadata.is_file() || metadata.file_type().is_symlink() {
             return Err(invalid());
         }
@@ -106,7 +130,7 @@ impl LiveConfigSource {
             return Err(invalid());
         }
 
-        let file = File::open(&self.path).map_err(|_| unavailable())?;
+        let file = File::open(path).map_err(|_| unavailable())?;
         let opened_metadata = file.metadata().map_err(|_| unavailable())?;
         if !opened_metadata.is_file() || opened_metadata.len() > MAX_LIVE_CONFIG_BYTES as u64 {
             return Err(invalid());
@@ -388,6 +412,79 @@ impl LiveSettings {
             .allows(severity)
     }
 
+    pub(crate) fn allows_with_manager_override(
+        &self,
+        now_unix_ms: u64,
+        severity: Severity,
+        kind: Kind,
+        module_id: Option<&str>,
+        client_id: Option<&str>,
+        operation_id: Option<&str>,
+        manager_policy: Option<swarm_telemetry::ScopedPolicyOverride>,
+    ) -> bool {
+        if !self.included_kinds.contains(&kind) {
+            return false;
+        }
+        let operator_level = self.effective_level(now_unix_ms, module_id, client_id, operation_id);
+        // An operator's explicit off remains the master fail-closed rule. The
+        // ordinary global Info default is not a ceiling on an exact active
+        // Manager scope's level choice.
+        if operator_level == FilterLevel::Off {
+            return false;
+        }
+        match active_manager_policy(now_unix_ms, manager_policy) {
+            Some(policy) => manager_level_allows(policy.level, severity),
+            None => operator_level.allows(severity),
+        }
+    }
+
+    pub(crate) fn allows_record(
+        &self,
+        now_unix_ms: u64,
+        severity: Severity,
+        kind: Kind,
+        module_id: Option<&str>,
+        client_id: Option<&str>,
+        operation_id: Option<&str>,
+        manager_policy: Option<swarm_telemetry::ScopedPolicyOverride>,
+        contains_redacted_text: bool,
+    ) -> bool {
+        let manager_policy = active_manager_policy(now_unix_ms, manager_policy);
+        if !self.allows_with_manager_override(
+            now_unix_ms,
+            severity,
+            kind,
+            module_id,
+            client_id,
+            operation_id,
+            manager_policy,
+        ) {
+            return false;
+        }
+        if !contains_redacted_text {
+            return true;
+        }
+        match manager_policy.map(|policy| policy.content) {
+            Some(swarm_telemetry::FilterContent::Metadata) => false,
+            Some(swarm_telemetry::FilterContent::RedactedText) => selected_text_content_override(
+                &self.overrides,
+                now_unix_ms,
+                module_id,
+                client_id,
+                operation_id,
+            )
+            .is_none_or(|content| content == ContentMode::RedactedText),
+            None => text_content_allows(
+                self.content,
+                &self.overrides,
+                now_unix_ms,
+                module_id,
+                client_id,
+                operation_id,
+            ),
+        }
+    }
+
     fn effective_level(
         &self,
         now_unix_ms: u64,
@@ -426,13 +523,6 @@ impl LiveSettings {
         self.level
     }
 
-    pub(crate) fn text_settings(&self) -> TextSettings {
-        TextSettings {
-            content: self.content,
-            overrides: self.overrides.clone(),
-        }
-    }
-
     fn allows_text_capture(
         &self,
         now_unix_ms: u64,
@@ -441,22 +531,75 @@ impl LiveSettings {
         module_id: Option<&str>,
         client_id: Option<&str>,
         operation_id: Option<&str>,
+        manager_policy: Option<swarm_telemetry::ScopedPolicyOverride>,
     ) -> bool {
-        self.allows(
+        if !self.allows_with_manager_override(
             now_unix_ms,
             severity,
             kind,
             module_id,
             client_id,
             operation_id,
-        ) && text_content_allows(
-            self.content,
-            &self.overrides,
-            now_unix_ms,
-            module_id,
-            client_id,
-            operation_id,
-        )
+            manager_policy,
+        ) {
+            return false;
+        }
+        match active_manager_policy(now_unix_ms, manager_policy).map(|policy| policy.content) {
+            Some(swarm_telemetry::FilterContent::Metadata) => false,
+            Some(swarm_telemetry::FilterContent::RedactedText) => {
+                // A scoped operator metadata override is an explicit content
+                // restriction. The global metadata default is overridable by
+                // an exact Manager opt-in.
+                selected_text_content_override(
+                    &self.overrides,
+                    now_unix_ms,
+                    module_id,
+                    client_id,
+                    operation_id,
+                )
+                .is_none_or(|content| content == ContentMode::RedactedText)
+            }
+            None => text_content_allows(
+                self.content,
+                &self.overrides,
+                now_unix_ms,
+                module_id,
+                client_id,
+                operation_id,
+            ),
+        }
+    }
+}
+
+fn active_manager_policy(
+    now_unix_ms: u64,
+    policy: Option<swarm_telemetry::ScopedPolicyOverride>,
+) -> Option<swarm_telemetry::ScopedPolicyOverride> {
+    let now_unix_ms = i64::try_from(now_unix_ms).ok()?;
+    policy.filter(|policy| {
+        policy
+            .expires_at_ms
+            .is_none_or(|expires_at_ms| expires_at_ms > now_unix_ms)
+    })
+}
+
+fn manager_level_allows(level: swarm_telemetry::FilterLevel, severity: Severity) -> bool {
+    match level {
+        swarm_telemetry::FilterLevel::Off => false,
+        swarm_telemetry::FilterLevel::Error => matches!(severity, Severity::Error),
+        swarm_telemetry::FilterLevel::Warn => {
+            matches!(severity, Severity::Error | Severity::Warn)
+        }
+        swarm_telemetry::FilterLevel::Info => {
+            matches!(severity, Severity::Error | Severity::Warn | Severity::Info)
+        }
+        swarm_telemetry::FilterLevel::Debug => {
+            matches!(
+                severity,
+                Severity::Error | Severity::Warn | Severity::Info | Severity::Debug
+            )
+        }
+        swarm_telemetry::FilterLevel::Trace => true,
     }
 }
 
@@ -524,38 +667,6 @@ struct ParsedLiveConfig {
     retention_days: u64,
 }
 
-#[derive(Clone, Debug)]
-struct TextSettings {
-    content: ContentMode,
-    overrides: Vec<ScopedOverride>,
-}
-
-impl TextSettings {
-    fn metadata_only() -> Self {
-        Self {
-            content: ContentMode::Metadata,
-            overrides: Vec::new(),
-        }
-    }
-
-    fn allows(
-        &self,
-        now_unix_ms: u64,
-        module_id: Option<&str>,
-        client_id: Option<&str>,
-        operation_id: Option<&str>,
-    ) -> bool {
-        text_content_allows(
-            self.content,
-            &self.overrides,
-            now_unix_ms,
-            module_id,
-            client_id,
-            operation_id,
-        )
-    }
-}
-
 fn text_content_allows(
     baseline: ContentMode,
     overrides: &[ScopedOverride],
@@ -564,6 +675,18 @@ fn text_content_allows(
     client_id: Option<&str>,
     operation_id: Option<&str>,
 ) -> bool {
+    selected_text_content_override(overrides, now_unix_ms, module_id, client_id, operation_id)
+        .unwrap_or(baseline)
+        == ContentMode::RedactedText
+}
+
+fn selected_text_content_override(
+    overrides: &[ScopedOverride],
+    now_unix_ms: u64,
+    module_id: Option<&str>,
+    client_id: Option<&str>,
+    operation_id: Option<&str>,
+) -> Option<ContentMode> {
     for (selector, value) in [
         (Selector::Operation, operation_id),
         (Selector::Client, client_id),
@@ -578,10 +701,10 @@ fn text_content_allows(
                 .flatten()
             })
         {
-            return content == ContentMode::RedactedText;
+            return Some(content);
         }
     }
-    baseline == ContentMode::RedactedText
+    None
 }
 
 #[derive(Clone, Copy)]

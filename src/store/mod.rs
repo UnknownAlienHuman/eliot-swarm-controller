@@ -1728,9 +1728,26 @@ impl Store {
                 mutate(db, &principal, &method, &params, &config)
             })
             .await;
-        let result = if reload_logging && result.is_ok() {
-            self.reload_logging_filters().await?;
-            result
+        let result = if reload_logging {
+            match result {
+                Ok(mut value) => match self.reload_logging_filters().await {
+                    Ok(()) => Ok(value),
+                    Err(reload_error) => {
+                        // The Store mutation has already committed. Return
+                        // its receipt with a bounded apply status instead of
+                        // turning a durable policy into an opaque transport
+                        // error or inviting an unsafe duplicate retry.
+                        value["apply"] = json!("reload_failed");
+                        value["apply_error"] = json!({
+                            "code": reload_error.code,
+                            "durable": true,
+                            "live_producer": "previous_snapshot_retained",
+                        });
+                        Ok(value)
+                    }
+                },
+                Err(error) => Err(error),
+            }
         } else {
             result
         };

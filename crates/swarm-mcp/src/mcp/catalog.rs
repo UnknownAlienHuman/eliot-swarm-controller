@@ -400,7 +400,7 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
         Monitoring,
         MANAGER_ONLY_AUDIENCES,
         Searchable,
-        "Read one ordinary Manager's client, Task/Attempt, owned Operation, binding route, or retained module diagnostic policy and live Producer status.",
+        "Read one ordinary Manager's client, Task/Attempt, owned Operation, binding route, or retained module diagnostic policy and live Producer status, including bounded Atlas-redacted-text capability.",
         "Use when reconciling bounded diagnostic detail for an authenticated Manager-owned scope; Task/Attempt context is inherited from an owned route when present.",
         &[
             "logging",
@@ -408,6 +408,8 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
             "telemetry",
             "level",
             "metadata",
+            "redacted",
+            "text",
             "filter"
         ],
         &[
@@ -417,7 +419,7 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
             "optional binding_id + binding_generation",
             "optional module_id"
         ],
-        "Bounded policy and runtime metadata only; no raw capture, text, frames, credentials, or cross-principal state."
+        "Bounded policy and runtime metadata only; redacted text is producer-bounded and Atlas-redacted before observer queueing; native frames, raw capture, credentials, and cross-principal state remain unavailable."
     ),
     entry!(
         "operation.list",
@@ -1685,8 +1687,8 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
         Monitoring,
         MANAGER_ONLY_AUDIENCES,
         ManualOnly,
-        "Persist one metadata-only diagnostic level for the authenticated ordinary Manager's client, Task/Attempt, owned Operation, binding route, or retained module scope.",
-        "Use after reading logging.get when the Manager owns the selected scope; an optional bounded ttl_seconds stores an absolute expiry. Redacted text and native frames require an installed redactor.",
+        "Persist one metadata or bounded Atlas-redacted-text diagnostic level for the authenticated ordinary Manager's client, Task/Attempt, owned Operation, binding route, or retained module scope.",
+        "Use after reading logging.get when the Manager owns the selected scope; an optional bounded ttl_seconds stores an absolute expiry. Native frames remain unsupported because no bounded frame producer exists.",
         &[
             "logging",
             "set",
@@ -1694,16 +1696,18 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
             "telemetry",
             "level",
             "metadata",
+            "redacted",
+            "text",
             "filter"
         ],
         &[
             "level",
-            "content=metadata",
+            "content=metadata|redacted_text",
             "optional scope selector",
             "optional ttl_seconds",
             "client_request_id"
         ],
-        "One durable Store meta policy and after-commit Producer reload; recorder file selection and retention remain the existing swarm-observer policy."
+        "One durable Store meta policy and after-commit Producer reload; selected text is Atlas-redacted before the observer queue, while recorder file selection and retention remain the existing swarm-observer policy."
     ),
     entry!(
         "event.emit",

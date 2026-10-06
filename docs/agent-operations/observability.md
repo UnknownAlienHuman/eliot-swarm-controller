@@ -22,8 +22,9 @@ passed. No model is queried to discover its heartbeat, health or resource usage.
 
 Log **level** and captured **content** are separate settings. Levels are
 `off/error/warn/info/debug/trace`. Default is `info` with metadata only. Content
-choices are metadata, redacted text and bounded redacted native frames. Increasing
-to trace must not silently enable raw prompts, tool arguments, environment dumps,
+choices are metadata and bounded Atlas-redacted text. Native frames are
+unsupported because this source has no bounded frame producer. Increasing to
+trace must not silently enable raw prompts, tool arguments, environment dumps,
 auth headers, account data or credentials. Hidden reasoning unavailable from a
 native API is not a logging feature and must not be fabricated.
 
@@ -34,11 +35,25 @@ scoped content overrides; schema 1 and 2 remain metadata-only. Redacted native
 frames are explicitly unsupported until a real bounded frame source exists.
 
 Managers can use `logging.get` and `logging.set` to inspect and save their own
-diagnostic scope policy without a GM session. The initial API supports metadata
-content and durable absolute TTL; connecting live expiry, higher detail levels,
-and Manager-selected redacted text to the recorder remains source work in
-progress. The operator-pinned schema-3 observer file can already select bounded
-redacted supervisor status text.
+diagnostic scope policy without a GM session. The API accepts metadata or
+`redacted_text` for the Manager's own client, current Task/Attempt, owned
+Operation, binding generation, or retained module scope. A selected Manager
+policy applies its absolute expiry on each producer emission and after-commit
+reload; it can raise detail above the observer's default Info level for that
+exact scope. Explicit operator `off`, excluded kinds, or a scoped operator
+metadata override still fail closed. A scoped Manager `redacted_text` choice
+overrides the observer's global metadata default, but Atlas redaction occurs
+before telemetry serialization or either queue, and the observer still applies
+its bounded file selector, retention, and TTL. Redacted native frames remain
+unsupported because there is no bounded native-frame producer.
+
+`logging.get` reports source capability separately from live availability. Its
+runtime projection shows whether the Producer is enabled, has an observer
+callback, redactor and live policy, whether the persisted scope policy matches
+the loaded Producer snapshot, and whether a non-emitting `module_stopped` scope
+probe passes the current operator policy. A passing probe means policy admission,
+not proof of a recorder file write; configured operator files remain fail-closed
+until the existing recorder worker validates and publishes their first snapshot.
 
 Target configuration example (proposed schema; not accepted by current Config):
 
@@ -74,9 +89,9 @@ It cannot expose another restricted principal's content or enable privileged raw
 capture through an ordinary log setting. Overrides expire back to baseline even
 after a producer restart; changing a filter never restarts a native session.
 
-Proposed normal interfaces: `logging.get/set` and `monitor.snapshot/follow` through
-the shared method registry; CLI `swarm logs` and `swarm monitor` are projections.
-They are **new interfaces to implement**, not available commands in this revision.
+`logging.get/set` are the ordinary Manager's durable scope-policy interface and
+live Producer projection. `monitor.snapshot/follow` and CLI `swarm logs` and
+`swarm monitor` remain separate projections of shared observations.
 Use stable query fields for module, manager, agent, Task, Attempt, Operation,
 binding/generation, time, event kind and severity. Errors name an actual supported
 next action, not a mandatory additional approval chain.

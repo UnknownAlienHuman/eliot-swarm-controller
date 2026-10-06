@@ -85,6 +85,9 @@ async fn run_until(
             .live_config_file
             .as_ref()
             .map(|path| LiveConfigSource::new(path.clone(), &root.path));
+        let policy_source = live_config
+            .clone()
+            .unwrap_or_else(|| LiveConfigSource::defaults_for_scope(&root.path));
         let recorder_config = RecorderConfig {
             directory: config.observability.recording_directory(&root.path),
             queue_records: config.observability.queue_records,
@@ -96,9 +99,7 @@ async fn run_until(
         };
         observer_config_valid = recorder_config.validate().is_ok();
         text_capture_policy = if observer_config_valid {
-            live_config
-                .as_ref()
-                .map(LiveConfigSource::text_capture_policy)
+            Some(policy_source.text_capture_policy())
         } else {
             None
         };
@@ -111,8 +112,8 @@ async fn run_until(
     });
     let line_observer = observer.as_ref().map(|recorder| {
         let recorder = Arc::clone(recorder);
-        Arc::new(move |line: &[u8]| {
-            let _ = recorder.observe_line(line);
+        Arc::new(move |line: &[u8], manager_policy| {
+            let _ = recorder.observe_line_with_manager_policy(line, manager_policy);
         }) as swarm_telemetry::LineObserver
     });
     let config = Arc::new(config);

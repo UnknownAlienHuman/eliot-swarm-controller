@@ -543,7 +543,7 @@ static TOOLS: &[(bool, ToolSpec)] = &[
     ),
     read(
         "logging.get",
-        "Read the authenticated ordinary Manager's metadata diagnostic policy for its client, exact current Task/Attempt, owned Operation, binding route, or retained module descriptor, plus the live Producer projection.",
+        "Read the authenticated ordinary Manager's metadata or bounded Atlas-redacted-text diagnostic policy for its client, exact current Task/Attempt, owned Operation, binding route, or retained module descriptor, plus the live Producer projection.",
         &[
             f("client_id", SN),
             f("task_id", SN),
@@ -819,7 +819,7 @@ static TOOLS: &[(bool, ToolSpec)] = &[
     ),
     mutation(
         "logging.set",
-        "Persist one metadata-only diagnostic level for the authenticated ordinary Manager's client, exact current Task/Attempt, owned Operation, binding route, or retained module descriptor and apply it to the live Producer after commit.",
+        "Persist one bounded diagnostic level and metadata or Atlas-redacted text policy for the authenticated ordinary Manager's client, exact current Task/Attempt, owned Operation, binding route, or retained module descriptor and apply it to the live Producer after commit.",
         &[
             f("client_id", SN),
             f("task_id", SN),
@@ -1681,7 +1681,10 @@ fn refine_input_schema(method: &str, schema: &mut Value) {
                     "type":"string",
                     "enum":["off","error","warn","info","debug","trace"]
                 });
-                properties["content"] = json!({"const":"metadata"});
+                properties["content"] = json!({
+                    "type":"string",
+                    "enum":["metadata","redacted_text"]
+                });
                 properties["ttl_seconds"] = json!({
                     "type":["integer","null"],
                     "minimum":1,
