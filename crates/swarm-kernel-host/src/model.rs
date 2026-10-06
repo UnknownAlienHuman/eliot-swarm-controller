@@ -132,7 +132,7 @@ fn bounded_event_text<'a>(
     value: &'a Value,
     field: &str,
     max_bytes: usize,
-    mut allowed: impl FnMut(u8) -> bool,
+    allowed: impl FnMut(u8) -> bool,
 ) -> Result<&'a str> {
     let text = text(value, field)?;
     if text.len() > max_bytes || !text.bytes().all(allowed) {

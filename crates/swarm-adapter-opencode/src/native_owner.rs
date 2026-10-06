@@ -206,7 +206,10 @@ impl NativeOwner {
             Ok(child) => child,
             Err(error) => {
                 return Err(failure(
-                    Error::new("NATIVE_OWNER_SPAWN", "pinned OpenCode owner could not start"),
+                    Error::new(
+                        "NATIVE_OWNER_SPAWN",
+                        "pinned OpenCode owner could not start",
+                    ),
                     "spawn",
                     true,
                     None,
@@ -332,12 +335,14 @@ impl NativeOwner {
 
     async fn shutdown(mut self) -> Result<()> {
         self.stdin.take();
-        let status = timeout(STOP_TIMEOUT, self.child.wait()).await.map_err(|_| {
-            Error::new(
-                "NATIVE_OWNER_STOP_UNKNOWN",
-                "OpenCode owner did not confirm a graceful stop before its deadline",
-            )
-        })??;
+        let status = timeout(STOP_TIMEOUT, self.child.wait())
+            .await
+            .map_err(|_| {
+                Error::new(
+                    "NATIVE_OWNER_STOP_UNKNOWN",
+                    "OpenCode owner did not confirm a graceful stop before its deadline",
+                )
+            })??;
         if status.success() {
             Ok(())
         } else {
@@ -475,7 +480,7 @@ fn ready_receipt(
         || connection.password.len() < 32
         || connection.password.len() > 4096
         || !is_loopback_endpoint(&endpoint)
-        || endpoint.port_or_known_default() != Some(u16::from(plan.config.port)) && plan.config.port != 0
+        || endpoint.port_or_known_default() != Some(plan.config.port) && plan.config.port != 0
         || owner["connection_sha256"] != digest_bytes(&connection_bytes)
     {
         return None;
@@ -518,11 +523,21 @@ fn process_birth_token(identity: &Value) -> Result<String> {
         let boot = identity["boot_id"]
             .as_str()
             .filter(|value| !value.is_empty())
-            .ok_or_else(|| Error::new("NATIVE_OWNER_IDENTITY", "process boot identity is unavailable"))?;
+            .ok_or_else(|| {
+                Error::new(
+                    "NATIVE_OWNER_IDENTITY",
+                    "process boot identity is unavailable",
+                )
+            })?;
         let ticks = identity["start_ticks"]
             .as_str()
             .filter(|value| !value.is_empty())
-            .ok_or_else(|| Error::new("NATIVE_OWNER_IDENTITY", "process start identity is unavailable"))?;
+            .ok_or_else(|| {
+                Error::new(
+                    "NATIVE_OWNER_IDENTITY",
+                    "process start identity is unavailable",
+                )
+            })?;
         json!({
             "platform":"linux",
             "pid":identity["pid"],
@@ -541,9 +556,12 @@ fn validate_live_bun_identity(plan: &OwnerPlan, image: &Value) -> Result<()> {
             "spawned owner image differs from the pinned Bun executable",
         ));
     }
-    let observed = image["image_path"]
-        .as_str()
-        .ok_or_else(|| Error::new("NATIVE_OWNER_IMAGE_MISMATCH", "owner image path is unavailable"))?;
+    let observed = image["image_path"].as_str().ok_or_else(|| {
+        Error::new(
+            "NATIVE_OWNER_IMAGE_MISMATCH",
+            "owner image path is unavailable",
+        )
+    })?;
     if !same_path(Path::new(observed), &plan.config.bun_executable)? {
         return Err(Error::new(
             "NATIVE_OWNER_IMAGE_MISMATCH",
@@ -594,7 +612,9 @@ fn spawn_stderr_reader(mut stderr: tokio::process::ChildStderr, target: Arc<Mute
             capture.hasher.update(&buffer[..count]);
             if capture.prefix.len() < MAX_STDERR_BYTES {
                 let remaining = MAX_STDERR_BYTES - capture.prefix.len();
-                capture.prefix.extend_from_slice(&buffer[..count.min(remaining)]);
+                capture
+                    .prefix
+                    .extend_from_slice(&buffer[..count.min(remaining)]);
             }
             capture.truncated |= capture.total_bytes > MAX_STDERR_BYTES as u64;
         }
@@ -698,15 +718,28 @@ fn safe_environment(state_root: &Path) -> Vec<(String, PathBuf)> {
 
 fn canonical_regular_file(path: &Path, maximum: u64) -> Result<PathBuf> {
     if !absolute_plain_path(path) {
-        return Err(Error::new("NATIVE_OWNER_PATH", "owner file path is invalid"));
+        return Err(Error::new(
+            "NATIVE_OWNER_PATH",
+            "owner file path is invalid",
+        ));
     }
     let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() == 0 || metadata.len() > maximum {
-        return Err(Error::new("NATIVE_OWNER_PATH", "owner file is not a bounded regular file"));
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() == 0
+        || metadata.len() > maximum
+    {
+        return Err(Error::new(
+            "NATIVE_OWNER_PATH",
+            "owner file is not a bounded regular file",
+        ));
     }
     let canonical = fs::canonicalize(path)?;
     if !same_path(&canonical, path)? {
-        return Err(Error::new("NATIVE_OWNER_PATH", "owner file path is redirected"));
+        return Err(Error::new(
+            "NATIVE_OWNER_PATH",
+            "owner file path is redirected",
+        ));
     }
     Ok(canonical)
 }
@@ -717,20 +750,26 @@ fn canonical_directory(path: &Path) -> Result<PathBuf> {
     }
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(Error::new("NATIVE_OWNER_PATH", "workspace is not a plain directory"));
+        return Err(Error::new(
+            "NATIVE_OWNER_PATH",
+            "workspace is not a plain directory",
+        ));
     }
     let canonical = fs::canonicalize(path)?;
     if !same_path(&canonical, path)? {
-        return Err(Error::new("NATIVE_OWNER_PATH", "workspace path is redirected"));
+        return Err(Error::new(
+            "NATIVE_OWNER_PATH",
+            "workspace path is redirected",
+        ));
     }
     Ok(canonical)
 }
 
 fn absolute_plain_path(path: &Path) -> bool {
     path.is_absolute()
-        && !path.components().any(|component| {
-            matches!(component, Component::CurDir | Component::ParentDir)
-        })
+        && !path
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
 }
 
 fn same_path(left: &Path, right: &Path) -> Result<bool> {
@@ -738,9 +777,10 @@ fn same_path(left: &Path, right: &Path) -> Result<bool> {
     let right = fs::canonicalize(right)?;
     #[cfg(windows)]
     {
-        Ok(left.to_string_lossy().replace('/', "\\").eq_ignore_ascii_case(
-            &right.to_string_lossy().replace('/', "\\"),
-        ))
+        Ok(left
+            .to_string_lossy()
+            .replace('/', "\\")
+            .eq_ignore_ascii_case(&right.to_string_lossy().replace('/', "\\")))
     }
     #[cfg(not(windows))]
     {
@@ -764,7 +804,9 @@ fn read_bounded(path: &Path, maximum: usize) -> Result<Vec<u8>> {
     }
     let mut file = File::open(path)?;
     let mut bytes = Vec::new();
-    file.by_ref().take(maximum as u64 + 1).read_to_end(&mut bytes)?;
+    file.by_ref()
+        .take(maximum as u64 + 1)
+        .read_to_end(&mut bytes)?;
     if bytes.len() > maximum {
         return Err(Error::new(
             "NATIVE_OWNER_RECEIPT",
@@ -786,7 +828,10 @@ fn digest_file(path: &Path, maximum: u64) -> Result<String> {
         }
         total = total.saturating_add(count as u64);
         if total > maximum {
-            return Err(Error::new("NATIVE_OWNER_PATH", "owner file exceeds its size bound"));
+            return Err(Error::new(
+                "NATIVE_OWNER_PATH",
+                "owner file exceeds its size bound",
+            ));
         }
         hasher.update(&buffer[..count]);
     }

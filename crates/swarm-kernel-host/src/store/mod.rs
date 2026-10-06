@@ -51,7 +51,6 @@ mod message_batch;
 #[cfg(test)]
 mod module_bridge_recovery_tests;
 mod module_credential;
-pub(crate) use module_credential::ProvisionedModuleCredential;
 pub(crate) mod module_demand;
 pub(crate) use legacy_worker_demand::LegacyWorkerDemand;
 mod module_handshake;
@@ -732,7 +731,8 @@ impl Store {
     pub(crate) async fn managed_bus_service_snapshot(
         &self,
     ) -> Result<Vec<bus_kernel::ManagedBusServiceDemand>> {
-        self.run(bus_kernel::managed_service_demands).await
+        self.run(|db: &mut Connection| bus_kernel::managed_service_demands(&*db))
+            .await
     }
 
     pub(crate) fn subscribe_managed_bus_service_changes(&self) -> watch::Receiver<u64> {

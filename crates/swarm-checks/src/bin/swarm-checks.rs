@@ -364,18 +364,18 @@ fn execute(control_file: &Path) -> Result<()> {
     let plan_sha256 = loaded.as_ref().map(|value| value.plan_sha256.as_str());
     let plan_context = loaded.as_ref().map(|value| &value.context);
 
-    if let Some(pid) = execution.child_pid {
-        if let (Some(started_at_ms), Some(loaded)) = (control.started_at_ms, loaded.as_ref()) {
-            write_once(
-                &job_dir.join("started.json"),
-                &json!({
-                    "pid": pid,
-                    "program": loaded.plan.executable.to_string_lossy(),
-                    "started_at_ms": started_at_ms,
-                    "token": bootstrap.identity.token
-                }),
-            )?;
-        }
+    if let Some(pid) = execution.child_pid
+        && let (Some(started_at_ms), Some(loaded)) = (control.started_at_ms, loaded.as_ref())
+    {
+        write_once(
+            &job_dir.join("started.json"),
+            &json!({
+                "pid": pid,
+                "program": loaded.plan.executable.to_string_lossy(),
+                "started_at_ms": started_at_ms,
+                "token": bootstrap.identity.token
+            }),
+        )?;
     }
 
     let receipt = execution_json(

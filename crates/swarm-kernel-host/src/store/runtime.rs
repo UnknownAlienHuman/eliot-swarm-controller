@@ -282,7 +282,7 @@ fn batch_original(
         |row| row.get(0),
     )?;
     let mut input: Value = serde_json::from_str(&raw)?;
-    let mut input_sha256 = model::digest(model::canonical(&input)?.as_bytes());
+    let input_sha256 = model::digest(model::canonical(&input)?.as_bytes());
     let method = model::text(&operation, "method")?.to_owned();
     if method == "task.dispatch" {
         let attempt = tasks::get_attempt(db, model::text(&input, "attempt_id")?)?;
@@ -1193,7 +1193,6 @@ fn next_internal(
         method == "agent.result" && input["selector"]["kind"] == "claude_assistant_result";
     let normalized_result_page =
         method == "agent.result" && input["normalized_result_origin"].is_object();
-    let mut sealed_claude_result_origin = None;
     let target_input_sha256 = if method == "agent.reconcile"
         || input_status_result
         || antigravity_status_result
@@ -1264,16 +1263,6 @@ fn next_internal(
                     "Claude assistant results require the exact task.dispatch and prepared session",
                 ));
             }
-            sealed_claude_result_origin = Some(seal_claude_result_origin(
-                &tx,
-                &id,
-                generation,
-                &b,
-                &op,
-                target_id,
-                &target,
-                &input["selector"],
-            )?);
         }
         if antigravity_status_result {
             if b["route"]["runtime"] != "antigravity" {
@@ -4291,6 +4280,23 @@ fn user_command_with_actor(
         tx.execute("UPDATE operations SET state='cancelled',result_json=?4,settled_at_ms=?3,updated_at_ms=?3 WHERE binding_id=?1 AND binding_generation=?2 AND state='queued' AND method='agent.goal' AND json_extract(original_request_json,'$.action') IN ('set','edit','resume')",
             params![id,generation,now,model::canonical(&json!({"reason":"superseded_by_goal_stop","stop_operation_id":op}))?])?;
     }
+    let sealed_claude_result_origin =
+        if method == "agent.result" && v["selector"]["kind"] == "claude_assistant_result" {
+            let target_id = model::text(&v["selector"], "input_operation_id")?;
+            let target = operations::get_operation(tx, target_id)?;
+            Some(seal_claude_result_origin(
+                tx,
+                id,
+                generation,
+                &b,
+                op,
+                target_id,
+                &target,
+                &v["selector"],
+            )?)
+        } else {
+            None
+        };
     let mut effective = json!({"route":b["route"],"native_root_id":b["native_root_id"]});
     effective["native_scope_key"] = b["native_scope_key"].clone();
     if let Some((_, origin)) = normalized_result_origin.as_ref() {

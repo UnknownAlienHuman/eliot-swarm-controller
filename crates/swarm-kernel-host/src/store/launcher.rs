@@ -5106,7 +5106,7 @@ fn launch_preview_inner(
             "digest":model::digest(canonical.as_bytes()),
             "references":detached_references.clone(),
         },
-        "hard_blocks":bounded_decision_literals(hard_blocks),
+        "hard_blocks":bounded_decision_literals(&hard_blocks),
         "coverage":"partial",
         "gaps":["combined_launch_preview_exceeded_serialized_budget; use the exact linked read projections"],
     });
@@ -5137,8 +5137,8 @@ fn launch_preview_inner(
         "decision_card":{
             "schema_version":1,
             "status":readiness,
-            "hard_blocks":bounded_decision_literals(hard_blocks),
-            "warnings":bounded_decision_literals(gaps),
+            "hard_blocks":bounded_decision_literals(&hard_blocks),
+            "warnings":bounded_decision_literals(&gaps),
             "detail_references":detached_references.clone(),
         },
         "context_detached":{

@@ -4,14 +4,16 @@
 
 ### Source delivery and remaining qualification — 2026-10-05
 
-Main source is published through `f51cf1bd7a8a4fb09c63d656ca5624375432bc47`.
 The product source integration, physical Kernel relocation, five Rust adapter
-paths and public CLI/host coordinates are present. The latest scoped production
-Clippy `--keep-going` run failed and collected compile/lint errors across
-OpenCode type aliases, Codex, Command, Claude, supervisor, observer, Forge,
-bus and checks. The integrated source batch addresses these defects; the
-corrected scoped gate is the first acceptance step. This remains `PARTIAL_PROGRESS` until
-that gate passes on the integrated repair revision. No tests, full builds or
+paths and public CLI/host coordinates are present. Production source at
+`eeb77b8b84bee8d8abde31ba42fb751d01d84d58` reached the relocated Kernel in the
+scoped Clippy `--keep-going` pass. That pass reported Kernel integration errors
+and the remaining Codex, OpenCode and checks lints. The following source batch
+repairs Store callback types, retained Claude result admission, immutable
+Command receipt joins, event cause scope, readback fields and launcher DTOs.
+Source closure precedes tests and native qualification. The product remains
+`PARTIAL_PROGRESS`; compiler success alone does not qualify failure recovery,
+installed adapters or productive execution. No tests, full builds or
 native/provider/model calls have run in this source phase. Historical binaries
 and qualification receipts retain only their recorded scope.
 

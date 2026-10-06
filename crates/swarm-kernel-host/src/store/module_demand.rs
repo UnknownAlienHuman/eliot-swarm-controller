@@ -7,7 +7,10 @@
 //! through the immutable selector on its binding.
 
 use super::{launcher_owned_service, module_handshake, operations};
-use crate::{config::Config, error::{Error, Result}};
+use crate::{
+    config::Config,
+    error::{Error, Result},
+};
 use rusqlite::{Connection, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -91,6 +94,7 @@ pub(crate) struct ModuleDemandSnapshot {
 pub(crate) struct ModuleScopeReadback {
     pub(crate) operations: Vec<StoredOperation>,
     pub(crate) native_identity_retained: bool,
+    pub(crate) module_hello_boot_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -343,7 +347,9 @@ fn prepare_owned_intents(
                AND o.method='agent.open' AND o.state='queued'",
         )?;
         statement
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?
     };
     if candidates.is_empty() {

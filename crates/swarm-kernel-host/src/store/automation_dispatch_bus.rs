@@ -1095,7 +1095,9 @@ fn module_event_contract_digest(
             "Module event descriptor has no retained event contract",
         )
     })?;
-    Ok(model::digest(model::canonical(event_schemas)?.as_bytes()))
+    Ok(model::digest(
+        model::canonical(&Value::Array(event_schemas.to_owned()))?.as_bytes(),
+    ))
 }
 
 /// Read immutable Task/Attempt origin facts and derive a separate current
@@ -1348,7 +1350,10 @@ fn module_event_native_mcp_phase_parent(
     let native_phase_matches = matches!(
         (method, native_phase.as_deref()),
         ("native.mcp.install", Some("install"))
-            | ("native.mcp.observe", Some("observe_unknown" | "observe_refresh"))
+            | (
+                "native.mcp.observe",
+                Some("observe_unknown" | "observe_refresh")
+            )
             | ("native.mcp.arm", Some("arm"))
             | ("native.mcp.read", Some("read"))
     );
@@ -1366,8 +1371,8 @@ fn module_event_native_mcp_phase_parent(
     else {
         return Err(unauthorized());
     };
-    let Some(parent_launch_operation_id) = parent_launch_operation_id
-        .filter(|value| !value.is_empty() && value != operation_id)
+    let Some(parent_launch_operation_id) =
+        parent_launch_operation_id.filter(|value| !value.is_empty() && value != operation_id)
     else {
         return Err(unauthorized());
     };

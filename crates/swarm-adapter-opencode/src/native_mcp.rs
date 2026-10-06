@@ -128,7 +128,7 @@ async fn execute_install(
     let response = native
         .mcp_put(&request.path, body)
         .await
-        .map_err(|error| effect_failure(error))?;
+        .map_err(effect_failure)?;
     let observed = native
         .mcp_get(&readback.path)
         .await

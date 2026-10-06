@@ -1,14 +1,14 @@
 mod config;
 mod journal;
+mod mcp_plugin;
 mod module_link;
 mod module_receipt;
 mod module_runtime;
-mod mcp_plugin;
 mod native;
-mod native_owner;
-mod provider_auth;
 mod native_mcp;
 mod native_mcp_intake;
+mod native_owner;
+mod provider_auth;
 
 pub use config::{
     ARTIFACT_ID, ARTIFACT_VERSION, AdapterConfig, ModelRef, NativeOptions, OwnedNativeOptions,
@@ -281,34 +281,36 @@ async fn handle_native_mcp(
     let intent = intent_for(command, claim, options, None, None)?;
     journal.write_intent(&intent)?;
     let result = match NativeClient::connect(options).await {
-        Ok((native, _)) => match native_mcp::execute(&native, &admitted.effect_command, options).await {
-            Ok(receipt) => outcome(
-                command,
-                claim,
-                EffectOutcome::Applied,
-                options,
-                command.native_root_id.clone(),
-                None,
-                json!({
-                    "native_mcp":receipt,
-                    "native_replay":false,
-                }),
-            )?,
-            Err(failure) => outcome(
-                command,
-                claim,
-                failure.outcome,
-                options,
-                command.native_root_id.clone(),
-                None,
-                {
-                    let mut details = diagnostic(&failure.error);
-                    details["native_mcp_action"] = json!(command.method);
-                    details["native_replay"] = json!(false);
-                    details
-                },
-            )?,
-        },
+        Ok((native, _)) => {
+            match native_mcp::execute(&native, &admitted.effect_command, options).await {
+                Ok(receipt) => outcome(
+                    command,
+                    claim,
+                    EffectOutcome::Applied,
+                    options,
+                    command.native_root_id.clone(),
+                    None,
+                    json!({
+                        "native_mcp":receipt,
+                        "native_replay":false,
+                    }),
+                )?,
+                Err(failure) => outcome(
+                    command,
+                    claim,
+                    failure.outcome,
+                    options,
+                    command.native_root_id.clone(),
+                    None,
+                    {
+                        let mut details = diagnostic(&failure.error);
+                        details["native_mcp_action"] = json!(command.method);
+                        details["native_replay"] = json!(false);
+                        details
+                    },
+                )?,
+            }
+        }
         Err(error) => outcome(
             command,
             claim,
@@ -647,25 +649,26 @@ async fn handle_assistant_result(
             "normalized assistant result target has no retained dispatch outcome",
         )
     })?;
-    let target_outcome: RuntimeOutcome = serde_json::from_value(target_outcome.clone()).map_err(
-        |_| {
+    let target_outcome: RuntimeOutcome =
+        serde_json::from_value(target_outcome.clone()).map_err(|_| {
             Error::new(
                 "RESULT_DISPATCH_OUTCOME_INVALID",
                 "saved task.dispatch outcome is not a runtime outcome",
             )
-        },
-    )?;
-    let saved_admission: TaskDispatchAdmissionReceipt =
-        serde_json::from_value(target_outcome.details["dispatch_admission"].clone()).map_err(
-            |_| {
-                Error::new(
-                    "RESULT_DISPATCH_ADMISSION_INVALID",
-                    "saved task.dispatch outcome lacks its typed admission receipt",
-                )
-            },
-        )?;
-    if !matches!(target_outcome.outcome, EffectOutcome::Applied | EffectOutcome::Accepted)
-        || target_outcome.operation_id != input_operation_id
+        })?;
+    let saved_admission: TaskDispatchAdmissionReceipt = serde_json::from_value(
+        target_outcome.details["dispatch_admission"].clone(),
+    )
+    .map_err(|_| {
+        Error::new(
+            "RESULT_DISPATCH_ADMISSION_INVALID",
+            "saved task.dispatch outcome lacks its typed admission receipt",
+        )
+    })?;
+    if !matches!(
+        target_outcome.outcome,
+        EffectOutcome::Applied | EffectOutcome::Accepted
+    ) || target_outcome.operation_id != input_operation_id
         || target_outcome.native_input_id.as_deref() != Some(target_native_input_id.as_str())
         || target_outcome.details["module_receipt"] != serde_json::to_value(&target_receipt)?
         || saved_admission != admission
@@ -749,15 +752,13 @@ async fn handle_assistant_result(
     }
     let native_identity = assistant_identity(assistant_message_id, &target_native_input_id);
     if let Some(saved) = own_history.result_params.as_ref() {
-        let source: NormalizedResultPageSource = serde_json::from_value(
-            saved["page"]["source"].clone(),
-        )
-        .map_err(|_| {
-            Error::new(
-                "ADAPTER_INTENT_MISMATCH",
-                "saved normalized assistant result page is malformed",
-            )
-        })?;
+        let source: NormalizedResultPageSource =
+            serde_json::from_value(saved["page"]["source"].clone()).map_err(|_| {
+                Error::new(
+                    "ADAPTER_INTENT_MISMATCH",
+                    "saved normalized assistant result page is malformed",
+                )
+            })?;
         if source.origin != origin
             || source.result_module_receipt != result_intent.module_receipt
             || source.native_response_identity.as_deref() != Some(native_identity.as_str())
@@ -840,16 +841,14 @@ fn normalized_assistant_result_page(
         .input
         .get("normalized_result_payload_identity")
         .filter(|value| value.is_object())
-    {
-        if expected["sha256"].as_str() != Some(payload_sha256.as_str())
+        && (expected["sha256"].as_str() != Some(payload_sha256.as_str())
             || expected["byte_length"].as_u64() != Some(body.len() as u64)
-            || expected["complete"] == false
-        {
-            return Err(Error::new(
-                "NORMALIZED_RESULT_PAYLOAD_MISMATCH",
-                "assistant result body differs from the Store-admitted payload identity",
-            ));
-        }
+            || expected["complete"] == false)
+    {
+        return Err(Error::new(
+            "NORMALIZED_RESULT_PAYLOAD_MISMATCH",
+            "assistant result body differs from the Store-admitted payload identity",
+        ));
     }
     let offset = command.input["offset_bytes"].as_u64().unwrap_or(0);
     let requested = command.input["length_bytes"]
@@ -860,11 +859,11 @@ fn normalized_assistant_result_page(
     if offset > total || (requested == 0 && offset < total) {
         return Err(Error::invalid("assistant result page range is invalid"));
     }
-    let end = offset.checked_add(requested).unwrap_or(u64::MAX).min(total);
+    let end = offset.saturating_add(requested).min(total);
     let start = usize::try_from(offset)
         .map_err(|_| Error::invalid("assistant result page offset is invalid"))?;
-    let stop = usize::try_from(end)
-        .map_err(|_| Error::invalid("assistant result page end is invalid"))?;
+    let stop =
+        usize::try_from(end).map_err(|_| Error::invalid("assistant result page end is invalid"))?;
     let page = &body[start..stop];
     let source = NormalizedResultPageSource {
         schema_id: "swarm.normalized_result_page".to_owned(),
@@ -1130,18 +1129,23 @@ fn normalized_dispatch_admission(
     input_id: &str,
     prompt_text: &str,
 ) -> Result<Option<TaskDispatchAdmissionReceipt>> {
-    if command.method != "task.dispatch"
-        || !module_runtime::normalized_dispatch_enabled(host.claim)
+    if command.method != "task.dispatch" || !module_runtime::normalized_dispatch_enabled(host.claim)
     {
         return Ok(None);
     }
-    let context: TaskDispatchContext = serde_json::from_value(
-        command.input["task_dispatch_context"].clone(),
-    )
-    .map_err(|_| Error::new("TASK_DISPATCH_CONTEXT_INVALID", "dispatch context is malformed"))?;
-    context
-        .validate()
-        .map_err(|_| Error::new("TASK_DISPATCH_CONTEXT_INVALID", "dispatch context is invalid"))?;
+    let context: TaskDispatchContext =
+        serde_json::from_value(command.input["task_dispatch_context"].clone()).map_err(|_| {
+            Error::new(
+                "TASK_DISPATCH_CONTEXT_INVALID",
+                "dispatch context is malformed",
+            )
+        })?;
+    context.validate().map_err(|_| {
+        Error::new(
+            "TASK_DISPATCH_CONTEXT_INVALID",
+            "dispatch context is invalid",
+        )
+    })?;
     if context.operation_id != command.operation_id
         || context.binding_id != command.binding_id
         || context.binding_generation != command.generation
@@ -1192,9 +1196,12 @@ fn normalized_dispatch_admission(
         native_payload_bytes: payload_bytes.len() as u64,
         native_input_id: Some(input_id.to_owned()),
     };
-    receipt
-        .validate()
-        .map_err(|_| Error::new("TASK_DISPATCH_CONTEXT_INVALID", "dispatch admission is invalid"))?;
+    receipt.validate().map_err(|_| {
+        Error::new(
+            "TASK_DISPATCH_CONTEXT_INVALID",
+            "dispatch admission is invalid",
+        )
+    })?;
     Ok(Some(receipt))
 }
 
@@ -1204,8 +1211,7 @@ fn validate_saved_dispatch_outcome(
     history: &journal::OperationHistory,
     saved: &Value,
 ) -> Result<()> {
-    if command.method != "task.dispatch"
-        || !module_runtime::normalized_dispatch_enabled(host.claim)
+    if command.method != "task.dispatch" || !module_runtime::normalized_dispatch_enabled(host.claim)
     {
         return Ok(());
     }
@@ -1309,13 +1315,8 @@ async fn handle_send(
         Some(input.clone()),
         Some(&prompt_text),
     )?;
-    intent.dispatch_admission = normalized_dispatch_admission(
-        host,
-        command,
-        &intent,
-        &input,
-        &prompt_text,
-    )?;
+    intent.dispatch_admission =
+        normalized_dispatch_admission(host, command, &intent, &input, &prompt_text)?;
     // Only the digest and byte count are retained; prompt text stays in this
     // stack frame and the HTTP request body.
     journal.write_intent(&intent)?;

@@ -1,6 +1,7 @@
 //! Native patches for one isolated, closed projected turn. Not a workspace
 //! capture, binary-file download, execution terminal or Task acceptance.
-use super::{Data, RuntimeCommand, Service, decode, input_id, unavailable};
+use super::{RuntimeCommand, Service, decode, input_id, unavailable};
+use crate::runtime::opencode_v2::http::Data;
 use crate::{error::Result, model};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;

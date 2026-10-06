@@ -98,7 +98,7 @@ pub(super) fn target_snapshot(
     if target["binding_id"] != binding_id
         || target["binding_generation"] != generation
         || target["method"] != "task.dispatch"
-        || (!unknown && !matches!(state.as_str(), "settled" | "rejected"))
+        || (!unknown && !matches!(state, "settled" | "rejected"))
     {
         return Err(Error::new(
             "RESULT_TARGET_NOT_TERMINAL",
@@ -162,7 +162,7 @@ pub(super) fn target_snapshot(
             ));
         }
         if unknown {
-            if outcome.outcome != EffectOutcome::Unknown
+            if !matches!(&outcome.outcome, EffectOutcome::Unknown)
                 || outcome.details["execution_shape"] != crate::runtime::batch::EXECUTION_SHAPE
                 || outcome.details["task_acceptance_claimed"] != false
                 || outcome.details["result_page_available"] != false
@@ -283,7 +283,7 @@ pub(super) fn target_output_snapshot(
     if target["binding_id"] != binding_id
         || target["binding_generation"] != generation
         || target["method"] != "task.dispatch"
-        || !matches!(state.as_str(), "settled" | "rejected" | "outcome_unknown")
+        || !matches!(state, "settled" | "rejected" | "outcome_unknown")
     {
         return Err(Error::new(
             "BATCH_OUTPUT_UNAVAILABLE",
@@ -492,7 +492,7 @@ fn retained_dispatch_admission(
     generation: i64,
 ) -> Result<Value> {
     let raw = &outcome.details["dispatch_admission"];
-    if !normalized || outcome.outcome != EffectOutcome::Applied {
+    if !normalized || !matches!(&outcome.outcome, EffectOutcome::Applied) {
         if !raw.is_null() {
             return Err(Error::new(
                 "RESULT_TARGET_RECEIPT_INVALID",
@@ -522,7 +522,7 @@ fn retained_dispatch_admission(
     })?;
     if !dispatch_context_matches(context, &receipt.context())
         || receipt.module_receipt != *module_receipt
-        || receipt.operation_id != context.operation_id
+        || receipt.operation_id.as_str() != model::text(context, "operation_id")?
         || receipt.binding_id != binding_id
         || receipt.binding_generation != generation
         || outcome.native_input_id != receipt.native_input_id
@@ -1286,8 +1286,8 @@ pub(super) fn prepare(
     let mut context = results::prepare(db, principal, operation_id, source)?;
     let kind = model::text(&context["selector"], "kind")?;
     if kind == "command_status" {
-        let target_id = model::text(&context["selector"], "input_operation_id")?;
-        let snapshot = target_snapshot_from_context(db, &context, target_id)?;
+        let target_id = model::text(&context["selector"], "input_operation_id")?.to_owned();
+        let snapshot = target_snapshot_from_context(db, &context, &target_id)?;
         let result_input_sha256 = request_digest(
             db,
             operation_id,
@@ -1314,7 +1314,7 @@ pub(super) fn prepare(
             &context["selector"],
             &["kind", "input_operation_id", "native_output"],
         )?;
-        let target_id = model::text(&context["selector"], "input_operation_id")?;
+        let target_id = model::text(&context["selector"], "input_operation_id")?.to_owned();
         let native_output = model::text(&context["selector"], "native_output")?;
         validate_native_output_name(native_output)?;
         let snapshot = admitted_output_snapshot(
@@ -1322,7 +1322,7 @@ pub(super) fn prepare(
             operation_id,
             model::text(&context, "binding_id")?,
             model::positive(&context, "generation")?,
-            target_id,
+            &target_id,
             native_output,
         )?;
         let result_input_sha256 = request_digest(

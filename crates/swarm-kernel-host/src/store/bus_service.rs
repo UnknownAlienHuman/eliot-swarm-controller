@@ -7,7 +7,6 @@
 use crate::{
     automation::{authorization, config as automation_config},
     error::{Error, Result},
-    model,
     store::{meta, set_meta},
 };
 use rusqlite::{Connection, Transaction};

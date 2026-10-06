@@ -1695,16 +1695,16 @@ pub(crate) fn validate_retained_script_event_cause(
             "retained ScriptRun event Task/Attempt scope is incomplete",
         ));
     }
+    let owner_manager_id = cause["automation_consumer"]["owner_manager_id"]
+        .as_str()
+        .filter(|value| !value.is_empty());
     let module_event_scope = if event.source_id.starts_with("module:") {
-        let owner_manager_id = cause["automation_consumer"]["owner_manager_id"]
-            .as_str()
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                Error::new(
-                    "AUTOMATION_LINK_CORRUPT",
-                    "retained Module ScriptRun event has no owner attribution",
-                )
-            })?;
+        let owner_manager_id = owner_manager_id.ok_or_else(|| {
+            Error::new(
+                "AUTOMATION_LINK_CORRUPT",
+                "retained Module ScriptRun event has no owner attribution",
+            )
+        })?;
         Some(bus_kernel::validate_retained_module_event_source(
             db,
             project_id,
@@ -1752,15 +1752,12 @@ pub(crate) fn validate_retained_script_event_cause(
             ));
         };
         if event.source_id == crate::store::MANAGER_EVENT_SOURCE_STREAM {
-            let owner_manager_id = cause["automation_consumer"]["owner_manager_id"]
-                .as_str()
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| {
-                    Error::new(
-                        "AUTOMATION_LINK_CORRUPT",
-                        "retained Manager event ScriptRun has no owner attribution",
-                    )
-                })?;
+            let owner_manager_id = owner_manager_id.ok_or_else(|| {
+                Error::new(
+                    "AUTOMATION_LINK_CORRUPT",
+                    "retained Manager event ScriptRun has no owner attribution",
+                )
+            })?;
             bus_kernel::require_manager_event_scope_for_retained(
                 db,
                 &event,
@@ -1788,7 +1785,7 @@ pub(crate) fn validate_retained_script_event_cause(
                     || operation_binding_generation != Some(module_scope.binding_generation)
                     || !source_scope_matches
                     || !action_scope_matches
-                    || caller_id != owner_manager_id
+                    || owner_manager_id != Some(caller_id.as_str())
                 {
                     return Err(Error::new(
                         "AUTOMATION_LINK_CORRUPT",

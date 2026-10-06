@@ -4,6 +4,7 @@
 //! digest. Its `DeclaredServiceScope` is an identity/generation fence, not an
 //! authorization grant; this file supplies the exact closed method scope.
 
+use super::{meta, set_meta};
 use crate::{
     config::Config,
     error::{Error, Result},

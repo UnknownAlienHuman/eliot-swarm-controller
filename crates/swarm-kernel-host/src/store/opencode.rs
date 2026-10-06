@@ -45,10 +45,13 @@ fn owned_bindings(db: &Connection) -> Result<Vec<Value>> {
     )?;
     let ids = stmt
         .query_map(
-            params![oc::RUNTIME, oc::ARTIFACT_ID, crate::config::OPENCODE_RUST_ARTIFACT_ID],
-            |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })?
+            params![
+                oc::RUNTIME,
+                oc::ARTIFACT_ID,
+                crate::config::OPENCODE_RUST_ARTIFACT_ID
+            ],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(stmt);
     let mut result = Vec::new();
@@ -72,7 +75,13 @@ fn active_owned_binding(db: &Connection, id: &str, generation: i64) -> Result<Op
           AND module_artifact_id IN (?4,?5)
           AND json_type(route_json,'$.owned_service')='object'
           AND json_type(state_json,'$.module_contract_selector') IS NULL)",
-        params![id, generation, oc::RUNTIME, oc::ARTIFACT_ID, crate::config::OPENCODE_RUST_ARTIFACT_ID],
+        params![
+            id,
+            generation,
+            oc::RUNTIME,
+            oc::ARTIFACT_ID,
+            crate::config::OPENCODE_RUST_ARTIFACT_ID
+        ],
         |row| row.get(0),
     )?;
     if !active {
@@ -335,7 +344,8 @@ impl Store {
                         }));
                     }
                 }
-                    let active_owned_bindings = self.run(owned_bindings).await?;
+                let active_owned_bindings =
+                    self.run(|db: &mut Connection| owned_bindings(&*db)).await?;
                 for binding in active_owned_bindings {
                     let key = (
                         binding["binding_id"]

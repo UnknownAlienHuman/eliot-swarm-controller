@@ -822,7 +822,7 @@ fn owned_binding(
         let task = if let (Some(task_id), Some(attempt_id)) =
             (task_id.as_deref(), attempt_id.as_deref())
         {
-            let revision = tasks::get_task(db, task_id)["revision"]
+            let revision = tasks::get_task(db, task_id)?["revision"]
                 .as_i64()
                 .ok_or_else(|| {
                     Error::new("LOGGING_SCOPE_CORRUPT", "binding Task revision is invalid")

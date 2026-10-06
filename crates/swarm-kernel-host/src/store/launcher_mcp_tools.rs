@@ -1042,13 +1042,8 @@ impl Store {
             }
             "observe_unknown" => {
                 let readback = receipt["readback"].clone();
-                self.record_install_observation(
-                    facts,
-                    credential,
-                    assignment,
-                    Some(readback),
-                )
-                .await?;
+                self.record_install_observation(facts, credential, assignment, Some(readback))
+                    .await?;
             }
             "observe_refresh" => {
                 let readback = receipt["readback"].clone();
@@ -1848,16 +1843,13 @@ fn load_launch_facts(db: &Connection, config: &Config, operation_id: &str) -> Re
 const INTERNAL_NATIVE_MCP_CALLER: &str = "swarm.internal.c8.native_mcp";
 
 fn require_internal_native_mcp_client(tx: &Connection) -> Result<()> {
-    let registration = super::meta(
-        tx,
-        &format!("client:{INTERNAL_NATIVE_MCP_CALLER}"),
-    )?
-    .ok_or_else(|| {
-        Error::new(
-            "INTERNAL_CLIENT_NOT_REGISTERED",
-            "native MCP phase caller is not durably registered",
-        )
-    })?;
+    let registration = super::meta(tx, &format!("client:{INTERNAL_NATIVE_MCP_CALLER}"))?
+        .ok_or_else(|| {
+            Error::new(
+                "INTERNAL_CLIENT_NOT_REGISTERED",
+                "native MCP phase caller is not durably registered",
+            )
+        })?;
     if registration["role"] != "module"
         || registration["internal_only"] != true
         || registration["disabled"] == true
@@ -1896,9 +1888,13 @@ fn queue_native_mcp_operation(
     if !matches!(
         method,
         "native.mcp.install" | "native.mcp.observe" | "native.mcp.arm" | "native.mcp.read"
-    ) || !matches!(phase, "install" | "observe_unknown" | "observe_refresh" | "arm" | "read")
-    {
-        return Err(Error::invalid("native MCP module operation phase is invalid"));
+    ) || !matches!(
+        phase,
+        "install" | "observe_unknown" | "observe_refresh" | "arm" | "read"
+    ) {
+        return Err(Error::invalid(
+            "native MCP module operation phase is invalid",
+        ));
     }
     require_internal_native_mcp_client(tx)?;
     let scope = assignment.as_value();
@@ -1920,8 +1916,9 @@ fn queue_native_mcp_operation(
         "native.mcp.read" => "read",
         _ => unreachable!("native MCP method was checked above"),
     };
-    let command_scope = command["scope"]
-        .as_object()
+    let command_scope = command
+        .get("scope")
+        .filter(|scope| scope.is_object())
         .ok_or_else(|| Error::invalid("native MCP command scope is missing"))?;
     if command_scope["binding_id"] != binding_id
         || command_scope["binding_generation"] != binding_generation
@@ -1947,8 +1944,9 @@ fn queue_native_mcp_operation(
     } else {
         "challenge"
     };
-    let artifact = command[artifact_key]
-        .as_object()
+    let artifact = command
+        .get(artifact_key)
+        .filter(|artifact| artifact.is_object())
         .ok_or_else(|| Error::invalid("native MCP private artifact is missing"))?;
     let artifact_sha256 = model::digest(model::canonical(artifact)?.as_bytes());
     let operation_id = model::new_id();
@@ -3685,8 +3683,7 @@ pub(crate) fn participant_capability_projection(
             row_binding_id,
             row_generation,
             effective_json,
-        ) =
-            row?;
+        ) = row?;
         let effective: Value = match serde_json::from_str(&effective_json) {
             Ok(value) => value,
             Err(_) => {
@@ -3814,7 +3811,12 @@ pub(crate) fn participant_capability_projection(
 
     let install_state = public_c8_status(
         &record["install"]["state"],
-        &["prepared", "outcome_unknown", "registered", "observed_after_unknown"],
+        &[
+            "prepared",
+            "outcome_unknown",
+            "registered",
+            "observed_after_unknown",
+        ],
     );
     let runtime_status = public_c8_status(
         &record["install"]["readback"]["runtime_status"],
@@ -3822,7 +3824,13 @@ pub(crate) fn participant_capability_projection(
     );
     let observer_state = public_c8_status(
         &record["challenge"]["state"],
-        &["not_started", "prepared", "outcome_unknown", "armed", "observed"],
+        &[
+            "not_started",
+            "prepared",
+            "outcome_unknown",
+            "armed",
+            "observed",
+        ],
     );
     let tools = &record["tools_readback"];
     let native_discovered = public_c8_status(
@@ -3877,10 +3885,7 @@ pub(crate) fn participant_capability_projection(
         } else {
             "missing"
         };
-        core_status.insert(
-            method.to_owned(),
-            json!(status),
-        );
+        core_status.insert(method.to_owned(), json!(status));
     }
     projection["core_tools"] = json!({
         "observed":observed_values,

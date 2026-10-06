@@ -610,7 +610,7 @@ pub(super) fn prepare(
             &origin["descriptor"],
             &source["result_module_receipt"],
             operation_id,
-            id,
+            &id,
             generation,
             origin["result_input_sha256"].as_str().unwrap_or_default(),
         )?;
