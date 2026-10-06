@@ -15,6 +15,13 @@ const CAPABILITIES: [&str; 4] = [
     "agent.send",
     "task.dispatch",
 ];
+const RESULT_CAPABILITIES: [&str; 5] = [
+    "agent.open",
+    "agent.reconcile",
+    "agent.result",
+    "agent.send",
+    "task.dispatch",
+];
 
 pub(crate) struct ModuleRuntimeContext {
     pub worker: VerifiedModuleWorker,
@@ -63,13 +70,18 @@ pub(crate) fn load_runtime_context() -> Result<ModuleRuntimeContext, AdapterErro
         || claim.artifact.build_id != build_id
         || claim.protocol != (ProtocolVersion { major: 1, minor: 0 })
         || claim.config_schema.is_some()
-        || claim
-            .capabilities
-            .iter()
-            .map(CapabilityId::as_str)
-            .collect::<Vec<_>>()
-            .as_slice()
-            != CAPABILITIES.as_slice()
+        || {
+            let capabilities = claim
+                .capabilities
+                .iter()
+                .map(CapabilityId::as_str)
+                .collect::<Vec<_>>();
+            if normalized_result_enabled(&claim) {
+                capabilities.as_slice() != RESULT_CAPABILITIES.as_slice()
+            } else {
+                capabilities.as_slice() != CAPABILITIES.as_slice()
+            }
+        }
         || !has_generic_schemas(&claim)
         || credential.client_id != module_client_id
     {
@@ -121,11 +133,28 @@ fn has_generic_schemas(claim: &ModuleContractClaim) -> bool {
     let runtime_outcome = schema("swarm.runtime_outcome", "1");
     let dispatch_context = schema("swarm.task_dispatch_context", "1");
     let dispatch_admission = schema("swarm.task_dispatch_admission", "1");
-    (claim.command_schemas == [runtime_command.clone()].as_slice()
-        && claim.event_schemas == [runtime_outcome.clone()].as_slice())
-        || (claim.command_schemas
-            == [runtime_command, dispatch_context].as_slice()
-            && claim.event_schemas == [runtime_outcome, dispatch_admission].as_slice())
+    let result_context = schema("swarm.normalized_result_context", "1");
+    let result_page = schema("swarm.normalized_result_page", "1");
+    (exact_schemas(&claim.command_schemas, &[runtime_command.clone()])
+        && exact_schemas(&claim.event_schemas, &[runtime_outcome.clone()]))
+        || (exact_schemas(
+            &claim.command_schemas,
+            &[runtime_command.clone(), dispatch_context.clone()],
+        ) && exact_schemas(
+            &claim.event_schemas,
+            &[runtime_outcome.clone(), dispatch_admission.clone()],
+        ))
+        || (exact_schemas(
+            &claim.command_schemas,
+            &[runtime_command, dispatch_context, result_context],
+        ) && exact_schemas(
+            &claim.event_schemas,
+            &[runtime_outcome, dispatch_admission, result_page],
+        ))
+}
+
+fn exact_schemas(actual: &[SchemaDescriptor], expected: &[SchemaDescriptor]) -> bool {
+    actual.len() == expected.len() && expected.iter().all(|schema| actual.contains(schema))
 }
 
 pub(crate) fn normalized_dispatch_enabled(claim: &ModuleContractClaim) -> bool {
@@ -136,8 +165,35 @@ pub(crate) fn normalized_dispatch_enabled(claim: &ModuleContractClaim) -> bool {
             sha256: None,
         }
     }
-    claim.command_schemas.contains(&schema("swarm.task_dispatch_context", "1"))
-        && claim.event_schemas.contains(&schema("swarm.task_dispatch_admission", "1"))
+    claim
+        .command_schemas
+        .contains(&schema("swarm.task_dispatch_context", "1"))
+        && claim
+            .event_schemas
+            .contains(&schema("swarm.task_dispatch_admission", "1"))
+}
+
+pub(crate) fn normalized_result_enabled(claim: &ModuleContractClaim) -> bool {
+    fn schema(id: &str, version: &str) -> SchemaDescriptor {
+        SchemaDescriptor {
+            schema_id: id.to_owned(),
+            version: version.to_owned(),
+            sha256: None,
+        }
+    }
+    let runtime_command = schema("swarm.runtime_command", "1");
+    let runtime_outcome = schema("swarm.runtime_outcome", "1");
+    let dispatch_context = schema("swarm.task_dispatch_context", "1");
+    let dispatch_admission = schema("swarm.task_dispatch_admission", "1");
+    let result_context = schema("swarm.normalized_result_context", "1");
+    let result_page = schema("swarm.normalized_result_page", "1");
+    exact_schemas(
+        &claim.command_schemas,
+        &[runtime_command, dispatch_context, result_context],
+    ) && exact_schemas(
+        &claim.event_schemas,
+        &[runtime_outcome, dispatch_admission, result_page],
+    )
 }
 
 pub(crate) fn receipt_identity(

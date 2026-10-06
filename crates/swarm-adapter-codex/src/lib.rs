@@ -12,6 +12,7 @@ use std::{
     time::Duration,
 };
 
+use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -20,8 +21,9 @@ use swarm_client::{IpcConfig, ModuleLink};
 use swarm_contracts::{
     module_contract::ModuleContractClaim,
     runtime::{
-        EffectOutcome, ModuleReceiptIdentity, RuntimeCommand, RuntimeOutcome,
-        TaskDispatchAdmissionReceipt, TaskDispatchContext,
+        EffectOutcome, ModuleReceiptIdentity, NormalizedResultOriginContext,
+        NormalizedResultPageSource, RuntimeCommand, RuntimeOutcome, TaskDispatchAdmissionReceipt,
+        TaskDispatchContext,
     },
 };
 use tokio::{net::TcpStream, time::timeout};
@@ -33,11 +35,13 @@ use url::Url;
 use uuid::Uuid;
 
 pub const ARTIFACT_ID: &str = "codex-rust-controller.1";
-pub const ARTIFACT_VERSION: &str = "3";
+pub const ARTIFACT_VERSION: &str = "4";
 pub const MODULE_ID: &str = "codex";
 const MAX_FRAME_BYTES: usize = 1_048_576;
 const MAX_HISTORY_PAGES: usize = 100;
 const PAGE_SIZE: u64 = 100;
+const MAX_NORMALIZED_RESULT_PAGE_BYTES: usize = 24 * 1024;
+const MAX_NORMALIZED_RESULT_BODY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CHECKPOINT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_LIVE_OPERATION_COUNT: usize = 256;
 const MAX_LIVE_OPERATION_BYTES: usize = 2 * 1024 * 1024;
@@ -156,6 +160,10 @@ struct OperationRecord {
     native_input_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     dispatch_admission: Option<TaskDispatchAdmissionReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_result_page: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    result_page_acknowledgement: Option<ResultPageAcknowledgement>,
     outcome: Option<Value>,
 }
 
@@ -182,6 +190,8 @@ impl OperationRecord {
             returned_turn_status: None,
             native_input_id: None,
             dispatch_admission: None,
+            pending_result_page: None,
+            result_page_acknowledgement: None,
             outcome: None,
         }
     }
@@ -208,8 +218,78 @@ impl OperationRecord {
             returned_turn_status: None,
             native_input_id: None,
             dispatch_admission: None,
+            pending_result_page: None,
+            result_page_acknowledgement: None,
             outcome: Some(outcome),
         }
+    }
+
+    fn compacted_result_page(
+        method: String,
+        kind: String,
+        input_sha256: String,
+        acknowledgement: ResultPageAcknowledgement,
+    ) -> Self {
+        Self {
+            method,
+            kind,
+            state: "terminal_acknowledged_compacted".into(),
+            input_sha256: Some(input_sha256),
+            native_request_failure_code: None,
+            native_rpc_error_code: None,
+            native_root_id: None,
+            native_scope_key: None,
+            requested_model_provider: None,
+            requested_model: None,
+            workspace_root: None,
+            client_user_message_id: None,
+            prompt_sha256: None,
+            prompt_bytes: None,
+            delivery: None,
+            expected_turn_id: None,
+            returned_turn_id: None,
+            returned_turn_status: None,
+            native_input_id: None,
+            dispatch_admission: None,
+            pending_result_page: None,
+            result_page_acknowledgement: Some(acknowledgement),
+            outcome: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResultPageAcknowledgement {
+    input_sha256: String,
+    artifact_ref: String,
+    source: NormalizedResultPageSource,
+    offset_bytes: u64,
+    byte_length: u64,
+    total_bytes: u64,
+    page_sha256: String,
+}
+
+impl ResultPageAcknowledgement {
+    fn validate(&self, operation_id: &str) -> Result<(), AdapterError> {
+        let end = self
+            .offset_bytes
+            .checked_add(self.byte_length)
+            .ok_or(AdapterError::Checkpoint)?;
+        if !valid_sha256(&self.input_sha256)
+            || self.artifact_ref.trim().is_empty()
+            || self.artifact_ref.len() > MAX_OPERATION_ID_BYTES
+            || self.source.validate().is_err()
+            || self.source.result_operation_id != operation_id
+            || self.source.result_input_sha256 != self.input_sha256
+            || !valid_sha256(&self.page_sha256)
+            || self.total_bytes != self.source.payload_bytes
+            || end > self.total_bytes
+            || self.byte_length > MAX_NORMALIZED_RESULT_PAGE_BYTES as u64
+        {
+            return Err(AdapterError::Checkpoint);
+        }
+        Ok(())
     }
 }
 
@@ -220,7 +300,10 @@ struct OperationTombstone {
     operation_id: String,
     method: String,
     kind: String,
-    outcome: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    outcome: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    result_page_acknowledgement: Option<ResultPageAcknowledgement>,
 }
 
 /// A write-ahead full-snapshot journal. A torn latest record makes startup
@@ -474,12 +557,24 @@ impl Journal {
         let Some(tombstone) = self.read_operation_tombstone(operation_id)? else {
             return Ok(None);
         };
-        let input_sha256 = receipt_identity_from_value(&tombstone.outcome)?.input_sha256;
-        Ok(Some(OperationRecord::compacted(
+        if let Some(outcome) = tombstone.outcome {
+            let input_sha256 = receipt_identity_from_value(&outcome)?.input_sha256;
+            return Ok(Some(OperationRecord::compacted(
+                tombstone.method,
+                tombstone.kind,
+                outcome,
+                input_sha256,
+            )));
+        }
+        let acknowledgement = tombstone
+            .result_page_acknowledgement
+            .ok_or(AdapterError::Checkpoint)?;
+        acknowledgement.validate(operation_id)?;
+        Ok(Some(OperationRecord::compacted_result_page(
             tombstone.method,
             tombstone.kind,
-            tombstone.outcome,
-            input_sha256,
+            acknowledgement.input_sha256.clone(),
+            acknowledgement,
         )))
     }
 
@@ -529,18 +624,30 @@ impl Journal {
         {
             return Err(AdapterError::Checkpoint);
         }
-        let outcome: RuntimeOutcome = serde_json::from_value(tombstone.outcome.clone())
-            .map_err(|_| AdapterError::Checkpoint)?;
-        let receipt = receipt_identity_from_outcome(&outcome)?;
         if operation_id.len() > MAX_OPERATION_ID_BYTES
-            || outcome.operation_id != operation_id
-            || receipt.operation_id != operation_id
-            || !matches!(
-                outcome.outcome,
-                EffectOutcome::Applied | EffectOutcome::Rejected
-            )
+            || tombstone.outcome.is_some() == tombstone.result_page_acknowledgement.is_some()
         {
             return Err(AdapterError::Checkpoint);
+        }
+        if let Some(encoded) = tombstone.outcome.as_ref() {
+            let outcome: RuntimeOutcome =
+                serde_json::from_value(encoded.clone()).map_err(|_| AdapterError::Checkpoint)?;
+            let receipt = receipt_identity_from_outcome(&outcome)?;
+            if outcome.operation_id != operation_id
+                || receipt.operation_id != operation_id
+                || !matches!(
+                    outcome.outcome,
+                    EffectOutcome::Applied | EffectOutcome::Rejected
+                )
+                || tombstone.result_page_acknowledgement.is_some()
+            {
+                return Err(AdapterError::Checkpoint);
+            }
+        } else if let Some(acknowledgement) = tombstone.result_page_acknowledgement.as_ref() {
+            acknowledgement.validate(operation_id)?;
+            if tombstone.method != "agent.result" || tombstone.kind != "result_page" {
+                return Err(AdapterError::Checkpoint);
+            }
         }
         Ok(Some(tombstone))
     }
@@ -568,13 +675,33 @@ impl Journal {
         if record.input_sha256.as_deref() != Some(receipt.input_sha256.as_str()) {
             return Err(AdapterError::Checkpoint);
         }
-        if let Some(existing) = self.read_operation_tombstone(operation_id)? {
-            if existing.method == record.method
-                && existing.kind == record.kind
-                && existing.outcome == outcome
-            {
-                return Ok(());
-            }
+        let tombstone = OperationTombstone {
+            version: 1,
+            operation_id: operation_id.to_owned(),
+            method: record.method.clone(),
+            kind: record.kind.clone(),
+            outcome: Some(outcome),
+            result_page_acknowledgement: None,
+        };
+        self.write_operation_tombstone_value(operation_id, &tombstone)
+    }
+
+    fn write_result_page_tombstone(
+        &self,
+        operation_id: &str,
+        record: &OperationRecord,
+    ) -> Result<(), AdapterError> {
+        let acknowledgement = record
+            .result_page_acknowledgement
+            .clone()
+            .ok_or(AdapterError::Checkpoint)?;
+        acknowledgement.validate(operation_id)?;
+        if record.method != "agent.result"
+            || record.kind != "result_page"
+            || record.pending_result_page.is_some()
+            || record.outcome.is_some()
+            || record.input_sha256.as_deref() != Some(acknowledgement.input_sha256.as_str())
+        {
             return Err(AdapterError::Checkpoint);
         }
         let tombstone = OperationTombstone {
@@ -582,9 +709,32 @@ impl Journal {
             operation_id: operation_id.to_owned(),
             method: record.method.clone(),
             kind: record.kind.clone(),
-            outcome,
+            outcome: None,
+            result_page_acknowledgement: Some(acknowledgement),
         };
-        let bytes = serde_json::to_vec(&tombstone).map_err(|_| AdapterError::Checkpoint)?;
+        self.write_operation_tombstone_value(operation_id, &tombstone)
+    }
+
+    fn write_operation_tombstone_value(
+        &self,
+        operation_id: &str,
+        tombstone: &OperationTombstone,
+    ) -> Result<(), AdapterError> {
+        if operation_id.len() > MAX_OPERATION_ID_BYTES {
+            return Err(AdapterError::Checkpoint);
+        }
+        if let Some(existing) = self.read_operation_tombstone(operation_id)? {
+            return if existing.method == tombstone.method
+                && existing.kind == tombstone.kind
+                && existing.outcome == tombstone.outcome
+                && existing.result_page_acknowledgement == tombstone.result_page_acknowledgement
+            {
+                Ok(())
+            } else {
+                Err(AdapterError::Checkpoint)
+            };
+        }
+        let bytes = serde_json::to_vec(tombstone).map_err(|_| AdapterError::Checkpoint)?;
         if bytes.len() as u64 > MAX_OPERATION_ACK_BYTES {
             return Err(AdapterError::Checkpoint);
         }
@@ -609,9 +759,11 @@ impl Journal {
             if self
                 .read_operation_tombstone(operation_id)?
                 .is_some_and(|existing| {
-                    existing.method == record.method
-                        && existing.kind == record.kind
+                    existing.method == tombstone.method
+                        && existing.kind == tombstone.kind
                         && existing.outcome == tombstone.outcome
+                        && existing.result_page_acknowledgement
+                            == tombstone.result_page_acknowledgement
                 })
             {
                 return Ok(());
@@ -647,9 +799,27 @@ impl Journal {
                 if tombstone.method != record.method || tombstone.kind != record.kind {
                     return Err(AdapterError::Checkpoint);
                 }
-                if record.outcome.as_ref() != Some(&tombstone.outcome) {
+                let matches = match (
+                    tombstone.outcome.as_ref(),
+                    tombstone.result_page_acknowledgement.as_ref(),
+                ) {
+                    (Some(outcome), None) => record.outcome.as_ref() == Some(outcome),
+                    (None, Some(acknowledgement)) => {
+                        record.outcome.is_none()
+                            && record.pending_result_page.is_none()
+                            && record.result_page_acknowledgement.as_ref() == Some(acknowledgement)
+                    }
+                    _ => false,
+                };
+                if !matches {
                     return Err(AdapterError::Checkpoint);
                 }
+                compact.push(operation_id);
+            } else if record.result_page_acknowledgement.is_some()
+                && record.pending_result_page.is_none()
+                && record.outcome.is_none()
+            {
+                self.write_result_page_tombstone(&operation_id, &record)?;
                 compact.push(operation_id);
             } else if self.state.acknowledged_outcomes.contains(&operation_id)
                 && is_terminal_record(&record, &operation_id)?
@@ -741,29 +911,35 @@ impl Journal {
         }
         let input_sha256 = receipt.input_sha256;
         let encoded = serde_json::to_value(outcome).map_err(|_| AdapterError::Checkpoint)?;
+        let dispatch_admission = outcome
+            .details
+            .get("dispatch_admission")
+            .filter(|value| !value.is_null())
+            .map(|value| {
+                let admission: TaskDispatchAdmissionReceipt =
+                    serde_json::from_value(value.clone()).map_err(|_| AdapterError::Checkpoint)?;
+                admission.validate().map_err(|_| AdapterError::Checkpoint)?;
+                if admission.operation_id != operation_id
+                    || admission.binding_id != receipt.binding_id
+                    || admission.binding_generation != receipt.binding_generation
+                    || admission.module_receipt != receipt
+                    || admission.native_input_id != outcome.native_input_id
+                {
+                    return Err(AdapterError::Checkpoint);
+                }
+                Ok(admission)
+            })
+            .transpose()?;
         if let Some(tombstone) = self.read_operation_tombstone(&operation_id)? {
             return if tombstone.method == method
                 && tombstone.kind == kind
-                && tombstone.outcome == encoded
+                && tombstone.outcome.as_ref() == Some(&encoded)
             {
                 Ok(())
             } else {
                 Err(AdapterError::Checkpoint)
             };
         }
-        if self
-            .state
-            .operations
-            .get(&operation_id)
-            .and_then(|record| record.outcome.as_ref())
-            == Some(&encoded)
-        {
-            return Ok(());
-        }
-        // Reconciliation may upgrade a previously acknowledged Unknown result
-        // after later native history evidence. The new bytes need a fresh host
-        // acknowledgment even though the operation ID stays stable.
-        self.state.acknowledged_outcomes.remove(&operation_id);
         if let Some(record) = self.state.operations.get_mut(&operation_id) {
             if record.method != method
                 || record.kind != kind
@@ -774,12 +950,30 @@ impl Journal {
             {
                 return Err(AdapterError::Checkpoint);
             }
+            let admission_changed = if let Some(admission) = dispatch_admission.as_ref() {
+                reconcile_dispatch_admission(record, admission)?
+            } else {
+                false
+            };
+            if record.outcome.as_ref() == Some(&encoded) {
+                return if admission_changed {
+                    self.save()
+                } else {
+                    Ok(())
+                };
+            }
+            // Reconciliation may upgrade a previously acknowledged Unknown
+            // result after later native history evidence. New bytes need a
+            // fresh host acknowledgment under the same operation ID.
+            self.state.acknowledged_outcomes.remove(&operation_id);
             record.input_sha256 = Some(input_sha256);
             record.state = "reported_pending".into();
             record.outcome = Some(encoded);
         } else {
+            self.state.acknowledged_outcomes.remove(&operation_id);
             let mut record = OperationRecord::intent(method, kind);
             record.input_sha256 = Some(input_sha256);
+            record.dispatch_admission = dispatch_admission;
             record.state = "reported_pending".into();
             record.outcome = Some(encoded);
             self.state.operations.insert(operation_id.clone(), record);
@@ -800,6 +994,136 @@ impl Journal {
                 serde_json::from_value(value.clone()).map_err(|_| AdapterError::Checkpoint)
             })
             .collect()
+    }
+
+    fn store_result_page(
+        &mut self,
+        operation_id: &str,
+        input_sha256: &str,
+        params: Value,
+    ) -> Result<(), AdapterError> {
+        let acknowledgement =
+            result_page_acknowledgement(&params, operation_id, input_sha256, None)?;
+        if let Some(tombstone) = self.read_operation_tombstone(operation_id)? {
+            return if tombstone.method == "agent.result"
+                && tombstone.kind == "result_page"
+                && tombstone
+                    .result_page_acknowledgement
+                    .as_ref()
+                    .is_some_and(|saved| {
+                        saved.input_sha256 == acknowledgement.input_sha256
+                            && saved.source == acknowledgement.source
+                            && saved.offset_bytes == acknowledgement.offset_bytes
+                            && saved.byte_length == acknowledgement.byte_length
+                            && saved.total_bytes == acknowledgement.total_bytes
+                            && saved.page_sha256 == acknowledgement.page_sha256
+                    })
+            {
+                Ok(())
+            } else {
+                Err(AdapterError::Checkpoint)
+            };
+        }
+        if let Some(record) = self.state.operations.get_mut(operation_id) {
+            if record.method != "agent.result"
+                || record.kind != "result_page"
+                || record.input_sha256.as_deref() != Some(input_sha256)
+                || record.outcome.is_some()
+            {
+                return Err(AdapterError::Checkpoint);
+            }
+            if let Some(saved) = record.pending_result_page.as_ref() {
+                return if saved == &params {
+                    Ok(())
+                } else {
+                    Err(AdapterError::Checkpoint)
+                };
+            }
+            if record.result_page_acknowledgement.as_ref() == Some(&acknowledgement) {
+                return Ok(());
+            }
+            record.pending_result_page = Some(params);
+            record.result_page_acknowledgement = None;
+            record.state = "result_page_pending".into();
+        } else {
+            let mut record = OperationRecord::intent("agent.result", "result_page");
+            record.input_sha256 = Some(input_sha256.to_owned());
+            record.pending_result_page = Some(params);
+            record.state = "result_page_pending".into();
+            self.state
+                .operations
+                .insert(operation_id.to_owned(), record);
+        }
+        self.save()
+    }
+
+    fn pending_result_pages(&self) -> Vec<(String, Value)> {
+        self.state
+            .operations
+            .iter()
+            .filter_map(|(operation_id, record)| {
+                record
+                    .pending_result_page
+                    .as_ref()
+                    .map(|params| (operation_id.clone(), params.clone()))
+            })
+            .take(MAX_PENDING_OUTCOMES_PER_BATCH)
+            .collect()
+    }
+
+    fn acknowledge_result_page(
+        &mut self,
+        operation_id: &str,
+        response: &Value,
+    ) -> Result<(), AdapterError> {
+        let Some(record) = self.state.operations.get(operation_id).cloned() else {
+            return if self
+                .read_operation_tombstone(operation_id)?
+                .is_some_and(|tombstone| tombstone.result_page_acknowledgement.is_some())
+            {
+                Ok(())
+            } else {
+                Err(AdapterError::Checkpoint)
+            };
+        };
+        let params = record
+            .pending_result_page
+            .as_ref()
+            .ok_or(AdapterError::Checkpoint)?;
+        let input_sha256 = record
+            .input_sha256
+            .as_deref()
+            .ok_or(AdapterError::Checkpoint)?;
+        if response["recorded"] != true {
+            return Err(AdapterError::HostProtocol);
+        }
+        let artifact_ref = response["artifact_ref"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or(AdapterError::HostProtocol)?;
+        let mut acknowledgement =
+            result_page_acknowledgement(params, operation_id, input_sha256, Some(artifact_ref))?;
+        acknowledgement.validate(operation_id)?;
+        let current = self
+            .state
+            .operations
+            .get_mut(operation_id)
+            .ok_or(AdapterError::Checkpoint)?;
+        current.pending_result_page = None;
+        current.result_page_acknowledgement = Some(acknowledgement);
+        current.state = "result_page_acknowledged".into();
+        self.save()?;
+
+        let record = self
+            .state
+            .operations
+            .get(operation_id)
+            .cloned()
+            .ok_or(AdapterError::Checkpoint)?;
+        self.write_result_page_tombstone(operation_id, &record)?;
+        self.state.operations.remove(operation_id);
+        self.state.acknowledged_outcomes.remove(operation_id);
+        self.save()
     }
 
     fn acknowledge_outcome(&mut self, operation_id: &str) -> Result<(), AdapterError> {
@@ -828,7 +1152,11 @@ impl Journal {
         self.save()
     }
 
-    fn next_observation(&mut self, ready: bool) -> Result<Value, AdapterError> {
+    fn next_observation(
+        &mut self,
+        ready: bool,
+        normalized_results: bool,
+    ) -> Result<Value, AdapterError> {
         if let Some(pending) = &self.state.pending_observation {
             return Ok(pending.clone());
         }
@@ -837,6 +1165,28 @@ impl Journal {
             .observe_sequence
             .checked_add(1)
             .ok_or(AdapterError::Checkpoint)?;
+        let mut supported = vec![
+            "agent.open",
+            "task.dispatch",
+            "agent.send",
+            "agent.reconcile",
+        ];
+        let mut unsupported = vec![
+            "agent.recover",
+            "agent.refresh",
+            "agent.result",
+            "agent.reply",
+            "agent.configure",
+            "agent.goal",
+            "agent.background",
+            "tools",
+            "family_enumeration",
+            "task_completion",
+        ];
+        if normalized_results {
+            supported.push("agent.result");
+            unsupported.retain(|capability| *capability != "agent.result");
+        }
         let state = json!({
             "module_artifact_id": ARTIFACT_ID,
             "boot_id": self.state.boot_id.as_str(),
@@ -855,8 +1205,8 @@ impl Journal {
                 "served_model_status": "unknown",
                 "billing_status": "unknown",
                 "capabilities": {
-                    "supported": ["agent.open", "task.dispatch", "agent.send", "agent.reconcile"],
-                    "unsupported": ["agent.recover", "agent.refresh", "agent.result", "agent.reply", "agent.configure", "agent.goal", "agent.background", "tools", "family_enumeration", "task_completion"]
+                    "supported": supported,
+                    "unsupported": unsupported
                 }
             }
         });
@@ -1299,6 +1649,18 @@ enum TurnRead {
     Failed(NativeError),
 }
 
+struct AssistantResponse {
+    item_id: String,
+    text: String,
+}
+
+enum AssistantRead {
+    Found(AssistantResponse),
+    Missing,
+    Truncated,
+    Failed(NativeError),
+}
+
 impl NativeClient {
     async fn read_thread(&mut self, thread_id: &str) -> Result<Value, NativeError> {
         self.request(
@@ -1428,6 +1790,87 @@ impl NativeClient {
         TurnRead::Truncated
     }
 
+    async fn read_final_assistant_response(
+        &mut self,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> AssistantRead {
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = HashSet::new();
+        let mut seen_item_ids = HashSet::new();
+        let mut last_final = None;
+        let mut last_phase_less = None;
+        for _ in 0..MAX_HISTORY_PAGES {
+            let mut params = json!({
+                "threadId":thread_id,
+                "turnId":turn_id,
+                "limit":PAGE_SIZE,
+                "sortDirection":"asc",
+            });
+            if let Some(value) = cursor.as_ref() {
+                params["cursor"] = json!(value);
+            }
+            let response = match self.request("thread/items/list", params).await {
+                Ok(response) => response,
+                Err(error) => return AssistantRead::Failed(error),
+            };
+            let Some(data) = response.get("data").and_then(Value::as_array) else {
+                return AssistantRead::Failed(NativeError::Protocol);
+            };
+            for entry in data {
+                if entry["turnId"].as_str() != Some(turn_id) {
+                    return AssistantRead::Failed(NativeError::Protocol);
+                }
+                let item = &entry["item"];
+                if item["type"] != "agentMessage" {
+                    continue;
+                }
+                let Some(item_id) = item["id"].as_str().filter(|value| !value.is_empty()) else {
+                    return AssistantRead::Failed(NativeError::Protocol);
+                };
+                if !seen_item_ids.insert(item_id.to_owned()) {
+                    return AssistantRead::Failed(NativeError::Protocol);
+                }
+                let Some(text) = item["text"].as_str() else {
+                    return AssistantRead::Failed(NativeError::Protocol);
+                };
+                if text.len() > MAX_NORMALIZED_RESULT_BODY_BYTES {
+                    return AssistantRead::Truncated;
+                }
+                let selected = AssistantResponse {
+                    item_id: item_id.to_owned(),
+                    text: text.to_owned(),
+                };
+                match item.get("phase") {
+                    Some(Value::String(phase)) if phase == "final_answer" => {
+                        last_final = Some(selected);
+                    }
+                    Some(Value::String(phase)) if phase == "commentary" => {}
+                    None | Some(Value::Null) => last_phase_less = Some(selected),
+                    Some(_) => return AssistantRead::Failed(NativeError::Protocol),
+                }
+            }
+            match response.get("nextCursor") {
+                None | Some(Value::Null) => {
+                    return last_final
+                        .or(last_phase_less)
+                        .map_or(AssistantRead::Missing, AssistantRead::Found);
+                }
+                Some(Value::String(next)) if next.is_empty() => {
+                    return last_final
+                        .or(last_phase_less)
+                        .map_or(AssistantRead::Missing, AssistantRead::Found);
+                }
+                Some(Value::String(next)) if !seen_cursors.insert(next.clone()) => {
+                    return AssistantRead::Truncated;
+                }
+                Some(Value::String(next)) => cursor = Some(next.clone()),
+                Some(_) => return AssistantRead::Failed(NativeError::Protocol),
+            }
+        }
+        AssistantRead::Truncated
+    }
+
     async fn active_turns(
         &mut self,
         thread_id: &str,
@@ -1464,6 +1907,127 @@ fn digest_hex(bytes: &[u8]) -> String {
         let _ = write!(output, "{byte:02x}");
     }
     output
+}
+
+fn canonical_json(value: &Value) -> Result<String, AdapterError> {
+    fn ordered(value: &Value) -> Value {
+        match value {
+            Value::Object(map) => {
+                let sorted: BTreeMap<_, _> = map
+                    .iter()
+                    .map(|(key, value)| (key.clone(), ordered(value)))
+                    .collect();
+                Value::Object(sorted.into_iter().collect())
+            }
+            Value::Array(values) => Value::Array(values.iter().map(ordered).collect()),
+            value => value.clone(),
+        }
+    }
+    serde_json::to_string(&ordered(value)).map_err(|_| AdapterError::HostProtocol)
+}
+
+fn result_page_acknowledgement(
+    params: &Value,
+    operation_id: &str,
+    input_sha256: &str,
+    artifact_ref: Option<&str>,
+) -> Result<ResultPageAcknowledgement, AdapterError> {
+    if params["operation_id"] != operation_id || !valid_sha256(input_sha256) {
+        return Err(AdapterError::HostProtocol);
+    }
+    let page = &params["page"];
+    let source: NormalizedResultPageSource =
+        serde_json::from_value(page["source"].clone()).map_err(|_| AdapterError::HostProtocol)?;
+    source.validate().map_err(|_| AdapterError::HostProtocol)?;
+    let offset_bytes = page["offset_bytes"]
+        .as_u64()
+        .ok_or(AdapterError::HostProtocol)?;
+    let byte_length = page["byte_length"]
+        .as_u64()
+        .ok_or(AdapterError::HostProtocol)?;
+    let total_bytes = page["total_bytes"]
+        .as_u64()
+        .ok_or(AdapterError::HostProtocol)?;
+    let page_sha256 = page["page_sha256"]
+        .as_str()
+        .filter(|digest| valid_sha256(digest))
+        .ok_or(AdapterError::HostProtocol)?;
+    let encoded = page["content_base64"]
+        .as_str()
+        .ok_or(AdapterError::HostProtocol)?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| AdapterError::HostProtocol)?;
+    let end = offset_bytes
+        .checked_add(byte_length)
+        .ok_or(AdapterError::HostProtocol)?;
+    let expected_media_type = "text/plain; charset=utf-8";
+    if source.schema_id != swarm_contracts::module_contract::NORMALIZED_RESULT_PAGE_SCHEMA_ID
+        || source.result_operation_id != operation_id
+        || source.result_input_sha256 != input_sha256
+        || source.native_response_identity.is_none()
+        || source.payload_bytes > MAX_NORMALIZED_RESULT_BODY_BYTES as u64
+        || total_bytes != source.payload_bytes
+        || byte_length != bytes.len() as u64
+        || byte_length > MAX_NORMALIZED_RESULT_PAGE_BYTES as u64
+        || end > total_bytes
+        || (byte_length == 0 && offset_bytes < total_bytes)
+        || page["eof"] != (end == total_bytes)
+        || page["media_type"] != expected_media_type
+        || digest_hex(&bytes) != page_sha256
+        || (offset_bytes == 0 && end == total_bytes && source.payload_sha256 != page_sha256)
+    {
+        return Err(AdapterError::HostProtocol);
+    }
+    let acknowledgement = ResultPageAcknowledgement {
+        input_sha256: input_sha256.to_owned(),
+        artifact_ref: artifact_ref.unwrap_or_default().to_owned(),
+        source,
+        offset_bytes,
+        byte_length,
+        total_bytes,
+        page_sha256: page_sha256.to_owned(),
+    };
+    if let Some(artifact_ref) = artifact_ref {
+        if artifact_ref.trim().is_empty() || artifact_ref.len() > MAX_OPERATION_ID_BYTES {
+            return Err(AdapterError::HostProtocol);
+        }
+        acknowledgement.validate(operation_id)?;
+    }
+    Ok(acknowledgement)
+}
+
+fn reconcile_dispatch_admission(
+    record: &mut OperationRecord,
+    admission: &TaskDispatchAdmissionReceipt,
+) -> Result<bool, AdapterError> {
+    if record.method != "task.dispatch" || admission.operation_id.is_empty() {
+        return Err(AdapterError::Checkpoint);
+    }
+    let Some(previous) = record.dispatch_admission.as_ref() else {
+        record.dispatch_admission = Some(admission.clone());
+        return Ok(true);
+    };
+    let mut same_except_native_id = previous.clone();
+    same_except_native_id.native_input_id = admission.native_input_id.clone();
+    if same_except_native_id != *admission {
+        return Err(AdapterError::Checkpoint);
+    }
+    if previous.native_input_id == admission.native_input_id {
+        return Ok(false);
+    }
+    let provisional_id = record.client_user_message_id.as_deref();
+    let new_native_id = admission.native_input_id.as_deref();
+    if new_native_id.is_none_or(str::is_empty)
+        || previous
+            .native_input_id
+            .as_deref()
+            .is_some_and(|saved| Some(saved) != provisional_id)
+    {
+        return Err(AdapterError::Checkpoint);
+    }
+    record.dispatch_admission = Some(admission.clone());
+    Ok(true)
 }
 
 fn normalize_path(value: &str) -> Option<String> {
@@ -1559,18 +2123,13 @@ fn normalized_dispatch_admission(
     boot_id: &str,
     payload: &Value,
 ) -> Result<Option<TaskDispatchAdmissionReceipt>, AdapterError> {
-    if command.method != "task.dispatch"
-        || !module_contract::normalized_dispatch_enabled(claim)
-    {
+    if command.method != "task.dispatch" || !module_contract::normalized_dispatch_enabled(claim) {
         return Ok(None);
     }
-    let context: TaskDispatchContext = serde_json::from_value(
-        command.input["task_dispatch_context"].clone(),
-    )
-    .map_err(|_| AdapterError::HostProtocol)?;
-    context
-        .validate()
-        .map_err(|_| AdapterError::HostProtocol)?;
+    let context: TaskDispatchContext =
+        serde_json::from_value(command.input["task_dispatch_context"].clone())
+            .map_err(|_| AdapterError::HostProtocol)?;
+    context.validate().map_err(|_| AdapterError::HostProtocol)?;
     if context.operation_id != command.operation_id
         || context.binding_id != command.binding_id
         || context.binding_generation != command.generation
@@ -1617,9 +2176,7 @@ fn normalized_dispatch_admission(
         native_payload_bytes: native_payload.len() as u64,
         native_input_id: Some(command.operation_id.clone()),
     };
-    receipt
-        .validate()
-        .map_err(|_| AdapterError::HostProtocol)?;
+    receipt.validate().map_err(|_| AdapterError::HostProtocol)?;
     Ok(Some(receipt))
 }
 
@@ -1768,9 +2325,7 @@ fn validate_saved_dispatch_admission(
     claim: &ModuleContractClaim,
     boot_id: &str,
 ) -> Result<(), AdapterError> {
-    if command.method != "task.dispatch"
-        || !module_contract::normalized_dispatch_enabled(claim)
-    {
+    if command.method != "task.dispatch" || !module_contract::normalized_dispatch_enabled(claim) {
         return Ok(());
     }
     let details = outcome
@@ -1782,9 +2337,7 @@ fn validate_saved_dispatch_admission(
         .map(|value| {
             let receipt: TaskDispatchAdmissionReceipt =
                 serde_json::from_value(value.clone()).map_err(|_| AdapterError::Checkpoint)?;
-            receipt
-                .validate()
-                .map_err(|_| AdapterError::Checkpoint)?;
+            receipt.validate().map_err(|_| AdapterError::Checkpoint)?;
             Ok::<_, AdapterError>(receipt)
         })
         .transpose()?;
@@ -1876,16 +2429,32 @@ fn unknown_send(
     )
 }
 
-fn unknown_send_after_exact_input(
+fn accepted_after_exact_input(
     record: &OperationRecord,
     operation_id: &str,
+    turn_id: &str,
+    native_input_id: &str,
     code: &'static str,
     turn_readback: &'static str,
 ) -> RuntimeOutcome {
-    let mut unresolved = unknown_send(record, operation_id, code);
-    unresolved.details["native_input_readback"] = json!("verified");
-    unresolved.details["native_turn_readback"] = json!(turn_readback);
-    unresolved
+    let mut accepted = unknown_send(record, operation_id, code);
+    accepted.outcome = EffectOutcome::Accepted;
+    accepted.turn_id = Some(turn_id.to_owned());
+    accepted.native_input_id = Some(native_input_id.to_owned());
+    accepted.details["diagnostic_code"] = json!(code);
+    accepted.details["native_input_readback"] = json!("verified");
+    accepted.details["native_turn_readback"] = json!(turn_readback);
+    accepted.details["completion_condition"] = json!("native_input_admitted");
+    accepted.details["execution_complete"] = json!(false);
+    accepted.details["task_completion"] = json!("unknown");
+    accepted.details["disposition"] = json!("admitted");
+    accepted.details["native_replay"] = json!(false);
+    if let Some(admission) = record.dispatch_admission.as_ref() {
+        if let Ok(value) = serde_json::to_value(admission) {
+            accepted.details["dispatch_admission"] = value;
+        }
+    }
+    accepted
 }
 
 async fn reconcile_send(
@@ -1919,19 +2488,29 @@ async fn reconcile_send(
         return unknown_send(record, operation_id, "NATIVE_ITEM_CORRELATION_NOT_UNIQUE");
     }
     let matched = &matches[0];
-    if record
-        .dispatch_admission
-        .as_ref()
-        .and_then(|receipt| receipt.native_input_id.as_deref())
-        != Some(matched.item_id.as_str())
-        && record.dispatch_admission.is_some()
-    {
-        return unknown_send(
-            record,
-            operation_id,
-            "NATIVE_DISPATCH_ADMISSION_ID_MISMATCH",
-        );
+    let mut dispatch_admission = record.dispatch_admission.clone();
+    if let Some(admission) = dispatch_admission.as_mut() {
+        match admission.native_input_id.as_deref() {
+            Some(id) if id == matched.item_id => {}
+            Some(id) if id == client_id => {
+                // `clientUserMessageId` is the request correlation key, while
+                // `item.id` is the durable native input identity. Promote the
+                // provisional key only after the unique exact-content
+                // readback above has linked them.
+                admission.native_input_id = Some(matched.item_id.clone());
+            }
+            None => admission.native_input_id = Some(matched.item_id.clone()),
+            Some(_) => {
+                return unknown_send(
+                    record,
+                    operation_id,
+                    "NATIVE_DISPATCH_ADMISSION_ID_MISMATCH",
+                );
+            }
+        }
     }
+    let mut verified_record = record.clone();
+    verified_record.dispatch_admission = dispatch_admission.clone();
     if digest_hex(matched.text.as_bytes()) != expected_digest
         || matched.text.len() as u64 != expected_bytes
         || record
@@ -1950,25 +2529,31 @@ async fn reconcile_send(
     let turn = match native.read_turn(root, &matched.turn_id).await {
         TurnRead::Found(turn) => turn,
         TurnRead::Missing => {
-            return unknown_send_after_exact_input(
-                record,
+            return accepted_after_exact_input(
+                &verified_record,
                 operation_id,
+                &matched.turn_id,
+                &matched.item_id,
                 "NATIVE_TURN_NOT_OBSERVED",
                 "not_observed",
             );
         }
         TurnRead::Truncated => {
-            return unknown_send_after_exact_input(
-                record,
+            return accepted_after_exact_input(
+                &verified_record,
                 operation_id,
+                &matched.turn_id,
+                &matched.item_id,
                 "NATIVE_TURN_PAGE_LIMIT",
                 "truncated",
             );
         }
         TurnRead::Failed(error) => {
-            let mut unresolved = unknown_send_after_exact_input(
-                record,
+            let mut unresolved = accepted_after_exact_input(
+                &verified_record,
                 operation_id,
+                &matched.turn_id,
+                &matched.item_id,
                 error.diagnostic_code(),
                 "failed",
             );
@@ -1977,17 +2562,21 @@ async fn reconcile_send(
         }
     };
     if turn.get("id").and_then(Value::as_str) != Some(matched.turn_id.as_str()) {
-        return unknown_send_after_exact_input(
-            record,
+        return accepted_after_exact_input(
+            &verified_record,
             operation_id,
+            &matched.turn_id,
+            &matched.item_id,
             "NATIVE_TURN_IDENTITY_MISMATCH",
             "mismatch",
         );
     }
     let Some(turn_status) = turn.get("status").and_then(Value::as_str) else {
-        return unknown_send_after_exact_input(
-            record,
+        return accepted_after_exact_input(
+            &verified_record,
             operation_id,
+            &matched.turn_id,
+            &matched.item_id,
             "NATIVE_TURN_STATUS_UNAVAILABLE",
             "invalid",
         );
@@ -1996,28 +2585,46 @@ async fn reconcile_send(
     let status_is_in_progress = turn_status == "inProgress";
     let status_is_failed = matches!(turn_status, "failed" | "interrupted");
     if !status_is_completed && !status_is_in_progress && !status_is_failed {
-        return unknown_send_after_exact_input(
-            record,
+        return accepted_after_exact_input(
+            &verified_record,
             operation_id,
+            &matched.turn_id,
+            &matched.item_id,
             "NATIVE_TURN_STATUS_UNRECOGNIZED",
             "invalid",
         );
     }
     if !status_is_failed && turn.get("error").is_some_and(|error| !error.is_null()) {
-        return unknown_send_after_exact_input(
-            record,
+        return accepted_after_exact_input(
+            &verified_record,
             operation_id,
+            &matched.turn_id,
+            &matched.item_id,
             "NATIVE_TURN_STATUS_CONTRADICTORY",
             "contradictory",
         );
     }
     let mut details = json!({
         "module_artifact_id": ARTIFACT_ID,
-        "completion_condition": if status_is_completed { "native_turn_completed" } else { "native_input_admitted" },
+        "completion_condition": if status_is_completed {
+            "native_turn_completed"
+        } else if status_is_failed {
+            "native_turn_failed"
+        } else {
+            "native_input_admitted"
+        },
         "native_input_readback": "verified",
         "native_turn_readback": "verified",
         "native_turn_status": turn_status,
         "execution_complete": status_is_completed || status_is_failed,
+        "task_completion": "unknown",
+        "disposition": if status_is_completed {
+            "completed"
+        } else if status_is_failed {
+            "failed"
+        } else {
+            "admitted"
+        },
         "client_user_message_id": client_id,
         "prompt_sha256": expected_digest,
         "prompt_bytes": expected_bytes,
@@ -2035,7 +2642,7 @@ async fn reconcile_send(
         "fallback_used": false,
     });
     if !status_is_failed {
-        if let Some(admission) = record.dispatch_admission.as_ref() {
+        if let Some(admission) = dispatch_admission.as_ref() {
             details["dispatch_admission"] = match serde_json::to_value(admission) {
                 Ok(value) => value,
                 Err(_) => {
@@ -2043,7 +2650,7 @@ async fn reconcile_send(
                         record,
                         operation_id,
                         "DISPATCH_ADMISSION_SERIALIZATION_FAILED",
-                    )
+                    );
                 }
             };
         }
@@ -2635,15 +3242,11 @@ async fn send_operation(
         steer,
         expected_turn.as_deref(),
     );
-    let dispatch_admission = match normalized_dispatch_admission(
-        command,
-        claim,
-        boot_id,
-        &native_payload,
-    ) {
-        Ok(admission) => admission,
-        Err(_) => return rejected(command, "TASK_DISPATCH_CONTEXT_INVALID", &journal.state),
-    };
+    let dispatch_admission =
+        match normalized_dispatch_admission(command, claim, boot_id, &native_payload) {
+            Ok(admission) => admission,
+            Err(_) => return rejected(command, "TASK_DISPATCH_CONTEXT_INVALID", &journal.state),
+        };
     let mut record = OperationRecord::intent(&command.method, "send");
     record.input_sha256 = command.input_sha256.clone();
     record.native_root_id = Some(root.clone());
@@ -2674,10 +3277,7 @@ async fn send_operation(
     }
     let request = if steer {
         native
-            .request(
-                "turn/steer",
-                native_payload.clone(),
-            )
+            .request("turn/steer", native_payload.clone())
             .await
             .map(|response| {
                 (
@@ -2687,10 +3287,7 @@ async fn send_operation(
             })
     } else {
         native
-            .request(
-                "turn/start",
-                native_payload,
-            )
+            .request("turn/start", native_payload)
             .await
             .map(|response| {
                 (
@@ -3049,6 +3646,16 @@ async fn handle_command(
         if record.input_sha256.as_deref() != Some(input_sha256) {
             return Err(AdapterError::Checkpoint);
         }
+        // A saved page or its host-acknowledged tombstone is immutable. Retry
+        // the exact pending bytes through report_pending; never re-read a
+        // possibly changed native transcript for the same result Operation.
+        if record.method == "agent.result"
+            && record.kind == "result_page"
+            && (record.pending_result_page.is_some()
+                || record.result_page_acknowledgement.is_some())
+        {
+            return Ok(Vec::new());
+        }
         if let Some(saved) = &record.outcome {
             let result: RuntimeOutcome =
                 serde_json::from_value(saved.clone()).map_err(|_| AdapterError::Checkpoint)?;
@@ -3089,17 +3696,16 @@ async fn handle_command(
                 vec![result]
             }
             "task.dispatch" | "agent.send" => {
-                let mut result =
-                    send_operation(
-                        &command,
-                        journal,
-                        claim,
-                        boot_id,
-                        endpoint,
-                        token,
-                        credential_unavailable,
-                    )
-                    .await;
+                let mut result = send_operation(
+                    &command,
+                    journal,
+                    claim,
+                    boot_id,
+                    endpoint,
+                    token,
+                    credential_unavailable,
+                )
+                .await;
                 attach_command_receipt(&mut result, &command, claim)?;
                 vec![result]
             }
@@ -3115,6 +3721,28 @@ async fn handle_command(
                 )
                 .await?
             }
+            "agent.result" if module_contract::normalized_result_enabled(claim) => {
+                match build_normalized_result_page(
+                    &command,
+                    journal,
+                    claim,
+                    endpoint,
+                    token,
+                    credential_unavailable,
+                )
+                .await
+                {
+                    Ok(params) => {
+                        journal.store_result_page(&command.operation_id, input_sha256, params)?;
+                        Vec::new()
+                    }
+                    Err(code) => {
+                        let mut failure = rejected(&command, code, &journal.state);
+                        attach_command_receipt(&mut failure, &command, claim)?;
+                        vec![failure]
+                    }
+                }
+            }
             _ => {
                 let mut result = rejected(&command, "CAPABILITY_UNAVAILABLE", &journal.state);
                 result.details["capability"] = json!(command.method);
@@ -3129,6 +3757,7 @@ async fn handle_command(
                 "agent.open" => String::from("open"),
                 "agent.send" | "task.dispatch" => String::from("send"),
                 "agent.reconcile" => String::from("reconcile"),
+                "agent.result" => String::from("result_page"),
                 _ => String::from("receipt"),
             };
             (command.method.clone(), kind)
@@ -3143,6 +3772,395 @@ async fn handle_command(
     Ok(result)
 }
 
+async fn build_normalized_result_page(
+    command: &RuntimeCommand,
+    journal: &Journal,
+    claim: &ModuleContractClaim,
+    endpoint: &str,
+    token: Option<&str>,
+    credential_unavailable: bool,
+) -> Result<Value, &'static str> {
+    if command.method != "agent.result" || !module_contract::normalized_result_enabled(claim) {
+        return Err("CODEX_RESULT_CONTRACT_UNAVAILABLE");
+    }
+    let selector = &command.input["selector"];
+    let selector_object = selector
+        .as_object()
+        .filter(|object| object.len() == 2)
+        .ok_or("CODEX_RESULT_SELECTOR_INVALID")?;
+    if selector_object.get("kind").and_then(Value::as_str) != Some("codex_assistant_result") {
+        return Err("CODEX_RESULT_SELECTOR_UNSUPPORTED");
+    }
+    let target_operation_id = selector_object
+        .get("input_operation_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("CODEX_RESULT_SELECTOR_INVALID")?;
+    let origin: NormalizedResultOriginContext =
+        serde_json::from_value(command.input["normalized_result_origin"].clone())
+            .map_err(|_| "CODEX_RESULT_ORIGIN_INVALID")?;
+    origin
+        .validate()
+        .map_err(|_| "CODEX_RESULT_ORIGIN_INVALID")?;
+    let result_input_sha256 = command
+        .input_sha256
+        .as_deref()
+        .filter(|digest| valid_sha256(digest))
+        .ok_or("CODEX_RESULT_INPUT_DIGEST_INVALID")?;
+    let target_input_sha256 = command
+        .target_input_sha256
+        .as_deref()
+        .filter(|digest| valid_sha256(digest))
+        .ok_or("CODEX_RESULT_TARGET_DIGEST_INVALID")?;
+    let (route_provider, route_model, route_workspace) =
+        validate_route(command).map_err(|_| "CODEX_RESULT_ROUTE_INVALID")?;
+    if command.binding_id != origin.binding_id
+        || command.generation != origin.binding_generation
+        || target_operation_id != origin.target_operation_id
+        || target_input_sha256 != origin.target_input_sha256
+        || journal.state.requested_model_provider.as_deref() != Some(route_provider.as_str())
+        || journal.state.requested_model.as_deref() != Some(route_model.as_str())
+        || journal
+            .state
+            .workspace_root
+            .as_deref()
+            .and_then(normalize_path)
+            != normalize_path(&route_workspace)
+        || digest_hex(
+            canonical_json(selector)
+                .map_err(|_| "CODEX_RESULT_SELECTOR_INVALID")?
+                .as_bytes(),
+        ) != origin.selector_sha256
+    {
+        return Err("CODEX_RESULT_ORIGIN_MISMATCH");
+    }
+
+    let target_record = journal
+        .operation_record(target_operation_id)
+        .map_err(|_| "CODEX_RESULT_TARGET_UNAVAILABLE")?
+        .ok_or("CODEX_RESULT_TARGET_UNAVAILABLE")?;
+    if target_record.method != "task.dispatch"
+        || target_record.kind != "send"
+        || target_record.input_sha256.as_deref() != Some(target_input_sha256)
+    {
+        return Err("CODEX_RESULT_TARGET_MISMATCH");
+    }
+    let encoded_outcome = target_record
+        .outcome
+        .as_ref()
+        .ok_or("CODEX_RESULT_DISPATCH_RECEIPT_UNAVAILABLE")?;
+    let dispatch_outcome: RuntimeOutcome = serde_json::from_value(encoded_outcome.clone())
+        .map_err(|_| "CODEX_RESULT_DISPATCH_RECEIPT_INVALID")?;
+    let target_receipt = receipt_identity_from_outcome(&dispatch_outcome)
+        .map_err(|_| "CODEX_RESULT_DISPATCH_RECEIPT_INVALID")?;
+    let expected_target_receipt = module_contract::receipt_identity(
+        claim,
+        &command.binding_id,
+        command.generation,
+        target_operation_id,
+        target_input_sha256,
+    )
+    .map_err(|_| "CODEX_RESULT_DISPATCH_RECEIPT_INVALID")?;
+    if dispatch_outcome.operation_id != target_operation_id
+        || target_receipt != expected_target_receipt
+        || !matches!(
+            dispatch_outcome.outcome,
+            EffectOutcome::Applied | EffectOutcome::Accepted
+        )
+    {
+        return Err("CODEX_RESULT_DISPATCH_RECEIPT_INVALID");
+    }
+    let completion_condition = dispatch_outcome.details["completion_condition"]
+        .as_str()
+        .ok_or("CODEX_RESULT_DISPATCH_RECEIPT_INVALID")?;
+    let execution_complete = dispatch_outcome.details["execution_complete"]
+        .as_bool()
+        .ok_or("CODEX_RESULT_DISPATCH_RECEIPT_INVALID")?;
+    let task_completion = dispatch_outcome.details["task_completion"]
+        .as_str()
+        .ok_or("CODEX_RESULT_DISPATCH_RECEIPT_INVALID")?;
+    let disposition = dispatch_outcome.details["disposition"]
+        .as_str()
+        .ok_or("CODEX_RESULT_DISPATCH_RECEIPT_INVALID")?;
+    let producer_completed = completion_condition == "native_turn_completed"
+        && execution_complete
+        && task_completion == "unknown"
+        && disposition == "completed"
+        && dispatch_outcome.outcome == EffectOutcome::Applied;
+    let producer_admitted = completion_condition == "native_input_admitted"
+        && !execution_complete
+        && task_completion == "unknown"
+        && disposition == "admitted"
+        && dispatch_outcome.outcome == EffectOutcome::Accepted;
+    let origin_completed = origin.producer.completion_condition == "native_turn_completed"
+        && origin.producer.execution_complete
+        && origin.producer.task_completion == "unknown"
+        && origin.producer.disposition == "completed";
+    let origin_admitted = origin.producer.completion_condition == "native_input_admitted"
+        && !origin.producer.execution_complete
+        && origin.producer.task_completion == "unknown"
+        && origin.producer.disposition == "admitted";
+    let exact_producer_snapshot = origin.producer.completion_condition == completion_condition
+        && origin.producer.execution_complete == execution_complete
+        && origin.producer.task_completion == task_completion
+        && origin.producer.disposition == disposition;
+    // The Store seals producer facts when the result Operation is admitted.
+    // A later reconciliation can monotonically upgrade the target's retained
+    // outcome from input-admitted to turn-completed; it cannot rewrite that
+    // earlier source snapshot.
+    let monotone_completion = origin_admitted && producer_completed;
+    if ((!producer_completed && !producer_admitted)
+        || (!origin_completed && !origin_admitted)
+        || (!exact_producer_snapshot && !monotone_completion))
+        || origin.producer.module_receipt != target_receipt
+    {
+        return Err("CODEX_RESULT_DISPATCH_RECEIPT_MISMATCH");
+    }
+    let admission: TaskDispatchAdmissionReceipt =
+        serde_json::from_value(dispatch_outcome.details["dispatch_admission"].clone())
+            .map_err(|_| "CODEX_RESULT_DISPATCH_ADMISSION_INVALID")?;
+    admission
+        .validate()
+        .map_err(|_| "CODEX_RESULT_DISPATCH_ADMISSION_INVALID")?;
+    let context = admission.context();
+    let native_input_id = origin
+        .producer
+        .native_input_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("CODEX_RESULT_INPUT_ID_UNAVAILABLE")?;
+    let turn_id = dispatch_outcome
+        .turn_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("CODEX_RESULT_TURN_ID_UNAVAILABLE")?;
+    let native_root_id = dispatch_outcome
+        .native_root_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("CODEX_RESULT_THREAD_ID_UNAVAILABLE")?;
+    let native_scope_key = dispatch_outcome
+        .native_scope_key
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("CODEX_RESULT_NATIVE_SCOPE_UNAVAILABLE")?;
+    let native_prompt_sha256 = dispatch_outcome.details["prompt_sha256"]
+        .as_str()
+        .filter(|digest| valid_sha256(digest))
+        .ok_or("CODEX_RESULT_DISPATCH_RECEIPT_INVALID")?;
+    let native_prompt_bytes = dispatch_outcome.details["prompt_bytes"]
+        .as_u64()
+        .ok_or("CODEX_RESULT_DISPATCH_RECEIPT_INVALID")?;
+    if admission.module_receipt != target_receipt
+        || admission.operation_id != target_operation_id
+        || admission.binding_id != command.binding_id
+        || admission.binding_generation != command.generation
+        || admission.worker_boot_id.trim().is_empty()
+        || admission.native_input_id.as_deref() != Some(native_input_id)
+        || dispatch_outcome.native_input_id.as_deref() != Some(native_input_id)
+        || dispatch_outcome.details["client_user_message_id"] != target_operation_id
+        || context.attempt_id != origin.attempt_id
+        || context.task_id != origin.task_id
+        || context.task_revision != origin.task_revision
+        || context.task_snapshot_sha256 != origin.task_snapshot_sha256
+        || context.source_text_sha256 != origin.producer.source_text_sha256
+        || context.source_text_bytes != origin.producer.source_text_bytes
+        || admission.native_payload_sha256 != origin.producer.native_payload_sha256
+        || admission.native_payload_bytes != origin.producer.native_payload_bytes
+        || origin.producer.assignment_id != target_operation_id
+        || origin.producer.dispatch_operation_id != target_operation_id
+        || target_record
+            .client_user_message_id
+            .as_deref()
+            .is_some_and(|id| id != target_operation_id)
+        || target_record
+            .prompt_sha256
+            .as_deref()
+            .is_some_and(|digest| digest != native_prompt_sha256)
+        || target_record
+            .prompt_bytes
+            .is_some_and(|bytes| bytes != native_prompt_bytes)
+        || target_record
+            .returned_turn_id
+            .as_deref()
+            .is_some_and(|saved| saved != turn_id)
+        || target_record
+            .native_root_id
+            .as_deref()
+            .is_some_and(|saved| saved != native_root_id)
+        || target_record
+            .native_scope_key
+            .as_deref()
+            .is_some_and(|saved| saved != native_scope_key)
+        || target_record
+            .workspace_root
+            .as_deref()
+            .and_then(normalize_path)
+            .is_some_and(|saved| {
+                Some(saved)
+                    != journal
+                        .state
+                        .workspace_root
+                        .as_deref()
+                        .and_then(normalize_path)
+            })
+        || dispatch_outcome.details["requested_model_provider"].as_str()
+            != journal.state.requested_model_provider.as_deref()
+        || dispatch_outcome.details["requested_model"].as_str()
+            != journal.state.requested_model.as_deref()
+    {
+        return Err("CODEX_RESULT_DISPATCH_ADMISSION_MISMATCH");
+    }
+
+    if journal.state.native_root_id.as_deref() != Some(native_root_id)
+        || journal.state.native_scope_key.as_deref() != Some(native_scope_key)
+    {
+        return Err("CODEX_RESULT_NATIVE_SCOPE_CHANGED");
+    }
+    let mut native = NativeClient::attach(endpoint, token, credential_unavailable)
+        .await
+        .map_err(|error| error.diagnostic_code())?;
+    if !native.identity_is_known() || native.scope_key() != native_scope_key {
+        return Err("CODEX_RESULT_NATIVE_SCOPE_CHANGED");
+    }
+    let thread = native
+        .read_thread(native_root_id)
+        .await
+        .map_err(|error| error.diagnostic_code())?;
+    let thread = &thread["thread"];
+    if thread["id"].as_str() != Some(native_root_id)
+        || thread["modelProvider"].as_str() != journal.state.requested_model_provider.as_deref()
+        || thread["model"].as_str() != journal.state.requested_model.as_deref()
+        || thread["cwd"].as_str().and_then(normalize_path)
+            != journal
+                .state
+                .workspace_root
+                .as_deref()
+                .and_then(normalize_path)
+    {
+        return Err("CODEX_RESULT_THREAD_CONFIGURATION_MISMATCH");
+    }
+    let history = match native
+        .read_history(native_root_id, target_operation_id)
+        .await
+    {
+        HistoryRead::Complete(matches) => matches,
+        HistoryRead::Truncated => return Err("CODEX_RESULT_HISTORY_TRUNCATED"),
+        HistoryRead::Failed(error) => return Err(error.diagnostic_code()),
+    };
+    if history.len() != 1 {
+        return Err(if history.is_empty() {
+            "CODEX_RESULT_INPUT_NOT_OBSERVED"
+        } else {
+            "CODEX_RESULT_INPUT_NOT_UNIQUE"
+        });
+    }
+    let history = &history[0];
+    if history.item_id != native_input_id
+        || history.turn_id != turn_id
+        || digest_hex(history.text.as_bytes()) != native_prompt_sha256
+        || history.text.len() as u64 != native_prompt_bytes
+    {
+        return Err("CODEX_RESULT_INPUT_IDENTITY_MISMATCH");
+    }
+    let turn = match native.read_turn(native_root_id, turn_id).await {
+        TurnRead::Found(turn) => turn,
+        TurnRead::Missing => return Err("CODEX_RESULT_TURN_NOT_OBSERVED"),
+        TurnRead::Truncated => return Err("CODEX_RESULT_TURN_READBACK_TRUNCATED"),
+        TurnRead::Failed(error) => return Err(error.diagnostic_code()),
+    };
+    if turn["id"].as_str() != Some(turn_id) {
+        return Err("CODEX_RESULT_TURN_IDENTITY_MISMATCH");
+    }
+    match turn["status"].as_str() {
+        Some("completed") if turn.get("error").is_none_or(Value::is_null) => {}
+        Some("completed") => return Err("CODEX_RESULT_TURN_CONTRADICTORY"),
+        Some("failed" | "interrupted") => return Err("CODEX_RESULT_TURN_FAILED"),
+        Some(_) => return Err("CODEX_RESULT_TURN_NOT_COMPLETED"),
+        None => return Err("CODEX_RESULT_TURN_STATUS_UNAVAILABLE"),
+    }
+    let response = match native
+        .read_final_assistant_response(native_root_id, turn_id)
+        .await
+    {
+        AssistantRead::Found(response) => response,
+        AssistantRead::Missing => return Err("CODEX_RESULT_FINAL_RESPONSE_NOT_OBSERVED"),
+        AssistantRead::Truncated => return Err("CODEX_RESULT_RESPONSE_READBACK_TRUNCATED"),
+        AssistantRead::Failed(error) => return Err(error.diagnostic_code()),
+    };
+    let body = response.text.as_bytes();
+    if body.is_empty() {
+        return Err("CODEX_RESULT_FINAL_RESPONSE_EMPTY");
+    }
+    if body.len() > MAX_NORMALIZED_RESULT_BODY_BYTES {
+        return Err("CODEX_RESULT_RESPONSE_TOO_LARGE");
+    }
+    let response_sha256 = digest_hex(body);
+    if let Some(expected) = command
+        .input
+        .get("normalized_result_payload_identity")
+        .filter(|value| value.is_object())
+    {
+        if expected["sha256"].as_str() != Some(response_sha256.as_str())
+            || expected["byte_length"].as_u64() != Some(body.len() as u64)
+            || expected["complete"] == false
+        {
+            return Err("CODEX_RESULT_PAYLOAD_IDENTITY_MISMATCH");
+        }
+    }
+    let offset = command.input["offset_bytes"].as_u64().unwrap_or(0);
+    let requested = command.input["length_bytes"]
+        .as_u64()
+        .unwrap_or(MAX_NORMALIZED_RESULT_PAGE_BYTES as u64)
+        .min(MAX_NORMALIZED_RESULT_PAGE_BYTES as u64);
+    let total = body.len() as u64;
+    if offset > total || (requested == 0 && offset < total) {
+        return Err("CODEX_RESULT_RANGE_INVALID");
+    }
+    let end = offset.checked_add(requested).unwrap_or(u64::MAX).min(total);
+    let start = usize::try_from(offset).map_err(|_| "CODEX_RESULT_RANGE_INVALID")?;
+    let stop = usize::try_from(end).map_err(|_| "CODEX_RESULT_RANGE_INVALID")?;
+    let selected = &body[start..stop];
+    let result_receipt = module_contract::receipt_identity(
+        claim,
+        &command.binding_id,
+        command.generation,
+        &command.operation_id,
+        result_input_sha256,
+    )
+    .map_err(|_| "CODEX_RESULT_RECEIPT_INVALID")?;
+    let source = NormalizedResultPageSource {
+        schema_id: swarm_contracts::module_contract::NORMALIZED_RESULT_PAGE_SCHEMA_ID.to_owned(),
+        schema_version: 1,
+        origin,
+        result_operation_id: command.operation_id.clone(),
+        result_input_sha256: result_input_sha256.to_owned(),
+        result_module_receipt: result_receipt,
+        payload_sha256: response_sha256,
+        payload_bytes: total,
+        native_response_identity: Some(response.item_id),
+        execution_complete: false,
+        task_completion: "unknown".to_owned(),
+        native_replay: false,
+    };
+    source
+        .validate()
+        .map_err(|_| "CODEX_RESULT_SOURCE_INVALID")?;
+    Ok(json!({
+        "operation_id":command.operation_id,
+        "page":{
+            "source":source,
+            "offset_bytes":offset,
+            "byte_length":selected.len(),
+            "total_bytes":total,
+            "eof":end == total,
+            "media_type":"text/plain; charset=utf-8",
+            "content_base64":base64::engine::general_purpose::STANDARD.encode(selected),
+            "page_sha256":digest_hex(selected),
+        }
+    }))
+}
+
 async fn connect_host(
     config: &AdapterConfig,
     context: &module_contract::ModuleRuntimeContext,
@@ -3153,7 +4171,21 @@ async fn connect_host(
         .map_err(|_| AdapterError::Host)
 }
 
-async fn report_pending(host: &mut ModuleLink, journal: &mut Journal) -> Result<(), AdapterError> {
+async fn report_pending(
+    host: &mut ModuleLink,
+    journal: &mut Journal,
+    normalized_results: bool,
+) -> Result<(), AdapterError> {
+    loop {
+        let pages = journal.pending_result_pages();
+        if pages.is_empty() {
+            break;
+        }
+        for (operation_id, params) in pages {
+            let response = host.result(params).await.map_err(|_| AdapterError::Host)?;
+            journal.acknowledge_result_page(&operation_id, &response)?;
+        }
+    }
     loop {
         let batch = journal.pending_outcomes()?;
         if batch.is_empty() {
@@ -3166,7 +4198,7 @@ async fn report_pending(host: &mut ModuleLink, journal: &mut Journal) -> Result<
             journal.acknowledge_outcome(&operation_id)?;
         }
     }
-    let pending = journal.next_observation(false)?;
+    let pending = journal.next_observation(false, normalized_results)?;
     host.observe(pending.clone())
         .await
         .map_err(|_| AdapterError::Host)?;
@@ -3225,7 +4257,8 @@ pub async fn run(config: AdapterConfig) -> Result<(), AdapterError> {
         };
         module_contract::validate_negotiated_hello(&hello_result, &context)?;
         journal.bind(&context.binding_id, context.generation)?;
-        match report_pending(&mut host, &mut journal).await {
+        let normalized_results = module_contract::normalized_result_enabled(&context.claim);
+        match report_pending(&mut host, &mut journal, normalized_results).await {
             Ok(()) => {}
             Err(AdapterError::Host) => {
                 tokio::time::sleep(HOST_RETRY_DELAY).await;
@@ -3262,7 +4295,7 @@ pub async fn run(config: AdapterConfig) -> Result<(), AdapterError> {
                     }
                     journal.acknowledge_outcome(&operation_id)?;
                 }
-                match report_pending(&mut host, &mut journal).await {
+                match report_pending(&mut host, &mut journal, normalized_results).await {
                     Ok(()) => {}
                     Err(AdapterError::Host) => break,
                     Err(error) => return Err(error),

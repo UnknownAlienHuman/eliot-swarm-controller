@@ -298,7 +298,7 @@ pub(super) fn validate_admitted_operation(
         || attempt["binding_generation"] != origin.binding_generation
         || model::digest(model::canonical(&attempt["task_snapshot"])?.as_bytes())
             != origin.task_snapshot_sha256
-        || producer_origin(retained)? != origin.producer
+        || !same_retained_producer_identity(retained, &origin.producer)?
     {
         return Err(Error::new(
             "RESULT_ORIGIN_INVALID",
@@ -612,6 +612,22 @@ fn normalized_page_identity(source: &Value) -> Value {
         fields.remove("result_module_receipt");
         fields.remove("whole_digest_verified");
     }
+    if let Some(producer) = identity
+        .get_mut("origin")
+        .and_then(|origin| origin.get_mut("producer"))
+        .and_then(Value::as_object_mut)
+    {
+        // This is a comparison key only. Persisted per-page sources keep and
+        // validate their exact lifecycle tuple; only cross-page identity omits
+        // these reconciliation-mutable observations.
+        producer.insert(
+            "completion_condition".to_owned(),
+            json!("native_input_admitted"),
+        );
+        producer.insert("execution_complete".to_owned(), json!(false));
+        producer.insert("task_completion".to_owned(), json!("unknown"));
+        producer.insert("disposition".to_owned(), json!("admitted"));
+    }
     identity
 }
 
@@ -631,7 +647,7 @@ fn validate_assembly_origin(
         || operation["result"]["details"]["metadata"]["identity"] != candidate.metadata["identity"]
         || operation["result"]["details"]["metadata"]["sha256"] != candidate.content_digest
         || operation["result"]["details"]["byte_length"] != candidate.byte_length
-        || candidate.metadata["identity"]["source"] != *source_identity
+        || normalized_page_identity(&candidate.metadata["identity"]["source"]) != *source_identity
         || candidate.metadata["identity"]["total_bytes"] != total_bytes
         || candidate.metadata["sha256"] != candidate.content_digest
         || candidate.metadata["byte_length"] != candidate.byte_length
@@ -666,6 +682,43 @@ fn validate_assembly_origin(
         ));
     }
     Ok(())
+}
+
+fn same_retained_producer_identity(
+    retained: &Value,
+    sealed: &NormalizedResultProducerOrigin,
+) -> Result<bool> {
+    let module_receipt: ModuleReceiptIdentity =
+        serde_json::from_value(retained["module_receipt"].clone()).map_err(|_| {
+            Error::new(
+                "RESULT_ORIGIN_INVALID",
+                "retained producer module receipt is malformed",
+            )
+        })?;
+    let native_input_id = match retained.get("native_input_id") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(id)) => Some(id.clone()),
+        _ => {
+            return Err(Error::new(
+                "RESULT_ORIGIN_INVALID",
+                "retained producer native input ID is malformed",
+            ));
+        }
+    };
+    Ok(
+        model::text(retained, "assignment_id")? == sealed.assignment_id
+            && model::text(retained, "dispatch_operation_id")? == sealed.dispatch_operation_id
+            && model::text(retained, "attempt_id")? == sealed.attempt_id
+            && model::text(retained, "task_id")? == sealed.task_id
+            && model::positive(retained, "task_revision")? == sealed.task_revision
+            && model::text(retained, "task_snapshot_sha256")? == sealed.task_snapshot_sha256
+            && model::text(retained, "source_text_sha256")? == sealed.source_text_sha256
+            && retained["source_text_bytes"].as_u64() == Some(sealed.source_text_bytes)
+            && model::text(retained, "native_payload_sha256")? == sealed.native_payload_sha256
+            && retained["native_payload_bytes"].as_u64() == Some(sealed.native_payload_bytes)
+            && native_input_id == sealed.native_input_id
+            && module_receipt == sealed.module_receipt,
+    )
 }
 
 fn check_attempt_scope(attempt: &Value, origin: &NormalizedResultOriginContext) -> Result<()> {

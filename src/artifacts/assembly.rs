@@ -123,11 +123,38 @@ fn identity(page: &ArtifactRecord) -> Result<Value> {
         }))
     }
 }
+
+fn identity_comparison_key(identity: &Value) -> Value {
+    let mut key = identity.clone();
+    if key["source"]["schema_id"]
+        == swarm_contracts::module_contract::NORMALIZED_RESULT_PAGE_SCHEMA_ID
+    {
+        if let Some(producer) = key
+            .get_mut("source")
+            .and_then(|source| source.get_mut("origin"))
+            .and_then(|origin| origin.get_mut("producer"))
+            .and_then(Value::as_object_mut)
+        {
+            // Assembly compares a stable origin while retaining the first
+            // page's exact sealed lifecycle facts in the published identity.
+            producer.insert(
+                "completion_condition".to_owned(),
+                json!("native_input_admitted"),
+            );
+            producer.insert("execution_complete".to_owned(), json!(false));
+            producer.insert("task_completion".to_owned(), json!("unknown"));
+            producer.insert("disposition".to_owned(), json!("admitted"));
+        }
+    }
+    key
+}
+
 fn plan(pages: &[ArtifactRecord]) -> Result<(Value, Vec<ResultPart>, u64)> {
     let first = pages
         .first()
         .ok_or_else(|| Error::invalid("no result pages"))?;
     let source = identity(first)?;
+    let source_identity_key = identity_comparison_key(&source);
     let total = number(&first.metadata, "total_bytes")?;
     let mut offset = 0u64;
     let mut parts = Vec::with_capacity(pages.len());
@@ -135,7 +162,7 @@ fn plan(pages: &[ArtifactRecord]) -> Result<(Value, Vec<ResultPart>, u64)> {
         let end = offset
             .checked_add(page.byte_length)
             .ok_or_else(|| Error::invalid("result length overflow"))?;
-        if identity(page)? != source
+        if identity_comparison_key(&identity(page)?) != source_identity_key
             || number(&page.metadata, "offset_bytes")? != offset
             || number(&page.metadata, "byte_length")? != page.byte_length
             || page.metadata["page_sha256"] != page.content_digest

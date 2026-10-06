@@ -3,7 +3,7 @@
   "module_id": "codex",
   "artifact": {
     "artifact_id": "codex-rust-controller.1",
-    "version": "3",
+    "version": "4",
     "build_id": null
   },
   "launch": {
@@ -36,6 +36,11 @@
       "schema_id": "swarm.task_dispatch_context",
       "version": "1",
       "sha256": null
+    },
+    {
+      "schema_id": "swarm.normalized_result_context",
+      "version": "1",
+      "sha256": null
     }
   ],
   "event_schemas": [
@@ -48,6 +53,11 @@
       "schema_id": "swarm.task_dispatch_admission",
       "version": "1",
       "sha256": null
+    },
+    {
+      "schema_id": "swarm.normalized_result_page",
+      "version": "1",
+      "sha256": null
     }
   ],
   "protocol": {
@@ -57,6 +67,7 @@
   "capabilities": [
     "agent.open",
     "agent.reconcile",
+    "agent.result",
     "agent.send",
     "task.dispatch"
   ],

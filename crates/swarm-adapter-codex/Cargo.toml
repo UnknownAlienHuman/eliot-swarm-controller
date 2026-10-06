@@ -11,6 +11,7 @@ name = "swarm-codex-adapter"
 path = "src/main.rs"
 
 [dependencies]
+base64 = "=0.22.1"
 futures-util = { version = "0.3", features = ["sink"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
