@@ -48,6 +48,13 @@ pub(crate) struct NativeMcpChallenge {
 pub(crate) struct PreparedNativeMcpArm {
     challenge: NativeMcpChallenge,
     expected_plugin_config: Value,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Retained encoded arm route in the prepared native MCP request contract"
+        )
+    )]
     request_path: String,
     request_body: Value,
 }
@@ -336,6 +343,13 @@ pub(crate) fn restore_challenge_metadata(
 /// Verify the observer is already active in the exact location and prepare
 /// the exact expected plugin configuration without arming it. This must run
 /// before the Store records its write-ahead `outcome_unknown` state.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Retained direct plugin-source preflight for the legacy embedded MCP flow"
+    )
+)]
 pub(crate) async fn preflight_arm(
     service: &Service,
     options: &Options,
@@ -387,6 +401,13 @@ pub(crate) fn prepare_arm(
 /// Arm the exact observer which passed the read-only preflight. This sends
 /// the single RPC POST; any transport or acknowledgement error is ambiguous
 /// and must be followed by read-only observation rather than another arm.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Retained one-shot direct arm RPC for the legacy embedded MCP flow"
+    )
+)]
 pub(crate) async fn arm_prepared(
     service: &Service,
     options: &Options,
@@ -496,6 +517,13 @@ fn expected_plugin_config(options: &Options, challenge: &NativeMcpChallenge) -> 
 /// Read the plugin's retained native discovery, session hook and provider
 /// request observations. The result remains non-dispatchable and never claims
 /// that a model consumed the supplied schemas.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Retained direct native MCP readback for the legacy embedded observer flow"
+    )
+)]
 pub(crate) async fn read(
     service: &Service,
     options: &Options,
@@ -609,6 +637,13 @@ struct ArmAck {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Retained pinned location-scoped plugin inventory envelope for direct compatibility reads"
+    )
+)]
 struct LocationEnvelope<T> {
     location: PluginLocation,
     data: T,
@@ -616,6 +651,13 @@ struct LocationEnvelope<T> {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Retained plugin inventory location identity for direct compatibility reads"
+    )
+)]
 struct PluginLocation {
     directory: String,
 }
@@ -836,6 +878,13 @@ pub(crate) fn plugin_entry_path(module_path: &Path) -> Result<PathBuf> {
     Ok(canonical)
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Retained exact-location plugin identity check for legacy direct RPC helpers"
+    )
+)]
 async fn verify_plugin_source(
     service: &Service,
     options: &Options,

@@ -22,6 +22,13 @@ fn frontend_config(config: &Config) -> swarm_mcp::Config {
     }
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Retained host-config adapter for the compatibility facade now implemented by swarm_mcp"
+    )
+)]
 pub(crate) fn profiled_facade(
     config: &Config,
     credential: Credential,

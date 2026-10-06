@@ -23,6 +23,13 @@ use std::{
 
 const PINNED_OPENCODE_VERSION: &str = "2.0.7";
 const MAX_PROFILE_CONFIG_BYTES: u64 = 131_072;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Retained response cap for the pinned OpenCode 2.0.7 MCP inventory schema"
+    )
+)]
 const MAX_MCP_SERVERS: usize = 256;
 const MAX_TEXT_BYTES: usize = 32_768;
 const MAX_EXECUTABLE_BYTES: u64 = 536_870_912;
@@ -34,6 +41,13 @@ pub(crate) struct PreparedMcpInstall {
     assignment: AssignmentContext,
     service_id: String,
     expected_version: String,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Retained private location path for exact prepared-route equality and omitted from identity JSON"
+        )
+    )]
     directory: PathBuf,
     directory_text: String,
     directory_sha256: String,
@@ -79,7 +93,9 @@ impl PreparedMcpInstall {
         service_pid: u32,
     ) -> Result<Value> {
         if !matches!(action, "install" | "observe") {
-            return Err(Error::invalid("prepared MCP install only supports install/observe"));
+            return Err(Error::invalid(
+                "prepared MCP install only supports install/observe",
+            ));
         }
         let list_path = list_route(self)?;
         let install_path = install_route(self)?;
@@ -127,9 +143,9 @@ impl PreparedMcpInstall {
             },
         });
         if action == "observe" {
-            let object = envelope.as_object_mut().ok_or_else(|| {
-                Error::invalid("native MCP command envelope is not an object")
-            })?;
+            let object = envelope
+                .as_object_mut()
+                .ok_or_else(|| Error::invalid("native MCP command envelope is not an object"))?;
             object.remove("precondition");
             object.remove("readback");
         }
@@ -139,6 +155,13 @@ impl PreparedMcpInstall {
 
 /// Runtime status read from the exact OpenCode location after registration.
 /// This reports only that a uniquely named runtime entry is visible.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Retained legacy readback model for the pinned OpenCode registration flow"
+    )
+)]
 pub(crate) struct InstallReadback {
     intent: Value,
     process_id: u32,
@@ -149,6 +172,13 @@ pub(crate) struct InstallReadback {
 }
 
 impl InstallReadback {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Retained serialized projection for the legacy OpenCode install readback schema"
+        )
+    )]
     pub(crate) fn as_value(&self) -> Value {
         json!({
             "schema_version":1,
@@ -351,6 +381,13 @@ pub(crate) fn prepare(
 /// is a conflict: OpenCode 2.0.7 implements this route as add-or-replace and
 /// offers no compare-and-create. The PUT is issued once; any uncertain result
 /// must be recorded by Store and read back, never replayed.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Retained legacy exact-location registration path with precondition and readback"
+    )
+)]
 pub(crate) async fn register(
     service: &Service,
     options: &Options,
@@ -392,6 +429,13 @@ pub(crate) async fn register(
 
 /// Read only the uniquely named entry for a previously prepared intent. This
 /// is the safe recovery path after an unknown PUT result; it never mutates.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Retained read-only recovery after an uncertain legacy registration PUT"
+    )
+)]
 pub(crate) async fn observe(
     service: &Service,
     options: &Options,
@@ -424,6 +468,13 @@ pub(crate) async fn observe(
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Retained pinned OpenCode 2.0.7 location envelope for legacy MCP readback"
+    )
+)]
 struct LocationEnvelope<T> {
     location: LocationRef,
     data: T,
@@ -431,6 +482,13 @@ struct LocationEnvelope<T> {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Retained exact directory identity in the legacy OpenCode location response"
+    )
+)]
 struct LocationRef {
     directory: String,
 }
@@ -453,6 +511,13 @@ struct ScopedStorage {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Retained pinned OpenCode 2.0.7 MCP server entry schema for legacy readback"
+    )
+)]
 struct NativeMcpServer {
     name: String,
     status: NativeMcpStatus,
@@ -462,6 +527,13 @@ struct NativeMcpServer {
 
 #[derive(Deserialize)]
 #[serde(tag = "status", deny_unknown_fields)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Retained pinned OpenCode 2.0.7 MCP server status wire variants"
+    )
+)]
 enum NativeMcpStatus {
     #[serde(rename = "connected")]
     Connected,
@@ -476,6 +548,13 @@ enum NativeMcpStatus {
 }
 
 impl NativeMcpStatus {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Retained status-to-safe-readback projection for the legacy install flow"
+        )
+    )]
     fn readback(self) -> (&'static str, bool) {
         match self {
             Self::Connected => ("connected", false),
@@ -493,6 +572,13 @@ impl NativeMcpStatus {
     }
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Retained bounded exact-location MCP inventory reader for legacy registration recovery"
+    )
+)]
 async fn list_location(
     service: &Service,
     prepared: &PreparedMcpInstall,
@@ -543,6 +629,13 @@ fn validate_options(options: &Options) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Retained service-version and exact-location binding before legacy install effects"
+    )
+)]
 fn validate_prepared_route(
     service: &Service,
     options: &Options,
@@ -594,6 +687,13 @@ fn list_route(prepared: &PreparedMcpInstall) -> Result<String> {
     Ok(format!("{}?{}", url.path(), query))
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Retained no-replay error projection for uncertain legacy OpenCode PUT outcomes"
+    )
+)]
 fn unknown_after_put(message: &str) -> Error {
     Error::new("NATIVE_OUTCOME_UNKNOWN", message)
 }
@@ -711,7 +811,11 @@ fn sibling_mcp_executable() -> Result<PathBuf> {
             "current launcher executable path cannot be resolved",
         )
     })?;
-    path.set_file_name(if cfg!(windows) { "swarm-mcp.exe" } else { "swarm-mcp" });
+    path.set_file_name(if cfg!(windows) {
+        "swarm-mcp.exe"
+    } else {
+        "swarm-mcp"
+    });
     let metadata = fs::symlink_metadata(&path).map_err(|_| {
         Error::new(
             "NATIVE_MCP_LAUNCHER",

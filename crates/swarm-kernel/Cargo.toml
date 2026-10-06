@@ -10,3 +10,6 @@ description = "Generic bounded writer actor primitives for the Swarm kernel"
 sha2 = "0.10"
 serde_json = "1"
 tokio = { version = "1", features = ["sync"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "time"] }
