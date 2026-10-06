@@ -2,6 +2,52 @@
 
 ## Current state
 
+### Code phase and remaining implementation — 2026-10-05
+
+The owner requires finishing all necessary source changes before compilation,
+tests, builds or native/model execution. Main contains source delivery through
+`17e0abc`; the current source has not passed those gates and is
+`PARTIAL_PROGRESS`. Earlier installed binaries and qualification receipts do not
+qualify these changes.
+
+The public CLI now delegates MCP serving to the installed `swarm-mcp` sibling
+and has no `swarm-mcp` runtime dependency. Host starts the demanded module
+supervisor as an independent child over a bounded private stdin bootstrap and
+authenticated IPC. The old in-process module supervisor is retired. Without
+durable demand, the legacy coordinator waits for Store notifications instead of
+waking every two seconds. Launch and watch changes wake it through that existing
+notification channel. Failed supervisor starts and exits retain Manager-visible
+failure observations; process isolation is still unqualified at runtime.
+
+The launch preview includes a bounded assignment decision card from retained
+Task, Attempt, dependency, route, capacity, workspace and MCP facts. Missing
+ranking or qualification evidence is explicit. Descriptor workspace pointers
+retain their full native-options path during reservation.
+
+The common normalized result context/page contract is connected to Store,
+Command Code and Codex. A result page seals its exact origin. Historical
+acknowledgement checks immutable producer identity, and assembly permits the
+producer's admitted-to-completed lifecycle transition without replacing each
+page's saved facts. Codex readback requires the exact submitted native user
+item and completed turn, and checkpoints the selected assistant page before
+Store acknowledgement. Antigravity validates the same result request but
+returns `RESULT_BODY_UNAVAILABLE`: its current stream has no documented native
+response parent. Status readback remains available. None of these result paths
+has current native qualification.
+
+Scoped Manager logging now connects level, metadata/redacted-text content and
+expiry to the existing Producer and observer before capture. Malformed scope
+configuration fails closed; expired policies do not consume the active bound.
+Raw native frames remain unsupported.
+
+Remaining source work is the complete OpenCode owned-launch handoff, native MCP
+command execution and plugin configuration, exact OpenCode assistant readback,
+retained on-behalf event ownership, final adapter/version consumers, and physical
+Kernel source relocation with packaging. Only after those changes are complete
+do compiler and focused qualification runs begin. The selected test model is
+`inclusionai/ling-3.1-flash`; Bunny is disabled. Local models, Linux/WSL and Zed
+remain deferred, and the current desktop Codex process must remain alive.
+
 ### Shared positive method policy — 2026-10-05
 
 Store admission/classification and MCP discovery/profiles now consume the same
@@ -36,16 +82,16 @@ Recording that snapshot does not submit or accept the Task.
 Ordinary registered Managers now have `logging.get` and `logging.set` for their
 own client, retained Operation, binding/module, or exact current Task/Attempt
 scope. The policy uses existing Store metadata and reloads the existing Producer
-after commit. The initial public API accepts metadata content; the connected
-Manager redacted-text and live TTL/level override path is still being completed.
-The observer can already carry bounded Atlas-redacted supervisor diagnostic
-text through its existing queue and recorder when live configuration opts in.
+after commit. Metadata and redacted-text content, scope level and live expiry
+are now connected to the Producer and observer. The observer carries bounded
+Atlas-redacted supervisor diagnostic text through its existing queue and
+recorder when the effective scope permits it.
 Raw native-frame capture remains unavailable.
 
 The independent `swarm-supervisor` binary and strict private-stdin bootstrap are
 implemented over authenticated kernel IPC, including retained hello identity and
-scoped health readback. Its actual host process handoff is still being completed;
-the presence of this binary alone does not prove process isolation at runtime.
+scoped health readback. Host now starts that executable through the bounded
+private handoff; runtime process isolation remains unqualified.
 
 These are source increments. Per owner direction, required code is completed
 before compiler, test, build, or model execution. Current native qualification
@@ -58,8 +104,8 @@ credential, recovery, observation and health operations through authenticated
 kernel IPC. `swarm-supervisor` uses a typed client and receives no Store or
 database handle. The existing exact supervisor credential is migrated at
 initialization; runtime calls require its complete bounded capability list.
-The host still starts the lifecycle actor in its own process. Moving that actor
-and its configuration into the standalone supervisor executable remains open.
+The lifecycle actor and its configuration now run in the standalone supervisor
+child; Host retains the process handoff and committed failure handling.
 
 Automatic reconciliation prepares Forge executable images only when its bounded
 publication page contains due work. A publication that becomes due after this
@@ -76,7 +122,7 @@ Store checks the retained lease and launch authority without filesystem I/O;
 the existing file-I/O lane resolves the repository before reading Git. Ordinary
 and extended Windows disk/UNC paths share that lexical scope. Manager and
 Operator capture retain their existing general path. Collection of an in-flight
-capture after assignment or lease release is a separate unfinished handoff.
+capture after assignment or lease release validates its saved admission.
 
 `monitor.snapshot` and `monitor.follow` use the existing status reader and
 visibility-filtered Store projections. The snapshot captures a committed

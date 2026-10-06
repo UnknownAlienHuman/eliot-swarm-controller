@@ -5,6 +5,17 @@ computer and Codex. This checkpoint preserves product source and records the
 remaining work. It is not whole-project completion or qualification of a new
 installed executable.
 
+## Current continuation direction, 2026-10-05
+
+The historical receipts below remain tied to their recorded source and binaries.
+For current work, the owner requires completing source first, then compilation
+and focused testing. Use [current implementation status](implementation-status.md)
+and the private runtime continuation checkpoint for the actual published main
+SHA and unfinished assignments. Do not resume the older R7/Bunny sequence from
+this document: Bunny is disabled and the selected test model is
+`inclusionai/ling-3.1-flash`. Local models, Linux/WSL and Zed remain deferred.
+Keep the current desktop Codex/OpenCodex processes alive.
+
 ## Saved implementation
 
 - CheckRunner resolves and pins source, baseline, executable/version, toolchain,
