@@ -26,6 +26,10 @@ const MAX_INSPECT_SNAPSHOT_FIELD_BYTES: usize = 12_288;
 const MAX_INSPECT_SNAPSHOT_FIELD_ITEMS: usize = 64;
 const MAX_LAUNCH_OPERATION_ROWS: i64 = 8;
 const MAX_LAUNCH_BRIEF_BYTES: usize = 8_192;
+const MAX_DECISION_CARD_OBJECTIVE_BYTES: usize = 4_096;
+const MAX_DECISION_CARD_TEXT_BYTES: usize = 512;
+const MAX_DECISION_CARD_LIST_ITEMS: usize = 16;
+const MAX_DECISION_CARD_OVERLAP_ITEMS: usize = 8;
 
 type OpeningChildRow = (
     String,
@@ -4722,7 +4726,14 @@ pub(super) fn launch_preview(
     params_value: &Value,
     config: &Config,
 ) -> Result<Value> {
-    launch_preview_for_actor(db, &LaunchActor::Direct(p.clone()), params_value, config)
+    // Keep every bounded planning read on one Store snapshot. This transaction
+    // is read-only in this path; launch admission revalidates the same digest
+    // in its own durable transaction before any effect.
+    let tx = db.unchecked_transaction()?;
+    let result =
+        launch_preview_for_actor(&tx, &LaunchActor::Direct(p.clone()), params_value, config)?;
+    tx.commit()?;
+    Ok(result)
 }
 
 pub(crate) fn launch_preview_for_actor(
@@ -4994,6 +5005,28 @@ fn launch_preview_inner(
         // workspace lease, or full-scope capacity proof.
         "unknown"
     };
+    let workspace = launch_workspace_projection(&request);
+    let detached_references = launch_detail_references(&row, &attempt_projection);
+    let decision_card = launch_decision_card(LaunchDecisionCardInput {
+        task_brief: &task_brief,
+        task: &row,
+        expected_revision: request.expected_task_revision,
+        attempt: &attempt_projection,
+        claim_readiness: &claim_readiness,
+        dependencies: &dependencies,
+        attempt_action: action,
+        attempt_binding: &attempt_binding,
+        capacity: &capacity,
+        overlaps: &overlaps,
+        route: &route,
+        mcp: &mcp_profile,
+        baseline: &baseline,
+        workspace: &workspace,
+        hard_blocks: hard_blocks.as_slice(),
+        gaps: gaps.as_slice(),
+        readiness,
+        detail_references: &detached_references,
+    });
     let mut plan = json!({
         "preview_only":true,
         "effects":"none",
@@ -5022,7 +5055,7 @@ fn launch_preview_inner(
             "dependencies":dependencies,
             "prior_launch_operations":launch_operations,
         },
-        "workspace":launch_workspace_projection(&request),
+        "workspace":workspace,
         "baseline":baseline,
         "route":route,
         "mcp":mcp_profile,
@@ -5034,24 +5067,11 @@ fn launch_preview_inner(
             "purpose":request.purpose,
             "enforceability":"not_recorded_until_a_durable_launch_manifest_exists",
         },
+        "decision_card":decision_card.clone(),
         "hard_blocks":hard_blocks,
         "coverage":if gaps.is_empty() {"complete"} else {"partial"},
         "gaps":gaps,
     });
-    let mut detached_references = vec![json!({
-        "method":"task.get",
-        "params":{"task_id":row.task_id},
-    })];
-    if let Some(attempt_id) = attempt_projection["attempt_id"].as_str() {
-        detached_references.push(json!({
-            "method":"swarm.agent.inspect",
-            "params":{"attempt_id":attempt_id},
-        }));
-    }
-    detached_references.push(json!({
-        "method":"swarm.queue.get",
-        "params":{"project_id":row.project_id,"limit":DASHBOARD_PAGE_LIMIT},
-    }));
     let canonical = model::canonical(&plan)?;
     let plan_digest = format!("sha256:{}", model::digest(canonical.as_bytes()));
     plan["plan_digest"] = json!(plan_digest);
@@ -5060,7 +5080,7 @@ fn launch_preview_inner(
         return Ok(plan);
     }
 
-    Ok(json!({
+    let fallback = json!({
         "plan_digest":plan_digest,
         "preview_only":true,
         "effects":"none",
@@ -5068,24 +5088,513 @@ fn launch_preview_inner(
         "launch_execution":"awaits_verified_workspace_lease",
         "preview_readiness":readiness,
         "task":{
-            "task_id":row.task_id,
-            "project_id":row.project_id,
+            "task_id":bounded_decision_value(&json!(row.task_id), MAX_DECISION_CARD_TEXT_BYTES).0,
+            "project_id":bounded_decision_value(&json!(row.project_id), MAX_DECISION_CARD_TEXT_BYTES).0,
             "revision":row.revision,
             "expected_revision":request.expected_task_revision,
             "state":row.state,
         },
         "attempt_action":action,
-        "current_attempt":attempt_projection,
+        "current_attempt":{
+            "status":attempt_projection["status"],
+            "attempt_id":bounded_decision_value(&attempt_projection["attempt_id"], MAX_DECISION_CARD_TEXT_BYTES).0,
+        },
+        "decision_card":decision_card.clone(),
         "context_detached":{
             "status":"detached",
             "serialized_bytes":canonical.len(),
             "digest":model::digest(canonical.as_bytes()),
-            "references":detached_references,
+            "references":detached_references.clone(),
         },
-        "hard_blocks":hard_blocks,
+        "hard_blocks":bounded_decision_literals(hard_blocks),
         "coverage":"partial",
         "gaps":["combined_launch_preview_exceeded_serialized_budget; use the exact linked read projections"],
-    }))
+    });
+    let fallback_canonical = model::canonical(&fallback)?;
+    if fallback_canonical.len() <= projection::MAX_SERIALIZED_BYTES {
+        return Ok(fallback);
+    }
+
+    let terminal_fallback = json!({
+        "plan_digest":plan_digest,
+        "preview_only":true,
+        "effects":"none",
+        "launch_mutation":"durable_intent_pending_workspace",
+        "launch_execution":"awaits_verified_workspace_lease",
+        "preview_readiness":readiness,
+        "task":{
+            "task_id":bounded_decision_value(&json!(row.task_id), MAX_DECISION_CARD_TEXT_BYTES).0,
+            "project_id":bounded_decision_value(&json!(row.project_id), MAX_DECISION_CARD_TEXT_BYTES).0,
+            "revision":row.revision,
+            "expected_revision":request.expected_task_revision,
+            "state":bounded_decision_value(&json!(row.state), MAX_DECISION_CARD_TEXT_BYTES).0,
+        },
+        "attempt_action":action,
+        "current_attempt":{
+            "status":attempt_projection["status"],
+            "attempt_id":bounded_decision_value(&attempt_projection["attempt_id"], MAX_DECISION_CARD_TEXT_BYTES).0,
+        },
+        "decision_card":{
+            "schema_version":1,
+            "status":readiness,
+            "hard_blocks":bounded_decision_literals(hard_blocks),
+            "warnings":bounded_decision_literals(gaps),
+            "detail_references":detached_references.clone(),
+        },
+        "context_detached":{
+            "status":"detached",
+            "serialized_bytes":canonical.len(),
+            "digest":model::digest(canonical.as_bytes()),
+            "references":detached_references.clone(),
+        },
+        "coverage":"partial",
+        "gaps":["combined_launch_preview_exceeded_serialized_budget; use the exact linked read projections"],
+    });
+    debug_assert!(model::canonical(&terminal_fallback)?.len() <= projection::MAX_SERIALIZED_BYTES);
+    Ok(terminal_fallback)
+}
+
+struct LaunchDecisionCardInput<'a> {
+    task_brief: &'a Value,
+    task: &'a TaskRow,
+    expected_revision: i64,
+    attempt: &'a Value,
+    claim_readiness: &'a Value,
+    dependencies: &'a Value,
+    attempt_action: &'a str,
+    attempt_binding: &'a Value,
+    capacity: &'a Value,
+    overlaps: &'a Value,
+    route: &'a Value,
+    mcp: &'a Value,
+    baseline: &'a Value,
+    workspace: &'a Value,
+    hard_blocks: &'a [&'static str],
+    gaps: &'a [&'static str],
+    readiness: &'a str,
+    detail_references: &'a Value,
+}
+
+fn launch_decision_card(input: LaunchDecisionCardInput<'_>) -> Value {
+    let LaunchDecisionCardInput {
+        task_brief,
+        task,
+        expected_revision,
+        attempt,
+        claim_readiness,
+        dependencies,
+        attempt_action,
+        attempt_binding,
+        capacity,
+        overlaps,
+        route,
+        mcp,
+        baseline,
+        workspace,
+        hard_blocks,
+        gaps,
+        readiness,
+        detail_references,
+    } = input;
+    let brief = task_brief
+        .get("brief")
+        .filter(|value| value.is_object())
+        .cloned()
+        .unwrap_or(Value::Null);
+    let brief_included = task_brief["status"] == "included" && brief.is_object();
+    let (objective_value, objective_truncated) = if brief_included {
+        bounded_decision_value(&brief["objective"], MAX_DECISION_CARD_OBJECTIVE_BYTES)
+    } else {
+        (Value::Null, false)
+    };
+    let (phase_value, phase_truncated) = if brief_included {
+        bounded_decision_value(&brief["phase"], MAX_DECISION_CARD_TEXT_BYTES)
+    } else {
+        (Value::Null, false)
+    };
+    let objective = if brief_included {
+        json!({
+            "status":"recorded",
+            "value":objective_value,
+            "phase":phase_value,
+            "truncated":objective_truncated || phase_truncated,
+        })
+    } else {
+        json!({
+            "status":"unknown",
+            "value":Value::Null,
+            "phase":Value::Null,
+            "truncated":false,
+            "reason":"task_brief_is_not_inline",
+        })
+    };
+    let (requirement_ids, requirement_count, requirement_omitted, requirement_truncated) =
+        compact_requirement_ids(&brief, brief_included);
+    let remaining_requirements = json!({
+        "status":"unknown",
+        "recorded":brief_included,
+        "count":if brief_included {json!(requirement_count)} else {Value::Null},
+        "ids":requirement_ids,
+        "omitted":if brief_included {json!(requirement_omitted)} else {Value::Null},
+        "truncated":requirement_truncated,
+        "reason":"requirement_completion_is_not_projected_by_launch_preview",
+    });
+    let raw_owner = attempt.get("owner").cloned().unwrap_or(Value::Null);
+    let owner_summary = compact_owner(&raw_owner);
+    let owner_status = if attempt["status"] == "current" && raw_owner.is_object() {
+        "recorded"
+    } else {
+        "unknown"
+    };
+    let binding_qualification = attempt_binding
+        .get("live_qualified")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let overlap_summary = compact_overlap(overlaps);
+    let claim_summary = compact_claim_readiness(claim_readiness);
+    let dependency_summary = compact_dependency_projection(dependencies);
+    let capacity_gap = capacity
+        .get("capacity_reason")
+        .or_else(|| capacity.get("reason"))
+        .filter(|value| value.is_string())
+        .map(|value| bounded_decision_value(value, MAX_DECISION_CARD_TEXT_BYTES).0)
+        .unwrap_or(Value::Null);
+    let surface_facts = mcp.get("surface_facts").cloned().unwrap_or(Value::Null);
+    let evidence_gaps = json!({
+        "preview":bounded_decision_literals(gaps),
+        "route":bounded_decision_values(&route["capability_gaps"]),
+        "mcp":bounded_decision_values(&mcp["gaps"]),
+        "overlap":bounded_decision_values(&overlaps["gaps"]),
+        "capacity":if capacity_gap.is_null() {Value::Array(Vec::new())} else {json!([capacity_gap])},
+    });
+    json!({
+        "schema_version":1,
+        "status":readiness,
+        "planning":{
+            "preview_only":true,
+            "effects":"none",
+            "attempt_action":attempt_action,
+        },
+        "task":{
+            "task_id":bounded_decision_value(&json!(task.task_id), MAX_DECISION_CARD_TEXT_BYTES).0,
+            "revision":task.revision,
+            "expected_revision":expected_revision,
+            "state":bounded_decision_value(&json!(task.state), MAX_DECISION_CARD_TEXT_BYTES).0,
+        },
+        "objective":objective,
+        "remaining_requirements":remaining_requirements,
+        "why_next":{
+            "status":"unknown",
+            "rank":{"status":"not_recorded"},
+            "claim_readiness":claim_summary,
+            "dependency_status":dependency_summary,
+            "reason":"queue_priority_and_rank_are_not_recorded",
+        },
+        "current_owners":{
+            "status":owner_status,
+            "attempt_owner":owner_summary,
+            "overlap_owners":{
+                "coverage":overlap_summary["coverage"],
+                "owner_count":overlap_summary["owner_count"],
+                "owner_ids":overlap_summary["owner_ids"],
+                "owner_ids_omitted":overlap_summary["owner_ids_omitted"],
+                "owner_ids_truncated":overlap_summary["owner_ids_truncated"],
+                "has_more":overlap_summary["has_more"],
+            },
+        },
+        "contracts":{
+            "status":"not_recorded_in_task_assignment_store",
+            "requires":Value::Null,
+            "provides":Value::Null,
+            "items":[],
+        },
+        "overlap":overlap_summary,
+        "workspace_lease_plan":{
+            "workspace":compact_workspace_projection(workspace),
+            "baseline":compact_baseline_projection(baseline),
+        },
+        "selection":{
+            "route":bounded_decision_value(&route["alias"], MAX_DECISION_CARD_TEXT_BYTES).0,
+            "agent_profile":compact_agent_profile(&route["agent_profile"]),
+            "mcp_profile":bounded_decision_value(&mcp["profile_name"], MAX_DECISION_CARD_TEXT_BYTES).0,
+            "mcp_surface":bounded_decision_value(&mcp["surface"], MAX_DECISION_CARD_TEXT_BYTES).0,
+            "requested_model":compact_requested_value(&route["requested_model"]),
+            "requested_effort":compact_requested_value(&route["requested_effort"]),
+            "observed_qualification":{
+                "route_live_qualified":route["live_qualified"],
+                "mcp_runtime_loaded":mcp["runtime_loaded"],
+                "binding_live_qualified":binding_qualification,
+            },
+        },
+        "mcp_core":{
+            "status":bounded_decision_value(&mcp["status"], MAX_DECISION_CARD_TEXT_BYTES).0,
+            "profile":bounded_decision_value(&mcp["profile_name"], MAX_DECISION_CARD_TEXT_BYTES).0,
+            "surface":bounded_decision_value(&mcp["surface"], MAX_DECISION_CARD_TEXT_BYTES).0,
+            "core":bounded_decision_values(&surface_facts["core"]),
+            "core_methods":bounded_decision_values(&surface_facts["core_methods"]),
+            "deferred_groups":bounded_decision_values(&surface_facts["deferred_groups"]),
+            "manual_tools":bounded_decision_values(&surface_facts["manual_tools"]),
+            "runtime_loaded":mcp["runtime_loaded"],
+        },
+        "blockers":{
+            "preview":bounded_decision_literals(hard_blocks),
+            "claim_readiness":claim_summary["blockers"],
+            "dependencies":dependency_summary,
+        },
+        "hard_blocks":bounded_decision_literals(hard_blocks),
+        "warnings":bounded_decision_literals(gaps),
+        "evidence_gaps":evidence_gaps,
+        "detail_references":detail_references,
+    })
+}
+
+fn launch_detail_references(task: &TaskRow, attempt: &Value) -> Value {
+    let mut references = vec![json!({
+        "method":"task.get",
+        "params":{"task_id":task.task_id},
+    })];
+    if let Some(attempt_id) = attempt["attempt_id"].as_str() {
+        references.push(json!({
+            "method":"swarm.agent.inspect",
+            "params":{
+                "attempt_id":attempt_id,
+                "operation_limit":1,
+                "check_limit":1,
+                "peer_limit":1,
+                "overlap_limit":1,
+            },
+        }));
+    }
+    references.push(json!({
+        "method":"swarm.queue.get",
+        "params":{"project_id":task.project_id,"limit":DASHBOARD_PAGE_LIMIT},
+    }));
+    Value::Array(references)
+}
+
+fn bounded_decision_value(value: &Value, max_bytes: usize) -> (Value, bool) {
+    let Some(text) = value.as_str() else {
+        return if value.is_null() || value.is_boolean() || value.is_number() {
+            (value.clone(), false)
+        } else {
+            (Value::Null, true)
+        };
+    };
+    let mut end = text.len().min(max_bytes);
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (Value::String(text[..end].to_owned()), end < text.len())
+}
+
+fn bounded_decision_values(value: &Value) -> Value {
+    let Some(values) = value.as_array() else {
+        return Value::Null;
+    };
+    Value::Array(
+        values
+            .iter()
+            .take(MAX_DECISION_CARD_LIST_ITEMS)
+            .filter(|value| value.is_string())
+            .map(|value| bounded_decision_value(value, MAX_DECISION_CARD_TEXT_BYTES).0)
+            .collect(),
+    )
+}
+
+fn bounded_decision_literals(values: &[&str]) -> Value {
+    Value::Array(
+        values
+            .iter()
+            .take(MAX_DECISION_CARD_LIST_ITEMS)
+            .map(|value| {
+                bounded_decision_value(
+                    &Value::String((*value).to_owned()),
+                    MAX_DECISION_CARD_TEXT_BYTES,
+                )
+                .0
+            })
+            .collect(),
+    )
+}
+
+fn compact_requirement_ids(brief: &Value, included: bool) -> (Value, usize, usize, bool) {
+    let Some(requirements) = brief["requirements"].as_array() else {
+        return (Value::Array(Vec::new()), 0, 0, false);
+    };
+    let mut ids = Vec::new();
+    let mut truncated = false;
+    for requirement in requirements.iter().take(MAX_DECISION_CARD_LIST_ITEMS) {
+        if let Some(id) = requirement["id"].as_str() {
+            let (value, was_truncated) =
+                bounded_decision_value(&Value::String(id.to_owned()), MAX_DECISION_CARD_TEXT_BYTES);
+            ids.push(value);
+            truncated |= was_truncated;
+        }
+    }
+    let count = if included { requirements.len() } else { 0 };
+    let id_count = ids.len();
+    (
+        Value::Array(ids),
+        count,
+        count.saturating_sub(id_count),
+        truncated,
+    )
+}
+
+fn compact_owner(owner: &Value) -> Value {
+    if !owner.is_object() {
+        return json!({"status":"unknown","client_id":Value::Null,"role":Value::Null});
+    }
+    let (client_id, client_id_truncated) =
+        bounded_decision_value(&owner["client_id"], MAX_DECISION_CARD_TEXT_BYTES);
+    let (role, role_truncated) =
+        bounded_decision_value(&owner["role"], MAX_DECISION_CARD_TEXT_BYTES);
+    json!({
+        "status":bounded_decision_value(&owner["status"], MAX_DECISION_CARD_TEXT_BYTES).0,
+        "client_id":client_id,
+        "role":role,
+        "truncated":client_id_truncated || role_truncated,
+    })
+}
+
+fn compact_dependency_projection(dependencies: &Value) -> Value {
+    let accepted_count = dependencies["accepted"].as_array().map_or(0, Vec::len);
+    let waiting = dependencies["waiting"].as_array();
+    let waiting_count = waiting.map_or(0, Vec::len);
+    let mut waiting_task_ids = Vec::new();
+    if let Some(waiting) = waiting {
+        for item in waiting.iter().take(MAX_DECISION_CARD_LIST_ITEMS) {
+            if let Some(task_id) = item["task_id"].as_str() {
+                waiting_task_ids.push(
+                    bounded_decision_value(
+                        &Value::String(task_id.to_owned()),
+                        MAX_DECISION_CARD_TEXT_BYTES,
+                    )
+                    .0,
+                );
+            }
+        }
+    }
+    let waiting_id_count = waiting_task_ids.len();
+    json!({
+        "status":bounded_decision_value(&dependencies["status"], MAX_DECISION_CARD_TEXT_BYTES).0,
+        "accepted_count":accepted_count,
+        "waiting_count":waiting_count,
+        "waiting_task_ids":waiting_task_ids,
+        "waiting_omitted":waiting_count.saturating_sub(waiting_id_count),
+        "omitted_count":dependencies["omitted_count"],
+        "gaps":bounded_decision_values(&dependencies["gaps"]),
+    })
+}
+
+fn compact_claim_readiness(readiness: &Value) -> Value {
+    json!({
+        "state":bounded_decision_value(&readiness["state"], MAX_DECISION_CARD_TEXT_BYTES).0,
+        "claim_preconditions":bounded_decision_value(&readiness["claim_preconditions"], MAX_DECISION_CARD_TEXT_BYTES).0,
+        "new_work_admission":bounded_decision_value(&readiness["new_work_admission"], MAX_DECISION_CARD_TEXT_BYTES).0,
+        "resource_capacity":bounded_decision_value(&readiness["resource_capacity"], MAX_DECISION_CARD_TEXT_BYTES).0,
+        "owner_policy":{
+            "status":bounded_decision_value(&readiness["owner_policy"]["status"], MAX_DECISION_CARD_TEXT_BYTES).0,
+            "edition":bounded_decision_value(&readiness["owner_policy"]["edition"], MAX_DECISION_CARD_TEXT_BYTES).0,
+        },
+        "blockers":bounded_decision_values(&readiness["blockers"]),
+        "gaps":bounded_decision_values(&readiness["gaps"]),
+    })
+}
+
+fn compact_overlap(overlaps: &Value) -> Value {
+    let items = overlaps["items"].as_array();
+    let item_count = items.map_or(0, Vec::len);
+    let mut owner_ids = Vec::new();
+    let mut owner_seen = Vec::new();
+    let mut owner_ids_truncated = false;
+    let mut matched_path_count = 0usize;
+    if let Some(items) = items {
+        for item in items {
+            if let Some(paths) = item["matched_paths"].as_array() {
+                matched_path_count = matched_path_count.saturating_add(paths.len());
+            }
+            if let Some(owner_id) = item["owner_id"].as_str()
+                && !owner_seen
+                    .iter()
+                    .any(|seen: &String| seen.as_str() == owner_id)
+            {
+                owner_seen.push(owner_id.to_owned());
+                if owner_ids.len() < MAX_DECISION_CARD_OVERLAP_ITEMS {
+                    let (owner_id, was_truncated) = bounded_decision_value(
+                        &Value::String(owner_id.to_owned()),
+                        MAX_DECISION_CARD_TEXT_BYTES,
+                    );
+                    owner_ids.push(owner_id);
+                    owner_ids_truncated |= was_truncated;
+                }
+            }
+        }
+    }
+    json!({
+        "status":bounded_decision_value(&overlaps["status"], MAX_DECISION_CARD_TEXT_BYTES).0,
+        "coverage":bounded_decision_value(&overlaps["coverage"], MAX_DECISION_CARD_TEXT_BYTES).0,
+        "item_count":item_count,
+        "owner_count":owner_seen.len(),
+        "owner_ids":owner_ids,
+        "owner_ids_omitted":owner_seen.len().saturating_sub(MAX_DECISION_CARD_OVERLAP_ITEMS),
+        "owner_ids_truncated":owner_ids_truncated,
+        "matched_path_count":matched_path_count,
+        "has_more":overlaps["has_more"],
+        "gaps":bounded_decision_values(&overlaps["gaps"]),
+    })
+}
+
+fn compact_agent_profile(profile: &Value) -> Value {
+    if !profile.is_object() {
+        return bounded_decision_value(profile, MAX_DECISION_CARD_TEXT_BYTES).0;
+    }
+    json!({
+        "requested":bounded_decision_value(&profile["requested"], MAX_DECISION_CARD_TEXT_BYTES).0,
+        "validation":bounded_decision_value(&profile["validation"], MAX_DECISION_CARD_TEXT_BYTES).0,
+    })
+}
+
+fn compact_requested_value(value: &Value) -> Value {
+    if value.is_object() {
+        let (requested, truncated) =
+            bounded_decision_value(&value["value"], MAX_DECISION_CARD_TEXT_BYTES);
+        return json!({
+            "value":requested,
+            "validation":bounded_decision_value(&value["validation"], MAX_DECISION_CARD_TEXT_BYTES).0,
+            "truncated":truncated,
+        });
+    }
+    let (requested, truncated) = bounded_decision_value(value, MAX_DECISION_CARD_TEXT_BYTES);
+    json!({
+        "value":requested,
+        "validation":"unknown",
+        "truncated":truncated,
+    })
+}
+
+fn compact_workspace_projection(workspace: &Value) -> Value {
+    json!({
+        "policy":bounded_decision_value(&workspace["policy"], MAX_DECISION_CARD_TEXT_BYTES).0,
+        "status":bounded_decision_value(&workspace["status"], MAX_DECISION_CARD_TEXT_BYTES).0,
+        "lease":bounded_decision_value(&workspace["lease"], MAX_DECISION_CARD_TEXT_BYTES).0,
+        "dirty":workspace["dirty"],
+        "filesystem_inspected":workspace["filesystem_inspected"],
+        "branch":bounded_decision_value(&workspace["branch"], MAX_DECISION_CARD_TEXT_BYTES).0,
+        "baseline_commit":bounded_decision_value(&workspace["baseline_commit"], MAX_DECISION_CARD_TEXT_BYTES).0,
+    })
+}
+
+fn compact_baseline_projection(baseline: &Value) -> Value {
+    json!({
+        "status":bounded_decision_value(&baseline["status"], MAX_DECISION_CARD_TEXT_BYTES).0,
+        "candidate_ref":bounded_decision_value(&baseline["candidate_ref"], MAX_DECISION_CARD_TEXT_BYTES).0,
+        "commit":bounded_decision_value(&baseline["commit"], MAX_DECISION_CARD_TEXT_BYTES).0,
+        "artifact_digest":bounded_decision_value(&baseline["artifact_digest"], MAX_DECISION_CARD_TEXT_BYTES).0,
+        "acceptance_task_id":bounded_decision_value(&baseline["acceptance_task_id"], MAX_DECISION_CARD_TEXT_BYTES).0,
+        "acceptance_attempt_id":bounded_decision_value(&baseline["acceptance_attempt_id"], MAX_DECISION_CARD_TEXT_BYTES).0,
+        "acceptance_task_revision":baseline["acceptance_task_revision"],
+    })
 }
 
 fn queue_page(db: &Connection, params_value: &Value, brief_limit: usize) -> Result<Value> {

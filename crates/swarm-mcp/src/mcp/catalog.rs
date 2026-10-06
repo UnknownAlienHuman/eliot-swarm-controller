@@ -1083,8 +1083,8 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
         ManagerCore,
         MANAGER_AUDIENCES,
         Core,
-        "Validate one exact launch request under current Manager or local Operator authority.",
-        "Use before admitting a launch to review the exact Task revision, route, profiles, budget, stop conditions, and requested configuration.",
+        "Validate one exact launch request under current Manager or local Operator authority and return its compact decision_card.",
+        "Use before admitting a launch to review the exact Task revision, route, profiles, budget, stop conditions, requested configuration, and bounded assignment facts. Missing facts remain explicit unknown or evidence gaps.",
         &[
             "launch",
             "preview",

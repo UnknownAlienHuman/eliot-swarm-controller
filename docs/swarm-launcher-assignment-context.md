@@ -814,7 +814,7 @@ current related owners and assignments
 contracts this work provides/requires
 path/symbol/scope overlap
 workspace/branch/lease plan
-suggested route/profile/model and qualification state
+selected route/profile/model and qualification state
 core MCP tools and deferred groups
 hard blocks, warnings and evidence gaps
 ```
@@ -822,19 +822,62 @@ hard blocks, warnings and evidence gaps
 Example text rendering:
 
 ```text
-Task T-42 rev 4 — ready; unblocks 3 consumers
-Owner/workspace: none; proposed manager M2 / worktree W17
-Requires: native-input-readback-v2 (owner P7, draft rev 3)
-Provides: operation-admission-v3 (consumers P9, P11)
-Overlap: src/runtime.rs shared integration seam; no competing exclusive owner
-Queue: blocker class, rank 2/18 ready
-Runtime: codex-writer configured; live qualification stale
-MCP: participant-core ready; git-read deferred; catalog abc123
-Gaps: provider quota unknown; one source-index comment retained as nonblocking gap
-Next: preview launch, then confirm plan digest
+Task T-42 rev 4 — blocked; readiness unknown where evidence is absent
+Owner/workspace: current owner unknown; workspace lease not provisioned
+Requires/provides: contracts not recorded in the assignment store
+Overlap: bounded projection with explicit coverage; omitted facts remain unknown
+Queue: rank not recorded; dependency and claim-readiness projections shown
+Runtime: configured route/profile recorded; live qualification unknown
+MCP: configured core/deferred groups recorded; runtime loading unknown
+Gaps: evidence gaps are listed without a quota, capability, or recommendation claim
+Next: unknown; review the recorded hard blocks before any launch admission
 ```
 
 The model's prompt receives the compact equivalent. It does not receive the full dashboard.
+
+The existing `swarm.launch.preview` response carries this card additively as
+`decision_card`; it does not add a method, approval step, or launch effect. The
+card is built from the same bounded Task, Attempt, dependency, overlap,
+workspace, route, profile, baseline, capacity, and operation projections that
+the preview already returns. Its `schema_version` is `1`, and its compact
+shape is:
+
+```json
+{
+  "schema_version": 1,
+  "status": "blocked | unknown",
+  "planning": {"preview_only": true, "effects": "none", "attempt_action": "..."},
+  "task": {"task_id": "...", "revision": 4, "expected_revision": 4, "state": "open"},
+  "objective": {"status": "recorded | unknown", "value": "...", "phase": "...", "truncated": false},
+  "remaining_requirements": {"status": "unknown", "recorded": true, "count": 0, "ids": [], "omitted": 0},
+  "why_next": {"status": "unknown", "rank": {"status": "not_recorded"}, "claim_readiness": {}, "dependency_status": {}},
+  "current_owners": {"status": "unknown | recorded", "attempt_owner": {"client_id": "...", "role": "..."}, "overlap_owners": {"owner_count": 0, "owner_ids": [], "owner_ids_omitted": 0, "owner_ids_truncated": false, "coverage": "..."}},
+  "contracts": {"status": "not_recorded_in_task_assignment_store"},
+  "overlap": {"item_count": 0, "owner_count": 0, "owner_ids": [], "owner_ids_omitted": 0, "owner_ids_truncated": false, "matched_path_count": 0, "coverage": "..."},
+  "workspace_lease_plan": {"workspace": {"policy": "...", "status": "...", "lease": "..."}, "baseline": {}},
+  "selection": {"route": "...", "agent_profile": {}, "mcp_profile": "...", "requested_model": {"value": "...", "validation": "..."}, "observed_qualification": {}},
+  "mcp_core": {"status": "...", "core": [], "core_methods": [], "deferred_groups": []},
+  "blockers": {"preview": [], "claim_readiness": [], "dependencies": []},
+  "hard_blocks": [],
+  "warnings": [],
+  "evidence_gaps": {},
+  "detail_references": []
+}
+```
+
+The card is read-only and assembled inside one bounded Store transaction;
+launch admission still revalidates its exact request and digest in its own
+durable transaction. It reports only recorded projections: absent owners,
+leases, ranks, contracts, runtime qualification, capabilities, quotas, or
+other evidence remain `unknown`, `null`, or an explicit gap. MCP and both
+existing CLI launch-preview paths render the same response JSON; no separate
+presentation API is required. Objective text, identifiers, gap lists, MCP
+method lists, and overlap owner summaries are UTF-8 and item bounded; a
+`truncated` or `omitted` field makes that boundary explicit. When the full
+preview exceeds the shared serialized response budget, the fallback retains
+the bounded card and exact `task.get`, `swarm.agent.inspect` (when an Attempt
+exists), and `swarm.queue.get` references instead of repeating unbounded
+projection objects.
 
 ## 15. Runtime capability receipt
 

@@ -228,7 +228,7 @@ static TOOLS: &[(bool, ToolSpec)] = &[
     ),
     read(
         "swarm.launch.preview",
-        "Preview one exact Task launch configuration under current manager authority. This validates configuration only; it never starts a model or native session.",
+        "Preview one exact Task launch configuration under current manager authority. The response also carries a compact decision_card from bounded Store projections; unknown remains explicit. It validates configuration only and never starts a model or native session.",
         &[
             f("task_id", S),
             f("expected_task_revision", I),
