@@ -49,18 +49,53 @@ No native connection occurs merely to list routes or read host status. After exp
 
 The adapter above still attaches to an already-running service. For an explicitly operator-managed local installation, `serve.mjs` composes the official `@opencode/server` **2.0.7** library with its pinned Effect/Node platform packages and runs it under **Bun 1.4.0**. It binds authenticated HTTP only to `127.0.0.1`, enables native `events.persist`, and puts the database, XDG roots, config, temporary files, owner record and connection record below one explicit private state directory. Give that directory and its password file restrictive OS permissions before launch; the launcher refuses reparse paths and does not copy global configuration, provider credentials, history or databases. It writes the generated connection record for the controller at `connection.json`; treat that file as a secret.
 
-Install only the locked module dependencies and run the exact bundled Bun executable selected by the operator:
+For an installed package, prepare the resource bundle with the same package installer
+that creates the host executable's receipt. Supply the exact Node and npm files and
+their versions; the installer runs the locked `npm ci` in a private staging tree,
+records every dependency file and tool hash, and publishes the resource directory
+only after verification. The host checks that receipt and the complete dependency
+tree before it uses the installed `serve.mjs`. It never installs dependencies when
+starting the service.
+
+Install the matching `swarm-supervisor` package into the same install root first;
+the kernel host package requires that verified sibling. Use a new install root for
+each immutable package set.
 
 ```powershell
-npm ci --ignore-scripts
-& '<absolute-path-to-bun-1.4.0.exe>' .\serve.mjs `
+& '<repo-root>\tools\modules\Install-SwarmFrontend.ps1' `
+  -PackageDirectory '<verified-swarm-kernel-host-package>' `
+  -InstallDirectory '<root-with-verified-swarm-supervisor>' `
+  -NodeExecutable '<absolute-path-to-pinned-node.exe>' `
+  -NpmCliScript '<absolute-path-to-pinned-npm-cli.js>' `
+  -ExpectedNodeVersion '<exact-node-version>' `
+  -ExpectedNpmVersion '<exact-npm-version>'
+& '<absolute-path-to-bun-1.4.0.exe>' '<install-root>\resources\modules\opencode\serve.mjs' `
   --state-root '<absolute-private-state-directory>' `
   --password-file '<absolute-private-state-directory>\server.password' `
   --port 12345 `
   --model-catalog refresh
 ```
 
-`refresh` is the live default: OpenCode loads its bundled model snapshot and enables its public Models.dev metadata refresh. That refresh is metadata traffic only; this option does not request inference or qualify provider credentials. The explicit `--model-catalog offline` mode disables both snapshot and fetch for deterministic, credential-free persistence checks. The smoke command below uses only that offline mode, creates a model-free session, verifies the exact durable `session.created` event before and after restarting the owned service, checks the SQLite row read-only, and requires clean observed process exits:
+The installer does not activate a route or start Bun. Treat the install receipt's
+resource-closure digest as package-integrity evidence; it is not native-service,
+provider, model, or inference qualification.
+
+The repository source tree is a separate development-only path. In a debug build,
+opt into it explicitly, install locked dependencies in the source tree, and use that
+source `serve.mjs` path. An invalid installed bundle is always an error and never
+falls back to the source tree.
+
+```powershell
+$env:ELIOT_OPENCODE_SOURCE_RESOURCES = '1'
+npm ci --ignore-scripts
+& '<absolute-path-to-bun-1.4.0.exe>' .\serve.mjs `
+  --state-root '<absolute-private-state-directory>' `
+  --password-file '<absolute-private-state-directory>\server.password' `
+  --port 12345 `
+  --model-catalog offline
+```
+
+`refresh` is the live default: OpenCode loads its bundled model snapshot and enables its public Models.dev metadata refresh. That refresh is metadata traffic only; this option does not request inference or qualify provider credentials. The explicit `--model-catalog offline` mode disables both snapshot and fetch for deterministic, credential-free persistence checks. The smoke command below uses only that offline mode, creates a model-free session, verifies the exact durable `session.created` event before and after restarting the owned service, checks the SQLite row read-only, and requires clean observed process exits. It is a source-tree development check, not installed-package qualification:
 
 ```powershell
 node .\selftest.mjs --bun '<absolute-path-to-bun-1.4.0.exe>'

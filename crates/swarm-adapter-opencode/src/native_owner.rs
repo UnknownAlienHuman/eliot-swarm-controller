@@ -360,6 +360,7 @@ impl OwnerPlan {
         let plugin_identity = plugin_config.identity().clone();
         let bun = canonical_regular_file(&config.bun_executable, MAX_FILE_BYTES)?;
         let server = canonical_regular_file(&config.server_program, SERVER_FILE_BYTES)?;
+        verify_server_dependency_closure(&server)?;
         if digest_file(&bun, MAX_FILE_BYTES)? != config.bun_sha256
             || digest_file(&server, SERVER_FILE_BYTES)? != config.server_program_sha256
         {
@@ -422,6 +423,82 @@ impl OwnerPlan {
             plugin_entrypoint_sha256: plugin_identity.entrypoint_sha256,
         })
     }
+}
+
+fn verify_server_dependency_closure(server_program: &Path) -> Result<()> {
+    if server_program.file_name().and_then(|name| name.to_str()) != Some("serve.mjs") {
+        return Err(Error::new(
+            "NATIVE_OWNER_RESOURCE_ROOT_INVALID",
+            "OpenCode owner must use the pinned serve.mjs resource",
+        ));
+    }
+
+    let source_tree_server = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("modules")
+        .join("opencode")
+        .join("serve.mjs");
+    #[cfg(debug_assertions)]
+    {
+        let source_resources_enabled =
+            std::env::var("ELIOT_OPENCODE_SOURCE_RESOURCES").is_ok_and(|value| value == "1");
+        if source_resources_enabled
+            && source_tree_server
+                .canonicalize()
+                .is_ok_and(|path| path == server_program)
+        {
+            return Ok(());
+        }
+    }
+
+    let resource_root = server_program.parent().ok_or_else(|| {
+        Error::new(
+            "NATIVE_OWNER_RESOURCE_ROOT_INVALID",
+            "installed OpenCode resource root is unavailable",
+        )
+    })?;
+    let modules_root = resource_root.parent().ok_or_else(|| {
+        Error::new(
+            "NATIVE_OWNER_RESOURCE_ROOT_INVALID",
+            "installed OpenCode resource root is unavailable",
+        )
+    })?;
+    let resources_root = modules_root.parent().ok_or_else(|| {
+        Error::new(
+            "NATIVE_OWNER_RESOURCE_ROOT_INVALID",
+            "installed OpenCode resource root is unavailable",
+        )
+    })?;
+    let install_root = resources_root.parent().ok_or_else(|| {
+        Error::new(
+            "NATIVE_OWNER_RESOURCE_ROOT_INVALID",
+            "installed OpenCode install root is unavailable",
+        )
+    })?;
+    let expected_resource_root = install_root
+        .join("resources")
+        .join("modules")
+        .join("opencode");
+    if resource_root != expected_resource_root.as_path() {
+        return Err(Error::new(
+            "NATIVE_OWNER_RESOURCE_ROOT_INVALID",
+            "OpenCode resources are outside the pinned installed layout",
+        ));
+    }
+    swarm_process::dependency_closure::verify_installed_dependency_closure(
+        install_root,
+        "swarm-kernel-host",
+        "swarm-kernel-host",
+        "swarm-kernel-host-opencode-resources",
+    )
+    .map_err(|_| {
+        Error::new(
+            "NATIVE_OWNER_DEPENDENCY_CLOSURE_INVALID",
+            "installed OpenCode resource dependency closure is invalid",
+        )
+    })?;
+    Ok(())
 }
 
 fn bun_command(plan: &OwnerPlan) -> Command {

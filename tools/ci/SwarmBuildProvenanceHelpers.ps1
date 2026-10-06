@@ -30,6 +30,23 @@ function Get-PathPackageSourceSha256([string] $Root, [string] $ManifestPath) {
     return $sourceHash
 }
 
+function Get-PackageManifestPin([object] $Package, [string] $Root) {
+    $manifestPath = [IO.Path]::GetFullPath([string]$Package.manifest_path)
+    if (-not (Test-PathWithin $manifestPath $Root) -or
+        -not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+        throw 'Selected package manifest is missing or outside the source checkout.'
+    }
+    $manifestItem = Get-Item -LiteralPath $manifestPath -Force
+    if (($manifestItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        $manifestItem.Length -le 0) {
+        throw 'Selected package manifest must be a non-empty regular file.'
+    }
+    return [ordered]@{
+        path = [IO.Path]::GetRelativePath($Root, $manifestPath).Replace('\', '/')
+        sha256 = Get-Sha256 $manifestPath
+    }
+}
+
 function Get-CargoLockPackageRecords([string] $LockfilePath) {
     if (-not (Test-Path -LiteralPath $LockfilePath -PathType Leaf)) { throw 'Cargo.lock is missing.' }
     $lockText = Get-Content -LiteralPath $LockfilePath -Raw

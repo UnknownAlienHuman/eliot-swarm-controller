@@ -89,6 +89,24 @@
       "resource_coordinate": "swarm-kernel-host-opencode-resources",
       "resource_installed_relative_root": "resources/modules/opencode",
       "resource_repository_relative_root": "modules/opencode",
+      "resource_dependency_install": {
+        "manager": "npm",
+        "arguments": [
+          "ci",
+          "--ignore-scripts",
+          "--no-audit",
+          "--no-fund",
+          "--no-progress",
+          "--loglevel=error"
+        ],
+        "output_directory": "node_modules",
+        "closure_manifest_file": "dependency-closure.json",
+        "max_files": 100000,
+        "max_entries": 200000,
+        "max_total_bytes": 1073741824,
+        "max_manifest_bytes": 33554432,
+        "timeout_seconds": 1800
+      },
       "resource_files": [
         {
           "path": "serve.mjs",

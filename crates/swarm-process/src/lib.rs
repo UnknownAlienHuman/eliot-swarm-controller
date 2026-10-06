@@ -4,6 +4,7 @@
 //! or claim to sandbox same-user processes. Callers retain their own admission
 //! and recovery policy and persist the returned owner identity as-is.
 
+pub mod dependency_closure;
 pub mod module_membership;
 pub mod module_owner;
 mod permissions;

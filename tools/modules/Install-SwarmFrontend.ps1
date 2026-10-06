@@ -1,7 +1,11 @@
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
 param(
     [Parameter(Mandatory = $true)] [ValidateNotNullOrEmpty()] [string] $PackageDirectory,
-    [Parameter(Mandatory = $true)] [ValidateNotNullOrEmpty()] [string] $InstallDirectory
+    [Parameter(Mandatory = $true)] [ValidateNotNullOrEmpty()] [string] $InstallDirectory,
+    [string] $NodeExecutable,
+    [string] $NpmCliScript,
+    [string] $ExpectedNodeVersion,
+    [string] $ExpectedNpmVersion
 )
 
 Set-StrictMode -Version Latest
@@ -28,6 +32,17 @@ $packageMap = @{
         required_siblings = @('swarm-supervisor')
         resource_coordinate = 'swarm-kernel-host-opencode-resources'
         resource_installed_relative_root = 'resources/modules/opencode'
+        resource_dependency_install = [ordered]@{
+            manager = 'npm'
+            arguments = @('ci', '--ignore-scripts', '--no-audit', '--no-fund', '--no-progress', '--loglevel=error')
+            output_directory = 'node_modules'
+            closure_manifest_file = 'dependency-closure.json'
+            max_files = 100000
+            max_entries = 200000
+            max_total_bytes = 1073741824
+            max_manifest_bytes = 33554432
+            timeout_seconds = 1800
+        }
         resource_files = @(
             [ordered]@{ path = 'serve.mjs'; role = 'server_program' },
             [ordered]@{ path = 'native-mcp-proof.mjs'; role = 'plugin_module' },
@@ -124,8 +139,33 @@ function Assert-ResourceManifest(
         $resources.repository_relative_root -cne 'modules/opencode' -or
         $resources.installed_relative_root -cne [string]$Spec.resource_installed_relative_root -or
         $resources.files -isnot [array] -or
-        $resources.dependency_policy.node_modules -cne 'external_locked_installation') {
+        $resources.dependency_policy -isnot [System.Collections.IDictionary]) {
         throw "$Label does not carry the pinned kernel resource coordinate."
+    }
+    $dependencyPolicy = $resources.dependency_policy
+    $expectedDependencyPolicy = $Spec.resource_dependency_install
+    if ($null -eq $expectedDependencyPolicy -or
+        $dependencyPolicy.node_modules -cne 'installer_generated_locked_closure' -or
+        $dependencyPolicy.manager -cne [string]$expectedDependencyPolicy.manager -or
+        $dependencyPolicy.install_command -cne 'npm ci --ignore-scripts' -or
+        $dependencyPolicy.output_directory -cne [string]$expectedDependencyPolicy.output_directory -or
+        $dependencyPolicy.closure_manifest_file -cne [string]$expectedDependencyPolicy.closure_manifest_file -or
+        [long]$dependencyPolicy.max_files -ne [long]$expectedDependencyPolicy.max_files -or
+        [long]$dependencyPolicy.max_entries -ne [long]$expectedDependencyPolicy.max_entries -or
+        [long]$dependencyPolicy.max_total_bytes -ne [long]$expectedDependencyPolicy.max_total_bytes -or
+        [long]$dependencyPolicy.max_manifest_bytes -ne [long]$expectedDependencyPolicy.max_manifest_bytes -or
+        [long]$dependencyPolicy.timeout_seconds -ne [long]$expectedDependencyPolicy.timeout_seconds) {
+        throw "$Label has an unsupported locked OpenCode dependency-install contract."
+    }
+    $actualArguments = @($dependencyPolicy.arguments | ForEach-Object { [string]$_ })
+    $expectedArguments = @($expectedDependencyPolicy.arguments | ForEach-Object { [string]$_ })
+    if ($actualArguments.Count -ne $expectedArguments.Count) {
+        throw "$Label has a different locked OpenCode dependency-install command."
+    }
+    for ($index = 0; $index -lt $expectedArguments.Count; $index++) {
+        if ($actualArguments[$index] -cne $expectedArguments[$index]) {
+            throw "$Label has a different locked OpenCode dependency-install command."
+        }
     }
     $actual = @($resources.files)
     if ($actual.Count -ne $expected.Count) { throw "$Label has an incomplete pinned kernel resource set." }
@@ -173,6 +213,357 @@ function Assert-InstalledResourceFiles(
     }
 }
 
+function Invoke-BoundedInstallerProcess(
+    [string] $Executable,
+    [string[]] $Arguments,
+    [string] $WorkingDirectory,
+    [int] $TimeoutSeconds,
+    [bool] $CaptureOutput
+) {
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $Executable
+    $startInfo.WorkingDirectory = $WorkingDirectory
+    $startInfo.UseShellExecute = $false
+    if ($CaptureOutput) {
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+    }
+    foreach ($argument in $Arguments) { $startInfo.ArgumentList.Add([string]$argument) }
+    foreach ($key in @($startInfo.Environment.Keys)) {
+        if ([string]$key -match '(?i)^(npm_config_|node_options$|node_path$)') {
+            [void]$startInfo.Environment.Remove([string]$key)
+        }
+    }
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    try {
+        if (-not $process.Start()) { throw 'The pinned installer process did not start.' }
+        $stdoutTask = $null
+        $stderrTask = $null
+        if ($CaptureOutput) {
+            $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+            $stderrTask = $process.StandardError.ReadToEndAsync()
+        }
+        $timeoutMilliseconds = [int][Math]::Min([long]::MaxValue, [long]$TimeoutSeconds * 1000)
+        if (-not $process.WaitForExit($timeoutMilliseconds)) {
+            try { $process.Kill($true) } catch { }
+            try { $process.WaitForExit() } catch { }
+            throw "The pinned installer process exceeded its $TimeoutSeconds second deadline and was stopped."
+        }
+        $process.WaitForExit()
+        if ($process.ExitCode -ne 0) {
+            if ($CaptureOutput) {
+                $stdout = $stdoutTask.GetAwaiter().GetResult()
+                $stderr = $stderrTask.GetAwaiter().GetResult()
+                $details = (($stdout + [Environment]::NewLine + $stderr).Trim())
+                if ($details.Length -gt 4096) { $details = $details.Substring($details.Length - 4096) }
+                throw "The pinned installer process exited with code $($process.ExitCode): $details"
+            }
+            throw "The pinned installer process exited with code $($process.ExitCode)."
+        }
+        if ($CaptureOutput) { return $stdoutTask.GetAwaiter().GetResult().Trim() }
+        return ''
+    } finally {
+        $process.Dispose()
+    }
+}
+
+function Get-PinnedNpmTools(
+    [string] $NodeExecutable,
+    [string] $NpmCliScript,
+    [string] $ExpectedNodeVersion,
+    [string] $ExpectedNpmVersion
+) {
+    if ([string]::IsNullOrWhiteSpace($NodeExecutable) -or
+        [string]::IsNullOrWhiteSpace($NpmCliScript) -or
+        $ExpectedNodeVersion -cnotmatch '\Av[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?\z' -or
+        $ExpectedNpmVersion -cnotmatch '\A[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?\z') {
+        throw 'Kernel OpenCode installation requires absolute Node/npm paths and exact expected version pins.'
+    }
+    $nodePath = Get-CanonicalPath $NodeExecutable 'NodeExecutable'
+    $npmPath = Get-CanonicalPath $NpmCliScript 'NpmCliScript'
+    foreach ($path in @($nodePath, $npmPath)) {
+        Assert-NoReparseTraversal $path
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            throw 'The explicitly pinned Node executable or npm CLI script is missing.'
+        }
+        $item = Get-Item -LiteralPath $path -Force
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $item.Length -le 0) {
+            throw 'The explicitly pinned Node executable or npm CLI script is not a regular non-empty file.'
+        }
+    }
+    $nodeHash = Get-Sha256 $nodePath
+    $npmHash = Get-Sha256 $npmPath
+    $nodeVersion = Invoke-BoundedInstallerProcess $nodePath @('--version') (Split-Path -Parent $nodePath) 30 $true
+    $npmVersion = Invoke-BoundedInstallerProcess $nodePath @($npmPath, '--version') (Split-Path -Parent $npmPath) 30 $true
+    if ($nodeVersion -cne $ExpectedNodeVersion -or $npmVersion -cne $ExpectedNpmVersion) {
+        throw "Pinned Node/npm versions do not match the supplied expectation (Node '$nodeVersion', npm '$npmVersion')."
+    }
+    return [ordered]@{
+        node = [ordered]@{
+            file = [IO.Path]::GetFileName($nodePath)
+            version = $nodeVersion
+            executable_sha256 = $nodeHash
+        }
+        npm = [ordered]@{
+            file = [IO.Path]::GetFileName($npmPath)
+            version = $npmVersion
+            cli_sha256 = $npmHash
+        }
+        node_path = $nodePath
+        npm_path = $npmPath
+    }
+}
+
+function Invoke-LockedNpmInstall(
+    [string] $ResourceRoot,
+    [System.Collections.IDictionary] $Tools,
+    [System.Collections.IDictionary] $Policy
+) {
+    $nodeModules = Join-Path $ResourceRoot ([string]$Policy.output_directory)
+    if (Test-Path -LiteralPath $nodeModules) {
+        throw 'The staged OpenCode resource directory already contains node_modules.'
+    }
+    $nonce = [guid]::NewGuid().ToString('N')
+    $configPath = Join-Path $ResourceRoot ('.npm-empty-config-' + $nonce)
+    $cachePath = Join-Path $ResourceRoot ('.npm-cache-' + $nonce)
+    $configBytes = [Text.UTF8Encoding]::new($false).GetBytes([string]::Empty)
+    $configStream = [IO.File]::Open($configPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    try {
+        $configStream.Write($configBytes, 0, $configBytes.Length)
+        $configStream.Flush($true)
+    } finally { $configStream.Dispose() }
+    [void][IO.Directory]::CreateDirectory($cachePath)
+    try {
+        $arguments = @($Tools.npm_path) + @($Policy.arguments | ForEach-Object { [string]$_ }) + @(
+            '--userconfig', $configPath,
+            '--globalconfig', $configPath,
+            '--cache', $cachePath
+        )
+        [void](Invoke-BoundedInstallerProcess ([string]$Tools.node_path) $arguments $ResourceRoot ([int]$Policy.timeout_seconds) $false)
+    } finally {
+        if (Test-Path -LiteralPath $configPath -PathType Leaf) {
+            Remove-Item -LiteralPath $configPath -Force -Confirm:$false
+        }
+        if (Test-Path -LiteralPath $cachePath) {
+            Remove-Item -LiteralPath $cachePath -Recurse -Force -Confirm:$false
+        }
+    }
+    if (-not (Test-Path -LiteralPath $nodeModules -PathType Container)) {
+        throw 'Locked npm ci returned success without producing node_modules.'
+    }
+}
+
+function Get-DependencyTreeRows([string] $NodeModulesPath, [System.Collections.IDictionary] $Policy) {
+    if (-not (Test-Path -LiteralPath $NodeModulesPath -PathType Container)) {
+        throw 'The installed OpenCode node_modules directory is missing.'
+    }
+    $rootItem = Get-Item -LiteralPath $NodeModulesPath -Force
+    if (($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw 'The installed OpenCode node_modules root must not be a reparse point.'
+    }
+    $root = [IO.Path]::GetFullPath($NodeModulesPath)
+    $pending = [Collections.Generic.Stack[string]]::new()
+    $pending.Push($root)
+    $entries = [Collections.Generic.List[object]]::new()
+    $entryCount = [long]0
+    $totalBytes = [long]0
+    while ($pending.Count -gt 0) {
+        $directory = $pending.Pop()
+        foreach ($item in Get-ChildItem -LiteralPath $directory -Force) {
+            $entryCount++
+            if ($entryCount -gt [long]$Policy.max_entries) {
+                throw 'Locked npm output exceeded its pinned directory-entry bound.'
+            }
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw 'Locked npm output contains a symbolic link or reparse point.'
+            }
+            if ($item.PSIsContainer) {
+                $pending.Push($item.FullName)
+                continue
+            }
+            if (-not $item.PSIsContainer -and $item.Length -lt 0) {
+                throw 'Locked npm output contains an invalid file entry.'
+            }
+            if ($entries.Count -ge [long]$Policy.max_files -or
+                [long]$item.Length -gt ([long]$Policy.max_total_bytes - $totalBytes)) {
+                throw 'Locked npm output exceeded its pinned file-count or total-size bound.'
+            }
+            $relative = [IO.Path]::GetRelativePath($root, $item.FullName).Replace('\', '/')
+            if ([string]::IsNullOrWhiteSpace($relative) -or $relative.Length -gt 4096 -or
+                $relative.StartsWith('/') -or $relative.Contains('\') -or $relative.Contains(':') -or
+                @($relative.Split('/') | Where-Object { [string]::IsNullOrEmpty($_) -or $_ -in @('.', '..') }).Count -gt 0) {
+                throw 'Locked npm output contains an unsafe relative path.'
+            }
+            $totalBytes += [long]$item.Length
+            $utf8Path = [Text.UTF8Encoding]::new($false).GetBytes($relative)
+            $entries.Add([pscustomobject]@{
+                sort_key = [Convert]::ToHexString($utf8Path)
+                path = $relative
+                bytes = [long]$item.Length
+                sha256 = Get-Sha256 $item.FullName
+            })
+        }
+    }
+    if ($entries.Count -eq 0) { throw 'Locked npm output contains no dependency files.' }
+    $ordered = @($entries | Sort-Object -Property sort_key -CaseSensitive)
+    return [pscustomobject]@{
+        files = @($ordered | ForEach-Object {
+            [ordered]@{ path = [string]$_.path; bytes = [long]$_.bytes; sha256 = [string]$_.sha256 }
+        })
+        entry_count = $entryCount
+        total_bytes = $totalBytes
+    }
+}
+
+function Get-DependencyTreeSha256([object[]] $Files) {
+    $hasher = [Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256)
+    $utf8 = [Text.UTF8Encoding]::new($false)
+    try {
+        foreach ($file in $Files) {
+            $record = [string]$file.path + [char]0 + [string]([long]$file.bytes) + [char]0 + [string]$file.sha256 + "`n"
+            $bytes = $utf8.GetBytes($record)
+            $hasher.AppendData($bytes)
+        }
+        return [Convert]::ToHexString($hasher.GetHashAndReset()).ToLowerInvariant()
+    } finally { $hasher.Dispose() }
+}
+
+function New-DependencyClosureManifest(
+    [string] $ResourceRoot,
+    [System.Collections.IDictionary] $Tools,
+    [System.Collections.IDictionary] $Spec
+) {
+    $policy = $Spec.resource_dependency_install
+    $tree = Get-DependencyTreeRows (Join-Path $ResourceRoot ([string]$policy.output_directory)) $policy
+    $treeHash = Get-DependencyTreeSha256 @($tree.files)
+    $packageJsonHash = Get-Sha256 (Join-Path $ResourceRoot 'package.json')
+    $packageLockHash = Get-Sha256 (Join-Path $ResourceRoot 'package-lock.json')
+    $manifest = [ordered]@{
+        schema_version = 1
+        format = 'eliot.opencode_dependency_closure.v1'
+        coordinate = [string]$Spec.resource_coordinate
+        package_json_sha256 = $packageJsonHash
+        package_lock_sha256 = $packageLockHash
+        node = [ordered]@{
+            file = [string]$Tools.node.file
+            version = [string]$Tools.node.version
+            executable_sha256 = [string]$Tools.node.executable_sha256
+        }
+        npm = [ordered]@{
+            file = [string]$Tools.npm.file
+            version = [string]$Tools.npm.version
+            cli_sha256 = [string]$Tools.npm.cli_sha256
+        }
+        tree_sha256 = $treeHash
+        entry_count = [long]$tree.entry_count
+        file_count = [long]$tree.files.Count
+        total_bytes = [long]$tree.total_bytes
+        files = @($tree.files)
+    }
+    $json = ConvertTo-Json -InputObject $manifest -Depth 8 -Compress
+    $manifestBytes = [Text.UTF8Encoding]::new($false).GetBytes($json + "`n")
+    if ($manifestBytes.Length -gt [long]$policy.max_manifest_bytes) {
+        throw 'Generated dependency closure manifest exceeds its pinned size bound.'
+    }
+    $manifestPath = Join-Path $ResourceRoot ([string]$policy.closure_manifest_file)
+    $stream = [IO.File]::Open($manifestPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    try {
+        $stream.Write($manifestBytes, 0, $manifestBytes.Length)
+        $stream.Flush($true)
+    } finally { $stream.Dispose() }
+    return [ordered]@{
+        schema_version = 1
+        manifest_file = [string]$policy.closure_manifest_file
+        manifest_sha256 = Get-Sha256 $manifestPath
+        coordinate = [string]$Spec.resource_coordinate
+        package_json_sha256 = $packageJsonHash
+        package_lock_sha256 = $packageLockHash
+        tree_sha256 = $treeHash
+        node_version = [string]$Tools.node.version
+        node_executable_sha256 = [string]$Tools.node.executable_sha256
+        node_file = [string]$Tools.node.file
+        npm_version = [string]$Tools.npm.version
+        npm_cli_sha256 = [string]$Tools.npm.cli_sha256
+        npm_cli_file = [string]$Tools.npm.file
+        file_count = [long]$tree.files.Count
+        total_bytes = [long]$tree.total_bytes
+    }
+}
+
+function Assert-DependencyClosure(
+    [string] $ResourceRoot,
+    [System.Collections.IDictionary] $ReceiptResources,
+    [object] $BuildResources,
+    [System.Collections.IDictionary] $Spec,
+    [string] $Label
+) {
+    $policy = $Spec.resource_dependency_install
+    $pin = $ReceiptResources.dependency_closure
+    if ($pin -isnot [System.Collections.IDictionary] -or
+        $pin.schema_version -ne 1 -or
+        $pin.manifest_file -cne [string]$policy.closure_manifest_file -or
+        $pin.coordinate -cne [string]$Spec.resource_coordinate) {
+        throw "$Label has no pinned installed dependency closure receipt."
+    }
+    Assert-Hash $pin.manifest_sha256 "$Label.resources.dependency_closure.manifest_sha256"
+    $manifestPath = Join-Path $ResourceRoot ([string]$pin.manifest_file)
+    Assert-NoReparseTraversal $manifestPath
+    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf) -or
+        (Get-Item -LiteralPath $manifestPath -Force).Length -gt [long]$policy.max_manifest_bytes -or
+        (Get-Sha256 $manifestPath) -cne [string]$pin.manifest_sha256) {
+        throw "$Label dependency closure manifest is missing or differs from its install receipt."
+    }
+    $manifest = Read-JsonMap $manifestPath "$Label dependency closure manifest"
+    if ($manifest.schema_version -ne 1 -or
+        $manifest.format -cne 'eliot.opencode_dependency_closure.v1' -or
+        $manifest.coordinate -cne [string]$Spec.resource_coordinate -or
+        $manifest.files -isnot [array]) {
+        throw "$Label dependency closure manifest has an unsupported format or coordinate."
+    }
+    foreach ($field in @('package_json_sha256', 'package_lock_sha256', 'tree_sha256', 'node_version', 'node_executable_sha256', 'node_file', 'npm_version', 'npm_cli_sha256', 'npm_cli_file')) {
+        if ([string]$manifest[$field] -cne [string]$pin[$field]) {
+            throw "$Label dependency closure identity differs from its install receipt."
+        }
+    }
+    foreach ($field in @('node_executable_sha256', 'npm_cli_sha256', 'package_json_sha256', 'package_lock_sha256', 'tree_sha256')) {
+        Assert-Hash $pin[$field] "$Label.resources.dependency_closure.$field"
+    }
+    if ([long]$manifest.entry_count -ne [long]$pin.entry_count -or
+        [long]$manifest.entry_count -le 0 -or
+        [long]$manifest.entry_count -gt [long]$policy.max_entries -or
+        [long]$manifest.file_count -ne [long]$pin.file_count -or
+        [long]$manifest.total_bytes -ne [long]$pin.total_bytes -or
+        [long]$manifest.file_count -le 0 -or
+        [long]$manifest.file_count -gt [long]$policy.max_files -or
+        [long]$manifest.total_bytes -gt [long]$policy.max_total_bytes) {
+        throw "$Label dependency closure exceeds or mismatches its pinned bounds."
+    }
+    if ((Get-Sha256 (Join-Path $ResourceRoot 'package.json')) -cne [string]$pin.package_json_sha256 -or
+        (Get-Sha256 (Join-Path $ResourceRoot 'package-lock.json')) -cne [string]$pin.package_lock_sha256) {
+        throw "$Label package files differ from the locked dependency closure."
+    }
+    $tree = Get-DependencyTreeRows (Join-Path $ResourceRoot ([string]$policy.output_directory)) $policy
+    if ($tree.files.Count -ne [long]$manifest.file_count -or
+        [long]$tree.entry_count -ne [long]$manifest.entry_count -or
+        [long]$tree.total_bytes -ne [long]$manifest.total_bytes -or
+        (Get-DependencyTreeSha256 @($tree.files)) -cne [string]$manifest.tree_sha256) {
+        throw "$Label installed node_modules differs from its dependency closure manifest."
+    }
+    if ($manifest.files.Count -ne $tree.files.Count) {
+        throw "$Label installed node_modules has a different number of files than its manifest."
+    }
+    for ($index = 0; $index -lt $tree.files.Count; $index++) {
+        $actual = $tree.files[$index]
+        $expected = $manifest.files[$index]
+        if ([string]$actual.path -cne [string]$expected.path -or
+            [long]$actual.bytes -ne [long]$expected.bytes -or
+            [string]$actual.sha256 -cne [string]$expected.sha256) {
+            throw "$Label installed node_modules file rows differ from the pinned manifest."
+        }
+    }
+}
+
 function Assert-ReceiptResourceContract([object] $Receipt, [object] $Resources, [string] $Label) {
     if ($null -eq $Resources) {
         if ($null -ne $Receipt.resources) { throw "$Label receipt advertises undeclared package resources." }
@@ -194,6 +585,19 @@ function Assert-ReceiptResourceContract([object] $Receipt, [object] $Resources, 
             [string]$receiptRows[$index].artifact_sha256 -cne [string]$manifestRows[$index].artifact_sha256) {
             throw "$Label receipt kernel resource row $index does not match its build manifest."
         }
+    }
+    $closure = $receiptResources.dependency_closure
+    if ($closure -isnot [System.Collections.IDictionary] -or
+        $closure.schema_version -ne 1 -or
+        $closure.manifest_file -cne 'dependency-closure.json' -or
+        $closure.coordinate -cne [string]$Resources.coordinate) {
+        throw "$Label receipt does not pin its installed dependency closure."
+    }
+    foreach ($field in @('manifest_sha256', 'package_json_sha256', 'package_lock_sha256', 'tree_sha256', 'node_executable_sha256', 'npm_cli_sha256')) {
+        Assert-Hash $closure[$field] "$Label receipt dependency_closure.$field"
+    }
+    if ([long]$closure.entry_count -le 0 -or [long]$closure.entry_count -gt [long]$Spec.resource_dependency_install.max_entries) {
+        throw "$Label receipt dependency closure has an invalid directory-entry count."
     }
 }
 
@@ -394,8 +798,14 @@ function Assert-SourceIdentity([object] $Source, [string] $Prefix, [bool] $Requi
     foreach ($field in @('cargo_toml_sha256', 'cargo_lock_sha256', 'rust_toolchain_toml_sha256')) {
         Assert-Hash $Source[$field] "$Prefix.$field"
     }
-    if ($RequirePackageManifestHash) {
-        Assert-Hash $Source.package_manifest_sha256 "$Prefix.package_manifest_sha256"
+    Assert-Hash $Source.package_manifest_sha256 "$Prefix.package_manifest_sha256"
+    if ($null -ne $Source.workspace_cargo_toml_sha256) {
+        Assert-Hash $Source.workspace_cargo_toml_sha256 "$Prefix.workspace_cargo_toml_sha256"
+        if ([string]$Source.workspace_cargo_toml_sha256 -cne [string]$Source.cargo_toml_sha256) {
+            throw "$Prefix workspace Cargo.toml aliases do not match."
+        }
+    } elseif ($RequirePackageManifestHash) {
+        throw "$Prefix is missing the explicit workspace Cargo.toml pin."
     }
 }
 
@@ -470,20 +880,29 @@ function Get-InstalledFrontend(
             throw "Installed frontend '$Name' receipt has incompatible sibling requirements."
         }
     }
-    Assert-SourceIdentity $manifest.source 'Installed build source' (-not $isHostPackage)
+    Assert-SourceIdentity $manifest.source 'Installed build source' $isHostPackage
     Assert-DependencyPins $manifest "Installed frontend '$Name' build manifest"
     Assert-CompatibilityManifest $manifest $Name $Spec "Installed frontend '$Name' build manifest"
     $resources = Assert-ResourceManifest $manifest $Spec "Installed frontend '$Name' build manifest"
     Assert-ReceiptResourceContract $receipt $resources "Installed frontend '$Name'"
     Assert-InstalledResourceFiles $Root $Spec $resources "Installed frontend '$Name'"
-    Assert-Hash $receipt.package_manifest_sha256 'receipt.package_manifest_sha256'
-    $expectedPackageManifestHash = if ($isHostPackage) {
-        [string]$manifest.source.cargo_toml_sha256
-    } else {
-        [string]$manifest.source.package_manifest_sha256
+    if ($null -ne $resources) {
+        $installedResourceRoot = Join-Path $Root ([string]$Spec.resource_installed_relative_root)
+        Assert-DependencyClosure $installedResourceRoot $receipt.resources $resources $Spec "Installed frontend '$Name'"
     }
+    Assert-Hash $receipt.package_manifest_sha256 'receipt.package_manifest_sha256'
+    if ($null -ne $manifest.source.package_manifest_path -and
+        [string]$manifest.source.package_manifest_path -cne [string]$manifest.build.package_manifest) {
+        throw "Installed frontend '$Name' selected package-manifest path differs between build and source provenance."
+    }
+    $expectedPackageManifestHash = [string]$manifest.source.package_manifest_sha256
     if ([string]$receipt.package_manifest_sha256 -cne $expectedPackageManifestHash) {
         throw "Installed frontend '$Name' package-manifest pin does not match its source manifest."
+    }
+    $expectedWorkspaceManifestHash = if ($null -ne $manifest.source.workspace_cargo_toml_sha256) {
+        [string]$manifest.source.workspace_cargo_toml_sha256
+    } else {
+        [string]$manifest.source.cargo_toml_sha256
     }
     Assert-Hash $receipt.executable_sha256 'receipt.executable_sha256'
     Assert-Hash $receipt.build_manifest_sha256 'receipt.build_manifest_sha256'
@@ -493,6 +912,8 @@ function Get-InstalledFrontend(
         [string]$manifest.source.tree -cne [string]$receipt.source_tree -or
         [string]$manifest.source.cargo_lock_sha256 -cne [string]$receipt.cargo_lock_sha256 -or
         [string]$manifest.source.cargo_toml_sha256 -cne [string]$receipt.cargo_toml_sha256 -or
+        [string]$manifest.source.package_manifest_sha256 -cne [string]$receipt.package_manifest_sha256 -or
+        $expectedWorkspaceManifestHash -cne [string]$receipt.workspace_cargo_toml_sha256 -or
         [string]$manifest.source.rust_toolchain_toml_sha256 -cne [string]$receipt.rust_toolchain_toml_sha256) {
         throw "Installed frontend '$Name' executable or provenance sidecar digest does not match its receipt. Use a new empty install directory."
     }
@@ -573,7 +994,11 @@ if ($provenance.schema_version -ne 1 -or
     [string]$provenance.build.package_version -cnotmatch '\A[0-9A-Za-z.+-]{1,128}\z') {
     throw 'Frontend build manifest package, binary, role, version, or release profile is not an approved exact coordinate.'
 }
-Assert-SourceIdentity $provenance.source 'Build source' (-not $isHostPackage)
+Assert-SourceIdentity $provenance.source 'Build source' $isHostPackage
+if ($null -ne $provenance.source.package_manifest_path -and
+    [string]$provenance.source.package_manifest_path -cne [string]$provenance.build.package_manifest) {
+    throw 'Frontend selected package-manifest path differs between build and source provenance.'
+}
 Assert-DependencyPins $provenance 'Build manifest'
 Assert-CompatibilityManifest $provenance $packageName $selectedSpec 'Build manifest'
 $provenanceResources = Assert-ResourceManifest $provenance $selectedSpec 'Build manifest'
@@ -704,7 +1129,10 @@ if ($null -ne $existing[$packageName]) {
         try {
             Copy-ToStage $packageBinary $stageBinary
             Copy-ToStage $manifestPath $stageBuild
+            $npmTools = $null
+            $dependencyClosure = $null
             if ($null -ne $provenanceResources) {
+                $npmTools = Get-PinnedNpmTools $NodeExecutable $NpmCliScript $ExpectedNodeVersion $ExpectedNpmVersion
                 [void][IO.Directory]::CreateDirectory($stageResourceRoot)
                 foreach ($row in @($provenanceResources.files)) {
                     $stageResourcePath = Join-Path $stageResourceRoot ([string]$row.path)
@@ -717,11 +1145,14 @@ if ($null -ne $existing[$packageName]) {
                         throw "Staged kernel resource '$($row.path)' failed its pinned size or SHA-256 check."
                     }
                 }
+                Invoke-LockedNpmInstall $stageResourceRoot $npmTools $selectedSpec.resource_dependency_install
+                $dependencyClosure = New-DependencyClosureManifest $stageResourceRoot $npmTools $selectedSpec
             }
-            $packageManifestHash = if ($isHostPackage) {
-                [string]$provenance.source.cargo_toml_sha256
+            $packageManifestHash = [string]$provenance.source.package_manifest_sha256
+            $workspaceManifestHash = if ($null -ne $provenance.source.workspace_cargo_toml_sha256) {
+                [string]$provenance.source.workspace_cargo_toml_sha256
             } else {
-                [string]$provenance.source.package_manifest_sha256
+                [string]$provenance.source.cargo_toml_sha256
             }
             $receipt = [ordered]@{
                 schema_version = 1
@@ -737,6 +1168,7 @@ if ($null -ne $existing[$packageName]) {
                 build_manifest_file = [IO.Path]::GetFileName($buildDestination)
                 build_manifest_sha256 = $buildManifestHash
                 package_manifest_sha256 = $packageManifestHash
+                workspace_cargo_toml_sha256 = $workspaceManifestHash
                 source_commit = [string]$provenance.source.commit
                 source_tree = [string]$provenance.source.tree
                 cargo_toml_sha256 = [string]$provenance.source.cargo_toml_sha256
@@ -747,8 +1179,12 @@ if ($null -ne $existing[$packageName]) {
                         coordinate = [string]$provenanceResources.coordinate
                         installed_relative_root = [string]$provenanceResources.installed_relative_root
                         files = @($provenanceResources.files)
+                        dependency_closure = $dependencyClosure
                     }
                 } else { $null }
+            }
+            if ($null -ne $provenanceResources) {
+                Assert-DependencyClosure $stageResourceRoot $receipt.resources $provenanceResources $selectedSpec 'Staged frontend'
             }
             $receiptJson = ConvertTo-Json -InputObject $receipt -Depth 6
             $receiptBytes = [Text.UTF8Encoding]::new($false).GetBytes($receiptJson + [Environment]::NewLine)
@@ -791,6 +1227,9 @@ if ($null -ne $existing[$packageName]) {
                 throw 'Installed frontend bytes differ from the staged package pins.'
             }
             Assert-InstalledResourceFiles $installRoot $selectedSpec $provenanceResources 'Installed frontend'
+            if ($null -ne $provenanceResources) {
+                Assert-DependencyClosure (Join-Path $installRoot ([string]$selectedSpec.resource_installed_relative_root)) $receipt.resources $provenanceResources $selectedSpec 'Installed frontend'
+            }
             $status = 'installed'
         } catch {
             $installFailure = $_
@@ -801,7 +1240,9 @@ if ($null -ne $existing[$packageName]) {
             $cleanupHashes[$receiptDestination] = $receiptHash
             if ($resourceMoved -and $null -ne $resourceDestinationRoot) {
                 try {
+                    Assert-NoReparseTraversal $resourceDestinationRoot
                     Assert-InstalledResourceFiles $installRoot $selectedSpec $provenanceResources 'Rollback resource check'
+                    Assert-DependencyClosure (Join-Path $installRoot ([string]$selectedSpec.resource_installed_relative_root)) $receipt.resources $provenanceResources $selectedSpec 'Rollback resource check'
                     Remove-Item -LiteralPath $resourceDestinationRoot -Recurse -Force -Confirm:$false
                     $resourceMoved = $false
                 } catch {

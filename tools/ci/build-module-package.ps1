@@ -118,7 +118,7 @@ function Get-PolicySiblingBinaries([object] $Coordinate) {
 
 function Assert-PolicyResourceCoordinate([object] $Coordinate) {
     if ($null -eq $Coordinate.resource_coordinate) {
-        foreach ($field in @('resource_installed_relative_root', 'resource_repository_relative_root', 'resource_files')) {
+        foreach ($field in @('resource_installed_relative_root', 'resource_repository_relative_root', 'resource_files', 'resource_dependency_install')) {
             if ($null -ne $Coordinate[$field]) {
                 throw "Package '$($Coordinate.package_name)' has resource metadata without a resource coordinate."
             }
@@ -128,7 +128,8 @@ function Assert-PolicyResourceCoordinate([object] $Coordinate) {
     if ([string]$Coordinate.resource_coordinate -cne 'swarm-kernel-host-opencode-resources' -or
         [string]$Coordinate.resource_installed_relative_root -cne 'resources/modules/opencode' -or
         [string]$Coordinate.resource_repository_relative_root -cne 'modules/opencode' -or
-        $Coordinate.resource_files -isnot [array]) {
+        $Coordinate.resource_files -isnot [array] -or
+        $Coordinate.resource_dependency_install -isnot [System.Collections.IDictionary]) {
         throw "Package '$($Coordinate.package_name)' has an unsupported resource coordinate."
     }
     $expected = @(
@@ -145,6 +146,25 @@ function Assert-PolicyResourceCoordinate([object] $Coordinate) {
             [string]$actual[$index].path -cne $expected[$index].path -or
             [string]$actual[$index].role -cne $expected[$index].role) {
             throw "Package '$($Coordinate.package_name)' resource file coordinate drifted from the pinned OpenCode set."
+        }
+    }
+    $install = $Coordinate.resource_dependency_install
+    $expectedArguments = @('ci', '--ignore-scripts', '--no-audit', '--no-fund', '--no-progress', '--loglevel=error')
+    $actualArguments = @($install.arguments | ForEach-Object { [string]$_ })
+    if ([string]$install.manager -cne 'npm' -or
+        [string]$install.output_directory -cne 'node_modules' -or
+        [string]$install.closure_manifest_file -cne 'dependency-closure.json' -or
+        [long]$install.max_files -ne 100000 -or
+        [long]$install.max_entries -ne 200000 -or
+        [long]$install.max_total_bytes -ne 1073741824 -or
+        [long]$install.max_manifest_bytes -ne 33554432 -or
+        [long]$install.timeout_seconds -ne 1800 -or
+        $actualArguments.Count -ne $expectedArguments.Count) {
+        throw "Package '$($Coordinate.package_name)' has an unsupported locked dependency-install contract."
+    }
+    for ($index = 0; $index -lt $expectedArguments.Count; $index++) {
+        if ($actualArguments[$index] -cne $expectedArguments[$index]) {
+            throw "Package '$($Coordinate.package_name)' dependency install arguments drifted from the pinned contract."
         }
     }
 }
@@ -448,6 +468,10 @@ $binaryRows = @(
 )
 
 $manifestRelative = [IO.Path]::GetRelativePath($repoRoot, $manifestPath).Replace('\', '/')
+$selectedManifestPin = Get-PackageManifestPin $selected $repoRoot
+if ([string]$selectedManifestPin.path -cne $manifestRelative) {
+    throw 'Selected package manifest provenance differs from its exact Cargo metadata path.'
+}
 $buildManifest = [ordered]@{
     schema_version = 1
     format = 'eliot.module_build_manifest.v1'
@@ -457,6 +481,9 @@ $buildManifest = [ordered]@{
         checkout_clean_before = $true
         checkout_clean_after = $true
         cargo_toml_sha256 = Get-Sha256 $rootManifest
+        workspace_cargo_toml_sha256 = Get-Sha256 $rootManifest
+        package_manifest_path = [string]$selectedManifestPin.path
+        package_manifest_sha256 = [string]$selectedManifestPin.sha256
         cargo_lock_sha256 = Get-Sha256 $lockFile
         rust_toolchain_toml_sha256 = Get-Sha256 $toolchainFile
     }
@@ -489,7 +516,19 @@ $buildManifest = [ordered]@{
             repository_relative_root = [string]$selectedCoordinate.resource_repository_relative_root
             installed_relative_root = [string]$selectedCoordinate.resource_installed_relative_root
             files = @($resourceRows)
-            dependency_policy = [ordered]@{ node_modules = 'external_locked_installation' }
+            dependency_policy = [ordered]@{
+                node_modules = 'installer_generated_locked_closure'
+                manager = [string]$selectedCoordinate.resource_dependency_install.manager
+                install_command = 'npm ci --ignore-scripts'
+                arguments = @($selectedCoordinate.resource_dependency_install.arguments)
+                output_directory = [string]$selectedCoordinate.resource_dependency_install.output_directory
+                closure_manifest_file = [string]$selectedCoordinate.resource_dependency_install.closure_manifest_file
+                max_files = [long]$selectedCoordinate.resource_dependency_install.max_files
+                max_entries = [long]$selectedCoordinate.resource_dependency_install.max_entries
+                max_total_bytes = [long]$selectedCoordinate.resource_dependency_install.max_total_bytes
+                max_manifest_bytes = [long]$selectedCoordinate.resource_dependency_install.max_manifest_bytes
+                timeout_seconds = [long]$selectedCoordinate.resource_dependency_install.timeout_seconds
+            }
         }
     } else { $null }
     installation = [ordered]@{
