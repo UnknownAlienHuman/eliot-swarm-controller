@@ -556,7 +556,8 @@ fn canonical_directory(path: &Path) -> Result<PathBuf, String> {
     }
     #[cfg(windows)]
     {
-        for ancestor in path.ancestors().rev() {
+        let ancestors = path.ancestors().collect::<Vec<_>>();
+        for ancestor in ancestors.into_iter().rev() {
             let metadata = fs::symlink_metadata(ancestor)
                 .map_err(|_| "installed package directory path is unavailable".to_owned())?;
             if is_reparse_point(&metadata) {

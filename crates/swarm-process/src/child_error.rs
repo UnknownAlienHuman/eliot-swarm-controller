@@ -6,7 +6,7 @@ use std::{
     io::{self, Read, Write},
     sync::mpsc::{self, Receiver, SyncSender},
     thread,
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 const MAX_ERROR_LINE_BYTES: usize = 8 * 1024;
