@@ -1789,13 +1789,28 @@ pub(super) fn outcome_with_artifacts(
         .details
         .as_object()
         .is_some_and(|details| details.contains_key("owned_service_ready"));
-    if has_owned_service_ready
-        && !(module_owned_service
+    let has_ready_only_marker = r
+        .details
+        .as_object()
+        .is_some_and(|details| details.contains_key("owned_service_ready_only"));
+    let owned_service_ready_only = r.details["owned_service_ready_only"] == true;
+    let valid_ready_only_marker = has_ready_only_marker == owned_service_ready_only;
+    let valid_ready_outcome = (matches!(r.outcome, EffectOutcome::Applied)
+        && !owned_service_ready_only)
+        || (matches!(r.outcome, EffectOutcome::Rejected | EffectOutcome::Unknown)
+            && owned_service_ready_only);
+    let applied_open_requires_ready_receipt = module_owned_service
+        && o["method"] == "agent.open"
+        && matches!(r.outcome, EffectOutcome::Applied);
+    if (has_owned_service_ready || has_ready_only_marker || applied_open_requires_ready_receipt)
+        && !(valid_ready_only_marker
+            && has_owned_service_ready
+            && module_owned_service
             && o["method"] == "agent.open"
-            && matches!(r.outcome, EffectOutcome::Applied))
+            && valid_ready_outcome)
     {
         return Err(Error::invalid(
-            "owned service readiness is valid only for its applied module agent.open",
+            "owned service readiness must bind an applied or ready-only module agent.open",
         ));
     }
     // Versioned bindings require a typed receipt for every outcome. Legacy
@@ -1807,6 +1822,11 @@ pub(super) fn outcome_with_artifacts(
     } else {
         None
     };
+    if has_owned_service_ready {
+        super::launcher_owned_service::retain_module_owned_service_ready(
+            &tx, &id, generation, &o, &r,
+        )?;
+    }
     // The normalized receipt is required only for a known native admission.
     // Unknown is deliberately left unresolved so it cannot create an Attempt
     // producer or imply Task completion.
@@ -2200,9 +2220,6 @@ pub(super) fn outcome_with_artifacts(
     if matches!(r.outcome, EffectOutcome::Applied) {
         if o["method"] == "agent.open" {
             if module_owned_service {
-                super::launcher_owned_service::retain_module_owned_service_ready(
-                    &tx, &id, generation, &o, &r,
-                )?;
                 let native = r
                     .native_root_id
                     .as_deref()

@@ -1182,17 +1182,28 @@ pub(crate) fn retain_module_owned_service_ready(
     operation: &Value,
     outcome: &RuntimeOutcome,
 ) -> Result<()> {
-    if !matches!(outcome.outcome, EffectOutcome::Applied)
-        || operation["operation_id"] != outcome.operation_id
+    let session_created = matches!(outcome.outcome, EffectOutcome::Applied);
+    let ready_only = outcome.details["owned_service_ready_only"] == true;
+    let applied_open = session_created
+        && !ready_only
+        && outcome.details["completion_condition"] == "native_session_created"
+        && outcome.details["durable_origin"] == "exact_session_created_event";
+    let failed_open_with_ready_owner = ready_only
+        && matches!(
+            outcome.outcome,
+            EffectOutcome::Rejected | EffectOutcome::Unknown
+        )
+        && outcome.details.get("completion_condition").is_none()
+        && outcome.details.get("durable_origin").is_none();
+    if operation["operation_id"] != outcome.operation_id
         || operation["method"] != "agent.open"
         || operation["binding_id"] != binding_id
         || operation["binding_generation"] != generation
         || outcome.details["native_replay"] != false
-        || outcome.details["completion_condition"] != "native_session_created"
-        || outcome.details["durable_origin"] != "exact_session_created_event"
+        || !(applied_open || failed_open_with_ready_owner)
     {
         return Err(corrupt(
-            "owned service readiness is not an exact applied agent.open receipt",
+            "owned service readiness is not an exact applied or ready-only agent.open receipt",
         ));
     }
     let receipt: swarm_contracts::runtime::OwnedServiceReadyReceipt =
@@ -1222,22 +1233,7 @@ pub(crate) fn retain_module_owned_service_ready(
     let (binding, stored_route, workspace_directory, route) =
         retained_start_route(tx, binding_id, generation, &row)?;
     let expected_scope = format!("opencode-v2:{}", row.service_id);
-    let native_root_id = outcome
-        .native_root_id
-        .as_deref()
-        .filter(|value| {
-            !value.is_empty() && value.len() <= MAX_ID_BYTES && !value.chars().any(char::is_control)
-        })
-        .ok_or_else(|| corrupt("owned service open is missing its native session identity"))?;
     if outcome.native_scope_key.as_deref() != Some(expected_scope.as_str())
-        || binding
-            .native_root_id
-            .as_deref()
-            .is_some_and(|retained| retained != native_root_id)
-        || binding
-            .native_scope_key
-            .as_deref()
-            .is_some_and(|retained| retained != expected_scope.as_str())
         || model::canonical(&outcome.details["model"])?
             != model::canonical(&serde_json::to_value(route.options().model)?)?
         || model::canonical(&outcome.details["selected_model"])?
@@ -1250,7 +1246,37 @@ pub(crate) fn retain_module_owned_service_ready(
         || stored_route.native_options["directory"].as_str() != workspace_directory.to_str()
     {
         return Err(corrupt(
-            "owned service readiness differs from its retained route or native session",
+            "owned service readiness differs from its retained route or selected model",
+        ));
+    }
+    if session_created {
+        let native_root_id = outcome
+            .native_root_id
+            .as_deref()
+            .filter(|value| {
+                !value.is_empty()
+                    && value.len() <= MAX_ID_BYTES
+                    && !value.chars().any(char::is_control)
+            })
+            .ok_or_else(|| corrupt("owned service open is missing its native session identity"))?;
+        if binding
+            .native_root_id
+            .as_deref()
+            .is_some_and(|retained| retained != native_root_id)
+            || binding
+                .native_scope_key
+                .as_deref()
+                .is_some_and(|retained| retained != expected_scope.as_str())
+        {
+            return Err(corrupt(
+                "owned service readiness differs from its retained native session",
+            ));
+        }
+    } else if outcome.native_root_id.as_deref().is_some_and(|value| {
+        value.is_empty() || value.len() > MAX_ID_BYTES || value.chars().any(char::is_control)
+    }) {
+        return Err(corrupt(
+            "ready-only owner fact carries an invalid proposed native session identity",
         ));
     }
     let mut proof = serde_json::to_value(&receipt)?;

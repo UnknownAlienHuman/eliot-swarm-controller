@@ -486,8 +486,15 @@ pub(super) fn prepare(
 ) -> Result<Value> {
     let normalized_result_page =
         source["schema_id"] == swarm_contracts::module_contract::NORMALIZED_RESULT_PAGE_SCHEMA_ID;
+    let admitted_command_status_scope = if normalized_result_page {
+        None
+    } else {
+        super::command_results::admitted_status_scope(db, p, operation_id)?
+    };
     let (id, generation, b) = if normalized_result_page {
         runtime::admitted_result_scope(db, p, operation_id)?
+    } else if let Some(scope) = admitted_command_status_scope {
+        scope
     } else {
         match admitted_claude_result_scope(db, p, operation_id)? {
             Some(scope) => scope,

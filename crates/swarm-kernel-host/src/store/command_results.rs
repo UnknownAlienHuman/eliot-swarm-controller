@@ -4,11 +4,11 @@
 //! identity. This projection reports only the saved Operation state and
 //! checked terminal facts; it never publishes response text or task completion.
 
-use super::{operations, results, runtime, tasks};
+use super::{meta, operations, results, runtime, tasks};
 use crate::{
     artifacts::ArtifactRecord,
     error::{Error, Result},
-    model::{self, Principal},
+    model::{self, Principal, Role},
     runtime::{EffectOutcome, RuntimeOutcome},
 };
 use rusqlite::{Connection, OptionalExtension, params};
@@ -748,6 +748,88 @@ pub(super) fn admitted_target_snapshot(
     };
     validate_frozen_snapshot(db, binding_id, generation, target_operation_id, &snapshot)?;
     Ok(snapshot)
+}
+
+/// Return a Store scope for an already-admitted Command status result. This
+/// deliberately ignores client disablement, binding release, and link changes
+/// only after checking the immutable result Operation and its sealed target.
+pub(super) fn admitted_status_scope(
+    db: &Connection,
+    principal: &Principal,
+    result_operation_id: &str,
+) -> Result<Option<(String, i64, Value)>> {
+    if principal.role != Role::Module {
+        return Ok(None);
+    }
+    let client = meta(db, &format!("client:{}", principal.client_id))?
+        .ok_or_else(|| Error::new("UNAUTHORIZED", "module is not registered"))?;
+    if client["role"] != "module" {
+        return Err(Error::new("UNAUTHORIZED", "client is not a module"));
+    }
+    let binding_id = model::text(&client, "binding_id")?;
+    let generation = model::positive(&client, "binding_generation")?;
+    let binding = operations::get_binding(db, binding_id, generation)?;
+    if binding["observation"]["module_client_id"] != principal.client_id {
+        return Err(Error::new(
+            "MODULE_OWNER_MISMATCH",
+            "credential does not own this Command binding",
+        ));
+    }
+    if !crate::runtime::batch::is_rust_command_route(&binding["route"]) {
+        return Ok(None);
+    }
+
+    let operation = operations::get_operation(db, result_operation_id)?;
+    if operation["method"] != "agent.result" {
+        return Ok(None);
+    }
+    let original_raw: String = db.query_row(
+        "SELECT original_request_json FROM operations WHERE operation_id=?1",
+        [result_operation_id],
+        |row| row.get(0),
+    )?;
+    let original: Value = serde_json::from_str(&original_raw)?;
+    let selector = &original["selector"];
+    if selector["kind"] != "command_status" {
+        return Ok(None);
+    }
+    model::fields(selector, &["kind", "input_operation_id"])?;
+    let target_operation_id = model::text(selector, "input_operation_id")?;
+    if !matches!(
+        operation["state"].as_str(),
+        Some("sending" | "native_accepted" | "outcome_unknown" | "settled")
+    ) {
+        return Err(Error::conflict(
+            "Command status page does not belong to an admitted result Operation",
+        ));
+    }
+
+    if operation["binding_id"] != binding_id || operation["binding_generation"] != generation {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "Command status result belongs to another binding generation",
+        ));
+    }
+    let target = operations::get_operation(db, target_operation_id)?;
+    if target["method"] != "task.dispatch"
+        || target["binding_id"] != binding_id
+        || target["binding_generation"] != generation
+        || operation["task_id"] != target["task_id"]
+        || operation["attempt_id"] != target["attempt_id"]
+    {
+        return Err(Error::new(
+            "RESULT_TARGET_SCOPE_INVALID",
+            "Command status result does not name its exact retained Task dispatch",
+        ));
+    }
+    admitted_target_snapshot(
+        db,
+        result_operation_id,
+        binding_id,
+        generation,
+        target_operation_id,
+    )?;
+    Ok(Some((binding_id.to_owned(), generation, binding)))
 }
 
 pub(super) fn admitted_output_snapshot(

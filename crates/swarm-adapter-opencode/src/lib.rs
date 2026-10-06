@@ -920,7 +920,7 @@ async fn queue_unknown_result(
         unknown.details["native_session_id"] = json!(target.native_session_id);
         unknown.details["native_input_id"] = json!(target.native_input_id);
         unknown.details["assistant_message_id"] = json!(target.assistant_message_id);
-        unknown.details["assistant_parent_id"] = json!(target.assistant_parent_id);
+        unknown.details["expected_assistant_parent_id"] = json!(target.assistant_parent_id);
         unknown.details["target_input_sha256"] = json!(target.target_input_sha256);
         unknown.details["target_module_receipt"] = json!(target.target_module_receipt);
         unknown.details["assistant_result_correlation"] = json!("unknown");
@@ -1066,24 +1066,49 @@ async fn handle_open(
             return flush_outbox(host).await;
         }
     };
+    let owner_ready = owner_ready.map(serde_json::to_value).transpose()?;
     let native = match NativeClient::connect(options).await {
         Ok((native, _)) => native,
         Err(error) => {
-            return queue_rejected(host, command, options, None, &error).await;
+            let mut rejected = outcome(
+                command,
+                claim,
+                EffectOutcome::Rejected,
+                options,
+                None,
+                None,
+                diagnostic(&error),
+            )?;
+            attach_owned_service_ready_only(&mut rejected, owner_ready.as_ref(), options);
+            journal.queue_outcome(&rejected)?;
+            return flush_outbox(host).await;
         }
     };
     let provider_auth = match native_owner.bootstrap_provider_auth(&native, options).await {
         Ok(proof) => proof,
         Err(error) => {
-            let outcome = effect_failure(command, claim, options, Some(root), None, &error, true)?;
-            journal.queue_outcome(&outcome)?;
+            let mut failure =
+                effect_failure(command, claim, options, Some(root), None, &error, true)?;
+            attach_owned_service_ready_only(&mut failure, owner_ready.as_ref(), options);
+            journal.queue_outcome(&failure)?;
             return flush_outbox(host).await;
         }
     };
     let location = match native.preflight_open(options).await {
         Ok(location) => location,
         Err(error) => {
-            return queue_rejected(host, command, options, None, &error).await;
+            let mut rejected = outcome(
+                command,
+                claim,
+                EffectOutcome::Rejected,
+                options,
+                None,
+                None,
+                diagnostic(&error),
+            )?;
+            attach_owned_service_ready_only(&mut rejected, owner_ready.as_ref(), options);
+            journal.queue_outcome(&rejected)?;
+            return flush_outbox(host).await;
         }
     };
     // This fsync is the barrier before the one native create POST. On any
@@ -1096,8 +1121,8 @@ async fn handle_open(
                 "native_replay":false,
                 "model":options.model
             });
-            if let Some(receipt) = owner_ready {
-                details["owned_service_ready"] = serde_json::to_value(receipt)?;
+            if let Some(receipt) = owner_ready.as_ref() {
+                details["owned_service_ready"] = receipt.clone();
             }
             if let Some(proof) = provider_auth {
                 details["provider_auth"] = proof;
@@ -1112,10 +1137,29 @@ async fn handle_open(
                 details,
             )?
         }
-        Err(error) => effect_failure(command, claim, options, Some(root), None, &error, true)?,
+        Err(error) => {
+            let mut failure =
+                effect_failure(command, claim, options, Some(root), None, &error, true)?;
+            attach_owned_service_ready_only(&mut failure, owner_ready.as_ref(), options);
+            failure
+        }
     };
     journal.queue_outcome(&outcome)?;
     flush_outbox(host).await
+}
+
+fn attach_owned_service_ready_only(
+    outcome: &mut RuntimeOutcome,
+    receipt: Option<&Value>,
+    options: &NativeOptions,
+) {
+    let Some(receipt) = receipt else {
+        return;
+    };
+    outcome.details["owned_service_ready"] = receipt.clone();
+    outcome.details["owned_service_ready_only"] = json!(true);
+    outcome.details["native_replay"] = json!(false);
+    outcome.details["model"] = json!(options.model);
 }
 
 fn sha256(bytes: &[u8]) -> String {
