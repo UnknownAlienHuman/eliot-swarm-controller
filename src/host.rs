@@ -182,9 +182,6 @@ async fn run_until(
     } else {
         None
     };
-    let module_supervisor_handle = optional_module_supervisor
-        .as_ref()
-        .map(|actor| actor.handle.clone());
     let optional_bus_supervisor = crate::host_bus_supervisor::spawn_isolated_managed_bus_supervisor(
         owner.store.clone(),
         root_path.clone(),
@@ -235,11 +232,10 @@ async fn run_until(
                 let stream=match accepted{Ok(s)=>s,Err(e)=>break Err(e)};
                 let permit=match semaphore.clone().try_acquire_owned(){Ok(p)=>p,Err(_)=>{drop(stream);continue}};
                 let store=owner.store.clone();let config=ipc_config.clone();let stopping=stopping.clone();
-                let module_supervisor=module_supervisor_handle.clone();
                 connections.spawn(async move{
                     let _permit=permit;
                     if let Err(e)=ipc::serve_with_module_supervisor(
-                        stream,store,config,stopping,module_supervisor
+                        stream,store,config,stopping,None
                     ).await{eprintln!("IPC connection: {}",e.code);}
                 });
             }

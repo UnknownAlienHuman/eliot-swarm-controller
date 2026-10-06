@@ -29,8 +29,8 @@ pub use observation::{
     ModuleEffectCertainty, ModuleFailureStage, ModuleSupervisorObservation, ModuleSupervisorPhase,
 };
 pub use standalone::{
-    LaunchConfigProvider, StandaloneLaunchConfig, StandaloneSupervisor, StandaloneSupervisorConfig,
-    SupervisorBootstrap,
+    LaunchConfigProvider, StandaloneLaunchConfig, StandaloneRouteConfigMapper,
+    StandaloneSupervisor, StandaloneSupervisorConfig, SupervisorBootstrap,
 };
 pub use supervisor::{
     AdmissionState, DemandCause, DemandLease, FailureSummary, KernelFault, LifecycleState,

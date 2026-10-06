@@ -8,10 +8,10 @@
 
 use crate::{
     AdmissionState, BindingLaunchConfig, BindingMapPublication, CapabilityId, DemandCause,
-    DemandLease, DescriptorCatalog, KernelFault, ModuleBindingCredential, ModuleDemandCursor,
-    ModuleDemandRecord, ModuleDescriptor, ModuleOwnerExecutable, ModuleSupervisorObservation,
-    OperationReadback, OperationSnapshot, ProtectedResolverContext, ResolverMapDirectory,
-    ServiceScope, Sha256Digest, SupervisorControlClient, SupervisorRegistry,
+    DemandLease, DescriptorCatalog, KernelFault, LaunchValue, ModuleBindingCredential,
+    ModuleDemandCursor, ModuleDemandRecord, ModuleDescriptor, ModuleOwnerExecutable,
+    ModuleSupervisorObservation, OperationReadback, OperationSnapshot, ProtectedResolverContext,
+    ResolverMapDirectory, ServiceScope, Sha256Digest, SupervisorControlClient, SupervisorRegistry,
     SupervisorRegistryConfig, load_installed_descriptor, module_contract_claim,
 };
 use serde::{Deserialize, Serialize};
@@ -19,7 +19,7 @@ use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     fs,
-    io::{Read, Write},
+    io::{BufRead, Cursor, Read, Write},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -44,6 +44,9 @@ const MAX_PROTECTED_FILES: usize = 128;
 const MAX_LAUNCH_CONFIGS: usize = 256;
 const MAX_STATUS_QUEUE: usize = 1_024;
 const MODULE_SUPERVISOR_CLIENT_ID: &str = "eliot-module-supervisor-v1";
+const OPENCODE_NATIVE_OPTIONS_SCHEMA_ID: &str = "opencode-v2-native-options";
+const OPENCODE_NATIVE_OPTIONS_SCHEMA_SHA256: &str =
+    "d597be6bae80dc82535b658b5daaf3037a09976e5704d799a6715a673a62f662";
 
 /// A launch configuration bound to one exact descriptor artifact and route
 /// option digest. Route options themselves remain in the authenticated demand
@@ -96,6 +99,20 @@ pub struct StandaloneSupervisorConfig {
     pub protected_files: BTreeMap<ProtectedRef, PathBuf>,
     #[serde(default)]
     pub launch_configs: BTreeMap<String, StandaloneLaunchConfig>,
+    /// The host's already-validated route mapper. This enum is deliberately
+    /// neutral: it carries the mapper choice across the process boundary,
+    /// never route payloads or credentials.
+    #[serde(default)]
+    pub route_config_mapper: StandaloneRouteConfigMapper,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum StandaloneRouteConfigMapper {
+    #[default]
+    DescriptorSchema,
+    EmptyOnly,
+    OpenCodeSevenField,
 }
 
 impl StandaloneSupervisorConfig {
@@ -206,6 +223,42 @@ impl SupervisorBootstrap {
         Ok(bootstrap)
     }
 
+    /// Read one bounded newline-delimited bootstrap frame. Keeping the pipe
+    /// open after this frame lets the host signal graceful shutdown with EOF.
+    pub fn from_frame<R: BufRead>(mut reader: R) -> Result<Self> {
+        let mut line = Vec::with_capacity(MAX_BOOTSTRAP_BYTES.min(4096));
+        let read = reader.read_until(b'\n', &mut line)?;
+        if read == 0 {
+            return Err(Error::invalid("supervisor bootstrap frame is missing"));
+        }
+        if line.len() > MAX_BOOTSTRAP_BYTES {
+            return Err(Error::invalid(
+                "supervisor bootstrap exceeds its size bound",
+            ));
+        }
+        let bootstrap: Self = serde_json::from_reader(Cursor::new(line.as_slice()))?;
+        bootstrap.validate()?;
+        Ok(bootstrap)
+    }
+
+    pub fn to_frame(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        let mut bytes = serde_json::to_vec(self)?;
+        bytes.push(b'\n');
+        if bytes.len() > MAX_BOOTSTRAP_BYTES {
+            return Err(Error::invalid(
+                "supervisor bootstrap exceeds its size bound",
+            ));
+        }
+        Ok(bytes)
+    }
+
+    pub fn write_frame<W: Write>(&self, mut writer: W) -> Result<()> {
+        writer.write_all(&self.to_frame()?)?;
+        writer.flush()?;
+        Ok(())
+    }
+
     pub fn write_to<W: Write>(&self, mut writer: W) -> Result<()> {
         self.validate()?;
         let bytes = serde_json::to_vec(self)?;
@@ -233,6 +286,7 @@ pub trait LaunchConfigProvider: Send + Sync + 'static {
 
 struct StaticLaunchConfigProvider {
     entries: BTreeMap<String, StandaloneLaunchConfig>,
+    mapper: StandaloneRouteConfigMapper,
 }
 
 impl LaunchConfigProvider for StaticLaunchConfigProvider {
@@ -243,16 +297,7 @@ impl LaunchConfigProvider for StaticLaunchConfigProvider {
     ) -> Result<BindingLaunchConfig> {
         let module_id = descriptor.module_id.as_str();
         let Some(entry) = self.entries.get(module_id) else {
-            if route_native_options
-                .as_object()
-                .is_some_and(serde_json::Map::is_empty)
-            {
-                return Ok(BindingLaunchConfig::default());
-            }
-            return Err(Error::new(
-                "MODULE_CONFIG_PROVIDER_REQUIRED",
-                "non-empty route options require an exact host launch-config mapping",
-            ));
+            return map_route_config(self.mapper, descriptor, route_native_options);
         };
         if entry.artifact_id != descriptor.artifact.artifact_id.as_str()
             || entry.artifact_version != descriptor.artifact.version.as_str()
@@ -266,6 +311,160 @@ impl LaunchConfigProvider for StaticLaunchConfigProvider {
         }
         Ok(entry.config.clone())
     }
+}
+
+fn map_route_config(
+    mapper: StandaloneRouteConfigMapper,
+    descriptor: &ModuleDescriptor,
+    route_native_options: &Value,
+) -> Result<BindingLaunchConfig> {
+    match mapper {
+        StandaloneRouteConfigMapper::EmptyOnly => {
+            if route_native_options
+                .as_object()
+                .is_some_and(serde_json::Map::is_empty)
+            {
+                Ok(BindingLaunchConfig::default())
+            } else {
+                Err(Error::new(
+                    "MODULE_CONFIG_SCHEMA_UNSUPPORTED",
+                    "this host has no schema-validated mapper for the binding's native options",
+                ))
+            }
+        }
+        StandaloneRouteConfigMapper::DescriptorSchema => match descriptor.config_schema.as_ref() {
+            None => Ok(BindingLaunchConfig::default()),
+            Some(schema)
+                if schema.schema_id == OPENCODE_NATIVE_OPTIONS_SCHEMA_ID
+                    && schema.version == "1"
+                    && schema.sha256.as_ref().is_some_and(|digest| {
+                        digest.as_str() == OPENCODE_NATIVE_OPTIONS_SCHEMA_SHA256
+                    }) =>
+            {
+                open_code_route_config(descriptor, route_native_options)
+            }
+            Some(_) => Err(Error::new(
+                "MODULE_CONFIG_SCHEMA_UNSUPPORTED",
+                "the retained descriptor names a launch config schema with no supervisor mapper",
+            )),
+        },
+        StandaloneRouteConfigMapper::OpenCodeSevenField => {
+            open_code_route_config(descriptor, route_native_options)
+        }
+    }
+}
+
+fn open_code_route_config(
+    descriptor: &ModuleDescriptor,
+    options: &Value,
+) -> Result<BindingLaunchConfig> {
+    if !descriptor.config_schema.as_ref().is_some_and(|schema| {
+        schema.schema_id == OPENCODE_NATIVE_OPTIONS_SCHEMA_ID
+            && schema.version == "1"
+            && schema
+                .sha256
+                .as_ref()
+                .is_some_and(|digest| digest.as_str() == OPENCODE_NATIVE_OPTIONS_SCHEMA_SHA256)
+    }) {
+        return Err(Error::new(
+            "MODULE_CONFIG_SCHEMA_MISMATCH",
+            "OpenCode route values require the exact registered native-options schema",
+        ));
+    }
+    let object = options.as_object().ok_or_else(|| {
+        Error::new(
+            "MODULE_CONFIG_INVALID",
+            "OpenCode route options must be an object",
+        )
+    })?;
+    let allowed = [
+        "service_id",
+        "connection_file",
+        "expected_version",
+        "directory",
+        "model",
+    ];
+    if object.keys().any(|key| !allowed.contains(&key.as_str())) || object.len() != allowed.len() {
+        return Err(Error::new(
+            "MODULE_CONFIG_INVALID",
+            "OpenCode route options must contain only the seven declared adapter values",
+        ));
+    }
+    let model = object["model"].as_object().ok_or_else(|| {
+        Error::new(
+            "MODULE_CONFIG_INVALID",
+            "OpenCode model options must be an object",
+        )
+    })?;
+    if model
+        .keys()
+        .any(|key| !["id", "providerID", "variant"].contains(&key.as_str()))
+        || model.len() != 3
+    {
+        return Err(Error::new(
+            "MODULE_CONFIG_INVALID",
+            "OpenCode model options must contain id, providerID, and variant only",
+        ));
+    }
+    let service_id = required_config_string(&object["service_id"], "service_id", 128)?;
+    let connection_file =
+        required_config_string(&object["connection_file"], "connection_file", 4096)?;
+    let expected_version =
+        required_config_string(&object["expected_version"], "expected_version", 256)?;
+    let directory = required_config_string(&object["directory"], "directory", 4096)?;
+    if !Path::new(&connection_file).is_absolute() || !Path::new(&directory).is_absolute() {
+        return Err(Error::new(
+            "MODULE_CONFIG_INVALID",
+            "OpenCode connection_file and directory values must be absolute paths",
+        ));
+    }
+    let model_id = required_config_string(&model["id"], "model.id", 256)?;
+    let provider_id = required_config_string(&model["providerID"], "model.providerID", 256)?;
+    let variant = required_config_string(&model["variant"], "model.variant", 256)?;
+    let config = BindingLaunchConfig {
+        values: BTreeMap::from([
+            (
+                "OPENCODE_SERVICE_ID".to_owned(),
+                LaunchValue::Literal(service_id),
+            ),
+            (
+                "OPENCODE_CONNECTION_FILE".to_owned(),
+                LaunchValue::Literal(connection_file),
+            ),
+            (
+                "OPENCODE_EXPECTED_VERSION".to_owned(),
+                LaunchValue::Literal(expected_version),
+            ),
+            (
+                "OPENCODE_DIRECTORY".to_owned(),
+                LaunchValue::Literal(directory),
+            ),
+            (
+                "OPENCODE_MODEL_ID".to_owned(),
+                LaunchValue::Literal(model_id),
+            ),
+            (
+                "OPENCODE_PROVIDER_ID".to_owned(),
+                LaunchValue::Literal(provider_id),
+            ),
+            ("OPENCODE_VARIANT".to_owned(), LaunchValue::Literal(variant)),
+        ]),
+    };
+    config.validate().map_err(module_error)?;
+    Ok(config)
+}
+
+fn required_config_string(value: &Value, field: &str, max: usize) -> Result<String> {
+    value
+        .as_str()
+        .filter(|text| !text.is_empty() && text.len() <= max && !text.chars().any(char::is_control))
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| {
+            Error::new(
+                "MODULE_CONFIG_INVALID",
+                format!("OpenCode {field} is missing or invalid"),
+            )
+        })
 }
 
 #[derive(Clone, Hash, PartialEq, Eq)]
@@ -299,6 +498,7 @@ impl StandaloneSupervisor {
     pub async fn start(config: StandaloneSupervisorConfig) -> Result<Self> {
         let provider = Arc::new(StaticLaunchConfigProvider {
             entries: config.launch_configs.clone(),
+            mapper: config.route_config_mapper,
         });
         Self::start_with_provider(config, provider).await
     }
@@ -386,6 +586,7 @@ impl StandaloneSupervisor {
                 return Ok(());
             }
             let mut cycle_error = None::<String>;
+            let mut saw_demand = false;
             match self.control.admission().await {
                 Ok(AdmissionState::Open) => {
                     if !recovered {
@@ -403,12 +604,15 @@ impl StandaloneSupervisor {
                         }
                     }
                     if recovered {
-                        if let Err(error) = self.reconcile_demands(&mut held).await {
-                            self.registry
-                                .close_durable_admission(KernelFault::StoreUnavailable);
-                            recovered = false;
-                            cycle_error = Some(error.code.clone());
-                            eprintln!("module supervisor demand readback: {}", error.code);
+                        match self.reconcile_demands(&mut held).await {
+                            Ok(found) => saw_demand = found,
+                            Err(error) => {
+                                self.registry
+                                    .close_durable_admission(KernelFault::StoreUnavailable);
+                                recovered = false;
+                                cycle_error = Some(error.code.clone());
+                                eprintln!("module supervisor demand readback: {}", error.code);
+                            }
                         }
                     }
                 }
@@ -434,7 +638,7 @@ impl StandaloneSupervisor {
                 cycle_error.get_or_insert_with(|| error.code.clone());
                 eprintln!("module supervisor observation: {}", error.code);
             }
-            if let Some(error_code) = cycle_error {
+            if let Some(ref error_code) = cycle_error {
                 consecutive_failures = consecutive_failures.saturating_add(1).min(32);
                 self.publish_health(
                     &mut last_health,
@@ -448,6 +652,19 @@ impl StandaloneSupervisor {
                 consecutive_failures = 0;
                 self.publish_health(&mut last_health, "running", 0, None, None)
                     .await;
+            }
+            if recovered
+                && cycle_error.is_none()
+                && !saw_demand
+                && held.is_empty()
+                && pending.is_empty()
+                && !self.registry_has_obligations().await
+            {
+                // Registry descriptors are retained in memory for this
+                // process, but no demand, owner, readback, or observation
+                // obligation needs a permanent safety-only poller. The host
+                // demand watch launches a fresh sibling for future demand.
+                return Ok(());
             }
             tokio::select! {
                 _ = tick.tick() => {}
@@ -524,9 +741,10 @@ impl StandaloneSupervisor {
             .map_err(module_error)
     }
 
-    async fn reconcile_demands(&self, held: &mut HashMap<DemandKey, DemandLease>) -> Result<()> {
+    async fn reconcile_demands(&self, held: &mut HashMap<DemandKey, DemandLease>) -> Result<bool> {
         let mut cursor = None::<ModuleDemandCursor>;
         let mut seen = HashSet::<DemandKey>::new();
+        let mut saw_demand = false;
         loop {
             let page = self.control.demand_page(cursor.as_ref()).await?;
             if page.truncated && page.next_cursor.is_none() {
@@ -535,7 +753,14 @@ impl StandaloneSupervisor {
                     "module demand page omitted its continuation cursor",
                 ));
             }
+            if !page.truncated && page.next_cursor.is_some() {
+                return Err(Error::new(
+                    "MODULE_DEMAND_CURSOR_UNEXPECTED",
+                    "module demand page returned a cursor without truncation",
+                ));
+            }
             for blocked in &page.blocked {
+                saw_demand = true;
                 // The durable Store already owns the blocked-demand reason;
                 // keep this process diagnostic bounded to its typed code.
                 eprintln!(
@@ -544,6 +769,7 @@ impl StandaloneSupervisor {
                 );
             }
             for demand in page.demands {
+                saw_demand = true;
                 let key = demand_key(&demand);
                 seen.insert(key.clone());
                 if held.contains_key(&key) {
@@ -712,7 +938,21 @@ impl StandaloneSupervisor {
                 let _ = held.remove(&key);
             }
         }
-        Ok(())
+        Ok(saw_demand)
+    }
+
+    async fn registry_has_obligations(&self) -> bool {
+        self.registry.statuses().await.into_iter().any(|status| {
+            status.owner.is_some()
+                || status.worker.is_some()
+                || status.readback_required
+                || status.unknown_operation_count != 0
+                || !status.unknown_operation_ids.is_empty()
+                || matches!(
+                    status.effect_certainty,
+                    crate::ModuleEffectCertainty::Unknown
+                )
+        })
     }
 
     async fn start_demand(
