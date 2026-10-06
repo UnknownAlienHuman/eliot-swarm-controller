@@ -108,7 +108,7 @@ pub fn decode_line(line: &[u8]) -> Result<DiagnosticRecord> {
             "diagnostic line is not the supported metadata schema",
         )
     })?;
-    if !matches!(record.schema_version, 1 | 2 | 3 | 4) {
+    if !matches!(record.schema_version, 1..=4) {
         return Err(Error::new(
             "OBSERVER_SCHEMA_UNSUPPORTED",
             "diagnostic schema version is unsupported",

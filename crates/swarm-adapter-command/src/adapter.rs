@@ -342,8 +342,7 @@ fn normalized_dispatch_admission(
             "dispatch context source identity differs from the command",
         ));
     }
-    if prompt.as_bytes().len() != identity.prompt_bytes
-        || digest(prompt.as_bytes()) != identity.prompt_sha256
+    if prompt.len() != identity.prompt_bytes || digest(prompt.as_bytes()) != identity.prompt_sha256
     {
         return Err(Error::new(
             "ADAPTER_EVIDENCE_CONFLICT",
@@ -568,10 +567,10 @@ async fn process_command(
             )
             .await?;
             let mut outcome = invocation.outcome;
-            if matches!(outcome.outcome, EffectOutcome::Applied) {
-                if let Some(admission) = dispatch_admission.as_ref() {
-                    outcome.details["dispatch_admission"] = serde_json::to_value(admission)?;
-                }
+            if matches!(outcome.outcome, EffectOutcome::Applied)
+                && let Some(admission) = dispatch_admission.as_ref()
+            {
+                outcome.details["dispatch_admission"] = serde_json::to_value(admission)?;
             }
             validate_dispatch_outcome(&outcome, dispatch_admission.as_ref())?;
             Ok((vec![outcome], invocation.stop_bridge))
@@ -891,6 +890,9 @@ fn target_dispatch_identity(command: &RuntimeCommand, target_id: &str) -> Result
     })
 }
 
+// Keep the transport, binding, route, outcome, and receipt hash together: the
+// journal retry path validates every item before it sends the saved envelope.
+#[allow(clippy::too_many_arguments)]
 async fn deliver_outcome(
     mut client: ModuleLink,
     config: &Config,
@@ -1336,7 +1338,7 @@ fn load_owner() -> Result<Owner> {
             "module owner record is not the exact child of its state directory",
         ));
     }
-    if owner_metadata.len() > MAX_CREDENTIAL_BYTES as u64 {
+    if owner_metadata.len() > MAX_CREDENTIAL_BYTES {
         return Err(Error::new(
             "MODULE_OWNER_INVALID",
             "module owner record is too large",

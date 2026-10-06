@@ -93,7 +93,7 @@ pub fn build(command: &RuntimeCommand, claim: &ModuleContractClaim) -> Result<Va
             "requested Command status page range is invalid",
         ));
     }
-    let end = offset.checked_add(requested).unwrap_or(u64::MAX).min(total);
+    let end = offset.saturating_add(requested).min(total);
     let start = usize::try_from(offset)
         .map_err(|_| Error::new("RESULT_RANGE_INVALID", "page offset is too large"))?;
     let end_index = usize::try_from(end)
@@ -194,10 +194,7 @@ pub fn build_output(
             "requested Command output page range is invalid",
         ));
     }
-    let end = offset
-        .checked_add(requested)
-        .unwrap_or(u64::MAX)
-        .min(stored_bytes);
+    let end = offset.saturating_add(requested).min(stored_bytes);
     let start = usize::try_from(offset)
         .map_err(|_| Error::new("RESULT_RANGE_INVALID", "page offset is too large"))?;
     let end_index = usize::try_from(end)
@@ -358,10 +355,7 @@ pub fn build_normalized_output(
             "requested Command output page range is invalid",
         ));
     }
-    let end = offset
-        .checked_add(requested)
-        .unwrap_or(u64::MAX)
-        .min(payload_bytes);
+    let end = offset.saturating_add(requested).min(payload_bytes);
     let start = usize::try_from(offset)
         .map_err(|_| Error::new("RESULT_RANGE_INVALID", "page offset is too large"))?;
     let end_index = usize::try_from(end)
@@ -1157,14 +1151,14 @@ fn sha256_hex(bytes: &[u8]) -> String {
 fn encode_base64(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    let mut chunks = bytes.chunks_exact(3);
-    for chunk in &mut chunks {
+    let (chunks, remainder) = bytes.as_chunks::<3>();
+    for chunk in chunks {
         encoded.push(ALPHABET[(chunk[0] >> 2) as usize] as char);
         encoded.push(ALPHABET[(((chunk[0] & 0x03) << 4) | (chunk[1] >> 4)) as usize] as char);
         encoded.push(ALPHABET[(((chunk[1] & 0x0f) << 2) | (chunk[2] >> 6)) as usize] as char);
         encoded.push(ALPHABET[(chunk[2] & 0x3f) as usize] as char);
     }
-    match chunks.remainder() {
+    match remainder {
         [first] => {
             encoded.push(ALPHABET[(*first >> 2) as usize] as char);
             encoded.push(ALPHABET[(((*first) & 0x03) << 4) as usize] as char);
@@ -1183,11 +1177,11 @@ fn encode_base64(bytes: &[u8]) -> String {
 }
 
 fn decode_base64(encoded: &str) -> Result<Vec<u8>> {
-    if encoded.len() % 4 != 0 {
+    if !encoded.len().is_multiple_of(4) {
         return Err(invalid("saved Command output is not canonical base64"));
     }
     let mut decoded = Vec::with_capacity(encoded.len() / 4 * 3);
-    let chunks: Vec<_> = encoded.as_bytes().chunks_exact(4).collect();
+    let (chunks, _) = encoded.as_bytes().as_chunks::<4>();
     for (index, chunk) in chunks.iter().enumerate() {
         let last = index + 1 == chunks.len();
         let a =

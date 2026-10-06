@@ -1,6 +1,6 @@
 # Agent Operations — Manager-Owned Automation
 
-Revision 9 · 2026-10-05 · source delivery `3fff155`; current runtime qualification remains pending.
+Revision 10 · 2026-10-05 · current source baseline `f51cf1b`; runtime qualification remains pending.
 
 **Status: partial implementation.** Current source includes manager-owned action
 admission and transfer, durable intake and peer coordination, the reviewed
@@ -11,6 +11,15 @@ path. Source checks, exact CI commits, native failures and remaining gaps are
 recorded in [Implementation status](../implementation-status.md); successful
 source tests do not establish productive native/model execution. The documents
 below retain the complete requirements, including work still outstanding.
+
+The current source integration includes the physical Kernel move and all five
+Rust adapter paths. The latest scoped production Clippy `--keep-going` run
+failed with compile/lint errors across the adapters, supervisor, observer,
+Forge, bus and checks; the integrated source batch addresses those defects. No tests, full
+builds or native/provider/model calls have run in this source phase. Productive
+qualification remains pending. OpenCode without exact assistant-parent proof
+remains `Unknown`, Antigravity's unavailable result body remains unavailable,
+and frozen historical qualification receipts are unchanged.
 
 ## Current operability and modularization
 
@@ -32,8 +41,8 @@ demand-driven activation, simpler ordinary manager authority and local restart.
 [Observability](observability.md) owns adjustable diagnostic depth and live views.
 These are implementation contracts, not another activation ledger or approval
 phase. Existing O1–O11 work is retained; M1–M6 specifies its extraction order and
-concrete completion conditions. Finish required source before compilation,
-tests and native qualification, as directed by the owner.
+concrete completion conditions. Finish required source before tests and native
+qualification, using scoped Clippy to close compile defects during development.
 
 ## Product rule
 

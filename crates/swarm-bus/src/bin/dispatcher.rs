@@ -391,11 +391,11 @@ fn ensure_private_directory(root: &Path, path: &Path) -> Result<()> {
                     "managed worker directory traverses a link or non-directory",
                 ));
             }
-            Ok(metadata) => {
+            Ok(_metadata) => {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
-                    if metadata.permissions().mode() & 0o077 != 0 {
+                    if _metadata.permissions().mode() & 0o077 != 0 {
                         return Err(Error::new(
                             "BUS_WORKER_CONFIG_NOT_PRIVATE",
                             "managed worker directory is not owner-only",
@@ -436,7 +436,7 @@ async fn revoke(options: &std::collections::BTreeMap<String, String>) -> Result<
     let root = PathBuf::from(required(options, "--root")?);
     let manager_path = PathBuf::from(required(options, "--manager-credential")?);
     let worker_path = PathBuf::from(required(options, "--worker-config")?);
-    let manager = SecretCredential(read_credential(&manager_path)?);
+    let mut manager = SecretCredential(read_credential(&manager_path)?);
     let worker = read_worker_config(&worker_path)?;
     if worker.store_root != root || worker.manager_id != manager.0.client_id {
         return Err(Error::new(

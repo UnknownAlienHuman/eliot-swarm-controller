@@ -562,7 +562,7 @@ fn open_code_route_config(
         let owner_connection_file = owner_state_root.join("connection.json");
         let owner_password_file = owner_state_root.join("server.password");
         if configured_service_id != owner_service_id
-            || PathBuf::from(configured_connection_file.clone()) != owner_connection_file
+            || Path::new(&configured_connection_file) != owner_connection_file
         {
             return Err(Error::new(
                 "MODULE_CONFIG_SCOPE_MISMATCH",
@@ -881,7 +881,7 @@ impl StandaloneSupervisor {
                     &mut last_health,
                     "retry_wait",
                     consecutive_failures,
-                    Some(&error_code),
+                    Some(error_code),
                     Some(RECONCILE_INTERVAL),
                 )
                 .await;
@@ -1042,13 +1042,12 @@ impl StandaloneSupervisor {
                         .map_err(module_error)
                     {
                         eprintln!("module operation apply: {}", error.code);
-                    } else if let Some(boot_id) = readback.module_hello_boot_id.as_deref() {
-                        if let Err(error) = self
+                    } else if let Some(boot_id) = readback.module_hello_boot_id.as_deref()
+                        && let Err(error) = self
                             .confirm_module_hello(&key.module_id, &scope, boot_id)
                             .await
-                        {
-                            eprintln!("module hello readback: {}", error.code);
-                        }
+                    {
+                        eprintln!("module hello readback: {}", error.code);
                     }
                     continue;
                 }
@@ -1095,13 +1094,12 @@ impl StandaloneSupervisor {
                         eprintln!("module new-scope apply: {}", error.code);
                         continue;
                     }
-                    if let Some(boot_id) = stored.module_hello_boot_id.as_deref() {
-                        if let Err(error) = self
+                    if let Some(boot_id) = stored.module_hello_boot_id.as_deref()
+                        && let Err(error) = self
                             .confirm_module_hello(&demand.module_id, &scope, boot_id)
                             .await
-                        {
-                            eprintln!("module new-scope hello readback: {}", error.code);
-                        }
+                    {
+                        eprintln!("module new-scope hello readback: {}", error.code);
                     }
                 }
                 match self.start_demand(&demand, readback).await {
@@ -1159,13 +1157,12 @@ impl StandaloneSupervisor {
                 eprintln!("module stale-scope apply: {}", error.code);
                 continue;
             }
-            if let Some(boot_id) = readback.module_hello_boot_id.as_deref() {
-                if let Err(error) = self
+            if let Some(boot_id) = readback.module_hello_boot_id.as_deref()
+                && let Err(error) = self
                     .confirm_module_hello(&key.module_id, &scope, boot_id)
                     .await
-                {
-                    eprintln!("module stale-scope hello readback: {}", error.code);
-                }
+            {
+                eprintln!("module stale-scope hello readback: {}", error.code);
             }
             let pending = readback
                 .operations
@@ -1540,7 +1537,7 @@ fn create_private_directory(path: &Path) -> Result<()> {
             Err(error) => return Err(error.into()),
         }
     }
-    swarm_process::private_permissions(path, true).map_err(Into::into)
+    swarm_process::private_permissions(path, true)
 }
 
 #[cfg(windows)]

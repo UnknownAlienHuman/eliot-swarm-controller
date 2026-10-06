@@ -396,6 +396,8 @@ impl LiveSettings {
         }
     }
 
+    // Keep each filtering dimension explicit at the shared observer policy boundary.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn allows_with_manager_override(
         &self,
         now_unix_ms: u64,
@@ -422,6 +424,8 @@ impl LiveSettings {
         }
     }
 
+    // These inputs mirror the recorder record fields evaluated by this single filter.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn allows_record(
         &self,
         now_unix_ms: u64,
@@ -507,6 +511,8 @@ impl LiveSettings {
         self.level
     }
 
+    // The live redaction callback uses the same explicit scope dimensions as record filtering.
+    #[allow(clippy::too_many_arguments)]
     fn allows_text_capture(
         &self,
         now_unix_ms: u64,

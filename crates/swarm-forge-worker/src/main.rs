@@ -220,8 +220,8 @@ fn run_from_args(args: Vec<OsString>) -> Result<()> {
 }
 
 fn run_forge_plan(paths: &JobPaths, plan_bytes: &[u8]) -> Result<()> {
-    let plan_sha256 = digest(&plan_bytes);
-    let plan: WorkPlan = serde_json::from_slice(&plan_bytes)
+    let plan_sha256 = digest(plan_bytes);
+    let plan: WorkPlan = serde_json::from_slice(plan_bytes)
         .map_err(|_| Error::invalid("Forge work plan is invalid"))?;
     validate_job_paths(paths)?;
     validate_plan(&plan)?;
@@ -547,27 +547,21 @@ fn run_github_patch_command(plan: &GitHubDescriptionPlan, owner: &Group) -> Resu
         .map(|mut stdin| thread::spawn(move || stdin.write_all(&input)));
     let deadline = Instant::now() + Duration::from_secs(plan.timeout_seconds);
     let mut timed_out = false;
-    let mut status: Option<ExitStatus> = None;
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(exit)) => {
-                status = Some(exit);
-                break;
-            }
+            Ok(Some(exit)) => break Some(exit),
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
             Ok(None) => {
                 timed_out = true;
                 let _ = child.kill();
-                status = wait_for_child(&mut child, COMMAND_WAIT_GRACE);
-                break;
+                break wait_for_child(&mut child, COMMAND_WAIT_GRACE);
             }
             Err(_) => {
                 let _ = child.kill();
-                status = wait_for_child(&mut child, COMMAND_WAIT_GRACE);
-                break;
+                break wait_for_child(&mut child, COMMAND_WAIT_GRACE);
             }
         }
-    }
+    };
     let stdout_capture = join_capture(stdout_reader);
     let stderr_capture = join_capture(stderr_reader);
     let readers_complete = stdout_capture.is_some() && stderr_capture.is_some();
@@ -1244,27 +1238,21 @@ fn run_git(plan: &WorkPlan, owner: &Group, args: &[String]) -> Result<NativeResu
     let stderr_reader = thread::spawn(move || drain_bounded(stderr, cap));
     let deadline = Instant::now() + Duration::from_secs(plan.timeout_seconds);
     let mut timed_out = false;
-    let mut status: Option<ExitStatus> = None;
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(exit)) => {
-                status = Some(exit);
-                break;
-            }
+            Ok(Some(exit)) => break Some(exit),
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
             Ok(None) => {
                 timed_out = true;
                 let _ = child.kill();
-                status = wait_for_child(&mut child, COMMAND_WAIT_GRACE);
-                break;
+                break wait_for_child(&mut child, COMMAND_WAIT_GRACE);
             }
             Err(_) => {
                 let _ = child.kill();
-                status = wait_for_child(&mut child, COMMAND_WAIT_GRACE);
-                break;
+                break wait_for_child(&mut child, COMMAND_WAIT_GRACE);
             }
         }
-    }
+    };
     let stdout_capture = join_capture(stdout_reader);
     let stderr_capture = join_capture(stderr_reader);
     let readers_complete = stdout_capture.is_some() && stderr_capture.is_some();

@@ -309,14 +309,15 @@ fn execute(control_file: &Path) -> Result<()> {
     let identity = bootstrap.identity.clone();
     let expected_identity = identity.clone();
     let job_dir = bootstrap.job_dir.clone();
+    let execution_job_dir = job_dir.clone();
     let mut control = FileCheckControl::new(bootstrap.clone());
     let execution_result = swarm_checks::execute_with_plan(
         identity.clone(),
         job_dir.clone(),
         &mut control,
         move || {
-            let owner = identity_from_worker(&job_dir, &expected_identity)?;
-            let loaded = load_execution_plan(&job_dir, &owner)?;
+            let owner = identity_from_worker(&execution_job_dir, &expected_identity)?;
+            let loaded = load_execution_plan(&execution_job_dir, &owner)?;
             *captured_context
                 .lock()
                 .map_err(|_| Error::new("CHECK_PLAN_LOCK_FAILED", "plan lock is unavailable"))? =

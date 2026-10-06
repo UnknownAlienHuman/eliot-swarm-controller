@@ -6,10 +6,7 @@
 //! intentionally a Value at this boundary so the neutral schema stays in
 //! `swarm-contracts`; this module never invents an alternate public DTO.
 
-use crate::{
-    config::NativeOptions,
-    native::NativeClient,
-};
+use crate::{config::NativeOptions, native::NativeClient};
 use reqwest::Url;
 use serde_json::{Value, json};
 use sha2::Digest;
@@ -38,7 +35,7 @@ pub struct EffectFailure {
     pub outcome: EffectOutcome,
 }
 
-pub type EffectResult = std::result::Result<Value, EffectFailure>;
+pub type EffectResult<T = Value> = std::result::Result<T, EffectFailure>;
 
 struct RequestSpec {
     method: String,
@@ -89,15 +86,12 @@ pub async fn execute(
         )),
     }?;
 
-    native
-        .verify_mcp_service()
-        .await
-        .map_err(|error| {
-            read_failure(
-                error,
-                matches!(parsed.action.as_str(), "install" | "arm" | "read"),
-            )
-        })?;
+    native.verify_mcp_service().await.map_err(|error| {
+        read_failure(
+            error,
+            matches!(parsed.action.as_str(), "install" | "arm" | "read"),
+        )
+    })?;
     Ok(result)
 }
 
@@ -144,7 +138,8 @@ async fn execute_install(
         "schema_version": SCHEMA_VERSION,
         "kind": "native_mcp_effect_receipt",
         "action": "install",
-        "put_response_digest": digest_value(&response)?,
+        "put_response_digest": digest_value(&response)
+            .map_err(|error| read_failure(error, true))?,
         "readback": readback,
         "native_replay": false,
     }))
@@ -339,7 +334,11 @@ fn parse(command: &RuntimeCommand, options: &NativeOptions) -> EffectResult<Pars
     })
 }
 
-fn validate_scope(scope: &Value, command: &RuntimeCommand, options: &NativeOptions) -> EffectResult<()> {
+fn validate_scope(
+    scope: &Value,
+    command: &RuntimeCommand,
+    options: &NativeOptions,
+) -> EffectResult<()> {
     let object = scope.as_object().ok_or_else(|| {
         reject(
             "NATIVE_MCP_COMMAND_SCOPE",
@@ -397,7 +396,11 @@ fn validate_scope(scope: &Value, command: &RuntimeCommand, options: &NativeOptio
     Ok(())
 }
 
-fn parse_request(value: Option<&Value>, options: &NativeOptions, action: &str) -> EffectResult<RequestSpec> {
+fn parse_request(
+    value: Option<&Value>,
+    options: &NativeOptions,
+    action: &str,
+) -> EffectResult<RequestSpec> {
     let value = value.ok_or_else(|| {
         reject(
             "NATIVE_MCP_COMMAND_INPUT",
@@ -414,13 +417,25 @@ fn parse_request(value: Option<&Value>, options: &NativeOptions, action: &str) -
         .get("method")
         .and_then(Value::as_str)
         .filter(|value| value.len() <= 8)
-        .ok_or_else(|| reject("NATIVE_MCP_COMMAND_INPUT", "native MCP HTTP method is invalid"))?
+        .ok_or_else(|| {
+            reject(
+                "NATIVE_MCP_COMMAND_INPUT",
+                "native MCP HTTP method is invalid",
+            )
+        })?
         .to_owned();
     let path = object
         .get("path")
         .and_then(Value::as_str)
-        .filter(|value| !value.is_empty() && value.len() <= MAX_PATH_BYTES && value.starts_with("/api/"))
-        .ok_or_else(|| reject("NATIVE_MCP_COMMAND_INPUT", "native MCP HTTP path is invalid"))?
+        .filter(|value| {
+            !value.is_empty() && value.len() <= MAX_PATH_BYTES && value.starts_with("/api/")
+        })
+        .ok_or_else(|| {
+            reject(
+                "NATIVE_MCP_COMMAND_INPUT",
+                "native MCP HTTP path is invalid",
+            )
+        })?
         .to_owned();
     if path.contains("://") || path.bytes().any(|byte| byte.is_ascii_control()) {
         return Err(reject(
@@ -519,7 +534,9 @@ fn validate_install_request(
     }
     for argument in command {
         let text = argument.as_str().filter(|value| {
-            !value.is_empty() && value.len() <= MAX_ARG_BYTES && !value.bytes().any(|byte| byte.is_ascii_control())
+            !value.is_empty()
+                && value.len() <= MAX_ARG_BYTES
+                && !value.bytes().any(|byte| byte.is_ascii_control())
         });
         if text.is_none() {
             return Err(reject(
@@ -546,9 +563,8 @@ fn validate_observe_request(
     prepared: &Value,
     _options: &NativeOptions,
 ) -> EffectResult<()> {
-    let parsed_path = Url::parse(&format!("http://127.0.0.1{}", request.path)).map_err(|_| {
-        reject("NATIVE_MCP_COMMAND_INPUT", "observe path is invalid")
-    })?;
+    let parsed_path = Url::parse(&format!("http://127.0.0.1{}", request.path))
+        .map_err(|_| reject("NATIVE_MCP_COMMAND_INPUT", "observe path is invalid"))?;
     if request.method != "GET"
         || request.path != request.path.trim()
         || parsed_path.path() != "/api/mcp"
@@ -570,9 +586,8 @@ fn validate_rpc_request(
     _options: &NativeOptions,
 ) -> EffectResult<()> {
     let expected_suffix = format!("/api/rpc/{RPC_ID}/{action}");
-    let parsed_path = Url::parse(&format!("http://127.0.0.1{}", request.path)).map_err(|_| {
-        reject("NATIVE_MCP_COMMAND_INPUT", "observer RPC path is invalid")
-    })?;
+    let parsed_path = Url::parse(&format!("http://127.0.0.1{}", request.path))
+        .map_err(|_| reject("NATIVE_MCP_COMMAND_INPUT", "observer RPC path is invalid"))?;
     if request.method != "POST"
         || parsed_path.path() != expected_suffix
         || request
@@ -587,7 +602,11 @@ fn validate_rpc_request(
             "observer command is not the exact prepared RPC request",
         ));
     }
-    let input = request.body.as_ref().and_then(|body| body.get("input")).unwrap();
+    let input = request
+        .body
+        .as_ref()
+        .and_then(|body| body.get("input"))
+        .unwrap();
     let challenge = challenge.as_ref().unwrap();
     for key in ["challenge_id", "nonce"] {
         if input.get(key) != challenge.get(key) {
@@ -653,7 +672,11 @@ fn validate_prepared_challenge(prepared: &Value, challenge: &Value) -> EffectRes
     Ok(())
 }
 
-fn ensure_install_absent(value: &Value, parsed: &ParsedCommand, options: &NativeOptions) -> EffectResult<()> {
+fn ensure_install_absent(
+    value: &Value,
+    parsed: &ParsedCommand,
+    options: &NativeOptions,
+) -> EffectResult<()> {
     if value["location"]["directory"] != options.directory.to_str().unwrap_or_default() {
         return Err(reject(
             "NATIVE_MCP_SCOPE_MISMATCH",
@@ -710,7 +733,9 @@ fn project_install_readback(
         ));
     }
     let server_name = parsed.prepared["server_name"].as_str().unwrap_or_default();
-    let mut matching = servers.iter().filter(|server| server["name"] == server_name);
+    let mut matching = servers
+        .iter()
+        .filter(|server| server["name"] == server_name);
     let server = matching.next().ok_or_else(|| {
         readback_failure(
             "NATIVE_OUTCOME_UNKNOWN",
@@ -728,7 +753,12 @@ fn project_install_readback(
     let status = server["status"]["status"]
         .as_str()
         .or_else(|| server["status"].as_str())
-        .filter(|value| matches!(*value, "connected" | "pending" | "disabled" | "failed" | "needs_auth"))
+        .filter(|value| {
+            matches!(
+                *value,
+                "connected" | "pending" | "disabled" | "failed" | "needs_auth"
+            )
+        })
         .ok_or_else(|| {
             readback_failure(
                 "NATIVE_MCP_SCHEMA",
@@ -756,7 +786,8 @@ fn project_install_readback(
 }
 
 fn validate_arm_ack(output: &Value, challenge: Option<&Value>) -> EffectResult<()> {
-    let challenge = challenge.ok_or_else(|| reject("NATIVE_MCP_COMMAND_SCOPE", "arm challenge is missing"))?;
+    let challenge =
+        challenge.ok_or_else(|| reject("NATIVE_MCP_COMMAND_SCOPE", "arm challenge is missing"))?;
     if output["accepted"] != true
         || output["challenge_id"] != challenge["challenge_id"]
         || output["nonce"] != challenge["nonce"]
@@ -774,7 +805,8 @@ fn validate_arm_ack(output: &Value, challenge: Option<&Value>) -> EffectResult<(
 }
 
 fn bounded_json(value: &Value) -> EffectResult<()> {
-    let bytes = serde_json::to_vec(value).map_err(|_| reject("NATIVE_MCP_COMMAND_INPUT", "native MCP JSON is invalid"))?;
+    let bytes = serde_json::to_vec(value)
+        .map_err(|_| reject("NATIVE_MCP_COMMAND_INPUT", "native MCP JSON is invalid"))?;
     if bytes.len() > MAX_ENVELOPE_BYTES {
         return Err(reject(
             "NATIVE_MCP_COMMAND_INPUT_LIMIT",

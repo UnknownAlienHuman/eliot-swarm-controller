@@ -239,13 +239,12 @@ impl NativeControl {
         session_root: Option<&str>,
     ) {
         let subtype = frame["subtype"].as_str().unwrap_or("");
-        let event_type = if frame_type == "system"
+        let event_type = if (frame_type == "system"
             && matches!(
                 subtype,
                 "task_started" | "task_progress" | "task_notification" | "task_updated"
-            ) {
-            Some(subtype)
-        } else if frame_type == "hook" && matches!(subtype, "subagent_started" | "subagent_stopped")
+            ))
+            || (frame_type == "hook" && matches!(subtype, "subagent_started" | "subagent_stopped"))
         {
             Some(subtype)
         } else if matches!(frame_type, "assistant" | "user")
@@ -284,11 +283,9 @@ impl NativeControl {
         } else {
             None
         };
-        let task_identity = if let Some(task_id) = task_id.as_deref() {
-            Some(format!("claude-sdk:task:v1:{task_id}"))
-        } else {
-            None
-        };
+        let task_identity = task_id
+            .as_deref()
+            .map(|task_id| format!("claude-sdk:task:v1:{task_id}"));
         let agent_id = safe_family_link(&frame["agent_id"]);
         let member_identity = if matches!(
             event_type,
@@ -654,31 +651,29 @@ impl NativeControl {
             input_operation_id,
             native_payload_sha256,
             native_payload_bytes,
-        ) {
-            if !self
-                .result_records
-                .iter()
-                .any(|record| record["result_frame_uuid"] == frame_id)
-            {
-                if self.result_records.len() == MAX_RESULT_RECORDS {
-                    self.result_records.remove(0);
-                }
-                self.result_records.push(json!({
-                    "input_operation_id":operation_id,
-                    "native_session_id":session,
-                    "native_input_id":primary_id,
-                    "native_payload_sha256":native_payload_sha256,
-                    "native_payload_bytes":native_payload_bytes,
-                    "result_frame_uuid":frame_id,
-                    "result_subtype":subtype,
-                    "result_status":terminal_status,
-                    "result_sha256":frame["result_sha256"],
-                    "result_bytes":frame["result_bytes"],
-                    "result_content_base64":result_content_base64,
-                    "result_body_available":result_body_available,
-                    "result_body_truncated":frame["result_body_truncated"] == true
-                }));
+        ) && !self
+            .result_records
+            .iter()
+            .any(|record| record["result_frame_uuid"] == frame_id)
+        {
+            if self.result_records.len() == MAX_RESULT_RECORDS {
+                self.result_records.remove(0);
             }
+            self.result_records.push(json!({
+                "input_operation_id":operation_id,
+                "native_session_id":session,
+                "native_input_id":primary_id,
+                "native_payload_sha256":native_payload_sha256,
+                "native_payload_bytes":native_payload_bytes,
+                "result_frame_uuid":frame_id,
+                "result_subtype":subtype,
+                "result_status":terminal_status,
+                "result_sha256":frame["result_sha256"],
+                "result_bytes":frame["result_bytes"],
+                "result_content_base64":result_content_base64,
+                "result_body_available":result_body_available,
+                "result_body_truncated":frame["result_body_truncated"] == true
+            }));
         }
     }
 

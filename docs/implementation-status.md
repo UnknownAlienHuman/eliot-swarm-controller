@@ -4,14 +4,16 @@
 
 ### Source delivery and remaining qualification — 2026-10-05
 
-Main source is published through `f67e1abc3b5fd94f1ba7e216cb9f613f281f19ff`.
-The owner requires finishing the source changes before tests and native/model
-execution. Production-only Clippy reached the extracted packages and reported
-compile defects; the current source delivery repairs that batch in Command,
-Claude, CLI, supervisor, observer and the Kernel MCP facade. It remains
-`PARTIAL_PROGRESS` until the corrected source passes its scoped compiler gate.
-No tests, full builds or native/model calls have run in this source phase;
-historical binaries and receipts retain their recorded scope.
+Main source is published through `f51cf1bd7a8a4fb09c63d656ca5624375432bc47`.
+The product source integration, physical Kernel relocation, five Rust adapter
+paths and public CLI/host coordinates are present. The latest scoped production
+Clippy `--keep-going` run failed and collected compile/lint errors across
+OpenCode type aliases, Codex, Command, Claude, supervisor, observer, Forge,
+bus and checks. The integrated source batch addresses these defects; the
+corrected scoped gate is the first acceptance step. This remains `PARTIAL_PROGRESS` until
+that gate passes on the integrated repair revision. No tests, full builds or
+native/provider/model calls have run in this source phase. Historical binaries
+and qualification receipts retain only their recorded scope.
 
 The actual Kernel now lives in `crates/swarm-kernel-host`: it owns Store, the
 database lock and authenticated IPC. The root library is a compatibility

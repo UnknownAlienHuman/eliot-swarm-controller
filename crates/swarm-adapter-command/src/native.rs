@@ -430,7 +430,6 @@ pub async fn invoke(
     };
 
     let summary = summarize_stdout(&stdout_capture.prefix, stdout_capture.truncated);
-    let exit_code = status.code();
     let signal = status_signal(&status);
     let mut anomalies = summary.gaps.clone();
     if summary.result.is_none() {
@@ -509,6 +508,9 @@ pub async fn invoke(
     })
 }
 
+// The receipt disposition consumes the full native capture tuple so the
+// saved outcome retains each independently verified stream fact.
+#[allow(clippy::too_many_arguments)]
 fn disposition(
     command: &RuntimeCommand,
     identity: &DispatchIdentity,
@@ -789,9 +791,9 @@ fn base_details(identity: &DispatchIdentity) -> Value {
 
 fn summarize_stdout(bytes: &[u8], truncated: bool) -> StreamSummary {
     let mut summary = StreamSummary::default();
-    let mut lines = bytes.split(|byte| *byte == b'\n');
+    let lines = bytes.split(|byte| *byte == b'\n');
     let has_final_newline = bytes.last() == Some(&b'\n');
-    while let Some(raw_line) = lines.next() {
+    for raw_line in lines {
         if raw_line.iter().all(|byte| byte.is_ascii_whitespace()) {
             continue;
         }
@@ -804,7 +806,7 @@ fn summarize_stdout(bytes: &[u8], truncated: bool) -> StreamSummary {
             add_gap(&mut summary, "native_frame_line_limit");
             continue;
         }
-        let raw_line = raw_line.strip_suffix(&[b'\r']).unwrap_or(raw_line);
+        let raw_line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
         let parsed: Value = match serde_json::from_slice(raw_line) {
             Ok(value) => value,
             Err(_) => {
@@ -862,10 +864,9 @@ fn summarize_stdout(bytes: &[u8], truncated: bool) -> StreamSummary {
                 if event_type == "run_start"
                     && summary.session_id.is_none()
                     && let Some(session) = event["sessionId"].as_str()
+                    && session.len() <= MAX_NATIVE_SESSION_ID_BYTES
                 {
-                    if session.len() <= MAX_NATIVE_SESSION_ID_BYTES {
-                        summary.session_id = Some(session.to_owned());
-                    }
+                    summary.session_id = Some(session.to_owned());
                 }
             }
             Some("result") => {

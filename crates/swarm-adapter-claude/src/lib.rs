@@ -1187,7 +1187,7 @@ fn save_result_unknown(invocation: UnknownResultInvocation<'_>) -> Result<bool> 
 }
 
 fn decode_base64(value: &str) -> Result<Vec<u8>> {
-    if value.len() % 4 != 0 || value.len() > 700_000 {
+    if !value.len().is_multiple_of(4) || value.len() > 700_000 {
         return Err(Error::new(
             "RESULT_BODY_INVALID",
             "SDK result body encoding is outside its boundary",
@@ -1205,7 +1205,8 @@ fn decode_base64(value: &str) -> Result<Vec<u8>> {
     }
     let bytes = value.as_bytes();
     let mut output = Vec::with_capacity(value.len() / 4 * 3);
-    for (index, chunk) in bytes.chunks_exact(4).enumerate() {
+    let (chunks, _) = bytes.as_chunks::<4>();
+    for (index, chunk) in chunks.iter().enumerate() {
         let last = index + 1 == bytes.len() / 4;
         let first = digit(chunk[0]).ok_or_else(|| Error::invalid("invalid SDK result base64"))?;
         let second = digit(chunk[1]).ok_or_else(|| Error::invalid("invalid SDK result base64"))?;
@@ -1259,6 +1260,8 @@ fn encode_base64(bytes: &[u8]) -> String {
     encoded
 }
 
+// This protocol handler keeps the existing borrowed runtime state explicit.
+#[allow(clippy::too_many_arguments)]
 fn handle_refresh(
     config: &AdapterConfig,
     claim: &ModuleContractClaim,
@@ -1499,6 +1502,8 @@ fn compact_refresh_observation(latest_state: &Value) -> Value {
     })
 }
 
+// The frame dispatcher mutates the existing owner-loop state in place.
+#[allow(clippy::too_many_arguments)]
 fn handle_frame(
     frame: HarnessFrame,
     config: &AdapterConfig,
@@ -1620,10 +1625,11 @@ fn handle_frame(
                 )),
             }
         }
-        HarnessFrame::Exited { .. } => {
+        HarnessFrame::Exited { code } => {
             *harness_alive = false;
             *native_prepared = false;
-            journal.recover_uncertain_with_code("SDK_HARNESS_PROCESS_EXITED_BEFORE_RECEIPT")?;
+            let diagnostic = harness_exit_diagnostic_code(code);
+            journal.recover_uncertain_with_code(&diagnostic)?;
             native_control.clear_pending();
             Ok(true)
         }
@@ -1704,7 +1710,7 @@ fn verify_hello(
         || negotiation["protocol"] != serde_json::to_value(claim.protocol)?
         || negotiation["capabilities"] != serde_json::to_value(&claim.capabilities)?
         || negotiation["config_schema"] != serde_json::to_value(&claim.config_schema)?
-        || negotiation["pre_input_open"] != serde_json::to_value(&claim.pre_input_open)?
+        || negotiation["pre_input_open"] != serde_json::to_value(claim.pre_input_open)?
         || negotiation["command_schemas"] != serde_json::to_value(&claim.command_schemas)?
         || negotiation["event_schemas"] != serde_json::to_value(&claim.event_schemas)?
         || negotiation["effects_authorized_by_descriptor"] != false
@@ -2044,25 +2050,26 @@ fn handle_reconcile(
             .as_ref()
             .and_then(|outcome| outcome["native_root_id"].as_str());
         let scope_ok = latest_state["native_scope_key"] == config.native_options.scope_key();
-        if scope_ok && expected_boot == latest_state["bridge_boot_id"].as_str() {
-            if let (Some(input_id), Some(root), Some(executions)) = (
+        if scope_ok
+            && expected_boot == latest_state["bridge_boot_id"].as_str()
+            && let (Some(input_id), Some(root), Some(executions)) = (
                 expected_input,
                 expected_root,
                 state.get("input_executions").and_then(Value::as_array),
-            ) {
-                native_result = executions
-                    .iter()
-                    .find(|event| {
-                        event["native_input_id"] == input_id
-                            && event["user_message_uuid"] == input_id
-                            && event["correlation"] == "unique"
-                            && event["native_session_id"] == root
-                            && event["result_frame_uuid"]
-                                .as_str()
-                                .is_some_and(|value| !value.is_empty())
-                    })
-                    .cloned();
-            }
+            )
+        {
+            native_result = executions
+                .iter()
+                .find(|event| {
+                    event["native_input_id"] == input_id
+                        && event["user_message_uuid"] == input_id
+                        && event["correlation"] == "unique"
+                        && event["native_session_id"] == root
+                        && event["result_frame_uuid"]
+                            .as_str()
+                            .is_some_and(|value| !value.is_empty())
+                })
+                .cloned();
         }
     }
     let target_outcome = target.as_ref().and_then(|state| state.outcome.as_ref());
@@ -2134,6 +2141,16 @@ fn required_message_text<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
                 "SDK harness message is missing an identity field",
             )
         })
+}
+
+fn harness_exit_diagnostic_code(code: Option<i32>) -> String {
+    match code {
+        Some(code) if code < 0 => {
+            format!("SDK_HARNESS_EXITED_CODE_NEG_{}", code.unsigned_abs())
+        }
+        Some(code) => format!("SDK_HARNESS_EXITED_CODE_{code}"),
+        None => "SDK_HARNESS_EXIT_STATUS_UNAVAILABLE".to_owned(),
+    }
 }
 
 fn safe_diagnostic(value: &Value, fallback: &'static str) -> String {

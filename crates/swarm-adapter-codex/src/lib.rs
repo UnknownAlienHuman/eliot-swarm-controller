@@ -909,7 +909,7 @@ impl Journal {
         {
             return Err(AdapterError::Checkpoint);
         }
-        let input_sha256 = receipt.input_sha256;
+        let input_sha256 = receipt.input_sha256.as_str();
         let encoded = serde_json::to_value(outcome).map_err(|_| AdapterError::Checkpoint)?;
         let dispatch_admission = outcome
             .details
@@ -966,13 +966,13 @@ impl Journal {
             // result after later native history evidence. New bytes need a
             // fresh host acknowledgment under the same operation ID.
             self.state.acknowledged_outcomes.remove(&operation_id);
-            record.input_sha256 = Some(input_sha256);
+            record.input_sha256 = Some(input_sha256.to_owned());
             record.state = "reported_pending".into();
             record.outcome = Some(encoded);
         } else {
             self.state.acknowledged_outcomes.remove(&operation_id);
             let mut record = OperationRecord::intent(method, kind);
-            record.input_sha256 = Some(input_sha256);
+            record.input_sha256 = Some(input_sha256.to_owned());
             record.dispatch_admission = dispatch_admission;
             record.state = "reported_pending".into();
             record.outcome = Some(encoded);
@@ -1101,7 +1101,7 @@ impl Journal {
             .as_str()
             .filter(|value| !value.trim().is_empty())
             .ok_or(AdapterError::HostProtocol)?;
-        let mut acknowledgement =
+        let acknowledgement =
             result_page_acknowledgement(params, operation_id, input_sha256, Some(artifact_ref))?;
         acknowledgement.validate(operation_id)?;
         let current = self
@@ -3886,12 +3886,12 @@ async fn build_normalized_result_page(
         && execution_complete
         && task_completion == "unknown"
         && disposition == "completed"
-        && dispatch_outcome.outcome == EffectOutcome::Applied;
+        && matches!(dispatch_outcome.outcome, EffectOutcome::Applied);
     let producer_admitted = completion_condition == "native_input_admitted"
         && !execution_complete
         && task_completion == "unknown"
         && disposition == "admitted"
-        && dispatch_outcome.outcome == EffectOutcome::Accepted;
+        && matches!(dispatch_outcome.outcome, EffectOutcome::Accepted);
     let origin_completed = origin.producer.completion_condition == "native_turn_completed"
         && origin.producer.execution_complete
         && origin.producer.task_completion == "unknown"
