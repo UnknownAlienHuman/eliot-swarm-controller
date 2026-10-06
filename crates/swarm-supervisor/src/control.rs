@@ -530,7 +530,7 @@ impl SupervisorControlClient {
             child.validate()?;
         }
         let child = child
-            .map(|value| serde_json::to_value(value))
+            .map(serde_json::to_value)
             .transpose()
             .map_err(|_| Error::invalid("supervisor child health receipt is not serializable"))?;
         self.request_value(

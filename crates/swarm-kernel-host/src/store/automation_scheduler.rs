@@ -219,7 +219,7 @@ pub(crate) fn provision(
     })?;
     let registration = SchedulerRegistration {
         schema_version: 1,
-        scope,
+        scope: scope.clone(),
         method_scope: METHOD_SCOPE
             .iter()
             .map(|method| (*method).to_owned())

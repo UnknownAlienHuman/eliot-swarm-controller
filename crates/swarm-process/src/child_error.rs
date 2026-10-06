@@ -180,12 +180,10 @@ pub fn forward_stderr<R: Read>(
 
         for byte in &read_buffer[..count] {
             if *byte == b'\n' {
-                if !line_overflowed {
-                    if let Some(valid_error) = parse_child_error_line(&line) {
-                        // Keep the last valid terminal-shaped sibling record;
-                        // an earlier diagnostic line is only provisional.
-                        child_error = Some(valid_error);
-                    }
+                if !line_overflowed && let Some(valid_error) = parse_child_error_line(&line) {
+                    // Keep the last valid terminal-shaped sibling record;
+                    // an earlier diagnostic line is only provisional.
+                    child_error = Some(valid_error);
                 }
                 line.clear();
                 line_overflowed = false;
@@ -212,10 +210,12 @@ pub fn forward_stderr<R: Read>(
         }
     }
 
-    if pipe_drained && !line_overflowed && !line.is_empty() {
-        if let Some(valid_error) = parse_child_error_line(&line) {
-            child_error = Some(valid_error);
-        }
+    if pipe_drained
+        && !line_overflowed
+        && !line.is_empty()
+        && let Some(valid_error) = parse_child_error_line(&line)
+    {
+        child_error = Some(valid_error);
     }
 
     StderrForwardResult {
@@ -240,7 +240,7 @@ pub fn wrapper_error_json(
     if include_exit_code {
         error.insert(
             "exit_code".to_owned(),
-            exit_code.map_or(Value::Null, |code| Value::from(code)),
+            exit_code.map_or(Value::Null, Value::from),
         );
     }
     if let Some(child_error) = child_error {
@@ -294,10 +294,10 @@ fn parse_child_error_line(line: &[u8]) -> Option<ChildError> {
     }
     let error = envelope.get("error")?.as_object()?;
 
-    if let Some(child_error) = error.get("child_error") {
-        if let Some(child_error) = parse_projected_child_error(child_error) {
-            return Some(child_error);
-        }
+    if let Some(child_error) = error.get("child_error")
+        && let Some(child_error) = parse_projected_child_error(child_error)
+    {
+        return Some(child_error);
     }
     parse_sibling_error(error)
 }

@@ -5,12 +5,14 @@
 ### Source delivery and remaining qualification — 2026-10-06
 
 The product source integration, physical Kernel relocation, five Rust adapter
-paths and public CLI/host coordinates are present. Production source at
-`eeb77b8b84bee8d8abde31ba42fb751d01d84d58` reached the relocated Kernel in the
-scoped Clippy `--keep-going` pass. That pass reported Kernel integration errors
-and the remaining Codex, OpenCode and checks lints. The following source batch
-repairs Store callback types, retained Claude result admission, immutable
-Command receipt joins, event cause scope, readback fields and launcher DTOs.
+paths and public CLI/host coordinates are present. Production diagnostics at
+`cf2cf122c0b1b450625c556d980d1ba837dbeb15` reached all five Rust adapters and
+reported 17 Kernel integration diagnostics. That diagnostic pass allowed
+warnings to collect other packages' errors and is not an acceptance result.
+The following source batch repairs typed supervisor error conversion,
+diagnostic-task access, lifecycle readback error types, bus slot ownership,
+scheduler scope ownership and the reported process/control lints. The final
+production compiler gate still requires no warnings.
 Source closure precedes tests and native qualification. The product remains
 `PARTIAL_PROGRESS`; compiler success alone does not qualify failure recovery,
 installed adapters or productive execution. No tests, full builds or

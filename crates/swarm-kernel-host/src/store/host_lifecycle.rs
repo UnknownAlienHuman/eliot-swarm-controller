@@ -652,22 +652,24 @@ pub(super) fn module_supervisor_health_readback(
     let child = receipt
         .and_then(|value| value.get("child"))
         .filter(|value| !value.is_null())
-        .map(|value| {
-            let child: swarm_supervisor::control::SupervisorChildHealth =
-                serde_json::from_value(value.clone()).map_err(|_| {
+        .map(
+            |value| -> Result<swarm_supervisor::control::SupervisorChildHealth> {
+                let child: swarm_supervisor::control::SupervisorChildHealth =
+                    serde_json::from_value(value.clone()).map_err(|_| {
+                        Error::new(
+                            "HOST_LIFECYCLE_INVALID",
+                            "module supervisor child health receipt is invalid",
+                        )
+                    })?;
+                child.validate().map_err(|_| {
                     Error::new(
                         "HOST_LIFECYCLE_INVALID",
-                        "module supervisor child health receipt is invalid",
+                        "module supervisor child health receipt failed validation",
                     )
                 })?;
-            child.validate().map_err(|_| {
-                Error::new(
-                    "HOST_LIFECYCLE_INVALID",
-                    "module supervisor child health receipt failed validation",
-                )
-            })?;
-            Ok(child)
-        })
+                Ok(child)
+            },
+        )
         .transpose()?;
     let readback = swarm_supervisor::control::SupervisorChildHealthReadback {
         state,

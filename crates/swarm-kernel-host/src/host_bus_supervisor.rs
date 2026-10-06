@@ -934,7 +934,8 @@ async fn reconcile_slot(
         return Ok(());
     }
 
-    match start_worker(store, pin, demand, &slot.data_root, slot).await {
+    let data_root = slot.data_root.clone();
+    match start_worker(store, pin, demand, &data_root, slot).await {
         Ok(()) => {
             slot.start_attempt = Instant::now();
             slot.stopping = false;

@@ -234,7 +234,7 @@ pub(crate) fn spawn_independent_module_supervisor(
                 Ok(control) => control,
                 Err(error) => {
                     eprintln!("optional module supervisor IPC unavailable: {}", error.code);
-                    return Err(error);
+                    return Err(module_error(error));
                 }
             };
             let host_config =
@@ -355,6 +355,7 @@ async fn run_supervisor_process_loop(
     let frame = match bootstrap.to_frame() {
         Ok(frame) => frame,
         Err(error) => {
+            let error = module_error(error);
             let error = match record_module_actor_status(
                 &control,
                 "isolated",
@@ -620,7 +621,7 @@ async fn run_supervisor_process_loop(
         };
         drop(bootstrap_pipe);
         let child_diagnostic = join_child_diagnostic(child.take_diagnostic()).await;
-        let child_exit = child_exit_from_result(&exit, child_diagnostic.as_deref());
+        let child_exit = child_exit_from_result(&exit, child_diagnostic.as_ref());
         let child_stop = match &exit {
             Some(Ok(_)) => SupervisorChildStopState::NotRequested,
             Some(Err(_)) | None => SupervisorChildStopState::Uncertain,
@@ -1126,6 +1127,12 @@ struct ChildDiagnosticTask {
     latest: Arc<Mutex<Option<ChildError>>>,
 }
 
+impl ChildDiagnosticTask {
+    fn abort(self) {
+        self.task.abort();
+    }
+}
+
 fn spawn_child_diagnostic(stderr: ChildStderr) -> ChildDiagnosticTask {
     let latest = Arc::new(Mutex::new(None));
     let task = tokio::spawn(read_bounded_child_diagnostic(stderr, Arc::clone(&latest)));
@@ -1358,7 +1365,7 @@ async fn reap_owned_supervisor_child(
     drop(stdin);
     let exit = Some(child.wait().await);
     let diagnostic = join_child_diagnostic(diagnostic).await;
-    let child_exit = child_exit_from_result(&exit, diagnostic.as_deref());
+    let child_exit = child_exit_from_result(&exit, diagnostic.as_ref());
     let stop = match &exit {
         Some(Ok(_)) => SupervisorChildStopState::Confirmed,
         Some(Err(_)) | None => SupervisorChildStopState::Uncertain,
