@@ -1,6 +1,6 @@
 # Agent Operations — Manager-Owned Automation
 
-Revision 8 · 2026-10-05 · historical source review `2aec51bb`; modularization and observability have partial source implementation.
+Revision 9 · 2026-10-05 · source delivery `3fff155`; current runtime qualification remains pending.
 
 **Status: partial implementation.** Current source includes manager-owned action
 admission and transfer, durable intake and peer coordination, the reviewed
@@ -19,8 +19,12 @@ the operator-only Task create/revise defect at its recorded revision. Later
 source admits ordinary authenticated Managers to planning, retains optional
 supervisor failures, and separates CLI, MCP, gateway and module supervisor
 packages/processes. Scoped logging and monitoring are connected in source.
-OpenCode native ownership/MCP effects and physical Kernel extraction remain in
-progress. These source changes have no current runtime qualification; see the
+OpenCode native ownership/MCP effects and physical Kernel extraction are
+delivered in source. The Kernel owns Store/IPC in `crates/swarm-kernel-host`,
+the public host is a launcher, and the standalone supervisor has no database
+access. Store retains typed native-start success against the original launch
+history after Manager/lease changes. The installer validates the complete
+sibling chain. These source changes have no current runtime qualification; see the
 exact boundaries in [Implementation status](../implementation-status.md).
 
 [Modular Runtime](modularity.md) owns the requested package/process boundaries,
@@ -79,7 +83,7 @@ Observation, streams, peer mail, requested reminders and late result collection 
 - One Store, Operation receipt path and effective authorization policy. Scheduling/ownership responsibilities remain unique but move into separately built modules/processes; they are not required to share one failure domain. In-memory notifications accelerate discovery; they never replace durable work.
 - One manual/automatic action reservation. Duplicate hooks, overlapping automations and reconnects cannot independently launch the same work or publish the same candidate again.
 - Each selected delivery step reads its own committed prerequisites. A repaired submission can be audited again; general loop suppression must not discard legitimate descendants of the workflow.
-- The technical executor and effective manager are both recorded. Auditor results retain their actual author. No reusable manager credential is copied to a script or forged into a public request.
+- The technical executor and effective manager are both recorded. Committed events, native-start receipts and result pages retain their original cause after Manager handover, session loss or lease release; current authority is checked before new effects. Auditor results retain their actual author. No reusable manager credential is copied to a script or forged into a public request.
 - Settings changes affect subsequent admissions; retained requests are not rewritten. Removing an action or disabling its entry blocks unstarted/follow-up effects. Running work remains visible until completion or a separate supported cancellation.
 - Enabled settings survive ordinary manager disconnect and host restart. Reconcile current rights and uncertain effects before proceeding; no reboot approval ceremony and no fallback to Root.
 
@@ -97,14 +101,14 @@ Observation, streams, peer mail, requested reminders and late result collection 
 
 | Existing anchor | Current fact | Required change or reuse |
 |---|---|---|
-| `src/store/submissions.rs::reserve/finish` | Queued admission precedes applied `task.submission`. | Audit only retained applied submissions. |
-| `src/store/submissions.rs::request_changes` | Exact anchors and frozen-policy-dependent feedback; owner-policy-v2 supports scoped manager disposition. | Preserve the landed policy checks; do not reimplement them as an unfinished grant system. Audit results and repair delivery remain separate. |
-| `src/model.rs::Principal::owns` | Internal Scheduler has a special ownership path for existing scheduled checks. | Do not generalize that exception to manager-owned automation. Use explicit current-manager authorization. |
-| `src/store/schedules.rs` | Cursor and check admission are transaction-coupled. | Preserve that property for new triggers and preserve old receipts. |
-| `src/policy.rs`, `docs/owner-decisions.md` | Accepted policy identities and GM/epoch restrictions exist. | Adopt deliberate new policy with code while retaining historical Attempts; do not edit away old evidence. |
-| `src/mcp/subscriptions.rs` | Bounded committed-fact polling with lag/resync. | Share projectors and retain durable cursors; live native text is a separate stream. |
+| `crates/swarm-kernel-host/src/store/submissions.rs::reserve/finish` | Queued admission precedes applied `task.submission`. | Audit only retained applied submissions. |
+| `crates/swarm-kernel-host/src/store/submissions.rs::request_changes` | Exact anchors and frozen-policy-dependent feedback; owner-policy-v2 supports scoped manager disposition. | Preserve the landed policy checks; do not reimplement them as an unfinished grant system. Audit results and repair delivery remain separate. |
+| `crates/swarm-kernel-host/src/model.rs::Principal::owns` | Internal Scheduler has a special ownership path for existing scheduled checks. | Do not generalize that exception to manager-owned automation. Use explicit current-manager authorization. |
+| `crates/swarm-kernel-host/src/store/schedules.rs` | Cursor and check admission are transaction-coupled. | Preserve that property for new triggers and preserve old receipts. |
+| `crates/swarm-kernel-host/src/policy.rs`, `docs/owner-decisions.md` | Accepted policy identities and GM/epoch restrictions exist. | Adopt deliberate new policy with code while retaining historical Attempts; do not edit away old evidence. |
+| `crates/swarm-kernel-host/src/mcp/subscriptions.rs` | Bounded committed-fact polling with lag/resync. | Share projectors and retain durable cursors; live native text is a separate stream. |
 | `docs/forge-publication.md` | Accepted-candidate non-force push and uncertain-effect readback. | Reuse; upload and PR merge are separate effects, not stronger guarantees inferred from a local lock. |
 
 ## Delivery scope
 
-This documentation change does not implement the proposed refactor. The bounded recheck used a temporary isolated host and IPC clients, with no native model calls or owner-machine service changes. No runtime settings, dependencies or source code are changed. Static review and the recorded IPC probe are not full security, native recovery or fleet qualification.
+The current Kernel, standalone supervisor, typed adapter handoff and event/result ownership changes are delivered as source. Compiler, core failure/recovery and native qualification remain separate acceptance work. The historical bounded recheck retains its recorded source and IPC scope; its temporary-host observation does not qualify the current implementation. See the current source block in [Implementation status](../implementation-status.md) before interpreting older receipts.

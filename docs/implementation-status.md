@@ -2,51 +2,72 @@
 
 ## Current state
 
-### Code phase and remaining implementation — 2026-10-05
+### Source delivery and remaining qualification — 2026-10-05
 
-The owner requires finishing all necessary source changes before compilation,
-tests, builds or native/model execution. Main contains source delivery through
-`17e0abc`; the current source has not passed those gates and is
-`PARTIAL_PROGRESS`. Earlier installed binaries and qualification receipts do not
-qualify these changes.
+Main source is published through `3fff155ba822021d080c014c9e61a33ab1fe147e`.
+The owner requires finishing the source changes before compiler, tests, builds
+or native/model execution. The current delivery has not run those gates and
+remains `PARTIAL_PROGRESS`; historical binaries and receipts retain their
+recorded scope.
 
-The public CLI now delegates MCP serving to the installed `swarm-mcp` sibling
-and has no `swarm-mcp` runtime dependency. Host starts the demanded module
-supervisor as an independent child over a bounded private stdin bootstrap and
-authenticated IPC. The old in-process module supervisor is retired. Without
-durable demand, the legacy coordinator waits for Store notifications instead of
-waking every two seconds. Launch and watch changes wake it through that existing
-notification channel. Failed supervisor starts and exits retain Manager-visible
-failure observations; process isolation is still unqualified at runtime.
+The actual Kernel now lives in `crates/swarm-kernel-host`: it owns Store, the
+database lock and authenticated IPC. The root library is a compatibility
+facade, and public `swarm-host` launches the Kernel sibling. The independent
+`swarm-supervisor` owns module lifecycle through authenticated IPC and has no
+database access. Installation verifies the complete declared sibling chain.
+CLI MCP commands use the separate installed `swarm-mcp` executable. The default
+build recipe uses one invocation for these five packages and one external
+shared target; it does not allocate checkout targets or worktrees.
 
-The launch preview includes a bounded assignment decision card from retained
-Task, Attempt, dependency, route, capacity, workspace and MCP facts. Missing
-ranking or qualification evidence is explicit. Descriptor workspace pointers
-retain their full native-options path during reservation.
+OpenCode's standalone Rust artifact is
+`eliot-opencode-v2.rust-http.1@0.3.0`, with native-options schema version `2`
+and exact schema SHA-256
+`7fc3136219b20d00570b65e5d4fe533e3ea042dadf53be3fdcdfa9781cf0eb68`.
+Its source owns fresh native service launch, selected-provider authorization,
+pinned plugin preparation, and the four typed native MCP methods
+(`install`, `observe`, `arm`, `read`). Store queues their retained C8 phase
+Operations through the exact internal caller; adapter intake validates the
+common DTO and immutable parent/input linkage before effects. The service-ready
+receipt is now consumed into the existing `owned_service_starts` reservation,
+including actual process identity and bounded proof. Recording this fact reads
+retained launch/actor/lease history and survives a later Manager handover or
+release. Fresh launch projection remains reserved-only; subsequent commands
+can derive native options from an exactly validated observed-service row.
+The readiness proof keeps `dispatch_permitted=false` until the separate C8
+phase requirements are satisfied.
 
-The common normalized result context/page contract is connected to Store,
-Command Code and Codex. A result page seals its exact origin. Historical
-acknowledgement checks immutable producer identity, and assembly permits the
-producer's admitted-to-completed lifecycle transition without replacing each
-page's saved facts. Codex readback requires the exact submitted native user
-item and completed turn, and checkpoints the selected assistant page before
-Store acknowledgement. Antigravity validates the same result request but
-returns `RESULT_BODY_UNAVAILABLE`: its current stream has no documented native
-response parent. Status readback remains available. None of these result paths
-has current native qualification.
+The common normalized result contract is connected to Store and the Rust
+OpenCode, Codex, Command, Claude and Antigravity adapters. Immutable page
+origins, duplicate acknowledgement, page assembly and exact native identities
+are preserved. Pinned OpenCode 2.0.7 exposes no immutable assistant-to-input
+parent join: missing parent evidence records
+`NATIVE_ASSISTANT_PARENT_UNAVAILABLE`, an `Unknown` adapter outcome and the
+Manager's `OUTCOME_UNKNOWN` projection. Antigravity reports the deterministic
+`RESULT_BODY_UNAVAILABLE` rejection. Neither path invents a body, response
+parent or Task completion from message order, timestamps or latest-message
+selection. Status/error readback remains available.
 
-Scoped Manager logging now connects level, metadata/redacted-text content and
-expiry to the existing Producer and observer before capture. Malformed scope
-configuration fails closed; expired policies do not consume the active bound.
-Raw native frames remain unsupported.
+Universal event routing retains the technical executor, effective Manager and
+immutable launch/module cause independently of current action authority.
+Manager-configured selectors/actions use the existing event intake, cursor and
+Operation path for hooks, submissions, replies, failures and other admitted
+events. Scoped logging and read-only monitoring are connected in source;
+selected metadata/redacted content policy is resolved before capture. Raw
+native-frame capture remains unavailable.
 
-Remaining source work is the complete OpenCode owned-launch handoff, native MCP
-command execution and plugin configuration, exact OpenCode assistant readback,
-retained on-behalf event ownership, final adapter/version consumers, and physical
-Kernel source relocation with packaging. Only after those changes are complete
-do compiler and focused qualification runs begin. The selected test model is
-`inclusionai/ling-3.1-flash`; Bunny is disabled. Local models, Linux/WSL and Zed
-remain deferred, and the current desktop Codex process must remain alive.
+The required source integrations listed in the preceding code-phase checkpoint
+are now delivered. Remaining acceptance work begins with one scoped compiler
+gate, then the necessary core failure/recovery and adapter qualification runs.
+The selected model is `inclusionai/ling-3.1-flash`; Bunny is disabled. Local
+models, Linux/WSL and Zed remain deferred. The active desktop Codex/OpenCodex
+process and configuration are preserved; Claude qualification follows the other
+routes because its quota is limited. Productive OpenCode body readback needs a
+pinned native contract exposing the missing causal link. It is unavailable on
+the current pinned projection, rather than an inferred completion.
+
+The dated sections below retain source history and exact earlier receipts.
+Their historical `src/**` anchors now reside under
+`crates/swarm-kernel-host/src/**` after the physical relocation.
 
 ### Shared positive method policy — 2026-10-05
 
