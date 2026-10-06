@@ -102,7 +102,7 @@ use rusqlite::{
     Connection, OptionalExtension, Transaction, TransactionBehavior, named_params, params,
 };
 use serde_json::{Value, json};
-use std::{path::Path, sync::Arc, thread::JoinHandle, time::Duration};
+use std::{fs::File, path::Path, sync::Arc, thread::JoinHandle, time::Duration};
 use tokio::sync::{Semaphore, oneshot, watch};
 
 const SCHEMA: &str = include_str!("../../migrations/001_core.sql");
@@ -135,7 +135,16 @@ pub struct StoreOwner {
     kernel: KernelHost,
     status_thread: JoinHandle<()>,
     module_supervisor_credential: Credential,
+    recovery: StoreRecovery,
     pub store: Store,
+}
+
+/// Inputs retained for the one recovery owner that may run only after the
+/// original kernel writer has joined. Sharing the same File keeps the data-root
+/// ownership fence without opening a concurrent Store writer.
+struct StoreRecovery {
+    root: std::path::PathBuf,
+    lock: Arc<File>,
 }
 
 struct LaunchWorkspaceWork {
@@ -274,9 +283,13 @@ impl StoreOwner {
             client_id: model::INTERNAL_MODULE_SUPERVISOR_CLIENT_ID.to_owned(),
             token: format!("{}{}", model::new_id(), model::new_id()),
         };
+        let writer_lock = Arc::new(root.lock);
+        let recovery = StoreRecovery {
+            root: root.path.clone(),
+            lock: Arc::clone(&writer_lock),
+        };
         let writer_supervisor_credential = module_supervisor_credential.clone();
         let writer_root = root.path.clone();
-        let writer_lock = root.lock;
         let writer_config = config.clone();
         let writer_open_config = config.clone();
         let writer_scheduler_credential = automation_scheduler_credential.clone();
@@ -306,12 +319,17 @@ impl StoreOwner {
         match kernel.wait_ready().await {
             Ok(()) => {}
             Err(swarm_kernel::KernelHostReadyError::Initialization(error)) => {
-                join_kernel_host(kernel, "database owner").await?;
-                return Err(error);
+                return Err(match join_kernel_host(kernel, "database owner").await {
+                    Ok(()) => error,
+                    Err(cleanup) => error.with_secondary_code(cleanup.code),
+                });
             }
             Err(_) => {
-                join_kernel_host(kernel, "database owner").await?;
-                return Err(Error::new("STORE_CLOSED", "initialization thread ended"));
+                let error = Error::new("STORE_CLOSED", "initialization thread ended");
+                return Err(match join_kernel_host(kernel, "database owner").await {
+                    Ok(()) => error,
+                    Err(cleanup) => error.with_secondary_code(cleanup.code),
+                });
             }
         }
         let kernel_handle = kernel.handle();
@@ -325,8 +343,10 @@ impl StoreOwner {
             Ok(reader) => reader,
             Err(error) => {
                 drop(kernel_handle);
-                join_kernel_host(kernel, "database owner").await?;
-                return Err(error);
+                return Err(match join_kernel_host(kernel, "database owner").await {
+                    Ok(()) => error,
+                    Err(cleanup) => error.with_secondary_code(cleanup.code),
+                });
             }
         };
         let store = Store {
@@ -356,9 +376,11 @@ impl StoreOwner {
                     kernel.close_admission(swarm_kernel::KernelAdmissionFault::ShuttingDown);
                     let status_shutdown = store.status_reader.shutdown().await;
                     drop(store);
-                    join_store_threads(status_thread, kernel).await?;
-                    status_shutdown?;
-                    return Err(error);
+                    let cleanup = merge_results(
+                        join_store_threads(status_thread, kernel).await,
+                        status_shutdown,
+                    );
+                    return Err(merge_cleanup(error, cleanup));
                 }
             };
             if swarm_automation::write_worker_config(
@@ -374,11 +396,16 @@ impl StoreOwner {
                 kernel.close_admission(swarm_kernel::KernelAdmissionFault::ShuttingDown);
                 let status_shutdown = store.status_reader.shutdown().await;
                 drop(store);
-                join_store_threads(status_thread, kernel).await?;
-                status_shutdown?;
-                return Err(Error::new(
-                    "AUTOMATION_SERVICE_CONFIG_WRITE_FAILED",
-                    "private scheduler config could not be created",
+                let cleanup = merge_results(
+                    join_store_threads(status_thread, kernel).await,
+                    status_shutdown,
+                );
+                return Err(merge_cleanup(
+                    Error::new(
+                        "AUTOMATION_SERVICE_CONFIG_WRITE_FAILED",
+                        "private scheduler config could not be created",
+                    ),
+                    cleanup,
                 ));
             }
         }
@@ -386,14 +413,17 @@ impl StoreOwner {
             kernel.close_admission(swarm_kernel::KernelAdmissionFault::ShuttingDown);
             let status_shutdown = store.status_reader.shutdown().await;
             drop(store);
-            join_store_threads(status_thread, kernel).await?;
-            status_shutdown?;
-            return Err(error);
+            let cleanup = merge_results(
+                join_store_threads(status_thread, kernel).await,
+                status_shutdown,
+            );
+            return Err(merge_cleanup(error, cleanup));
         }
         Ok(Self {
             kernel,
             status_thread,
             module_supervisor_credential,
+            recovery,
             store,
         })
     }
@@ -402,6 +432,7 @@ impl StoreOwner {
             kernel,
             status_thread,
             module_supervisor_credential: _,
+            recovery: _,
             store,
         } = self;
         kernel.close_admission(swarm_kernel::KernelAdmissionFault::ShuttingDown);
@@ -409,8 +440,48 @@ impl StoreOwner {
         drop(store);
         // Join both owners even if the reader already failed. Retained Store
         // handles must not keep an idle reader or writer alive after close.
-        join_store_threads(status_thread, kernel).await?;
-        status_shutdown
+        merge_results(
+            join_store_threads(status_thread, kernel).await,
+            status_shutdown,
+        )
+    }
+
+    /// Close the status reader and join the original writer before opening one
+    /// sequential recovery owner for the final lifecycle receipt. A receipt is
+    /// never committed while the original writer can still tear down.
+    pub(crate) async fn close_with_exit(
+        self,
+        mut exit: Result<()>,
+        failed_supervisor: Option<&'static str>,
+    ) -> Result<()> {
+        let StoreOwner {
+            kernel,
+            status_thread,
+            module_supervisor_credential: _,
+            recovery,
+            store,
+        } = self;
+        kernel.close_admission(swarm_kernel::KernelAdmissionFault::ShuttingDown);
+        let status_shutdown = store.status_reader.shutdown().await;
+        let status_join = join_store_thread(status_thread, "status reader").await;
+        exit = merge_results(exit, merge_results(status_join, status_shutdown));
+        drop(store);
+        let kernel_join = join_kernel_host(kernel, "database owner").await;
+        let kernel_join_confirmed = !matches!(
+            kernel_join.as_ref().err().map(|error| error.code.as_str()),
+            Some("KERNEL_JOIN_UNCONFIRMED")
+        );
+        exit = merge_results(exit, kernel_join);
+        if !kernel_join_confirmed {
+            return exit;
+        }
+        let receipt = recovery
+            .record_host_exit(
+                exit.as_ref().err().map(|error| error.code.clone()),
+                failed_supervisor,
+            )
+            .await;
+        merge_results(exit, receipt)
     }
 
     /// Return this host's credential for the trusted local module supervisor.
@@ -420,11 +491,49 @@ impl StoreOwner {
         self.module_supervisor_credential.clone()
     }
 }
+
+impl StoreRecovery {
+    async fn record_host_exit(
+        self,
+        error_code: Option<String>,
+        failed_supervisor: Option<&'static str>,
+    ) -> Result<()> {
+        tokio::task::spawn_blocking(move || {
+            let StoreRecovery { root, lock } = self;
+            let _lock = lock;
+            let mut db = open_recovery_database(&root)?;
+            record_host_exit_on_connection(&mut db, error_code, failed_supervisor)
+        })
+        .await
+        .map_err(|error| {
+            Error::new(
+                "STORE_CLOSED",
+                format!("lifecycle recovery owner failed: {error}"),
+            )
+        })?
+    }
+}
+
 async fn join_store_threads(status_thread: JoinHandle<()>, kernel: KernelHost) -> Result<()> {
     let status_result = join_store_thread(status_thread, "status reader").await;
     let database_result = join_kernel_host(kernel, "database owner").await;
-    status_result?;
-    database_result
+    merge_results(status_result, database_result)
+}
+
+fn merge_results(primary: Result<()>, secondary: Result<()>) -> Result<()> {
+    match (primary, secondary) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(error)) => Err(error),
+        (Err(error), Ok(())) => Err(error),
+        (Err(primary), Err(secondary)) => Err(primary.with_secondary_code(secondary.code)),
+    }
+}
+
+fn merge_cleanup(primary: Error, cleanup: Result<()>) -> Error {
+    match cleanup {
+        Ok(()) => primary,
+        Err(cleanup) => primary.with_secondary_code(cleanup.code),
+    }
 }
 async fn join_store_thread(thread: JoinHandle<()>, name: &'static str) -> Result<()> {
     tokio::task::spawn_blocking(move || thread.join())
@@ -436,8 +545,20 @@ async fn join_store_thread(thread: JoinHandle<()>, name: &'static str) -> Result
 async fn join_kernel_host(kernel: KernelHost, name: &'static str) -> Result<()> {
     tokio::task::spawn_blocking(move || kernel.join())
         .await
-        .map_err(|error| Error::new("STORE_CLOSED", format!("{name} join failed: {error}")))?
-        .map_err(|_| Error::new("STORE_PANIC", format!("{name} panicked")))
+        .map_err(|error| {
+            Error::new(
+                "KERNEL_JOIN_UNCONFIRMED",
+                format!("{name} join could not confirm writer teardown: {error}"),
+            )
+        })?
+        .map_err(|error| match error {
+            swarm_kernel::KernelHostJoinError::WriterFailed(_) => {
+                Error::new("KERNEL_WRITER_EXITED", "kernel writer exited unexpectedly")
+            }
+            swarm_kernel::KernelHostJoinError::Panicked => {
+                Error::new("STORE_PANIC", format!("{name} panicked"))
+            }
+        })
 }
 
 fn map_kernel_spawn_error(error: swarm_kernel::KernelHostSpawnError) -> Error {
@@ -486,11 +607,19 @@ fn kernel_host_status_value(snapshot: swarm_kernel::KernelHostSnapshot) -> Value
             ("closed", Some(kernel_admission_fault_name(fault)))
         }
     };
+    let failure = snapshot.failure.map(kernel_failure_name);
     json!({
         "admission": admission,
         "fault": fault,
+        "failure": failure,
         "lifecycle": kernel_lifecycle_name(snapshot.lifecycle),
     })
+}
+
+fn kernel_failure_name(failure: swarm_kernel::KernelHostFailure) -> &'static str {
+    match failure {
+        swarm_kernel::KernelHostFailure::WriterExited => "writer_exited",
+    }
 }
 
 fn kernel_admission_fault_name(fault: swarm_kernel::KernelAdmissionFault) -> &'static str {
@@ -858,6 +987,12 @@ impl Store {
         self.kernel.snapshot()
     }
 
+    pub(crate) fn kernel_status_receiver(
+        &self,
+    ) -> watch::Receiver<swarm_kernel::KernelHostSnapshot> {
+        self.kernel.status_receiver()
+    }
+
     pub(crate) async fn record_host_start(&self) -> Result<()> {
         self.run(move |db| {
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -880,23 +1015,14 @@ impl Store {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn record_host_exit(
         &self,
         error_code: Option<String>,
         failed_supervisor: Option<&'static str>,
     ) -> Result<()> {
-        self.run(move |db| {
-            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            host_lifecycle::finish(
-                &tx,
-                error_code.as_deref(),
-                failed_supervisor,
-                model::now_ms()?,
-            )?;
-            tx.commit()?;
-            Ok(())
-        })
-        .await
+        self.run(move |db| record_host_exit_on_connection(db, error_code, failed_supervisor))
+            .await
     }
     pub(crate) async fn reconcile_workspace_lifecycle_once(&self) -> Result<Value> {
         // Exact owned-process departure is observed outside the DB owner
@@ -2430,6 +2556,50 @@ fn require_local_operator(db: &Connection, client_id: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn record_host_exit_on_connection(
+    db: &mut Connection,
+    error_code: Option<String>,
+    failed_supervisor: Option<&'static str>,
+) -> Result<()> {
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    host_lifecycle::finish(
+        &tx,
+        error_code.as_deref(),
+        failed_supervisor,
+        model::now_ms()?,
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn open_recovery_database(root: &Path) -> Result<Connection> {
+    let opened = swarm_store::open_existing_writer(
+        &root.join("swarm.db"),
+        swarm_store::SchemaIdentity {
+            application_id: APPLICATION_ID,
+            user_version: 1,
+            base_schema: SCHEMA,
+        },
+        swarm_store::WriterOptions::default(),
+        |_, is_new| {
+            if is_new {
+                Err(Error::new(
+                    "STORE_CLOSED",
+                    "lifecycle recovery requires the existing kernel database",
+                ))
+            } else {
+                Ok(())
+            }
+        },
+    );
+    let (db, ()) = match opened {
+        Ok(value) => value,
+        Err(swarm_store::OpenError::Store(error)) => return Err(error.into()),
+        Err(swarm_store::OpenError::Initializer(error)) => return Err(error),
+    };
+    Ok(db)
 }
 
 fn open_database(

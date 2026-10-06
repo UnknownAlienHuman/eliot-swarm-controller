@@ -166,6 +166,27 @@ pub fn open_writer<T, E>(
     options: WriterOptions,
     initialize: impl FnOnce(&Transaction<'_>, bool) -> Result<T, E>,
 ) -> Result<(Connection, T), OpenError<E>> {
+    open_writer_inner(path, identity, options, true, initialize)
+}
+
+/// Reopen an existing writer database without creating a missing file or
+/// initializing an empty database. The caller must retain exclusive ownership.
+pub fn open_existing_writer<T, E>(
+    path: &Path,
+    identity: SchemaIdentity<'_>,
+    options: WriterOptions,
+    initialize: impl FnOnce(&Transaction<'_>, bool) -> Result<T, E>,
+) -> Result<(Connection, T), OpenError<E>> {
+    open_writer_inner(path, identity, options, false, initialize)
+}
+
+fn open_writer_inner<T, E>(
+    path: &Path,
+    identity: SchemaIdentity<'_>,
+    options: WriterOptions,
+    create: bool,
+    initialize: impl FnOnce(&Transaction<'_>, bool) -> Result<T, E>,
+) -> Result<(Connection, T), OpenError<E>> {
     identity.validate()?;
     if options.minimum_sqlite_version > 0 {
         let actual = rusqlite::version_number();
@@ -178,7 +199,11 @@ pub fn open_writer<T, E>(
         }
     }
 
-    let mut db = Connection::open(path)?;
+    let mut db = if create {
+        Connection::open(path)?
+    } else {
+        Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?
+    };
     let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
     let application_id: i64 = db.pragma_query_value(None, "application_id", |row| row.get(0))?;
     let empty: bool = db.query_row(
@@ -190,6 +215,9 @@ pub fn open_writer<T, E>(
     let already_tagged_empty =
         empty && application_id == identity.application_id && version == identity.user_version;
     let is_new = untagged_empty || already_tagged_empty;
+    if is_new && !create {
+        return Err(Error::SchemaMismatch.into());
+    }
     if !is_new && (application_id != identity.application_id || version != identity.user_version) {
         return Err(Error::SchemaMismatch.into());
     }

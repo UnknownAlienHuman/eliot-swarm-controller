@@ -19,7 +19,7 @@ use std::{
     thread::{JoinHandle, Thread},
 };
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 /// One ordinary writer operation or one explicitly batchable item.
 pub enum WriterJob<Run, Batch> {
@@ -44,11 +44,37 @@ pub struct WriterActor<Run, Batch, InitError> {
 struct WriterExitSignal<Hold> {
     _hold: Hold,
     finished: Arc<AtomicBool>,
+    stop_requested: Arc<AtomicBool>,
+    status: Arc<Mutex<KernelHostSnapshot>>,
+    status_updates: watch::Sender<KernelHostSnapshot>,
 }
 
 impl<Hold> Drop for WriterExitSignal<Hold> {
     fn drop(&mut self) {
         self.finished.store(true, Ordering::Release);
+        if self.stop_requested.load(Ordering::Acquire) {
+            return;
+        }
+        let mut snapshot = self
+            .status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !matches!(
+            snapshot.lifecycle,
+            KernelHostLifecycle::Stopping
+                | KernelHostLifecycle::Stopped
+                | KernelHostLifecycle::Failed
+                | KernelHostLifecycle::AdmissionClosed {
+                    fault: KernelAdmissionFault::ShuttingDown
+                }
+        ) {
+            snapshot.admission = KernelAdmissionState::Closed {
+                fault: KernelAdmissionFault::StoreUnavailable,
+            };
+            snapshot.lifecycle = KernelHostLifecycle::Failed;
+            snapshot.failure = Some(KernelHostFailure::WriterExited);
+            let _ = self.status_updates.send_replace(*snapshot);
+        }
     }
 }
 
@@ -285,10 +311,37 @@ pub enum KernelHostLifecycle {
     Failed,
 }
 
+/// A bounded failure fact published when the sole writer exits unexpectedly.
+/// No panic payload, database value, or provider detail crosses this boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelHostFailure {
+    WriterExited,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelHostJoinError {
+    WriterFailed(KernelHostFailure),
+    Panicked,
+}
+
+impl fmt::Display for KernelHostJoinError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WriterFailed(KernelHostFailure::WriterExited) => {
+                formatter.write_str("kernel writer exited unexpectedly")
+            }
+            Self::Panicked => formatter.write_str("kernel writer panicked"),
+        }
+    }
+}
+
+impl std::error::Error for KernelHostJoinError {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KernelHostSnapshot {
     pub admission: KernelAdmissionState,
     pub lifecycle: KernelHostLifecycle,
+    pub failure: Option<KernelHostFailure>,
 }
 
 #[derive(Debug)]
@@ -336,6 +389,7 @@ pub struct KernelHost<Run, Batch, InitError> {
     thread: JoinHandle<()>,
     ready: Option<oneshot::Receiver<std::result::Result<(), InitError>>>,
     status: Arc<Mutex<KernelHostSnapshot>>,
+    status_updates: watch::Sender<KernelHostSnapshot>,
     writer_finished: Arc<AtomicBool>,
     stop_requested: Arc<AtomicBool>,
     writer_thread: Arc<Thread>,
@@ -349,6 +403,7 @@ pub struct KernelHost<Run, Batch, InitError> {
 pub struct KernelHostHandle<Run, Batch> {
     sender: WriterSender<Run, Batch>,
     status: Arc<Mutex<KernelHostSnapshot>>,
+    status_updates: watch::Sender<KernelHostSnapshot>,
     writer_finished: Arc<AtomicBool>,
     writer_thread: Arc<Thread>,
 }
@@ -360,6 +415,7 @@ impl<Run, Batch> Clone for KernelHostHandle<Run, Batch> {
         Self {
             sender: self.sender.clone(),
             status: Arc::clone(&self.status),
+            status_updates: self.status_updates.clone(),
             writer_finished: Arc::clone(&self.writer_finished),
             writer_thread: Arc::clone(&self.writer_thread),
         }
@@ -386,6 +442,9 @@ fn refresh_writer_status(status: &Arc<Mutex<KernelHostSnapshot>>, writer_finishe
     if let Some(fault) = fault {
         snapshot.admission = KernelAdmissionState::Closed { fault };
         snapshot.lifecycle = KernelHostLifecycle::Failed;
+        snapshot
+            .failure
+            .get_or_insert(KernelHostFailure::WriterExited);
     }
 }
 
@@ -403,6 +462,11 @@ impl<Run, Batch> KernelHostHandle<Run, Batch> {
 
     pub fn admission_state(&self) -> KernelAdmissionState {
         self.snapshot().admission
+    }
+
+    /// Subscribe to bounded host-state changes without adding another queue.
+    pub fn status_receiver(&self) -> watch::Receiver<KernelHostSnapshot> {
+        self.status_updates.subscribe()
     }
 
     fn writer_closed_error(&self) -> KernelSubmitError {
@@ -483,6 +547,7 @@ impl<Run, Batch, InitError> KernelHost<Run, Batch, InitError> {
         KernelHostHandle {
             sender: self.sender.clone(),
             status: Arc::clone(&self.status),
+            status_updates: self.status_updates.clone(),
             writer_finished: Arc::clone(&self.writer_finished),
             writer_thread: Arc::clone(&self.writer_thread),
         }
@@ -500,18 +565,6 @@ impl<Run, Batch, InitError> KernelHost<Run, Batch, InitError> {
         }
         status.admission = KernelAdmissionState::Closed { fault };
         status.lifecycle = KernelHostLifecycle::AdmissionClosed { fault };
-    }
-
-    pub fn reopen_admission_after_recovery(&self) {
-        let mut status = self.status_lock();
-        if matches!(
-            status.lifecycle,
-            KernelHostLifecycle::AdmissionClosed { fault }
-                if !matches!(fault, KernelAdmissionFault::ShuttingDown)
-        ) {
-            status.admission = KernelAdmissionState::Open;
-            status.lifecycle = KernelHostLifecycle::Ready;
-        }
     }
 
     /// Wait for the authoritative initialization callback before admitting
@@ -578,12 +631,13 @@ impl<Run, Batch, InitError> KernelHost<Run, Batch, InitError> {
     }
 
     /// Stop new admissions and join the sole writer thread.
-    pub fn join(self) -> std::thread::Result<()> {
+    pub fn join(self) -> std::result::Result<(), KernelHostJoinError> {
         let KernelHost {
             sender,
             thread,
             ready: _,
             status,
+            status_updates: _,
             writer_finished: _,
             stop_requested,
             writer_thread,
@@ -606,7 +660,8 @@ impl<Run, Batch, InitError> KernelHost<Run, Batch, InitError> {
         let mut snapshot = status
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let failed = matches!(snapshot.lifecycle, KernelHostLifecycle::Failed);
+        let failure = snapshot.failure;
+        let failed = matches!(snapshot.lifecycle, KernelHostLifecycle::Failed) || failure.is_some();
         snapshot.admission = KernelAdmissionState::Closed {
             fault: KernelAdmissionFault::ShuttingDown,
         };
@@ -615,7 +670,13 @@ impl<Run, Batch, InitError> KernelHost<Run, Batch, InitError> {
         } else {
             KernelHostLifecycle::Failed
         };
-        result
+        if result.is_err() {
+            Err(KernelHostJoinError::Panicked)
+        } else if let Some(failure) = failure {
+            Err(KernelHostJoinError::WriterFailed(failure))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -650,6 +711,13 @@ where
         .map_err(KernelHostSpawnError::InvalidConfig)?;
     let writer_finished = Arc::new(AtomicBool::new(false));
     let stop_requested = Arc::new(AtomicBool::new(false));
+    let initial_status = KernelHostSnapshot {
+        admission: KernelAdmissionState::Starting,
+        lifecycle: KernelHostLifecycle::Starting,
+        failure: None,
+    };
+    let status = Arc::new(Mutex::new(initial_status));
+    let (status_updates, _status_receiver) = watch::channel(initial_status);
     let WriterActor {
         sender,
         thread,
@@ -661,6 +729,9 @@ where
         WriterExitSignal {
             _hold: hold,
             finished: Arc::clone(&writer_finished),
+            stop_requested: Arc::clone(&stop_requested),
+            status: Arc::clone(&status),
+            status_updates: status_updates.clone(),
         },
         initialize,
         process_run,
@@ -673,10 +744,8 @@ where
         sender,
         thread,
         ready: Some(ready),
-        status: Arc::new(Mutex::new(KernelHostSnapshot {
-            admission: KernelAdmissionState::Starting,
-            lifecycle: KernelHostLifecycle::Starting,
-        })),
+        status,
+        status_updates,
         writer_finished,
         stop_requested,
         writer_thread,

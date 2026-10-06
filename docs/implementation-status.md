@@ -62,14 +62,24 @@ events. Scoped logging and read-only monitoring are connected in source;
 selected metadata/redacted content policy is resolved before capture. Raw
 native-frame capture remains unavailable.
 
-The previously listed product source integrations are delivered. A subsequent
-bounded source review found further required closure work: wake and retain a
-Kernel writer failure, record truthful final Store close diagnostics, preserve
-primary startup errors, retain standalone supervisor child identity and exit
-causes, and carry child structured failures through the public wrappers. The
-installed OpenCode resources also require an explicit locked dependency closure
-and correctly labeled package-manifest hashes. These source changes must finish
-before tests or native qualification.
+Kernel writer failure now publishes a retained watch snapshot that wakes the
+host even when no request is active. Shutdown joins the original writer before
+recording its final lifecycle result through the existing Store. That sequential
+recovery retains the same locked File, opens only the existing database and
+does not replay work or advance the host epoch. Primary startup errors survive
+cleanup with bounded secondary codes.
+
+Installed OpenCode resources now have a locked npm dependency closure, atomic
+resource publication, exact package/build sidecar identity and a shared bounded
+tree verifier used by Kernel and the standalone adapter. Source-tree resources
+require an explicit debug opt-in. These are source deliveries; installation and
+native launch remain unqualified.
+
+Remaining source work includes retained secondary lifecycle diagnostics, the
+standalone supervisor's full child identity/exit/stop receipt, bounded child
+stderr forwarding through public wrappers, generic Module event status
+projection and pending-event transfer. These changes must finish before tests
+or native qualification.
 
 The native qualification script now validates the
 public CLI, host wrapper, actual Kernel and supervisor coordinates separately,

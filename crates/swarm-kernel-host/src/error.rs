@@ -12,6 +12,8 @@ pub struct Error {
     pub rejection_class: Option<NativeRpcRejectionClass>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub native_http_failure: Option<NativeHttpFailure>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secondary_codes: Vec<String>,
 }
 
 impl Error {
@@ -21,10 +23,28 @@ impl Error {
             message: message.into(),
             rejection_class: None,
             native_http_failure: None,
+            secondary_codes: Vec::new(),
         }
     }
     pub fn with_rejection_class(mut self, rejection_class: NativeRpcRejectionClass) -> Self {
         self.rejection_class = Some(rejection_class);
+        self
+    }
+    pub fn with_secondary_code(mut self, code: impl Into<String>) -> Self {
+        if self.secondary_codes.len() < 2 {
+            let code = code.into();
+            let bounded = if !code.is_empty()
+                && code.len() <= 64
+                && code
+                    .bytes()
+                    .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+            {
+                code
+            } else {
+                "ERROR_SECONDARY".to_owned()
+            };
+            self.secondary_codes.push(bounded);
+        }
         self
     }
     pub fn invalid(message: impl Into<String>) -> Self {
@@ -41,6 +61,7 @@ impl From<swarm_contracts::error::Error> for Error {
             message: value.message,
             rejection_class: value.rejection_class,
             native_http_failure: value.native_http_failure,
+            secondary_codes: Vec::new(),
         }
     }
 }

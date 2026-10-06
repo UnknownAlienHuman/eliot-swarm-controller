@@ -126,6 +126,7 @@ async fn run_until(
     )
     .await
     .map_err(|error| startup_error("store_start", error))?;
+    let mut kernel_status = owner.store.kernel_status_receiver();
     let mut host_image_receipt = if observer_config_valid {
         match swarm_observer::host_image_receipt::HostImageReceipt::publish(&root_path) {
             Ok(receipt) => Some(receipt),
@@ -149,21 +150,12 @@ async fn run_until(
     let mut listener = match startup {
         Ok(listener) => listener,
         Err(error) => {
-            if let Err(receipt_error) = owner
-                .store
-                .record_host_exit(Some(error.code.clone()), None)
-                .await
-            {
-                eprintln!("host startup failure receipt: {}", receipt_error.code);
-            }
             let producer_drained = owner.store.drain_diagnostics(Duration::from_secs(5)).await;
             let producer_stats = owner.store.diagnostic_stats();
             cleanup_host_image_receipt(&mut host_image_receipt);
-            if let Err(close_error) = owner.close().await {
-                eprintln!("host startup Store close: {}", close_error.code);
-            }
+            let result = owner.close_with_exit(Err(error), None).await;
             report_observer_shutdown(&observer, Some(producer_stats), producer_drained);
-            return Err(error);
+            return result;
         }
     };
     let (shutdown, stopping) = watch::channel(false);
@@ -205,42 +197,65 @@ async fn run_until(
     let mut connections = JoinSet::new();
     eprintln!("swarm host ready: {}", listener.endpoint());
     let mut failed_supervisor: Option<&'static str> = None;
-    let mut exit = loop {
-        tokio::select! {
-            signal=&mut foreground_stop=>break signal,
-            Some(result)=supervisors.join_next_with_id()=>{
-                break match result {
-                    Ok((id, (name, Ok(())))) => {
-                        let _ = supervisor_names.remove(&id);
-                        failed_supervisor = Some(name);
-                        Err(Error::new("SUPERVISOR_STOPPED", format!("{name} stopped before host shutdown")))
-                    }
-                    Ok((id, (name, Err(error)))) => {
-                        let _ = supervisor_names.remove(&id);
-                        failed_supervisor = Some(name);
-                        Err(Error::new(error.code, format!("{name}: {}", error.message)))
-                    }
-                    Err(error) => {
-                        failed_supervisor = supervisor_names.remove(&error.id());
-                        Err(Error::new("SUPERVISOR_FAILED", error.to_string()))
-                    }
-                };
-            }
-            Some(result)=connections.join_next(),if !connections.is_empty()=>{
-                if let Err(e)=result{eprintln!("IPC worker ended: {e}");}
-            }
-            accepted=listener.accept()=>{
-                let stream=match accepted{Ok(s)=>s,Err(e)=>break Err(e)};
-                let permit=match semaphore.clone().try_acquire_owned(){Ok(p)=>p,Err(_)=>{drop(stream);continue}};
-                let store=owner.store.clone();let config=ipc_config.clone();let stopping=stopping.clone();
-                connections.spawn(async move{
-                    let _permit=permit;
-                    if let Err(e)=ipc::serve_connection(
-                        stream,store,config,stopping
-                    ).await{eprintln!("IPC connection: {}",e.code);}
-                });
-            }
+    let mut exit = match kernel_snapshot_error_code(owner.store.kernel_snapshot()) {
+        Some(error_code) => {
+            eprintln!("host kernel failure: {error_code}");
+            Err(Error::new(error_code, "kernel writer stopped unexpectedly"))
         }
+        None => loop {
+            tokio::select! {
+                signal=&mut foreground_stop=>break signal,
+                changed=kernel_status.changed()=>{
+                    if changed.is_err() {
+                        break Err(Error::new(
+                            "KERNEL_STATUS_CLOSED",
+                            "kernel writer status stream ended",
+                        ));
+                    }
+                    let snapshot = *kernel_status.borrow_and_update();
+                    if let Some(error_code) = kernel_snapshot_error_code(snapshot) {
+                        eprintln!("host kernel failure: {error_code}");
+                        break Err(Error::new(error_code, "kernel writer stopped unexpectedly"));
+                    }
+                },
+                Some(result)=supervisors.join_next_with_id()=>{
+                    break match result {
+                        Ok((id, (name, Ok(())))) => {
+                            let _ = supervisor_names.remove(&id);
+                            failed_supervisor = Some(name);
+                            Err(Error::new("SUPERVISOR_STOPPED", format!("{name} stopped before host shutdown")))
+                        }
+                        Ok((id, (name, Err(error)))) => {
+                            let _ = supervisor_names.remove(&id);
+                            failed_supervisor = Some(name);
+                            let mut contextual = Error::new(error.code, format!("{name}: {}", error.message));
+                            for code in error.secondary_codes {
+                                contextual = contextual.with_secondary_code(code);
+                            }
+                            Err(contextual)
+                        }
+                        Err(error) => {
+                            failed_supervisor = supervisor_names.remove(&error.id());
+                            Err(Error::new("SUPERVISOR_FAILED", error.to_string()))
+                        }
+                    };
+                }
+                Some(result)=connections.join_next(),if !connections.is_empty()=>{
+                    if let Err(e)=result{eprintln!("IPC worker ended: {e}");}
+                }
+                accepted=listener.accept()=>{
+                    let stream=match accepted{Ok(s)=>s,Err(e)=>break Err(e)};
+                    let permit=match semaphore.clone().try_acquire_owned(){Ok(p)=>p,Err(_)=>{drop(stream);continue}};
+                    let store=owner.store.clone();let config=ipc_config.clone();let stopping=stopping.clone();
+                    connections.spawn(async move{
+                        let _permit=permit;
+                        if let Err(e)=ipc::serve_connection(
+                            stream,store,config,stopping
+                        ).await{eprintln!("IPC connection: {}",e.code);}
+                    });
+                }
+            }
+        },
     };
     drop(listener);
     let _ = shutdown.send(true);
@@ -276,38 +291,26 @@ async fn run_until(
             }
         }
     }
-    if let Some(error_code) = kernel_admission_error_code(owner.store.kernel_snapshot()) {
+    if let Some(error_code) = kernel_snapshot_error_code(owner.store.kernel_snapshot()) {
         eprintln!("host kernel admission: {error_code}");
         if exit.is_ok() {
-            exit = Err(Error::new(error_code, "kernel durable admission is closed"));
-        }
-    }
-    if let Err(error) = owner
-        .store
-        .record_host_exit(
-            exit.as_ref().err().map(|error| error.code.clone()),
-            failed_supervisor,
-        )
-        .await
-    {
-        eprintln!("host exit receipt: {}", error.code);
-        if exit.is_ok() {
-            exit = Err(error);
+            exit = Err(Error::new(error_code, "kernel writer admission is closed"));
         }
     }
     let producer_drained = owner.store.drain_diagnostics(Duration::from_secs(5)).await;
     let producer_stats = owner.store.diagnostic_stats();
     cleanup_host_image_receipt(&mut host_image_receipt);
-    if let Err(error) = owner.close().await
-        && exit.is_ok()
-    {
-        exit = Err(error);
-    }
+    exit = owner.close_with_exit(exit, failed_supervisor).await;
     report_observer_shutdown(&observer, Some(producer_stats), producer_drained);
     exit
 }
 
-fn kernel_admission_error_code(snapshot: swarm_kernel::KernelHostSnapshot) -> Option<&'static str> {
+fn kernel_snapshot_error_code(snapshot: swarm_kernel::KernelHostSnapshot) -> Option<&'static str> {
+    if let Some(failure) = snapshot.failure {
+        return Some(match failure {
+            swarm_kernel::KernelHostFailure::WriterExited => "KERNEL_WRITER_EXITED",
+        });
+    }
     match snapshot.admission {
         swarm_kernel::KernelAdmissionState::Closed { fault } => Some(match fault {
             swarm_kernel::KernelAdmissionFault::InitializationFailed => {
@@ -412,12 +415,16 @@ fn report_observer_shutdown(
 /// phase and controller code as the terminal startup result. No DB receipt can
 /// be promised when opening that database itself failed.
 fn startup_error(phase: &'static str, error: Error) -> Error {
-    Error::new(
+    let mut sanitized = Error::new(
         error.code,
         format!(
             "host startup failed at {phase}; inspect that stage before starting the host again"
         ),
-    )
+    );
+    for code in error.secondary_codes {
+        sanitized = sanitized.with_secondary_code(code);
+    }
+    sanitized
 }
 
 /// One host-owned reconciler for enabled automation entries and passive scoped
