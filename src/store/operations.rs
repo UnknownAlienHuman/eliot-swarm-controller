@@ -2322,20 +2322,11 @@ pub(super) fn open_for_launch_for_actor(
         let workspace_field = route
             .workspace_option
             .as_deref()
-            .or({
-                match route.runtime.as_str() {
-                    crate::runtime::opencode_v2::RUNTIME => Some("directory"),
-                    "zed" => Some("workdir"),
-                    "codex" | "command" | "claude" | "antigravity" | "muse" => {
-                        Some("workspaceRoot")
-                    }
-                    _ => None,
-                }
-            })
+            .or_else(|| route.compatibility_workspace_option())
             .ok_or_else(|| {
                 Error::new(
                     "CAPABILITY_GAP",
-                    "runtime has no registered workspace-bound launch contract",
+                    "legacy launch route has no workspace compatibility contract",
                 )
             })?;
         let options = route.native_options.as_object_mut().ok_or_else(|| {
@@ -2402,7 +2393,6 @@ fn inject_admitted_workspace(
         ));
     }
     *value = json!(workspace_path);
-    route.workspace_option = Some(leaf.clone());
     Ok(())
 }
 

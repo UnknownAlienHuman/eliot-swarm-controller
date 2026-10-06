@@ -211,6 +211,20 @@ impl std::fmt::Debug for OwnedProviderAuthSourceConfig {
 }
 
 impl Route {
+    /// Preserve the workspace-field convention of routes that predate the
+    /// descriptor-selected module contract. New selected descriptors supply
+    /// their RFC 6901 native-options pointer through the module contract; this
+    /// helper is only the bounded compatibility translation for an unselected
+    /// legacy route.
+    pub(crate) fn compatibility_workspace_option(&self) -> Option<&'static str> {
+        match self.runtime.as_str() {
+            crate::runtime::opencode_v2::RUNTIME => Some("directory"),
+            "zed" => Some("workdir"),
+            "codex" | "command" | "claude" | "antigravity" | "muse" => Some("workspaceRoot"),
+            _ => None,
+        }
+    }
+
     fn validate_activation_contract(&self) -> Result<()> {
         if self.workspace_option.as_deref().is_some_and(|field| {
             let mut bytes = field.bytes();
