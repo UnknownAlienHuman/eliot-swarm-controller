@@ -201,3 +201,21 @@ existing per-scope supervisor recreation does not replay native input. Snapshot
 readiness restoration also retains recovery and unresolved-input guards.
 
 Implementation qualification is recorded in `docs/implementation-status.md`. These receipts do not introduce an automatic host restart, a model call or a new daemon.
+
+## Optional module-supervisor child recovery
+
+Before child `exec`, the coordinator writes and reads back
+`MODULE_SUPERVISOR_SPAWN_PENDING`. It does not spawn unless that durable intent
+and prior-child departure evidence are confirmed. A restart finding the pending
+marker without a child receipt keeps the launch fenced.
+
+The prior child is resolved only by a retained confirmed-exit receipt or exact
+identity reconciliation using PID, process-birth identity and image. A matching
+live child remains owned; uncertain identity keeps a safe Manager error in
+`host.status.host_lifecycle.optional_workers["module-supervisor"].last_error_code`.
+This retained health read uses ordinary authorization and is independent of any
+particular GM or chat; it does not authorize a launch. A detached one-shot
+reaper waits for the exact verified child only while the runtime exists. If the
+runtime is gone, it sends no signal and claims no departure; the handle remains
+unreaped and durable pending/uncertain state awaits Manager recovery. This is a
+source boundary, not a runtime-qualification claim.
