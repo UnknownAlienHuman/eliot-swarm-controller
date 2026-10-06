@@ -22,6 +22,22 @@ pub const NORMALIZED_RESULT_CONTEXT_SCHEMA_ID: &str = "swarm.normalized_result_c
 pub const NORMALIZED_RESULT_PAGE_SCHEMA_ID: &str = "swarm.normalized_result_page";
 pub const RUNTIME_SCHEMA_VERSION: &str = "1";
 
+pub use crate::native_mcp::{
+    NATIVE_MCP_COMMAND_SCHEMA_ID, NATIVE_MCP_COMMAND_SCHEMA_VERSION,
+};
+
+/// Descriptor declaration for the bounded native MCP command carried inside
+/// the existing authenticated RuntimeCommand transport. Native outcomes keep
+/// using `swarm.runtime_outcome@1`; this helper intentionally adds no event
+/// schema or receipt channel.
+pub fn native_mcp_command_schema() -> SchemaDescriptor {
+    SchemaDescriptor {
+        schema_id: NATIVE_MCP_COMMAND_SCHEMA_ID.to_owned(),
+        version: NATIVE_MCP_COMMAND_SCHEMA_VERSION.to_owned(),
+        sha256: None,
+    }
+}
+
 pub fn runtime_command_schema() -> SchemaDescriptor {
     SchemaDescriptor {
         schema_id: RUNTIME_COMMAND_SCHEMA_ID.to_owned(),

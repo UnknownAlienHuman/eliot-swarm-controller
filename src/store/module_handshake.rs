@@ -19,7 +19,9 @@ use swarm_contracts::module_catalog::{
     ArtifactIdentity, ArtifactVersion, CapabilityId, ModuleCatalog, ModuleDescriptor, ModuleId,
     PreInputOpenContract, ProtocolVersion, SchemaDescriptor, WorkspaceOptionContract,
 };
-use swarm_contracts::module_contract::{MODULE_PROTOCOL_V1, ModuleContractClaim};
+use swarm_contracts::module_contract::{
+    MODULE_PROTOCOL_V1, ModuleContractClaim, native_mcp_command_schema,
+};
 
 const REGISTRY_KEY: &str = "module_catalog:trusted_descriptors:v1";
 const REGISTRY_SCHEMA_VERSION: u16 = 1;
@@ -758,15 +760,35 @@ pub(super) fn selected_native_command_supported(
     let Some(required) = native_command_capability(method, input) else {
         return Ok(Some(true));
     };
+    let native_mcp = is_native_mcp_method(method);
     let Some(retained) = retained_contract_identity(db, binding_artifact_id, selector)? else {
-        return Ok(None);
+        // Native MCP phase Operations are meaningful only under the exact
+        // retained descriptor that authorizes their command schema. Preserve
+        // legacy behavior for the pre-existing agent.* runtime contract.
+        return Ok(if native_mcp { Some(false) } else { None });
     };
-    Ok(Some(retained.capabilities.iter().any(|capability| {
+    let capability_supported = retained.capabilities.iter().any(|capability| {
         capability_satisfies(capability.as_str(), required)
-    })))
+    });
+    let schema_supported = !native_mcp
+        || retained
+            .command_schemas
+            .contains(&native_mcp_command_schema());
+    Ok(Some(capability_supported && schema_supported))
+}
+
+fn is_native_mcp_method(method: &str) -> bool {
+    swarm_contracts::native_mcp::NATIVE_MCP_METHODS.contains(&method)
 }
 
 fn native_command_capability(method: &str, input: &Value) -> Option<&'static str> {
+    if let Some(capability) = swarm_contracts::native_mcp::NATIVE_MCP_METHODS
+        .iter()
+        .copied()
+        .find(|candidate| *candidate == method)
+    {
+        return Some(capability);
+    }
     Some(match method {
         "agent.open" => "agent.open",
         "task.dispatch" => "task.dispatch",

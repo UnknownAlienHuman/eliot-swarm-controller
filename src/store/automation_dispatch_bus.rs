@@ -1221,6 +1221,253 @@ fn module_event_operation_link_owner(
     }
 }
 
+const NATIVE_MCP_PHASE_OPERATION_CALLER: &str = "swarm.internal.c8.native_mcp";
+
+/// Read the retained parent of a C8 native MCP phase Operation. The child
+/// Operation stores this link in its immutable native_mcp envelope; no live
+/// AssignmentContext, Task, participant lease, or supervisor record is read.
+fn module_event_native_mcp_phase_parent(
+    db: &Connection,
+    operation_id: &str,
+    method: &str,
+    caller_id: &str,
+    task_id: Option<&str>,
+    attempt_id: Option<&str>,
+    binding_id: Option<&str>,
+    binding_generation: Option<i64>,
+) -> Result<Option<String>> {
+    let expected_original_phase = match method {
+        "native.mcp.install" => "install",
+        "native.mcp.observe" => "observe",
+        "native.mcp.arm" => "arm",
+        "native.mcp.read" => "read",
+        _ => return Ok(None),
+    };
+    let unauthorized = || {
+        Error::new(
+            "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
+            "native MCP phase Operation has no exact retained launch parent",
+        )
+    };
+    if caller_id != NATIVE_MCP_PHASE_OPERATION_CALLER {
+        return Err(unauthorized());
+    }
+
+    type PhaseOperationRow = (
+        String,
+        String,
+        String,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let phase_operation: Option<PhaseOperationRow> = db
+        .query_row(
+            "SELECT method,caller_id,client_request_id,\
+                    json_extract(original_request_json,'$.schema_version'),\
+                    json_extract(original_request_json,'$.operation_id'),\
+                    json_extract(original_request_json,'$.phase'),\
+                    json_extract(original_request_json,'$.binding_generation'),\
+                    json_extract(original_request_json,'$.binding_id'),\
+                    json_extract(effective_request_json,'$.native_mcp.schema_version'),\
+                    json_extract(effective_request_json,'$.native_mcp.binding_generation'),\
+                    json_extract(effective_request_json,'$.native_mcp.parent_launch_operation_id'),\
+                    json_extract(effective_request_json,'$.native_mcp.launch_identity_digest'),\
+                    json_extract(effective_request_json,'$.native_mcp.phase'),\
+                    json_extract(effective_request_json,'$.native_mcp.method'),\
+                    json_extract(effective_request_json,'$.native_mcp.task_revision'),\
+                    json_extract(effective_request_json,'$.native_mcp.task_id'),\
+                    json_extract(effective_request_json,'$.native_mcp.attempt_id'),\
+                    json_extract(effective_request_json,'$.native_mcp.binding_id'),\
+                    json_extract(effective_request_json,'$.native_mcp.child_operation_id') \
+             FROM operations WHERE operation_id=?1",
+            [operation_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
+                    row.get(13)?,
+                    row.get(14)?,
+                    row.get(15)?,
+                    row.get(16)?,
+                    row.get(17)?,
+                    row.get(18)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        retained_method,
+        retained_caller_id,
+        client_request_id,
+        original_schema_version,
+        original_operation_id,
+        original_phase,
+        original_binding_generation,
+        original_binding_id,
+        native_schema_version,
+        native_binding_generation,
+        parent_launch_operation_id,
+        launch_identity_digest,
+        native_phase,
+        native_method,
+        native_task_revision,
+        native_task_id,
+        native_attempt_id,
+        native_binding_id,
+        native_child_operation_id,
+    )) = phase_operation
+    else {
+        return Err(unauthorized());
+    };
+
+    let native_phase_matches = matches!(
+        (method, native_phase.as_deref()),
+        ("native.mcp.install", Some("install"))
+            | ("native.mcp.observe", Some("observe_unknown" | "observe_refresh"))
+            | ("native.mcp.arm", Some("arm"))
+            | ("native.mcp.read", Some("read"))
+    );
+    let valid_launch_digest = launch_identity_digest
+        .as_deref()
+        .and_then(|value| value.strip_prefix("sha256:"))
+        .is_some_and(|digest| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        });
+    let (Some(task_id), Some(attempt_id), Some(binding_id), Some(binding_generation)) =
+        (task_id, attempt_id, binding_id, binding_generation)
+    else {
+        return Err(unauthorized());
+    };
+    let Some(parent_launch_operation_id) = parent_launch_operation_id
+        .filter(|value| !value.is_empty() && value != operation_id)
+    else {
+        return Err(unauthorized());
+    };
+    if retained_method != method
+        || retained_caller_id != caller_id
+        || client_request_id != format!("native-mcp:{operation_id}")
+        || original_schema_version != Some(1)
+        || original_operation_id.as_deref() != Some(operation_id)
+        || original_phase.as_deref() != Some(expected_original_phase)
+        || original_binding_id.as_deref() != Some(binding_id)
+        || original_binding_generation != Some(binding_generation)
+        || native_schema_version != Some(1)
+        || !valid_launch_digest
+        || !native_phase_matches
+        || native_method.as_deref() != Some(method)
+        || native_task_id.as_deref() != Some(task_id)
+        || native_task_revision.is_none_or(|revision| revision <= 0)
+        || native_attempt_id.as_deref() != Some(attempt_id)
+        || native_binding_id.as_deref() != Some(binding_id)
+        || native_child_operation_id.as_deref() != Some(operation_id)
+        || native_binding_generation != Some(binding_generation)
+    {
+        return Err(unauthorized());
+    }
+    let task_revision = native_task_revision.ok_or_else(unauthorized)?;
+
+    type ParentLaunchRow = (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        String,
+    );
+    let parent: Option<ParentLaunchRow> = db
+        .query_row(
+            "SELECT method,task_id,attempt_id,binding_id,binding_generation,\
+                    json_extract(effective_request_json,'$.launch_manifest.task.task_id'),\
+                    json_extract(effective_request_json,'$.launch_manifest.task.observed_revision'),\
+                    json_extract(effective_request_json,'$.launch_manifest.task.attempt_id'),\
+                    json_extract(effective_request_json,'$.launch_manifest.binding.binding_id'),\
+                    json_extract(effective_request_json,'$.launch_manifest.binding.generation'),\
+                    operation_id \
+             FROM operations WHERE operation_id=?1",
+            [&parent_launch_operation_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        parent_method,
+        parent_task_id,
+        parent_attempt_id,
+        parent_binding_id,
+        parent_binding_generation,
+        manifest_task_id,
+        manifest_task_revision,
+        manifest_attempt_id,
+        manifest_binding_id,
+        manifest_binding_generation,
+        retained_parent_id,
+    )) = parent
+    else {
+        return Err(unauthorized());
+    };
+    if parent_method != "swarm.launch"
+        || retained_parent_id != parent_launch_operation_id
+        || parent_task_id.as_deref() != Some(task_id)
+        || parent_attempt_id.as_deref() != Some(attempt_id)
+        || parent_binding_id.as_deref() != Some(binding_id)
+        || parent_binding_generation != Some(binding_generation)
+        || manifest_task_id.as_deref() != Some(task_id)
+        || manifest_task_revision != Some(task_revision)
+        || manifest_attempt_id.as_deref() != Some(attempt_id)
+        || manifest_binding_id.as_deref() != Some(binding_id)
+        || manifest_binding_generation != Some(binding_generation)
+    {
+        return Err(unauthorized());
+    }
+    Ok(Some(parent_launch_operation_id))
+}
+
 /// Resolve only an Operation's retained Manager owner. Direct callers remain
 /// direct; technical callers require a validated retained automation link or
 /// the exact immutable WorkDispatch launch ancestry. This carries an owner ID
@@ -1332,6 +1579,31 @@ fn module_event_operation_owner(
         else {
             return Err(unauthorized("Module event Operation is unavailable"));
         };
+
+        if let Some(parent_id) = module_event_native_mcp_phase_parent(
+            db,
+            operation_id,
+            &method,
+            &caller_id,
+            task_id.as_deref(),
+            attempt_id.as_deref(),
+            binding_id.as_deref(),
+            binding_generation,
+        )? {
+            return resolve(
+                db,
+                &parent_id,
+                project_id,
+                expected_owner_manager_id,
+                seen,
+                depth + 1,
+            );
+        }
+        if caller_id == NATIVE_MCP_PHASE_OPERATION_CALLER {
+            return Err(unauthorized(
+                "internal native MCP Operation is outside its retained phase contract",
+            ));
+        }
 
         if let Some(link) = authorization::any_on_behalf_operation_link(db, operation_id)? {
             let (

@@ -25,7 +25,7 @@ const PROVISION_KEY: &str = "module_credential_provision";
 const MAX_CREDENTIAL_FILE_BYTES: u64 = 4 * 1024;
 const PENDING_OPERATION_STATES: [&str; 4] =
     ["queued", "sending", "native_accepted", "outcome_unknown"];
-const MODULE_OPERATIONS: [&str; 11] = [
+const MODULE_OPERATIONS: [&str; 15] = [
     "agent.open",
     "task.dispatch",
     "agent.send",
@@ -37,6 +37,10 @@ const MODULE_OPERATIONS: [&str; 11] = [
     "agent.reconcile",
     "agent.result",
     "agent.recover",
+    "native.mcp.install",
+    "native.mcp.observe",
+    "native.mcp.arm",
+    "native.mcp.read",
 ];
 
 /// A host-only proof that the exact retained binding credential exists and is
