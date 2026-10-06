@@ -6,6 +6,7 @@
 
 use super::{Store, capacity, current_principal, gm, mutate, operations};
 use crate::{
+    automation::{authorization::GithubProjectionContext, config::AutomationEntry},
     error::{Error, Result},
     github::{
         client::{GhCli, GitHubLabelApi, IssueLabelSnapshot, RepositoryRef},
@@ -28,6 +29,7 @@ type EffectTargetRow = (
     i64,
     i64,
     String,
+    String,
     i64,
     String,
     Option<bool>,
@@ -43,6 +45,7 @@ struct EffectTarget {
     repository_id: i64,
     issue_id: i64,
     issue_number: i64,
+    source_revision: String,
     task_id: String,
     task_revision: i64,
 }
@@ -438,6 +441,535 @@ async fn call_with_api_inner<A: GitHubLabelApi + ?Sized>(
     }
 }
 
+/// Dispatch one retained automated projection without manufacturing a
+/// Principal for its technical caller. The typed on-behalf context is
+/// revalidated at load and immediately before the single remote write.
+pub(super) async fn call_automatic(store: &Store, operation_id: &str) -> Result<Value> {
+    call_automatic_with_api(store, operation_id, &GhCli).await
+}
+
+async fn call_automatic_with_api<A: GitHubLabelApi + ?Sized>(
+    store: &Store,
+    operation_id: &str,
+    api: &A,
+) -> Result<Value> {
+    let operation_id = operation_id.to_owned();
+    let (operation, request) = store
+        .run(move |db| {
+            let operation = operations::get_operation(db, &operation_id)?;
+            let context = GithubProjectionContext::from_committed_operation(db, &operation_id)?;
+            let original_json: String = db.query_row(
+                "SELECT original_request_json FROM operations WHERE operation_id=?1",
+                [&operation_id],
+                |row| row.get(0),
+            )?;
+            let original: Value = serde_json::from_str(&original_json)?;
+            let request = ManagedLabelRequest::parse(&original)?;
+            context.require_request_matches(&request)?;
+            if operation["caller_id"].as_str() != Some(context.technical_requester_id())
+                || operation["method"].as_str() != Some(METHOD)
+                || operation["task_id"].as_str() != Some(context.task_id())
+                || operation["attempt_id"].as_str() != Some(context.attempt_id())
+            {
+                return Err(Error::new(
+                    "AUTOMATION_LINK_CORRUPT",
+                    "managed-label Operation identity differs from its retained on-behalf cause",
+                ));
+            }
+            Ok((operation, request))
+        })
+        .await?;
+    let state = operation["state"].as_str().unwrap_or_default();
+    match state {
+        "settled" => {
+            let id = operation["operation_id"].as_str().ok_or_else(|| {
+                Error::new(
+                    "AUTOMATION_LINK_CORRUPT",
+                    "managed-label Operation has no ID",
+                )
+            })?;
+            return operation_result(store, id).await;
+        }
+        "rejected" => return Err(operation_error(&operation["result"])),
+        "cancelled" => {
+            return Err(Error::new(
+                "GITHUB_EFFECT_CANCELLED",
+                "the retained automated managed-label Operation was cancelled before dispatch",
+            ));
+        }
+        "queued" => {}
+        "sending" => {
+            return Err(Error::new(
+                "GITHUB_EFFECT_IN_PROGRESS",
+                "the automated managed-label effect may be in flight; it cannot be resent",
+            ));
+        }
+        "outcome_unknown" => {
+            return Err(Error::new(
+                "GITHUB_EFFECT_READBACK_REQUIRED",
+                "the automated managed-label effect is uncertain and requires the retained Manager readback path",
+            ));
+        }
+        _ => {
+            return Err(Error::new(
+                "GITHUB_EFFECT_NOT_RESUMABLE",
+                "the retained automated managed-label Operation is not resumable",
+            ));
+        }
+    }
+
+    let operation_id = operation["operation_id"]
+        .as_str()
+        .ok_or_else(|| {
+            Error::new(
+                "AUTOMATION_LINK_CORRUPT",
+                "managed-label Operation has no ID",
+            )
+        })?
+        .to_owned();
+    let (context, target) = load_automatic_target(store, &operation_id, &request).await?;
+    let repository = RepositoryRef::new(&target.host, &target.owner, &target.repo)?;
+    let initial = match read_remote(api, &repository, &target).await {
+        Ok(initial) => initial,
+        Err(error) => {
+            return finish_automatic_effect(
+                store,
+                &operation_id,
+                &target,
+                &request,
+                "rejected",
+                "rejected_before_write",
+                "not_confirmed",
+                false,
+                None,
+                Some(&error),
+            )
+            .await;
+        }
+    };
+    let currently_present = initial.labels.iter().any(|label| label == &request.label);
+    if currently_present == request.present {
+        return finish_automatic_effect(
+            store,
+            &operation_id,
+            &target,
+            &request,
+            "settled",
+            "already_in_desired_state",
+            "confirmed",
+            false,
+            Some(&initial),
+            None,
+        )
+        .await;
+    }
+
+    begin_automatic_write(store, &operation_id, &context, &target, &request).await?;
+    // The write call is issued once. From the durable `sending` transition
+    // onward, all recovery is readback-only.
+    let write_error = api
+        .set_label(
+            &repository,
+            target.issue_number,
+            &request.label,
+            request.present,
+        )
+        .await
+        .err();
+    if let Err(error) = validate_automatic_readback(store, &operation_id, &target, &request).await {
+        return finish_automatic_effect(
+            store,
+            &operation_id,
+            &target,
+            &request,
+            "outcome_unknown",
+            "readback_blocked_by_current_authority_or_target",
+            "unknown",
+            true,
+            None,
+            Some(&error),
+        )
+        .await;
+    }
+    match read_remote(api, &repository, &target).await {
+        Ok(readback)
+            if readback.labels.iter().any(|label| label == &request.label) == request.present =>
+        {
+            finish_automatic_effect(
+                store,
+                &operation_id,
+                &target,
+                &request,
+                "settled",
+                if write_error.is_some() {
+                    "confirmed_after_transport_error"
+                } else {
+                    "applied"
+                },
+                "confirmed",
+                true,
+                Some(&readback),
+                None,
+            )
+            .await
+        }
+        Ok(readback) => {
+            finish_automatic_effect(
+                store,
+                &operation_id,
+                &target,
+                &request,
+                "outcome_unknown",
+                "desired_state_not_observed_after_write",
+                "unknown",
+                true,
+                Some(&readback),
+                write_error.as_ref(),
+            )
+            .await
+        }
+        Err(error) => {
+            finish_automatic_effect(
+                store,
+                &operation_id,
+                &target,
+                &request,
+                "outcome_unknown",
+                "readback_unavailable_after_write",
+                "unknown",
+                true,
+                None,
+                Some(write_error.as_ref().unwrap_or(&error)),
+            )
+            .await
+        }
+    }
+}
+
+async fn load_automatic_target(
+    store: &Store,
+    operation_id: &str,
+    request: &ManagedLabelRequest,
+) -> Result<(GithubProjectionContext, EffectTarget)> {
+    let operation_id = operation_id.to_owned();
+    let request = request.clone();
+    store
+        .run(move |db| {
+            let operation = operations::get_operation(db, &operation_id)?;
+            if operation["state"] != "queued" {
+                return Err(Error::conflict(
+                    "the automated managed-label Operation changed before dispatch",
+                ));
+            }
+            let context = GithubProjectionContext::from_committed_operation(db, &operation_id)?;
+            context.require_current(db)?;
+            context.require_request_matches(&request)?;
+            let target = resolve_target_identity(db, &request, true)?;
+            validate_automatic_target(&context, &request, &target)?;
+            require_automatic_slot(db, &request, &target, &operation_id)?;
+            Ok((context, target))
+        })
+        .await
+}
+
+async fn validate_automatic_readback(
+    store: &Store,
+    operation_id: &str,
+    expected_target: &EffectTarget,
+    request: &ManagedLabelRequest,
+) -> Result<()> {
+    let operation_id = operation_id.to_owned();
+    let expected_target = expected_target.clone();
+    let request = request.clone();
+    store
+        .run(move |db| {
+            let operation = operations::get_operation(db, &operation_id)?;
+            if operation["state"].as_str() != Some("sending") {
+                return Err(Error::conflict(
+                    "the automated managed-label Operation changed before readback",
+                ));
+            }
+            let context = GithubProjectionContext::from_committed_operation(db, &operation_id)?;
+            context.require_current(db)?;
+            context.require_request_matches(&request)?;
+            let target = resolve_target_identity(db, &request, true)?;
+            validate_automatic_target(&context, &request, &target)?;
+            if !same_automatic_effect_target(&target, &expected_target) {
+                return Err(Error::new(
+                    "GITHUB_EFFECT_TARGET_CHANGED",
+                    "registered source target changed before automated readback",
+                ));
+            }
+            require_automatic_slot(db, &request, &target, &operation_id)
+        })
+        .await
+}
+
+async fn begin_automatic_write(
+    store: &Store,
+    operation_id: &str,
+    expected_context: &GithubProjectionContext,
+    expected_target: &EffectTarget,
+    request: &ManagedLabelRequest,
+) -> Result<()> {
+    let operation_id = operation_id.to_owned();
+    let expected_context = expected_context.clone();
+    let expected_target = expected_target.clone();
+    let request = request.clone();
+    store
+        .run(move |db| {
+            let now = model::now_ms()?;
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let operation = operations::get_operation(&tx, &operation_id)?;
+            if operation["caller_id"].as_str()
+                != Some(expected_context.technical_requester_id())
+                || operation["method"].as_str() != Some(METHOD)
+                || operation["state"].as_str() != Some("queued")
+            {
+                return Err(Error::conflict(
+                    "the automated managed-label Operation is no longer queued",
+                ));
+            }
+            let context = GithubProjectionContext::from_committed_operation(&tx, &operation_id)?;
+            context.require_current(&tx)?;
+            context.require_request_matches(&request)?;
+            let target = resolve_target_identity(&tx, &request, true)?;
+            validate_automatic_target(&context, &request, &target)?;
+            if context.source_revision() != expected_context.source_revision()
+                || !same_automatic_effect_target(&target, &expected_target)
+            {
+                return Err(Error::new(
+                    "GITHUB_EFFECT_TARGET_CHANGED",
+                    "registered source target changed before the automated label write",
+                ));
+            }
+            require_automatic_slot(&tx, &request, &target, &operation_id)?;
+            let changed = tx.execute(
+                "UPDATE operations SET state='sending',sent_at_ms=?2,updated_at_ms=?2 WHERE operation_id=?1 AND caller_id=?3 AND method=?4 AND state='queued'",
+                params![operation_id, now, context.technical_requester_id(), METHOD],
+            )?;
+            if changed != 1 {
+                return Err(Error::conflict(
+                    "the automated managed-label Operation changed before write",
+                ));
+            }
+            capacity::sync_operation(&tx, &operation_id, now)?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finish_automatic_effect(
+    store: &Store,
+    operation_id: &str,
+    target: &EffectTarget,
+    request: &ManagedLabelRequest,
+    requested_state: &'static str,
+    outcome: &str,
+    readback: &str,
+    write_attempted: bool,
+    snapshot: Option<&IssueLabelSnapshot>,
+    error: Option<&Error>,
+) -> Result<Value> {
+    let observed_present =
+        snapshot.map(|snapshot| snapshot.labels.iter().any(|label| label == &request.label));
+    let result = effect_result(
+        operation_id,
+        target,
+        request,
+        outcome,
+        readback,
+        write_attempted,
+        observed_present,
+        error,
+    );
+    persist_automatic_effect(
+        store,
+        operation_id,
+        target,
+        request,
+        result,
+        requested_state,
+        write_attempted,
+    )
+    .await?;
+    operation_result(store, operation_id).await
+}
+
+async fn persist_automatic_effect(
+    store: &Store,
+    operation_id: &str,
+    expected_target: &EffectTarget,
+    request: &ManagedLabelRequest,
+    mut result: Value,
+    requested_state: &'static str,
+    write_attempted: bool,
+) -> Result<()> {
+    let operation_id = operation_id.to_owned();
+    let expected_target = expected_target.clone();
+    let request = request.clone();
+    store
+        .run(move |db| {
+            let now = model::now_ms()?;
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let operation = operations::get_operation(&tx, &operation_id)?;
+            let context = GithubProjectionContext::from_committed_operation(&tx, &operation_id)?;
+            context.require_request_matches(&request)?;
+            if operation["caller_id"].as_str() != Some(context.technical_requester_id())
+                || operation["method"].as_str() != Some(METHOD)
+                || operation["task_id"].as_str() != Some(context.task_id())
+                || operation["attempt_id"].as_str() != Some(context.attempt_id())
+            {
+                return Err(Error::new(
+                    "AUTOMATION_LINK_CORRUPT",
+                    "managed-label Operation identity differs from its retained on-behalf cause",
+                ));
+            }
+            let current_state = operation["state"].as_str().unwrap_or_default();
+            if current_state == "settled" {
+                tx.commit()?;
+                return Ok(());
+            }
+            let mut state = requested_state;
+            let allowed_state = match requested_state {
+                "settled" if write_attempted => "sending",
+                "settled" | "rejected" => "queued",
+                "outcome_unknown" => "sending",
+                _ => return Err(Error::new("INTERNAL", "invalid automated GitHub effect state")),
+            };
+            if current_state != allowed_state {
+                return Err(Error::conflict(
+                    "the automated managed-label Operation changed before result recording",
+                ));
+            }
+
+            let fence = (|| {
+                context.require_current(&tx)?;
+                let target = resolve_target_identity(&tx, &request, true)?;
+                validate_automatic_target(&context, &request, &target)?;
+                if !same_automatic_effect_target(&target, &expected_target) {
+                    return Err(Error::new(
+                        "GITHUB_EFFECT_TARGET_CHANGED",
+                        "the registered source Issue, revision, or Task changed before managed-label settlement",
+                    ));
+                }
+                require_automatic_slot(&tx, &request, &target, &operation_id)
+            })();
+            if let Err(fence_error) = fence {
+                if write_attempted {
+                    state = "outcome_unknown";
+                    result["outcome"] = json!("settlement_blocked_by_current_authority_or_target");
+                    result["readback"] = json!("observed_but_unsettled");
+                    result["error"] = json!({"code":fence_error.code,"message":fence_error.message});
+                } else {
+                    return Err(fence_error);
+                }
+            }
+
+            let allowed_from = match state {
+                "settled" => "'queued','sending'",
+                "rejected" => "'queued'",
+                "outcome_unknown" => "'sending'",
+                _ => return Err(Error::new("INTERNAL", "invalid automated GitHub effect state")),
+            };
+            let sql = format!(
+                "UPDATE operations SET state=?2,result_json=?3,settled_at_ms=?4,updated_at_ms=?5 WHERE operation_id=?1 AND caller_id=?6 AND method=?7 AND state IN ({allowed_from})"
+            );
+            let changed = tx.execute(
+                &sql,
+                params![
+                    operation_id,
+                    state,
+                    model::canonical(&result)?,
+                    if state == "outcome_unknown" { None } else { Some(now) },
+                    now,
+                    context.technical_requester_id(),
+                    METHOD
+                ],
+            )?;
+            if changed != 1 {
+                return Err(Error::conflict(
+                    "the automated managed-label Operation changed before its result was recorded",
+                ));
+            }
+            capacity::sync_operation(&tx, &operation_id, now)?;
+            if state != "outcome_unknown" {
+                let event_key = if state == "settled" {
+                    format!("finished:{operation_id}")
+                } else {
+                    format!("rejected:{operation_id}")
+                };
+                tx.execute(
+                    "INSERT OR IGNORE INTO observations(source_stream_id,source_event_key,operation_id,kind,payload_json,recorded_at_ms) VALUES('github:managed-label',?1,?2,'github.effect.managed_label',?3,?4)",
+                    params![event_key, operation_id, model::canonical(&result)?, now],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+}
+
+fn validate_automatic_target(
+    context: &GithubProjectionContext,
+    request: &ManagedLabelRequest,
+    target: &EffectTarget,
+) -> Result<()> {
+    context.require_request_matches(request)?;
+    if target.source_id != context.source_id()
+        || target.source_revision != context.source_revision()
+        || target.project_id != context.project_id()
+        || target.task_id != context.task_id()
+        || target.task_revision != context.task_revision()
+    {
+        return Err(Error::new(
+            "AUTOMATION_GITHUB_PROJECTION_SOURCE_STALE",
+            "registered GitHub target differs from the retained accepted-candidate cause",
+        ));
+    }
+    Ok(())
+}
+
+fn require_automatic_slot(
+    db: &Connection,
+    request: &ManagedLabelRequest,
+    target: &EffectTarget,
+    operation_id: &str,
+) -> Result<()> {
+    let slot: Option<(i64, String)> = db
+        .query_row(
+            "SELECT desired_present,operation_id FROM github_label_effect_slots WHERE source_id=?1 AND issue_id=?2 AND label=?3",
+            params![request.source_id, target.issue_id, request.label],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if slot.as_ref().is_none_or(|(present, operation)| {
+        *present != i64::from(request.present) || operation != operation_id
+    }) {
+        return Err(Error::new(
+            "GITHUB_EFFECT_SLOT_MISMATCH",
+            "the retained Issue/label slot no longer points to this exact Operation",
+        ));
+    }
+    Ok(())
+}
+
+fn same_automatic_effect_target(left: &EffectTarget, right: &EffectTarget) -> bool {
+    left.source_id == right.source_id
+        && left.source_revision == right.source_revision
+        && left.project_id == right.project_id
+        && left.host == right.host
+        && left.owner == right.owner
+        && left.repo == right.repo
+        && left.repository_id == right.repository_id
+        && left.issue_id == right.issue_id
+        && left.issue_number == right.issue_number
+        && left.task_id == right.task_id
+        && left.task_revision == right.task_revision
+}
+
 pub(super) fn apply(
     tx: &Transaction<'_>,
     principal: &Principal,
@@ -485,6 +1017,7 @@ pub(super) fn apply(
             "task_revision":request.expected_task_revision,
             "issue_id":target.issue_id,
             "issue_number":target.issue_number,
+            "source_revision":target.source_revision,
             "label":request.label,
             "present":request.present,
             "outcome":"managed_label_queued",
@@ -492,6 +1025,97 @@ pub(super) fn apply(
         }),
         true,
     ))
+}
+
+/// Reserve the same durable `(source, Issue, label)` slot used by the direct
+/// managed-label writer, with a closed accepted-candidate cause and current
+/// Manager authority. This function performs no provider I/O.
+pub(super) fn reserve_on_behalf(
+    tx: &Transaction<'_>,
+    entry: &AutomationEntry,
+    context: &GithubProjectionContext,
+    value: &Value,
+    operation_id: &str,
+    now: i64,
+) -> Result<Value> {
+    if entry.owner_manager_id != context.effective_manager_id()
+        || entry.project_id != context.project_id()
+        || entry.automation_id != context.automation_id()
+        || !entry.github_projection_ready()
+    {
+        return Err(Error::new(
+            "AUTOMATION_ACTION_CHANGED",
+            "GitHub projection settings changed before the managed-label slot was reserved",
+        ));
+    }
+    context.require_current(tx)?;
+    let request = ManagedLabelRequest::parse(value)?;
+    context.require_request_matches(&request)?;
+    let target = resolve_target_identity(tx, &request, true)?;
+    if target.project_id != context.project_id()
+        || target.task_id != context.task_id()
+        || target.task_revision != context.task_revision()
+        || target.source_id != context.source_id()
+        || target.source_revision != context.source_revision()
+    {
+        return Err(Error::new(
+            "AUTOMATION_GITHUB_PROJECTION_SOURCE_STALE",
+            "registered source target differs from the exact accepted-candidate projection",
+        ));
+    }
+    let previous: Option<(String, String)> = tx
+        .query_row(
+            "SELECT s.operation_id,o.state FROM github_label_effect_slots s JOIN operations o ON o.operation_id=s.operation_id WHERE s.source_id=?1 AND s.issue_id=?2 AND s.label=?3",
+            params![request.source_id, target.issue_id, request.label],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if previous.is_some_and(|(previous_operation, state)| {
+        previous_operation != operation_id
+            && matches!(
+                state.as_str(),
+                "queued" | "sending" | "native_accepted" | "outcome_unknown"
+            )
+    }) {
+        return Err(Error::new(
+            "GITHUB_EFFECT_SLOT_BUSY",
+            "the exact Issue/label slot has an unresolved Operation; reconcile it before admission",
+        ));
+    }
+    tx.execute(
+        "INSERT INTO github_label_effect_slots(source_id,issue_id,label,desired_present,operation_id,updated_at_ms) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(source_id,issue_id,label) DO UPDATE SET desired_present=excluded.desired_present,operation_id=excluded.operation_id,updated_at_ms=excluded.updated_at_ms",
+        params![request.source_id, target.issue_id, request.label, request.present, operation_id, now],
+    )?;
+    let changed = tx.execute(
+        "UPDATE operations SET task_id=?2,attempt_id=?3 WHERE operation_id=?1 AND caller_id=?4 AND method=?5 AND state='queued'",
+        params![
+            operation_id,
+            request.task_id,
+            context.attempt_id(),
+            context.technical_requester_id(),
+            METHOD
+        ],
+    )?;
+    if changed != 1 {
+        return Err(Error::conflict(
+            "the automated managed-label Operation changed during admission",
+        ));
+    }
+    Ok(json!({
+        "operation_id":operation_id,
+        "source_id":request.source_id,
+        "project_id":target.project_id,
+        "task_id":request.task_id,
+        "task_revision":request.expected_task_revision,
+        "source_revision":target.source_revision,
+        "issue_id":target.issue_id,
+        "issue_number":target.issue_number,
+        "label":request.label,
+        "present":request.present,
+        "desired_present":request.present,
+        "outcome":"managed_label_queued",
+        "current_state_read_method":"operation.get"
+    }))
 }
 
 /// Admit a current-GM/operator readback as its own ordinary Operation. It is
@@ -624,6 +1248,15 @@ fn load_retained_effect_record(
             "the retained Operation receipt does not identify this exact Operation",
         ));
     }
+    let projection_context =
+        if effective_request["automation_on_behalf"]["action"] == "github.effect.managed_label" {
+            Some(GithubProjectionContext::from_committed_operation(
+                db,
+                operation_id,
+            )?)
+        } else {
+            None
+        };
     let result = record["result"].clone();
     validate_retained_effect_result(&result, &receipt["value"], operation_id, &request)?;
 
@@ -645,6 +1278,17 @@ fn load_retained_effect_record(
         return Err(Error::new(
             "GITHUB_EFFECT_TARGET_CHANGED",
             "the registered source no longer resolves to the exact retained repository and Issue",
+        ));
+    }
+    if let Some(context) = projection_context
+        && (target.source_revision != context.source_revision()
+            || target.task_revision != context.task_revision()
+            || receipt["value"]["source_revision"] != context.source_revision()
+            || result["source_revision"] != context.source_revision())
+    {
+        return Err(Error::new(
+            "AUTOMATION_GITHUB_PROJECTION_SOURCE_STALE",
+            "current registered source revision differs from the exact retained projection cause",
         ));
     }
 
@@ -793,9 +1437,9 @@ fn resolve_target_identity(
 ) -> Result<EffectTarget> {
     let row: Option<EffectTargetRow> = db
         .query_row(
-            "SELECT s.project_id,s.host,s.owner,s.repository_name,s.repository_id,i.issue_id,i.issue_number,i.mapping_status,t.revision,t.project_id,m.selected FROM github_sources s JOIN github_issue_items i ON i.source_id=s.source_id JOIN tasks t ON t.task_id=i.task_id LEFT JOIN github_work_pool_members m ON m.source_id=i.source_id AND m.issue_id=i.issue_id AND m.task_id=t.task_id WHERE s.source_id=?1 AND i.task_id=?2",
+            "SELECT s.project_id,s.host,s.owner,s.repository_name,s.repository_id,i.issue_id,i.issue_number,i.mapping_status,i.source_revision,t.revision,t.project_id,m.selected FROM github_sources s JOIN github_issue_items i ON i.source_id=s.source_id JOIN tasks t ON t.task_id=i.task_id LEFT JOIN github_work_pool_members m ON m.source_id=i.source_id AND m.issue_id=i.issue_id AND m.task_id=t.task_id WHERE s.source_id=?1 AND i.task_id=?2",
             params![request.source_id, request.task_id],
-            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?)),
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?,row.get(11)?)),
         )
         .optional()?;
     let Some((
@@ -807,6 +1451,7 @@ fn resolve_target_identity(
         issue_id,
         issue_number,
         mapping,
+        source_revision,
         revision,
         task_project,
         selected,
@@ -817,7 +1462,14 @@ fn resolve_target_identity(
             "the Task is not mapped to an Issue in this registered source work pool",
         ));
     };
-    if mapping != "mapped" || task_project != project_id || issue_id <= 0 || issue_number <= 0 {
+    if mapping != "mapped"
+        || source_revision.trim().is_empty()
+        || source_revision.len() > 512
+        || source_revision.chars().any(char::is_control)
+        || task_project != project_id
+        || issue_id <= 0
+        || issue_number <= 0
+    {
         return Err(Error::new(
             "GITHUB_EFFECT_TARGET_INVALID",
             "the source Issue/Task mapping is unresolved or inconsistent",
@@ -840,6 +1492,7 @@ fn resolve_target_identity(
         repository_id,
         issue_id,
         issue_number,
+        source_revision,
         task_id: request.task_id.clone(),
         task_revision: revision,
     })
@@ -1284,6 +1937,7 @@ fn effect_result(
         "repository_id":target.repository_id,
         "issue_id":target.issue_id,
         "issue_number":target.issue_number,
+        "source_revision":target.source_revision,
         "label":request.label,
         "desired_present":request.present,
         "observed_present":observed_present,
@@ -1561,6 +2215,7 @@ fn reconcile_result(
         result["project_id"] = json!(retained.target.project_id);
         result["task_id"] = json!(retained.target.task_id);
         result["repository_id"] = json!(retained.target.repository_id);
+        result["source_revision"] = json!(retained.target.source_revision);
         result["issue_id"] = json!(retained.target.issue_id);
         result["issue_number"] = json!(retained.target.issue_number);
         result["label"] = json!(retained.request.label);

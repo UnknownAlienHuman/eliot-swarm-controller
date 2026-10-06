@@ -14,6 +14,9 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
+use swarm_contracts::runtime::{
+    GoalContinuationAdmissionContext, GoalContinuationLink, GoalTerminalEvidence,
+};
 use tokio::{sync::watch, task::JoinHandle};
 
 fn descriptor_pre_input_open(
@@ -85,6 +88,69 @@ fn task_dispatch_context(
         source_text_bytes: u64::try_from(text.len())
             .map_err(|_| Error::invalid("task dispatch text length is out of range"))?,
     })
+}
+
+fn goal_continuation_admission_context(
+    operation_id: &str,
+    binding_id: &str,
+    binding_generation: i64,
+    binding: &Value,
+    effective: &Value,
+) -> Result<Option<GoalContinuationAdmissionContext>> {
+    let on_behalf = &effective["automation_on_behalf"];
+    if on_behalf["action"] != "agent.send" || on_behalf["cause"]["kind"] != "goal_progression" {
+        return Ok(None);
+    }
+    if !crate::runtime::codex::is_controller_route(&binding["route"]) {
+        return Err(Error::new(
+            "GOAL_UNSUPPORTED_RUNTIME",
+            "only the Codex controller has a closed Goal continuation admission receipt",
+        ));
+    }
+    let continuation: GoalContinuationLink =
+        serde_json::from_value(on_behalf["cause"]["continuation"].clone()).map_err(|_| {
+            Error::new(
+                "AUTOMATION_LINK_CORRUPT",
+                "Goal continuation admission is missing its immutable linkage",
+            )
+        })?;
+    if continuation.validate().is_err()
+        || continuation.method != "agent.send"
+        || continuation.source_operation_id
+            != on_behalf["cause"]["source_operation_id"]
+                .as_str()
+                .unwrap_or_default()
+        || continuation.source_observation_id
+            != on_behalf["cause"]["source_observation_id"]
+                .as_i64()
+                .unwrap_or_default()
+        || serde_json::to_value(&continuation.terminal_event)?
+            != on_behalf["cause"]["terminal_event"]
+        || continuation.binding_id != binding_id
+        || continuation.binding_generation != binding_generation
+    {
+        return Err(Error::new(
+            "AUTOMATION_LINK_CORRUPT",
+            "Goal continuation admission linkage differs from its retained cause",
+        ));
+    }
+    let worker_boot_id = model::text(&binding["observation"], "bridge_boot_id")?.to_owned();
+    let context = GoalContinuationAdmissionContext {
+        schema_id: swarm_contracts::module_contract::GOAL_CONTINUATION_CONTEXT_SCHEMA_ID.to_owned(),
+        schema_version: GoalContinuationAdmissionContext::VERSION,
+        operation_id: operation_id.to_owned(),
+        binding_id: binding_id.to_owned(),
+        binding_generation,
+        worker_boot_id,
+        continuation,
+    };
+    context.validate().map_err(|_| {
+        Error::new(
+            "AUTOMATION_LINK_CORRUPT",
+            "Goal continuation context is invalid",
+        )
+    })?;
+    Ok(Some(context))
 }
 
 fn validate_task_dispatch_admission(
@@ -176,6 +242,141 @@ fn validate_task_dispatch_admission(
         return Err(Error::new(
             "TASK_DISPATCH_ADMISSION_INVALID",
             "normalized dispatch receipt differs from the original text or immutable Task snapshot",
+        ));
+    }
+    Ok(receipt)
+}
+
+fn validate_goal_continuation_admission(
+    db: &Connection,
+    binding_id: &str,
+    binding_generation: i64,
+    binding: &Value,
+    operation: &Value,
+    outcome: &RuntimeOutcome,
+    module_receipt: &swarm_contracts::runtime::ModuleReceiptIdentity,
+) -> Result<swarm_contracts::runtime::GoalContinuationAdmissionReceipt> {
+    if model::text(operation, "method")? != "agent.send"
+        || model::text(operation, "operation_id")? != outcome.operation_id
+        || !matches!(
+            outcome.outcome,
+            EffectOutcome::Accepted | EffectOutcome::Applied
+        )
+    {
+        return Err(Error::new(
+            "GOAL_CONTINUATION_ADMISSION_INVALID",
+            "continuation receipt must name an admitted agent.send Operation",
+        ));
+    }
+    let effective_raw: String = db.query_row(
+        "SELECT effective_request_json FROM operations WHERE operation_id=?1 AND binding_id=?2 AND binding_generation=?3",
+        params![outcome.operation_id.as_str(), binding_id, binding_generation],
+        |row| row.get(0),
+    )?;
+    let effective: Value = serde_json::from_str(&effective_raw).map_err(|_| {
+        Error::new(
+            "GOAL_CONTINUATION_ADMISSION_INVALID",
+            "continuation Operation effective request is malformed",
+        )
+    })?;
+    let expected_context = goal_continuation_admission_context(
+        &outcome.operation_id,
+        binding_id,
+        binding_generation,
+        binding,
+        &effective,
+    )?
+    .ok_or_else(|| {
+        Error::new(
+            "GOAL_CONTINUATION_ADMISSION_INVALID",
+            "agent.send has no exact Store-authenticated Goal continuation context",
+        )
+    })?;
+    let value = outcome
+        .details
+        .get("goal_continuation_admission")
+        .ok_or_else(|| {
+            Error::new(
+                "GOAL_CONTINUATION_ADMISSION_INVALID",
+                "continuation admission receipt is missing",
+            )
+        })?;
+    let receipt: swarm_contracts::runtime::GoalContinuationAdmissionReceipt =
+        serde_json::from_value(value.clone()).map_err(|_| {
+            Error::new(
+                "GOAL_CONTINUATION_ADMISSION_INVALID",
+                "continuation admission receipt has an invalid shape",
+            )
+        })?;
+    receipt.validate().map_err(|_| {
+        Error::new(
+            "GOAL_CONTINUATION_ADMISSION_INVALID",
+            "continuation admission receipt is invalid",
+        )
+    })?;
+    if receipt.context != expected_context
+        || receipt.module_receipt != *module_receipt
+        || receipt.context.operation_id != outcome.operation_id
+        || receipt.context.binding_id != binding_id
+        || receipt.context.binding_generation != binding_generation
+        || receipt.native_input_id.as_deref() != outcome.native_input_id.as_deref()
+        || receipt.native_input_id.is_none()
+        || outcome.details.get("dispatch_admission").is_some()
+    {
+        return Err(Error::new(
+            "GOAL_CONTINUATION_ADMISSION_INVALID",
+            "continuation receipt does not name the exact Operation, module, prior EventRef, or native input",
+        ));
+    }
+    let task_id = model::text(operation, "task_id")?;
+    let attempt_id = model::text(operation, "attempt_id")?;
+    let attempt = tasks::get_attempt(db, attempt_id)?;
+    if attempt["task_id"] != task_id
+        || attempt["task_revision"] != receipt.context.continuation.task_revision
+        || attempt["attempt_id"] != receipt.context.continuation.attempt_id
+        || attempt["binding_id"] != binding_id
+        || attempt["binding_generation"] != binding_generation
+        || receipt.context.continuation.task_id != task_id
+        || receipt.context.continuation.binding_id != binding_id
+        || receipt.context.continuation.binding_generation != binding_generation
+    {
+        return Err(Error::new(
+            "GOAL_CONTINUATION_ADMISSION_INVALID",
+            "continuation receipt does not match the retained Task Attempt tuple",
+        ));
+    }
+    let raw: String = db.query_row(
+        "SELECT original_request_json FROM operations WHERE operation_id=?1",
+        [&outcome.operation_id],
+        |row| row.get(0),
+    )?;
+    let request: Value = serde_json::from_str(&raw).map_err(|_| {
+        Error::new(
+            "GOAL_CONTINUATION_ADMISSION_INVALID",
+            "continuation Operation request is malformed",
+        )
+    })?;
+    let slot_id = effective["automation_on_behalf"]["cause"]["id"]
+        .as_str()
+        .ok_or_else(|| {
+            Error::new(
+                "GOAL_CONTINUATION_ADMISSION_INVALID",
+                "continuation cause has no exact semantic slot ID",
+            )
+        })?;
+    if request["binding_id"] != binding_id
+        || request["generation"] != binding_generation
+        || request["delivery"] != "next_turn"
+        || request["client_request_id"] != format!("o9gc:{slot_id}")
+        || request.get("action").is_some()
+        || request.get("expected_revision").is_some()
+        || request["text"].as_str().is_none_or(|text| {
+            model::digest(text.as_bytes()) != receipt.context.continuation.objective_sha256
+        })
+    {
+        return Err(Error::new(
+            "GOAL_CONTINUATION_ADMISSION_INVALID",
+            "continuation receipt does not match the immutable agent.send request",
         ));
     }
     Ok(receipt)
@@ -1116,6 +1317,14 @@ fn next_internal(
     if won != 1 {
         return Err(Error::conflict("dispatch already admitted"));
     }
+    if let Some(context) =
+        goal_continuation_admission_context(&op, &id, generation, &b, &effective)?
+    {
+        // This is authenticated Store enrichment. It is deliberately outside
+        // the immutable request digest and is present only for the exact
+        // manager-owned Codex continuation Operation.
+        input["goal_continuation_context"] = serde_json::to_value(context)?;
+    }
     if method == "task.dispatch" {
         let a = tasks::get_attempt(&tx, model::text(&input, "attempt_id")?)?;
         input["task_snapshot"] = a["task_snapshot"].clone();
@@ -1765,6 +1974,152 @@ fn validate_registered_module_recovery_link(
     }
     Ok(())
 }
+fn codex_goal_terminal_evidence(
+    tx: &rusqlite::Transaction<'_>,
+    binding: &Value,
+    operation: &Value,
+    outcome: &RuntimeOutcome,
+) -> Result<Option<GoalTerminalEvidence>> {
+    let Some(marker) = outcome.details.get("goal_terminal_event") else {
+        return Ok(None);
+    };
+    if marker.is_null() {
+        return Ok(None);
+    }
+    if !crate::runtime::codex::is_controller_route(&binding["route"])
+        || !matches!(
+            operation["method"].as_str(),
+            Some("task.dispatch" | "agent.send")
+        )
+        || !matches!(outcome.outcome, EffectOutcome::Applied)
+    {
+        return Err(Error::invalid(
+            "Goal terminal evidence is outside the Codex controller receipt path",
+        ));
+    }
+    if outcome.details["completion_condition"] != "native_turn_completed"
+        || outcome.details["execution_complete"] != true
+        || outcome.details["task_completion"] != "unknown"
+        || outcome.details["disposition"] != "completed"
+        || outcome.details["native_turn_status"] != "completed"
+        || outcome.details["native_input_readback"] != "verified"
+        || outcome.details["native_turn_readback"] != "verified"
+        || outcome.details["client_user_message_id"] != outcome.operation_id
+    {
+        return Err(Error::invalid(
+            "Codex Goal terminal evidence does not prove a completed turn",
+        ));
+    }
+    let has_dispatch_admission = outcome
+        .details
+        .get("dispatch_admission")
+        .is_some_and(|value| !value.is_null());
+    let has_continuation_admission = outcome
+        .details
+        .get("goal_continuation_admission")
+        .is_some_and(|value| !value.is_null());
+    let eligible_admission = match operation["method"].as_str() {
+        Some("task.dispatch") => has_dispatch_admission && !has_continuation_admission,
+        Some("agent.send") => has_continuation_admission && !has_dispatch_admission,
+        _ => false,
+    };
+    if !eligible_admission {
+        return Err(Error::new(
+            "GOAL_TERMINAL_EVIDENCE_INVALID",
+            "Codex terminal evidence has no exact dispatch or closed Goal continuation admission",
+        ));
+    }
+    let attempt_id = model::text(operation, "attempt_id")?;
+    let attempt = tasks::get_attempt(tx, attempt_id)?;
+    if attempt["task_id"] != operation["task_id"]
+        || attempt["binding_id"] != operation["binding_id"]
+        || attempt["binding_generation"] != operation["binding_generation"]
+        || attempt["binding_id"] != binding["binding_id"]
+        || attempt["binding_generation"] != binding["generation"]
+    {
+        return Err(Error::new(
+            "NATIVE_IDENTITY_MISMATCH",
+            "Codex terminal evidence Attempt tuple differs from its Operation",
+        ));
+    }
+    let event: swarm_contracts::runtime::GoalTerminalEventRef =
+        serde_json::from_value(marker["event"].clone())
+            .map_err(|_| Error::invalid("Codex terminal EventRef is invalid"))?;
+    event
+        .validate()
+        .map_err(|_| Error::invalid("Codex terminal EventRef is invalid"))?;
+    let event_record = &marker["event_record"];
+    if event_record["id"].as_str() != Some(event.id.as_str())
+        || event_record["seq"].as_u64() != Some(event.seq)
+        || event_record["operation_id"].as_str() != Some(outcome.operation_id.as_str())
+        || event_record["native_root_id"].as_str() != outcome.native_root_id.as_deref()
+        || event_record["turn_id"].as_str() != outcome.turn_id.as_deref()
+        || event_record["native_input_id"].as_str() != outcome.native_input_id.as_deref()
+        || event_record["kind"].as_str() != Some("turn.completed")
+        || event_record["status"].as_str() != Some("completed")
+        || event.sha256 != model::digest(model::canonical(event_record)?.as_bytes())
+    {
+        return Err(Error::new(
+            "NATIVE_IDENTITY_MISMATCH",
+            "Codex terminal EventRef does not match its retained journal record",
+        ));
+    }
+    let evidence = GoalTerminalEvidence {
+        schema_id: marker["schema_id"]
+            .as_str()
+            .ok_or_else(|| Error::invalid("Codex terminal evidence schema is missing"))?
+            .to_owned(),
+        schema_version: marker["schema_version"]
+            .as_u64()
+            .and_then(|version| u16::try_from(version).ok())
+            .ok_or_else(|| Error::invalid("Codex terminal evidence version is invalid"))?,
+        source: marker["source"]
+            .as_str()
+            .ok_or_else(|| Error::invalid("Codex terminal evidence source is missing"))?
+            .to_owned(),
+        reader_revision: marker["reader_revision"]
+            .as_str()
+            .ok_or_else(|| Error::invalid("Codex terminal evidence reader is missing"))?
+            .to_owned(),
+        operation_id: outcome.operation_id.clone(),
+        binding_id: operation["binding_id"]
+            .as_str()
+            .ok_or_else(|| Error::invalid("Codex terminal evidence binding is missing"))?
+            .to_owned(),
+        binding_generation: operation["binding_generation"]
+            .as_i64()
+            .ok_or_else(|| Error::invalid("Codex terminal evidence generation is missing"))?,
+        task_id: attempt["task_id"]
+            .as_str()
+            .ok_or_else(|| Error::invalid("Codex terminal evidence Task is missing"))?
+            .to_owned(),
+        task_revision: attempt["task_revision"]
+            .as_i64()
+            .ok_or_else(|| Error::invalid("Codex terminal evidence Task revision is missing"))?,
+        task_snapshot_sha256: model::digest(
+            model::canonical(&attempt["task_snapshot"])?.as_bytes(),
+        ),
+        attempt_id: attempt_id.to_owned(),
+        native_session_id: outcome
+            .native_root_id
+            .clone()
+            .ok_or_else(|| Error::invalid("Codex terminal evidence session is missing"))?,
+        native_input_id: outcome
+            .native_input_id
+            .clone()
+            .ok_or_else(|| Error::invalid("Codex terminal evidence input is missing"))?,
+        native_run_id: outcome.turn_id.clone(),
+        completion_condition: "native_turn_completed".to_owned(),
+        disposition: "completed".to_owned(),
+        terminal_outcome: "completed".to_owned(),
+        terminal_event: event,
+    };
+    evidence
+        .validate()
+        .map_err(|_| Error::invalid("Codex Goal terminal evidence is invalid"))?;
+    Ok(Some(evidence))
+}
+
 pub(super) fn outcome_with_artifacts(
     db: &mut Connection,
     p: &Principal,
@@ -1822,6 +2177,29 @@ pub(super) fn outcome_with_artifacts(
     } else {
         None
     };
+    let effective_raw: String = tx.query_row(
+        "SELECT effective_request_json FROM operations WHERE operation_id=?1",
+        [&r.operation_id],
+        |row| row.get(0),
+    )?;
+    let effective: Value = serde_json::from_str(&effective_raw)?;
+    let continuation_expected = o["method"] == "agent.send"
+        && effective["automation_on_behalf"]["action"] == "agent.send"
+        && effective["automation_on_behalf"]["cause"]["kind"] == "goal_progression";
+    if continuation_expected {
+        let receipt = module_receipt.as_ref().ok_or_else(|| {
+            Error::new(
+                "GOAL_CONTINUATION_ADMISSION_INVALID",
+                "Codex Goal continuation requires a typed module receipt",
+            )
+        })?;
+        validate_goal_continuation_admission(&tx, &id, generation, &b, &o, &r, receipt)?;
+    } else if r.details.get("goal_continuation_admission").is_some() {
+        return Err(Error::new(
+            "GOAL_CONTINUATION_ADMISSION_INVALID",
+            "continuation receipt is outside a Store-authenticated Goal agent.send",
+        ));
+    }
     if has_owned_service_ready {
         super::launcher_owned_service::retain_module_owned_service_ready(
             &tx, &id, generation, &o, &r,
@@ -2083,6 +2461,7 @@ pub(super) fn outcome_with_artifacts(
         ));
     }
     let now = model::now_ms()?;
+    let goal_terminal_evidence = codex_goal_terminal_evidence(&tx, &b, &o, &r)?;
     let result_value = serde_json::to_value(&r)?;
     let applied_configuration = if o["method"] == "agent.configure"
         && crate::runtime::prerequisites::validator_for(
@@ -2403,7 +2782,7 @@ pub(super) fn outcome_with_artifacts(
             tx.execute("UPDATE bindings SET state='ready',state_json=json_set(state_json,'$.recovery_required',json('false'),'$.last_recovery',json(?3)) WHERE binding_id=?1 AND generation=?2",params![id,generation,encoded])?;
         }
     }
-    let native_refs = if sessionless_batch {
+    let mut native_refs = if sessionless_batch {
         json!({"session_id":null,"turn_id":null,"input_id":null,
             "execution_shape":crate::runtime::batch::EXECUTION_SHAPE,
             "dispatch_operation_id":if o["method"]=="task.dispatch" {json!(r.operation_id)} else {Value::Null},
@@ -2414,6 +2793,9 @@ pub(super) fn outcome_with_artifacts(
         json!({"session_id":r.native_root_id,"turn_id":r.turn_id,"input_id":r.native_input_id,
             "local_execution_ref":r.details.get("local_execution_ref").cloned().unwrap_or(Value::Null)})
     };
+    if let Some(evidence) = goal_terminal_evidence.as_ref() {
+        native_refs["goal_terminal_evidence"] = serde_json::to_value(evidence)?;
+    }
     tx.execute("UPDATE operations SET state=?2,result_json=?3,native_refs_json=?4,settled_at_ms=?5,updated_at_ms=?6 WHERE operation_id=?1",params![r.operation_id,state,encoded,model::canonical(&native_refs)?,if matches!(state,"outcome_unknown"|"native_accepted"){None}else{Some(now)},now])?;
     if sessionless_batch
         && matches!(
@@ -2427,6 +2809,26 @@ pub(super) fn outcome_with_artifacts(
         )?;
     }
     tx.execute("INSERT INTO observations(source_stream_id,source_event_key,binding_id,binding_generation,operation_id,kind,payload_json,recorded_at_ms) VALUES(?1,?2,?3,?4,?5,'runtime.outcome',?6,?7)",params![format!("module:{}",p.client_id),key,id,generation,r.operation_id,encoded,now])?;
+    if let Some(evidence) = goal_terminal_evidence.as_ref() {
+        let payload = model::canonical(&serde_json::to_value(evidence)?)?;
+        let source_stream = format!("module:{}:goal-terminal", p.client_id);
+        let source_key = format!(
+            "{}:{}",
+            evidence.operation_id, evidence.terminal_event.sha256
+        );
+        tx.execute("INSERT OR IGNORE INTO observations(source_stream_id,source_event_key,binding_id,binding_generation,operation_id,kind,payload_json,recorded_at_ms) VALUES(?1,?2,?3,?4,?5,'goal.terminal.evidence',?6,?7)", params![source_stream, source_key, id, generation, evidence.operation_id, payload, now])?;
+        let retained: String = tx.query_row(
+            "SELECT payload_json FROM observations WHERE source_stream_id=?1 AND source_event_key=?2 AND kind='goal.terminal.evidence'",
+            params![source_stream, source_key],
+            |row| row.get(0),
+        )?;
+        if retained != payload {
+            return Err(Error::new(
+                "NATIVE_IDENTITY_MISMATCH",
+                "Goal terminal evidence was already retained with another EventRef",
+            ));
+        }
+    }
     if matches!(r.outcome, EffectOutcome::Applied | EffectOutcome::Rejected) {
         let (status, phase) = match r.outcome {
             EffectOutcome::Applied => ("applied", "native_outcome_terminal"),
@@ -3965,7 +4367,7 @@ pub(super) fn user_command_for_goal_progression(
     user_command_with_actor(
         tx,
         UserCommandActor::GoalProgression(context),
-        "agent.goal",
+        context.continuation_method(),
         context.request(),
         operation_id,
         config,
@@ -4088,8 +4490,8 @@ fn user_command_with_actor(
                 }
             }
             UserCommandActor::GoalProgression(context) => {
-                if method != "agent.goal"
-                    || v["action"] != "continue"
+                if method != context.continuation_method()
+                    || (context.continuation_method() == "agent.goal" && v["action"] != "continue")
                     || id != context.binding_id()
                     || generation != context.binding_generation()
                     || model::canonical(v)? != model::canonical(context.request())?

@@ -6,6 +6,7 @@ mod automation_acceptance;
 mod automation_cron;
 pub(crate) mod automation_dispatch;
 mod automation_disposition;
+mod automation_github_projection;
 pub(crate) mod automation_goal_progression;
 mod automation_intake;
 mod automation_publication;
@@ -48,6 +49,7 @@ mod launcher_owned_service;
 mod launcher_participant;
 mod legacy_worker_demand;
 mod logging;
+mod mailbox;
 mod message_batch;
 #[cfg(test)]
 mod module_bridge_recovery_tests;
@@ -1386,32 +1388,40 @@ impl Store {
         } else {
             forge::ForgeExecutionPreparation::Skipped
         };
-        let mut result = self.run(move |db| {
-            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let now = model::now_ms()?;
-            let review_dispatch = automation_dispatch::reconcile(&tx, &config, 16, 64, now)?;
-            let work_dispatch = automation_work_dispatch::reconcile(&tx, &config, 16, 64, now)?;
-            let publication = automation_publication::reconcile(
-                &tx,
-                &config,
-                16,
-                64,
-                now,
-                &forge_preparation,
-            )?;
-            let goal_progression = automation_goal_progression::reconcile(
-                &tx,
-                16,
-                64,
-                now,
-                |tx, admission| admit_goal_progression_operation(tx, admission, &config, now),
-            )?;
-            // The cursor, pending reasons, semantic slot and Operation are
-            // durable before the host can observe an admitted action.
-            tx.commit()?;
-            Ok(json!({"review_dispatch":review_dispatch,"work_dispatch":work_dispatch,"publication":publication,"goal_progression":goal_progression}))
-        })
-        .await?;
+        let mut result = self
+            .run(move |db| {
+                let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let now = model::now_ms()?;
+                let review_dispatch = automation_dispatch::reconcile(&tx, &config, 16, 64, now)?;
+                let work_dispatch = automation_work_dispatch::reconcile(&tx, &config, 16, 64, now)?;
+                let publication = automation_publication::reconcile(
+                    &tx,
+                    &config,
+                    16,
+                    64,
+                    now,
+                    &forge_preparation,
+                )?;
+                let goal_progression =
+                    automation_goal_progression::reconcile(&tx, 16, 64, now, |tx, admission| {
+                        admit_goal_progression_operation(tx, admission, &config, now)
+                    })?;
+                let github_projection = automation_github_projection::reconcile(&tx, 16, 16, now)?;
+                // The cursor, pending reasons, semantic slot and Operation are
+                // durable before the host can observe an admitted action.
+                tx.commit()?;
+                Ok(json!({
+                    "review_dispatch":review_dispatch,
+                    "work_dispatch":work_dispatch,
+                    "publication":publication,
+                    "goal_progression":goal_progression,
+                    "github_projection":github_projection
+                }))
+            })
+            .await?;
+        // Projection effects are invoked only after their cursor and Operations commit.
+        result["github_projection_effects"] =
+            automation_github_projection::reconcile_effects_once(self, 16).await?;
         // Script bundle preparation performs file I/O after the durable
         // event cursor and pending causes have committed.
         result["script_run"] = self.reconcile_script_triggers_once(16).await?;
@@ -3091,7 +3101,7 @@ fn page(params: &Value) -> Result<(i64, i64)> {
 const OPERATION_VISIBILITY_SQL: &str = r#"(
     :operator = 1
     OR (
-        op.method NOT IN ('message.send', 'message.cancel', 'coordination.send',
+        op.method NOT IN ('message.send', 'message.cancel', 'coordination.send', 'coordination.message.send',
             'task.request_changes', 'check.run', 'check.cancel', 'event.emit')
         AND op.method NOT LIKE 'coordination.%'
         AND op.method NOT LIKE 'concilium.%'
@@ -3238,7 +3248,7 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
     )
     OR (
         op.caller_id = 'eliot-internal-automation-v1'
-        AND op.method NOT IN ('task.accept','agent.send')
+        AND op.method != 'task.accept'
         AND op.method != 'forge.publish_ref'
         AND EXISTS (
             SELECT 1 FROM meta AS link
@@ -3250,6 +3260,8 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
                     WHEN 'review.assign' THEN '$.on_behalf.effective_manager_id'
                     ELSE '$.automation_on_behalf.effective_manager_id' END)
                   = json_extract(link.value_json, '$.record.effective_manager_id')
+              AND (op.method != 'agent.send'
+                   OR json_extract(link.value_json, '$.record.cause.kind') = 'goal_progression')
               AND NOT (op.method='message.send'
                        AND json_extract(link.value_json,'$.record.cause.kind')='script_controller_effect')
               AND (
@@ -3701,7 +3713,7 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
         )
     )
     OR (
-        op.method IN ('message.send', 'coordination.send', 'coordination.consult')
+        op.method IN ('message.send', 'coordination.message.send', 'coordination.send', 'coordination.consult')
         AND op.state = 'settled'
         AND json_type(op.result_json, '$.sender') = 'text'
         AND json_extract(op.result_json, '$.sender') = op.caller_id
@@ -3714,7 +3726,7 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
         AND op.state = 'settled'
         AND EXISTS (
             SELECT 1 FROM operations AS original
-            WHERE original.method = 'message.send'
+            WHERE original.method IN ('message.send', 'coordination.message.send', 'coordination.send', 'coordination.consult')
               AND original.state = 'settled'
               AND json_extract(original.result_json, '$.delivery_id') =
                   json_extract(op.result_json, '$.cancellation.delivery_id')
@@ -3728,7 +3740,7 @@ const OPERATION_VISIBILITY_SQL: &str = r#"(
               AND json_extract(original.result_json, '$.recipient') = :client
               AND (
                   SELECT count(*) FROM operations AS same_identity
-                  WHERE same_identity.method = 'message.send'
+                  WHERE same_identity.method IN ('message.send', 'coordination.message.send', 'coordination.send', 'coordination.consult')
                     AND same_identity.state = 'settled'
                     AND json_extract(same_identity.result_json, '$.delivery_id') =
                         json_extract(op.result_json, '$.cancellation.delivery_id')
@@ -3756,14 +3768,14 @@ fn timeline_visibility_sql() -> String {
             AND (
             (
                 :mailbox_only = 1
-                AND o.kind IN ('message.send', 'task.feedback', 'check.completed')
+                AND o.kind IN ('message.send', 'coordination.message.send', 'task.feedback', 'check.completed')
                 AND json_extract(o.payload_json, '$.recipient') = :client
             )
             OR (
                 :mailbox_only = 0
                 AND (
                     (
-                        o.kind NOT IN ('message.send', 'message.cancel', 'coordination.send',
+                        o.kind NOT IN ('message.send', 'message.cancel', 'coordination.send', 'coordination.message.send',
                             'task.request_changes', 'task.feedback', 'task.review_stale',
                             'check.run', 'check.cancel', 'check.completed')
                         AND o.kind NOT LIKE 'coordination.%'
@@ -3771,10 +3783,10 @@ fn timeline_visibility_sql() -> String {
                         AND o.kind NOT LIKE 'automation.%'
                         AND NOT EXISTS (SELECT 1 FROM operations AS automatic WHERE automatic.operation_id=o.operation_id AND automatic.caller_id='eliot-internal-automation-v1')
                     )
-                    OR (:operator = 1 AND o.kind IN ('message.send', 'message.cancel', 'coordination.send'))
+                    OR (:operator = 1 AND o.kind IN ('message.send', 'message.cancel', 'coordination.send', 'coordination.message.send'))
                     OR (
                         (
-                            o.kind IN ('message.send', 'message.cancel', 'coordination.send',
+                            o.kind IN ('message.send', 'message.cancel', 'coordination.send', 'coordination.message.send',
                                 'task.request_changes', 'task.feedback', 'task.review_stale',
                                 'check.run', 'check.cancel', 'check.completed')
                             OR o.kind LIKE 'coordination.%'
@@ -4801,6 +4813,7 @@ fn admit_goal_progression_operation(
     admission.require_current_for_admission(tx, now)?;
     let caller = crate::automation::authorization::AUTOMATION_TECHNICAL_REQUESTER_ID;
     let request = admission.request();
+    let method = admission.continuation_method();
     let request_id = model::text(request, "client_request_id")?;
     let original = model::canonical(request)?;
     let prior: Option<(String, String)> = tx
@@ -4812,17 +4825,19 @@ fn admit_goal_progression_operation(
         .optional()?;
     if prior
         .as_ref()
-        .is_some_and(|(method, body)| method != "agent.goal" || body != &original)
+        .is_some_and(|(prior_method, body)| prior_method != method || body != &original)
     {
         return Ok(automation_goal_progression::AdmissionResult::Conflict {
             code: "REQUEST_ID_CONFLICT".to_owned(),
-            reason: "terminal-event request ID already belongs to another Goal request".to_owned(),
+            reason:
+                "terminal-event request ID already belongs to another Goal continuation request"
+                    .to_owned(),
         });
     }
     let receipt = mutate_in_transaction_with_authority(
         tx,
         MutationAuthority::GoalProgression(admission),
-        "agent.goal",
+        method,
         request,
         config,
         now,
@@ -4850,8 +4865,8 @@ fn admit_goal_progression_operation(
     };
     let operation_id: Option<String> = tx
         .query_row(
-            "SELECT operation_id FROM operations WHERE caller_id=?1 AND client_request_id=?2 AND method='agent.goal' AND original_request_json=?3",
-            params![caller, request_id, original],
+            "SELECT operation_id FROM operations WHERE caller_id=?1 AND client_request_id=?2 AND method=?3 AND original_request_json=?4",
+            params![caller, request_id, method, original],
             |row| row.get(0),
         )
         .optional()?;
@@ -5034,11 +5049,13 @@ fn mutate_in_transaction_with_authority(
         context.require_current_check_target(tx)?;
     }
     if let MutationAuthority::GoalProgression(context) = &authority {
-        if method != "agent.goal" || plan.launch_operation_id.is_some() || plan.check_plan.is_some()
+        if method != context.continuation_method()
+            || plan.launch_operation_id.is_some()
+            || plan.check_plan.is_some()
         {
             return Err(Error::new(
                 "FORBIDDEN",
-                "Goal progression authority permits only agent.goal continue",
+                "Goal progression authority permits only its exact continuation action",
             ));
         }
         context.require_current_for_admission(tx, now)?;
@@ -5291,8 +5308,10 @@ fn mutate_in_transaction_with_authority(
             },
         ),
         MutationAuthority::ScriptEffect(admission) => match method {
-            "message.send" => apply_message_send(tx, admission.effective_manager_id(), v, &id)
-                .map(|value| (value, false)),
+            "message.send" => {
+                mailbox::apply_message_send(tx, admission.effective_manager_id(), v, &id)
+                    .map(|value| (value, false))
+            }
             "task.create" => {
                 tasks::create_for_script_effect(tx, admission.project_id(), v, &id, now)
                     .map(|value| (value, false))
@@ -5356,8 +5375,10 @@ fn record_safe_system_events(
         return Ok(());
     }
 
-    let message_sent = matches!(method, "message.send" | "coordination.send")
-        || (method == "coordination.consult" && value["delivery_created"] == true);
+    let message_sent = matches!(
+        method,
+        "message.send" | "coordination.send" | "coordination.message.send"
+    ) || (method == "coordination.consult" && value["delivery_created"] == true);
     if message_sent {
         insert_safe_system_event(
             tx,
@@ -5893,14 +5914,14 @@ fn apply_goal_progression(
     config: &Config,
     apply: ApplyContext<'_>,
 ) -> Result<(Value, bool)> {
-    if method != "agent.goal"
+    if method != context.continuation_method()
         || apply.plan.launch_operation_id.is_some()
         || apply.plan.check_plan.is_some()
         || model::canonical(value)? != model::canonical(context.request())?
     {
         return Err(Error::new(
             "FORBIDDEN",
-            "Goal progression permits only its exact admitted agent.goal continue request",
+            "Goal progression permits only its exact admitted continuation request",
         ));
     }
     let result = runtime::user_command_for_goal_progression(
@@ -6397,146 +6418,15 @@ fn apply(
                 false,
             ))
         }
-        "message.send" => apply_message_send(tx, &p.client_id, v, id).map(|value| (value, false)),
-        "message.cancel" => cancel_message(tx, p, v, id).map(|v| (v, false)),
+        "message.send" => {
+            mailbox::apply_message_send(tx, &p.client_id, v, id).map(|value| (value, false))
+        }
+        "message.cancel" => mailbox::cancel_message(tx, p, v, id).map(|v| (v, false)),
         _ => Err(Error::new(
             "METHOD_NOT_FOUND",
             format!("{method} is not implemented; no native effect was attempted"),
         )),
     }
-}
-
-/// Shared message admission for direct callers and the one typed ScriptRun
-/// effect. The caller identity is selected only by the closed mutation actor;
-/// automatic effects provide it from their validated Store context.
-fn apply_message_send(tx: &Transaction<'_>, sender_id: &str, v: &Value, id: &str) -> Result<Value> {
-    model::fields(
-        v,
-        &[
-            "client_request_id",
-            "recipient",
-            "text",
-            "in_reply_to",
-            "in_reply_to_digest",
-            "admission_deadline_ms",
-            "delivery_deadline_ms",
-            "reply_deadline_ms",
-        ],
-    )?;
-    let recipient = model::text(v, "recipient")?;
-    let body = model::text(v, "text")?;
-    let recipient_registration = meta(tx, &format!("client:{recipient}"))?
-        .ok_or_else(|| Error::new("NOT_FOUND", "recipient is not registered"))?;
-    let sender_registration = meta(tx, &format!("client:{sender_id}"))?
-        .ok_or_else(|| Error::new("UNAUTHORIZED", "sender is not registered"))?;
-    let payload_digest = model::message_payload_digest(sender_id, recipient, body)?;
-    let mut reply_to = Value::Null;
-    if let Some(reply) = v.get("in_reply_to").and_then(Value::as_str) {
-        // A reply addresses the original delivery: by its own delivery_id
-        // when it carries one, otherwise by the historical operation id.
-        let prior = match find_delivery(tx, reply)? {
-            Some(original) => original,
-            None => operations::get_operation(tx, reply)?,
-        };
-        if !(prior["method"] == "message.send"
-            || (prior["method"] == "task.request_changes" && prior["result"]["applied"] == true)
-            || (prior["method"] == "task.invalidate_acceptance"
-                && prior["result"]["message_id"] == reply))
-            || prior["result"]["recipient"] != sender_id
-            || prior["result"]["sender"] != recipient
-        {
-            return Err(Error::invalid(
-                "reply does not match the sender and recipient of that message",
-            ));
-        }
-        model::verify_payload_digest_claim(
-            prior["result"]["payload_digest"].as_str(),
-            v.get("in_reply_to_digest").and_then(Value::as_str),
-        )?;
-        reply_to = model::message_reply_reference(&prior["result"]);
-    }
-    Ok(json!({
-        "operation_id":id,
-        "message_id":id,
-        "delivery_id":model::new_id(),
-        "sender":sender_id,
-        "recipient":recipient,
-        "source_scope":model::message_scope(&sender_registration,sender_id),
-        "target_scope":model::message_scope(&recipient_registration,recipient),
-        "actor":model::message_actor(&sender_registration,sender_id),
-        "payload_digest":payload_digest,
-        "admission_deadline_ms":model::deadline(v,"admission_deadline_ms")?,
-        "delivery_deadline_ms":model::deadline(v,"delivery_deadline_ms")?,
-        "reply_deadline_ms":model::deadline(v,"reply_deadline_ms")?,
-        "text":body,
-        "in_reply_to":v.get("in_reply_to"),
-        "reply_to":reply_to,
-        "cancellation":Value::Null,
-        "delivery":"durable_mailbox_only"
-    }))
-}
-
-/// Finds a settled mailbox delivery by its own delivery identity (R22).
-/// Records written before delivery identity existed have no `delivery_id`
-/// and stay addressable only by their historical operation id.
-fn find_delivery(db: &Connection, delivery_id: &str) -> Result<Option<Value>> {
-    let operation_id: Option<String> = db
-        .query_row(
-            "SELECT operation_id FROM operations WHERE method='message.send' AND state='settled' AND json_extract(result_json,'$.delivery_id')=?1",
-            [delivery_id],
-            |r| r.get(0),
-        )
-        .optional()?;
-    match operation_id {
-        Some(id) => Ok(Some(operations::get_operation(db, &id)?)),
-        None => Ok(None),
-    }
-}
-
-/// Records the cancellation of one mailbox delivery. A cancellation is its
-/// own durable record referencing the original delivery by identity and
-/// digest; the original record is evidence and is never rewritten, and no
-/// workflow state changes because a delivery was cancelled — this text, like
-/// any message text, is not a workflow transition.
-fn cancel_message(tx: &Transaction<'_>, p: &Principal, v: &Value, id: &str) -> Result<Value> {
-    model::fields(
-        v,
-        &[
-            "client_request_id",
-            "delivery_id",
-            "payload_digest",
-            "reason",
-        ],
-    )?;
-    let delivery_id = model::text(v, "delivery_id")?;
-    let claimed = model::text(v, "payload_digest")?;
-    let original = find_delivery(tx, delivery_id)?
-        .ok_or_else(|| Error::new("NOT_FOUND", format!("Delivery {delivery_id}")))?;
-    if original["result"]["sender"] != p.client_id {
-        return Err(Error::new(
-            "FORBIDDEN",
-            "only the original sender can cancel a delivery",
-        ));
-    }
-    model::verify_payload_digest_claim(
-        original["result"]["payload_digest"].as_str(),
-        Some(claimed),
-    )?;
-    let existing: Option<String> = tx
-        .query_row(
-            "SELECT operation_id FROM operations WHERE method='message.cancel' AND state='settled' AND json_extract(result_json,'$.cancellation.delivery_id')=?1",
-            [delivery_id],
-            |r| r.get(0),
-        )
-        .optional()?;
-    if existing.is_some() {
-        return Err(Error::conflict("delivery is already cancelled"));
-    }
-    let sender_registration = meta(tx, &format!("client:{}", p.client_id))?
-        .ok_or_else(|| Error::new("UNAUTHORIZED", "sender is not registered"))?;
-    Ok(
-        json!({"operation_id":id,"cancellation":{"delivery_id":delivery_id,"payload_digest":claimed},"cancelled_by":model::message_actor(&sender_registration,&p.client_id),"reason":v.get("reason").cloned().unwrap_or(Value::Null),"original_record_changed":false,"delivery":"durable_mailbox_only"}),
-    )
 }
 
 #[cfg(test)]

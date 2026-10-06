@@ -360,6 +360,238 @@ impl NormalizedResultPageSource {
     }
 }
 
+/// Exact immutable event identity retained by a Goal terminal evidence
+/// producer.  `id` may be an adapter-owned journal identity; it is not
+/// required to be a provider-issued identifier.  Store binds this reference
+/// to the outer immutable observation and the source Operation tuple.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GoalTerminalEventRef {
+    pub id: String,
+    pub seq: u64,
+    pub sha256: String,
+}
+
+impl GoalTerminalEventRef {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if !valid_bounded_identity(&self.id, 512) || self.seq == 0 || !is_lower_sha256(&self.sha256)
+        {
+            return Err("goal terminal EventRef is invalid");
+        }
+        Ok(())
+    }
+}
+
+/// Versioned, adapter-neutral proof that one exact source Operation produced
+/// one immutable completed terminal event.  It proves only the native terminal
+/// fact; it never grants a Goal continuation and it never asserts Task
+/// acceptance/completion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GoalTerminalEvidence {
+    pub schema_id: String,
+    pub schema_version: u16,
+    pub source: String,
+    pub reader_revision: String,
+    pub operation_id: String,
+    pub binding_id: String,
+    pub binding_generation: i64,
+    pub task_id: String,
+    pub task_revision: i64,
+    pub task_snapshot_sha256: String,
+    pub attempt_id: String,
+    pub native_session_id: String,
+    pub native_input_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_run_id: Option<String>,
+    pub completion_condition: String,
+    pub disposition: String,
+    pub terminal_outcome: String,
+    pub terminal_event: GoalTerminalEventRef,
+}
+
+impl GoalTerminalEvidence {
+    pub const VERSION: u16 = 1;
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        let source_valid = matches!(self.source.as_str(), "codex" | "opencode");
+        let reader_valid = matches!(
+            (self.source.as_str(), self.reader_revision.as_str()),
+            ("codex", "codex-turn-journal-v1") | ("opencode", "opencode-execution-log-v1")
+        );
+        let completion_valid = matches!(
+            (self.source.as_str(), self.completion_condition.as_str()),
+            ("codex", "native_turn_completed") | ("opencode", "native_execution_terminal")
+        );
+        if self.schema_id != crate::module_contract::GOAL_TERMINAL_EVIDENCE_SCHEMA_ID
+            || self.schema_version != Self::VERSION
+            || !source_valid
+            || !reader_valid
+            || !completion_valid
+            || !valid_bounded_identity(&self.operation_id, 512)
+            || !valid_bounded_identity(&self.binding_id, 512)
+            || self.binding_generation <= 0
+            || !valid_bounded_identity(&self.task_id, 512)
+            || self.task_revision <= 0
+            || !is_lower_sha256(&self.task_snapshot_sha256)
+            || !valid_bounded_identity(&self.attempt_id, 512)
+            || !valid_bounded_identity(&self.native_session_id, 512)
+            || !valid_bounded_identity(&self.native_input_id, 512)
+            || self
+                .native_run_id
+                .as_deref()
+                .is_some_and(|value| !valid_bounded_identity(value, 512))
+            || self.disposition != "completed"
+            || self.terminal_outcome != "completed"
+            || self.terminal_event.validate().is_err()
+        {
+            return Err("goal terminal evidence is invalid");
+        }
+        Ok(())
+    }
+}
+
+/// Closed linkage used by the one manager-owned Goal continuation consumer.
+/// The method is an admitted ordinary action: OpenCode keeps its controller
+/// `agent.goal` path, while Codex uses the already supported `agent.send`
+/// next-turn path.  The source EventRef and immutable Task/Attempt tuple are
+/// retained in the same linkage so a retry cannot select a different turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GoalContinuationLink {
+    pub schema_id: String,
+    pub schema_version: u16,
+    pub method: String,
+    pub owner: String,
+    pub source_operation_id: String,
+    pub source_observation_id: i64,
+    pub terminal_event: GoalTerminalEventRef,
+    pub native_session_id: String,
+    pub native_input_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_run_id: Option<String>,
+    pub task_id: String,
+    pub task_revision: i64,
+    pub attempt_id: String,
+    pub binding_id: String,
+    pub binding_generation: i64,
+    pub goal_id: String,
+    pub goal_revision: i64,
+    pub objective_sha256: String,
+}
+
+impl GoalContinuationLink {
+    pub const VERSION: u16 = 1;
+    pub const OWNER: &'static str = "manager_enabled_automation";
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.schema_id != crate::module_contract::GOAL_CONTINUATION_SCHEMA_ID
+            || self.schema_version != Self::VERSION
+            || !matches!(self.method.as_str(), "agent.goal" | "agent.send")
+            || self.owner != Self::OWNER
+            || !valid_bounded_identity(&self.source_operation_id, 512)
+            || self.source_observation_id <= 0
+            || self.terminal_event.validate().is_err()
+            || !valid_bounded_identity(&self.native_session_id, 512)
+            || !valid_bounded_identity(&self.native_input_id, 512)
+            || self
+                .native_run_id
+                .as_deref()
+                .is_some_and(|value| !valid_bounded_identity(value, 512))
+            || !valid_bounded_identity(&self.task_id, 512)
+            || self.task_revision <= 0
+            || !valid_bounded_identity(&self.attempt_id, 512)
+            || !valid_bounded_identity(&self.binding_id, 512)
+            || self.binding_generation <= 0
+            || !valid_bounded_identity(&self.goal_id, 512)
+            || self.goal_revision <= 0
+            || !is_lower_sha256(&self.objective_sha256)
+        {
+            return Err("goal continuation linkage is invalid");
+        }
+        Ok(())
+    }
+}
+
+/// Store-enriched context for one exact Codex Goal continuation `agent.send`.
+/// This is carried in the authenticated RuntimeCommand envelope after the
+/// ordinary request has been persisted. It is not a caller-provided
+/// capability or a task-dispatch receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GoalContinuationAdmissionContext {
+    pub schema_id: String,
+    pub schema_version: u16,
+    pub operation_id: String,
+    pub binding_id: String,
+    pub binding_generation: i64,
+    pub worker_boot_id: String,
+    pub continuation: GoalContinuationLink,
+}
+
+impl GoalContinuationAdmissionContext {
+    pub const VERSION: u16 = 1;
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.schema_id != crate::module_contract::GOAL_CONTINUATION_CONTEXT_SCHEMA_ID
+            || self.schema_version != Self::VERSION
+            || !valid_bounded_identity(&self.operation_id, 512)
+            || !valid_bounded_identity(&self.binding_id, 512)
+            || self.binding_generation <= 0
+            || !valid_bounded_identity(&self.worker_boot_id, 512)
+            || self.continuation.validate().is_err()
+            || self.continuation.method != "agent.send"
+            || self.continuation.binding_id != self.binding_id
+            || self.continuation.binding_generation != self.binding_generation
+            || self.continuation.source_operation_id == self.operation_id
+        {
+            return Err("goal continuation admission context is invalid");
+        }
+        Ok(())
+    }
+}
+
+/// Adapter receipt that proves admission and exact native input identity for
+/// one Store-authorized Goal continuation. It is deliberately distinct from
+/// `TaskDispatchAdmissionReceipt`: an ordinary `agent.send` continuation must
+/// never be presented as a `task.dispatch` producer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GoalContinuationAdmissionReceipt {
+    pub schema_id: String,
+    pub schema_version: u16,
+    pub context: GoalContinuationAdmissionContext,
+    pub module_receipt: ModuleReceiptIdentity,
+    pub native_payload_sha256: String,
+    pub native_payload_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_input_id: Option<String>,
+}
+
+impl GoalContinuationAdmissionReceipt {
+    pub const VERSION: u16 = 1;
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.schema_id != crate::module_contract::GOAL_CONTINUATION_ADMISSION_SCHEMA_ID
+            || self.schema_version != Self::VERSION
+            || self.context.validate().is_err()
+            || self.module_receipt.validate().is_err()
+            || self.module_receipt.operation_id != self.context.operation_id
+            || self.module_receipt.binding_id != self.context.binding_id
+            || self.module_receipt.binding_generation != self.context.binding_generation
+            || !is_lower_sha256(&self.native_payload_sha256)
+            || self.native_payload_bytes == 0
+            || self
+                .native_input_id
+                .as_ref()
+                .is_some_and(|id| !valid_bounded_identity(id, 512))
+        {
+            return Err("goal continuation admission receipt is invalid");
+        }
+        Ok(())
+    }
+}
+
 fn is_lower_sha256(value: &str) -> bool {
     value.len() == 64
         && value

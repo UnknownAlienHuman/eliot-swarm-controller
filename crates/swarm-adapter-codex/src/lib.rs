@@ -21,7 +21,8 @@ use swarm_client::{IpcConfig, ModuleLink};
 use swarm_contracts::{
     module_contract::ModuleContractClaim,
     runtime::{
-        EffectOutcome, ModuleReceiptIdentity, NormalizedResultOriginContext,
+        EffectOutcome, GoalContinuationAdmissionContext, GoalContinuationAdmissionReceipt,
+        GoalTerminalEventRef, ModuleReceiptIdentity, NormalizedResultOriginContext,
         NormalizedResultPageSource, RuntimeCommand, RuntimeOutcome, TaskDispatchAdmissionReceipt,
         TaskDispatchContext,
     },
@@ -161,6 +162,8 @@ struct OperationRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     dispatch_admission: Option<TaskDispatchAdmissionReceipt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    continuation_admission: Option<GoalContinuationAdmissionReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pending_result_page: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     result_page_acknowledgement: Option<ResultPageAcknowledgement>,
@@ -190,6 +193,7 @@ impl OperationRecord {
             returned_turn_status: None,
             native_input_id: None,
             dispatch_admission: None,
+            continuation_admission: None,
             pending_result_page: None,
             result_page_acknowledgement: None,
             outcome: None,
@@ -218,6 +222,7 @@ impl OperationRecord {
             returned_turn_status: None,
             native_input_id: None,
             dispatch_admission: None,
+            continuation_admission: None,
             pending_result_page: None,
             result_page_acknowledgement: None,
             outcome: Some(outcome),
@@ -251,6 +256,7 @@ impl OperationRecord {
             returned_turn_status: None,
             native_input_id: None,
             dispatch_admission: None,
+            continuation_admission: None,
             pending_result_page: None,
             result_page_acknowledgement: Some(acknowledgement),
             outcome: None,
@@ -930,6 +936,29 @@ impl Journal {
                 Ok(admission)
             })
             .transpose()?;
+        let continuation_admission = outcome
+            .details
+            .get("goal_continuation_admission")
+            .filter(|value| !value.is_null())
+            .map(|value| {
+                if method != "agent.send" {
+                    return Err(AdapterError::Checkpoint);
+                }
+                let admission: GoalContinuationAdmissionReceipt =
+                    serde_json::from_value(value.clone()).map_err(|_| AdapterError::Checkpoint)?;
+                admission.validate().map_err(|_| AdapterError::Checkpoint)?;
+                if admission.context.operation_id != operation_id
+                    || admission.context.binding_id != receipt.binding_id
+                    || admission.context.binding_generation != receipt.binding_generation
+                    || admission.module_receipt != receipt
+                    || admission.native_input_id != outcome.native_input_id
+                    || admission.context.continuation.method != "agent.send"
+                {
+                    return Err(AdapterError::Checkpoint);
+                }
+                Ok(admission)
+            })
+            .transpose()?;
         if let Some(tombstone) = self.read_operation_tombstone(&operation_id)? {
             return if tombstone.method == method
                 && tombstone.kind == kind
@@ -955,8 +984,13 @@ impl Journal {
             } else {
                 false
             };
+            let continuation_changed = if let Some(admission) = continuation_admission.as_ref() {
+                reconcile_continuation_admission(record, admission)?
+            } else {
+                false
+            };
             if record.outcome.as_ref() == Some(&encoded) {
-                return if admission_changed {
+                return if admission_changed || continuation_changed {
                     self.save()
                 } else {
                     Ok(())
@@ -974,11 +1008,172 @@ impl Journal {
             let mut record = OperationRecord::intent(method, kind);
             record.input_sha256 = Some(input_sha256.to_owned());
             record.dispatch_admission = dispatch_admission;
+            record.continuation_admission = continuation_admission;
             record.state = "reported_pending".into();
             record.outcome = Some(encoded);
             self.state.operations.insert(operation_id.clone(), record);
         }
         self.save()
+    }
+
+    fn validate_existing_goal_terminal_event(
+        &self,
+        outcome: &RuntimeOutcome,
+    ) -> Result<(), AdapterError> {
+        let Some(existing) = outcome.details.get("goal_terminal_event") else {
+            return Ok(());
+        };
+        let (Some(root), Some(turn), Some(input)) = (
+            outcome.native_root_id.as_deref(),
+            outcome.turn_id.as_deref(),
+            outcome.native_input_id.as_deref(),
+        ) else {
+            return Err(AdapterError::Checkpoint);
+        };
+        let event: GoalTerminalEventRef = serde_json::from_value(existing["event"].clone())
+            .map_err(|_| AdapterError::Checkpoint)?;
+        event.validate().map_err(|_| AdapterError::Checkpoint)?;
+        if event.seq > self.state.observe_sequence
+            || existing["schema_id"]
+                != swarm_contracts::module_contract::GOAL_TERMINAL_EVIDENCE_SCHEMA_ID
+            || existing["schema_version"] != 1
+            || existing["source"] != "codex"
+            || existing["reader_revision"] != "codex-turn-journal-v1"
+            || existing["event_record"]["id"].as_str() != Some(event.id.as_str())
+            || existing["event_record"]["operation_id"].as_str()
+                != Some(outcome.operation_id.as_str())
+            || existing["event_record"]["native_root_id"].as_str() != Some(root)
+            || existing["event_record"]["turn_id"].as_str() != Some(turn)
+            || existing["event_record"]["native_input_id"].as_str() != Some(input)
+            || existing["event_record"]["seq"].as_u64() != Some(event.seq)
+            || existing["event_record"]["kind"].as_str() != Some("turn.completed")
+            || existing["event_record"]["status"].as_str() != Some("completed")
+            || event.sha256
+                != digest_hex(
+                    canonical_json(&existing["event_record"])
+                        .map_err(|_| AdapterError::Checkpoint)?
+                        .as_bytes(),
+                )
+        {
+            return Err(AdapterError::Checkpoint);
+        }
+        Ok(())
+    }
+
+    /// Seal a newly read native `turn.completed` outcome before its first
+    /// journal persistence. Replayed outcomes are handled by the exact-byte
+    /// path and never receive a new EventRef.
+    fn seal_goal_terminal_event(
+        &mut self,
+        outcome: &mut RuntimeOutcome,
+    ) -> Result<(), AdapterError> {
+        if outcome.outcome != EffectOutcome::Applied
+            || outcome.details["completion_condition"] != "native_turn_completed"
+            || outcome.details["execution_complete"] != true
+            || outcome.details["task_completion"] != "unknown"
+            || outcome.details["disposition"] != "completed"
+            || outcome.details["native_input_readback"] != "verified"
+            || outcome.details["native_turn_readback"] != "verified"
+            || outcome.details["native_turn_status"] != "completed"
+            || outcome.details["client_user_message_id"] != outcome.operation_id
+        {
+            return Ok(());
+        }
+        let (Some(root), Some(turn), Some(input)) = (
+            outcome.native_root_id.as_deref(),
+            outcome.turn_id.as_deref(),
+            outcome.native_input_id.as_deref(),
+        ) else {
+            return Err(AdapterError::Checkpoint);
+        };
+        if root.is_empty() || turn.is_empty() || input.is_empty() {
+            return Err(AdapterError::Checkpoint);
+        }
+        let continuation_admission = outcome
+            .details
+            .get("goal_continuation_admission")
+            .filter(|value| !value.is_null())
+            .map(|value| {
+                let admission: GoalContinuationAdmissionReceipt =
+                    serde_json::from_value(value.clone()).map_err(|_| AdapterError::Checkpoint)?;
+                admission.validate().map_err(|_| AdapterError::Checkpoint)?;
+                let module_receipt: ModuleReceiptIdentity =
+                    serde_json::from_value(outcome.details["module_receipt"].clone())
+                        .map_err(|_| AdapterError::Checkpoint)?;
+                if admission.context.operation_id != outcome.operation_id
+                    || admission.context.continuation.method != "agent.send"
+                    || admission.module_receipt != module_receipt
+                    || admission.native_input_id.as_deref() != Some(input)
+                {
+                    return Err(AdapterError::Checkpoint);
+                }
+                Ok(admission)
+            })
+            .transpose()?;
+        if continuation_admission.is_some() && outcome.details.get("dispatch_admission").is_some() {
+            return Err(AdapterError::Checkpoint);
+        }
+        if outcome.details.get("goal_terminal_event").is_some() {
+            self.validate_existing_goal_terminal_event(outcome)?;
+            return Ok(());
+        }
+        // A Goal terminal marker is eligible only for a real task dispatch
+        // or a Store-authenticated Goal continuation admission. Ordinary
+        // taskless agent.send operations retain their normal receipt without
+        // manufactured Task identity.
+        let dispatch_admission = outcome
+            .details
+            .get("dispatch_admission")
+            .filter(|value| !value.is_null())
+            .map(|value| {
+                let admission: TaskDispatchAdmissionReceipt =
+                    serde_json::from_value(value.clone()).map_err(|_| AdapterError::Checkpoint)?;
+                admission.validate().map_err(|_| AdapterError::Checkpoint)?;
+                if admission.operation_id != outcome.operation_id
+                    || admission.native_input_id.as_deref() != outcome.native_input_id.as_deref()
+                {
+                    return Err(AdapterError::Checkpoint);
+                }
+                Ok(admission)
+            })
+            .transpose()?;
+        if dispatch_admission.is_none() && continuation_admission.is_none() {
+            return Ok(());
+        }
+        let sequence = self
+            .state
+            .observe_sequence
+            .checked_add(1)
+            .ok_or(AdapterError::Checkpoint)?;
+        let event_id = format!("{}:{sequence}", self.state.boot_id);
+        let event_record = json!({
+            "id": event_id,
+            "seq": sequence,
+            "kind": "turn.completed",
+            "operation_id": outcome.operation_id,
+            "native_root_id": root,
+            "turn_id": turn,
+            "native_input_id": input,
+            "status": "completed",
+            "input_sha256": outcome.details["prompt_sha256"],
+        });
+        let sha256 = digest_hex(
+            canonical_json(&event_record)
+                .map_err(|_| AdapterError::Checkpoint)?
+                .as_bytes(),
+        );
+        self.state.observe_sequence = sequence;
+        outcome.details["goal_terminal_event"] = json!({
+            "schema_id": swarm_contracts::module_contract::GOAL_TERMINAL_EVIDENCE_SCHEMA_ID,
+            "schema_version": 1,
+            "source": "codex",
+            "reader_revision": "codex-turn-journal-v1",
+            "event": {"id": event_id, "seq": sequence, "sha256": sha256},
+            "event_record": event_record,
+        });
+        // `store_outcome` immediately follows this helper and writes the
+        // outcome plus the advanced journal sequence in one snapshot.
+        Ok(())
     }
 
     fn pending_outcomes(&self) -> Result<Vec<RuntimeOutcome>, AdapterError> {
@@ -2030,6 +2225,42 @@ fn reconcile_dispatch_admission(
     Ok(true)
 }
 
+fn reconcile_continuation_admission(
+    record: &mut OperationRecord,
+    admission: &GoalContinuationAdmissionReceipt,
+) -> Result<bool, AdapterError> {
+    if record.method != "agent.send"
+        || admission.context.operation_id.is_empty()
+        || admission.context.continuation.method != "agent.send"
+    {
+        return Err(AdapterError::Checkpoint);
+    }
+    let Some(previous) = record.continuation_admission.as_ref() else {
+        record.continuation_admission = Some(admission.clone());
+        return Ok(true);
+    };
+    let mut same_except_native_id = previous.clone();
+    same_except_native_id.native_input_id = admission.native_input_id.clone();
+    if same_except_native_id != *admission {
+        return Err(AdapterError::Checkpoint);
+    }
+    if previous.native_input_id == admission.native_input_id {
+        return Ok(false);
+    }
+    let provisional_id = record.client_user_message_id.as_deref();
+    let new_native_id = admission.native_input_id.as_deref();
+    if new_native_id.is_none_or(str::is_empty)
+        || previous
+            .native_input_id
+            .as_deref()
+            .is_some_and(|saved| Some(saved) != provisional_id)
+    {
+        return Err(AdapterError::Checkpoint);
+    }
+    record.continuation_admission = Some(admission.clone());
+    Ok(true)
+}
+
 fn normalize_path(value: &str) -> Option<String> {
     let path = Path::new(value);
     if !path.is_absolute() {
@@ -2175,6 +2406,55 @@ fn normalized_dispatch_admission(
         native_payload_sha256: digest_hex(&native_payload),
         native_payload_bytes: native_payload.len() as u64,
         native_input_id: Some(command.operation_id.clone()),
+    };
+    receipt.validate().map_err(|_| AdapterError::HostProtocol)?;
+    Ok(Some(receipt))
+}
+
+fn normalized_goal_continuation_admission(
+    command: &RuntimeCommand,
+    claim: &ModuleContractClaim,
+    boot_id: &str,
+    payload: &Value,
+) -> Result<Option<GoalContinuationAdmissionReceipt>, AdapterError> {
+    let Some(context_value) = command.input.get("goal_continuation_context") else {
+        return Ok(None);
+    };
+    if command.method != "agent.send" || command.input["delivery"] != "next_turn" {
+        return Err(AdapterError::HostProtocol);
+    }
+    let context: GoalContinuationAdmissionContext =
+        serde_json::from_value(context_value.clone()).map_err(|_| AdapterError::HostProtocol)?;
+    context.validate().map_err(|_| AdapterError::HostProtocol)?;
+    if context.operation_id != command.operation_id
+        || context.binding_id != command.binding_id
+        || context.binding_generation != command.generation
+        || context.worker_boot_id != boot_id
+        || payload["clientUserMessageId"] != command.operation_id
+    {
+        return Err(AdapterError::HostProtocol);
+    }
+    let input_sha256 = command
+        .input_sha256
+        .as_deref()
+        .filter(|digest| valid_sha256(digest))
+        .ok_or(AdapterError::HostProtocol)?;
+    let module_receipt = module_contract::receipt_identity(
+        claim,
+        &command.binding_id,
+        command.generation,
+        &command.operation_id,
+        input_sha256,
+    )?;
+    let native_payload = serde_json::to_vec(payload).map_err(|_| AdapterError::HostProtocol)?;
+    let receipt = GoalContinuationAdmissionReceipt {
+        schema_id: module_contract::GOAL_CONTINUATION_ADMISSION_SCHEMA_ID.to_owned(),
+        schema_version: GoalContinuationAdmissionReceipt::VERSION,
+        context,
+        module_receipt,
+        native_payload_sha256: digest_hex(&native_payload),
+        native_payload_bytes: native_payload.len() as u64,
+        native_input_id: None,
     };
     receipt.validate().map_err(|_| AdapterError::HostProtocol)?;
     Ok(Some(receipt))
@@ -2382,6 +2662,72 @@ fn validate_saved_dispatch_admission(
     Ok(())
 }
 
+fn validate_saved_goal_continuation_admission(
+    outcome: &RuntimeOutcome,
+    command: &RuntimeCommand,
+    claim: &ModuleContractClaim,
+    boot_id: &str,
+) -> Result<(), AdapterError> {
+    let details = outcome
+        .details
+        .as_object()
+        .ok_or(AdapterError::Checkpoint)?;
+    let saved = details
+        .get("goal_continuation_admission")
+        .map(|value| {
+            let receipt: GoalContinuationAdmissionReceipt =
+                serde_json::from_value(value.clone()).map_err(|_| AdapterError::Checkpoint)?;
+            receipt.validate().map_err(|_| AdapterError::Checkpoint)?;
+            Ok::<_, AdapterError>(receipt)
+        })
+        .transpose()?;
+    let context = command.input.get("goal_continuation_context");
+    match (context, saved, outcome.outcome) {
+        (None, None, _) => Ok(()),
+        (None, Some(_), _) => Err(AdapterError::Checkpoint),
+        (Some(_), None, EffectOutcome::Accepted | EffectOutcome::Applied) => {
+            Err(AdapterError::Checkpoint)
+        }
+        (Some(context_value), Some(receipt), EffectOutcome::Accepted | EffectOutcome::Applied) => {
+            let expected_context: GoalContinuationAdmissionContext =
+                serde_json::from_value(context_value.clone())
+                    .map_err(|_| AdapterError::Checkpoint)?;
+            expected_context
+                .validate()
+                .map_err(|_| AdapterError::Checkpoint)?;
+            let input_sha256 = command
+                .input_sha256
+                .as_deref()
+                .filter(|digest| valid_sha256(digest))
+                .ok_or(AdapterError::Checkpoint)?;
+            let expected = module_contract::receipt_identity(
+                claim,
+                &command.binding_id,
+                command.generation,
+                &command.operation_id,
+                input_sha256,
+            )?;
+            if receipt.context != expected_context
+                || receipt.module_receipt != expected
+                || expected_context.operation_id != command.operation_id
+                || expected_context.binding_id != command.binding_id
+                || expected_context.binding_generation != command.generation
+                || expected_context.worker_boot_id != boot_id
+                || receipt.native_input_id.as_deref() != outcome.native_input_id.as_deref()
+                || receipt.native_input_id.is_none()
+                || details.contains_key("dispatch_admission")
+            {
+                return Err(AdapterError::Checkpoint);
+            }
+            Ok(())
+        }
+        (Some(_), None, EffectOutcome::Rejected | EffectOutcome::Unknown) => Ok(()),
+        (Some(_), Some(_), EffectOutcome::Rejected | EffectOutcome::Unknown) => {
+            Err(AdapterError::Checkpoint)
+        }
+    }
+}
+
 fn base_details(state: &Checkpoint) -> Value {
     json!({
         "module_artifact_id": ARTIFACT_ID,
@@ -2454,6 +2800,11 @@ fn accepted_after_exact_input(
     {
         accepted.details["dispatch_admission"] = value;
     }
+    if let Some(admission) = record.continuation_admission.as_ref()
+        && let Ok(value) = serde_json::to_value(admission)
+    {
+        accepted.details["goal_continuation_admission"] = value;
+    }
     accepted
 }
 
@@ -2509,8 +2860,26 @@ async fn reconcile_send(
             }
         }
     }
+    let mut continuation_admission = record.continuation_admission.clone();
+    if let Some(admission) = continuation_admission.as_mut() {
+        match admission.native_input_id.as_deref() {
+            Some(id) if id == matched.item_id => {}
+            Some(id) if id == client_id => {
+                admission.native_input_id = Some(matched.item_id.clone());
+            }
+            None => admission.native_input_id = Some(matched.item_id.clone()),
+            Some(_) => {
+                return unknown_send(
+                    record,
+                    operation_id,
+                    "NATIVE_CONTINUATION_ADMISSION_ID_MISMATCH",
+                );
+            }
+        }
+    }
     let mut verified_record = record.clone();
     verified_record.dispatch_admission = dispatch_admission.clone();
+    verified_record.continuation_admission = continuation_admission.clone();
     if digest_hex(matched.text.as_bytes()) != expected_digest
         || matched.text.len() as u64 != expected_bytes
         || record
@@ -2649,6 +3018,18 @@ async fn reconcile_send(
                     record,
                     operation_id,
                     "DISPATCH_ADMISSION_SERIALIZATION_FAILED",
+                );
+            }
+        };
+    }
+    if !status_is_failed && let Some(admission) = continuation_admission.as_ref() {
+        details["goal_continuation_admission"] = match serde_json::to_value(admission) {
+            Ok(value) => value,
+            Err(_) => {
+                return unknown_send(
+                    record,
+                    operation_id,
+                    "GOAL_CONTINUATION_ADMISSION_SERIALIZATION_FAILED",
                 );
             }
         };
@@ -3106,6 +3487,14 @@ async fn send_operation(
                 "DISPATCH_ADMISSION_INTENT_MISSING",
             );
         }
+        let continuation_context_present = command.input.get("goal_continuation_context").is_some();
+        if continuation_context_present != previous.continuation_admission.is_some() {
+            return unknown_send(
+                previous,
+                &command.operation_id,
+                "GOAL_CONTINUATION_ADMISSION_INTENT_MISSING",
+            );
+        }
         let mut native = match NativeClient::attach(endpoint, token, credential_unavailable).await {
             Ok(native) => native,
             Err(error) => {
@@ -3245,6 +3634,13 @@ async fn send_operation(
             Ok(admission) => admission,
             Err(_) => return rejected(command, "TASK_DISPATCH_CONTEXT_INVALID", &journal.state),
         };
+    let continuation_admission =
+        match normalized_goal_continuation_admission(command, claim, boot_id, &native_payload) {
+            Ok(admission) => admission,
+            Err(_) => {
+                return rejected(command, "GOAL_CONTINUATION_CONTEXT_INVALID", &journal.state);
+            }
+        };
     let mut record = OperationRecord::intent(&command.method, "send");
     record.input_sha256 = command.input_sha256.clone();
     record.native_root_id = Some(root.clone());
@@ -3258,6 +3654,7 @@ async fn send_operation(
     record.delivery = Some(if steer { "steer" } else { "next_turn" }.into());
     record.expected_turn_id = expected_turn.clone();
     record.dispatch_admission = dispatch_admission;
+    record.continuation_admission = continuation_admission;
     journal
         .state
         .operations
@@ -3484,6 +3881,7 @@ async fn reconcile_operation(
             target_id,
             target_input_sha256,
         )?;
+        journal.seal_goal_terminal_event(&mut result)?;
         journal.store_outcome(&result, &target.method, &target.kind)?;
         target_result = Some(result);
     }
@@ -3532,6 +3930,7 @@ async fn reconcile_operation(
                 target_id,
                 target_input_sha256,
             )?;
+            journal.seal_goal_terminal_event(&mut value)?;
             journal.store_outcome(&value, &target.method, &target.kind)?;
             target_result = Some(value);
         } else {
@@ -3565,6 +3964,7 @@ async fn reconcile_operation(
                 target_id,
                 target_input_sha256,
             )?;
+            journal.seal_goal_terminal_event(&mut unresolved)?;
             journal.store_outcome(&unresolved, &target.method, &target.kind)?;
             target_result = Some(unresolved);
         }
@@ -3666,10 +4066,12 @@ async fn handle_command(
                 input_sha256,
             )?;
             validate_saved_dispatch_admission(&result, &command, claim, boot_id)?;
+            validate_saved_goal_continuation_admission(&result, &command, claim, boot_id)?;
+            journal.validate_existing_goal_terminal_event(&result)?;
             return Ok(vec![result]);
         }
     }
-    let result = if previous.is_none()
+    let mut result = if previous.is_none()
         && !journal.can_start_operation(command.method == "agent.reconcile")?
     {
         let mut failure = rejected(&command, "JOURNAL_LIVE_CAPACITY_REACHED", &journal.state);
@@ -3749,7 +4151,8 @@ async fn handle_command(
             }
         }
     };
-    for outcome in &result {
+    for outcome in &mut result {
+        journal.seal_goal_terminal_event(outcome)?;
         let (method, kind) = if outcome.operation_id == command.operation_id {
             let kind = match command.method.as_str() {
                 "agent.open" => String::from("open"),
@@ -4188,6 +4591,10 @@ async fn report_pending(
             break;
         }
         for result in batch {
+            journal
+                .operation_record(&result.operation_id)?
+                .ok_or(AdapterError::Checkpoint)?;
+            journal.validate_existing_goal_terminal_event(&result)?;
             let operation_id = result.operation_id.clone();
             let value = serde_json::to_value(&result).map_err(|_| AdapterError::Checkpoint)?;
             host.outcome(value).await.map_err(|_| AdapterError::Host)?;

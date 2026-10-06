@@ -2,8 +2,8 @@
 //! schema-versioned per-record `meta` entries. No migration is required.
 
 use super::{
-    automation_dispatch, automation_publication, automation_work_dispatch, gm, operations, page,
-    review_disposition,
+    automation_dispatch, automation_github_projection, automation_publication,
+    automation_work_dispatch, gm, operations, page, review_disposition,
 };
 use crate::{
     automation::{
@@ -186,6 +186,14 @@ pub(super) fn apply(
                 change.include_existing,
                 now_ms,
             )?;
+            automation_github_projection::configure_activation(
+                tx,
+                change.before.as_ref(),
+                &change.after,
+                change.include_existing,
+                cut,
+                now_ms,
+            )?;
             let removed_or_narrowed_dispatch = change.before.as_ref().is_some_and(|before| {
                 (before.enabled && !change.after.enabled)
                     || (before.steps.contains(&AutomationStep::ReviewDispatch)
@@ -194,8 +202,16 @@ pub(super) fn apply(
                         && !change.after.steps.contains(&AutomationStep::WorkDispatch))
                     || (before.steps.contains(&AutomationStep::Publication)
                         && !change.after.steps.contains(&AutomationStep::Publication))
+                    || (before.steps.contains(&AutomationStep::GithubProjection)
+                        && !change
+                            .after
+                            .steps
+                            .contains(&AutomationStep::GithubProjection))
                     || (before.work_dispatch_ready() && !change.after.work_dispatch_ready())
                     || (before.publication_ready() && !change.after.publication_ready())
+                    || (before.github_projection_ready()
+                        && (!change.after.github_projection_ready()
+                            || before.github_projection != change.after.github_projection))
                     || (before.publication != change.after.publication)
                     || (before.check_run_ready() && !change.after.check_run_ready())
                     || (before.cron != change.after.cron)
@@ -329,6 +345,7 @@ pub(super) fn explain(db: &Connection, p: &Principal, value: &Value) -> Result<V
     let publication = automation_publication::state(db, &entry)?;
     let cron = super::automation_cron::state(db, &entry)?;
     let goal_progression = super::automation_goal_progression::state(db, &entry)?;
+    let github_projection = automation_github_projection::state(db, &entry)?;
     let work = match operation_impacts(db, &owner_manager_id, project, automation_id) {
         Ok(work) => work,
         Err(error) if error.code == "AUTOMATION_LINK_CORRUPT" => closed_operation_impacts(),
@@ -354,6 +371,7 @@ pub(super) fn explain(db: &Connection, p: &Principal, value: &Value) -> Result<V
         "publication":publication,
         "cron":cron,
         "goal_progression":goal_progression,
+        "github_projection":github_projection,
         "linked_operations":work,
         "linked_operation_history":operation_history
     }))
@@ -651,6 +669,11 @@ fn build_plan(
             && before
                 .as_ref()
                 .is_none_or(|prior| !prior.check_run_ready() || prior.cron != after.cron);
+        let new_github_projection_coverage = after.github_projection_ready()
+            && before.as_ref().is_none_or(|prior| {
+                !prior.github_projection_ready()
+                    || prior.github_projection != after.github_projection
+            });
         let new_coverage = after.enabled
             && (enabled_now
                 || added_steps
@@ -658,7 +681,8 @@ fn build_plan(
                 || new_review_dispatch_coverage
                 || new_script_run_coverage
                 || new_publication_coverage
-                || new_cron_coverage);
+                || new_cron_coverage
+                || new_github_projection_coverage);
         if change.include_existing && !new_coverage {
             return Err(Error::invalid(
                 "include_existing is meaningful only when enabling an entry or adding step coverage",

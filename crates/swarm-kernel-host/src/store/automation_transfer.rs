@@ -5,8 +5,9 @@
 //! per-entry ledgers are relocated in this transaction.
 
 use super::{
-    automation_cron, automation_dispatch, automation_goal_progression, automation_publication,
-    automation_work_dispatch, review_disposition,
+    automation_cron, automation_dispatch, automation_github_projection,
+    automation_goal_progression, automation_publication, automation_work_dispatch,
+    review_disposition,
 };
 use crate::{
     automation::{
@@ -158,6 +159,7 @@ pub(super) fn apply(
     automation_publication::relocate_state(tx, &former, &successor)?;
     review_disposition::relocate_state(tx, &former, &successor)?;
     automation_goal_progression::relocate_state(tx, &former, &successor)?;
+    automation_github_projection::relocate_state(tx, &former, &successor)?;
 
     config::write_record(
         tx,

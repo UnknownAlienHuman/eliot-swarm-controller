@@ -20,6 +20,22 @@ pub const TASK_DISPATCH_CONTEXT_SCHEMA_ID: &str = "swarm.task_dispatch_context";
 pub const TASK_DISPATCH_ADMISSION_SCHEMA_ID: &str = "swarm.task_dispatch_admission";
 pub const NORMALIZED_RESULT_CONTEXT_SCHEMA_ID: &str = "swarm.normalized_result_context";
 pub const NORMALIZED_RESULT_PAGE_SCHEMA_ID: &str = "swarm.normalized_result_page";
+pub const GOAL_CONTINUATION_SCHEMA_ID: &str = "swarm.goal_continuation";
+pub const GOAL_CONTINUATION_SCHEMA_VERSION: &str = "1";
+/// Internal Store-enriched command context for a Codex Goal continuation.
+/// This is transported through the existing authenticated RuntimeCommand and
+/// does not advertise a native capability.
+pub const GOAL_CONTINUATION_CONTEXT_SCHEMA_ID: &str = "swarm.goal_continuation_context";
+pub const GOAL_CONTINUATION_CONTEXT_SCHEMA_VERSION: &str = "1";
+/// Closed adapter receipt for the exact continuation input. This is distinct
+/// from the task.dispatch admission event schema.
+pub const GOAL_CONTINUATION_ADMISSION_SCHEMA_ID: &str = "swarm.goal_continuation_admission";
+pub const GOAL_CONTINUATION_ADMISSION_SCHEMA_VERSION: &str = "1";
+/// Versioned common terminal evidence retained by Store consumers.  This is
+/// an evidence envelope, not a capability declaration or a continuation
+/// grant; adapters opt in only by producing a validated retained event.
+pub const GOAL_TERMINAL_EVIDENCE_SCHEMA_ID: &str = "swarm.goal_terminal_evidence";
+pub const GOAL_TERMINAL_EVIDENCE_SCHEMA_VERSION: &str = "1";
 /// Common bounded metadata envelope for descriptor-admitted operationless
 /// Module events. The descriptor still decides which event stream/schema a
 /// binding may publish; this schema only defines the closed projection fields.
@@ -90,6 +106,41 @@ pub fn normalized_result_page_schema() -> SchemaDescriptor {
     SchemaDescriptor {
         schema_id: NORMALIZED_RESULT_PAGE_SCHEMA_ID.to_owned(),
         version: RUNTIME_SCHEMA_VERSION.to_owned(),
+        sha256: None,
+    }
+}
+
+/// Closed Store-owned linkage for one Goal continuation.  This is an
+/// attribution schema, not a provider capability declaration: each adapter
+/// must prove its own terminal evidence before the Store can use it.
+pub fn goal_continuation_schema() -> SchemaDescriptor {
+    SchemaDescriptor {
+        schema_id: GOAL_CONTINUATION_SCHEMA_ID.to_owned(),
+        version: GOAL_CONTINUATION_SCHEMA_VERSION.to_owned(),
+        sha256: None,
+    }
+}
+
+/// Internal receipt declaration for Store validation of one task-bound
+/// continuation. It is not inserted into a module capability set by this
+/// helper; the existing Codex `agent.send` capability remains the only native
+/// action.
+pub fn goal_continuation_admission_schema() -> SchemaDescriptor {
+    SchemaDescriptor {
+        schema_id: GOAL_CONTINUATION_ADMISSION_SCHEMA_ID.to_owned(),
+        version: GOAL_CONTINUATION_ADMISSION_SCHEMA_VERSION.to_owned(),
+        sha256: None,
+    }
+}
+
+/// Descriptor for the common immutable terminal event envelope.  The current
+/// Codex descriptor keeps its existing capability set; this schema is carried
+/// in the Store's authenticated evidence path and does not advertise
+/// `agent.goal`.
+pub fn goal_terminal_evidence_schema() -> SchemaDescriptor {
+    SchemaDescriptor {
+        schema_id: GOAL_TERMINAL_EVIDENCE_SCHEMA_ID.to_owned(),
+        version: GOAL_TERMINAL_EVIDENCE_SCHEMA_VERSION.to_owned(),
         sha256: None,
     }
 }

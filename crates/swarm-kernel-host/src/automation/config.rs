@@ -47,6 +47,23 @@ pub(crate) struct PublicationSettings {
     pub(crate) expected_create: bool,
 }
 
+/// One explicitly selected desired Issue label after exact candidate acceptance.
+/// Repository and Issue identity come from the registered source's Task map.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GithubProjectionSettings {
+    pub(crate) source_id: String,
+    pub(crate) label: String,
+    pub(crate) present: bool,
+}
+
+impl GithubProjectionSettings {
+    pub(crate) fn validate(&self) -> Result<()> {
+        crate::github::protocol::validate_source_id(&self.source_id)?;
+        crate::github::protocol::validate_managed_label(&self.label)
+    }
+}
+
 /// Optional post-commit trigger for an existing ReviewDispatch action.
 /// Presence selects one setup-issued HookSource; `AutomationEntry.enabled`
 /// remains the sole enable switch.
@@ -139,6 +156,8 @@ pub(crate) struct AutomationEntry {
     pub(crate) script_run: Option<ScriptRunSettings>,
     #[serde(default)]
     pub(crate) publication: Option<PublicationSettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) github_projection: Option<GithubProjectionSettings>,
     #[serde(default)]
     pub(crate) cron: Option<crate::scheduler::CronSettings>,
     #[serde(default)]
@@ -175,6 +194,7 @@ impl AutomationEntry {
             goal_progression: None,
             script_run: None,
             publication: None,
+            github_projection: None,
             cron: None,
             hook_commit: None,
             event_rules: None,
@@ -197,6 +217,15 @@ impl AutomationEntry {
             if let Some(gap) = step.capability_gap() {
                 gaps.push(gap);
             }
+        }
+        if self.steps.contains(&AutomationStep::GithubProjection)
+            && self.github_projection.is_none()
+        {
+            gaps.push(json!({
+                "code":"github_projection_settings_required",
+                "step":"github_projection",
+                "reason":"select one registered source_id, Eliot label and explicit present state"
+            }));
         }
         if self.scope.work_pool_id.is_some() {
             gaps.push(json!({
@@ -310,6 +339,13 @@ impl AutomationEntry {
         self.enabled
             && self.steps.contains(&AutomationStep::Publication)
             && self.publication.is_some()
+            && self.scope.work_pool_id.is_none()
+    }
+
+    pub(crate) fn github_projection_ready(&self) -> bool {
+        self.enabled
+            && self.steps.contains(&AutomationStep::GithubProjection)
+            && self.github_projection.is_some()
             && self.scope.work_pool_id.is_none()
     }
 
@@ -844,6 +880,7 @@ pub(crate) fn apply_patch(
             "script_run" => patch_script_run(&mut next.script_run, value)?,
             "work_dispatch" => patch_work_dispatch(&mut next.work_dispatch, value)?,
             "publication" => patch_publication(&mut next.publication, value)?,
+            "github_projection" => patch_github_projection(&mut next.github_projection, value)?,
             "cron" => patch_cron(&mut next.cron, value)?,
             "hook_commit" => patch_hook_commit(&mut next.hook_commit, value)?,
             "event_rules" => next.event_rules = event_rules::parse_settings(value)?,
@@ -902,6 +939,31 @@ fn patch_publication(settings: &mut Option<PublicationSettings>, patch: &Value) 
     merge_object_patch(&mut merged, patch)?;
     let parsed: PublicationSettings = serde_json::from_value(merged)
         .map_err(|_| Error::invalid("invalid publication settings"))?;
+    parsed.validate()?;
+    *settings = Some(parsed);
+    Ok(())
+}
+
+fn patch_github_projection(
+    settings: &mut Option<GithubProjectionSettings>,
+    patch: &Value,
+) -> Result<()> {
+    if patch.is_null() {
+        *settings = None;
+        return Ok(());
+    }
+    if !patch.is_object() {
+        return Err(Error::invalid(
+            "github_projection patch must be an object or null",
+        ));
+    }
+    let mut merged = match settings {
+        Some(settings) => serde_json::to_value(settings)?,
+        None => json!({}),
+    };
+    merge_object_patch(&mut merged, patch)?;
+    let parsed: GithubProjectionSettings = serde_json::from_value(merged)
+        .map_err(|_| Error::invalid("github_projection requires source_id, label and present"))?;
     parsed.validate()?;
     *settings = Some(parsed);
     Ok(())
@@ -1170,6 +1232,14 @@ pub(crate) fn validate_entry(entry: &AutomationEntry) -> Result<()> {
             Error::new(
                 "AUTOMATION_RECORD_INVALID",
                 "stored publication settings do not match the exact Forge target contract",
+            )
+        })?;
+    }
+    if let Some(settings) = entry.github_projection.as_ref() {
+        settings.validate().map_err(|_| {
+            Error::new(
+                "AUTOMATION_RECORD_INVALID",
+                "stored GitHub projection settings do not select one registered-source Eliot label",
             )
         })?;
     }

@@ -14,6 +14,7 @@ use std::{
     collections::BTreeMap,
     time::{Duration, Instant},
 };
+use swarm_contracts::runtime::{GoalTerminalEventRef, GoalTerminalEvidence};
 use tokio::{sync::watch, task::JoinHandle};
 
 type BindingKey = (String, i64);
@@ -166,6 +167,66 @@ fn is_terminal(proof: &Value) -> bool {
         Some("completed" | "failed" | "cancelled")
     )
 }
+
+fn terminal_evidence(
+    db: &Connection,
+    command: &RuntimeCommand,
+    operation: &Value,
+    proof: &Value,
+) -> Result<Option<Value>> {
+    if proof["disposition"] != "completed" || proof["terminal"]["outcome"] != "completed" {
+        return Ok(None);
+    }
+    if proof["operation_id"] != command.operation_id {
+        return Err(Error::new(
+            "NATIVE_IDENTITY_MISMATCH",
+            "execution proof names another Operation",
+        ));
+    }
+    let attempt_id = model::text(operation, "attempt_id")?;
+    let attempt = tasks::get_attempt(db, attempt_id)?;
+    if attempt["task_id"] != operation["task_id"]
+        || attempt["binding_id"] != operation["binding_id"]
+        || attempt["binding_generation"] != operation["binding_generation"]
+    {
+        return Err(Error::new(
+            "NATIVE_IDENTITY_MISMATCH",
+            "execution proof Attempt tuple differs from its Operation",
+        ));
+    }
+    let task_snapshot_sha256 =
+        model::digest(model::canonical(&attempt["task_snapshot"])?.as_bytes());
+    let terminal_event: GoalTerminalEventRef =
+        serde_json::from_value(proof["terminal"]["event"].clone())
+            .map_err(|_| Error::invalid("execution proof terminal EventRef is invalid"))?;
+    let evidence = GoalTerminalEvidence {
+        schema_id: swarm_contracts::module_contract::GOAL_TERMINAL_EVIDENCE_SCHEMA_ID.to_owned(),
+        schema_version: GoalTerminalEvidence::VERSION,
+        source: "opencode".to_owned(),
+        reader_revision: "opencode-execution-log-v1".to_owned(),
+        operation_id: command.operation_id.clone(),
+        binding_id: command.binding_id.clone(),
+        binding_generation: command.generation,
+        task_id: model::text(operation, "task_id")?.to_owned(),
+        task_revision: attempt["task_revision"]
+            .as_i64()
+            .filter(|revision| *revision > 0)
+            .ok_or_else(|| Error::invalid("execution proof Task revision is invalid"))?,
+        task_snapshot_sha256,
+        attempt_id: attempt_id.to_owned(),
+        native_session_id: model::text(proof, "native_session_id")?.to_owned(),
+        native_input_id: model::text(proof, "native_input_id")?.to_owned(),
+        native_run_id: proof["native_run_id"].as_str().map(str::to_owned),
+        completion_condition: "native_execution_terminal".to_owned(),
+        disposition: "completed".to_owned(),
+        terminal_outcome: "completed".to_owned(),
+        terminal_event,
+    };
+    evidence
+        .validate()
+        .map_err(|_| Error::invalid("execution Goal terminal evidence is invalid"))?;
+    Ok(Some(serde_json::to_value(evidence)?))
+}
 fn next_read(
     db: &Connection,
     p: &Principal,
@@ -288,6 +349,10 @@ fn record(
     refs.insert("execution_read".into(), status);
     let now = model::now_ms()?;
     if let Some(proof) = proof {
+        let mut proof = proof;
+        if let Some(evidence) = terminal_evidence(&tx, command, &op, &proof)? {
+            proof["goal_terminal_evidence"] = evidence;
+        }
         if op["native_refs"]["input_id"] != proof["native_input_id"] {
             return Err(Error::new(
                 "NATIVE_INPUT_MISMATCH",

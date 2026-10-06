@@ -21,7 +21,8 @@ pub use error::{Error, NativeRpcRejectionClass, Result};
 pub use native_mcp::{NativeMcpCommand, NativeMcpPhase, ProtectedArtifactRef};
 pub use rpc::Request;
 pub use runtime::{
-    EffectOutcome, ModuleReceiptIdentity, NormalizedResultOriginContext,
-    NormalizedResultPageSource, NormalizedResultProducerOrigin, RuntimeCommand, RuntimeOutcome,
-    TaskDispatchAdmissionReceipt, TaskDispatchContext,
+    EffectOutcome, GoalContinuationAdmissionContext, GoalContinuationAdmissionReceipt,
+    GoalContinuationLink, GoalTerminalEventRef, GoalTerminalEvidence, ModuleReceiptIdentity,
+    NormalizedResultOriginContext, NormalizedResultPageSource, NormalizedResultProducerOrigin,
+    RuntimeCommand, RuntimeOutcome, TaskDispatchAdmissionReceipt, TaskDispatchContext,
 };

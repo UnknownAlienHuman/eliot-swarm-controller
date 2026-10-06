@@ -1,11 +1,13 @@
-//! Manager-enabled, task-scoped Goal progression from durable OpenCode turns.
+//! Manager-enabled, task-scoped Goal progression from durable adapter turns.
 //!
-//! This consumer admits one ordinary `agent.goal continue` Operation per exact
-//! terminal EventRef. It never dispatches native input itself. Store supplies
-//! the normal authority/admission callback and commits it with the cursor and
-//! event receipt in the same SQLite transaction.
+//! This consumer admits one ordinary continuation Operation per exact terminal
+//! EventRef. OpenCode uses its existing controller `agent.goal continue` path;
+//! Codex uses the existing `agent.send` next-turn path only after its journal
+//! evidence and source tuple are revalidated. It never dispatches native input
+//! itself. Store supplies the normal authority/admission callback and commits
+//! it with the cursor and event receipt in the same SQLite transaction.
 
-use super::operations;
+use super::{operations, tasks};
 use crate::{
     automation::{
         actions::AutomationStep,
@@ -18,6 +20,10 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashSet;
+use swarm_contracts::runtime::{
+    GoalContinuationAdmissionReceipt, GoalContinuationLink, GoalTerminalEvidence,
+    ModuleReceiptIdentity,
+};
 
 const STATE_PREFIX: &str = "automation:v1:goal-progression:state:";
 const SLOT_PREFIX: &str = "goal-progression:v1:terminal-slot:";
@@ -30,6 +36,7 @@ const MAX_ENTRY_PAGE: usize = 16;
 const MAX_RECENT: usize = 20;
 const MAX_PENDING_SOURCE_GAPS: usize = 64;
 const MAX_SOURCE_GAP_RECHECKS: usize = 8;
+const GOAL_TERMINAL_EVIDENCE_KIND: &str = "goal.terminal.evidence";
 
 type ObservationRow = (i64, String, String);
 type LinkedGoalOperationRow = (
@@ -125,6 +132,7 @@ struct TerminalSlot {
 pub(crate) struct GoalProgressionAdmission {
     request: Value,
     linkage: Value,
+    continuation_method: String,
     semantic_slot_id: String,
     effective_manager_id: String,
     task_id: String,
@@ -140,6 +148,9 @@ impl GoalProgressionAdmission {
     }
     pub(crate) fn linkage(&self) -> &Value {
         &self.linkage
+    }
+    pub(crate) fn continuation_method(&self) -> &str {
+        &self.continuation_method
     }
     pub(crate) fn semantic_slot_id(&self) -> &str {
         &self.semantic_slot_id
@@ -309,7 +320,7 @@ pub(super) fn relocate_state(
 
 fn observation_high_water(db: &Connection) -> Result<i64> {
     Ok(db.query_row(
-        "SELECT COALESCE(MAX(observation_id),0) FROM observations WHERE kind='opencode.input_execution'",
+        "SELECT COALESCE(MAX(observation_id),0) FROM observations WHERE kind IN ('opencode.input_execution','goal.terminal.evidence')",
         [], |row| row.get(0),
     )?)
 }
@@ -387,7 +398,7 @@ fn event_page(
     let rows = if let Some(through) = through {
         let mut statement = db.prepare(
             "SELECT observation_id,operation_id,payload_json FROM observations \
-             WHERE kind='opencode.input_execution' AND observation_id>?1 AND observation_id<=?2 \
+             WHERE kind IN ('opencode.input_execution','goal.terminal.evidence') AND observation_id>?1 AND observation_id<=?2 \
              ORDER BY observation_id LIMIT ?3",
         )?;
         statement
@@ -398,7 +409,7 @@ fn event_page(
     } else {
         let mut statement = db.prepare(
             "SELECT observation_id,operation_id,payload_json FROM observations \
-             WHERE kind='opencode.input_execution' AND observation_id>?1 \
+             WHERE kind IN ('opencode.input_execution','goal.terminal.evidence') AND observation_id>?1 \
              ORDER BY observation_id LIMIT ?2",
         )?;
         statement
@@ -429,7 +440,7 @@ fn pending_source_gap_payload(db: &Connection, pending: &PendingSourceGap) -> Re
             "retained terminal source observation is missing immutable identity or payload",
         ));
     };
-    if kind != "opencode.input_execution" {
+    if kind != "opencode.input_execution" && kind != GOAL_TERMINAL_EVIDENCE_KIND {
         return Err(invalid_source(
             "retained terminal source observation has an immutable unexpected kind",
         ));
@@ -691,6 +702,260 @@ fn original_request(db: &Connection, operation_id: &str) -> Result<Value> {
     serde_json::from_str(&raw).map_err(|_| invalid_source("source Operation request is invalid"))
 }
 
+fn verified_goal_terminal_evidence(
+    db: &Connection,
+    observation_id: i64,
+    operation_id: &str,
+    evidence_value: &Value,
+    operation: &Value,
+    input_execution: Option<&Value>,
+) -> Result<Value> {
+    let evidence: GoalTerminalEvidence = serde_json::from_value(evidence_value.clone())
+        .map_err(|_| invalid_source("Goal terminal evidence payload is malformed"))?;
+    evidence
+        .validate()
+        .map_err(|_| invalid_source("Goal terminal evidence contract is invalid"))?;
+    if evidence.operation_id != operation_id
+        || operation["binding_id"].as_str() != Some(evidence.binding_id.as_str())
+        || Some(evidence.binding_generation) != operation["binding_generation"].as_i64()
+        || operation["task_id"].as_str() != Some(evidence.task_id.as_str())
+        || operation["attempt_id"].as_str() != Some(evidence.attempt_id.as_str())
+        || evidence.task_revision != source_task_revision(db, operation)?
+    {
+        return Err(invalid_source(
+            "Goal terminal evidence does not match the source Operation tuple",
+        ));
+    }
+    let attempt_id = operation["attempt_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| invalid_source("source Operation Attempt ID is missing"))?;
+    let attempt = tasks::get_attempt(db, attempt_id).map_err(|error| {
+        if error.code == "NOT_FOUND" {
+            Error::new(
+                "AUTOMATION_GOAL_SOURCE_GAP",
+                "source Attempt is not retained yet",
+            )
+        } else {
+            error
+        }
+    })?;
+    if attempt["task_id"] != operation["task_id"]
+        || attempt["binding_id"] != operation["binding_id"]
+        || attempt["binding_generation"] != operation["binding_generation"]
+        || evidence.task_snapshot_sha256
+            != model::digest(model::canonical(&attempt["task_snapshot"])?.as_bytes())
+    {
+        return Err(invalid_source(
+            "Goal terminal evidence Attempt snapshot or binding differs",
+        ));
+    }
+    let retained = if evidence.source == "codex" {
+        operation["native_refs"].get("goal_terminal_evidence")
+    } else {
+        input_execution.and_then(|proof| proof.get("goal_terminal_evidence"))
+    };
+    if evidence.source == "opencode"
+        && input_execution
+            .is_none_or(|proof| operation["native_refs"]["input_execution"] != proof.clone())
+    {
+        return Err(invalid_source(
+            "OpenCode Goal terminal evidence is not the retained execution proof",
+        ));
+    }
+    if retained != Some(evidence_value) {
+        return Err(invalid_source(
+            "Goal terminal evidence is not the exact retained producer receipt",
+        ));
+    }
+    if evidence.source == "codex" {
+        let marker = &operation["result"]["details"]["goal_terminal_event"];
+        let retained_event = marker.get("event").ok_or_else(|| {
+            invalid_source("Codex terminal journal event is not retained with its Operation")
+        })?;
+        let retained_record = marker.get("event_record").ok_or_else(|| {
+            invalid_source("Codex terminal journal record is not retained with its Operation")
+        })?;
+        if retained_event != &serde_json::to_value(&evidence.terminal_event)?
+            || retained_record["id"] != retained_event["id"]
+            || retained_record["seq"] != retained_event["seq"]
+            || retained_record["kind"] != "turn.completed"
+            || retained_record["status"] != "completed"
+            || retained_event["sha256"].as_str()
+                != Some(model::digest(model::canonical(retained_record)?.as_bytes()).as_str())
+        {
+            return Err(invalid_source(
+                "Codex terminal journal EventRef does not match its retained record",
+            ));
+        }
+    }
+    let (native_session, native_input) = if evidence.source == "codex" {
+        (
+            operation["native_refs"]["session_id"].as_str(),
+            operation["native_refs"]["input_id"].as_str(),
+        )
+    } else {
+        (
+            operation["native_refs"]["input_execution"]["native_session_id"].as_str(),
+            operation["native_refs"]["input_execution"]["native_input_id"].as_str(),
+        )
+    };
+    if native_session != Some(evidence.native_session_id.as_str())
+        || native_input != Some(evidence.native_input_id.as_str())
+    {
+        return Err(invalid_source(
+            "Goal terminal evidence native identity differs from the retained Operation",
+        ));
+    }
+    let retained_run = if evidence.source == "codex" {
+        operation["native_refs"]["turn_id"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+    } else {
+        operation["native_refs"]["input_execution"]["native_run_id"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+    };
+    if retained_run != evidence.native_run_id.as_deref() {
+        return Err(invalid_source(
+            "Goal terminal evidence native run identity differs from the retained Operation",
+        ));
+    }
+    if operation["method"] == "agent.send" {
+        validate_retained_goal_continuation_admission(db, operation_id, operation, evidence)?;
+    }
+    Ok(json!({
+        "observation_id":observation_id,
+        "source_operation_id":operation_id,
+        "source_method":operation["method"],
+        "task_id":evidence.task_id,
+        "task_revision":evidence.task_revision,
+        "attempt_id":evidence.attempt_id,
+        "binding_id":evidence.binding_id,
+        "binding_generation":evidence.binding_generation,
+        "native_session_id":evidence.native_session_id,
+        "native_input_id":evidence.native_input_id,
+        "terminal_event":serde_json::to_value(&evidence.terminal_event)?,
+        "native_run_id":evidence.native_run_id,
+        "disposition":evidence.disposition,
+    }))
+}
+
+/// A Codex Goal continuation is an ordinary `agent.send`, so its terminal
+/// marker is only meaningful when the Store-authenticated closed continuation
+/// receipt is retained with the same Operation.  Revalidation is entirely
+/// historical: it follows the immutable effective cause and Operation tuple and
+/// never asks the current binding boot, Task/Attempt owner, or manager for
+/// permission again.
+fn validate_retained_goal_continuation_admission(
+    db: &Connection,
+    operation_id: &str,
+    operation: &Value,
+    evidence: &GoalTerminalEvidence,
+) -> Result<()> {
+    let details = operation["result"]["details"]
+        .as_object()
+        .ok_or_else(|| invalid_source("Codex continuation result details are missing"))?;
+    let receipt: GoalContinuationAdmissionReceipt = serde_json::from_value(
+        details
+            .get("goal_continuation_admission")
+            .cloned()
+            .ok_or_else(|| {
+                invalid_source("Codex continuation terminal result has no admission receipt")
+            })?,
+    )
+    .map_err(|_| invalid_source("Codex continuation admission receipt is malformed"))?;
+    receipt
+        .validate()
+        .map_err(|_| invalid_source("Codex continuation admission receipt is invalid"))?;
+    let module_receipt: ModuleReceiptIdentity = serde_json::from_value(
+        details
+            .get("module_receipt")
+            .cloned()
+            .ok_or_else(|| invalid_source("Codex continuation module receipt is missing"))?,
+    )
+    .map_err(|_| invalid_source("Codex continuation module receipt is malformed"))?;
+    module_receipt
+        .validate()
+        .map_err(|_| invalid_source("Codex continuation module receipt is invalid"))?;
+    if receipt.module_receipt != module_receipt
+        || receipt.context.operation_id != operation_id
+        || receipt.context.binding_id != operation["binding_id"].as_str().unwrap_or_default()
+        || receipt.context.binding_generation
+            != operation["binding_generation"].as_i64().unwrap_or_default()
+        || receipt.native_input_id.as_deref() != Some(evidence.native_input_id.as_str())
+        || operation["native_refs"]["input_id"].as_str() != Some(evidence.native_input_id.as_str())
+    {
+        return Err(invalid_source(
+            "Codex continuation receipt does not match the terminal Operation and native input",
+        ));
+    }
+    let effective_raw: String = db.query_row(
+        "SELECT effective_request_json FROM operations WHERE operation_id=?1",
+        [operation_id],
+        |row| row.get(0),
+    )?;
+    let effective: Value = serde_json::from_str(&effective_raw)
+        .map_err(|_| invalid_source("Codex continuation effective request is malformed"))?;
+    if effective["automation_on_behalf"]["action"] != "agent.send"
+        || effective["automation_on_behalf"]["cause"]["kind"] != "goal_progression"
+    {
+        return Err(invalid_source(
+            "Codex continuation admission is outside the retained Goal cause",
+        ));
+    }
+    let expected_continuation: GoalContinuationLink =
+        serde_json::from_value(effective["automation_on_behalf"]["cause"]["continuation"].clone())
+            .map_err(|_| invalid_source("Codex continuation cause linkage is malformed"))?;
+    if receipt.context.continuation != expected_continuation {
+        return Err(invalid_source(
+            "Codex continuation receipt differs from the retained prior EventRef linkage",
+        ));
+    }
+    Ok(())
+}
+
+/// The common Goal DTO is an additional typed terminal receipt.  OpenCode
+/// still has to satisfy the original execution-proof reader before that DTO
+/// can be consumed; the DTO must never turn a partial input receipt into a
+/// terminal source by itself.
+fn validate_opencode_execution_proof(operation: &Value, proof: &Value) -> Result<()> {
+    if operation["native_refs"]["input_execution"] != proof
+        || proof["reader_revision"] != "opencode-execution-log-v1"
+        || proof["correlation"] != "durable_serialized_execution"
+        || proof["disposition"] != "completed"
+        || proof["uncertainty"].is_string()
+        || !proof["admission"].is_object()
+        || !proof["delivery"].is_object()
+        || !proof["execution_started"].is_object()
+        || proof["terminal"]["outcome"] != "completed"
+        || proof["terminal"]["event"]["id"].as_str().is_none()
+        || proof["terminal"]["event"]["seq"]
+            .as_i64()
+            .is_none_or(|seq| seq < 1)
+        || proof["terminal"]["event"]["sha256"]
+            .as_str()
+            .is_none_or(|hash| !is_digest(hash))
+        || proof["native_input_id"].as_str().is_none()
+        || proof["native_session_id"].as_str().is_none()
+    {
+        return Err(invalid_source(
+            "exact synchronized OpenCode terminal proof is incomplete",
+        ));
+    }
+    if let Some(retained_run) = operation["native_refs"]["input_execution"]["native_run_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+    {
+        if proof["native_run_id"].as_str() != Some(retained_run) {
+            return Err(invalid_source(
+                "OpenCode terminal proof native run differs from the retained execution",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn verified_terminal(
     db: &Connection,
     observation_id: i64,
@@ -751,43 +1016,52 @@ fn verified_terminal(
             "only explicit Goal continuation inputs are progression sources",
         ));
     }
+    if proof["schema_id"].as_str()
+        == Some(swarm_contracts::module_contract::GOAL_TERMINAL_EVIDENCE_SCHEMA_ID)
+    {
+        if operation["method"] == "agent.goal" {
+            return Err(invalid_source(
+                "Goal continuation Operations cannot be terminal source evidence",
+            ));
+        }
+        return verified_goal_terminal_evidence(
+            db,
+            observation_id,
+            operation_id,
+            &proof,
+            &operation,
+            None,
+        );
+    }
+    if proof["goal_terminal_evidence"].is_object() {
+        if proof["goal_terminal_evidence"]["source"] == "opencode" {
+            validate_opencode_execution_proof(&operation, &proof)?;
+        }
+        return verified_goal_terminal_evidence(
+            db,
+            observation_id,
+            operation_id,
+            &proof["goal_terminal_evidence"],
+            &operation,
+            Some(&proof),
+        );
+    }
     if operation["native_refs"]["input_execution"].is_null() {
         return Err(Error::new(
             "AUTOMATION_GOAL_SOURCE_GAP",
             "settled source Operation has no synchronized execution receipt yet",
         ));
     }
-    if operation["native_refs"]["input_execution"] != proof {
-        return Err(invalid_source(
-            "terminal observation does not match the retained Operation execution receipt",
-        ));
-    }
-    if proof["reader_revision"] != "opencode-execution-log-v1"
-        || proof["correlation"] != "durable_serialized_execution"
-        || proof["disposition"] != "completed"
-        || proof["uncertainty"].is_string()
-        || !proof["admission"].is_object()
-        || !proof["delivery"].is_object()
-        || !proof["execution_started"].is_object()
-        || proof["terminal"]["outcome"] != "completed"
-        || proof["terminal"]["event"]["id"].as_str().is_none()
-        || proof["terminal"]["event"]["seq"]
-            .as_i64()
-            .is_none_or(|seq| seq < 1)
-        || proof["terminal"]["event"]["sha256"]
-            .as_str()
-            .is_none_or(|hash| !is_digest(hash))
-        || operation["task_id"].as_str().is_none()
+    validate_opencode_execution_proof(&operation, &proof)?;
+    if operation["task_id"].as_str().is_none()
         || operation["attempt_id"].as_str().is_none()
         || operation["binding_id"].as_str().is_none()
         || operation["binding_generation"]
             .as_i64()
             .is_none_or(|generation| generation < 1)
-        || proof["native_input_id"].as_str().is_none()
-        || proof["native_session_id"].as_str().is_none()
     {
         return Err(invalid_source(
-            "exact synchronized terminal EventRef or source Operation linkage is missing",
+            "exact source Operation Task/Attempt linkage is missing",
         ));
     }
     Ok(json!({
@@ -987,45 +1261,113 @@ fn prepare(
         .filter(|generation| *generation > 0)
         .ok_or_else(|| invalid_source("Goal Attempt has no immutable binding generation"))?;
     let binding = operations::get_binding(db, binding_id, binding_generation)?;
-    if !binding["released_at_ms"].is_null()
+    let continuation_method = if crate::runtime::codex::is_controller_route(&binding["route"]) {
+        "agent.send"
+    } else if binding["route"]["runtime"] == crate::runtime::opencode_v2::RUNTIME {
+        "agent.goal"
+    } else {
+        ""
+    };
+    if continuation_method.is_empty()
+        || !binding["released_at_ms"].is_null()
         || binding["state"] != "ready"
-        || binding["route"]["runtime"] != crate::runtime::opencode_v2::RUNTIME
         || binding["native_root_id"].as_str().is_none()
     {
         return Err(Error::new(
             "GOAL_UNSUPPORTED_RUNTIME",
-            "Goal progression currently supports only a ready OpenCode V2 binding",
+            "Goal progression requires a ready OpenCode controller or Codex controller binding",
         ));
     }
-    let (native_goal_predecessor_operation_id, expected_revision) = native_goal_predecessor(
-        db,
-        binding_id,
-        binding_generation,
-        None,
-        target["objective"]
+    let objective = target["objective"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            invalid_source("shared Goal objective is missing from the retained Goal record")
+        })?;
+    let (native_goal_predecessor_operation_id, expected_revision) =
+        if continuation_method == "agent.goal" {
+            let (predecessor, revision) =
+                native_goal_predecessor(db, binding_id, binding_generation, None, objective)?;
+            (predecessor, Some(revision))
+        } else {
+            (None, None)
+        };
+    let request_id = if continuation_method == "agent.send" {
+        format!("o9gc:{}", slot_id)
+    } else {
+        format!("o9gp:{}", slot_id)
+    };
+    let request = if continuation_method == "agent.send" {
+        json!({
+            "client_request_id":request_id,
+            "binding_id":binding_id,
+            "generation":binding_generation,
+            "text":objective,
+            "delivery":"next_turn",
+        })
+    } else {
+        json!({
+            "client_request_id":request_id,
+            "binding_id":binding_id,
+            "generation":binding_generation,
+            "action":"continue",
+            "objective":objective,
+            "expected_revision":expected_revision.unwrap_or_default(),
+        })
+    };
+    let continuation = GoalContinuationLink {
+        schema_id: swarm_contracts::module_contract::GOAL_CONTINUATION_SCHEMA_ID.to_owned(),
+        schema_version: GoalContinuationLink::VERSION,
+        method: continuation_method.to_owned(),
+        owner: GoalContinuationLink::OWNER.to_owned(),
+        source_operation_id: fact["source_operation_id"]
             .as_str()
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                invalid_source("shared Goal objective is missing from the retained Goal record")
-            })?,
-    )?;
-    let request_id = format!("o9gp:{}", slot_id);
-    let request = json!({
-        "client_request_id":request_id,
-        "binding_id":binding_id,
-        "generation":binding_generation,
-        "action":"continue",
-        "objective":target["objective"],
-        "expected_revision":expected_revision,
-    });
+            .unwrap_or_default()
+            .to_owned(),
+        source_observation_id: fact["observation_id"].as_i64().unwrap_or_default(),
+        terminal_event: serde_json::from_value(fact["terminal_event"].clone())
+            .map_err(|_| invalid_source("terminal EventRef cannot form continuation linkage"))?,
+        native_session_id: fact["native_session_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned(),
+        native_input_id: fact["native_input_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned(),
+        native_run_id: fact["native_run_id"].as_str().map(str::to_owned),
+        task_id: target["scope"]["task_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned(),
+        task_revision: target["scope"]["task_revision"]
+            .as_i64()
+            .unwrap_or_default(),
+        attempt_id: target["scope"]["attempt_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned(),
+        binding_id: binding_id.to_owned(),
+        binding_generation,
+        goal_id: target["goal_id"].as_str().unwrap_or_default().to_owned(),
+        goal_revision: target["revision"].as_i64().unwrap_or_default(),
+        objective_sha256: model::digest(objective.as_bytes()),
+    };
+    continuation
+        .validate()
+        .map_err(|_| invalid_source("continuation linkage is invalid"))?;
+    let continuation_value = serde_json::to_value(&continuation)?;
     let cause = json!({
         "kind":"goal_progression",
         "id":slot_id,
+        "continuation":continuation_value.clone(),
+        "continuation_owner":GoalContinuationLink::OWNER,
         "source_operation_id":fact["source_operation_id"],
         "source_observation_id":fact["observation_id"],
         "terminal_event":fact["terminal_event"],
         "native_session_id":fact["native_session_id"],
         "native_input_id":fact["native_input_id"],
+        "native_run_id":fact["native_run_id"],
         "goal_id":target["goal_id"],
         "goal_revision":target["revision"],
         "goal_active":target["active"],
@@ -1048,7 +1390,7 @@ fn prepare(
         "automation_id":entry.automation_id,
         "automation_revision":entry.revision,
         "project_id":entry.project_id,
-        "action":"agent.goal",
+        "action":continuation_method,
         "semantic_cause_kind":"goal_progression",
         "semantic_cause_id":slot_id,
         "cause":cause,
@@ -1070,14 +1412,17 @@ fn prepare(
         "terminal_event":fact["terminal_event"],
         "native_session_id":fact["native_session_id"],
         "native_input_id":fact["native_input_id"],
+        "native_run_id":fact["native_run_id"],
         "semantic_slot_id":slot_id,
         "expected_native_goal_revision":expected_revision,
         "native_goal_predecessor_operation_id":native_goal_predecessor_operation_id,
-        "continuation_owner":"manager_enabled_automation",
+        "continuation_owner":GoalContinuationLink::OWNER,
+        "continuation":continuation_value,
     });
     Ok(GoalProgressionAdmission {
         request,
         linkage,
+        continuation_method: continuation_method.to_owned(),
         semantic_slot_id: slot_id.to_owned(),
         effective_manager_id: entry.owner_manager_id.clone(),
         task_id: target["scope"]["task_id"]
@@ -1128,6 +1473,11 @@ fn require_current_admission(
     let goal_id = linkage["goal_id"].as_str().ok_or_else(stale)?;
     let target = super::goals::progression_target(db, project, task_id, goal_id, now_ms)?
         .ok_or_else(stale)?;
+    let requested_objective = if admission.continuation_method() == "agent.send" {
+        admission.request.get("text")
+    } else {
+        admission.request.get("objective")
+    };
     if target["active"] != linkage["goal_active"]
         || linkage["goal_active"] != true
         || target["completion"]["status"] != linkage["completion_status"]
@@ -1139,7 +1489,7 @@ fn require_current_admission(
         || target["scope"]["attempt_id"] != linkage["attempt_id"]
         || target["binding_id"] != linkage["binding_id"]
         || target["binding_generation"] != linkage["binding_generation"]
-        || target["objective"] != admission.request["objective"]
+        || target.get("objective") != requested_objective
     {
         return Err(stale());
     }
@@ -1153,45 +1503,75 @@ fn require_current_admission(
     }
     let binding =
         operations::get_binding(db, admission.binding_id(), admission.binding_generation())?;
-    if !binding["released_at_ms"].is_null()
+    let supported_binding = match admission.continuation_method() {
+        "agent.goal" => binding["route"]["runtime"] == crate::runtime::opencode_v2::RUNTIME,
+        "agent.send" => crate::runtime::codex::is_controller_route(&binding["route"]),
+        _ => false,
+    };
+    if !supported_binding
+        || !binding["released_at_ms"].is_null()
         || binding["state"] != "ready"
-        || binding["route"]["runtime"] != crate::runtime::opencode_v2::RUNTIME
         || binding["native_root_id"].as_str().is_none()
     {
         return Err(Error::new(
             "GOAL_UNSUPPORTED_RUNTIME",
-            "Goal progression currently supports only a ready OpenCode V2 binding",
+            "Goal continuation requires its exact ready OpenCode or Codex controller binding",
         ));
     }
-    if admission.request["action"] != "continue"
-        || admission.request["binding_id"] != admission.binding_id()
-        || admission.request["generation"] != admission.binding_generation()
-        || admission.request["client_request_id"]
-            != format!("o9gp:{}", admission.semantic_slot_id())
-        || admission.request["expected_revision"] != linkage["expected_native_goal_revision"]
+    let request_valid = if admission.continuation_method() == "agent.send" {
+        admission.request["binding_id"] == admission.binding_id()
+            && admission.request["generation"] == admission.binding_generation()
+            && admission.request["client_request_id"]
+                == format!("o9gc:{}", admission.semantic_slot_id())
+            && admission.request["delivery"] == "next_turn"
+            && admission.request["text"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty())
+            && admission.request.get("action").is_none()
+            && admission.request.get("expected_revision").is_none()
+    } else {
+        admission.request["action"] == "continue"
+            && admission.request["binding_id"] == admission.binding_id()
+            && admission.request["generation"] == admission.binding_generation()
+            && admission.request["client_request_id"]
+                == format!("o9gp:{}", admission.semantic_slot_id())
+            && admission.request["expected_revision"] == linkage["expected_native_goal_revision"]
+    };
+    let continuation: GoalContinuationLink =
+        serde_json::from_value(linkage["continuation"].clone()).map_err(|_| {
+            Error::new(
+                "AUTOMATION_LINK_CORRUPT",
+                "Goal continuation linkage is invalid",
+            )
+        })?;
+    if !request_valid
+        || continuation.method != admission.continuation_method()
+        || continuation.owner != GoalContinuationLink::OWNER
     {
         return Err(Error::new(
             "AUTOMATION_LINK_CORRUPT",
             "Goal progression request differs from its immutable admission linkage",
         ));
     }
-    let (native_predecessor, native_revision) = native_goal_predecessor(
-        db,
-        admission.binding_id(),
-        admission.binding_generation(),
-        before_operation_id,
-        admission.request["objective"].as_str().ok_or_else(stale)?,
-    )?;
-    if linkage["native_goal_predecessor_operation_id"]
-        != native_predecessor
-            .as_deref()
-            .map_or(Value::Null, |id| json!(id))
-        || linkage["expected_native_goal_revision"] != json!(native_revision)
-    {
-        return Err(Error::new(
-            "GOAL_NATIVE_OWNERSHIP_CONFLICT",
-            "the controller-recorded native Goal changed before continuation admission",
-        ));
+    if admission.continuation_method() == "agent.goal" {
+        let (native_predecessor, native_revision) = native_goal_predecessor(
+            db,
+            admission.binding_id(),
+            admission.binding_generation(),
+            before_operation_id,
+            admission.request["objective"].as_str().ok_or_else(stale)?,
+        )?;
+        if linkage["native_goal_predecessor_operation_id"]
+            != native_predecessor
+                .as_deref()
+                .map_or(Value::Null, |id| json!(id))
+            || linkage["expected_native_goal_revision"] != json!(native_revision)
+        {
+            return Err(Error::new(
+                "GOAL_NATIVE_OWNERSHIP_CONFLICT",
+                "the controller-recorded native Goal changed before continuation admission",
+            ));
+        }
     }
     let observation_id = linkage["source_observation_id"]
         .as_i64()
@@ -1199,7 +1579,7 @@ fn require_current_admission(
         .ok_or_else(stale)?;
     let source_operation_id = linkage["source_operation_id"].as_str().ok_or_else(stale)?;
     let raw: Option<String> = db.query_row(
-        "SELECT payload_json FROM observations WHERE observation_id=?1 AND operation_id=?2 AND kind='opencode.input_execution'",
+        "SELECT payload_json FROM observations WHERE observation_id=?1 AND operation_id=?2 AND kind IN ('opencode.input_execution','goal.terminal.evidence')",
         params![observation_id, source_operation_id],
         |row| row.get(0),
     ).optional()?;
@@ -1213,6 +1593,7 @@ fn require_current_admission(
         || fact["attempt_id"] != linkage["attempt_id"]
         || fact["binding_id"] != linkage["binding_id"]
         || fact["binding_generation"] != linkage["binding_generation"]
+        || fact["native_run_id"] != linkage["native_run_id"]
     {
         return Err(stale());
     }
@@ -1252,7 +1633,7 @@ pub(crate) fn validate_operation_link(
         )
     };
     let cause = &link.cause;
-    if link.action != "agent.goal"
+    if !matches!(link.action.as_str(), "agent.goal" | "agent.send")
         || cause["kind"] != "goal_progression"
         || cause["id"].as_str().is_none_or(str::is_empty)
         || cause["goal_id"].as_str().is_none_or(str::is_empty)
@@ -1289,10 +1670,12 @@ pub(crate) fn validate_operation_link(
             .as_str()
             .is_none_or(str::is_empty)
         || cause["native_input_id"].as_str().is_none_or(str::is_empty)
-        || cause["expected_native_goal_revision"]
-            .as_i64()
-            .is_none_or(|value| value < 0)
-        || (!cause["native_goal_predecessor_operation_id"].is_null()
+        || (link.action == "agent.goal"
+            && cause["expected_native_goal_revision"]
+                .as_i64()
+                .is_none_or(|value| value < 0))
+        || (link.action == "agent.goal"
+            && !cause["native_goal_predecessor_operation_id"].is_null()
             && cause["native_goal_predecessor_operation_id"]
                 .as_str()
                 .is_none_or(str::is_empty))
@@ -1320,7 +1703,7 @@ pub(crate) fn validate_operation_link(
     };
     if caller != link.technical_requester_id
         || caller != crate::automation::authorization::AUTOMATION_TECHNICAL_REQUESTER_ID
-        || method != "agent.goal"
+        || method != link.action
         || task_id.as_deref() != cause["task_id"].as_str()
         || attempt_id.as_deref() != cause["attempt_id"].as_str()
         || binding_id.as_deref() != cause["binding_id"].as_str()
@@ -1330,48 +1713,98 @@ pub(crate) fn validate_operation_link(
     }
     let request: Value = serde_json::from_str(&original_raw).map_err(|_| corrupt())?;
     let effective: Value = serde_json::from_str(&effective_raw).map_err(|_| corrupt())?;
-    if request["action"] != "continue"
-        || request["binding_id"] != cause["binding_id"]
-        || request["generation"] != cause["binding_generation"]
-        || request["expected_revision"] != cause["expected_native_goal_revision"]
-        || request["client_request_id"] != format!("o9gp:{slot_id}")
-        || request["objective"].as_str().is_none_or(|objective| {
-            model::digest(objective.as_bytes())
-                != cause["objective_sha256"].as_str().unwrap_or_default()
-        })
+    let request_valid = if link.action == "agent.send" {
+        request["binding_id"] == cause["binding_id"]
+            && request["generation"] == cause["binding_generation"]
+            && request["client_request_id"] == format!("o9gc:{slot_id}")
+            && request["delivery"] == "next_turn"
+            && request["text"].as_str().is_some_and(|text| {
+                model::digest(text.as_bytes())
+                    == cause["objective_sha256"].as_str().unwrap_or_default()
+            })
+            && request.get("action").is_none()
+            && request.get("expected_revision").is_none()
+    } else {
+        request["action"] == "continue"
+            && request["binding_id"] == cause["binding_id"]
+            && request["generation"] == cause["binding_generation"]
+            && request["expected_revision"] == cause["expected_native_goal_revision"]
+            && request["client_request_id"] == format!("o9gp:{slot_id}")
+            && request["objective"].as_str().is_some_and(|objective| {
+                model::digest(objective.as_bytes())
+                    == cause["objective_sha256"].as_str().unwrap_or_default()
+            })
+    };
+    if link.action == "agent.send" || cause.get("continuation").is_some() {
+        let continuation: GoalContinuationLink =
+            serde_json::from_value(cause["continuation"].clone()).map_err(|_| corrupt())?;
+        if continuation.validate().is_err()
+            || continuation.method != link.action
+            || cause["source_operation_id"].as_str()
+                != Some(continuation.source_operation_id.as_str())
+            || cause["source_observation_id"].as_i64() != Some(continuation.source_observation_id)
+            || serde_json::to_value(&continuation.terminal_event).map_err(|_| corrupt())?
+                != cause["terminal_event"]
+            || cause["native_session_id"].as_str() != Some(continuation.native_session_id.as_str())
+            || cause["native_input_id"].as_str() != Some(continuation.native_input_id.as_str())
+            || continuation.native_run_id != cause["native_run_id"].as_str().map(str::to_owned)
+            || cause["task_id"].as_str() != Some(continuation.task_id.as_str())
+            || cause["task_revision"].as_i64() != Some(continuation.task_revision)
+            || cause["attempt_id"].as_str() != Some(continuation.attempt_id.as_str())
+            || cause["binding_id"].as_str() != Some(continuation.binding_id.as_str())
+            || cause["binding_generation"].as_i64() != Some(continuation.binding_generation)
+            || cause["goal_id"].as_str() != Some(continuation.goal_id.as_str())
+            || cause["goal_revision"].as_i64() != Some(continuation.goal_revision)
+            || cause["objective_sha256"].as_str() != Some(continuation.objective_sha256.as_str())
+            || !request_valid
+            || effective["automation_on_behalf"]["technical_requester_id"]
+                != link.technical_requester_id
+            || effective["automation_on_behalf"]["effective_manager_id"]
+                != link.effective_manager_id
+            || effective["automation_on_behalf"]["automation_id"] != link.automation_id
+            || effective["automation_on_behalf"]["automation_revision"] != link.automation_revision
+            || effective["automation_on_behalf"]["project_id"] != link.project_id
+            || effective["automation_on_behalf"]["action"] != link.action
+            || effective["automation_on_behalf"]["cause"] != *cause
+        {
+            return Err(corrupt());
+        }
+    } else if !request_valid
         || effective["automation_on_behalf"]["technical_requester_id"]
             != link.technical_requester_id
         || effective["automation_on_behalf"]["effective_manager_id"] != link.effective_manager_id
         || effective["automation_on_behalf"]["automation_id"] != link.automation_id
         || effective["automation_on_behalf"]["automation_revision"] != link.automation_revision
         || effective["automation_on_behalf"]["project_id"] != link.project_id
-        || effective["automation_on_behalf"]["action"] != "agent.goal"
+        || effective["automation_on_behalf"]["action"] != link.action
         || effective["automation_on_behalf"]["cause"] != *cause
     {
         return Err(corrupt());
     }
-    let (native_predecessor, native_revision) = native_goal_predecessor(
-        db,
-        cause["binding_id"].as_str().ok_or_else(corrupt)?,
-        cause["binding_generation"].as_i64().ok_or_else(corrupt)?,
-        Some(&link.operation_id),
-        request["objective"].as_str().ok_or_else(corrupt)?,
-    )
-    .map_err(|_| corrupt())?;
-    if cause["native_goal_predecessor_operation_id"]
-        != native_predecessor
-            .as_deref()
-            .map_or(Value::Null, |id| json!(id))
-        || cause["expected_native_goal_revision"] != json!(native_revision)
-    {
-        return Err(corrupt());
+    if link.action == "agent.goal" {
+        let (native_predecessor, native_revision) = native_goal_predecessor(
+            db,
+            cause["binding_id"].as_str().ok_or_else(corrupt)?,
+            cause["binding_generation"].as_i64().ok_or_else(corrupt)?,
+            Some(&link.operation_id),
+            request["objective"].as_str().ok_or_else(corrupt)?,
+        )
+        .map_err(|_| corrupt())?;
+        if cause["native_goal_predecessor_operation_id"]
+            != native_predecessor
+                .as_deref()
+                .map_or(Value::Null, |id| json!(id))
+            || cause["expected_native_goal_revision"] != json!(native_revision)
+        {
+            return Err(corrupt());
+        }
     }
     let source_operation_id = cause["source_operation_id"].as_str().ok_or_else(corrupt)?;
     let source_observation_id = cause["source_observation_id"]
         .as_i64()
         .ok_or_else(corrupt)?;
     let raw: Option<String> = db.query_row(
-        "SELECT payload_json FROM observations WHERE observation_id=?1 AND operation_id=?2 AND kind='opencode.input_execution'",
+        "SELECT payload_json FROM observations WHERE observation_id=?1 AND operation_id=?2 AND kind IN ('opencode.input_execution','goal.terminal.evidence')",
         params![source_observation_id, source_operation_id],
         |row| row.get(0),
     ).optional()?;
@@ -1386,6 +1819,7 @@ pub(crate) fn validate_operation_link(
         || fact["attempt_id"] != cause["attempt_id"]
         || fact["binding_id"] != cause["binding_id"]
         || fact["binding_generation"] != cause["binding_generation"]
+        || fact["native_run_id"] != cause["native_run_id"]
     {
         return Err(corrupt());
     }
@@ -1437,7 +1871,8 @@ fn state_projection(db: &Connection, state: &State, processed: usize) -> Result<
 
 /// Transactional bounded pass. The supplied callback must route through the
 /// ordinary manager on-behalf authority, mutate/Operation receipt path, and
-/// return only after the exact `agent.goal` Operation has been admitted.
+/// return only after the exact controller-owned continuation Operation has
+/// been admitted (`agent.goal` for OpenCode or `agent.send` for Codex).
 pub(crate) fn reconcile_entry<F>(
     tx: &Transaction<'_>,
     entry: &AutomationEntry,

@@ -267,22 +267,26 @@ impl ManagedLabelRequest {
         {
             return Err(Error::invalid("task_id must be bounded printable text"));
         }
-        // The fixed prefix gives this method a narrow ownership boundary and
-        // keeps the path segment safe for GitHub's per-label endpoints.
-        if !(10..=50).contains(&request.label.len())
-            || !request.label.starts_with("eliot-")
-            || !request
-                .label
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-            || request.label.ends_with('-')
-        {
-            return Err(Error::invalid(
-                "label must be a 10..=50 byte lowercase eliot-* label",
-            ));
-        }
+        validate_managed_label(&request.label)?;
         Ok(request)
     }
+}
+
+/// Shared direct/automatic selector validation. The reserved prefix also keeps
+/// the label safe as a path segment in GitHub's per-label endpoints.
+pub(crate) fn validate_managed_label(label: &str) -> Result<()> {
+    if !(10..=50).contains(&label.len())
+        || !label.starts_with("eliot-")
+        || !label
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        || label.ends_with('-')
+    {
+        return Err(Error::invalid(
+            "label must be a 10..=50 byte lowercase eliot-* label",
+        ));
+    }
+    Ok(())
 }
 
 /// One exact readback of a retained, unknown managed-label Operation. The

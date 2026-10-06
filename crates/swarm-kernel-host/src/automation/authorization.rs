@@ -8,6 +8,7 @@ use super::{
 use crate::{
     acceptance::AcceptRequest,
     error::{Error, Result},
+    github::protocol::ManagedLabelRequest,
     model::{self, Principal, Role},
     review::{
         PRIMARY_REVIEW_SLOT, ReviewCoverage, ReviewSlotIdentity, ReviewSubmitRequest, ReviewVerdict,
@@ -53,6 +54,56 @@ type ScriptEventRunLinkRow = (
     String,
 );
 
+const GITHUB_PROJECTION_ACTION: &str = "github.effect.managed_label";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct GithubProjectionCause {
+    kind: String,
+    observation_id: i64,
+    operation_id: String,
+    id: String,
+    task_id: String,
+    task_revision: i64,
+    attempt_id: String,
+    submission_ref: String,
+    candidate_ref: String,
+    source_id: String,
+    source_revision: String,
+    label: String,
+    present: bool,
+    gm_epoch: i64,
+    activation_cut: i64,
+    historical_replay_authorized: bool,
+}
+
+/// Typed Manager-on-behalf authority for one exact accepted-candidate Issue
+/// label projection. It is built only from the retained acceptance fact and
+/// the current registered source map; it has no request deserializer.
+#[derive(Debug, Clone)]
+pub(crate) struct GithubProjectionContext {
+    technical_requester_id: String,
+    effective_manager_id: String,
+    automation_id: String,
+    automation_revision: i64,
+    project_id: String,
+    task_id: String,
+    task_revision: i64,
+    attempt_id: String,
+    submission_ref: String,
+    candidate_ref: String,
+    acceptance_observation_id: i64,
+    accepted_operation_id: String,
+    source_id: String,
+    source_revision: String,
+    label: String,
+    present: bool,
+    gm_epoch: i64,
+    activation_cut: i64,
+    historical_replay_authorized: bool,
+    committed_operation_id: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ManagerExecutionContext {
     technical_requester_id: String,
@@ -73,6 +124,443 @@ pub(crate) struct CronExecutionContext {
     entry: config::AutomationEntry,
     occurrence_id: String,
     cause: AutomationCause,
+}
+
+impl GithubProjectionContext {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_acceptance_observation(
+        db: &Connection,
+        entry: &config::AutomationEntry,
+        observation_id: i64,
+        accepted_operation_id: &str,
+        activation_cut: i64,
+        historical_replay_authorized: bool,
+    ) -> Result<Self> {
+        validate_github_projection_entry_authority(db, entry)?;
+        let candidate = crate::automation::publication::accepted_candidate_from_observation(
+            db,
+            observation_id,
+            accepted_operation_id,
+        )?;
+        if candidate.project_id != entry.project_id
+            || (observation_id <= activation_cut) != historical_replay_authorized
+        {
+            return Err(Error::new(
+                "AUTOMATION_GITHUB_PROJECTION_SOURCE_STALE",
+                "acceptance is outside this exact projection activation or project",
+            ));
+        }
+        let settings = entry.github_projection.as_ref().ok_or_else(|| {
+            Error::new(
+                "AUTOMATION_GITHUB_PROJECTION_SETTINGS_REQUIRED",
+                "GitHub projection settings are missing",
+            )
+        })?;
+        let source_revision = github_projection_source_revision(
+            db,
+            &settings.source_id,
+            &candidate.task_id,
+            &candidate.project_id,
+            candidate.task_revision,
+            true,
+        )?;
+        let gm_epoch = current_gm_epoch_for(db, &entry.owner_manager_id)?;
+        crate::automation::publication::validate_current_accepted_candidate_for_projection(
+            db,
+            &candidate,
+            &entry.project_id,
+        )?;
+        let context = Self {
+            technical_requester_id: AUTOMATION_TECHNICAL_REQUESTER_ID.to_owned(),
+            effective_manager_id: entry.owner_manager_id.clone(),
+            automation_id: entry.automation_id.clone(),
+            automation_revision: entry.revision,
+            project_id: entry.project_id.clone(),
+            task_id: candidate.task_id,
+            task_revision: candidate.task_revision,
+            attempt_id: candidate.attempt_id,
+            submission_ref: candidate.submission_ref,
+            candidate_ref: candidate.candidate_ref,
+            acceptance_observation_id: observation_id,
+            accepted_operation_id: candidate.accepted_operation_id,
+            source_id: settings.source_id.clone(),
+            source_revision,
+            label: settings.label.clone(),
+            present: settings.present,
+            gm_epoch,
+            activation_cut,
+            historical_replay_authorized,
+            committed_operation_id: None,
+        };
+        context.require_current(db)?;
+        Ok(context)
+    }
+
+    /// Rehydrate the exact retained managed-label Operation and immutable
+    /// on-behalf record. Current Manager/GM authority is checked separately
+    /// immediately before an unsent effect; uncertain writes remain readback-only.
+    pub(crate) fn from_committed_operation(db: &Connection, operation_id: &str) -> Result<Self> {
+        let row: Option<(String, String, Option<String>, Option<String>, String, String)> = db
+            .query_row(
+                "SELECT caller_id,method,task_id,attempt_id,original_request_json,effective_request_json FROM operations WHERE operation_id=?1",
+                [operation_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+            )
+            .optional()?;
+        let Some((caller_id, method, task_id, attempt_id, original_json, effective_json)) = row
+        else {
+            return Err(Error::new(
+                "NOT_FOUND",
+                "automated managed-label Operation was not found",
+            ));
+        };
+        if caller_id != AUTOMATION_TECHNICAL_REQUESTER_ID || method != GITHUB_PROJECTION_ACTION {
+            return Err(Error::new(
+                "AUTOMATION_LINK_CORRUPT",
+                "Operation is not the retained internal managed-label action",
+            ));
+        }
+        let link = operation_link(db, operation_id)?.ok_or_else(|| {
+            Error::new(
+                "AUTOMATION_LINK_CORRUPT",
+                "managed-label Operation has no retained on-behalf attribution",
+            )
+        })?;
+        let cause: GithubProjectionCause =
+            serde_json::from_value(link.cause.clone()).map_err(|_| {
+                Error::new(
+                    "AUTOMATION_LINK_CORRUPT",
+                    "managed-label attribution cause fields are invalid",
+                )
+            })?;
+        let mut context = Self::from_link(&link, cause);
+        context.committed_operation_id = Some(operation_id.to_owned());
+        let effective: Value = serde_json::from_str(&effective_json).map_err(|_| {
+            Error::new(
+                "AUTOMATION_LINK_CORRUPT",
+                "managed-label effective request is invalid",
+            )
+        })?;
+        model::fields(&effective, &["automation_on_behalf", "receipt"]).map_err(|_| {
+            Error::new(
+                "AUTOMATION_LINK_CORRUPT",
+                "managed-label effective request has unexpected fields",
+            )
+        })?;
+        if effective["automation_on_behalf"] != context.linkage_value()
+            || task_id.as_deref() != Some(context.task_id.as_str())
+            || attempt_id.as_deref() != Some(context.attempt_id.as_str())
+        {
+            return Err(Error::new(
+                "AUTOMATION_LINK_CORRUPT",
+                "managed-label Operation differs from its exact on-behalf cause",
+            ));
+        }
+        let request_value: Value = serde_json::from_str(&original_json)?;
+        let request = ManagedLabelRequest::parse(&request_value)?;
+        context.require_request_matches(&request)?;
+        let index_key = config::entry_operation_key(
+            &context.effective_manager_id,
+            &context.project_id,
+            &context.automation_id,
+            operation_id,
+        )?;
+        let indexed =
+            config::read_record(db, &index_key, "GitHub projection entry Operation link")?
+                .ok_or_else(|| {
+                    Error::new(
+                        "AUTOMATION_LINK_CORRUPT",
+                        "managed-label Operation is missing from its entry history index",
+                    )
+                })?;
+        if indexed != context.operation_link_value(operation_id, link.linked_at_ms) {
+            return Err(Error::new(
+                "AUTOMATION_LINK_CORRUPT",
+                "managed-label entry index differs from its immutable Operation link",
+            ));
+        }
+        Ok(context)
+    }
+
+    fn from_link(link: &OnBehalfOperationLink, cause: GithubProjectionCause) -> Self {
+        Self {
+            technical_requester_id: link.technical_requester_id.clone(),
+            effective_manager_id: link.effective_manager_id.clone(),
+            automation_id: link.automation_id.clone(),
+            automation_revision: link.automation_revision,
+            project_id: link.project_id.clone(),
+            task_id: cause.task_id,
+            task_revision: cause.task_revision,
+            attempt_id: cause.attempt_id,
+            submission_ref: cause.submission_ref,
+            candidate_ref: cause.candidate_ref,
+            acceptance_observation_id: cause.observation_id,
+            accepted_operation_id: cause.operation_id,
+            source_id: cause.source_id,
+            source_revision: cause.source_revision,
+            label: cause.label,
+            present: cause.present,
+            gm_epoch: cause.gm_epoch,
+            activation_cut: cause.activation_cut,
+            historical_replay_authorized: cause.historical_replay_authorized,
+            committed_operation_id: None,
+        }
+    }
+
+    pub(crate) fn require_current(&self, db: &Connection) -> Result<()> {
+        let candidate = crate::automation::publication::accepted_candidate_from_observation(
+            db,
+            self.acceptance_observation_id,
+            &self.accepted_operation_id,
+        )?;
+        crate::automation::publication::validate_current_accepted_candidate_for_projection(
+            db,
+            &candidate,
+            &self.project_id,
+        )?;
+        if candidate.task_id != self.task_id
+            || candidate.task_revision != self.task_revision
+            || candidate.attempt_id != self.attempt_id
+            || candidate.submission_ref != self.submission_ref
+            || candidate.candidate_ref != self.candidate_ref
+        {
+            return Err(Error::new(
+                "AUTOMATION_GITHUB_PROJECTION_SOURCE_STALE",
+                "retained acceptance no longer identifies this exact Task candidate",
+            ));
+        }
+        if let Some(operation_id) = self.committed_operation_id.as_deref()
+            && let Some(continuation) = current_transfer_continuation(
+                db,
+                operation_id,
+                GITHUB_PROJECTION_ACTION,
+                AutomationStep::GithubProjection,
+                &self.task_id,
+            )?
+        {
+            if continuation.historical_owner_id() != self.effective_manager_id
+                || continuation.historical_revision() != self.automation_revision
+                || continuation.project_id() != self.project_id
+                || continuation.automation_id() != self.automation_id
+                || !entry_matches_github_projection_settings(continuation.current_entry(), self)
+            {
+                return Err(Error::new(
+                    "AUTOMATION_TRANSFER_SCOPE",
+                    "current GM transfer does not preserve the exact GitHub projection",
+                ));
+            }
+            github_projection_source_revision(
+                db,
+                &self.source_id,
+                &self.task_id,
+                &self.project_id,
+                self.task_revision,
+                true,
+            )
+            .and_then(|revision| {
+                if revision == self.source_revision {
+                    Ok(revision)
+                } else {
+                    Err(Error::new(
+                        "AUTOMATION_GITHUB_PROJECTION_SOURCE_STALE",
+                        "registered Issue source revision changed before the label effect",
+                    ))
+                }
+            })?;
+            return Ok(());
+        }
+        validate_github_projection_entry_authority_for_identity(
+            db,
+            &self.effective_manager_id,
+            &self.project_id,
+            &self.automation_id,
+            self.automation_revision,
+            self.source_id.as_str(),
+            self.label.as_str(),
+            self.present,
+        )?;
+        let gm_epoch = current_gm_epoch_for(db, &self.effective_manager_id)?;
+        if gm_epoch != self.gm_epoch {
+            return Err(Error::new(
+                "AUTOMATION_CURRENT_GM_REQUIRED",
+                "current GM or epoch changed after GitHub projection admission",
+            ));
+        }
+        if !current_manager_id_has_task_scope(
+            db,
+            &self.effective_manager_id,
+            &self.task_id,
+            &self.project_id,
+        )? {
+            return Err(Error::new(
+                "FORBIDDEN",
+                "current Manager no longer has scope for the exact projected Task",
+            ));
+        }
+        let revision = github_projection_source_revision(
+            db,
+            &self.source_id,
+            &self.task_id,
+            &self.project_id,
+            self.task_revision,
+            true,
+        )?;
+        if revision != self.source_revision {
+            return Err(Error::new(
+                "AUTOMATION_GITHUB_PROJECTION_SOURCE_STALE",
+                "registered Issue source revision changed before the label effect",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn request_value(&self) -> Result<Value> {
+        let request = ManagedLabelRequest {
+            client_request_id: self.client_request_id()?,
+            source_id: self.source_id.clone(),
+            task_id: self.task_id.clone(),
+            expected_task_revision: self.task_revision,
+            label: self.label.clone(),
+            present: self.present,
+        };
+        let value = serde_json::to_value(request)?;
+        ManagedLabelRequest::parse(&value)?;
+        Ok(value)
+    }
+
+    fn client_request_id(&self) -> Result<String> {
+        let identity = json!({
+            "schema_version":1,
+            "owner_manager_id":self.effective_manager_id,
+            "automation_id":self.automation_id,
+            "automation_revision":self.automation_revision,
+            "project_id":self.project_id,
+            "acceptance_observation_id":self.acceptance_observation_id,
+            "accepted_operation_id":self.accepted_operation_id,
+            "task_id":self.task_id,
+            "task_revision":self.task_revision,
+            "attempt_id":self.attempt_id,
+            "candidate_ref":self.candidate_ref,
+            "source_id":self.source_id,
+            "source_revision":self.source_revision,
+            "label":self.label,
+            "present":self.present,
+            "action":GITHUB_PROJECTION_ACTION
+        });
+        Ok(format!(
+            "auto-github-label-{}",
+            model::digest(model::canonical(&identity)?.as_bytes())
+        ))
+    }
+
+    pub(crate) fn require_request_matches(&self, request: &ManagedLabelRequest) -> Result<()> {
+        if request.client_request_id != self.client_request_id()?
+            || request.source_id != self.source_id
+            || request.task_id != self.task_id
+            || request.expected_task_revision != self.task_revision
+            || request.label != self.label
+            || request.present != self.present
+        {
+            return Err(Error::new(
+                "AUTOMATION_LINK_CORRUPT",
+                "managed-label request differs from its exact acceptance and settings",
+            ));
+        }
+        Ok(())
+    }
+
+    fn cause(&self) -> GithubProjectionCause {
+        GithubProjectionCause {
+            kind: "task.acceptance".to_owned(),
+            observation_id: self.acceptance_observation_id,
+            operation_id: self.accepted_operation_id.clone(),
+            id: self.accepted_operation_id.clone(),
+            task_id: self.task_id.clone(),
+            task_revision: self.task_revision,
+            attempt_id: self.attempt_id.clone(),
+            submission_ref: self.submission_ref.clone(),
+            candidate_ref: self.candidate_ref.clone(),
+            source_id: self.source_id.clone(),
+            source_revision: self.source_revision.clone(),
+            label: self.label.clone(),
+            present: self.present,
+            gm_epoch: self.gm_epoch,
+            activation_cut: self.activation_cut,
+            historical_replay_authorized: self.historical_replay_authorized,
+        }
+    }
+
+    pub(crate) fn linkage_value(&self) -> Value {
+        json!({
+            "schema_version":1,
+            "technical_requester_id":self.technical_requester_id,
+            "effective_manager_id":self.effective_manager_id,
+            "automation_id":self.automation_id,
+            "automation_revision":self.automation_revision,
+            "project_id":self.project_id,
+            "action":GITHUB_PROJECTION_ACTION,
+            "cause":self.cause()
+        })
+    }
+
+    pub(crate) fn operation_link_value(&self, operation_id: &str, linked_at_ms: i64) -> Value {
+        json!({
+            "schema_version":1,
+            "operation_id":operation_id,
+            "technical_requester_id":self.technical_requester_id,
+            "effective_manager_id":self.effective_manager_id,
+            "automation_id":self.automation_id,
+            "automation_revision":self.automation_revision,
+            "project_id":self.project_id,
+            "action":GITHUB_PROJECTION_ACTION,
+            "cause":self.cause(),
+            "linked_at_ms":linked_at_ms
+        })
+    }
+
+    pub(crate) fn technical_requester_id(&self) -> &str {
+        &self.technical_requester_id
+    }
+
+    pub(crate) fn effective_manager_id(&self) -> &str {
+        &self.effective_manager_id
+    }
+
+    pub(crate) fn project_id(&self) -> &str {
+        &self.project_id
+    }
+
+    pub(crate) fn automation_id(&self) -> &str {
+        &self.automation_id
+    }
+
+    pub(crate) fn task_id(&self) -> &str {
+        &self.task_id
+    }
+
+    pub(crate) fn task_revision(&self) -> i64 {
+        self.task_revision
+    }
+
+    pub(crate) fn attempt_id(&self) -> &str {
+        &self.attempt_id
+    }
+
+    pub(crate) fn source_id(&self) -> &str {
+        &self.source_id
+    }
+
+    pub(crate) fn source_revision(&self) -> &str {
+        &self.source_revision
+    }
+
+    pub(crate) fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub(crate) fn present(&self) -> bool {
+        self.present
+    }
 }
 
 /// A direct Manager invocation of an entry's saved CheckRun action. Unlike a
@@ -294,6 +782,149 @@ fn manual_check_run_selected(entry: &config::AutomationEntry) -> bool {
     entry.steps.contains(&AutomationStep::CheckRun)
         && entry.cron.is_some()
         && entry.scope.work_pool_id.is_none()
+}
+
+fn validate_github_projection_entry_authority(
+    db: &Connection,
+    entry: &config::AutomationEntry,
+) -> Result<()> {
+    config::validate_entry(entry)?;
+    if !entry.github_projection_ready() {
+        return Err(Error::new(
+            "AUTOMATION_ACTION_UNAVAILABLE",
+            "entry does not currently admit the selected GitHub projection",
+        ));
+    }
+    require_registered_manager(db, &entry.owner_manager_id)?;
+    let current = config::load_entry(
+        db,
+        &entry.owner_manager_id,
+        &entry.project_id,
+        &entry.automation_id,
+    )?
+    .ok_or_else(|| {
+        Error::new(
+            "FORBIDDEN",
+            "GitHub projection automation entry was removed",
+        )
+    })?;
+    if current.value()? != entry.value()? {
+        return Err(Error::new(
+            "AUTOMATION_ACTION_CHANGED",
+            "current automation entry differs from the selected GitHub projection revision",
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_github_projection_entry_authority_for_identity(
+    db: &Connection,
+    owner: &str,
+    project: &str,
+    automation_id: &str,
+    revision: i64,
+    source_id: &str,
+    label: &str,
+    present: bool,
+) -> Result<()> {
+    require_registered_manager(db, owner)?;
+    let entry = config::load_entry(db, owner, project, automation_id)?.ok_or_else(|| {
+        Error::new(
+            "FORBIDDEN",
+            "GitHub projection automation entry was removed",
+        )
+    })?;
+    if !entry.github_projection_ready()
+        || entry.revision != revision
+        || entry.github_projection.as_ref().is_none_or(|settings| {
+            settings.source_id != source_id
+                || settings.label != label
+                || settings.present != present
+        })
+    {
+        return Err(Error::new(
+            "AUTOMATION_ACTION_CHANGED",
+            "current entry no longer admits this exact GitHub projection",
+        ));
+    }
+    Ok(())
+}
+
+fn current_gm_epoch_for(db: &Connection, manager_id: &str) -> Result<i64> {
+    let gm: Option<(String, i64)> = db
+        .query_row(
+            "SELECT json_extract(value_json,'$.client_id'),json_extract(value_json,'$.epoch') FROM meta WHERE key='gm'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let (gm_id, epoch) = gm.ok_or_else(|| {
+        Error::new(
+            "AUTOMATION_CURRENT_GM_REQUIRED",
+            "automatic GitHub projection requires a designated current GM",
+        )
+    })?;
+    if gm_id != manager_id || epoch <= 0 {
+        return Err(Error::new(
+            "AUTOMATION_CURRENT_GM_REQUIRED",
+            "automatic GitHub projection requires the entry owner to be current GM",
+        ));
+    }
+    Ok(epoch)
+}
+
+fn github_projection_source_revision(
+    db: &Connection,
+    source_id: &str,
+    task_id: &str,
+    project_id: &str,
+    task_revision: i64,
+    require_selected: bool,
+) -> Result<String> {
+    crate::github::protocol::validate_source_id(source_id)?;
+    let row: Option<(String, String, i64, i64, Option<bool>)> = db
+        .query_row(
+            "SELECT i.source_revision,i.mapping_status,i.issue_id,t.revision,m.selected FROM github_sources s JOIN github_issue_items i ON i.source_id=s.source_id JOIN tasks t ON t.task_id=i.task_id LEFT JOIN github_work_pool_members m ON m.source_id=i.source_id AND m.issue_id=i.issue_id AND m.task_id=t.task_id WHERE s.source_id=?1 AND i.task_id=?2 AND s.project_id=?3 AND t.project_id=?3",
+            params![source_id, task_id, project_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .optional()?;
+    let Some((source_revision, mapping_status, issue_id, current_task_revision, selected)) = row
+    else {
+        return Err(Error::new(
+            "GITHUB_EFFECT_TARGET_NOT_FOUND",
+            "accepted Task is not mapped in the configured registered GitHub source",
+        ));
+    };
+    if source_revision.is_empty()
+        || source_revision.len() > 512
+        || source_revision.chars().any(char::is_control)
+        || mapping_status != "mapped"
+        || issue_id <= 0
+        || current_task_revision != task_revision
+        || (require_selected && selected != Some(true))
+    {
+        return Err(Error::new(
+            "AUTOMATION_GITHUB_PROJECTION_SOURCE_STALE",
+            "registered Issue source does not select this exact current Task revision",
+        ));
+    }
+    Ok(source_revision)
+}
+
+fn entry_matches_github_projection_settings(
+    entry: &config::AutomationEntry,
+    context: &GithubProjectionContext,
+) -> bool {
+    entry.project_id == context.project_id
+        && entry.automation_id == context.automation_id
+        && entry.github_projection_ready()
+        && entry.github_projection.as_ref().is_some_and(|settings| {
+            settings.source_id == context.source_id
+                && settings.label == context.label
+                && settings.present == context.present
+        })
 }
 
 struct CurrentReviewSubject {
@@ -873,6 +1504,7 @@ pub(crate) enum AnyOnBehalfOperationLink {
     Review(OnBehalfOperationLink),
     Acceptance(OnBehalfOperationLink),
     Publication(OnBehalfOperationLink),
+    GithubProjection(OnBehalfOperationLink),
     CronCheckRun(OnBehalfOperationLink),
     GoalProgression(OnBehalfOperationLink),
     ScriptRun(OnBehalfOperationLink),
@@ -1040,6 +1672,7 @@ impl AnyOnBehalfOperationLink {
             Self::Review(link) => link.belongs_to(principal),
             Self::Acceptance(link) => link.belongs_to(principal),
             Self::Publication(link) => link.belongs_to(principal),
+            Self::GithubProjection(link) => link.belongs_to(principal),
             Self::CronCheckRun(link) => link.belongs_to(principal),
             Self::GoalProgression(link) => link.belongs_to(principal),
             Self::ScriptRun(link) => link.belongs_to(principal),
@@ -1081,8 +1714,10 @@ pub(crate) fn operation_link(
         ("task.request_changes", Some("review_result")) => "task.request_changes",
         ("task.accept", Some("review_result")) => "task.accept",
         ("forge.publish_ref", Some("task.acceptance")) => "forge.publish_ref",
+        (GITHUB_PROJECTION_ACTION, Some("task.acceptance")) => GITHUB_PROJECTION_ACTION,
         ("check.run", Some("cron_occurrence")) => "check.run",
         ("agent.goal", Some("goal_progression")) => "agent.goal",
+        ("agent.send", Some("goal_progression")) => "agent.send",
         ("script.run", Some("applied_submission")) => "script.run",
         ("script.run", Some("system_event")) => "script.run",
         ("message.send", Some("script_controller_effect")) => "message.send",
@@ -1125,9 +1760,13 @@ pub(crate) fn operation_link(
         validate_acceptance_link(db, &link)?;
     } else if link.action == "forge.publish_ref" {
         validate_publication_link(db, &link)?;
+    } else if link.action == GITHUB_PROJECTION_ACTION {
+        validate_github_projection_link(db, &link)?;
     } else if link.action == "check.run" {
         validate_cron_check_run_link(db, &link)?;
-    } else if link.action == "agent.goal" {
+    } else if matches!(link.action.as_str(), "agent.goal" | "agent.send")
+        && link.cause["kind"] == "goal_progression"
+    {
         crate::store::automation_goal_progression::validate_operation_link(db, &link)?;
     } else if link.action == "script.run" {
         validate_script_run_operation_link(db, &link)?;
@@ -2974,6 +3613,113 @@ struct PublicationAttemptSubjectRow {
     candidate_ref: Option<String>,
 }
 
+fn validate_github_projection_link(db: &Connection, link: &OnBehalfOperationLink) -> Result<()> {
+    let corrupt = || {
+        Error::new(
+            "AUTOMATION_LINK_CORRUPT",
+            "GitHub projection link does not match its exact accepted candidate and managed-label Operation",
+        )
+    };
+    let cause: GithubProjectionCause =
+        serde_json::from_value(link.cause.clone()).map_err(|_| corrupt())?;
+    if link.action != GITHUB_PROJECTION_ACTION
+        || link.technical_requester_id != AUTOMATION_TECHNICAL_REQUESTER_ID
+        || cause.kind != "task.acceptance"
+        || cause.id != cause.operation_id
+        || cause.observation_id <= 0
+        || cause.task_revision <= 0
+        || cause.gm_epoch <= 0
+        || cause.activation_cut < 0
+        || cause.historical_replay_authorized != (cause.observation_id <= cause.activation_cut)
+        || cause.source_revision.trim().is_empty()
+        || cause.source_revision.len() > 512
+        || cause.source_revision.chars().any(char::is_control)
+    {
+        return Err(corrupt());
+    }
+    crate::github::protocol::validate_source_id(&cause.source_id).map_err(|_| corrupt())?;
+    crate::github::protocol::validate_managed_label(&cause.label).map_err(|_| corrupt())?;
+    let candidate = crate::automation::publication::accepted_candidate_from_observation(
+        db,
+        cause.observation_id,
+        &cause.operation_id,
+    )
+    .map_err(|_| corrupt())?;
+    let operation: Option<(String, String, Option<String>, Option<String>, String, String, Option<String>)> = db
+        .query_row(
+            "SELECT caller_id,method,task_id,attempt_id,original_request_json,effective_request_json,result_json FROM operations WHERE operation_id=?1",
+            [&link.operation_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+        )
+        .optional()?;
+    let Some((caller_id, method, task_id, attempt_id, original_json, effective_json, result_json)) =
+        operation
+    else {
+        return Err(corrupt());
+    };
+    let request_value: Value = serde_json::from_str(&original_json).map_err(|_| corrupt())?;
+    let request = ManagedLabelRequest::parse(&request_value).map_err(|_| corrupt())?;
+    GithubProjectionContext::from_link(link, cause.clone())
+        .require_request_matches(&request)
+        .map_err(|_| corrupt())?;
+    let effective: Value = serde_json::from_str(&effective_json).map_err(|_| corrupt())?;
+    model::fields(&effective, &["automation_on_behalf", "receipt"]).map_err(|_| corrupt())?;
+    let expected_linkage = json!({
+        "schema_version":link.schema_version,
+        "technical_requester_id":link.technical_requester_id,
+        "effective_manager_id":link.effective_manager_id,
+        "automation_id":link.automation_id,
+        "automation_revision":link.automation_revision,
+        "project_id":link.project_id,
+        "action":link.action,
+        "cause":link.cause
+    });
+    let receipt = &effective["receipt"];
+    model::fields(receipt, &["ok", "value"]).map_err(|_| corrupt())?;
+    if caller_id != AUTOMATION_TECHNICAL_REQUESTER_ID
+        || method != GITHUB_PROJECTION_ACTION
+        || task_id.as_deref() != Some(cause.task_id.as_str())
+        || attempt_id.as_deref() != Some(cause.attempt_id.as_str())
+        || candidate.accepted_operation_id != cause.operation_id
+        || candidate.project_id != link.project_id
+        || candidate.task_id != cause.task_id
+        || candidate.task_revision != cause.task_revision
+        || candidate.attempt_id != cause.attempt_id
+        || candidate.submission_ref != cause.submission_ref
+        || candidate.candidate_ref != cause.candidate_ref
+        || request.source_id != cause.source_id
+        || request.task_id != cause.task_id
+        || request.expected_task_revision != cause.task_revision
+        || request.label != cause.label
+        || request.present != cause.present
+        || effective["automation_on_behalf"] != expected_linkage
+        || receipt["ok"] != true
+        || receipt["value"]["operation_id"] != link.operation_id
+        || receipt["value"]["source_id"] != cause.source_id
+        || receipt["value"]["source_revision"] != cause.source_revision
+        || receipt["value"]["task_id"] != cause.task_id
+        || receipt["value"]["task_revision"] != cause.task_revision
+        || receipt["value"]["label"] != cause.label
+        || receipt["value"]["present"] != cause.present
+        || receipt["value"]["desired_present"] != cause.present
+        || receipt["value"]["issue_id"]
+            .as_i64()
+            .is_none_or(|value| value <= 0)
+        || receipt["value"]["issue_number"]
+            .as_i64()
+            .is_none_or(|value| value <= 0)
+    {
+        return Err(corrupt());
+    }
+    if let Some(result_raw) = result_json {
+        let result: Value = serde_json::from_str(&result_raw).map_err(|_| corrupt())?;
+        if result["operation_id"] != link.operation_id {
+            return Err(corrupt());
+        }
+    }
+    Ok(())
+}
+
 fn validate_publication_link(db: &Connection, link: &OnBehalfOperationLink) -> Result<()> {
     let corrupt = || {
         Error::new(
@@ -3441,6 +4187,39 @@ pub(crate) fn save_operation_link(
     Ok(link)
 }
 
+pub(crate) fn save_github_projection_operation_link(
+    db: &Connection,
+    operation_id: &str,
+    context: &GithubProjectionContext,
+    now_ms: i64,
+) -> Result<OnBehalfOperationLink> {
+    let value = context.operation_link_value(operation_id, now_ms);
+    let link: OnBehalfOperationLink = serde_json::from_value(value.clone()).map_err(|_| {
+        Error::new(
+            "AUTOMATION_LINK_CORRUPT",
+            "GitHub projection Operation link could not be serialized",
+        )
+    })?;
+    let operation_key = config::operation_link_key(operation_id)?;
+    let entry_key = config::entry_operation_key(
+        context.effective_manager_id(),
+        context.project_id(),
+        &context.automation_id,
+        operation_id,
+    )?;
+    if config::read_record(db, &operation_key, "GitHub projection Operation link")?.is_some()
+        || config::read_record(db, &entry_key, "GitHub projection entry Operation link")?.is_some()
+    {
+        return Err(Error::new(
+            "AUTOMATION_LINK_CORRUPT",
+            "GitHub projection Operation link cannot replace retained history",
+        ));
+    }
+    config::write_record(db, &operation_key, &value)?;
+    config::write_record(db, &entry_key, &value)?;
+    Ok(link)
+}
+
 pub(crate) fn save_cron_operation_link(
     db: &Connection,
     operation_id: &str,
@@ -3473,15 +4252,17 @@ pub(crate) fn save_cron_operation_link(
 }
 
 /// Retain the exact terminal-event/Goal attribution for one normally admitted
-/// `agent.goal continue` Operation.
+/// controller continuation Operation.
 pub(crate) fn save_goal_progression_operation_link(
     db: &Connection,
     operation_id: &str,
     linkage: &Value,
     now_ms: i64,
 ) -> Result<OnBehalfOperationLink> {
-    if linkage["action"] != "agent.goal"
-        || linkage["semantic_cause_kind"] != "goal_progression"
+    if !matches!(
+        linkage["action"].as_str(),
+        Some("agent.goal" | "agent.send")
+    ) || linkage["semantic_cause_kind"] != "goal_progression"
         || linkage["cause"]["kind"] != "goal_progression"
         || linkage["cause"]["id"].as_str().is_none_or(str::is_empty)
     {
@@ -3498,7 +4279,7 @@ pub(crate) fn save_goal_progression_operation_link(
         automation_id: model::text(linkage, "automation_id")?.to_owned(),
         automation_revision: model::positive(linkage, "automation_revision")?,
         project_id: model::text(linkage, "project_id")?.to_owned(),
-        action: "agent.goal".to_owned(),
+        action: model::text(linkage, "action")?.to_owned(),
         cause: linkage["cause"].clone(),
         linked_at_ms: now_ms,
     };
@@ -3592,6 +4373,15 @@ pub(crate) fn on_behalf_visible_to(
                 Error::new(
                     "AUTOMATION_LINK_CORRUPT",
                     "publication link has no exact Task identity",
+                )
+            })?;
+            current_manager_has_task_scope(db, principal, task_id, &link.project_id)
+        }
+        AnyOnBehalfOperationLink::GithubProjection(link) => {
+            let task_id = link.cause["task_id"].as_str().ok_or_else(|| {
+                Error::new(
+                    "AUTOMATION_LINK_CORRUPT",
+                    "GitHub projection link has no exact Task identity",
                 )
             })?;
             current_manager_has_task_scope(db, principal, task_id, &link.project_id)
@@ -3735,6 +4525,15 @@ fn current_gm_on_behalf_scope_visible_to(
             })?;
             current_gm_has_task_project(db, task_id, &link.project_id)
         }
+        AnyOnBehalfOperationLink::GithubProjection(link) => {
+            let task_id = link.cause["task_id"].as_str().ok_or_else(|| {
+                Error::new(
+                    "AUTOMATION_LINK_CORRUPT",
+                    "GitHub projection link has no exact Task identity",
+                )
+            })?;
+            current_gm_has_task_project(db, task_id, &link.project_id)
+        }
         AnyOnBehalfOperationLink::WorkDispatch(link) => {
             current_gm_has_task_project(db, &link.task_id, &link.project_id)
         }
@@ -3818,7 +4617,13 @@ pub(crate) fn any_on_behalf_operation_link(
         (Some(link), None, None) if link.action == "forge.publish_ref" => {
             Ok(Some(AnyOnBehalfOperationLink::Publication(link)))
         }
-        (Some(link), None, None) if link.action == "agent.goal" => {
+        (Some(link), None, None) if link.action == GITHUB_PROJECTION_ACTION => {
+            Ok(Some(AnyOnBehalfOperationLink::GithubProjection(link)))
+        }
+        (Some(link), None, None)
+            if matches!(link.action.as_str(), "agent.goal" | "agent.send")
+                && link.cause["kind"] == "goal_progression" =>
+        {
             Ok(Some(AnyOnBehalfOperationLink::GoalProgression(link)))
         }
         (Some(link), None, None) if link.action == "script.run" && is_script_run => {
@@ -4486,7 +5291,8 @@ fn current_transfer_continuation_at_phase(
     ) = match &link {
         AnyOnBehalfOperationLink::Review(link)
         | AnyOnBehalfOperationLink::Acceptance(link)
-        | AnyOnBehalfOperationLink::Publication(link) => (
+        | AnyOnBehalfOperationLink::Publication(link)
+        | AnyOnBehalfOperationLink::GithubProjection(link) => (
             link.operation_id.as_str(),
             link.effective_manager_id.as_str(),
             link.automation_revision,
@@ -4696,7 +5502,7 @@ fn current_transfer_continuation_at_phase(
             current_entry.enabled && current_entry.scope.work_pool_id.is_none()
         }
         AutomationStep::CheckRun => current_entry.check_run_ready(),
-        AutomationStep::GithubProjection => false,
+        AutomationStep::GithubProjection => current_entry.github_projection_ready(),
         AutomationStep::GoalProgression => false,
         AutomationStep::ScriptRun => false,
     };
@@ -4740,6 +5546,7 @@ fn transfer_action_matches_step(action: &str, step: AutomationStep) -> bool {
             | ("task.accept", AutomationStep::Acceptance)
             | ("check.run", AutomationStep::CheckRun)
             | ("forge.publish_ref", AutomationStep::Publication)
+            | (GITHUB_PROJECTION_ACTION, AutomationStep::GithubProjection)
     )
 }
 
@@ -5053,7 +5860,11 @@ pub(crate) fn entry_operation_links(
             }
         } else if matches!(
             link.action.as_str(),
-            "task.accept" | "forge.publish_ref" | "check.run" | "message.send"
+            "task.accept"
+                | "forge.publish_ref"
+                | "github.effect.managed_label"
+                | "check.run"
+                | "message.send"
         ) {
             let task_id = if link.action == "task.accept" {
                 link.cause["identity"]["task_id"].as_str()

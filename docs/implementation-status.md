@@ -2,6 +2,40 @@
 
 ## Current state
 
+### Current queue source integration — 2026-10-06
+
+The current queue is being closed and saved before further verification. The
+shared immutable mailbox implementation, Codex Goal terminal-evidence and
+continuation-admission source, and configured GitHub managed-Issue-label
+projection are integrated. Thread, immutable peer-contract, code-scope,
+integration-agreement and public frontend packets remain in the assigned source
+queue. No new Git inspection module has been started for this closeout.
+
+Mailbox admission keeps one immutable body and one explicit recipient through
+the existing Operation/Observation path. Legacy addressed messages and typed
+Thread messages share admission and exact delivery read/cancellation logic;
+feedback and check Operations are not treated as deliveries.
+
+Codex Goal continuation now carries a distinct Store-authenticated admission
+context and adapter receipt for the new `agent.send` Operation, exact
+Task/Attempt, prior terminal EventRef and observed native input. It does not reuse
+`task.dispatch` admission. Saved outcomes replay their retained bytes. The common
+terminal-evidence envelope preserves the existing strict OpenCode execution
+proof; supported producer paths remain limited to Codex and OpenCode. Command
+and Antigravity Goal progression remain unavailable.
+
+The first automatic GitHub projection is one explicitly configured managed
+Issue label derived from an exact retained accepted-candidate fact. It uses
+current Manager/GM and source-map authority, the existing durable label slot,
+transactional activation/cursors and a post-commit drain of queued Operations.
+An uncertain remote write remains readback-only. Checks, PR summaries and
+closure are not implemented by this action.
+
+These changes have only source inspection, owned-file formatter parsing and
+whitespace verification. They have not been compiled, tested or exercised with
+a native provider/model. Product status remains `PARTIAL_PROGRESS`; historical
+qualification below applies only to its recorded commits.
+
 ### Source delivery and remaining qualification — 2026-10-06
 
 The product source integration, physical Kernel relocation, five Rust adapter
