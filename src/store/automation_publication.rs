@@ -212,6 +212,79 @@ pub(crate) fn reconcile(
     }))
 }
 
+/// Read-only bounded preflight for the Forge executable preparation. It uses
+/// the same selected publication-entry page and cursor/state rules as the
+/// mutating reconciliation pass, so check/review-only automation passes do not
+/// hash executable images when no publication reservation is due.
+pub(crate) fn forge_preparation_demand(
+    db: &Connection,
+    entry_budget: usize,
+    fact_budget: usize,
+    now_ms: i64,
+) -> Result<bool> {
+    if now_ms < 0 {
+        return Err(Error::invalid("publication preparation time is invalid"));
+    }
+    let entry_budget = entry_budget.min(MAX_ENTRIES_PER_PASS);
+    let fact_budget = fact_budget.min(MAX_FACTS_PER_ENTRY);
+    if entry_budget == 0 || fact_budget == 0 {
+        return Ok(false);
+    }
+    let (entries, _) = enabled_entry_page(db, entry_budget)?;
+    let high_water = acceptance_high_water(db)?;
+    entries.iter().try_fold(false, |demand, entry| {
+        if demand {
+            return Ok(true);
+        }
+        publication_entry_demand(db, entry, fact_budget, now_ms, high_water)
+    })
+}
+
+fn publication_entry_demand(
+    db: &Connection,
+    entry: &AutomationEntry,
+    budget: usize,
+    now_ms: i64,
+    high_water: i64,
+) -> Result<bool> {
+    if !entry.publication_ready() || budget == 0 {
+        return Ok(false);
+    }
+    let Some(state) = load_state(db, entry)? else {
+        return Ok(false);
+    };
+    if state.configured_revision != entry.revision {
+        return Err(Error::new(
+            "AUTOMATION_PUBLICATION_CURSOR_MISMATCH",
+            "publication activation cursor does not match the current automation revision",
+        ));
+    }
+    if state
+        .pending
+        .iter()
+        .any(|pending| pending.next_retry_at_ms <= now_ms)
+    {
+        return Ok(true);
+    }
+    if state.pending.len() >= MAX_PENDING {
+        return Ok(false);
+    }
+    let target = state
+        .catch_up_until
+        .map_or(high_water, |cut| cut.min(high_water));
+    if state.cursor >= target {
+        return Ok(false);
+    }
+    db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM observations \
+         WHERE source_stream_id=?1 AND kind='task.acceptance' \
+           AND observation_id>?2 AND observation_id<=?3)",
+        params![ACCEPTANCE_STREAM, state.cursor, target],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
 /// Bounded manager-facing state projection for automation explain/readback.
 pub(crate) fn state(db: &Connection, entry: &AutomationEntry) -> Result<Value> {
     match load_state(db, entry)? {
@@ -864,7 +937,9 @@ fn skip_context_error(error: &Error) -> bool {
 fn pending_reservation_error(error: &Error) -> bool {
     matches!(
         error.code.as_str(),
-        "FORGE_PROCESS_TREE_UNCONFIRMED" | "FORGE_PUBLICATION_SLOT_BUSY"
+        "FORGE_PROCESS_TREE_UNCONFIRMED"
+            | "FORGE_PUBLICATION_SLOT_BUSY"
+            | "FORGE_EXECUTION_PREPARATION_MISSING"
     )
 }
 

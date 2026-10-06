@@ -12,6 +12,7 @@ use crate::{
     platform,
 };
 use rusqlite::{Connection, Transaction, TransactionBehavior, params};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     fs::{self, File},
@@ -40,7 +41,8 @@ const MODULE_OPERATIONS: [&str; 11] = [
 
 /// A host-only proof that the exact retained binding credential exists and is
 /// registered. This DTO deliberately has no token or token-hash field.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ProvisionedModuleCredential {
     pub operation_id: String,
     pub binding_id: String,

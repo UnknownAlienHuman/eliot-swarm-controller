@@ -390,8 +390,8 @@ impl StoreOwner {
     }
 
     /// Return this host's credential for the trusted local module supervisor.
-    /// Its only Store method is `module.descriptor.register`; do not pass it to
-    /// Managers or module adapters.
+    /// Its only Store access is the bounded module-supervisor control surface;
+    /// do not pass this credential to Managers or module adapters.
     pub fn module_supervisor_credential(&self) -> Credential {
         self.module_supervisor_credential.clone()
     }
@@ -477,6 +477,17 @@ fn kernel_admission_fault_name(fault: swarm_kernel::KernelAdmissionFault) -> &'s
             "durable_journal_unavailable"
         }
         swarm_kernel::KernelAdmissionFault::ShuttingDown => "shutting_down",
+    }
+}
+
+fn supervisor_kernel_fault_name(fault: swarm_kernel::KernelAdmissionFault) -> &'static str {
+    match fault {
+        swarm_kernel::KernelAdmissionFault::DurableJournalUnavailable => {
+            "durable_journal_unavailable"
+        }
+        swarm_kernel::KernelAdmissionFault::InitializationFailed
+        | swarm_kernel::KernelAdmissionFault::StoreUnavailable
+        | swarm_kernel::KernelAdmissionFault::ShuttingDown => "store_unavailable",
     }
 }
 
@@ -1162,7 +1173,26 @@ impl Store {
 
     pub(crate) async fn reconcile_automations_once(&self) -> Result<Value> {
         let config = self.config.clone();
-        let forge_preparation = self.prepare_forge_execution(config.clone()).await;
+        let forge_preparation = if config.forge.enabled {
+            let preflight_now = model::now_ms()?;
+            let demand = self
+                .run(move |db| {
+                    automation_publication::forge_preparation_demand(
+                        db,
+                        16,
+                        64,
+                        preflight_now,
+                    )
+                })
+                .await?;
+            if demand {
+                self.prepare_forge_execution(config.clone()).await
+            } else {
+                forge::ForgeExecutionPreparation::Skipped
+            }
+        } else {
+            forge::ForgeExecutionPreparation::Skipped
+        };
         let mut result = self.run(move |db| {
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let now = model::now_ms()?;
@@ -1370,13 +1400,7 @@ impl Store {
             return automation_scheduler::call(self, principal, &method, params).await;
         }
         if principal.role == Role::ModuleSupervisor {
-            if method != "module.descriptor.register" {
-                return Err(Error::new(
-                    "FORBIDDEN",
-                    "module supervisor may register trusted descriptors only",
-                ));
-            }
-            return self.register_module_descriptor(principal, params).await;
+            return self.module_supervisor_call(principal, method, params).await;
         }
         if principal.role == Role::HookSource
             && !matches!(method.as_str(), "hook.emit" | "hook.source.get")
@@ -1672,6 +1696,156 @@ impl Store {
                 .send_modify(|revision| *revision = revision.wrapping_add(1));
         }
         Ok(result)
+    }
+
+    /// Authenticated, bounded control surface consumed by the independent
+    /// module supervisor. The supervisor never receives a Store handle or a
+    /// database connection; every operation below remains a kernel-owned
+    /// transaction or an admission snapshot.
+    async fn module_supervisor_call(
+        &self,
+        principal: Principal,
+        method: String,
+        params: Value,
+    ) -> Result<Value> {
+        let authorization = principal.clone();
+        self.run(move |db| {
+            let current = current_principal(db, authorization)?;
+            module_handshake::require_supervisor_scope(db, &current)
+        })
+        .await?;
+
+        match method.as_str() {
+            "module.descriptor.register" => {
+                self.register_module_descriptor(principal, params).await
+            }
+            "module.supervisor.admission" => {
+                model::fields(&params, &[])?;
+                let value = match self.kernel.snapshot().admission {
+                    swarm_kernel::KernelAdmissionState::Open => {
+                        json!({"state":"open"})
+                    }
+                    swarm_kernel::KernelAdmissionState::Starting => {
+                        json!({"state":"closed","fault":"store_unavailable"})
+                    }
+                    swarm_kernel::KernelAdmissionState::Closed { fault } => json!({
+                        "state":"closed",
+                        "fault": supervisor_kernel_fault_name(fault),
+                    }),
+                };
+                Ok(value)
+            }
+            "module.supervisor.demand.page" => {
+                model::fields(&params, &["cursor"])?;
+                let cursor = match params.get("cursor") {
+                    None | Some(Value::Null) => None,
+                    Some(value) => Some(
+                        serde_json::from_value(value.clone()).map_err(|_| {
+                            Error::invalid("cursor does not match the bounded module page shape")
+                        })?,
+                    ),
+                };
+                serde_json::to_value(self.module_demand_snapshot(cursor).await?)
+                    .map_err(Into::into)
+            }
+            "module.supervisor.scope.readback" => {
+                model::fields(&params, &["module_id", "binding_id", "generation"])?;
+                let module_id = model::text(&params, "module_id")?.to_owned();
+                let binding_id = model::text(&params, "binding_id")?.to_owned();
+                let generation = model::positive(&params, "generation")?;
+                serde_json::to_value(
+                    self.module_scope_readback(module_id, binding_id, generation)
+                        .await?,
+                )
+                .map_err(Into::into)
+            }
+            "module.supervisor.credential.ensure"
+            | "module.supervisor.credential.ready" => {
+                model::fields(&params, &["operation_id", "binding_id", "generation"])?;
+                let operation_id = model::text(&params, "operation_id")?.to_owned();
+                let binding_id = model::text(&params, "binding_id")?.to_owned();
+                let generation = model::positive(&params, "generation")?;
+                let credential = if method == "module.supervisor.credential.ensure" {
+                    self.ensure_module_binding_credential(&operation_id, &binding_id, generation)
+                        .await?
+                } else {
+                    self.check_module_binding_credential_ready(
+                        &operation_id,
+                        &binding_id,
+                        generation,
+                    )
+                    .await?
+                };
+                serde_json::to_value(credential).map_err(Into::into)
+            }
+            "module.supervisor.recovery.reconcile" => {
+                model::fields(&params, &[])?;
+                self.reconcile_module_recovery_journal_page().await?;
+                Ok(json!({"reconciled":true}))
+            }
+            "module.supervisor.observation.record" => {
+                model::fields(&params, &["observation"])?;
+                let observation = params
+                    .get("observation")
+                    .cloned()
+                    .ok_or_else(|| Error::invalid("observation is required"))?;
+                self.record_module_supervisor_observation(observation).await?;
+                Ok(json!({"recorded":true}))
+            }
+            "module.supervisor.health.record" => {
+                model::fields(
+                    &params,
+                    &[
+                        "name",
+                        "state",
+                        "consecutive_failures",
+                        "error_code",
+                        "retry_in_ms",
+                    ],
+                )?;
+                if model::text(&params, "name")? != "module-supervisor" {
+                    return Err(Error::invalid("unsupported module supervisor health name"));
+                }
+                let state = match model::text(&params, "state")? {
+                    "dormant" => "dormant",
+                    "running" => "running",
+                    "retry_wait" => "retry_wait",
+                    "isolated" => "isolated",
+                    _ => return Err(Error::invalid("invalid module supervisor health state")),
+                };
+                let consecutive_failures = params
+                    .get("consecutive_failures")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok())
+                    .ok_or_else(|| Error::invalid("consecutive_failures must be a u32"))?;
+                let error_code = match params.get("error_code") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(value)) => Some(value.clone()),
+                    Some(_) => return Err(Error::invalid("error_code must be a string or null")),
+                };
+                let retry_in_ms = match params.get("retry_in_ms") {
+                    None | Some(Value::Null) => None,
+                    Some(value) => Some(
+                        value
+                            .as_u64()
+                            .ok_or_else(|| Error::invalid("retry_in_ms must be a u64 or null"))?,
+                    ),
+                };
+                self.record_legacy_worker_status(
+                    "module-supervisor",
+                    state,
+                    consecutive_failures,
+                    error_code,
+                    retry_in_ms,
+                )
+                .await?;
+                Ok(json!({"recorded":true}))
+            }
+            _ => Err(Error::new(
+                "FORBIDDEN",
+                "method is outside the module supervisor control surface",
+            )),
+        }
     }
 
     /// Hook issuance/ingress has a fixed repository scope. Setup acknowledges
@@ -2360,7 +2534,17 @@ fn initialize_database(
         "disabled":false,
         "internal_only":false,
         "module_scope":"descriptor_catalog",
-        "capabilities":["module.descriptor.register"],
+        "capabilities":[
+            "module.descriptor.register",
+            "module.supervisor.admission",
+            "module.supervisor.demand.page",
+            "module.supervisor.scope.readback",
+            "module.supervisor.credential.ensure",
+            "module.supervisor.credential.ready",
+            "module.supervisor.recovery.reconcile",
+            "module.supervisor.observation.record",
+            "module.supervisor.health.record"
+        ],
     });
     match meta(tx, &supervisor_key)? {
         None => set_meta(tx, &supervisor_key, &supervisor_record)?,

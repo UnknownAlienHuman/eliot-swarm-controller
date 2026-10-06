@@ -5,11 +5,16 @@
 //! [`ModuleLink`] for the current `module.hello`, `module.next`, and
 //! `module.outcome` methods.
 
+pub mod control;
 mod descriptor;
 mod module_link;
 pub mod observation;
 mod supervisor;
 
+pub use control::{
+    ModuleBindingCredential, ModuleDemandBlock, ModuleDemandCursor, ModuleDemandPage,
+    ModuleDemandRecord, ModuleScopeReadback, StoredOperation, SupervisorControlClient,
+};
 pub use descriptor::{
     ActivationPolicy, ArtifactIdentity, ArtifactSelector, BindingLaunchConfig,
     BindingMapPublication, CapabilityId, DescriptorCatalog, EnvironmentVariable, LaunchSpec,

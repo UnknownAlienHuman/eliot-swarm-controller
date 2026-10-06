@@ -183,11 +183,14 @@ impl ForgeExecutionPreparation {
         }
     }
 
-    fn pin(&self) -> Result<Option<&ForgeExecutionPin>> {
+    fn pin(&self) -> Result<&ForgeExecutionPin> {
         match self {
-            Self::Ready(pin) => Ok(Some(pin)),
+            Self::Ready(pin) => Ok(pin),
             Self::Failed(error) => Err(error.clone()),
-            Self::Skipped => Ok(None),
+            Self::Skipped => Err(Error::new(
+                "FORGE_EXECUTION_PREPARATION_MISSING",
+                "Forge publication demand appeared after executable preparation preflight",
+            )),
         }
     }
 }
@@ -700,14 +703,14 @@ fn persist_intent(
     id: &str,
     input: &PublishRefRequest,
     intent: &PublicationIntent,
-    execution: Option<&ForgeExecutionPin>,
+    execution: &ForgeExecutionPin,
     attribution: Option<&Value>,
 ) -> Result<()> {
     let task_id = model::text(&tasks::get_attempt(tx, &input.attempt_id)?, "task_id")?.to_owned();
-    let mut effective = json!({"publication_intent":intent});
-    if let Some(execution) = execution {
-        effective["execution_pin"] = serde_json::to_value(execution)?;
-    }
+    let mut effective = json!({
+        "publication_intent":intent,
+        "execution_pin":serde_json::to_value(execution)?
+    });
     if let Some(attribution) = attribution {
         if attribution.is_null() {
             return Err(Error::new(

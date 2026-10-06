@@ -31,6 +31,19 @@ const MAX_ROUTE_SELECTIONS_PER_OWNER: usize = 256;
 const MAX_PAGE_ITEMS: usize = 8;
 const MAX_PAGE_BYTES: usize = 512 * 1024;
 
+const LEGACY_SUPERVISOR_CAPABILITIES: &[&str] = &["module.descriptor.register"];
+const SUPERVISOR_CAPABILITIES: &[&str] = &[
+    "module.descriptor.register",
+    "module.supervisor.admission",
+    "module.supervisor.demand.page",
+    "module.supervisor.scope.readback",
+    "module.supervisor.credential.ensure",
+    "module.supervisor.credential.ready",
+    "module.supervisor.recovery.reconcile",
+    "module.supervisor.observation.record",
+    "module.supervisor.health.record",
+];
+
 /// The currently implemented generic module contract. A descriptor may
 /// advertise a wider compatible range, but this Store negotiates only 1.0.
 /// Bump this constant only with a host implementation of the new contract.
@@ -114,7 +127,8 @@ pub(super) fn supervisor_scope_matches(client_id: &str, registration: &Value) ->
         && registration["internal_only"] == false
         && registration["disabled"] == false
         && registration["module_scope"] == "descriptor_catalog"
-        && registration["capabilities"] == json!(["module.descriptor.register"])
+        && (registration["capabilities"] == json!(LEGACY_SUPERVISOR_CAPABILITIES)
+            || registration["capabilities"] == json!(SUPERVISOR_CAPABILITIES))
         && registration["token_hash"].as_str().is_some_and(|hash| {
             hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
         })
@@ -123,12 +137,17 @@ pub(super) fn supervisor_scope_matches(client_id: &str, registration: &Value) ->
             .is_some_and(|fields| fields.len() == 6)
 }
 
+fn runtime_supervisor_scope_matches(client_id: &str, registration: &Value) -> bool {
+    supervisor_scope_matches(client_id, registration)
+        && registration["capabilities"] == json!(SUPERVISOR_CAPABILITIES)
+}
+
 pub(super) fn require_supervisor_scope(db: &Connection, principal: &Principal) -> Result<()> {
     let registration = super::meta(db, &format!("client:{}", principal.client_id))?
         .ok_or_else(|| Error::new("UNAUTHORIZED", "supervisor credential is not registered"))?;
     if principal.role != Role::ModuleSupervisor
         || registration["disabled"] == true
-        || !supervisor_scope_matches(&principal.client_id, &registration)
+        || !runtime_supervisor_scope_matches(&principal.client_id, &registration)
     {
         return Err(Error::new(
             "FORBIDDEN",

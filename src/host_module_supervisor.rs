@@ -6,10 +6,7 @@
 use crate::{
     error::{Error, Result},
     model,
-    store::{
-        Store,
-        module_demand::{ModuleDemand, ModuleDemandBlock, ModuleDemandCursor, ModuleScopeReadback},
-    },
+    store::Store,
 };
 use futures_util::FutureExt;
 use serde_json::Value;
@@ -28,10 +25,12 @@ use swarm_contracts::{
 };
 use swarm_supervisor::{
     AdmissionState, BindingLaunchConfig, BindingMapPublication, DemandCause, KernelFault,
-    LaunchValue, ModuleDemandRequest, ModuleDescriptor, ModuleEffectCertainty, ModuleFailureStage,
-    ModuleOwnerExecutable, ModuleSupervisorObservation, ModuleSupervisorPhase, OperationReadback,
-    OperationSnapshot, ProtectedResolverContext, ResolverMapDirectory, ServiceScope,
-    SupervisorRegistry, SupervisorRegistryConfig, load_installed_descriptor, module_contract_claim,
+    LaunchValue, ModuleBindingCredential, ModuleDemandBlock, ModuleDemandCursor,
+    ModuleDemandRecord, ModuleDemandRequest, ModuleDescriptor, ModuleEffectCertainty,
+    ModuleFailureStage, ModuleOwnerExecutable, ModuleSupervisorObservation, ModuleSupervisorPhase,
+    OperationReadback, OperationSnapshot, ProtectedResolverContext, ResolverMapDirectory,
+    ServiceScope, SupervisorControlClient, SupervisorRegistry, SupervisorRegistryConfig,
+    load_installed_descriptor, module_contract_claim,
 };
 use tokio::{sync::watch, task::JoinHandle, time};
 
@@ -45,6 +44,9 @@ const MAX_ADDITIONAL_PROTECTED_FILES: usize = 128;
 const OPENCODE_NATIVE_OPTIONS_SCHEMA_ID: &str = "opencode-v2-native-options";
 const OPENCODE_NATIVE_OPTIONS_SCHEMA_SHA256: &str =
     "d597be6bae80dc82535b658b5daaf3037a09976e5704d799a6715a673a62f662";
+
+type ModuleDemand = ModuleDemandRecord;
+type ModuleScopeReadback = swarm_supervisor::ModuleScopeReadback;
 
 #[derive(Clone)]
 pub(crate) struct ModuleSupervisorHostConfig {
@@ -355,7 +357,7 @@ struct RecoveryEventQueue<'a> {
 }
 
 pub(crate) struct ModuleSupervisorHost {
-    store: Store,
+    control: SupervisorControlClient,
     registry: Arc<SupervisorRegistry>,
     descriptors: Vec<ModuleDescriptor>,
     config: ModuleSupervisorHostConfig,
@@ -450,8 +452,11 @@ impl OptionalModuleSupervisor {
 }
 
 impl ModuleSupervisorHost {
-    pub(crate) async fn start(
-        store: Store,
+    /// Build the lifecycle host over its authenticated IPC control plane. No
+    /// Store handle crosses this boundary; the kernel host remains the single
+    /// writer and transaction authority behind `SupervisorControlClient`.
+    pub(crate) async fn start_with_control(
+        control: SupervisorControlClient,
         supervisor_credential: Credential,
         admission: watch::Sender<AdmissionState>,
         root: &Path,
@@ -504,7 +509,7 @@ impl ModuleSupervisorHost {
             }
         }
         Ok(Self {
-            store,
+            control,
             registry,
             descriptors,
             config,
@@ -513,10 +518,25 @@ impl ModuleSupervisorHost {
         })
     }
 
+    pub(crate) async fn start(
+        _store: Store,
+        supervisor_credential: Credential,
+        admission: watch::Sender<AdmissionState>,
+        root: &Path,
+        ipc: swarm_client::IpcConfig,
+        config: ModuleSupervisorHostConfig,
+    ) -> Result<Self> {
+        let control = SupervisorControlClient::new(
+            root.to_path_buf(),
+            supervisor_credential.clone(),
+            ipc.clone(),
+        )?;
+        Self::start_with_control(control, supervisor_credential, admission, root, ipc, config).await
+    }
+
     /// Run the optional actor. Store/journal errors close only new module
     /// starts; existing leases and native-owner obligations are retained.
     pub(crate) async fn run(&self, mut stopping: watch::Receiver<bool>) -> Result<()> {
-        let mut changed = self.store.subscribe_module_demand_changes();
         let mut scan = time::interval(MODULE_SCAN_FALLBACK);
         scan.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
         let mut held = HashMap::<DemandKey, HeldDemand>::new();
@@ -531,10 +551,25 @@ impl ModuleSupervisorHost {
             if *stopping.borrow() {
                 return Ok(());
             }
-            if matches!(
-                self.registry.admission_state(),
-                AdmissionState::Closed { .. }
-            ) {
+            let kernel_admission = self.control.admission().await;
+            let kernel_admission_open = matches!(&kernel_admission, Ok(AdmissionState::Open));
+            match kernel_admission {
+                Ok(AdmissionState::Open) => {}
+                Ok(AdmissionState::Closed { fault }) => {
+                    self.registry.close_durable_admission(fault);
+                }
+                Err(error) => {
+                    self.registry
+                        .close_durable_admission(KernelFault::StoreUnavailable);
+                    eprintln!("module supervisor admission readback: {}", error.code);
+                }
+            }
+            if kernel_admission_open
+                && matches!(
+                    self.registry.admission_state(),
+                    AdmissionState::Closed { .. }
+                )
+            {
                 match self
                     .verify_recovery(&mut recovery_events, &mut host_diagnostics)
                     .await
@@ -551,7 +586,8 @@ impl ModuleSupervisorHost {
                         eprintln!("module recovery verification: {}", error.code);
                     }
                 }
-            } else if !recovery_events.blocks.is_empty()
+            } else if kernel_admission_open
+                && !recovery_events.blocks.is_empty()
                 && let Err(error) = self.refresh_recovery_blocks(&mut recovery_events).await
             {
                 if is_store_unavailable(&error) {
@@ -561,10 +597,11 @@ impl ModuleSupervisorHost {
                 eprintln!("module scoped recovery readback: {}", error.code);
             }
 
-            let scan_result = if matches!(
-                self.registry.admission_state(),
-                AdmissionState::Closed { .. }
-            ) {
+            let scan_result = if !kernel_admission_open
+                || matches!(
+                    self.registry.admission_state(),
+                    AdmissionState::Closed { .. }
+                ) {
                 Ok(())
             } else {
                 self.reconcile_demands(&mut held, &mut recovery_events, &mut host_diagnostics)
@@ -588,12 +625,6 @@ impl ModuleSupervisorHost {
             .await;
 
             tokio::select! {
-                changed_result = changed.changed() => {
-                    if changed_result.is_err() {
-                        self.registry.close_durable_admission(KernelFault::StoreUnavailable);
-                        time::sleep(MODULE_SCAN_FALLBACK).await;
-                    }
-                }
                 _ = scan.tick() => {}
                 stop_result = stopping.changed() => {
                     if stop_result.is_err() || *stopping.borrow() {
@@ -629,12 +660,12 @@ impl ModuleSupervisorHost {
         // This bounded Store transaction verifies the existing durable source
         // journal and advances at most one page. Remaining backlog is normal;
         // it is not a global admission failure for unrelated module scopes.
-        self.store.reconcile_module_recovery_journal_page().await?;
+        self.control.reconcile_recovery_page().await?;
 
         let mut cursor = None::<ModuleDemandCursor>;
         let mut blocked_scopes = HashSet::<ModuleScopeKey>::new();
         loop {
-            let snapshot = self.store.module_demand_snapshot(cursor.clone()).await?;
+            let snapshot = self.control.demand_page(cursor.as_ref()).await?;
             for blocked in &snapshot.blocked {
                 self.note_blocked_demand(
                     blocked,
@@ -660,10 +691,10 @@ impl ModuleSupervisorHost {
                     scope: scope.clone(),
                 };
                 let readback = self
-                    .store
-                    .module_scope_readback(
-                        demand.module_id.clone(),
-                        scope.binding_id.clone(),
+                    .control
+                    .scope_readback(
+                        &demand.module_id,
+                        &scope.binding_id,
                         i64::try_from(scope.generation)
                             .map_err(|_| Error::invalid("binding generation overflow"))?,
                     )
@@ -744,12 +775,8 @@ impl ModuleSupervisorHost {
             let generation = i64::try_from(key.scope.generation)
                 .map_err(|_| Error::invalid("binding generation overflow"))?;
             let readback = self
-                .store
-                .module_scope_readback(
-                    key.module_id.clone(),
-                    key.scope.binding_id.clone(),
-                    generation,
-                )
+                .control
+                .scope_readback(&key.module_id, &key.scope.binding_id, generation)
                 .await;
             match readback {
                 Ok(stored) => {
@@ -915,12 +942,8 @@ impl ModuleSupervisorHost {
         let generation = i64::try_from(key.scope.generation)
             .map_err(|_| Error::invalid("binding generation overflow"))?;
         let readback = match self
-            .store
-            .module_scope_readback(
-                key.module_id.clone(),
-                key.scope.binding_id.clone(),
-                generation,
-            )
+            .control
+            .scope_readback(&key.module_id, &key.scope.binding_id, generation)
             .await
         {
             Ok(readback) => readback,
@@ -1066,7 +1089,7 @@ impl ModuleSupervisorHost {
         let mut seen = HashSet::<DemandKey>::new();
         let mut blocked_scopes = HashSet::<ModuleScopeKey>::new();
         loop {
-            let snapshot = self.store.module_demand_snapshot(cursor.clone()).await?;
+            let snapshot = self.control.demand_page(cursor.as_ref()).await?;
             for blocked in snapshot.blocked {
                 self.note_blocked_demand(
                     &blocked,
@@ -1181,10 +1204,10 @@ impl ModuleSupervisorHost {
                 scope: scope.clone(),
             };
             let readback = match self
-                .store
-                .module_scope_readback(
-                    module_id.clone(),
-                    binding_id.clone(),
+                .control
+                .scope_readback(
+                    &module_id,
+                    &binding_id,
                     i64::try_from(generation)
                         .map_err(|_| Error::invalid("binding generation overflow"))?,
                 )
@@ -1268,8 +1291,8 @@ impl ModuleSupervisorHost {
             .launch_config
             .for_binding(&demand.descriptor, &demand.route_native_options)?;
         let provisioned = self
-            .store
-            .ensure_module_binding_credential(
+            .control
+            .ensure_binding_credential(
                 &demand.operation_id,
                 &demand.binding_id,
                 i64::try_from(demand.generation)
@@ -1326,8 +1349,8 @@ impl ModuleSupervisorHost {
             })
             .map_err(module_error)?;
         let ready = self
-            .store
-            .check_module_binding_credential_ready(
+            .control
+            .check_binding_credential_ready(
                 &demand.operation_id,
                 &demand.binding_id,
                 i64::try_from(demand.generation)
@@ -1420,11 +1443,7 @@ impl ModuleSupervisorHost {
             }
         }
         while let Some(event) = recovery_events.pending.front().cloned() {
-            match self
-                .store
-                .record_module_supervisor_observation(event.clone())
-                .await
-            {
+            match self.control.record_observation(&event).await {
                 Ok(()) => {
                     recovery_events.pending.pop_front();
                 }
@@ -1450,12 +1469,8 @@ impl ModuleSupervisorHost {
                             }
                         };
                         let refreshed = self
-                            .store
-                            .module_scope_readback(
-                                module_id.clone(),
-                                scope.binding_id.clone(),
-                                generation,
-                            )
+                            .control
+                            .scope_readback(&module_id, &scope.binding_id, generation)
                             .await;
                         match refreshed.and_then(|readback| {
                             operation_readback_for_scope(&scope, &readback)
@@ -1595,10 +1610,10 @@ impl ModuleSupervisorHost {
 }
 
 /// Start an optional actor that retries its own configuration/Store failures.
-/// The parent host owns this handle separately and must never feed its error
-/// or panic into the required-supervisor JoinSet.
-pub(crate) fn spawn_isolated_module_supervisor(
-    store: Store,
+/// The actor owns no Store handle: all kernel reads/writes use the authenticated
+/// supervisor control plane. The parent host owns this handle separately and
+/// must never feed its error or panic into the required-supervisor JoinSet.
+pub(crate) fn spawn_independent_module_supervisor(
     supervisor_credential: Credential,
     root: PathBuf,
     ipc: swarm_client::IpcConfig,
@@ -1607,7 +1622,16 @@ pub(crate) fn spawn_isolated_module_supervisor(
 ) -> OptionalModuleSupervisor {
     let handle = ModuleSupervisorHandle::default();
     let actor_handle = handle.clone();
+    let control =
+        SupervisorControlClient::new(root.clone(), supervisor_credential.clone(), ipc.clone());
     let task = tokio::spawn(async move {
+        let control = match control {
+            Ok(control) => control,
+            Err(error) => {
+                eprintln!("optional module supervisor IPC unavailable: {}", error.code);
+                return;
+            }
+        };
         let mut retry = Duration::from_millis(250);
         let mut failures = 0_u32;
         loop {
@@ -1624,7 +1648,7 @@ pub(crate) fn spawn_isolated_module_supervisor(
                         error.code
                     );
                     record_module_actor_status(
-                        &store,
+                        &control,
                         "isolated",
                         failures.saturating_add(1),
                         Some(&error.code),
@@ -1637,8 +1661,8 @@ pub(crate) fn spawn_isolated_module_supervisor(
                     return;
                 }
             };
-            let host = AssertUnwindSafe(ModuleSupervisorHost::start(
-                store.clone(),
+            let host = AssertUnwindSafe(ModuleSupervisorHost::start_with_control(
+                control.clone(),
                 supervisor_credential.clone(),
                 actor_handle.admission.clone(),
                 &root,
@@ -1650,7 +1674,7 @@ pub(crate) fn spawn_isolated_module_supervisor(
             match host {
                 Ok(Ok(host)) => {
                     failures = 0;
-                    record_module_actor_status(&store, "running", 0, None, None).await;
+                    record_module_actor_status(&control, "running", 0, None, None).await;
                     let host = Arc::new(host);
                     actor_handle.install(host.clone());
                     let run = AssertUnwindSafe(host.run(stopping.clone()))
@@ -1662,7 +1686,7 @@ pub(crate) fn spawn_isolated_module_supervisor(
                         Ok(Ok(())) => {
                             failures = failures.saturating_add(1).min(32);
                             record_module_actor_status(
-                                &store,
+                                &control,
                                 "retry_wait",
                                 failures,
                                 Some("SUPERVISOR_STOPPED"),
@@ -1674,7 +1698,7 @@ pub(crate) fn spawn_isolated_module_supervisor(
                         Ok(Err(error)) => {
                             failures = failures.saturating_add(1).min(32);
                             record_module_actor_status(
-                                &store,
+                                &control,
                                 "retry_wait",
                                 failures,
                                 Some(&error.code),
@@ -1686,7 +1710,7 @@ pub(crate) fn spawn_isolated_module_supervisor(
                         Err(_) => {
                             failures = failures.saturating_add(1).min(32);
                             record_module_actor_status(
-                                &store,
+                                &control,
                                 "retry_wait",
                                 failures,
                                 Some("SUPERVISOR_PANIC"),
@@ -1703,7 +1727,7 @@ pub(crate) fn spawn_isolated_module_supervisor(
                     eprintln!("optional module supervisor unavailable: {}", error.code);
                     if !retryable_supervisor_start(&error) {
                         record_module_actor_status(
-                            &store,
+                            &control,
                             "isolated",
                             failures.saturating_add(1).min(32),
                             Some(&error.code),
@@ -1717,7 +1741,7 @@ pub(crate) fn spawn_isolated_module_supervisor(
                     }
                     failures = failures.saturating_add(1).min(32);
                     record_module_actor_status(
-                        &store,
+                        &control,
                         "retry_wait",
                         failures,
                         Some(&error.code),
@@ -1728,7 +1752,7 @@ pub(crate) fn spawn_isolated_module_supervisor(
                 Err(_) => {
                     failures = failures.saturating_add(1).min(32);
                     record_module_actor_status(
-                        &store,
+                        &control,
                         "retry_wait",
                         failures,
                         Some("SUPERVISOR_START_PANIC"),
@@ -1748,8 +1772,23 @@ pub(crate) fn spawn_isolated_module_supervisor(
     OptionalModuleSupervisor { handle, task }
 }
 
+/// Compatibility entry point for the current in-process host composition.
+/// It intentionally drops the legacy Store parameter after the independent
+/// control client is constructed; kernel-owned composition can switch to
+/// `spawn_independent_module_supervisor` without changing lifecycle behavior.
+pub(crate) fn spawn_isolated_module_supervisor(
+    _store: Store,
+    supervisor_credential: Credential,
+    root: PathBuf,
+    ipc: swarm_client::IpcConfig,
+    config: crate::config::ModuleSupervisorConfig,
+    stopping: watch::Receiver<bool>,
+) -> OptionalModuleSupervisor {
+    spawn_independent_module_supervisor(supervisor_credential, root, ipc, config, stopping)
+}
+
 async fn record_module_actor_status(
-    store: &Store,
+    control: &SupervisorControlClient,
     state: &'static str,
     failures: u32,
     error_code: Option<&str>,
@@ -1757,17 +1796,14 @@ async fn record_module_actor_status(
 ) {
     let error_code = error_code.map(safe_optional_worker_code);
     let retry_in_ms = retry.map(|delay| u64::try_from(delay.as_millis()).unwrap_or(u64::MAX));
-    if let Err(error) = store
-        .record_legacy_worker_status(
-            "module-supervisor",
-            state,
-            failures,
-            error_code,
-            retry_in_ms,
-        )
+    if let Err(error) = control
+        .record_health(state, failures, error_code.as_deref(), retry_in_ms)
         .await
     {
-        eprintln!("module supervisor health readback unavailable: {}", error.code);
+        eprintln!(
+            "module supervisor health readback unavailable: {}",
+            error.code
+        );
     }
 }
 
@@ -1854,10 +1890,7 @@ fn is_pending_operation(state: &str) -> bool {
     )
 }
 
-fn validate_provisioned(
-    credential: &crate::store::ProvisionedModuleCredential,
-    demand: &ModuleDemand,
-) -> Result<()> {
+fn validate_provisioned(credential: &ModuleBindingCredential, demand: &ModuleDemand) -> Result<()> {
     if !credential.ready
         || credential.operation_id != demand.operation_id
         || credential.binding_id != demand.binding_id
@@ -2013,7 +2046,10 @@ fn failure_stage_for(code: &str) -> ModuleFailureStage {
     } else if code.starts_with("MODULE_OWNER_SPAWN_") {
         ModuleFailureStage::Spawn
     } else if code.starts_with("MODULE_WORKER_")
-        || matches!(code, "MODULE_EXITED" | "MODULE_NOT_ACTIVE" | "MODULE_SUPERVISOR_EXITED")
+        || matches!(
+            code,
+            "MODULE_EXITED" | "MODULE_NOT_ACTIVE" | "MODULE_SUPERVISOR_EXITED"
+        )
     {
         ModuleFailureStage::Worker
     } else if code == "MODULE_STATE_DIRECTORY"

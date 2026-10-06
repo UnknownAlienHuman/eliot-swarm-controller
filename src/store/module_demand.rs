@@ -31,7 +31,8 @@ const MODULE_METHODS: &[&str] = &[
 
 /// Exact status-only Operation data used for scoped recovery readback. Inputs,
 /// results, identities of callers, and native payloads are deliberately absent.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct StoredOperation {
     pub(crate) operation_id: String,
     pub(crate) method: String,
@@ -40,7 +41,8 @@ pub(crate) struct StoredOperation {
     pub(crate) state: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ModuleDemand {
     pub(crate) descriptor: ModuleDescriptor,
     pub(crate) descriptor_revision: u64,
@@ -57,7 +59,8 @@ pub(crate) struct ModuleDemand {
     pub(crate) operation_readback: Vec<StoredOperation>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ModuleDemandBlock {
     pub(crate) binding_id: String,
     pub(crate) generation: u64,
@@ -69,7 +72,8 @@ pub(crate) struct ModuleDemandBlock {
     pub(crate) descriptor: Option<ModuleDescriptor>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ModuleDemandSnapshot {
     pub(crate) demands: Vec<ModuleDemand>,
     pub(crate) blocked: Vec<ModuleDemandBlock>,
@@ -80,7 +84,8 @@ pub(crate) struct ModuleDemandSnapshot {
 /// Complete status-only readback used before releasing the last host demand
 /// lease for a service scope. `native_identity_retained` is a conservative
 /// Store fact, not proof that an external/native process is currently alive.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ModuleScopeReadback {
     pub(crate) operations: Vec<StoredOperation>,
     pub(crate) native_identity_retained: bool,

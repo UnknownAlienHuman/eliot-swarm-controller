@@ -2,7 +2,7 @@ use crate::{
     ActivationPolicy, ArtifactSelector, BindingLaunchConfig, CapabilityId, DescriptorCatalog,
     LaunchValue, LifecycleOwnership, ModuleDescriptor, ModuleEffectCertainty, ModuleFailureStage,
     ModuleOwnerExecutable, ProtectedResolver, ProtectedResolverContext, ProtocolRange,
-    ProtocolVersion, ServiceScope,
+    ProtocolVersion, ServiceScope, SupervisorControlClient,
     descriptor::{validate_environment_name, validate_identifier, validate_launch_value},
     module_link::module_contract_claim,
 };
@@ -23,7 +23,7 @@ use std::{
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use swarm_client::{Client, HostConnectionConfig, IpcConfig};
+use swarm_client::{HostConnectionConfig, IpcConfig};
 use swarm_contracts::{
     Credential,
     error::{Error, Result},
@@ -503,14 +503,12 @@ impl SupervisorRegistry {
             ));
         }
 
-        let mut client =
-            Client::connect(&self.ipc_root, &self.supervisor_credential, &self.ipc).await?;
-        let response = client
-            .request(
-                "module.descriptor.register",
-                serde_json::json!({"descriptor": descriptor}),
-            )
-            .await?;
+        let control = SupervisorControlClient::new(
+            self.ipc_root.clone(),
+            self.supervisor_credential.clone(),
+            self.ipc.clone(),
+        )?;
+        let response = control.register_descriptor(descriptor).await?;
         validate_registration_response(&response, descriptor)?;
         Ok(response)
     }
