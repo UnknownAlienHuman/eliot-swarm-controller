@@ -287,6 +287,52 @@ existing runner receives a bounded `system.event` input. Task scope is either
 the real complete Task/Attempt tuple or entirely absent; a taskless invocation
 receives no controller-effect grants.
 
+### Descriptor-backed generic Module events
+
+An authenticated Module may publish a generic operationless event through
+`module.event` only when its retained descriptor opts into
+`swarm.module_event_metadata@1` in `event_schemas`. This is an internal Module
+method, not an MCP tool. The request has only `event_id`, `event_kind`, and
+`metadata`; the Store derives the source client, binding ID and generation from
+the authenticated connection and checks that exact retained descriptor.
+`event_id` is nonempty, at most 512 bytes, and contains no control characters.
+`event_kind` has the same character rule and a 256-byte maximum; the reserved
+`runtime.outcome` and `runtime.state` kinds remain on their existing codecs.
+
+The closed `metadata` object contains `schema_id` (exactly
+`swarm.module_event_metadata`), `schema_version` (1), and the same `event_kind`,
+plus optional `status`, `occurrence_phase`, and `occurrence_id`. Unknown fields
+are rejected. Status is one of `applied`, `completed`, `failed`, `incomplete`,
+`cancelled`, `rejected`, `sent`, `answered`, `invalidated`, or `unknown`.
+`occurrence_phase` and `occurrence_id` must either both be absent or both be
+present; their respective limits are 128 and 256 bytes. The metadata event
+kind, phase and occurrence ID use nonempty ASCII alphanumeric characters plus
+`._:-/@`. Omitting `status` leaves the event statusless; it does not imply
+completion. Omitting the occurrence pair does not create one. These fields
+carry bounded selector metadata, not an arbitrary payload, Task, Attempt or
+Operation.
+
+The Store appends the canonical metadata to the existing observations stream
+under the authenticated Module source and exact binding generation. Reusing an
+`event_id` with identical binding and metadata is idempotent; reusing it for
+different retained facts conflicts. Generic Module events enter the existing
+event selector and admission path only after descriptor, source, Manager and
+configured-rule checks succeed. If source proof is temporarily unavailable,
+the cause remains in the existing bounded pending journal under
+`system_event_source_proof_pending`; ordinary revalidation seals that exact
+proof and any verified Task scope before release. This source-proof release
+path applies only to that exact hold reason. It does not synthesize a Task,
+Operation, status or occurrence, and it does not create a new replay path.
+
+Automation transfer preserves causality. An event whose ScriptRun Operation
+was already admitted is retained in transfer history with the original cause
+and Operation ID; transfer does not rewrite that admitted cause for the new
+owner. A still-pending, unadmitted event is moved under the existing transfer
+hold and must pass the successor's current actor revalidation before admission.
+The successor consumer context is rebuilt only when it selects the same pending
+ScriptRun identity; otherwise the stale context is cleared while the original
+cause remains held. Transfer alone does not release pending work.
+
 Event phases preserve subject boundaries. A provider's
 `native_input_accepted` acknowledgement has no normalized status and can match
 a statusless rule; it cannot match a completed filter. Script terminal statuses

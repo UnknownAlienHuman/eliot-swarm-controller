@@ -10,6 +10,21 @@ If startup fails before the Store is available, the foreground launching process
 
 Owned OpenCode startup failures are persisted separately with their exact launch/open Operation and binding references. The current GM or local Operator receives a safe `manager_action_required` projection through `operation.get` and `swarm.exceptions.get`. The original Operation admission result remains intact. A replacement GM can inspect the same durable failure without the former chat.
 
+Read-only technical facts and action authority are separate. When safe
+technical facts are retained on an Operation, an authenticated Manager or
+local Operator who already passes the ordinary `operation.get` visibility
+check can read those facts on that exact Operation without the originating
+chat, a live native session or producer, current-GM/lease status, or a
+still-current Task/Attempt. When present, this covers the retained
+`native_mcp_readback`, `native_mcp_tools_readback`, `workspace_failure_readback`
+and `participant_issuance` diagnostic fields. They remain attached to the
+exact retained operation and any project, binding, generation or session
+evidence it already carries; this does not widen visibility to unrelated
+projects or give Participants cross-Task access.
+Current-GM or local-Operator action suggestions remain distinct, and every new
+command or effect still passes its current action-authority checks. Reading a
+historical fact never authorizes retry, replay or mutation.
+
 After an owned service is observed, an error selecting its exact queued `agent.open` is retained separately as `runtime_dispatch_action_required` on the same read APIs. A deterministic opening-actor validation error rejects the queued operation before command admission. Ordinary idle and prerequisite waits remain waits. The diagnostic retains only the error code, stage and exact operation references, survives manager handover and service departure, and does not replace the launch admission receipt. `not_dispatched` describes the specific open command only when its retained state and absent send timestamp prove that boundary. A later send or native rejection keeps the outcome unknown. Readback never authorizes an automatic retry.
 
 An OpenCode `agent.reconcile` whose retained target cannot be loaded records an

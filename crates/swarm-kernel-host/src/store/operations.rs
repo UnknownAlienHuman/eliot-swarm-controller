@@ -37,18 +37,20 @@ pub(super) fn get_operation(db: &Connection, id: &str) -> Result<Value> {
     })?)?)
 }
 
-/// Current-manager readback adds bounded startup, bridge-recovery,
-/// module-outcome, native-MCP and workspace-launch diagnostics. Other
-/// Operation readers keep the existing projection and visibility boundary.
+/// Operation readback adds bounded retained native-MCP, workspace-launch
+/// and Participant issuance diagnostics for an
+/// authenticated Manager or local Operator that can already see this exact
+/// Operation. Current-GM authority remains required for action projections;
+/// retained diagnostics never grant a new command, retry, or recovery right.
 pub(super) fn get_operation_for_current_manager(
     db: &Connection,
     p: &Principal,
     id: &str,
 ) -> Result<Value> {
     let mut operation = get_operation(db, id)?;
-    let current_manager = matches!(p.role, Role::Manager | Role::Operator)
-        && super::gm::require_authority(db, p).is_ok()
-        && super::operation_visible_to(db, p, id)?;
+    let operation_reader =
+        matches!(p.role, Role::Manager | Role::Operator) && super::operation_visible_to(db, p, id)?;
+    let current_manager = operation_reader && super::gm::require_authority(db, p).is_ok();
     if current_manager && let Some(action) = owned_service_start_action_for_operation(db, id)? {
         operation["manager_action_required"] = action;
     }
@@ -61,22 +63,23 @@ pub(super) fn get_operation_for_current_manager(
     if current_manager && let Some(action) = module_outcome_readback_action_for_operation(db, id)? {
         operation["module_outcome_readback_required"] = action;
     }
-    if current_manager && let Some(readback) = native_mcp_readback_for_operation(db, id)? {
+    if operation_reader && let Some(readback) = native_mcp_readback_for_operation(db, id)? {
         operation["native_mcp_readback"] = readback;
     }
-    if current_manager
+    if operation_reader
         && operation["method"] == "swarm.launch"
         && let Some(readback) = super::launcher_mcp_tools::diagnostic_for_operation(db, id)?
     {
         operation["native_mcp_tools_readback"] = readback;
     }
-    if current_manager
+    if operation_reader
         && operation["method"] == "swarm.launch"
         && let Some(readback) = workspace_launch_failure_readback_for_operation(db, id, &operation)?
     {
         operation["workspace_failure_readback"] = readback;
     }
-    if current_manager && let Some(issuance) = participant_issuance_failure_for_operation(db, id)? {
+    if operation_reader && let Some(issuance) = participant_issuance_failure_for_operation(db, id)?
+    {
         operation["participant_issuance"] = issuance;
     }
     Ok(operation)
@@ -84,7 +87,7 @@ pub(super) fn get_operation_for_current_manager(
 
 /// Project only safe retained readback for a proven closed workspace admission
 /// failure or an unknown workspace effect. The existing operation
-/// visibility/current-Manager gate runs before this helper.
+/// visibility and Manager/Operator role checks run before this helper.
 fn workspace_launch_failure_readback_for_operation(
     db: &Connection,
     operation_id: &str,

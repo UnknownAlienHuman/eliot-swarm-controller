@@ -94,6 +94,12 @@ consumer context during automation transfer. The original producer cause,
 observation and admitted Operation identities remain unchanged; normal current
 authorization and source checks still control release.
 
+Visible Operation diagnostics now use the existing authenticated Manager or
+local Operator read scope. The retained native-MCP, workspace and Participant
+issuance facts do not require live GM authority. Current action projections and
+new effects keep their authority checks. The canonical Module API and recovery
+documents describe this read boundary and the generic event contract.
+
 Installed OpenCode resources now have a locked npm dependency closure, atomic
 resource publication, exact package/build sidecar identity and a shared bounded
 tree verifier used by Kernel and the standalone adapter. Source-tree resources
@@ -107,11 +113,11 @@ Module facts wait for missing source proof; release recognizes the exact
 `SYSTEM_EVENT_SOURCE_PROOF_PENDING` reason. Statusless events gain no invented
 status or occurrence. The method is internal and has no MCP exposure.
 
-Remaining source work closes exact live-child ownership and restart
-reconciliation, connects structured child diagnostics, removes the live-GM gate
-from otherwise authorized retained Operation diagnostics, and updates the
-canonical generic Module event documentation. These changes must finish before
-compiler, tests or native qualification.
+Remaining source work closes exact live-child ownership, durable pre-spawn
+intent and uncertain restart reconciliation, connects structured child
+diagnostics, and upgrades the trusted supervisor capability registration for
+its retained health reader. These changes must finish before compiler, tests or
+native qualification.
 
 The native qualification script now validates the
 public CLI, host wrapper, actual Kernel and supervisor coordinates separately,
