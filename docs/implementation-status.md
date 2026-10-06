@@ -2,6 +2,33 @@
 
 ## Current state
 
+### Supervisor control and publication demand — 2026-10-05
+
+Source `3755bc1` exposes the supervisor's existing admission, demand, binding,
+credential, recovery, observation and health operations through authenticated
+kernel IPC. `swarm-supervisor` uses a typed client and receives no Store or
+database handle. The existing exact supervisor credential is migrated at
+initialization; runtime calls require its complete bounded capability list.
+The host still starts the lifecycle actor in its own process. Moving that actor
+and its configuration into the standalone supervisor executable remains open.
+
+Automatic reconciliation prepares Forge executable images only when its bounded
+publication page contains due work. A publication that becomes due after this
+read-only preflight remains retryable pending until preparation is available;
+it cannot create a new unpinned publication intent. Existing immutable executor
+pins and historical legacy readback remain intact.
+
+These are source changes. Current compiler, test and native qualification gates
+are deferred until the required implementation is complete.
+
+Participant discovery now includes `source.capture`. Its current assignment
+must own the exact held launch workspace for that Task, revision and Attempt.
+Store checks the retained lease and launch authority without filesystem I/O;
+the existing file-I/O lane resolves the repository before reading Git. Ordinary
+and extended Windows disk/UNC paths share that lexical scope. Manager and
+Operator capture retain their existing general path. Collection of an in-flight
+capture after assignment or lease release is a separate unfinished handoff.
+
 ### Kernel, independent frontends and managed services — 2026-10-05
 
 Store now uses the actual bounded `KernelHost` queue and one writer thread for

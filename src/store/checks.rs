@@ -796,9 +796,21 @@ fn cache_hit_is_current(
 }
 
 fn attempt(db: &Connection, p: &Principal, id: &str) -> Result<Value> {
-    p.require_writer()?;
     let a = tasks::get_attempt(db, id)?;
-    super::gm::require_attempt_control(db, p, &a)?;
+    if p.role == Role::Participant {
+        let task_id = model::text(&a, "task_id")?;
+        let revision = a["task_revision"]
+            .as_i64()
+            .ok_or_else(|| Error::invalid("Attempt has no task revision"))?;
+        // Source capture is a scoped Participant submission primitive. The
+        // coordination guard proves the live registration, exact Task
+        // revision, Attempt, and non-review participation basis before any
+        // filesystem capture is admitted.
+        super::coordination::authorize_task_submission(db, p, task_id, revision, id)?;
+    } else {
+        p.require_writer()?;
+        super::gm::require_attempt_control(db, p, &a)?;
+    }
     let t = tasks::get_task(db, model::text(&a, "task_id")?)?;
     if !a["released_at_ms"].is_null() || t["state"] != "open" || t["revision"] != a["task_revision"]
     {
@@ -848,6 +860,15 @@ pub(super) fn reserve_source(
             "source capture revision changed",
         ));
     }
+    if p.role == Role::Participant {
+        super::workspace::participant_source_workspace(
+            tx,
+            model::text(&a, "task_id")?,
+            input.expected_revision,
+            &input.attempt_id,
+            &input.repository,
+        )?;
+    }
     tx.execute("UPDATE operations SET task_id=?2,attempt_id=?3,effective_request_json=?4 WHERE operation_id=?1",params![id,a["task_id"].as_str(),input.attempt_id,model::canonical(&json!({"capture":input,"git_executable":config.checks.git_executable,"identity":{"task_id":a["task_id"],"attempt_id":a["attempt_id"],"task_revision":a["task_revision"]}}))?])?;
     Ok(json!({"operation_id":id,"state":"queued","admission":"durable_local"}))
 }
@@ -855,7 +876,7 @@ fn begin_source(
     db: &mut Connection,
     p: Principal,
     id: &str,
-) -> Result<Option<(CaptureRequest, PathBuf, Value)>> {
+) -> Result<Option<(CaptureRequest, PathBuf, Value, Option<PathBuf>)>> {
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let p = current_principal(&tx, p)?;
     let op = operations::get_operation(&tx, id)?;
@@ -872,13 +893,31 @@ fn begin_source(
     )?;
     let v: Value = serde_json::from_str(&raw)?;
     let input: CaptureRequest = serde_json::from_value(v["capture"].clone())?;
-    attempt(&tx, &p, &input.attempt_id)?;
+    let a = attempt(&tx, &p, &input.attempt_id)?;
+    if op["attempt_id"] != input.attempt_id || a["task_revision"] != input.expected_revision {
+        return Err(Error::new(
+            "STALE_REVISION",
+            "source capture Operation no longer names the exact Task Attempt",
+        ));
+    }
+    let authorized_repository = if p.role == Role::Participant {
+        Some(super::workspace::participant_source_workspace(
+            &tx,
+            model::text(&a, "task_id")?,
+            input.expected_revision,
+            &input.attempt_id,
+            &input.repository,
+        )?)
+    } else {
+        None
+    };
     tx.execute("UPDATE operations SET state='sending',sent_at_ms=?2,updated_at_ms=?2 WHERE operation_id=?1",params![id,model::now_ms()?])?;
     tx.commit()?;
     Ok(Some((
         input,
         serde_json::from_value(v["git_executable"].clone())?,
         v["identity"].clone(),
+        authorized_repository,
     )))
 }
 fn finish_source(
@@ -894,6 +933,30 @@ fn finish_source(
     }
     let result=outcome.and_then(|r|{
         let p=current_principal(&tx,p)?;let a=attempt(&tx,&p,model::text(&op,"attempt_id")?)?;
+        if p.role == Role::Participant {
+            let raw: String = tx.query_row(
+                "SELECT effective_request_json FROM operations WHERE operation_id=?1",
+                [id],
+                |row| row.get(0),
+            )?;
+            let effective: Value = serde_json::from_str(&raw)?;
+            let input = CaptureRequest::parse(&effective["capture"])?;
+            if op["attempt_id"] != input.attempt_id
+                || a["task_revision"] != input.expected_revision
+            {
+                return Err(Error::new(
+                    "STALE_REVISION",
+                    "source capture Operation no longer names the exact Task Attempt",
+                ));
+            }
+            super::workspace::participant_source_workspace(
+                &tx,
+                model::text(&a, "task_id")?,
+                input.expected_revision,
+                &input.attempt_id,
+                &input.repository,
+            )?;
+        }
         if r.metadata["attempt_id"]!=a["attempt_id"]||r.metadata["task_revision"]!=a["task_revision"]{return Err(Error::new("STALE_REVISION","capture revision changed before publication"));}
         artifact(&tx,&r)?;Ok(json!({"operation_id":id,"outcome":"applied","candidate_ref":r.artifact_id,"commit":r.metadata["commit"],"tree":r.metadata["tree"],"file_count":r.metadata["file_count"],"task_accepted":false}))
     });
@@ -1583,20 +1646,32 @@ impl Store {
         let receipt = self
             .run(move |db| {
                 let p = current_principal(db, p)?;
-                p.require_writer()?;
+                if p.role != Role::Participant {
+                    p.require_writer()?;
+                }
                 super::mutate(db, &p, "source.capture", &params, &config)
             })
             .await?;
         let id = model::text(&receipt, "operation_id")?.to_owned();
         let start = id.clone();
         let p = principal.clone();
-        if let Some((input, git, identity)) =
+        if let Some((input, git, identity, authorized_repository)) =
             self.run(move |db| begin_source(db, p, &start)).await?
         {
             let root = self.data_dir.clone();
             let op = id.clone();
             let outcome = self
-                .file_io(move |files| source::capture(&root, &files, &input, &op, &git, identity))
+                .file_io(move |files| {
+                    source::capture(
+                        &root,
+                        &files,
+                        &input,
+                        &op,
+                        &git,
+                        identity,
+                        authorized_repository.as_deref(),
+                    )
+                })
                 .await;
             self.run(move |db| finish_source(db, principal, &id, outcome))
                 .await?;

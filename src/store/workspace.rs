@@ -15,7 +15,7 @@ use crate::{
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf, Prefix};
 
 const MAX_PENDING_LEASES: usize = 32;
 const MAX_ACTIVE_SCOPE_ROWS: i64 = 257;
@@ -756,6 +756,202 @@ pub(crate) fn get_lease_view(db: &Connection, reference: &LeaseAuthorityRef) -> 
         "state":row.state,
         "local_path_included":false,
     }))
+}
+
+/// Bind a Participant source capture to the exact host workspace retained by
+/// the live launch lease. The lease path is deliberately absent from public
+/// receipts, but it remains a durable Store fact for this local pre-effect
+/// check. Managers and Operators use the existing general capture path.
+pub(crate) fn participant_source_workspace(
+    db: &Connection,
+    task_id: &str,
+    task_revision: i64,
+    attempt_id: &str,
+    repository: &Path,
+) -> Result<PathBuf> {
+    let lease_ids = {
+        let mut statement = db.prepare(
+            "SELECT lease_id FROM workspace_leases
+             WHERE state='held' AND project_id=(SELECT project_id FROM tasks WHERE task_id=?1)
+               AND task_id=?1 AND task_revision=?2 AND attempt_id=?3
+             ORDER BY generation,lease_id LIMIT 2",
+        )?;
+        statement
+            .query_map(params![task_id, task_revision, attempt_id], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    let lease_id = match lease_ids.as_slice() {
+        [lease_id] => lease_id,
+        [] => {
+            return Err(Error::new(
+                "SOURCE_WORKSPACE_UNAVAILABLE",
+                "Participant source capture requires one held launch workspace lease",
+            ));
+        }
+        _ => {
+            return Err(Error::new(
+                "SOURCE_WORKSPACE_AMBIGUOUS",
+                "Participant source capture has more than one held workspace lease",
+            ));
+        }
+    };
+    let row = lease_row(db, lease_id)?;
+    if row.task_id != task_id
+        || row.task_revision != task_revision
+        || row.attempt_id.as_deref() != Some(attempt_id)
+        || row.state != "held"
+        || !row.workspace_path.is_absolute()
+    {
+        return Err(Error::new(
+            "SOURCE_WORKSPACE_STALE",
+            "held workspace lease no longer matches the Participant Task and Attempt",
+        ));
+    }
+    verify_current_registration_generation(db, &row)?;
+    let authority = lease_authority(&row)?;
+    if held_lease_for_operation(db, &row.operation_id)?.as_ref() != Some(&authority) {
+        return Err(Error::new(
+            "SOURCE_WORKSPACE_STALE",
+            "held workspace lease is not the exact current launch authority",
+        ));
+    }
+
+    let (method, operation_task, operation_attempt, effective_raw): (
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+    ) = db.query_row(
+        "SELECT method,task_id,attempt_id,effective_request_json
+         FROM operations WHERE operation_id=?1",
+        [row.operation_id.as_str()],
+        |record| {
+            Ok((
+                record.get(0)?,
+                record.get(1)?,
+                record.get(2)?,
+                record.get(3)?,
+            ))
+        },
+    )?;
+    if method != "swarm.launch"
+        || operation_task.as_deref() != Some(task_id)
+        || operation_attempt.as_deref() != Some(attempt_id)
+    {
+        return Err(Error::new(
+            "SOURCE_WORKSPACE_STALE",
+            "workspace lease is not retained by the exact launch Operation",
+        ));
+    }
+    let effective: Value = serde_json::from_str(&effective_raw)?;
+    let manifest = effective.get("launch_manifest").ok_or_else(|| {
+        Error::new(
+            "SOURCE_WORKSPACE_STALE",
+            "launch Operation has no retained launch manifest",
+        )
+    })?;
+    if manifest["task"]["task_id"] != task_id
+        || manifest["task"]["observed_revision"] != task_revision
+        || manifest["task"]["attempt_id"] != attempt_id
+    {
+        return Err(Error::new(
+            "SOURCE_WORKSPACE_STALE",
+            "launch manifest does not retain the exact source Task and Attempt",
+        ));
+    }
+    let manifest_authority: LeaseAuthorityRef =
+        serde_json::from_value(manifest["workspace"]["lease_authority"].clone()).map_err(|_| {
+            Error::new(
+                "SOURCE_WORKSPACE_STALE",
+                "launch manifest workspace authority is unavailable",
+            )
+        })?;
+    if manifest_authority != authority {
+        return Err(Error::new(
+            "SOURCE_WORKSPACE_STALE",
+            "launch manifest workspace authority differs from the held lease",
+        ));
+    }
+
+    if lexical_source_path(repository)? != lexical_source_path(&row.workspace_path)? {
+        return Err(Error::new(
+            "SOURCE_WORKSPACE_MISMATCH",
+            "Participant source repository is outside the exact held workspace",
+        ));
+    }
+    Ok(row.workspace_path)
+}
+
+fn lexical_source_path(path: &Path) -> Result<String> {
+    if !path.is_absolute() {
+        return Err(Error::new(
+            "SOURCE_WORKSPACE_MISMATCH",
+            "Participant source repository must be absolute",
+        ));
+    }
+    let mut normalized = String::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => match prefix.kind() {
+                Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => {
+                    normalized.push(char::from(drive));
+                    normalized.push(':');
+                }
+                Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => {
+                    let server = server.to_str().ok_or_else(|| {
+                        Error::new("SOURCE_WORKSPACE_MISMATCH", "source path is not UTF-8")
+                    })?;
+                    let share = share.to_str().ok_or_else(|| {
+                        Error::new("SOURCE_WORKSPACE_MISMATCH", "source path is not UTF-8")
+                    })?;
+                    normalized.push_str("//");
+                    normalized.push_str(server);
+                    normalized.push('/');
+                    normalized.push_str(share);
+                }
+                Prefix::DeviceNS(_) | Prefix::Verbatim(_) => {
+                    return Err(Error::new(
+                        "SOURCE_WORKSPACE_MISMATCH",
+                        "unsupported device namespace in Participant source repository",
+                    ));
+                }
+            },
+            Component::RootDir => {
+                if !normalized.ends_with('/') {
+                    normalized.push('/');
+                }
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(Error::new(
+                    "SOURCE_WORKSPACE_MISMATCH",
+                    "Participant source repository may not contain parent traversal",
+                ));
+            }
+            Component::Normal(part) => {
+                let part = part.to_str().ok_or_else(|| {
+                    Error::new("SOURCE_WORKSPACE_MISMATCH", "source path is not UTF-8")
+                })?;
+                if !normalized.is_empty() && !normalized.ends_with('/') {
+                    normalized.push('/');
+                }
+                normalized.push_str(part);
+            }
+        }
+    }
+    if normalized.is_empty() || normalized.chars().any(char::is_control) {
+        return Err(Error::new(
+            "SOURCE_WORKSPACE_MISMATCH",
+            "Participant source repository path is invalid",
+        ));
+    }
+    Ok(if cfg!(windows) {
+        normalized.to_ascii_lowercase()
+    } else {
+        normalized
+    })
 }
 
 /// Recover durable authority after a lost commit or pin response. The caller

@@ -217,8 +217,29 @@ pub fn capture(
     operation: &str,
     git_executable: &Path,
     identity: Value,
+    authorized_repository: Option<&Path>,
 ) -> Result<ArtifactRecord> {
     let repository = fs::canonicalize(&input.repository)?;
+    if let Some(expected) = authorized_repository {
+        let canonical_expected = fs::canonicalize(expected).map_err(|_| {
+            Error::new(
+                "SOURCE_WORKSPACE_STALE",
+                "held workspace path is no longer available for source capture",
+            )
+        })?;
+        if canonical_expected.as_path() != expected {
+            return Err(Error::new(
+                "SOURCE_WORKSPACE_STALE",
+                "held workspace path changed after lease preparation",
+            ));
+        }
+        if repository != canonical_expected {
+            return Err(Error::new(
+                "SOURCE_WORKSPACE_MISMATCH",
+                "source repository changed after Participant workspace admission",
+            ));
+        }
+    }
     let commit = object(
         git_executable,
         &repository,

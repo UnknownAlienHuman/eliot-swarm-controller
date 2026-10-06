@@ -2740,6 +2740,7 @@ fn participant_method_allowed(method: &str) -> bool {
         || matches!(
             method,
             "mcp.authorization"
+                | "source.capture"
                 | "task.submit"
                 | "review.submit"
                 | "review.get"

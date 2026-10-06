@@ -581,10 +581,10 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
     entry!(
         "source.capture",
         AcceptanceEffects,
-        FULL_AUDIENCE,
-        ManualOnly,
-        "Capture an exact Git commit as a fixed-source candidate.",
-        "Use only when an explicit task workflow requires capturing a named commit.",
+        PARTICIPANT_ONLY_AUDIENCES,
+        Core,
+        "Capture an exact Git commit as a fixed-source candidate for the current Task/Attempt.",
+        "Use from the authenticated assigned Participant before task.submit; the repository and full commit are captured exactly.",
         &["source", "capture", "git", "commit", "candidate"],
         &["attempt_id", "expected_revision", "repository", "commit"],
         "One immutable source capture."
@@ -2170,6 +2170,7 @@ const PARTICIPANT_CORE: &[&str] = &[
     "coordination.inbox",
     "coordination.watch.create",
     "swarm.overlap.check",
+    "source.capture",
     "task.submit",
     "artifact.read",
     "operation.get",
