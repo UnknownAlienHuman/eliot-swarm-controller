@@ -78,6 +78,7 @@ async fn run_until(
         .map_err(|error| startup_error("credential_bootstrap", error))?;
     let root_path = root.path.clone();
     let mut observer_config_valid = false;
+    let mut text_capture_policy = None;
     let observer = config.observability.enabled.then(|| {
         let live_config = config
             .observability
@@ -94,6 +95,13 @@ async fn run_until(
             retention_days: config.observability.retention_days,
         };
         observer_config_valid = recorder_config.validate().is_ok();
+        text_capture_policy = if observer_config_valid {
+            live_config
+                .as_ref()
+                .map(LiveConfigSource::text_capture_policy)
+        } else {
+            None
+        };
         let recorder = if observer_config_valid {
             swarm_observer::host::HostRecorder::new_with_live_config(recorder_config, live_config)
         } else {
@@ -108,10 +116,15 @@ async fn run_until(
         }) as swarm_telemetry::LineObserver
     });
     let config = Arc::new(config);
-    let owner =
-        StoreOwner::start_with_line_observer(root, config.clone(), credential, line_observer)
-            .await
-            .map_err(|error| startup_error("store_start", error))?;
+    let owner = StoreOwner::start_with_observer_policies(
+        root,
+        config.clone(),
+        credential,
+        line_observer,
+        text_capture_policy,
+    )
+    .await
+    .map_err(|error| startup_error("store_start", error))?;
     let mut host_image_receipt = if observer_config_valid {
         match swarm_observer::host_image_receipt::HostImageReceipt::publish(&root_path) {
             Ok(receipt) => Some(receipt),

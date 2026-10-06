@@ -2,6 +2,32 @@
 
 ## Current state
 
+### Retained source completion and scoped diagnostic controls — 2026-10-05
+
+The source-capture completion path now validates the immutable admission saved
+before Git/file I/O. It can retain the exact captured source snapshot after a
+Task closes, an Attempt is released, or manager/lease ownership changes. Current
+principal, assignment and held-lease checks still run before starting capture.
+Recording that snapshot does not submit or accept the Task.
+
+Ordinary registered Managers now have `logging.get` and `logging.set` for their
+own client, retained Operation, binding/module, or exact current Task/Attempt
+scope. The policy uses existing Store metadata and reloads the existing Producer
+after commit. The initial public API accepts metadata content; the connected
+Manager redacted-text and live TTL/level override path is still being completed.
+The observer can already carry bounded Atlas-redacted supervisor diagnostic
+text through its existing queue and recorder when live configuration opts in.
+Raw native-frame capture remains unavailable.
+
+The independent `swarm-supervisor` binary and strict private-stdin bootstrap are
+implemented over authenticated kernel IPC, including retained hello identity and
+scoped health readback. Its actual host process handoff is still being completed;
+the presence of this binary alone does not prove process isolation at runtime.
+
+These are source increments. Per owner direction, required code is completed
+before compiler, test, build, or model execution. Current native qualification
+and complete-product acceptance remain pending.
+
 ### Supervisor control and publication demand — 2026-10-05
 
 Source `3755bc1` exposes the supervisor's existing admission, demand, binding,

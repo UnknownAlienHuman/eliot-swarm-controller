@@ -10,6 +10,7 @@ use std::{
     fs::{self, File},
     io::Read,
     path::{Path, PathBuf},
+    sync::{Arc, RwLock},
 };
 use swarm_contracts::error::{Error, Result};
 
@@ -24,6 +25,7 @@ const MAX_SELECTOR_BYTES: usize = 128;
 pub struct LiveConfigSource {
     path: PathBuf,
     scope_id: String,
+    text_settings: Arc<RwLock<TextSettings>>,
 }
 
 impl LiveConfigSource {
@@ -33,7 +35,49 @@ impl LiveConfigSource {
         Self {
             path,
             scope_id: current_scope.to_string_lossy().into_owned(),
+            text_settings: Arc::new(RwLock::new(TextSettings::metadata_only())),
         }
+    }
+
+    /// Share the live content decision with the telemetry producer. The
+    /// producer checks this policy before redacting or queueing any text.
+    pub fn text_capture_policy(&self) -> swarm_telemetry::TextCapturePolicy {
+        let settings = Arc::clone(&self.text_settings);
+        Arc::new(move |severity, kind, module_id, client_id, operation_id| {
+            let severity = match severity {
+                swarm_telemetry::Severity::Error => Severity::Error,
+                swarm_telemetry::Severity::Warn => Severity::Warn,
+                swarm_telemetry::Severity::Info => Severity::Info,
+                swarm_telemetry::Severity::Debug => Severity::Debug,
+                swarm_telemetry::Severity::Trace => Severity::Trace,
+            };
+            let kind = match kind {
+                swarm_telemetry::Kind::ClientDisconnected => Kind::ClientDisconnected,
+                swarm_telemetry::Kind::StoreOperationFailed => Kind::StoreOperationFailed,
+                swarm_telemetry::Kind::ModuleStarted => Kind::ModuleStarted,
+                swarm_telemetry::Kind::ModuleStopped => Kind::ModuleStopped,
+                swarm_telemetry::Kind::AgentDeliveryFailed => Kind::AgentDeliveryFailed,
+                swarm_telemetry::Kind::RecorderFailure => Kind::RecorderFailure,
+            };
+            settings
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .allows_text_capture(
+                    now_unix_ms(),
+                    severity,
+                    kind,
+                    module_id,
+                    client_id,
+                    operation_id,
+                )
+        })
+    }
+
+    pub(crate) fn publish_text_settings(&self, settings: &LiveSettings) {
+        *self
+            .text_settings
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = settings.text_settings();
     }
 
     pub(crate) fn validate(&self) -> Result<()> {
@@ -92,6 +136,7 @@ impl LiveConfigSource {
                     config_version: file.config_version,
                     scope_id: file.scope_id,
                     level: FilterLevel::from_severity(file.minimum_severity),
+                    content: ContentMode::Metadata,
                     included_kinds: file.included_kinds,
                     overrides: Vec::new(),
                     retention_bytes: file.retention_bytes,
@@ -108,18 +153,45 @@ impl LiveConfigSource {
                     config_version: file.config_version,
                     scope_id: file.scope_id,
                     level: file.level,
+                    content: ContentMode::Metadata,
                     included_kinds: file.included_kinds,
                     overrides: file.overrides,
                     retention_bytes: file.retention_bytes,
                     retention_days: file.retention_days,
                 }
             }
-            // Schema 3 belongs to the diagnostic record wire format. This
-            // file deliberately has only the additive v2 filter schema.
+            3 => {
+                let file: LiveConfigFileV3 =
+                    serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+                if file.schema_version != schema_version {
+                    return Err(invalid());
+                }
+                ParsedLiveConfig {
+                    config_version: file.config_version,
+                    scope_id: file.scope_id,
+                    level: file.level,
+                    content: file.content,
+                    included_kinds: file.included_kinds,
+                    overrides: file.overrides,
+                    retention_bytes: file.retention_bytes,
+                    retention_days: file.retention_days,
+                }
+            }
             _ => return Err(invalid()),
         };
         if parsed.scope_id.len() > MAX_SCOPE_ID_BYTES {
             return Err(invalid());
+        }
+        if parsed.content == ContentMode::RedactedNativeFrames
+            || parsed
+                .overrides
+                .iter()
+                .any(|item| item.content == Some(ContentMode::RedactedNativeFrames))
+        {
+            return Err(Error::new(
+                "OBSERVER_CONTENT_UNSUPPORTED",
+                "no bounded native-frame producer is available",
+            ));
         }
         if parsed.scope_id != self.scope_id {
             return Err(Error::new(
@@ -129,6 +201,9 @@ impl LiveConfigSource {
         }
         if parsed.config_version == 0 || parsed.config_version < current.config_version {
             return Err(version_rejected());
+        }
+        if schema_version < 3 && parsed.overrides.iter().any(|item| item.content.is_some()) {
+            return Err(invalid());
         }
         if parsed.retention_bytes < segment_bytes
             || parsed.retention_bytes > MAX_RETENTION_BYTES
@@ -150,6 +225,7 @@ impl LiveConfigSource {
         let next = LiveSettings {
             config_version: parsed.config_version,
             level: parsed.level,
+            content: parsed.content,
             included_kinds,
             overrides: parsed.overrides,
             retention_bytes: parsed.retention_bytes,
@@ -200,6 +276,16 @@ pub(crate) enum FilterLevel {
     Info,
     Debug,
     Trace,
+}
+
+/// Optional content modes accepted by the local recorder. Native frames are
+/// unsupported until a real bounded native-frame producer exists.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ContentMode {
+    Metadata,
+    RedactedText,
+    RedactedNativeFrames,
 }
 
 impl FilterLevel {
@@ -266,6 +352,7 @@ impl Kind {
 pub(crate) struct LiveSettings {
     pub(crate) config_version: u64,
     pub(crate) level: FilterLevel,
+    pub(crate) content: ContentMode,
     pub(crate) included_kinds: BTreeSet<Kind>,
     pub(crate) overrides: Vec<ScopedOverride>,
     pub(crate) retention_bytes: u64,
@@ -277,6 +364,7 @@ impl LiveSettings {
         Self {
             config_version: 0,
             level: FilterLevel::Info,
+            content: ContentMode::Metadata,
             included_kinds: Kind::ALL.into_iter().collect(),
             overrides: Vec::new(),
             retention_bytes,
@@ -337,6 +425,39 @@ impl LiveSettings {
         }
         self.level
     }
+
+    pub(crate) fn text_settings(&self) -> TextSettings {
+        TextSettings {
+            content: self.content,
+            overrides: self.overrides.clone(),
+        }
+    }
+
+    fn allows_text_capture(
+        &self,
+        now_unix_ms: u64,
+        severity: Severity,
+        kind: Kind,
+        module_id: Option<&str>,
+        client_id: Option<&str>,
+        operation_id: Option<&str>,
+    ) -> bool {
+        self.allows(
+            now_unix_ms,
+            severity,
+            kind,
+            module_id,
+            client_id,
+            operation_id,
+        ) && text_content_allows(
+            self.content,
+            &self.overrides,
+            now_unix_ms,
+            module_id,
+            client_id,
+            operation_id,
+        )
+    }
 }
 
 #[derive(Deserialize)]
@@ -364,6 +485,20 @@ struct LiveConfigFileV2 {
     retention_days: u64,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LiveConfigFileV3 {
+    schema_version: u8,
+    config_version: u64,
+    scope_id: String,
+    level: FilterLevel,
+    content: ContentMode,
+    included_kinds: Vec<Kind>,
+    overrides: Vec<ScopedOverride>,
+    retention_bytes: u64,
+    retention_days: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ScopedOverride {
@@ -371,6 +506,8 @@ pub(crate) struct ScopedOverride {
     pub(crate) client_id: Option<String>,
     pub(crate) operation_id: Option<String>,
     pub(crate) level: FilterLevel,
+    #[serde(default)]
+    pub(crate) content: Option<ContentMode>,
     /// Absolute Unix epoch milliseconds. Relative TTLs are not reconstructed
     /// across a recorder restart.
     pub(crate) expires_at_unix_ms: u64,
@@ -380,10 +517,88 @@ struct ParsedLiveConfig {
     config_version: u64,
     scope_id: String,
     level: FilterLevel,
+    content: ContentMode,
     included_kinds: Vec<Kind>,
     overrides: Vec<ScopedOverride>,
     retention_bytes: u64,
     retention_days: u64,
+}
+
+#[derive(Clone, Debug)]
+struct TextSettings {
+    content: ContentMode,
+    overrides: Vec<ScopedOverride>,
+}
+
+impl TextSettings {
+    fn metadata_only() -> Self {
+        Self {
+            content: ContentMode::Metadata,
+            overrides: Vec::new(),
+        }
+    }
+
+    fn allows(
+        &self,
+        now_unix_ms: u64,
+        module_id: Option<&str>,
+        client_id: Option<&str>,
+        operation_id: Option<&str>,
+    ) -> bool {
+        text_content_allows(
+            self.content,
+            &self.overrides,
+            now_unix_ms,
+            module_id,
+            client_id,
+            operation_id,
+        )
+    }
+}
+
+fn text_content_allows(
+    baseline: ContentMode,
+    overrides: &[ScopedOverride],
+    now_unix_ms: u64,
+    module_id: Option<&str>,
+    client_id: Option<&str>,
+    operation_id: Option<&str>,
+) -> bool {
+    for (selector, value) in [
+        (Selector::Operation, operation_id),
+        (Selector::Client, client_id),
+        (Selector::Module, module_id),
+    ] {
+        if let Some(value) = value
+            && let Some(content) = overrides.iter().find_map(|item| {
+                (item.expires_at_unix_ms > now_unix_ms
+                    && item.content.is_some()
+                    && selector.matches(item, value))
+                .then_some(item.content)
+                .flatten()
+            })
+        {
+            return content == ContentMode::RedactedText;
+        }
+    }
+    baseline == ContentMode::RedactedText
+}
+
+#[derive(Clone, Copy)]
+enum Selector {
+    Module,
+    Client,
+    Operation,
+}
+
+impl Selector {
+    fn matches(self, item: &ScopedOverride, value: &str) -> bool {
+        match self {
+            Self::Module => item.module_id.as_deref() == Some(value),
+            Self::Client => item.client_id.as_deref() == Some(value),
+            Self::Operation => item.operation_id.as_deref() == Some(value),
+        }
+    }
 }
 
 fn validate_overrides(overrides: &[ScopedOverride]) -> Result<()> {

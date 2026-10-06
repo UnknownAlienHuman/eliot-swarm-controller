@@ -12,6 +12,7 @@ use crate::{
     config::Config,
     error::{Error, Result},
     model::{self, Principal, Role},
+    workspace::LeaseAuthorityRef,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::{Value, json};
@@ -845,6 +846,174 @@ fn settle(db: &Connection, id: &str, result: &Value) -> Result<()> {
     db.execute("INSERT INTO observations(source_stream_id,source_event_key,operation_id,kind,payload_json,recorded_at_ms) VALUES('controller:checks',?1,?1,'check.completed',?2,?3)",params![id,encoded,now])?;
     Ok(())
 }
+
+fn source_admission_json(
+    id: &str,
+    p: &Principal,
+    a: &Value,
+    input: &CaptureRequest,
+    lease_authority: Option<&LeaseAuthorityRef>,
+) -> Result<Value> {
+    Ok(json!({
+        "schema_version":1,
+        "operation_id":id,
+        "method":"source.capture",
+        "caller_id":p.client_id,
+        "role":serde_json::to_value(&p.role)?,
+        "task_id":a["task_id"],
+        "task_revision":a["task_revision"],
+        "attempt_id":input.attempt_id,
+        "repository":serde_json::to_value(&input.repository)?,
+        "commit":input.commit,
+        "lease_authority":lease_authority.map(|authority| serde_json::to_value(authority)).transpose()?.unwrap_or(Value::Null),
+    }))
+}
+
+/// Validate only the immutable source admission sealed before native file I/O.
+/// This deliberately performs no current-principal, Task, Attempt or lease
+/// lookup so already-captured bytes remain recordable after release.
+fn validate_source_admission(
+    op: &Value,
+    effective: &Value,
+    id: &str,
+    p: &Principal,
+    input: &CaptureRequest,
+) -> Result<Option<LeaseAuthorityRef>> {
+    let admission = effective.get("source_admission").ok_or_else(|| {
+        Error::new(
+            "SOURCE_ADMISSION_MISSING",
+            "source capture has no retained admission origin",
+        )
+    })?;
+    if admission["schema_version"] != 1
+        || admission["operation_id"] != id
+        || admission["method"] != "source.capture"
+        || admission["caller_id"] != p.client_id
+        || admission["caller_id"] != op["caller_id"]
+        || admission["task_id"] != op["task_id"]
+        || admission["attempt_id"] != op["attempt_id"]
+        || admission["task_revision"] != input.expected_revision
+        || admission["repository"] != serde_json::to_value(&input.repository)?
+        || admission["commit"] != input.commit
+    {
+        return Err(Error::new(
+            "SOURCE_ADMISSION_MISMATCH",
+            "source capture admission no longer names the original request",
+        ));
+    }
+    let identity = effective.get("identity").ok_or_else(|| {
+        Error::new(
+            "SOURCE_ADMISSION_MISSING",
+            "source capture has no retained Task identity",
+        )
+    })?;
+    if identity["task_id"] != op["task_id"]
+        || identity["attempt_id"] != op["attempt_id"]
+        || identity["task_revision"] != input.expected_revision
+    {
+        return Err(Error::new(
+            "SOURCE_ADMISSION_MISMATCH",
+            "source capture identity no longer names the original Task Attempt",
+        ));
+    }
+    let admitted_role: Role = serde_json::from_value(admission["role"].clone())?;
+    if !matches!(
+        admitted_role,
+        Role::Participant | Role::Manager | Role::Operator
+    ) {
+        return Err(Error::new(
+            "SOURCE_ADMISSION_MISMATCH",
+            "source capture admission retained a role without capture authority",
+        ));
+    }
+    if admitted_role == Role::Participant {
+        if admission["lease_authority"].is_null() {
+            return Err(Error::new(
+                "SOURCE_ADMISSION_MISSING",
+                "Participant source capture has no retained launch authority",
+            ));
+        }
+        let task_id = model::text(op, "task_id")?;
+        let authority: LeaseAuthorityRef =
+            serde_json::from_value(admission["lease_authority"].clone())?;
+        if authority.state != "held"
+            || authority.task_id != task_id
+            || authority.task_revision != input.expected_revision
+            || authority.attempt_id.as_deref() != Some(input.attempt_id.as_str())
+        {
+            return Err(Error::new(
+                "SOURCE_ADMISSION_MISMATCH",
+                "Participant source capture retained an invalid launch authority",
+            ));
+        }
+        Ok(Some(authority))
+    } else {
+        if !admission["lease_authority"].is_null() {
+            return Err(Error::new(
+                "SOURCE_ADMISSION_MISMATCH",
+                "non-Participant source capture retained a launch authority",
+            ));
+        }
+        Ok(None)
+    }
+}
+
+fn validate_source_artifact(
+    op: &Value,
+    input: &CaptureRequest,
+    record: &ArtifactRecord,
+) -> Result<()> {
+    let operation_id = model::text(op, "operation_id")?;
+    if record.artifact_id != format!("source-{}", model::digest(operation_id.as_bytes())) {
+        return Err(Error::new(
+            "SOURCE_CAPTURE_METADATA",
+            "capture result is bound to a different source Operation",
+        ));
+    }
+    if record.kind != "source_snapshot"
+        || record.metadata["task_id"] != op["task_id"]
+        || record.metadata["attempt_id"] != input.attempt_id
+        || record.metadata["task_revision"] != input.expected_revision
+    {
+        return Err(Error::new(
+            "STALE_REVISION",
+            "capture result no longer names the admitted Task Attempt",
+        ));
+    }
+    let commit = record.metadata["commit"].as_str().ok_or_else(|| {
+        Error::new(
+            "SOURCE_CAPTURE_METADATA",
+            "capture result has no immutable commit identity",
+        )
+    })?;
+    if !commit.eq_ignore_ascii_case(&input.commit) {
+        return Err(Error::new(
+            "SOURCE_CAPTURE_METADATA",
+            "capture result commit differs from the admitted source",
+        ));
+    }
+    let tree = record.metadata["tree"].as_str().ok_or_else(|| {
+        Error::new(
+            "SOURCE_CAPTURE_METADATA",
+            "capture result has no immutable tree identity",
+        )
+    })?;
+    if !matches!(tree.len(), 40 | 64) || !tree.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(Error::new(
+            "SOURCE_CAPTURE_METADATA",
+            "capture result tree identity is invalid",
+        ));
+    }
+    if record.metadata["coverage"] != "complete" || record.metadata["file_count"].as_u64().is_none()
+    {
+        return Err(Error::new(
+            "SOURCE_CAPTURE_METADATA",
+            "capture result is not a complete immutable source snapshot",
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn reserve_source(
     tx: &Transaction<'_>,
     p: &Principal,
@@ -860,16 +1029,27 @@ pub(super) fn reserve_source(
             "source capture revision changed",
         ));
     }
-    if p.role == Role::Participant {
-        super::workspace::participant_source_workspace(
+    let participant_workspace = if p.role == Role::Participant {
+        Some(super::workspace::participant_source_workspace(
             tx,
             model::text(&a, "task_id")?,
             input.expected_revision,
             &input.attempt_id,
             &input.repository,
-        )?;
-    }
-    tx.execute("UPDATE operations SET task_id=?2,attempt_id=?3,effective_request_json=?4 WHERE operation_id=?1",params![id,a["task_id"].as_str(),input.attempt_id,model::canonical(&json!({"capture":input,"git_executable":config.checks.git_executable,"identity":{"task_id":a["task_id"],"attempt_id":a["attempt_id"],"task_revision":a["task_revision"]}}))?])?;
+        )?)
+    } else {
+        None
+    };
+    let admission = source_admission_json(
+        id,
+        p,
+        &a,
+        &input,
+        participant_workspace
+            .as_ref()
+            .map(|workspace| &workspace.authority),
+    )?;
+    tx.execute("UPDATE operations SET task_id=?2,attempt_id=?3,effective_request_json=?4 WHERE operation_id=?1",params![id,a["task_id"].as_str(),input.attempt_id,model::canonical(&json!({"capture":input,"git_executable":config.checks.git_executable,"identity":{"task_id":a["task_id"],"attempt_id":a["attempt_id"],"task_revision":a["task_revision"]},"source_admission":admission}))?])?;
     Ok(json!({"operation_id":id,"state":"queued","admission":"durable_local"}))
 }
 fn begin_source(
@@ -894,21 +1074,81 @@ fn begin_source(
     let v: Value = serde_json::from_str(&raw)?;
     let input: CaptureRequest = serde_json::from_value(v["capture"].clone())?;
     let a = attempt(&tx, &p, &input.attempt_id)?;
-    if op["attempt_id"] != input.attempt_id || a["task_revision"] != input.expected_revision {
+    if op["task_id"] != a["task_id"]
+        || op["attempt_id"] != input.attempt_id
+        || a["task_revision"] != input.expected_revision
+    {
         return Err(Error::new(
             "STALE_REVISION",
             "source capture Operation no longer names the exact Task Attempt",
         ));
     }
+    let sealed_lease = if v.get("source_admission").is_some() {
+        let sealed = validate_source_admission(&op, &v, id, &p, &input)?;
+        if v["source_admission"]["role"] != serde_json::to_value(&p.role)? {
+            return Err(Error::new(
+                "SOURCE_ADMISSION_MISMATCH",
+                "source capture admission role differs from the current start principal",
+            ));
+        }
+        sealed
+    } else {
+        let participant_workspace = if p.role == Role::Participant {
+            Some(super::workspace::participant_source_workspace(
+                &tx,
+                model::text(&a, "task_id")?,
+                input.expected_revision,
+                &input.attempt_id,
+                &input.repository,
+            )?)
+        } else {
+            None
+        };
+        let admission = source_admission_json(
+            id,
+            &p,
+            &a,
+            &input,
+            participant_workspace
+                .as_ref()
+                .map(|workspace| &workspace.authority),
+        )?;
+        tx.execute(
+            "UPDATE operations SET effective_request_json=?2 WHERE operation_id=?1",
+            params![
+                id,
+                model::canonical(&json!({
+                    "capture":input,
+                    "git_executable":v["git_executable"],
+                    "identity":v["identity"],
+                    "source_admission":admission,
+                }))?
+            ],
+        )?;
+        participant_workspace.map(|workspace| workspace.authority)
+    };
     let authorized_repository = if p.role == Role::Participant {
-        Some(super::workspace::participant_source_workspace(
+        let admitted = super::workspace::participant_source_workspace(
             &tx,
             model::text(&a, "task_id")?,
             input.expected_revision,
             &input.attempt_id,
             &input.repository,
-        )?)
+        )?;
+        if sealed_lease.as_ref() != Some(&admitted.authority) {
+            return Err(Error::new(
+                "SOURCE_WORKSPACE_STALE",
+                "held workspace lease differs from the sealed source admission",
+            ));
+        }
+        Some(admitted.path)
     } else {
+        if sealed_lease.is_some() {
+            return Err(Error::new(
+                "SOURCE_ADMISSION_MISMATCH",
+                "non-Participant source capture retained a launch authority",
+            ));
+        }
         None
     };
     tx.execute("UPDATE operations SET state='sending',sent_at_ms=?2,updated_at_ms=?2 WHERE operation_id=?1",params![id,model::now_ms()?])?;
@@ -931,34 +1171,18 @@ fn finish_source(
     if op["state"] != "sending" || op["method"] != "source.capture" {
         return Err(Error::conflict("capture is not executing"));
     }
-    let result=outcome.and_then(|r|{
-        let p=current_principal(&tx,p)?;let a=attempt(&tx,&p,model::text(&op,"attempt_id")?)?;
-        if p.role == Role::Participant {
-            let raw: String = tx.query_row(
-                "SELECT effective_request_json FROM operations WHERE operation_id=?1",
-                [id],
-                |row| row.get(0),
-            )?;
-            let effective: Value = serde_json::from_str(&raw)?;
-            let input = CaptureRequest::parse(&effective["capture"])?;
-            if op["attempt_id"] != input.attempt_id
-                || a["task_revision"] != input.expected_revision
-            {
-                return Err(Error::new(
-                    "STALE_REVISION",
-                    "source capture Operation no longer names the exact Task Attempt",
-                ));
-            }
-            super::workspace::participant_source_workspace(
-                &tx,
-                model::text(&a, "task_id")?,
-                input.expected_revision,
-                &input.attempt_id,
-                &input.repository,
-            )?;
-        }
-        if r.metadata["attempt_id"]!=a["attempt_id"]||r.metadata["task_revision"]!=a["task_revision"]{return Err(Error::new("STALE_REVISION","capture revision changed before publication"));}
-        artifact(&tx,&r)?;Ok(json!({"operation_id":id,"outcome":"applied","candidate_ref":r.artifact_id,"commit":r.metadata["commit"],"tree":r.metadata["tree"],"file_count":r.metadata["file_count"],"task_accepted":false}))
+    let raw: String = tx.query_row(
+        "SELECT effective_request_json FROM operations WHERE operation_id=?1",
+        [id],
+        |row| row.get(0),
+    )?;
+    let effective: Value = serde_json::from_str(&raw)?;
+    let input = CaptureRequest::parse(&effective["capture"])?;
+    let _sealed_lease = validate_source_admission(&op, &effective, id, &p, &input)?;
+    let result = outcome.and_then(|r| {
+        validate_source_artifact(&op, &input, &r)?;
+        artifact(&tx, &r)?;
+        Ok(json!({"operation_id":id,"outcome":"applied","candidate_ref":r.artifact_id,"commit":r.metadata["commit"],"tree":r.metadata["tree"],"file_count":r.metadata["file_count"],"task_accepted":false}))
     });
     let result = match result {
         Ok(v) => v,

@@ -300,9 +300,24 @@ pub(super) fn scope_readback(
     let native_identity_retained = native_root.is_some()
         || native_scope.is_some()
         || !binding["observation"]["managed_owner"].is_null();
+    let module_hello_boot_id = match binding["observation"].get("bridge_boot_id") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value))
+            if !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control) =>
+        {
+            Some(value.clone())
+        }
+        Some(_) => {
+            return Err(Error::new(
+                "MODULE_READBACK_BOOT_INVALID",
+                "binding module hello boot identity is malformed",
+            ));
+        }
+    };
     Ok(ModuleScopeReadback {
         operations,
         native_identity_retained,
+        module_hello_boot_id,
     })
 }
 

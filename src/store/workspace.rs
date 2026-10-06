@@ -762,13 +762,19 @@ pub(crate) fn get_lease_view(db: &Connection, reference: &LeaseAuthorityRef) -> 
 /// the live launch lease. The lease path is deliberately absent from public
 /// receipts, but it remains a durable Store fact for this local pre-effect
 /// check. Managers and Operators use the existing general capture path.
+#[derive(Debug, Clone)]
+pub(crate) struct ParticipantSourceWorkspace {
+    pub(crate) path: PathBuf,
+    pub(crate) authority: LeaseAuthorityRef,
+}
+
 pub(crate) fn participant_source_workspace(
     db: &Connection,
     task_id: &str,
     task_revision: i64,
     attempt_id: &str,
     repository: &Path,
-) -> Result<PathBuf> {
+) -> Result<ParticipantSourceWorkspace> {
     let lease_ids = {
         let mut statement = db.prepare(
             "SELECT lease_id FROM workspace_leases
@@ -881,7 +887,10 @@ pub(crate) fn participant_source_workspace(
             "Participant source repository is outside the exact held workspace",
         ));
     }
-    Ok(row.workspace_path)
+    Ok(ParticipantSourceWorkspace {
+        path: row.workspace_path,
+        authority,
+    })
 }
 
 fn lexical_source_path(path: &Path) -> Result<String> {

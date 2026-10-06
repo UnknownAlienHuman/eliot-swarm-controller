@@ -89,6 +89,11 @@ pub struct ModuleDemandCursor {
 pub struct ModuleScopeReadback {
     pub operations: Vec<StoredOperation>,
     pub native_identity_retained: bool,
+    /// The exact module boot accepted by Store's existing module.hello state,
+    /// when this binding has one. A missing or stale value never proves that
+    /// the currently launched worker completed its hello.
+    #[serde(default)]
+    pub module_hello_boot_id: Option<String>,
 }
 
 /// Host proof that the exact binding credential is prepared and registered.

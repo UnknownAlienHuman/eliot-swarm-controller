@@ -1,4 +1,4 @@
-//! Optional metadata-only observer.
+//! Optional local observer with metadata-only defaults and redacted text opt-in.
 //!
 //! The observer has no global subscriber, host service, model, provider, or
 //! business ledger. The host recorder is opt-in and lazy; local file following
@@ -43,10 +43,10 @@ const MAX_SEGMENT_BYTES: u64 = 1_073_741_824;
 const MAX_RETENTION_BYTES: u64 = 8_589_934_592;
 const MAX_RETENTION_DAYS: u64 = 3650;
 
-/// Exact wire shapes emitted by `swarm-telemetry` schemas 1 through 3.
-/// Unknown fields are rejected so the observer cannot silently claim newer
-/// coverage; schemas 1 and 2 remain readable without the schema-3 correlation
-/// identities.
+/// Exact wire shapes emitted by `swarm-telemetry` schemas 1 through 4.
+/// Schema 4 adds bounded redacted text. Unknown fields are rejected so the
+/// observer cannot silently claim newer coverage; schemas 1 and 2 remain
+/// readable without schema-3 correlation identities.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DiagnosticRecord {
@@ -89,6 +89,10 @@ pub struct DiagnosticRecord {
     pub task_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attempt_id: Option<String>,
+    /// Bounded, Atlas-redacted producer text. This field is accepted only in
+    /// schema 4 and is absent from metadata-only schema 1 through 3 records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redacted_text: Option<String>,
 }
 
 pub fn decode_line(line: &[u8]) -> Result<DiagnosticRecord> {
@@ -104,7 +108,7 @@ pub fn decode_line(line: &[u8]) -> Result<DiagnosticRecord> {
             "diagnostic line is not the supported metadata schema",
         )
     })?;
-    if !matches!(record.schema_version, 1 | 2 | 3) {
+    if !matches!(record.schema_version, 1 | 2 | 3 | 4) {
         return Err(Error::new(
             "OBSERVER_SCHEMA_UNSUPPORTED",
             "diagnostic schema version is unsupported",
@@ -128,6 +132,23 @@ pub fn decode_line(line: &[u8]) -> Result<DiagnosticRecord> {
         return Err(Error::new(
             "OBSERVER_SCHEMA_UNSUPPORTED",
             "diagnostic schema-2 record contains a schema-3 field",
+        ));
+    }
+    if record.schema_version <= 3 && record.redacted_text.is_some() {
+        return Err(Error::new(
+            "OBSERVER_SCHEMA_UNSUPPORTED",
+            "metadata diagnostic schema contains a newer content field",
+        ));
+    }
+    if record.schema_version == 4
+        && record
+            .redacted_text
+            .as_ref()
+            .is_none_or(|text| text.len() > swarm_telemetry::MAX_REDACTED_TEXT_BYTES)
+    {
+        return Err(Error::new(
+            "OBSERVER_RECORD_INVALID",
+            "schema-4 diagnostic text is missing or exceeds its bound",
         ));
     }
     validate_record(&record)?;
@@ -255,6 +276,27 @@ fn validate_record(record: &DiagnosticRecord) -> Result<()> {
             return Err(Error::new(
                 "OBSERVER_RECORD_INVALID",
                 "schema-3 module diagnostics require exact event, module, artifact, binding, and boot identities",
+            ));
+        }
+    }
+    if record.schema_version == 4 && has_schema3_identity {
+        let is_module = matches!(record.kind.as_str(), "module_started" | "module_stopped");
+        if !is_module
+            || record.component.as_deref() != Some("module_supervisor")
+            || record.event_id.is_none()
+            || record.module_id.is_none()
+            || record.artifact_id.is_none()
+            || record.artifact_version.is_none()
+            || record.binding_id.is_none()
+            || record.binding_generation.is_none()
+            || record.module_boot_id.is_none()
+            || (record.attempt_id.is_some() && record.task_id.is_none())
+            || ((record.task_id.is_some() || record.attempt_id.is_some())
+                && record.operation_id.is_none())
+        {
+            return Err(Error::new(
+                "OBSERVER_RECORD_INVALID",
+                "schema-4 correlated diagnostics require exact module identities",
             ));
         }
     }
@@ -995,6 +1037,7 @@ fn reload_live_settings(
             config.retention_bytes = next.retention_bytes;
             config.retention_days = next.retention_days;
             *current = next;
+            source.publish_text_settings(current);
             counters.live_config_last_error.store(0, Ordering::Release);
             counters
                 .live_config_version
@@ -1018,6 +1061,7 @@ fn live_config_error_number(code: &str) -> u64 {
         "OBSERVER_LIVE_CONFIG_SCOPE_MISMATCH" => 2,
         "OBSERVER_LIVE_CONFIG_VERSION_REJECTED" => 3,
         "OBSERVER_LIVE_CONFIG_INVALID" => 4,
+        "OBSERVER_CONTENT_UNSUPPORTED" => 5,
         _ => 4,
     }
 }
@@ -1028,6 +1072,7 @@ fn live_config_error_code(value: u64) -> Option<&'static str> {
         2 => Some("OBSERVER_LIVE_CONFIG_SCOPE_MISMATCH"),
         3 => Some("OBSERVER_LIVE_CONFIG_VERSION_REJECTED"),
         4 => Some("OBSERVER_LIVE_CONFIG_INVALID"),
+        5 => Some("OBSERVER_CONTENT_UNSUPPORTED"),
         _ => None,
     }
 }

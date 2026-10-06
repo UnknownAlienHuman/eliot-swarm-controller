@@ -7,3 +7,9 @@ pub(crate) fn value(input: serde_json::Value) -> serde_json::Value {
         |_| serde_json::json!({"redacted":true,"reason":"invalid_redaction_output"}),
     )
 }
+
+/// Redact the existing producer's bounded human-readable status summary with
+/// Atlas before `swarm-telemetry` serializes or queues it.
+pub(crate) fn diagnostic_text(input: &str) -> Option<String> {
+    Some(atlas_redact::redact_auto(input).text)
+}

@@ -40,12 +40,13 @@ mod launcher_dispatch;
 mod launcher_issuance;
 mod launcher_mcp_tools;
 pub(crate) use launcher_mcp_tools::{
-    participant_capability_projection, ParticipantCapabilityScope,
+    ParticipantCapabilityScope, participant_capability_projection,
 };
 mod launcher_native_mcp;
 mod launcher_owned_service;
 mod launcher_participant;
 mod legacy_worker_demand;
+mod logging;
 mod message_batch;
 #[cfg(test)]
 mod module_bridge_recovery_tests;
@@ -160,8 +161,22 @@ impl StoreOwner {
         credential: Credential,
         line_observer: Option<swarm_telemetry::LineObserver>,
     ) -> Result<Self> {
+        Self::start_with_observer_policies(root, config, credential, line_observer, None).await
+    }
+
+    pub(crate) async fn start_with_observer_policies(
+        root: DataRoot,
+        config: Arc<Config>,
+        credential: Credential,
+        line_observer: Option<swarm_telemetry::LineObserver>,
+        text_capture_policy: Option<swarm_telemetry::TextCapturePolicy>,
+    ) -> Result<Self> {
         // Recorder limits cannot reconfigure or prevent the operational stderr producer.
-        let telemetry_config = swarm_telemetry::Config::default();
+        let mut telemetry_config = swarm_telemetry::Config::default()
+            .with_text_redactor(crate::redaction::diagnostic_text);
+        if let Some(policy) = text_capture_policy {
+            telemetry_config = telemetry_config.with_text_capture_policy(policy);
+        }
         let artifacts = ArtifactFiles::new(&root.path)?;
         let data_dir = root.path.clone();
         let automation_scheduler_enabled = config.automation_scheduler.enabled;
@@ -366,6 +381,14 @@ impl StoreOwner {
                     "private scheduler config could not be created",
                 ));
             }
+        }
+        if let Err(error) = store.reload_logging_filters().await {
+            kernel.close_admission(swarm_kernel::KernelAdmissionFault::ShuttingDown);
+            let status_shutdown = store.status_reader.shutdown().await;
+            drop(store);
+            join_store_threads(status_thread, kernel).await?;
+            status_shutdown?;
+            return Err(error);
         }
         Ok(Self {
             kernel,
@@ -816,6 +839,19 @@ impl Store {
         self.telemetry.stats()
     }
 
+    /// Reconcile the persisted metadata policy into the live Producer only
+    /// after the database commit or during startup. The observer's existing
+    /// file selector and retention worker remain independent.
+    async fn reload_logging_filters(&self) -> Result<()> {
+        let filters = self.run(|db| logging::load_filters(db)).await?;
+        self.telemetry.replace_scoped_filters(filters).map_err(|_| {
+            Error::new(
+                "LOGGING_POLICY_LIMIT",
+                "diagnostic policy snapshot exceeds the live Producer bound",
+            )
+        })
+    }
+
     pub(crate) fn kernel_snapshot(&self) -> swarm_kernel::KernelHostSnapshot {
         self.kernel.snapshot()
     }
@@ -1178,12 +1214,7 @@ impl Store {
             let preflight_now = model::now_ms()?;
             let demand = self
                 .run(move |db| {
-                    automation_publication::forge_preparation_demand(
-                        db,
-                        16,
-                        64,
-                        preflight_now,
-                    )
+                    automation_publication::forge_preparation_demand(db, 16, 64, preflight_now)
                 })
                 .await?;
             if demand {
@@ -1623,6 +1654,8 @@ impl Store {
                 | "hook.source.revoke"
         );
         let config = self.config.clone();
+        let reload_logging = method == "logging.set";
+        let read_logging = method == "logging.get";
         let result = self
             .run(move |db| {
                 let principal = current_principal(db, principal)?;
@@ -1691,6 +1724,21 @@ impl Store {
                 mutate(db, &principal, &method, &params, &config)
             })
             .await;
+        let result = if reload_logging && result.is_ok() {
+            self.reload_logging_filters().await?;
+            result
+        } else {
+            result
+        };
+        let result = if read_logging {
+            result.map(|mut value| {
+                let runtime = logging::producer_projection(&self.telemetry, &value);
+                value["runtime"] = runtime;
+                value
+            })
+        } else {
+            result
+        };
         if result.is_ok() && wake_dispatch {
             self.changed.send_modify(|n| *n = n.wrapping_add(1));
         }
@@ -1771,14 +1819,11 @@ impl Store {
                 model::fields(&params, &["cursor"])?;
                 let cursor = match params.get("cursor") {
                     None | Some(Value::Null) => None,
-                    Some(value) => Some(
-                        serde_json::from_value(value.clone()).map_err(|_| {
-                            Error::invalid("cursor does not match the bounded module page shape")
-                        })?,
-                    ),
+                    Some(value) => Some(serde_json::from_value(value.clone()).map_err(|_| {
+                        Error::invalid("cursor does not match the bounded module page shape")
+                    })?),
                 };
-                serde_json::to_value(self.module_demand_snapshot(cursor).await?)
-                    .map_err(Into::into)
+                serde_json::to_value(self.module_demand_snapshot(cursor).await?).map_err(Into::into)
             }
             "module.supervisor.scope.readback" => {
                 model::fields(&params, &["module_id", "binding_id", "generation"])?;
@@ -1791,8 +1836,7 @@ impl Store {
                 )
                 .map_err(Into::into)
             }
-            "module.supervisor.credential.ensure"
-            | "module.supervisor.credential.ready" => {
+            "module.supervisor.credential.ensure" | "module.supervisor.credential.ready" => {
                 model::fields(&params, &["operation_id", "binding_id", "generation"])?;
                 let operation_id = model::text(&params, "operation_id")?.to_owned();
                 let binding_id = model::text(&params, "binding_id")?.to_owned();
@@ -1821,7 +1865,8 @@ impl Store {
                     .get("observation")
                     .cloned()
                     .ok_or_else(|| Error::invalid("observation is required"))?;
-                self.record_module_supervisor_observation(observation).await?;
+                self.record_module_supervisor_observation(observation)
+                    .await?;
                 Ok(json!({"recorded":true}))
             }
             "module.supervisor.health.record" => {
@@ -2737,6 +2782,7 @@ fn is_read(method: &str) -> bool {
             | "automation.config.get"
             | "automation.config.preview"
             | "automation.config.explain"
+            | "logging.get"
             | "swarm.dashboard"
             | "monitor.snapshot"
             | "monitor.follow"
@@ -4059,6 +4105,22 @@ fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config
         "automation.config.get" => automation::get(db, p, v),
         "automation.config.preview" => automation::preview(db, p, v),
         "automation.config.explain" => automation::explain(db, p, v),
+        "logging.get" => {
+            model::fields(
+                v,
+                &[
+                    "client_id",
+                    "task_id",
+                    "task_revision",
+                    "attempt_id",
+                    "operation_id",
+                    "binding_id",
+                    "binding_generation",
+                    "module_id",
+                ],
+            )?;
+            logging::get(db, p, v)
+        }
         "swarm.dashboard" => launcher::dashboard(db, p, v),
         "monitor.snapshot" => monitor::snapshot(db, p, v, config),
         "monitor.follow" => monitor::follow(db, p, v, config),
@@ -5755,9 +5817,7 @@ fn emit_manager_event(
     });
     let encoded = model::canonical(&event_payload)?;
     if encoded.len()
-        > model::MAX_MANAGER_EVENT_PAYLOAD_BYTES
-            + model::MAX_MANAGER_EVENT_CAUSE_BYTES
-            + 2048
+        > model::MAX_MANAGER_EVENT_PAYLOAD_BYTES + model::MAX_MANAGER_EVENT_CAUSE_BYTES + 2048
     {
         return Err(Error::invalid("manager event exceeds its storage bound"));
     }
@@ -5904,16 +5964,17 @@ fn apply(
         "automation.config.apply" => {
             automation::apply(tx, p, v, id, config, now).map(|value| (value, false))
         }
+        "logging.set" => logging::set(tx, p, v, id, now).map(|value| (value, false)),
         "event.emit" => emit_manager_event(tx, p, v, id, now).map(|value| (value, false)),
         "automation.config.transfer" => {
             automation_transfer::apply(tx, p, v, id, now).map(|value| (value, false))
         }
-        "forge.publish_ref" => forge::reserve(tx, p, v, id, config, plan.forge_execution).map(
-            |value| {
+        "forge.publish_ref" => {
+            forge::reserve(tx, p, v, id, config, plan.forge_execution).map(|value| {
                 let queued = value.get("coalesced") != Some(&Value::Bool(true));
                 (value, queued)
-            },
-        ),
+            })
+        }
         "source.capture" => checks::reserve_source(tx, p, v, id, config).map(|v| (v, true)),
         "check.run" => checks::reserve(tx, p, v, id, config, plan.check_plan),
         "check.cancel" => checks::cancel(tx, p, v, id).map(|v| (v, false)),

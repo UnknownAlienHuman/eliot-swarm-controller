@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
 publish = false
-description = "Bounded metadata-only diagnostic producer for the ELIOT swarm runtime"
+description = "Bounded diagnostic producer with opt-in redacted text for the ELIOT swarm runtime"
 
 [lib]
 path = "src/lib.rs"

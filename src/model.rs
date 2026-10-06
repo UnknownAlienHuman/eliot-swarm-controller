@@ -171,12 +171,9 @@ fn validate_manager_event_mutation(params: &Value) -> Result<()> {
         MAX_MANAGER_EVENT_PROJECT_BYTES,
         |byte| !byte.is_ascii_control() && !byte.is_ascii_whitespace(),
     )?;
-    bounded_event_text(
-        params,
-        "name",
-        MAX_MANAGER_EVENT_NAME_BYTES,
-        |byte| byte.is_ascii_alphanumeric() || b"._:-/@".contains(&byte),
-    )?;
+    bounded_event_text(params, "name", MAX_MANAGER_EVENT_NAME_BYTES, |byte| {
+        byte.is_ascii_alphanumeric() || b"._:-/@".contains(&byte)
+    })?;
     bounded_event_text(
         params,
         "dedupe_key",
@@ -212,12 +209,9 @@ fn validate_manager_event_mutation(params: &Value) -> Result<()> {
             .get("operation_id")
             .is_some_and(|value| !value.is_null())
         {
-            bounded_event_text(
-                cause,
-                "operation_id",
-                128,
-                |byte| !byte.is_ascii_control() && !byte.is_ascii_whitespace(),
-            )?;
+            bounded_event_text(cause, "operation_id", 128, |byte| {
+                !byte.is_ascii_control() && !byte.is_ascii_whitespace()
+            })?;
         }
         if cause
             .get("observation_id")
@@ -647,6 +641,21 @@ pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
             return Ok(());
         }
         "check.cancel" => &["client_request_id", "check_id", "reason"],
+
+        "logging.set" => &[
+            "client_request_id",
+            "client_id",
+            "task_id",
+            "task_revision",
+            "attempt_id",
+            "operation_id",
+            "binding_id",
+            "binding_generation",
+            "module_id",
+            "level",
+            "content",
+            "ttl_seconds",
+        ],
 
         "artifact.assemble" => &["client_request_id", "page_refs", "expected_sha256"],
         "task.submit.recover" => &["client_request_id", "operation_id"],

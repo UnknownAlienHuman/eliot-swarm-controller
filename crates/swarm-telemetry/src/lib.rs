@@ -1,4 +1,4 @@
-//! Bounded, metadata-only diagnostic producer.
+//! Bounded diagnostic producer with opt-in Atlas-redacted text.
 //!
 //! Constructing a [`Producer`] starts no worker. The first enabled emission
 //! lazily starts one stderr writer. Emission validates and serializes only a
@@ -32,7 +32,20 @@ pub const DEFAULT_MAX_RECORD_BYTES: usize = 16_384;
 pub const MAX_QUEUE_RECORDS: usize = 65_536;
 pub const MAX_QUEUE_BYTES: usize = 67_108_864;
 pub const MAX_RECORD_BYTES: usize = 65_536;
+/// Maximum raw text accepted by the optional content path before redaction.
+/// Oversized text is rejected before any wire serialization.
+pub const MAX_TEXT_INPUT_BYTES: usize = 16_384;
+/// Maximum redacted text retained in one observer content record.
+pub const MAX_REDACTED_TEXT_BYTES: usize = 8_192;
 const MAX_ID_BYTES: usize = 128;
+
+/// Host-provided pure redactor. A missing result suppresses optional content;
+/// the bounded metadata record remains available.
+pub type TextRedactor = fn(&str) -> Option<String>;
+/// A bounded scope check for the current capture policy. It is evaluated
+/// before redaction, serialization, or queue admission.
+pub type TextCapturePolicy =
+    Arc<dyn Fn(Severity, Kind, Option<&str>, Option<&str>, Option<&str>) -> bool + Send + Sync>;
 
 /// Validated local-recorder configuration. The optional producer is local to
 /// its caller; this crate installs no global subscriber or mandatory backend.
@@ -42,6 +55,8 @@ pub struct Config {
     queue_records: usize,
     queue_bytes: usize,
     max_record_bytes: usize,
+    text_redactor: Option<TextRedactor>,
+    text_capture_policy: Option<TextCapturePolicy>,
 }
 
 impl Config {
@@ -92,11 +107,28 @@ impl Config {
             queue_records,
             queue_bytes,
             max_record_bytes,
+            text_redactor: None,
+            text_capture_policy: None,
         })
     }
 
     pub fn is_enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// Install the pure redactor used by the optional content path. The
+    /// default remains metadata-only; callers must opt into a redactor before
+    /// a text field can reach the observer line.
+    pub fn with_text_redactor(mut self, redactor: TextRedactor) -> Self {
+        self.text_redactor = Some(redactor);
+        self
+    }
+
+    /// Install a live scope policy. Without a policy, the producer remains
+    /// metadata-only even when a record carries optional text.
+    pub fn with_text_capture_policy(mut self, policy: TextCapturePolicy) -> Self {
+        self.text_capture_policy = Some(policy);
+        self
     }
 }
 
@@ -107,6 +139,8 @@ impl Default for Config {
             queue_records: DEFAULT_QUEUE_RECORDS,
             queue_bytes: DEFAULT_QUEUE_BYTES,
             max_record_bytes: DEFAULT_MAX_RECORD_BYTES,
+            text_redactor: None,
+            text_capture_policy: None,
         }
     }
 }
@@ -274,6 +308,7 @@ pub struct Record {
     build_id: Option<KnownMetadata>,
     task_id: Option<KnownId>,
     attempt_id: Option<KnownId>,
+    text: Option<String>,
 }
 
 impl Record {
@@ -297,6 +332,7 @@ impl Record {
             build_id: None,
             task_id: None,
             attempt_id: None,
+            text: None,
         }
     }
 
@@ -362,6 +398,15 @@ impl Record {
         self
     }
 
+    /// Attach optional producer text. Oversized inputs are not copied, and the
+    /// value is serialized only after the configured redactor succeeds.
+    pub fn with_text(mut self, value: Option<&str>) -> Self {
+        self.text = value
+            .filter(|text| text.len() <= MAX_TEXT_INPUT_BYTES)
+            .map(str::to_owned);
+        self
+    }
+
     fn has_extended_correlation(&self) -> bool {
         self.event_id.is_some()
             && self.component.is_some()
@@ -420,10 +465,23 @@ struct WireRecord<'a> {
     task_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     attempt_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    redacted_text: Option<&'a str>,
 }
 
 struct Queued {
     bytes: Vec<u8>,
+    observer_bytes: Option<Vec<u8>>,
+}
+
+impl Queued {
+    fn pending_bytes(&self) -> u64 {
+        self.bytes.len() as u64
+            + self
+                .observer_bytes
+                .as_ref()
+                .map_or(0, |bytes| bytes.len() as u64)
+    }
 }
 
 #[derive(Default)]
@@ -446,6 +504,7 @@ struct Counters {
 struct Inner {
     config: Config,
     line_observer: Option<LineObserver>,
+    scoped_filters: Mutex<Vec<ScopedFilter>>,
     sender: OnceLock<SyncSender<Queued>>,
     state: Arc<AtomicU8>,
     next_sequence: AtomicU64,
@@ -457,6 +516,149 @@ struct Inner {
 /// recorder is called on this crate's diagnostic writer thread, never on a
 /// Store/kernel caller.
 pub type LineObserver = Arc<dyn Fn(&[u8]) + Send + Sync + 'static>;
+
+/// A closed metadata-only level used by the authenticated Store logging
+/// control. The scope is matched before serialization, so a diagnostic filter
+/// cannot change durable Operations or journal admission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FilterLevel {
+    Off,
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl FilterLevel {
+    pub fn allows(self, severity: Severity) -> bool {
+        match self {
+            Self::Off => false,
+            Self::Error => matches!(severity, Severity::Error),
+            Self::Warn => matches!(severity, Severity::Error | Severity::Warn),
+            Self::Info => matches!(severity, Severity::Error | Severity::Warn | Severity::Info),
+            Self::Debug => matches!(
+                severity,
+                Severity::Error | Severity::Warn | Severity::Info | Severity::Debug
+            ),
+            Self::Trace => true,
+        }
+    }
+}
+
+/// Exact metadata identities attached to one Manager-owned diagnostic scope.
+/// Task/Attempt are optional because taskless client, Operation, binding, and
+/// module events are valid diagnostic sources. When present, Task/Attempt are
+/// the current owner context proven by the Store; optional selectors narrow
+/// that context and never widen it to another principal or task.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FilterScope {
+    client_id: String,
+    task_id: Option<String>,
+    attempt_id: Option<String>,
+    operation_id: Option<String>,
+    binding_id: Option<String>,
+    binding_generation: Option<u64>,
+    module_id: Option<String>,
+}
+
+impl FilterScope {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        client_id: &str,
+        task_id: Option<&str>,
+        attempt_id: Option<&str>,
+        operation_id: Option<&str>,
+        binding_id: Option<&str>,
+        binding_generation: Option<u64>,
+        module_id: Option<&str>,
+    ) -> Option<Self> {
+        let known = |value: &str| KnownId::from_known(value).map(|id| id.0);
+        let client_id = known(client_id)?;
+        if task_id.is_some() != attempt_id.is_some() {
+            return None;
+        }
+        let task_id = task_id.and_then(known);
+        let attempt_id = attempt_id.and_then(known);
+        let operation_id = operation_id.and_then(known);
+        let binding_id = binding_id.and_then(known);
+        let module_id = module_id.and_then(KnownMetadata::from_atom).map(|id| id.0);
+        if binding_id.is_some() != binding_generation.is_some()
+            || binding_generation.is_some_and(|generation| generation == 0)
+        {
+            return None;
+        }
+        Some(Self {
+            client_id,
+            task_id,
+            attempt_id,
+            operation_id,
+            binding_id,
+            binding_generation,
+            module_id,
+        })
+    }
+
+    fn matches(&self, record: &Record) -> bool {
+        record
+            .client_id
+            .as_ref()
+            .is_some_and(|id| id.0.as_str() == self.client_id.as_str())
+            && self.task_id.as_deref().is_none_or(|expected| {
+                record
+                    .task_id
+                    .as_ref()
+                    .is_some_and(|id| id.0.as_str() == expected)
+            })
+            && self.attempt_id.as_deref().is_none_or(|expected| {
+                record
+                    .attempt_id
+                    .as_ref()
+                    .is_some_and(|id| id.0.as_str() == expected)
+            })
+            && self.operation_id.as_deref().is_none_or(|expected| {
+                record
+                    .operation_id
+                    .as_ref()
+                    .is_some_and(|id| id.0.as_str() == expected)
+            })
+            && self.binding_id.as_deref().is_none_or(|expected| {
+                record
+                    .binding_id
+                    .as_ref()
+                    .is_some_and(|id| id.0.as_str() == expected)
+                    && self.binding_generation == record.binding_generation
+            })
+            && self.module_id.as_deref().is_none_or(|expected| {
+                record
+                    .module_id
+                    .as_ref()
+                    .is_some_and(|id| id.0.as_str() == expected)
+            })
+    }
+
+    fn specificity(&self) -> (bool, bool, bool, bool) {
+        (
+            self.operation_id.is_some(),
+            self.module_id.is_some(),
+            self.binding_id.is_some(),
+            self.task_id.is_some(),
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScopedFilter {
+    pub scope: FilterScope,
+    pub level: FilterLevel,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FilterError {
+    TooManyScopes,
+}
+
+const MAX_SCOPED_FILTERS: usize = 64;
 
 /// Cloneable, per-owner producer with no global state or mandatory install.
 #[derive(Clone)]
@@ -479,6 +681,7 @@ impl Producer {
             inner: Arc::new(Inner {
                 config,
                 line_observer,
+                scoped_filters: Mutex::new(Vec::new()),
                 sender: OnceLock::new(),
                 state: Arc::new(AtomicU8::new(STATE_UNSTARTED)),
                 next_sequence: AtomicU64::new(0),
@@ -494,14 +697,44 @@ impl Producer {
         if !self.inner.config.enabled {
             return EmitResult::Disabled;
         }
+        if !self.allows(&record) {
+            return EmitResult::Disabled;
+        }
         let sequence = next_sequence(&self.inner.next_sequence);
-        let schema_version = if record.has_extended_correlation() {
-            3
+        let include_correlation = record.has_extended_correlation();
+        let text_capture_enabled = if self.inner.line_observer.is_some()
+            && record.text.is_some()
+            && let Some(policy) = self.inner.config.text_capture_policy.as_ref()
+        {
+            catch_unwind(AssertUnwindSafe(|| {
+                policy(
+                    record.severity,
+                    record.kind,
+                    record.module_id.as_ref().map(|value| value.0.as_str()),
+                    record.client_id.as_ref().map(|value| value.0.as_str()),
+                    record.operation_id.as_ref().map(|value| value.0.as_str()),
+                )
+            }))
+            .unwrap_or(false)
         } else {
-            2
+            false
         };
-        let include_correlation = schema_version == 3;
-        let wire = WireRecord {
+        let redacted_text = if text_capture_enabled {
+            record.text.as_deref().and_then(|raw_text| {
+                if raw_text.len() > MAX_TEXT_INPUT_BYTES {
+                    return None;
+                }
+                let redactor = self.inner.config.text_redactor?;
+                catch_unwind(AssertUnwindSafe(|| redactor(raw_text)))
+                    .ok()
+                    .flatten()
+                    .filter(|text| text.len() <= MAX_REDACTED_TEXT_BYTES)
+            })
+        } else {
+            None
+        };
+        let schema_version = if include_correlation { 3 } else { 2 };
+        let mut wire = WireRecord {
             schema_version,
             sequence,
             occurred_at_unix_ms: unix_time_ms(),
@@ -555,6 +788,7 @@ impl Producer {
             } else {
                 None
             },
+            redacted_text: None,
         };
         let mut bytes = match serde_json::to_vec(&wire) {
             Ok(bytes) => bytes,
@@ -571,14 +805,51 @@ impl Producer {
         bytes.push(b'\n');
         let byte_count = bytes.len() as u64;
 
-        if self.inner.counters.sink_failed.load(Ordering::Acquire) {
+        // The stderr line stays metadata-only. The observer receives the
+        // schema-4 variant only after the live scope policy has opted in and
+        // Atlas has redacted the bounded input. Raw text is never serialized.
+        let observer_bytes = if let Some(redacted_text) = redacted_text.as_deref() {
+            wire.schema_version = 4;
+            wire.redacted_text = Some(redacted_text);
+            let mut observer_bytes = match serde_json::to_vec(&wire) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    record_drop(&self.inner.counters, 1, byte_count);
+                    return EmitResult::Dropped(DropReason::SerializationFailure);
+                }
+            };
+            let observer_line_bytes = observer_bytes.len().saturating_add(1);
+            if observer_line_bytes > self.inner.config.max_record_bytes {
+                None
+            } else {
+                observer_bytes.push(b'\n');
+                Some(observer_bytes)
+            }
+        } else {
+            None
+        };
+        let queued_bytes = (bytes.len() as u64).saturating_add(
+            observer_bytes
+                .as_ref()
+                .map_or(0, |bytes| bytes.len() as u64),
+        );
+        if bytes.len() > self.inner.config.max_record_bytes
+            || observer_bytes
+                .as_ref()
+                .is_some_and(|bytes| bytes.len() > self.inner.config.max_record_bytes)
+        {
             record_drop(&self.inner.counters, 1, byte_count);
+            return EmitResult::Dropped(DropReason::RecordTooLarge);
+        }
+
+        if self.inner.counters.sink_failed.load(Ordering::Acquire) {
+            record_drop(&self.inner.counters, 1, queued_bytes);
             return EmitResult::Dropped(DropReason::RecorderUnavailable);
         }
         let sender = match self.ensure_writer() {
             Ok(sender) => sender,
             Err(reason) => {
-                record_drop(&self.inner.counters, 1, byte_count);
+                record_drop(&self.inner.counters, 1, queued_bytes);
                 return EmitResult::Dropped(reason);
             }
         };
@@ -588,34 +859,37 @@ impl Producer {
             self.inner.config.queue_records as u64,
             1,
         ) {
-            record_drop(&self.inner.counters, 1, byte_count);
+            record_drop(&self.inner.counters, 1, queued_bytes);
             return EmitResult::Dropped(DropReason::QueueFull);
         }
         if !reserve(
             &self.inner.counters.pending_bytes,
             self.inner.config.queue_bytes as u64,
-            byte_count,
+            queued_bytes,
         ) {
             atomic_sub(&self.inner.counters.pending_records, 1);
-            record_drop(&self.inner.counters, 1, byte_count);
+            record_drop(&self.inner.counters, 1, queued_bytes);
             return EmitResult::Dropped(DropReason::QueueFull);
         }
-        let queued = Queued { bytes };
+        let queued = Queued {
+            bytes,
+            observer_bytes,
+        };
         match sender.try_send(queued) {
             Ok(()) => {
                 atomic_add(&self.inner.counters.enqueued_records, 1);
                 EmitResult::Queued
             }
             Err(TrySendError::Full(queued)) => {
-                finish_pending(&self.inner.counters, byte_count);
-                record_drop(&self.inner.counters, 1, byte_count);
+                finish_pending(&self.inner.counters, queued_bytes);
+                record_drop(&self.inner.counters, 1, queued_bytes);
                 drop(queued);
                 EmitResult::Dropped(DropReason::QueueFull)
             }
             Err(TrySendError::Disconnected(queued)) => {
-                finish_pending(&self.inner.counters, byte_count);
+                finish_pending(&self.inner.counters, queued_bytes);
                 mark_failed(&self.inner.counters, &self.inner.state);
-                record_drop(&self.inner.counters, 1, byte_count);
+                record_drop(&self.inner.counters, 1, queued_bytes);
                 drop(queued);
                 EmitResult::Dropped(DropReason::RecorderUnavailable)
             }
@@ -649,6 +923,43 @@ impl Producer {
             startup_failures: load(&self.inner.counters.startup_failures),
             observer_panics: load(&self.inner.counters.observer_panics),
         }
+    }
+
+    /// Atomically replace the bounded set of exact Store-owned scopes. The
+    /// replacement is in-memory only and therefore safe to call after the
+    /// durable meta transaction commits or while a recorder is idle.
+    pub fn replace_scoped_filters(&self, filters: Vec<ScopedFilter>) -> Result<(), FilterError> {
+        if filters.len() > MAX_SCOPED_FILTERS {
+            return Err(FilterError::TooManyScopes);
+        }
+        let mut current = self
+            .inner
+            .scoped_filters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *current = filters;
+        Ok(())
+    }
+
+    pub fn scoped_filter_count(&self) -> usize {
+        self.inner
+            .scoped_filters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    fn allows(&self, record: &Record) -> bool {
+        let filters = self
+            .inner
+            .scoped_filters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        filters
+            .iter()
+            .filter(|filter| filter.scope.matches(record))
+            .max_by_key(|filter| filter.scope.specificity())
+            .map_or(true, |filter| filter.level.allows(record.severity))
     }
 
     /// Wait for currently admitted diagnostics and line-observer callbacks to
@@ -741,7 +1052,7 @@ impl Producer {
                     // Keep the failed worker parked on recv and account every
                     // admitted record until producers are dropped. No retry timer.
                     while let Ok(item) = receiver.recv() {
-                        let bytes = item.bytes.len() as u64;
+                        let bytes = item.pending_bytes();
                         finish_pending(&counters, bytes);
                         record_drop(&counters, 1, bytes);
                     }
@@ -830,15 +1141,19 @@ fn writer_loop(
     let mut sink_failed = false;
     while let Ok(item) = receiver.recv() {
         let byte_count = item.bytes.len() as u64;
-        *active_bytes = Some(byte_count);
+        let pending_byte_count = item.pending_bytes();
+        *active_bytes = Some(pending_byte_count);
         if let Some(observer) = &line_observer
-            && catch_unwind(AssertUnwindSafe(|| observer(&item.bytes))).is_err()
+            && catch_unwind(AssertUnwindSafe(|| {
+                observer(item.observer_bytes.as_deref().unwrap_or(&item.bytes))
+            }))
+            .is_err()
         {
             atomic_add(&counters.observer_panics, 1);
         }
         if sink_failed {
-            finish_pending(counters, byte_count);
-            record_drop(counters, 1, byte_count);
+            finish_pending(counters, pending_byte_count);
+            record_drop(counters, 1, pending_byte_count);
             *active_bytes = None;
             continue;
         }
@@ -850,13 +1165,13 @@ fn writer_loop(
             Ok(()) => {
                 atomic_add(&counters.written_records, 1);
                 atomic_add(&counters.written_bytes, byte_count);
-                finish_pending(counters, byte_count);
+                finish_pending(counters, pending_byte_count);
             }
             Err(_) => {
                 mark_failed(counters, state);
                 sink_failed = true;
-                finish_pending(counters, byte_count);
-                record_drop(counters, 1, byte_count);
+                finish_pending(counters, pending_byte_count);
+                record_drop(counters, 1, pending_byte_count);
             }
         }
         *active_bytes = None;

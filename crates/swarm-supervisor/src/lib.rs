@@ -9,6 +9,7 @@ pub mod control;
 mod descriptor;
 mod module_link;
 pub mod observation;
+pub mod standalone;
 mod supervisor;
 
 pub use control::{
@@ -26,6 +27,10 @@ pub use descriptor::{
 pub use module_link::module_contract_claim;
 pub use observation::{
     ModuleEffectCertainty, ModuleFailureStage, ModuleSupervisorObservation, ModuleSupervisorPhase,
+};
+pub use standalone::{
+    LaunchConfigProvider, StandaloneLaunchConfig, StandaloneSupervisor, StandaloneSupervisorConfig,
+    SupervisorBootstrap,
 };
 pub use supervisor::{
     AdmissionState, DemandCause, DemandLease, FailureSummary, KernelFault, LifecycleState,

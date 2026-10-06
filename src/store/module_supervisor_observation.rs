@@ -686,9 +686,11 @@ fn diagnostic_for_transition(
         }
         _ => return None,
     };
+    let diagnostic_text = diagnostic_text_for_transition(observation);
     let mut record = Record::new(severity, kind, phase)
         .with_component(Some(Component::ModuleSupervisor))
         .with_code(code)
+        .with_client_id(operation_link.and_then(|link| link.owner_id.as_deref()))
         .with_binding_id(Some(&observation.scope.binding_id))
         .with_binding_generation(Some(observation.scope.generation))
         .with_operation_id(operation_link.map(|link| link.operation_id.as_str()))
@@ -703,7 +705,36 @@ fn diagnostic_for_transition(
             .with_task_id(link.task_id.as_deref())
             .with_attempt_id(link.attempt_id.as_deref());
     }
+    if let Some(text) = diagnostic_text.as_deref() {
+        record = record.with_text(Some(text));
+    }
     Some(record)
+}
+
+/// Render only closed supervisor status fields. The helper never includes
+/// native stdout/stderr, prompts, request headers, credentials, or Store JSON.
+fn diagnostic_text_for_transition(observation: &ModuleSupervisorObservation) -> Option<String> {
+    if !matches!(
+        observation.phase,
+        ModuleSupervisorPhase::Exited
+            | ModuleSupervisorPhase::ExitedProven
+            | ModuleSupervisorPhase::RestartBackoff
+    ) && observation.error_code.is_none()
+        && observation.stage.is_none()
+    {
+        return None;
+    }
+    Some(format!(
+        "module supervisor status: phase={} effect_certainty={} stage={} error_code={} unresolved_operations={}",
+        observation.phase.as_str(),
+        observation.effect_certainty.as_str(),
+        observation
+            .stage
+            .map(ModuleFailureStage::as_str)
+            .unwrap_or("none"),
+        observation.error_code.as_deref().unwrap_or("none"),
+        observation.unknown_operation_count,
+    ))
 }
 
 fn record_lifecycle_trigger(
@@ -1491,6 +1522,7 @@ struct ValidatedOperationLink {
     operation_id: String,
     task_id: Option<String>,
     attempt_id: Option<String>,
+    owner_id: Option<String>,
 }
 
 fn validate_operation_ids(
@@ -1503,19 +1535,40 @@ fn validate_operation_ids(
         && !observation.unknown_operation_ids_truncated;
     let mut exact_link = None;
     for operation_id in &observation.unknown_operation_ids {
-        let row: Option<(String, Option<String>, Option<String>, Option<String>)> = tx
+        let row: Option<(
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )> = tx
             .query_row(
-                "SELECT o.state,o.task_id,o.attempt_id,a.task_id \
-                 FROM operations o LEFT JOIN attempts a \
-                   ON a.attempt_id=o.attempt_id AND a.binding_id=o.binding_id \
-                     AND a.binding_generation=o.binding_generation \
-                 WHERE o.operation_id=?1 AND o.binding_id=?2 \
-                   AND o.binding_generation=?3",
+                "SELECT o.state,
+                        o.task_id,
+                        o.attempt_id,
+                        a.task_id,
+                        a.owner_id
+                   FROM operations o
+                   LEFT JOIN attempts a
+                     ON a.attempt_id=o.attempt_id
+                    AND a.binding_id=o.binding_id
+                    AND a.binding_generation=o.binding_generation
+                  WHERE o.operation_id=?1
+                    AND o.binding_id=?2
+                    AND o.binding_generation=?3",
                 params![operation_id, observation.scope.binding_id, generation],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .optional()?;
-        let Some((state, operation_task_id, attempt_id, attempt_task_id)) = row else {
+        let Some((state, operation_task_id, attempt_id, attempt_task_id, owner_id)) = row else {
             return Err(Error::new(
                 "MODULE_OBSERVATION_OPERATION_SCOPE",
                 "listed Operation is absent or outside the exact binding generation",
@@ -1554,6 +1607,7 @@ fn validate_operation_ids(
                 operation_id: operation_id.clone(),
                 task_id,
                 attempt_id,
+                owner_id,
             });
         }
     }

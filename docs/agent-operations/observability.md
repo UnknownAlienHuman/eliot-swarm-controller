@@ -27,6 +27,19 @@ to trace must not silently enable raw prompts, tool arguments, environment dumps
 auth headers, account data or credentials. Hidden reasoning unavailable from a
 native API is not a logging feature and must not be fabricated.
 
+The current observer source supports metadata by default and bounded
+Atlas-redacted text for selected module-supervisor lifecycle diagnostics. Live
+config schema 3 adds `content: "metadata" | "redacted_text"` and optional
+scoped content overrides; schema 1 and 2 remain metadata-only. Redacted native
+frames are explicitly unsupported until a real bounded frame source exists.
+
+Managers can use `logging.get` and `logging.set` to inspect and save their own
+diagnostic scope policy without a GM session. The initial API supports metadata
+content and durable absolute TTL; connecting live expiry, higher detail levels,
+and Manager-selected redacted text to the recorder remains source work in
+progress. The operator-pinned schema-3 observer file can already select bounded
+redacted supervisor status text.
+
 Target configuration example (proposed schema; not accepted by current Config):
 
 ```toml

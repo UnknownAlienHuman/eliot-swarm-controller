@@ -396,6 +396,30 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
         "One durable operation projection."
     ),
     entry!(
+        "logging.get",
+        Monitoring,
+        MANAGER_ONLY_AUDIENCES,
+        Searchable,
+        "Read one ordinary Manager's client, Task/Attempt, owned Operation, binding route, or retained module diagnostic policy and live Producer status.",
+        "Use when reconciling bounded diagnostic detail for an authenticated Manager-owned scope; Task/Attempt context is inherited from an owned route when present.",
+        &[
+            "logging",
+            "diagnostic",
+            "telemetry",
+            "level",
+            "metadata",
+            "filter"
+        ],
+        &[
+            "optional client_id",
+            "optional Task/Attempt selectors",
+            "optional operation_id",
+            "optional binding_id + binding_generation",
+            "optional module_id"
+        ],
+        "Bounded policy and runtime metadata only; no raw capture, text, frames, credentials, or cross-principal state."
+    ),
+    entry!(
         "operation.list",
         Monitoring,
         OBSERVER_AUDIENCES,
@@ -1655,6 +1679,31 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
             "client_request_id"
         ],
         "One guarded configuration update; enabling dispatch does not start a model turn."
+    ),
+    entry!(
+        "logging.set",
+        Monitoring,
+        MANAGER_ONLY_AUDIENCES,
+        ManualOnly,
+        "Persist one metadata-only diagnostic level for the authenticated ordinary Manager's client, Task/Attempt, owned Operation, binding route, or retained module scope.",
+        "Use after reading logging.get when the Manager owns the selected scope; an optional bounded ttl_seconds stores an absolute expiry. Redacted text and native frames require an installed redactor.",
+        &[
+            "logging",
+            "set",
+            "diagnostic",
+            "telemetry",
+            "level",
+            "metadata",
+            "filter"
+        ],
+        &[
+            "level",
+            "content=metadata",
+            "optional scope selector",
+            "optional ttl_seconds",
+            "client_request_id"
+        ],
+        "One durable Store meta policy and after-commit Producer reload; recorder file selection and retention remain the existing swarm-observer policy."
     ),
     entry!(
         "event.emit",

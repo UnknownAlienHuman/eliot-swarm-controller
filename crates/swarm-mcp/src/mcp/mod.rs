@@ -542,6 +542,21 @@ static TOOLS: &[(bool, ToolSpec)] = &[
         &["operation_id"],
     ),
     read(
+        "logging.get",
+        "Read the authenticated ordinary Manager's metadata diagnostic policy for its client, exact current Task/Attempt, owned Operation, binding route, or retained module descriptor, plus the live Producer projection.",
+        &[
+            f("client_id", SN),
+            f("task_id", SN),
+            f("task_revision", IN),
+            f("attempt_id", SN),
+            f("operation_id", SN),
+            f("binding_id", SN),
+            f("binding_generation", IN),
+            f("module_id", SN),
+        ],
+        &[],
+    ),
+    read(
         "operation.list",
         "Page operations, optionally filtered by state.",
         &[f("after", I), f("limit", I), f("state", S)],
@@ -801,6 +816,24 @@ static TOOLS: &[(bool, ToolSpec)] = &[
         "Apply a revision-checked Manager-owned automation plan. Preview first and pass its digest when available; activation does not start a model turn.",
         &[f("project_id", S), f("changes", A), f("preview_digest", SN)],
         &["project_id", "changes"],
+    ),
+    mutation(
+        "logging.set",
+        "Persist one metadata-only diagnostic level for the authenticated ordinary Manager's client, exact current Task/Attempt, owned Operation, binding route, or retained module descriptor and apply it to the live Producer after commit.",
+        &[
+            f("client_id", SN),
+            f("task_id", SN),
+            f("task_revision", IN),
+            f("attempt_id", SN),
+            f("operation_id", SN),
+            f("binding_id", SN),
+            f("binding_generation", IN),
+            f("module_id", SN),
+            f("level", S),
+            f("content", S),
+            f("ttl_seconds", IN),
+        ],
+        &["level", "content"],
     ),
     mutation(
         "event.emit",
@@ -1606,6 +1639,63 @@ fn refine_input_schema(method: &str, schema: &mut Value) {
     }
     let properties = &mut schema["properties"];
     match method {
+        "logging.get" | "logging.set" => {
+            for field in [
+                "client_id",
+                "task_id",
+                "attempt_id",
+                "operation_id",
+                "binding_id",
+                "module_id",
+            ] {
+                properties[field] = json!({
+                    "type":["string","null"],
+                    "minLength":1,
+                    "maxLength":128,
+                    "pattern":"^[A-Za-z0-9._:-]+$"
+                });
+            }
+            properties["task_revision"] = json!({
+                "type":["integer","null"],
+                "minimum":1,
+                "maximum":9223372036854775807_i64
+            });
+            properties["binding_generation"] = json!({
+                "type":["integer","null"],
+                "minimum":1,
+                "maximum":9223372036854775807_i64
+            });
+            if method == "logging.set" {
+                properties["level"] = json!({
+                    "type":"string",
+                    "enum":["off","error","warn","info","debug","trace"]
+                });
+                properties["content"] = json!({"const":"metadata"});
+                properties["ttl_seconds"] = json!({
+                    "type":["integer","null"],
+                    "minimum":1,
+                    "maximum":86400
+                });
+            }
+            append_all_of(
+                schema,
+                json!({
+                    "oneOf":[
+                        {"not":{"anyOf":[{"required":["task_id"]},{"required":["task_revision"]},{"required":["attempt_id"]}]}},
+                        {"required":["task_id","task_revision","attempt_id"]}
+                    ]
+                }),
+            );
+            append_all_of(
+                schema,
+                json!({
+                    "oneOf":[
+                        {"not":{"anyOf":[{"required":["binding_id"]},{"required":["binding_generation"]}]}},
+                        {"required":["binding_id","binding_generation"]}
+                    ]
+                }),
+            );
+        }
         "module.catalog.get" => {
             properties["after"] =
                 json!({"type":"integer","minimum":0,"maximum":9223372036854775807_i64});
@@ -3534,6 +3624,7 @@ mod tests {
             "task.acceptance",
             "attempt.get",
             "operation.get",
+            "logging.get",
             "operation.list",
             "agent.state",
             "agent.list",
@@ -3618,6 +3709,8 @@ mod tests {
             "review.assign",
             "review.submit",
             "automation.config.apply",
+            "logging.set",
+            "event.emit",
             "bus.consumer.admit",
             "automation.config.transfer",
             "schedule.run_now",
@@ -3651,11 +3744,11 @@ mod tests {
         .into_iter()
         .collect();
         assert_eq!(methods, expected);
-        assert_eq!(TOOLS.len(), 124);
-        assert_eq!(TOOLS.iter().filter(|(read_only, _)| *read_only).count(), 56);
+        assert_eq!(TOOLS.len(), 127);
+        assert_eq!(TOOLS.iter().filter(|(read_only, _)| *read_only).count(), 57);
         assert_eq!(
             TOOLS.iter().filter(|(read_only, _)| !*read_only).count(),
-            68
+            70
         );
     }
 

@@ -16,8 +16,9 @@ const COMMAND_RUST_ARTIFACT_ID: &str = "eliot-command.rust-headless.1";
 const ANTIGRAVITY_RUST_ARTIFACT_ID: &str = "eliot-antigravity.rust-headless.1";
 const ANTIGRAVITY_RUST_MODEL_ID: &str = "gemini-3.8-flash-high";
 
-/// Trusted local recorder settings. This controls only optional diagnostic
-/// metadata; it never disables or redirects Store/business receipts.
+/// Trusted local recorder settings. This controls optional diagnostic
+/// metadata and explicitly selected redacted text; it never disables or
+/// redirects Store/business receipts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ObservabilityConfig {

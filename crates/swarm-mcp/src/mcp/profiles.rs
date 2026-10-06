@@ -113,6 +113,8 @@ pub(super) fn exposes_method(profile: McpToolProfile, method: &str) -> bool {
                 | "attempt.release"
                 | "attempt.bind_producer"
                 | "operation.cancel"
+                | "logging.get"
+                | "logging.set"
                 | "agent.open"
                 | "agent.send"
                 | "agent.reply"
