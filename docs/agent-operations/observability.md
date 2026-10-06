@@ -1,6 +1,8 @@
 # Observability — Adjustable Logs and Live Agent Monitoring
 
-Owner direction: 2026-10-05. **Target contract; not implemented by this documentation PR.**
+Source status (2026-10-05): Section 2 describes the implemented recorder and
+Manager policy path. Sections 1 and 3–6 retain architecture, target, or
+acceptance guidance; they do not claim every listed projection or metric exists.
 Use the module/process boundaries in [Modular Runtime](modularity.md).
 Existing receipts, `report.delta`, attention/capacity, family observations and
 Doctor remain useful foundations; this document does not claim they are absent.
@@ -43,7 +45,7 @@ reload; it can raise detail above the observer's default Info level for that
 exact scope. Explicit operator `off`, excluded kinds, or a scoped operator
 metadata override still fail closed. A scoped Manager `redacted_text` choice
 overrides the observer's global metadata default, but Atlas redaction occurs
-before telemetry serialization or either queue, and the observer still applies
+before redacted-text serialization and either queue, and the observer still applies
 its bounded file selector, retention, and TTL. Redacted native frames remain
 unsupported because there is no bounded native-frame producer.
 
@@ -55,32 +57,110 @@ probe passes the current operator policy. A passing probe means policy admission
 not proof of a recorder file write; configured operator files remain fail-closed
 until the existing recorder worker validates and publishes their first snapshot.
 
-Target configuration example (proposed schema; not accepted by current Config):
+### Host recorder configuration
+
+The host accepts only these fields under `[observability]`; level and content
+live in the separate JSON policy file, not in TOML. The recorder is disabled by
+default. Relative paths resolve against the controller config file, and an
+omitted `directory` uses `<storage.data_dir>/diagnostics`.
 
 ```toml
 [observability]
 enabled = true
-level = "info"
-content = "metadata"
+live_config_file = "diagnostics-live.json"
 queue_bytes = 8388608
+queue_records = 256
 max_record_bytes = 65536
 file_segment_bytes = 16777216
 retention_bytes = 134217728
 retention_days = 7
-metrics_interval_ms = 2000
-
-[observability.overrides.opencode_debug]
-module = "opencode"
-level = "debug"
-content = "redacted_text"
-ttl_seconds = 600
 ```
 
-Defaults above are initial engineering budgets, not measured fleet sizing. Bounds
-are validated, configurable and reported. `enabled` concerns the optional recorder,
-not the durable event journal. Resource sampling runs only for active selected
-subjects/observers; merely saving this configuration does not load an agent.
+The exact host `ObservabilityConfig` fields are `enabled`, optional `directory`
+and `live_config_file`, `queue_records`, `queue_bytes`, `max_record_bytes`,
+`file_segment_bytes`, `retention_bytes`, and `retention_days`. The Host maps
+these to the observer's `RecorderConfig` (`file_segment_bytes` becomes
+`segment_bytes`) and creates a `LineObserver`; the callback forwards the exact
+scoped Manager policy to `HostRecorder`. There is no separate `ObserverOptions`
+configuration object. `Store` installs the Atlas text redactor and observer
+text-capture policy before constructing the Producer. Raw text is never
+serialized: Atlas redaction precedes observer-line text serialization and either
+queue admission, while ordinary stderr remains metadata-only.
 
+### Pinned operator live policy
+
+The optional JSON file is read by the existing recorder writer after lazy
+startup. Schema 3 is the first version with content controls; schemas 1 and 2
+remain metadata-only. Replace `scope_id` with the exact canonical local data
+root path. This sample uses all supported kinds and a bounded, expiring
+operation override:
+
+```json
+{
+  "schema_version": 3,
+  "config_version": 1,
+  "scope_id": "C:\\path\\to\\canonical-data-root",
+  "level": "info",
+  "content": "metadata",
+  "included_kinds": [
+    "client_disconnected",
+    "store_operation_failed",
+    "module_started",
+    "module_stopped",
+    "agent_delivery_failed",
+    "recorder_failure"
+  ],
+  "overrides": [
+    {
+      "operation_id": "op_example",
+      "level": "debug",
+      "content": "redacted_text",
+      "expires_at_unix_ms": 4102444800000
+    }
+  ],
+  "retention_bytes": 134217728,
+  "retention_days": 7
+}
+```
+
+Only one selector (`module_id`, `client_id`, or `operation_id`) is accepted per
+override; expiry is an absolute Unix timestamp in milliseconds. The live file
+is capped at 16 KiB, 64 overrides, and 128 bytes per selector. Explicit operator
+`off`, excluded kinds, or a matching metadata-only content override remain
+fail-closed restrictions.
+
+### Manager tool
+
+An ordinary registered Manager discovers the `logging_get` and `logging_set`
+tools in the typed Manager MCP profile; they dispatch the `logging.get` and
+`logging.set` application methods. Read `logging_get` for the target scope
+first; `logging_set` accepts the typed `level`, `content`, optional exact scope
+selectors, and optional `ttl_seconds` from 1 through 86,400. Omitting selectors
+targets the authenticated Manager's own client scope. For example, a temporary
+client-scope opt-in is:
+
+```json
+{
+  "client_request_id": "diagnostic-manager-debug-001",
+  "level": "debug",
+  "content": "redacted_text",
+  "ttl_seconds": 600
+}
+```
+
+The MCP tool arguments are flat; use the same fields when calling the Store
+method directly. Task policies require the exact `task_id`, `task_revision`,
+and `attempt_id` together; binding policies require `binding_id` and
+`binding_generation` together. A successful mutation commits durably, then
+reloads the existing Producer; its policy carries an absolute expiry checked on
+each emission. `logging.get` distinguishes source capability and runtime
+availability from proof that any record reached disk. Native frames remain
+unsupported because no bounded native-frame producer exists.
+
+The queue and retention defaults are bounded engineering settings, not measured
+fleet sizing. Bounds are validated. `enabled` concerns the optional recorder,
+not the durable event journal. Merely saving a Manager policy does not start an
+agent or native session.
 The supervisor publishes the effective logging configuration revision to live
 producers; each reports applied/unsupported/error for that revision. Validate a
 whole change before atomically swapping a process's filter. A manager can narrow

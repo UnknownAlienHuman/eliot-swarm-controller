@@ -389,4 +389,17 @@ version = '0.1.0'
 
 The host verifies the executable path and image digest, including before Store Go. `artifact_id` and `version` are retained evidence labels; they are not read from binary metadata. A bad path or digest fails that launch without switching to the legacy worker.
 
-The host `[observability]` recorder also defaults disabled. Its current fields are `enabled`, optional `directory` and `live_config_file`, `queue_records`, `queue_bytes`, `max_record_bytes`, `file_segment_bytes`, `retention_bytes`, and `retention_days`; omitted values use the current config defaults. Relative paths resolve beside the controller config. The optional pinned JSON live-config file sets diagnostic severity/category filters and retention when the lazy recorder runs. This is bounded metadata recording, not prompt, tool-argument, environment, or credential capture. The standalone `swarm-observer` binary takes an absolute private directory and optional `--queue-records`, `--queue-bytes`, `--max-record-bytes`, `--segment-bytes`, `--retention-bytes`, and `--retention-days`; it reads newline-delimited diagnostic records from stdin.
+The host `[observability]` recorder defaults disabled. Its current fields are
+`enabled`, optional `directory` and `live_config_file`, `queue_records`,
+`queue_bytes`, `max_record_bytes`, `file_segment_bytes`, `retention_bytes`, and
+`retention_days`; omitted values use the current config defaults. Relative paths
+resolve beside the controller config, while the default recording directory is
+`<storage.data_dir>/diagnostics`. The optional pinned JSON live-config schema 3
+sets level, content mode, included diagnostic kinds, exact one-selector overrides,
+and retention when the lazy recorder runs; schemas 1 and 2 remain metadata-only.
+Metadata is the default. Only explicitly selected bounded module-supervisor
+lifecycle text may be Atlas-redacted and captured. Raw prompts, tool arguments,
+environment values, authorization headers, credentials, and native frames are
+not captured.
+
+The standalone `swarm-observer` binary takes an absolute private directory and optional `--queue-records`, `--queue-bytes`, `--max-record-bytes`, `--segment-bytes`, `--retention-bytes`, and `--retention-days`; it reads newline-delimited diagnostic records from stdin.

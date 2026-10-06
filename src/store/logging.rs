@@ -253,6 +253,16 @@ pub(super) fn load_filters(db: &Connection) -> Result<Vec<swarm_telemetry::Scope
         filters.push(swarm_telemetry::ScopedFilter {
             scope,
             level: policy.level.telemetry(),
+            content: match policy.content.as_str() {
+                "metadata" => swarm_telemetry::FilterContent::Metadata,
+                "redacted_text" => swarm_telemetry::FilterContent::RedactedText,
+                _ => {
+                    return Err(Error::new(
+                        "LOGGING_POLICY_CORRUPT",
+                        "retained diagnostic policy content is invalid",
+                    ));
+                }
+            },
             // The Producer owns expiry enforcement on each emission. Keeping
             // the absolute timestamp in the immutable snapshot avoids a
             // timer/worker and remains correct across Store restarts.

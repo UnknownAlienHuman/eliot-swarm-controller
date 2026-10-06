@@ -6,6 +6,7 @@
 //! pending-intent writer. It owns no database, queue, or second cursor.
 
 use super::*;
+use std::collections::BTreeSet;
 
 const MAX_BUS_SCAN: usize = crate::automation::intake::MAX_INTAKE_PAGE;
 const MAX_BUS_PAGE_ITEMS: usize = 32;
@@ -1175,6 +1176,373 @@ fn module_event_task_scopes(
     }
 }
 
+fn module_event_operation_link_owner(
+    link: crate::automation::authorization::AnyOnBehalfOperationLink,
+) -> (
+    String,
+    String,
+    String,
+    String,
+    Option<(String, i64, String)>,
+) {
+    use crate::automation::authorization::AnyOnBehalfOperationLink as Link;
+    match link {
+        Link::Review(link)
+        | Link::Acceptance(link)
+        | Link::Publication(link)
+        | Link::CronCheckRun(link)
+        | Link::GoalProgression(link)
+        | Link::ScriptRun(link)
+        | Link::ScriptEffect(link) => (
+            link.operation_id,
+            link.technical_requester_id,
+            link.effective_manager_id,
+            link.project_id,
+            None,
+        ),
+        Link::WorkDispatch(link) => (
+            link.operation_id,
+            link.technical_requester_id,
+            link.effective_manager_id,
+            link.project_id,
+            Some((
+                link.automation_id,
+                link.automation_revision,
+                link.semantic_slot_id,
+            )),
+        ),
+        Link::Repair(link) => (
+            link.operation_id.clone(),
+            link.technical_requester_id.clone(),
+            link.effective_manager_id.clone(),
+            link.project_id.clone(),
+            None,
+        ),
+    }
+}
+
+/// Resolve only an Operation's retained Manager owner. Direct callers remain
+/// direct; technical callers require a validated retained automation link or
+/// the exact immutable WorkDispatch launch ancestry. This carries an owner ID
+/// as provenance data and never constructs a Manager Principal.
+fn module_event_operation_owner(
+    db: &Connection,
+    operation_id: &str,
+    project_id: &str,
+    expected_owner_manager_id: &str,
+) -> Result<String> {
+    fn resolve(
+        db: &Connection,
+        operation_id: &str,
+        project_id: &str,
+        expected_owner_manager_id: &str,
+        seen: &mut BTreeSet<String>,
+        depth: u8,
+    ) -> Result<String> {
+        let unauthorized = |message: &str| Error::new("SCRIPT_EVENT_SOURCE_UNAUTHORIZED", message);
+        if depth > 3 || !seen.insert(operation_id.to_owned()) {
+            return Err(unauthorized(
+                "Module event Operation ancestry is cyclic, ambiguous, or too deep",
+            ));
+        }
+        let operation: Option<(
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+        )> = db
+            .query_row(
+                "SELECT method,caller_id,task_id,attempt_id,binding_id,binding_generation,\
+                        prerequisite_operation_id,\
+                        json_type(effective_request_json,'$.automation_on_behalf'),\
+                        json_type(effective_request_json,'$.on_behalf'),\
+                        json_extract(effective_request_json,'$.launch_manifest.actor.kind'),\
+                        json_extract(effective_request_json,'$.launch_manifest.actor.client_id'),\
+                        json_extract(effective_request_json,'$.launch_manifest.actor.effective_manager_id'),\
+                        json_extract(effective_request_json,'$.launch_manifest.actor.automation_id'),\
+                        json_extract(effective_request_json,'$.launch_manifest.actor.automation_revision'),\
+                        json_extract(effective_request_json,'$.launch_manifest.actor.semantic_slot_id'),\
+                        json_extract(effective_request_json,'$.launch_manifest.task.task_id'),\
+                        json_extract(effective_request_json,'$.launch_manifest.task.attempt_id'),\
+                        json_extract(effective_request_json,'$.launch_manifest.binding.binding_id'),\
+                        json_extract(effective_request_json,'$.launch_manifest.binding.generation') \
+                 FROM operations WHERE operation_id=?1",
+                [operation_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                        row.get(11)?,
+                        row.get(12)?,
+                        row.get(13)?,
+                        row.get(14)?,
+                        row.get(15)?,
+                        row.get(16)?,
+                        row.get(17)?,
+                        row.get(18)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            method,
+            caller_id,
+            task_id,
+            attempt_id,
+            binding_id,
+            binding_generation,
+            prerequisite_id,
+            automation_on_behalf_type,
+            on_behalf_type,
+            launch_actor_kind,
+            launch_actor_client_id,
+            launch_actor_manager_id,
+            launch_actor_automation_id,
+            launch_actor_automation_revision,
+            launch_actor_semantic_slot_id,
+            launch_manifest_task_id,
+            launch_manifest_attempt_id,
+            launch_manifest_binding_id,
+            launch_manifest_binding_generation,
+        )) = operation
+        else {
+            return Err(unauthorized("Module event Operation is unavailable"));
+        };
+
+        if let Some(link) = authorization::any_on_behalf_operation_link(db, operation_id)? {
+            let (
+                linked_operation_id,
+                technical_requester_id,
+                owner_id,
+                linked_project_id,
+                work_dispatch_identity,
+            ) = module_event_operation_link_owner(link);
+            if linked_operation_id != operation_id
+                || technical_requester_id != caller_id
+                || linked_project_id != project_id
+                || owner_id != expected_owner_manager_id
+            {
+                return Err(unauthorized(
+                    "Module event Operation retained on-behalf identity does not match its project or caller",
+                ));
+            }
+            if let Some((automation_id, automation_revision, semantic_slot_id)) =
+                work_dispatch_identity
+            {
+                if method != "swarm.launch"
+                    || launch_actor_kind.as_deref() != Some("work_dispatch")
+                    || launch_actor_client_id.as_deref() != Some(caller_id.as_str())
+                    || launch_actor_manager_id.as_deref() != Some(owner_id.as_str())
+                    || launch_actor_automation_id.as_deref() != Some(automation_id.as_str())
+                    || launch_actor_automation_revision != Some(automation_revision)
+                    || launch_actor_semantic_slot_id.as_deref() != Some(semantic_slot_id.as_str())
+                    || task_id
+                        .as_deref()
+                        .is_some_and(|task| launch_manifest_task_id.as_deref() != Some(task))
+                    || attempt_id.as_deref().is_some_and(|attempt| {
+                        launch_manifest_attempt_id.as_deref() != Some(attempt)
+                    })
+                    || binding_id.as_deref().is_some_and(|binding| {
+                        launch_manifest_binding_id.as_deref() != Some(binding)
+                    })
+                    || binding_generation.is_some_and(|generation| {
+                        launch_manifest_binding_generation != Some(generation)
+                    })
+                {
+                    return Err(unauthorized(
+                        "WorkDispatch link and retained launch manifest disagree about the Manager owner",
+                    ));
+                }
+            }
+            return Ok(owner_id);
+        }
+
+        if automation_on_behalf_type.as_deref() == Some("object")
+            || on_behalf_type.as_deref() == Some("object")
+            || launch_actor_kind.as_deref() == Some("work_dispatch")
+        {
+            return Err(unauthorized(
+                "Module event Operation has on-behalf request data without a validated retained owner link",
+            ));
+        }
+
+        if method == "agent.open" {
+            if let Some(parent_id) = prerequisite_id.as_deref() {
+                validate_module_event_launch_open_parent(
+                    db,
+                    operation_id,
+                    parent_id,
+                    &caller_id,
+                    task_id.as_deref(),
+                    attempt_id.as_deref(),
+                    binding_id.as_deref(),
+                    binding_generation,
+                )?;
+                return resolve(
+                    db,
+                    parent_id,
+                    project_id,
+                    expected_owner_manager_id,
+                    seen,
+                    depth + 1,
+                );
+            }
+        }
+
+        if method == "task.dispatch" {
+            if let Some(parent_id) =
+                super::super::launcher_dispatch::historical_parent_for_operation(db, operation_id)?
+            {
+                return resolve(
+                    db,
+                    &parent_id,
+                    project_id,
+                    expected_owner_manager_id,
+                    seen,
+                    depth + 1,
+                );
+            }
+        }
+
+        if caller_id == expected_owner_manager_id {
+            return Ok(caller_id);
+        }
+        Err(unauthorized(
+            "Module event Operation caller has no immutable retained Manager owner proof",
+        ))
+    }
+
+    resolve(
+        db,
+        operation_id,
+        project_id,
+        expected_owner_manager_id,
+        &mut BTreeSet::new(),
+        0,
+    )
+}
+
+fn require_module_event_operation_owner(
+    db: &Connection,
+    operation_id: &str,
+    project_id: &str,
+    expected_owner_manager_id: &str,
+) -> Result<()> {
+    module_event_operation_owner(db, operation_id, project_id, expected_owner_manager_id)?;
+    Ok(())
+}
+
+fn validate_module_event_launch_open_parent(
+    db: &Connection,
+    open_operation_id: &str,
+    parent_operation_id: &str,
+    open_caller_id: &str,
+    task_id: Option<&str>,
+    attempt_id: Option<&str>,
+    binding_id: Option<&str>,
+    binding_generation: Option<i64>,
+) -> Result<()> {
+    let unauthorized = || {
+        Error::new(
+            "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
+            "Module agent.open does not match its retained launch parent",
+        )
+    };
+    let parent: Option<(String, String, Option<String>, Option<String>, Option<String>, Option<i64>, String)> = db
+        .query_row(
+            "SELECT caller_id,method,task_id,attempt_id,binding_id,binding_generation,effective_request_json \
+             FROM operations WHERE operation_id=?1",
+            [parent_operation_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        parent_caller_id,
+        method,
+        parent_task_id,
+        parent_attempt_id,
+        parent_binding_id,
+        parent_generation,
+        effective_raw,
+    )) = parent
+    else {
+        return Err(unauthorized());
+    };
+    let effective: Value = serde_json::from_str(&effective_raw).map_err(|_| unauthorized())?;
+    let manifest = &effective["launch_manifest"];
+    if method != "swarm.launch"
+        || parent_caller_id != open_caller_id
+        || parent_task_id.as_deref() != task_id
+        || parent_attempt_id.as_deref() != attempt_id
+        || parent_binding_id.as_deref() != binding_id
+        || parent_generation != binding_generation
+        || task_id.is_none_or(str::is_empty)
+        || attempt_id.is_none_or(str::is_empty)
+        || binding_id.is_none_or(str::is_empty)
+        || binding_generation.is_none_or(|value| value <= 0)
+        || manifest["task"]["task_id"].as_str() != task_id
+        || manifest["task"]["attempt_id"].as_str() != attempt_id
+        || manifest["binding"]["binding_id"].as_str() != binding_id
+        || manifest["binding"]["generation"].as_i64() != binding_generation
+        || manifest["binding"]["operation_id"].as_str() != Some(open_operation_id)
+    {
+        return Err(unauthorized());
+    }
+    let open_matches_parent: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM operations WHERE operation_id=?1 AND method='agent.open' \
+         AND caller_id=?2 AND prerequisite_operation_id=?3 AND task_id=?4 AND attempt_id=?5 \
+         AND binding_id=?6 AND binding_generation=?7)",
+        params![
+            open_operation_id,
+            open_caller_id,
+            parent_operation_id,
+            task_id,
+            attempt_id,
+            binding_id,
+            binding_generation,
+        ],
+        |row| row.get(0),
+    )?;
+    if !open_matches_parent {
+        return Err(unauthorized());
+    }
+    Ok(())
+}
+
 /// Prove a Module event from its already committed authenticated observation,
 /// immutable binding and descriptor selector, and the unique Manager-owned
 /// `agent.open`. A linked event Operation supplies its own immutable
@@ -1333,13 +1701,13 @@ pub(super) fn require_module_event_source_provenance(
             "Module event binding has no unique retained agent.open source",
         ));
     }
-    let (agent_open_operation_id, caller_id, binding_task_id, binding_attempt_id) = &opens[0];
-    if caller_id != owner_manager_id {
-        return Err(Error::new(
-            "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
-            "Module event binding was opened by another Manager",
-        ));
-    }
+    let (agent_open_operation_id, _caller_id, binding_task_id, binding_attempt_id) = &opens[0];
+    require_module_event_operation_owner(
+        db,
+        agent_open_operation_id,
+        project_id,
+        owner_manager_id,
+    )?;
     let (agent_open_origin, _) = module_event_task_scopes(
         db,
         project_id,
@@ -1377,7 +1745,7 @@ pub(super) fn require_module_event_source_provenance(
             .optional()?;
         let Some((
             retained_operation_id,
-            operation_caller_id,
+            _operation_caller_id,
             operation_binding_id,
             operation_binding_generation,
             operation_task_id,
@@ -1389,8 +1757,8 @@ pub(super) fn require_module_event_source_provenance(
                 "Module event Operation is unavailable",
             ));
         };
+        require_module_event_operation_owner(db, operation_id, project_id, owner_manager_id)?;
         if retained_operation_id != operation_id
-            || operation_caller_id != owner_manager_id
             || operation_binding_id.as_deref() != Some(binding_id.as_str())
             || operation_binding_generation != Some(binding_generation)
         {
@@ -1722,7 +2090,7 @@ pub(super) fn validate_retained_module_event_source(
         .optional()?;
     let Some((
         retained_open_operation_id,
-        caller_id,
+        _caller_id,
         open_task_id,
         open_attempt_id,
         open_binding_id,
@@ -1733,8 +2101,9 @@ pub(super) fn validate_retained_module_event_source(
             "retained Module agent.open source is missing",
         ));
     };
+    require_module_event_operation_owner(db, agent_open_operation_id, project_id, owner_manager_id)
+        .map_err(|_| retained_module_source_corrupt("retained Module agent.open owner changed"))?;
     if retained_open_operation_id != agent_open_operation_id
-        || caller_id != owner_manager_id
         || open_binding_id.as_deref() != Some(binding_id)
         || open_binding_generation != Some(binding_generation)
         || open_task_id.as_ref() != proof_agent_open_task_id.as_ref()
@@ -1787,7 +2156,7 @@ pub(super) fn validate_retained_module_event_source(
             .optional()?;
         let Some((
             retained_operation_id,
-            operation_caller_id,
+            _operation_caller_id,
             operation_binding_id,
             operation_binding_generation,
             operation_task_id,
@@ -1798,8 +2167,11 @@ pub(super) fn validate_retained_module_event_source(
                 "retained Module event Operation is missing",
             ));
         };
+        require_module_event_operation_owner(db, operation_id, project_id, owner_manager_id)
+            .map_err(|_| {
+                retained_module_source_corrupt("retained Module event Operation owner changed")
+            })?;
         if retained_operation_id != operation_id
-            || operation_caller_id != owner_manager_id
             || operation_binding_id.as_deref() != Some(binding_id)
             || operation_binding_generation != Some(binding_generation)
         {
@@ -1994,10 +2366,15 @@ pub(super) fn script_event_invocation_context_for_consumer(
                 let source_scope_matches = operation_task_id.as_deref()
                     == module_scope.source_task_id.as_deref()
                     && operation_attempt_id.as_deref() == module_scope.source_attempt_id.as_deref();
+                require_module_event_operation_owner(
+                    db,
+                    event_operation_id,
+                    &entry.project_id,
+                    owner_manager_id,
+                )?;
                 if operation_binding_id.as_deref() != Some(module_scope.binding_id.as_str())
                     || operation_binding_generation != Some(module_scope.binding_generation)
                     || !source_scope_matches
-                    || caller_id != owner_manager_id
                 {
                     return Err(Error::new(
                         "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
@@ -2221,7 +2598,7 @@ fn require_module_lifecycle_binding_source(
     fact: &crate::store::module_supervisor_observation::VerifiedModuleLifecycleEvent,
 ) -> Result<()> {
     let mut statement = db.prepare(
-        "SELECT caller_id,task_id,attempt_id FROM operations \
+        "SELECT operation_id,caller_id,task_id,attempt_id FROM operations \
          WHERE method='agent.open' AND binding_id=?1 AND binding_generation=?2 \
          ORDER BY created_at_ms,operation_id LIMIT 2",
     )?;
@@ -2229,8 +2606,9 @@ fn require_module_lifecycle_binding_source(
         .query_map(params![fact.binding_id, fact.generation], |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(1)?,
                 row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
             ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -2240,13 +2618,8 @@ fn require_module_lifecycle_binding_source(
             "module lifecycle binding has no unique retained agent.open source",
         ));
     }
-    let (caller_id, task_id, attempt_id) = &opens[0];
-    if caller_id != owner_manager_id {
-        return Err(Error::new(
-            "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
-            "module lifecycle binding was opened by another Manager",
-        ));
-    }
+    let (operation_id, _caller_id, task_id, attempt_id) = &opens[0];
+    require_module_event_operation_owner(db, operation_id, &entry.project_id, owner_manager_id)?;
     match (task_id.as_deref(), attempt_id.as_deref()) {
         (Some(task_id), Some(attempt_id)) => {
             let task = super::tasks::get_task(db, task_id)?;

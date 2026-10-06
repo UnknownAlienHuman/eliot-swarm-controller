@@ -1271,6 +1271,312 @@ fn validate_retained_link(
     Ok(())
 }
 
+/// Recover the immutable launch parent of a retained dispatch without
+/// consulting the current Attempt or the parent's mutable progress/state.
+/// Event-source provenance is historical: a completed launch keeps its
+/// Manager attribution even after the effect-time dispatch validator would
+/// correctly reject another mutation.
+pub(super) fn historical_parent_for_operation(
+    db: &Connection,
+    operation_id: &str,
+) -> Result<Option<String>> {
+    type DispatchRow = (
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        String,
+        String,
+    );
+    let operation: Option<DispatchRow> = db
+        .query_row(
+            "SELECT method,caller_id,task_id,attempt_id,binding_id,binding_generation,\
+                    original_request_json,effective_request_json \
+             FROM operations WHERE operation_id=?1",
+            [operation_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        method,
+        caller_id,
+        task_id,
+        attempt_id,
+        binding_id,
+        binding_generation,
+        original_raw,
+        effective_raw,
+    )) = operation
+    else {
+        return Err(Error::new(
+            "LAUNCH_DISPATCH_LINK_MISSING",
+            "launch dispatch Operation is missing",
+        ));
+    };
+    if method != "task.dispatch" {
+        return Ok(None);
+    }
+
+    let original: Value = serde_json::from_str(&original_raw)?;
+    let effective: Value = serde_json::from_str(&effective_raw)?;
+    let original_parent = match original.get("launch_operation_id") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) => Some(value.as_str()),
+        Some(_) => {
+            return Err(Error::new(
+                "LAUNCH_DISPATCH_LINK_CORRUPT",
+                "dispatch launch parent identity is malformed",
+            ));
+        }
+    };
+    let packet = effective.get("launch_dispatch_packet");
+    match (original_parent, packet) {
+        (None, None) => return Ok(None),
+        (Some(_), Some(_)) => {}
+        _ => {
+            return Err(Error::new(
+                "LAUNCH_DISPATCH_LINK_CORRUPT",
+                "dispatch request and retained launch packet disagree about ancestry",
+            ));
+        }
+    }
+    let parent_operation_id = original_parent
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            Error::new(
+                "LAUNCH_DISPATCH_LINK_CORRUPT",
+                "dispatch launch parent identity is empty",
+            )
+        })?;
+    let Some(packet) = packet else {
+        return Err(Error::new(
+            "LAUNCH_DISPATCH_LINK_CORRUPT",
+            "dispatch launch packet is missing",
+        ));
+    };
+    model::fields(
+        packet,
+        &[
+            "schema_version",
+            "launch_operation_id",
+            "plan_digest",
+            "task",
+            "selection",
+            "purpose",
+            "capability",
+        ],
+    )?;
+    model::fields(
+        &packet["task"],
+        &["task_id", "revision", "attempt_id", "snapshot_digest"],
+    )?;
+    let task_id = task_id
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            Error::new(
+                "LAUNCH_DISPATCH_LINK_CORRUPT",
+                "dispatch Task identity is missing",
+            )
+        })?;
+    let attempt_id = attempt_id
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            Error::new(
+                "LAUNCH_DISPATCH_LINK_CORRUPT",
+                "dispatch Attempt identity is missing",
+            )
+        })?;
+    let binding_id = binding_id
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            Error::new(
+                "LAUNCH_DISPATCH_LINK_CORRUPT",
+                "dispatch binding identity is missing",
+            )
+        })?;
+    let binding_generation = binding_generation
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            Error::new(
+                "LAUNCH_DISPATCH_LINK_CORRUPT",
+                "dispatch binding generation is missing",
+            )
+        })?;
+    let task_revision = packet["task"]["revision"]
+        .as_i64()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            Error::new(
+                "LAUNCH_DISPATCH_LINK_CORRUPT",
+                "dispatch packet Task revision is missing",
+            )
+        })?;
+    let packet_digest = digest_value(packet)?;
+    model::fields(
+        &effective["operation_contract"]["launch_dispatch"],
+        &[
+            "contract_revision",
+            "launch_operation_id",
+            "packet_digest",
+            "completion_condition",
+            "replay_policy",
+        ],
+    )?;
+    if original["attempt_id"] != attempt_id
+        || packet["schema_version"] != 1
+        || packet["launch_operation_id"] != parent_operation_id
+        || packet["task"]["task_id"] != task_id
+        || packet["task"]["attempt_id"] != attempt_id
+        || packet["plan_digest"]
+            .as_str()
+            .is_none_or(|value| !valid_digest(value))
+        || packet["task"]["snapshot_digest"]
+            .as_str()
+            .is_none_or(|value| !valid_digest(value))
+        || effective["operation_contract"]["launch_dispatch"]["contract_revision"]
+            != PACKET_REVISION
+        || effective["operation_contract"]["launch_dispatch"]["launch_operation_id"]
+            != parent_operation_id
+        || effective["operation_contract"]["launch_dispatch"]["packet_digest"] != packet_digest
+        || effective["operation_contract"]["launch_dispatch"]["completion_condition"]
+            != "native_input_admitted"
+        || effective["operation_contract"]["launch_dispatch"]["replay_policy"]
+            != "same_parent_and_packet_only_no_mutation_replay"
+    {
+        return Err(Error::new(
+            "LAUNCH_DISPATCH_LINK_CORRUPT",
+            "dispatch Operation and retained launch packet disagree",
+        ));
+    }
+
+    let link = meta(db, &link_key(operation_id))?.ok_or_else(|| {
+        Error::new(
+            "LAUNCH_DISPATCH_LINK_MISSING",
+            "launch dispatch ancestry is missing",
+        )
+    })?;
+    model::fields(
+        &link,
+        &[
+            "schema_version",
+            "kind",
+            "launch_operation_id",
+            "dispatch_operation_id",
+            "plan_digest",
+            "task_id",
+            "task_revision",
+            "attempt_id",
+            "binding_id",
+            "binding_generation",
+            "packet_digest",
+            "capability_identity_digest",
+            "created_at_ms",
+        ],
+    )?;
+    if link["schema_version"] != 1
+        || link["kind"] != LINK_KIND
+        || link["launch_operation_id"] != parent_operation_id
+        || link["dispatch_operation_id"] != operation_id
+        || link["plan_digest"] != packet["plan_digest"]
+        || link["task_id"] != task_id
+        || link["task_revision"] != task_revision
+        || link["attempt_id"] != attempt_id
+        || link["binding_id"] != binding_id
+        || link["binding_generation"] != binding_generation
+        || link["packet_digest"] != packet_digest
+        || link["capability_identity_digest"] != packet["capability"]["identity_digest"]
+        || link["created_at_ms"].as_i64().is_none_or(|time| time <= 0)
+    {
+        return Err(Error::new(
+            "LAUNCH_DISPATCH_LINK_CORRUPT",
+            "dispatch packet and immutable ancestry link disagree",
+        ));
+    }
+
+    type ParentRow = (
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        String,
+    );
+    let parent: Option<ParentRow> = db
+        .query_row(
+            "SELECT caller_id,method,task_id,attempt_id,binding_id,binding_generation,effective_request_json \
+             FROM operations WHERE operation_id=?1",
+            [parent_operation_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        parent_caller_id,
+        parent_method,
+        parent_task_id,
+        parent_attempt_id,
+        parent_binding_id,
+        parent_generation,
+        parent_effective_raw,
+    )) = parent
+    else {
+        return Err(Error::new(
+            "LAUNCH_DISPATCH_LINK_CORRUPT",
+            "dispatch launch parent is missing",
+        ));
+    };
+    let parent_effective: Value = serde_json::from_str(&parent_effective_raw)?;
+    let manifest = &parent_effective["launch_manifest"];
+    if parent_method != "swarm.launch"
+        || parent_caller_id != caller_id
+        || parent_task_id.as_deref() != Some(task_id)
+        || parent_attempt_id.as_deref() != Some(attempt_id)
+        || parent_binding_id.as_deref() != Some(binding_id)
+        || parent_generation != Some(binding_generation)
+        || manifest["plan_digest"] != packet["plan_digest"]
+        || manifest["task"]["task_id"] != task_id
+        || manifest["task"]["observed_revision"] != task_revision
+        || manifest["task"]["attempt_id"] != attempt_id
+        || manifest["binding"]["binding_id"] != binding_id
+        || manifest["binding"]["generation"] != binding_generation
+        || manifest["binding"]["operation_id"]
+            .as_str()
+            .is_none_or(str::is_empty)
+    {
+        return Err(Error::new(
+            "LAUNCH_DISPATCH_LINK_CORRUPT",
+            "launch parent manifest and retained dispatch packet disagree",
+        ));
+    }
+    Ok(Some(parent_operation_id.to_owned()))
+}
+
 #[allow(clippy::too_many_arguments)] // Canonical immutable dispatch-link tuple.
 fn link_value(
     parent_id: &str,
