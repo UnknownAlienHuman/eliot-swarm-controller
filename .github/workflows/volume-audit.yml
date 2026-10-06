@@ -8,19 +8,47 @@ permissions:
 jobs:
   inventory:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Install analysis parser only
-        run: python -m pip install --quiet tree-sitter tree-sitter-rust
-      - name: Inspect immutable source snapshot without executing product code
+      - name: Export exact public source and count text without any parser or product execution
+        env:
+          TARGET: 5f6a94c9c9afac54cbfe5561f827e1db335b21b9
         run: |
-          python tools/audit/code_volume.py 5f6a94c9c9afac54cbfe5561f827e1db335b21b9 "$RUNNER_TEMP/code-volume" > "$RUNNER_TEMP/code-volume-summary.log"
-          cat "$RUNNER_TEMP/code-volume-summary.log"
-          git archive --format=tar 5f6a94c9c9afac54cbfe5561f827e1db335b21b9 | gzip > "$RUNNER_TEMP/code-volume/source-snapshot.tar.gz"
+          mkdir -p "$RUNNER_TEMP/code-volume"
+          git branch audit-target "$TARGET"
+          git bundle create "$RUNNER_TEMP/code-volume/source.bundle" refs/heads/audit-target
+          git archive --format=tar "$TARGET" | gzip > "$RUNNER_TEMP/code-volume/source-snapshot.tar.gz"
+          python - <<'PY'
+          import collections,csv,hashlib,io,json,os,pathlib,subprocess,tarfile
+          target=os.environ['TARGET'];out=pathlib.Path(os.environ['RUNNER_TEMP'])/'code-volume'
+          raw=subprocess.check_output(['git','archive','--format=tar',target]); entries=[]
+          with tarfile.open(fileobj=io.BytesIO(raw)) as a:
+              for m in a:
+                  if not m.isfile(): continue
+                  d=a.extractfile(m).read();p=pathlib.PurePosixPath(m.name)
+                  try:d.decode('utf-8');text=b'\0' not in d
+                  except UnicodeDecodeError:text=False
+                  n=d.count(b'\n')+int(bool(d) and not d.endswith(b'\n')) if text else 0
+                  if p.parts[0] in ('vendor','donors') or 'vendor_bridge' in p.parts:kind='third_party'
+                  elif m.name.startswith('docs/continuation/'):kind='continuation'
+                  elif p.name in ('Cargo.lock','package-lock.json','yarn.lock','pnpm-lock.yaml','uv.lock'):kind='lockfiles'
+                  elif p.suffix=='.md':kind='documentation'
+                  elif p.suffix=='.rs':kind='owned_rust_including_tests'
+                  else:kind='other'
+                  entries.append(dict(path=m.name,category=kind,bytes=len(d),lines=n,git_blob=hashlib.sha1(b'blob '+str(len(d)).encode()+b'\0'+d).hexdigest()))
+          totals={}
+          for e in entries:
+              r=totals.setdefault(e['category'],dict(files=0,bytes=0,lines=0));r['files']+=1;r['bytes']+=e['bytes'];r['lines']+=e['lines']
+          summary=dict(revision=target,tree=subprocess.check_output(['git','rev-parse',target+'^{tree}']).decode().strip(),files=len(entries),physical_text_lines=sum(e['lines'] for e in entries),categories=totals)
+          (out/'byte-inventory.json').write_text(json.dumps(summary,indent=2)+'\n')
+          with (out/'byte-files.csv').open('w',newline='') as h:
+              w=csv.DictWriter(h,fieldnames=list(entries[0]));w.writeheader();w.writerows(entries)
+          print(json.dumps(summary,indent=2))
+          PY
       - uses: actions/upload-artifact@v4
         with:
           name: code-volume-5f6a94c9
