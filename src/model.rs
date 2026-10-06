@@ -325,33 +325,6 @@ impl Principal {
     }
 }
 
-/// Participant methods are routed through a dedicated Store authorization
-/// branch. They must never be admitted by `require_writer()`.
-pub const PARTICIPANT_READ_METHODS: &[&str] = &[
-    "swarm.context.get",
-    "swarm.overlap.check",
-    "coordination.peer.find",
-    "coordination.work_card.get",
-    "coordination.work_card.list",
-    "coordination.contract_card.get",
-    "coordination.contract_card.list",
-    "coordination.inbox",
-    "coordination.watch.list",
-    "operation.get",
-];
-
-pub const PARTICIPANT_MUTATION_METHODS: &[&str] = &[
-    "coordination.work_card.publish",
-    "coordination.work_card.withdraw",
-    "coordination.contract_card.publish",
-    "coordination.contract_card.withdraw",
-    "coordination.send",
-    "coordination.consult",
-    "coordination.sync_integration",
-    "coordination.watch.create",
-    "coordination.watch.cancel",
-];
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Requirement {
@@ -524,6 +497,17 @@ pub fn response(id: Value, result: Result<Value>) -> Value {
 /// Reject malformed/unknown envelopes before storing the original request. In
 /// particular, an accidental client.hello/token must never become a receipt.
 pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
+    // Store, direct CLI, and automation admissions share the positive class
+    // table. Read/facade/unknown names never acquire a writer default.
+    if !matches!(
+        swarm_contracts::method_policy::class(method),
+        Some(
+            swarm_contracts::method_policy::MethodClass::Mutation
+                | swarm_contracts::method_policy::MethodClass::Internal
+        )
+    ) {
+        return Err(Error::new("METHOD_NOT_FOUND", method));
+    }
     let allowed: &[&str] = match method {
         "swarm.launch" => {
             crate::launcher::LaunchRequest::parse(params)?;

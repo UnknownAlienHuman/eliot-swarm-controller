@@ -2,6 +2,16 @@
 
 ## Current state
 
+### Shared positive method policy — 2026-10-05
+
+Store admission/classification and MCP discovery/profiles now consume the same
+data-only `swarm-contracts::method_policy` registry. It covers the current 129
+typed MCP methods and 22 additional Store/internal methods, including scoped
+logging, monitoring, source capture and existing result handling. Profiles can
+narrow this inventory; handler ownership, revision, assignment, independent
+review and publication checks still decide the actual resource request.
+This source change has not been compiled or tested.
+
 ### Historical event provenance and current script action scope — 2026-10-05
 
 The shared event dispatcher now retains a Module observation's exact binding,

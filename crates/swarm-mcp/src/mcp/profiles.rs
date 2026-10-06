@@ -3,9 +3,12 @@ use crate::config::McpToolProfile;
 use super::subscriptions::Category;
 
 /// Frontend exposure filters. A new method is not exposed through a restricted profile
-/// until it is named here. The host independently
-/// authorizes every forwarded request from the authenticated credential.
+/// until it is present in the shared positive policy and allowed by that profile.
+/// The host independently authorizes every forwarded request from the authenticated credential.
 pub(super) fn exposes_method(profile: McpToolProfile, method: &str) -> bool {
+    if !swarm_contracts::method_policy::is_mcp_method(method) {
+        return false;
+    }
     if profile == McpToolProfile::Full {
         return true;
     }
@@ -56,38 +59,10 @@ pub(super) fn exposes_method(profile: McpToolProfile, method: &str) -> bool {
     match profile {
         McpToolProfile::Observer => false,
         McpToolProfile::Reviewer => method == "task.request_changes",
-        McpToolProfile::Participant => matches!(
-            method,
-            "swarm.tools.search"
-                | "swarm.context.get"
-                | "coordination.peer.find"
-                | "swarm.overlap.check"
-                | "coordination.work_card.get"
-                | "coordination.work_card.list"
-                | "coordination.work_card.publish"
-                | "coordination.work_card.withdraw"
-                | "coordination.contract_card.get"
-                | "coordination.contract_card.list"
-                | "coordination.contract_card.publish"
-                | "coordination.contract_card.withdraw"
-                | "coordination.send"
-                | "coordination.sync_integration"
-                | "coordination.consult"
-                | "coordination.inbox"
-                | "coordination.watch.create"
-                | "coordination.watch.list"
-                | "coordination.watch.cancel"
-                | "review.get"
-                | "review.list"
-                | "swarm.review.context"
-                | "review.submit"
-                | "source.capture"
-                | "task.submit"
-                | "task.submission"
-                | "check.get"
-                | "artifact.read"
-                | "operation.get"
-        ),
+        McpToolProfile::Participant => {
+            method == "swarm.tools.search"
+                || swarm_contracts::method_policy::participant_allowed(method)
+        }
         McpToolProfile::AssignedReviewer => matches!(
             method,
             "swarm.tools.search"

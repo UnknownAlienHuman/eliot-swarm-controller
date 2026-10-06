@@ -1682,7 +1682,7 @@ impl Store {
                         // guard; Task liveness must not erase late evidence.
                         return mutate(db, &principal, &method, &params, &config);
                     }
-                    if model::PARTICIPANT_READ_METHODS.contains(&method.as_str()) {
+                    if swarm_contracts::method_policy::participant_coordination_read(&method) {
                         if method == "swarm.overlap.check" {
                             return integration::read(db, &principal, &method, &params);
                         }
@@ -1708,7 +1708,7 @@ impl Store {
                         reviews::authorize_evidence_read(db, &principal, &method, &params)?;
                         return read(db, &principal, &method, &params, &config);
                     }
-                    if model::PARTICIPANT_MUTATION_METHODS.contains(&method.as_str()) {
+                    if swarm_contracts::method_policy::participant_coordination_mutation(&method) {
                         coordination::authorize_participant_mutation(db, &principal, &method)?;
                         return mutate(db, &principal, &method, &params, &config);
                     }
@@ -2755,86 +2755,16 @@ fn install_schema_extension(
 }
 
 fn is_read(method: &str) -> bool {
-    matches!(
-        method,
-        "goal.get"
-            | "goal.list"
-            | "script.get"
-            | "script.list"
-            | "script.validate"
-            | "hook.source.get"
-            | "check.get"
-            | "mcp.authorization"
-            | "swarm.context.get"
-            | "coordination.participant.get"
-            | "coordination.participant.list"
-            | "coordination.peer.find"
-            | "coordination.work_card.get"
-            | "coordination.work_card.list"
-            | "coordination.contract_card.get"
-            | "coordination.contract_card.list"
-            | "coordination.inbox"
-            | "coordination.watch.list"
-            | "bus.events.page"
-            | "review.get"
-            | "review.list"
-            | "swarm.review.context"
-            | "automation.config.get"
-            | "automation.config.preview"
-            | "automation.config.explain"
-            | "logging.get"
-            | "swarm.dashboard"
-            | "monitor.snapshot"
-            | "monitor.follow"
-            | "swarm.queue.get"
-            | "swarm.agent.inspect"
-            | "swarm.exceptions.get"
-            | "swarm.launch.preview"
-            | "swarm.overlap.check"
-            | "check.profiles"
-            | "artifact.get"
-            | "artifact.parts"
-            | "task.submission"
-            | "task.acceptance"
-            | "task.get"
-            | "task.list"
-            | "attempt.get"
-            | "operation.get"
-            | "operation.list"
-            | "agent.family"
-            | "agent.state"
-            | "agent.list"
-            | "route.list"
-            | "module.catalog.get"
-            | "report.delta"
-            | "report.capacity"
-            | "report.attention"
-            | "message.read"
-            | "client.list"
-    )
+    swarm_contracts::method_policy::is_read_only(method)
 }
 
 fn participant_method_allowed(method: &str) -> bool {
-    model::PARTICIPANT_READ_METHODS.contains(&method)
-        || model::PARTICIPANT_MUTATION_METHODS.contains(&method)
-        || matches!(
-            method,
-            "mcp.authorization"
-                | "source.capture"
-                | "task.submit"
-                | "review.submit"
-                | "review.get"
-                | "review.list"
-                | "swarm.review.context"
-                | "artifact.read"
-                | "task.submission"
-                | "check.get"
-        )
+    swarm_contracts::method_policy::participant_allowed(method)
 }
 // Watch ownership is checked against the live assignment in its handler;
 // these two methods are shared with Manager/Operator identities.
 fn participant_only_mutation(method: &str) -> bool {
-    model::PARTICIPANT_MUTATION_METHODS.contains(&method)
+    swarm_contracts::method_policy::participant_coordination_mutation(method)
         && !matches!(
             method,
             "coordination.watch.create" | "coordination.watch.cancel"
@@ -3957,12 +3887,14 @@ fn mcp_authorization(db: &Connection, p: &Principal, value: &Value) -> Result<Va
                     revision_context["scope_state"] = json!("current");
                     revision_context["scope"] = scope;
                     allowed.extend(methods.into_iter().filter(|method| {
-                        (model::PARTICIPANT_READ_METHODS.contains(method)
+                        (swarm_contracts::method_policy::participant_coordination_read(method)
                             && !matches!(
                                 *method,
                                 "coordination.participant.get" | "coordination.participant.list"
                             ))
-                            || model::PARTICIPANT_MUTATION_METHODS.contains(method)
+                            || swarm_contracts::method_policy::participant_coordination_mutation(
+                                method,
+                            )
                     }));
                     if matches!(
                         registration["participation_basis"]["kind"].as_str(),

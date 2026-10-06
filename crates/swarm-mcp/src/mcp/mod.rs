@@ -1570,18 +1570,29 @@ static TOOLS: &[(bool, ToolSpec)] = &[
 /// Canonical application methods advertised by MCP. The catalog search is a
 /// local facade method and is intentionally excluded from the Store registry.
 pub(crate) fn registered_application_methods() -> Vec<&'static str> {
-    TOOLS
+    // Discovery authorization follows the contracts policy. The typed table
+    // remains the schema inventory; catalog validation rejects drift.
+    swarm_contracts::method_policy::METHOD_REGISTRY
         .iter()
-        .filter_map(|(_, spec)| (spec.method != "swarm.tools.search").then_some(spec.method))
+        .filter_map(|entry| {
+            (entry.mcp
+                && entry.method != "swarm.tools.search"
+                && TOOLS.iter().any(|(_, spec)| spec.method == entry.method))
+            .then_some(entry.method)
+        })
         .collect()
 }
 
-/// Read/mutation semantics from the same registry used to build tool schemas.
-/// This is parameter preparation metadata, not application authorization.
+/// Read/mutation semantics from the contracts policy shared with Store and CLI.
+/// The typed TOOLS table remains schema inventory, not application authorization.
 pub fn application_method_read_only(method: &str) -> Option<bool> {
-    TOOLS.iter().find_map(|(read_only, spec)| {
-        (spec.method == method && spec.method != "swarm.tools.search").then_some(*read_only)
-    })
+    if !swarm_contracts::method_policy::is_mcp_method(method)
+        || method == "swarm.tools.search"
+        || !TOOLS.iter().any(|(_, spec)| spec.method == method)
+    {
+        return None;
+    }
+    swarm_contracts::method_policy::read_only(method)
 }
 
 fn tool_name(method: &str) -> String {
@@ -3612,143 +3623,36 @@ mod tests {
                 );
             }
         }
-        let expected: BTreeSet<&str> = [
-            "swarm.tools.search",
-            "host.status",
-            "route.list",
-            "module.catalog.get",
-            "client.list",
-            "task.get",
-            "task.list",
-            "task.submission",
-            "task.acceptance",
-            "attempt.get",
-            "operation.get",
-            "logging.get",
-            "operation.list",
-            "agent.state",
-            "agent.list",
-            "agent.family",
-            "check.get",
-            "check.profiles",
-            "artifact.get",
-            "artifact.read",
-            "artifact.parts",
-            "report.delta",
-            "report.attention",
-            "report.capacity",
-            "message.read",
-            "swarm.context.get",
-            "swarm.dashboard",
-            "swarm.queue.get",
-            "swarm.agent.inspect",
-            "swarm.exceptions.get",
-            "swarm.launch.preview",
-            "swarm.launch",
-            "swarm.overlap.check",
-            "coordination.participant.get",
-            "coordination.participant.list",
-            "coordination.peer.find",
-            "coordination.work_card.get",
-            "coordination.work_card.list",
-            "coordination.contract_card.get",
-            "coordination.contract_card.list",
-            "coordination.inbox",
-            "coordination.watch.list",
-            "review.get",
-            "review.list",
-            "swarm.review.context",
-            "automation.config.get",
-            "automation.config.preview",
-            "automation.config.explain",
-            "bus.events.page",
-            "host.mode",
-            "module.route.select",
-            "client.register",
-            "source.capture",
-            "check.run",
-            "check.cancel",
-            "task.create",
-            "task.revise",
-            "task.claim",
-            "task.dispatch",
-            "task.submit",
-            "task.submit.recover",
-            "task.request_changes",
-            "task.accept",
-            "forge.publish_ref",
-            "task.invalidate_acceptance",
-            "attempt.release",
-            "attempt.bind_producer",
-            "agent.open",
-            "agent.send",
-            "agent.reply",
-            "agent.configure",
-            "agent.goal",
-            "agent.refresh",
-            "agent.reconcile",
-            "agent.recover",
-            "agent.result",
-            "artifact.assemble",
-            "operation.cancel",
-            "gm.handover",
-            "agent.background",
-            "message.send",
-            "message.cancel",
-            "coordination.participant.register",
-            "coordination.participant.disable",
-            "coordination.work_card.publish",
-            "coordination.work_card.withdraw",
-            "coordination.contract_card.publish",
-            "coordination.contract_card.withdraw",
-            "coordination.send",
-            "coordination.consult",
-            "coordination.sync_integration",
-            "coordination.watch.create",
-            "coordination.watch.cancel",
-            "review.assign",
-            "review.submit",
-            "automation.config.apply",
-            "logging.set",
-            "event.emit",
-            "bus.consumer.admit",
-            "automation.config.transfer",
-            "schedule.run_now",
-            "hook.source.get",
-            "hook.source.revoke",
-            "goal.create",
-            "goal.revise",
-            "goal.enable",
-            "goal.disable",
-            "goal.readback",
-            "goal.get",
-            "goal.list",
-            "script.register",
-            "script.revise",
-            "script.validate",
-            "script.activate",
-            "script.run",
-            "script.get",
-            "script.list",
-            "github.source.inspect",
-            "github.source.setup",
-            "github.source.get",
-            "github.source.poll",
-            "github.work_pool.preview",
-            "github.work_pool.apply",
-            "github.effect.managed_label",
-            "github.effect.reconcile_managed_label",
-            "github.pull_request.update_description",
-            "github.pull_request.reconcile_description",
-        ]
-        .into_iter()
-        .collect();
+        let expected: BTreeSet<&str> = swarm_contracts::method_policy::METHOD_REGISTRY
+            .iter()
+            .filter(|entry| entry.mcp)
+            .map(|entry| entry.method)
+            .collect();
         assert_eq!(methods, expected);
-        assert_eq!(TOOLS.len(), 127);
-        assert_eq!(TOOLS.iter().filter(|(read_only, _)| *read_only).count(), 57);
+        assert_eq!(TOOLS.len(), expected.len());
+        assert_eq!(
+            TOOLS.iter().filter(|(read_only, _)| *read_only).count(),
+            swarm_contracts::method_policy::METHOD_REGISTRY
+                .iter()
+                .filter(|entry| {
+                    entry.mcp
+                        && matches!(
+                            entry.class,
+                            swarm_contracts::method_policy::MethodClass::ReadOnly
+                                | swarm_contracts::method_policy::MethodClass::FacadeOnly
+                        )
+                })
+                .count()
+        );
         assert_eq!(
             TOOLS.iter().filter(|(read_only, _)| !*read_only).count(),
-            70
+            swarm_contracts::method_policy::METHOD_REGISTRY
+                .iter()
+                .filter(|entry| {
+                    entry.mcp
+                        && entry.class == swarm_contracts::method_policy::MethodClass::Mutation
+                })
+                .count()
         );
     }
 

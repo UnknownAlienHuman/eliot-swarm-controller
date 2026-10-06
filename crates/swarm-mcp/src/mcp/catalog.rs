@@ -2542,7 +2542,12 @@ pub fn validate_registry_metadata() -> Result<(), CatalogError> {
             return Err(CatalogError::IncompleteRegistry);
         }
     }
-    if TOOLS.iter().any(|(_, spec)| !seen.contains(spec.method)) {
+    if TOOLS.iter().any(|(read_only, spec)| {
+        !seen.contains(spec.method)
+            || !swarm_contracts::method_policy::is_mcp_method(spec.method)
+            || (spec.method != "swarm.tools.search"
+                && swarm_contracts::method_policy::read_only(spec.method) != Some(*read_only))
+    }) {
         return Err(CatalogError::IncompleteRegistry);
     }
     Ok(())
