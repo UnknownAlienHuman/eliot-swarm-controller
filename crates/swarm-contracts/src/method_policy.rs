@@ -948,6 +948,12 @@ pub const METHOD_REGISTRY: &[MethodPolicy] = &[
         mcp: false,
         participant: ParticipantAccess::None,
     },
+    MethodPolicy {
+        method: "module.supervisor.health.read",
+        class: MethodClass::Internal,
+        mcp: false,
+        participant: ParticipantAccess::None,
+    },
 ];
 
 pub fn policy(method: &str) -> Option<&'static MethodPolicy> {

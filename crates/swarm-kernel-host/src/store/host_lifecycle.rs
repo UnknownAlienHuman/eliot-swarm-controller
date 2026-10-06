@@ -614,6 +614,75 @@ pub(super) fn update_optional_worker_with_child(
     set_meta(tx, OPTIONAL_WORKER_HEALTH, &health)
 }
 
+/// Read only the existing module-supervisor child receipt used to prevent a
+/// replacement while a prior process is still live or its departure remains
+/// uncertain. No new lifecycle record is created by this helper.
+pub(super) fn module_supervisor_health_readback(
+    db: &Connection,
+) -> Result<swarm_supervisor::control::SupervisorChildHealthReadback> {
+    let health = optional_worker_health(db)?;
+    let receipt = health
+        .get("workers")
+        .and_then(Value::as_object)
+        .and_then(|workers| workers.get("module-supervisor"));
+    let state = receipt
+        .and_then(|value| value.get("state"))
+        .and_then(Value::as_str)
+        .unwrap_or("dormant")
+        .to_owned();
+    let error_code = receipt
+        .and_then(|value| value.get("last_error_code"))
+        .map(|value| {
+            if value.is_null() {
+                Ok(None)
+            } else {
+                value
+                    .as_str()
+                    .map(|code| Some(code.to_owned()))
+                    .ok_or_else(|| {
+                        Error::new(
+                            "HOST_LIFECYCLE_INVALID",
+                            "module supervisor health error code is invalid",
+                        )
+                    })
+            }
+        })
+        .transpose()?
+        .flatten();
+    let child = receipt
+        .and_then(|value| value.get("child"))
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            let child: swarm_supervisor::control::SupervisorChildHealth =
+                serde_json::from_value(value.clone()).map_err(|_| {
+                    Error::new(
+                        "HOST_LIFECYCLE_INVALID",
+                        "module supervisor child health receipt is invalid",
+                    )
+                })?;
+            child.validate().map_err(|_| {
+                Error::new(
+                    "HOST_LIFECYCLE_INVALID",
+                    "module supervisor child health receipt failed validation",
+                )
+            })?;
+            Ok(child)
+        })
+        .transpose()?;
+    let readback = swarm_supervisor::control::SupervisorChildHealthReadback {
+        state,
+        error_code,
+        child,
+    };
+    readback.validate().map_err(|_| {
+        Error::new(
+            "HOST_LIFECYCLE_INVALID",
+            "module supervisor health readback is invalid",
+        )
+    })?;
+    Ok(readback)
+}
+
 fn optional_worker_health(db: &Connection) -> Result<Value> {
     let Some(value) = meta(db, OPTIONAL_WORKER_HEALTH)? else {
         return Ok(json!({"schema_version":1,"workers":{}}));
@@ -782,9 +851,10 @@ fn exit_receipt(db: &Connection, key: &str) -> Result<Option<Value>> {
                     )
                 })
                 || (receipt.failed_supervisor.is_some() && receipt.failure_category.is_none())
-                || receipt.error_code.as_ref().is_some_and(|code| {
-                    !valid_error_code(code)
-                })
+                || receipt
+                    .error_code
+                    .as_ref()
+                    .is_some_and(|code| !valid_error_code(code))
                 || !valid_secondary_codes(&receipt.secondary_codes)
                 || (receipt.error_code.is_none() && !receipt.secondary_codes.is_empty())
                 || receipt.error_code.as_ref().is_some_and(|primary| {

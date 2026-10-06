@@ -26,6 +26,7 @@ const SUPERVISOR_CREDENTIAL_READY: &str = "module.supervisor.credential.ready";
 const SUPERVISOR_RECOVERY_RECONCILE: &str = "module.supervisor.recovery.reconcile";
 const SUPERVISOR_OBSERVATION_RECORD: &str = "module.supervisor.observation.record";
 const SUPERVISOR_HEALTH_RECORD: &str = "module.supervisor.health.record";
+const SUPERVISOR_HEALTH_READ: &str = "module.supervisor.health.read";
 
 /// Status-only Operation evidence returned by the host.  Inputs, outputs,
 /// caller identities, and native payloads never cross this boundary.
@@ -145,6 +146,10 @@ pub struct SupervisorChildExit {
     pub code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
+    /// A bounded, machine-only projection of an additional child failure
+    /// fact. Raw stderr and messages never cross the health boundary.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secondary_codes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -165,6 +170,43 @@ pub struct SupervisorChildHealth {
     pub exit: Option<SupervisorChildExit>,
 }
 
+/// Bounded readback of the existing module-supervisor health receipt. The
+/// Store remains the authority; this DTO carries only the state needed to
+/// decide whether a prior child incarnation can be replaced safely.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisorChildHealthReadback {
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child: Option<SupervisorChildHealth>,
+}
+
+impl SupervisorChildHealthReadback {
+    pub fn validate(&self) -> Result<()> {
+        if !matches!(
+            self.state.as_str(),
+            "dormant" | "running" | "retry_wait" | "isolated"
+        ) {
+            return Err(Error::invalid("module supervisor health state is invalid"));
+        }
+        if self
+            .error_code
+            .as_deref()
+            .is_some_and(|code| !valid_health_code(code))
+        {
+            return Err(Error::invalid(
+                "module supervisor health error code is invalid",
+            ));
+        }
+        if let Some(child) = &self.child {
+            child.validate()?;
+        }
+        Ok(())
+    }
+}
+
 impl SupervisorChildHealth {
     pub fn validate(&self) -> Result<()> {
         self.process.validate()?;
@@ -172,15 +214,15 @@ impl SupervisorChildHealth {
             exit.validate()?;
         }
         match self.stop {
-            SupervisorChildStopState::Running if self.exit.is_some() => {
-                Err(Error::invalid("running supervisor child has an exit receipt"))
-            }
-            SupervisorChildStopState::Confirmed if self.exit.is_none() => {
-                Err(Error::invalid("confirmed supervisor stop has no exit receipt"))
-            }
-            SupervisorChildStopState::NotRequested if self.exit.is_none() => {
-                Err(Error::invalid("departed supervisor child has no exit receipt"))
-            }
+            SupervisorChildStopState::Running if self.exit.is_some() => Err(Error::invalid(
+                "running supervisor child has an exit receipt",
+            )),
+            SupervisorChildStopState::Confirmed if self.exit.is_none() => Err(Error::invalid(
+                "confirmed supervisor stop has no exit receipt",
+            )),
+            SupervisorChildStopState::NotRequested if self.exit.is_none() => Err(Error::invalid(
+                "departed supervisor child has no exit receipt",
+            )),
             _ => Ok(()),
         }
     }
@@ -208,17 +250,26 @@ impl SupervisorChildProcessIdentity {
 
 impl SupervisorChildExit {
     fn validate(&self) -> Result<()> {
-        let valid_code = self
-            .error_code
-            .as_deref()
-            .is_none_or(valid_health_code);
+        let valid_code = self.error_code.as_deref().is_none_or(valid_health_code);
+        let valid_secondary_codes = self.secondary_codes.len() <= 2
+            && (self.error_code.is_some() || self.secondary_codes.is_empty())
+            && self.secondary_codes.iter().all(|code| {
+                valid_health_code(code)
+                    && self.error_code.as_deref() != Some(code.as_str())
+                    && self
+                        .secondary_codes
+                        .iter()
+                        .filter(|other| *other == code)
+                        .count()
+                        == 1
+            });
         let valid_category = match self.category {
             SupervisorChildExitCategory::Exited => self.code.is_some(),
             SupervisorChildExitCategory::Signaled | SupervisorChildExitCategory::WaitError => {
                 self.code.is_none()
             }
         };
-        if !valid_code || !valid_category {
+        if !valid_code || !valid_secondary_codes || !valid_category {
             return Err(Error::invalid("supervisor child exit receipt is invalid"));
         }
         Ok(())
@@ -244,7 +295,8 @@ fn positive_decimal(value: &Value, maximum: usize) -> bool {
     let Some(value) = value.as_str() else {
         return false;
     };
-    if value.len() > maximum || value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+    if value.len() > maximum || value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
         return false;
     }
     let Ok(number) = value.parse::<u64>() else {
@@ -261,9 +313,10 @@ fn valid_child_uuid(value: &Value) -> bool {
         && [8, 13, 18, 23]
             .into_iter()
             .all(|index| value.as_bytes()[index] == b'-')
-        && value.bytes().enumerate().all(|(index, byte)| {
-            [8, 13, 18, 23].contains(&index) || byte.is_ascii_hexdigit()
-        })
+        && value
+            .bytes()
+            .enumerate()
+            .all(|(index, byte)| [8, 13, 18, 23].contains(&index) || byte.is_ascii_hexdigit())
 }
 
 fn valid_child_birth(value: &Value, pid: u32) -> bool {
@@ -292,7 +345,9 @@ fn valid_child_image(value: &Value, pid: u32) -> bool {
     let path_valid = value
         .get("image_path")
         .and_then(Value::as_str)
-        .is_some_and(|path| !path.is_empty() && path.len() <= 4096 && !path.chars().any(char::is_control));
+        .is_some_and(|path| {
+            !path.is_empty() && path.len() <= 4096 && !path.chars().any(char::is_control)
+        });
     let digest_valid = value
         .get("image_sha256")
         .and_then(Value::as_str)
@@ -309,7 +364,13 @@ fn valid_child_image(value: &Value, pid: u32) -> bool {
     if value.get("start_ticks").is_some() || value.get("boot_id").is_some() {
         exact_child_keys(
             value,
-            &["pid", "boot_id", "image_path", "image_sha256", "start_ticks"],
+            &[
+                "pid",
+                "boot_id",
+                "image_path",
+                "image_sha256",
+                "start_ticks",
+            ],
         ) && valid_child_uuid(&value["boot_id"])
             && positive_decimal(&value["start_ticks"], 64)
     } else {
@@ -485,6 +546,16 @@ impl SupervisorControlClient {
         )
         .await
         .map(|_| ())
+    }
+
+    /// Read the existing bounded child receipt before launching a replacement.
+    /// An uncertain or live receipt must be reconciled against the same
+    /// process birth/image identity before a new child may be spawned.
+    pub async fn read_health(&self) -> Result<SupervisorChildHealthReadback> {
+        let readback: SupervisorChildHealthReadback =
+            self.request(SUPERVISOR_HEALTH_READ, json!({})).await?;
+        readback.validate()?;
+        Ok(readback)
     }
 
     async fn request<T: DeserializeOwned>(&self, method: &str, params: Value) -> Result<T> {

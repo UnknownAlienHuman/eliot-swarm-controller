@@ -79,7 +79,9 @@ pre-readiness admission closure does not misclassify an initializer failure.
 Standalone and managed-bus outer health persistence errors now propagate
 through their existing result paths. Standalone emits a bounded safe secondary
 diagnostic when a reconciliation failure already supplies the primary. The
-structured async host reader is part of the remaining child ownership change.
+structured async host reader drains stderr continuously and retains only the
+bounded safe error projection, including distinct secondary codes. A later
+plain terminal code cannot erase the same primary's structured diagnostics.
 Per-slot managed-bus retries retain their existing child handles on Store
 outages.
 
@@ -113,11 +115,17 @@ Module facts wait for missing source proof; release recognizes the exact
 `SYSTEM_EVENT_SOURCE_PROOF_PENDING` reason. Statusless events gain no invented
 status or occurrence. The method is internal and has no MCP exposure.
 
-Remaining source work closes exact live-child ownership, durable pre-spawn
-intent and uncertain restart reconciliation, connects structured child
-diagnostics, and upgrades the trusted supervisor capability registration for
-its retained health reader. These changes must finish before compiler, tests or
-native qualification.
+The supervisor child lease now retains the exact child handle through health
+write failures and coordinator unwinds. Before creating a process, the host
+persists and reads back `MODULE_SUPERVISOR_SPAWN_PENDING` in existing worker
+health. Restart preserves that intent and the child receipt; replacement needs
+confirmed departure or matching PID, birth and image evidence. Missing evidence
+remains a Manager-visible error. Rejected health writes do not become durable
+receipts, and secondary health failures block a fresh replacement. The trusted
+supervisor registration upgrades the prior nine-capability record to the current
+ten-capability record with the internal retained-health reader. Detached reaping
+depends on the current runtime and does not claim child departure after runtime
+loss. These source changes precede compiler and failure qualification.
 
 The native qualification script now validates the
 public CLI, host wrapper, actual Kernel and supervisor coordinates separately,

@@ -480,11 +480,7 @@ impl StoreOwner {
             Err(error) => (Some(error.code.clone()), error.secondary_codes.clone()),
         };
         let receipt = recovery
-            .record_host_exit(
-                error_code,
-                secondary_codes,
-                failed_supervisor,
-            )
+            .record_host_exit(error_code, secondary_codes, failed_supervisor)
             .await;
         merge_results(exit, receipt)
     }
@@ -880,6 +876,13 @@ impl Store {
             Ok(())
         })
         .await
+    }
+
+    pub(crate) async fn module_supervisor_health_readback(
+        &self,
+    ) -> Result<swarm_supervisor::control::SupervisorChildHealthReadback> {
+        self.run(|db: &mut Connection| host_lifecycle::module_supervisor_health_readback(&*db))
+            .await
     }
 
     /// Demand comes from explicitly managed, durable consumer registrations and
@@ -2114,6 +2117,11 @@ impl Store {
                 .await?;
                 Ok(json!({"recorded":true}))
             }
+            "module.supervisor.health.read" => {
+                model::fields(&params, &[])?;
+                serde_json::to_value(self.module_supervisor_health_readback().await?)
+                    .map_err(Into::into)
+            }
             _ => Err(Error::new(
                 "FORBIDDEN",
                 "method is outside the module supervisor control surface",
@@ -2885,7 +2893,8 @@ fn initialize_database(
             "module.supervisor.credential.ready",
             "module.supervisor.recovery.reconcile",
             "module.supervisor.observation.record",
-            "module.supervisor.health.record"
+            "module.supervisor.health.record",
+            "module.supervisor.health.read"
         ],
     });
     match meta(tx, &supervisor_key)? {
