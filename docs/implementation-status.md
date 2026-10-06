@@ -2,6 +2,19 @@
 
 ## Current state
 
+### Historical event provenance and current script action scope — 2026-10-05
+
+The shared event dispatcher now retains a Module observation's exact binding,
+descriptor/event-contract digest, opening Operation and linked Task/Attempt
+origin separately from the current action scope. Closing or revising a Task,
+releasing an Attempt/binding, or disabling a descriptor does not erase the cause
+of an already committed event. Task actions still require current authority;
+valid historical events can use the existing taskless Manager notification path.
+Manager-created event bodies remain private and bound to their existing owner,
+project, name, key and payload digest. Source/kind matching continues to use the
+existing generic selector and cursor, without a new event allowlist or ledger.
+This source increment has not been compiled or tested.
+
 ### Retained source completion and scoped diagnostic controls — 2026-10-05
 
 The source-capture completion path now validates the immutable admission saved

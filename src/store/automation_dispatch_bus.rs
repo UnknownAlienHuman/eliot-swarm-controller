@@ -20,7 +20,42 @@ type ConsumerTaskAttemptScopeRow = (
     i64,
     Option<i64>,
 );
-type ConsumerEventOperationRow = (Option<String>, Option<String>, String, String);
+type ConsumerEventOperationRow = (
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+    Option<String>,
+    Option<i64>,
+);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct DescriptorModuleEventScope {
+    pub(super) binding_id: String,
+    pub(super) binding_generation: i64,
+    pub(super) source_event_key: String,
+    pub(super) module_client_id: String,
+    pub(super) module_artifact_id: String,
+    pub(super) descriptor_selector_digest: String,
+    pub(super) descriptor_event_schema_digest: String,
+    pub(super) agent_open_operation_id: String,
+    pub(super) agent_open_task_id: Option<String>,
+    pub(super) agent_open_task_revision: Option<i64>,
+    pub(super) agent_open_attempt_id: Option<String>,
+    pub(super) source_task_id: Option<String>,
+    pub(super) source_task_revision: Option<i64>,
+    pub(super) source_attempt_id: Option<String>,
+    pub(super) task_id: Option<String>,
+    pub(super) task_revision: Option<i64>,
+    pub(super) attempt_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct ModuleEventTaskScope {
+    task_id: Option<String>,
+    task_revision: Option<i64>,
+    attempt_id: Option<String>,
+}
 
 enum ScriptConsumerAuthority<'a> {
     /// Compatibility/direct Store route. This remains a real authenticated
@@ -696,6 +731,7 @@ fn process_scoped_system_event(
             owner_manager_id,
         ) {
             Ok(context) => {
+                seal_retained_module_event_source(tx, entry, event, &mut cause)?;
                 mark_observed_script_selectors(state, entry, event, projection.status)?;
                 attach_event_task_scope(&mut cause, &context)?;
                 if let Some(operation_id) =
@@ -866,9 +902,9 @@ fn consumer_owner_has_current_attempt(
     ))
 }
 
-/// Module-consumer source check. It uses the persisted Manager identity only
-/// as data and revalidates that identity's current Task scope; it never creates
-/// a Manager Principal or depends on a Manager IPC/GM session.
+/// Revalidate one retained Manager-owned `event.emit` source without creating
+/// a Manager Principal or depending on Manager IPC/GM state. The retained
+/// event body remains private; this checks only its immutable Store identity.
 fn require_manager_event_scope(
     db: &Connection,
     event: &crate::automation::intake::ObservedEvent,
@@ -876,10 +912,50 @@ fn require_manager_event_scope(
     entry: &AutomationEntry,
     caller_id: &str,
 ) -> Result<()> {
+    require_manager_event_scope_for_owner(
+        db,
+        event,
+        operation_id,
+        &entry.project_id,
+        &entry.owner_manager_id,
+        caller_id,
+    )
+}
+
+/// The retained ScriptRun link validator has the same Manager owner and
+/// project identity as an AutomationEntry, but does not hold the entry. Keep
+/// its `event.emit` checks on this shared source proof so operation-linked
+/// Manager events cannot fall through the generic Operation ACL path.
+pub(super) fn require_manager_event_scope_for_retained(
+    db: &Connection,
+    event: &crate::automation::intake::ObservedEvent,
+    operation_id: &str,
+    project_id: &str,
+    owner_manager_id: &str,
+    caller_id: &str,
+) -> Result<()> {
+    require_manager_event_scope_for_owner(
+        db,
+        event,
+        operation_id,
+        project_id,
+        owner_manager_id,
+        caller_id,
+    )
+}
+
+fn require_manager_event_scope_for_owner(
+    db: &Connection,
+    event: &crate::automation::intake::ObservedEvent,
+    operation_id: &str,
+    project_id: &str,
+    owner_manager_id: &str,
+    caller_id: &str,
+) -> Result<()> {
     if event.source_id != crate::store::MANAGER_EVENT_SOURCE_STREAM {
         return Ok(());
     }
-    if caller_id != entry.owner_manager_id {
+    if caller_id != owner_manager_id {
         return Err(Error::new(
             "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
             "Manager event Operation is outside the configured owner scope",
@@ -905,8 +981,8 @@ fn require_manager_event_scope(
     let scope = &effective["event_emit"];
     if scope["schema_version"] != 1
         || scope["source_stream_id"] != crate::store::MANAGER_EVENT_SOURCE_STREAM
-        || scope["owner_manager_id"] != entry.owner_manager_id
-        || scope["project_id"] != entry.project_id
+        || scope["owner_manager_id"] != owner_manager_id
+        || scope["project_id"] != project_id
         || scope["name"] != event.event_kind
         || scope["source_event_key"].as_str().is_none()
         || scope["payload_digest"].as_str().is_none()
@@ -948,8 +1024,8 @@ fn require_manager_event_scope(
     if payload["schema_version"] != 1
         || payload["source_stream_id"] != crate::store::MANAGER_EVENT_SOURCE_STREAM
         || payload["source_event_key"] != scope["source_event_key"]
-        || payload["owner_manager_id"] != entry.owner_manager_id
-        || payload["project_id"] != entry.project_id
+        || payload["owner_manager_id"] != owner_manager_id
+        || payload["project_id"] != project_id
         || payload["name"] != event.event_kind
         || payload["dedupe_key"] != scope["dedupe_key"]
         || payload["payload"].is_null()
@@ -962,6 +1038,826 @@ fn require_manager_event_scope(
         ));
     }
     Ok(())
+}
+
+fn module_event_contract_digest(
+    db: &Connection,
+    selector: &Value,
+    artifact_id: &str,
+) -> Result<String> {
+    let registry =
+        crate::store::meta(db, "module_catalog:trusted_descriptors:v1")?.ok_or_else(|| {
+            Error::new(
+                "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
+                "Module event has no retained trusted descriptor registry",
+            )
+        })?;
+    let registered_revision = selector["registered_revision"]
+        .as_u64()
+        .filter(|value| *value > 0);
+    let selected_revision = selector["selected_revision"].as_u64();
+    let registry_revision = registry["revision"].as_u64();
+    let module_id = selector["module_id"].as_str();
+    if registry["schema_version"] != 1
+        || registered_revision.is_none()
+        || selected_revision
+            .is_none_or(|revision| revision < registered_revision.unwrap_or_default())
+        || registry_revision.is_none_or(|revision| revision < selected_revision.unwrap_or_default())
+        || module_id.is_none_or(str::is_empty)
+    {
+        return Err(Error::new(
+            "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
+            "Module event descriptor selector is inconsistent with its retained registry",
+        ));
+    }
+    let descriptor = registry["descriptors"]
+        .as_array()
+        .and_then(|entries| {
+            entries.iter().find_map(|entry| {
+                let descriptor = &entry["descriptor"];
+                (entry["registered_revision"].as_u64() == registered_revision
+                    && descriptor["module_id"].as_str() == module_id
+                    && descriptor["artifact"] == selector["artifact"]
+                    && descriptor["artifact"]["artifact_id"].as_str() == Some(artifact_id))
+                .then_some(descriptor)
+            })
+        })
+        .ok_or_else(|| {
+            Error::new(
+                "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
+                "Module event descriptor contract is unavailable",
+            )
+        })?;
+    let event_schemas = descriptor["event_schemas"].as_array().ok_or_else(|| {
+        Error::new(
+            "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
+            "Module event descriptor has no retained event contract",
+        )
+    })?;
+    Ok(model::digest(model::canonical(event_schemas)?.as_bytes()))
+}
+
+/// Read immutable Task/Attempt origin facts and derive a separate current
+/// action scope. Task state, the current Attempt pointer, release time and the
+/// present Task revision can remove action rights, but never erase the source
+/// of an already committed Module observation.
+fn module_event_task_scopes(
+    db: &Connection,
+    project_id: &str,
+    owner_manager_id: &str,
+    binding_id: &str,
+    binding_generation: i64,
+    task_id: Option<&str>,
+    attempt_id: Option<&str>,
+) -> Result<(ModuleEventTaskScope, ModuleEventTaskScope)> {
+    match (task_id, attempt_id) {
+        (Some(task_id), Some(attempt_id)) => {
+            let task = super::tasks::get_task(db, task_id)?;
+            let attempt = super::tasks::get_attempt(db, attempt_id)?;
+            let source_revision = attempt["task_revision"].as_i64().filter(|value| *value > 0);
+            if task["project_id"] != project_id
+                || attempt["task_id"].as_str() != Some(task_id)
+                || source_revision.is_none()
+                || attempt["owner_id"].as_str() != Some(owner_manager_id)
+                || attempt["binding_id"].as_str() != Some(binding_id)
+                || attempt["binding_generation"].as_i64() != Some(binding_generation)
+                || attempt["task_snapshot"]["revision"]
+                    .as_i64()
+                    .is_some_and(|revision| Some(revision) != source_revision)
+            {
+                return Err(Error::new(
+                    "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
+                    "Module event Task/Attempt provenance is inconsistent",
+                ));
+            }
+            let origin = ModuleEventTaskScope {
+                task_id: Some(task_id.to_owned()),
+                task_revision: source_revision,
+                attempt_id: Some(attempt_id.to_owned()),
+            };
+            let current_task_revision = task["revision"].as_i64();
+            let action = if task["state"] == "open"
+                && current_task_revision == source_revision
+                && task["current_attempt_id"].as_str() == Some(attempt_id)
+                && attempt["released_at_ms"].is_null()
+            {
+                origin.clone()
+            } else {
+                ModuleEventTaskScope::default()
+            };
+            Ok((origin, action))
+        }
+        (Some(task_id), None) => {
+            let task = super::tasks::get_task(db, task_id)?;
+            if task["project_id"] != project_id {
+                return Err(Error::new(
+                    "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
+                    "Module event Task provenance is outside its retained project",
+                ));
+            }
+            Ok((
+                ModuleEventTaskScope {
+                    task_id: Some(task_id.to_owned()),
+                    task_revision: None,
+                    attempt_id: None,
+                },
+                ModuleEventTaskScope::default(),
+            ))
+        }
+        (None, Some(_)) => Err(Error::new(
+            "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
+            "Module event source has an Attempt without its Task",
+        )),
+        (None, None) => Ok((
+            ModuleEventTaskScope::default(),
+            ModuleEventTaskScope::default(),
+        )),
+    }
+}
+
+/// Prove a Module event from its already committed authenticated observation,
+/// immutable binding and descriptor selector, and the unique Manager-owned
+/// `agent.open`. A linked event Operation supplies its own immutable
+/// Task/Attempt origin; current Task state is used only to derive action scope.
+/// No current registration, descriptor enablement, binding release or Task
+/// liveness check can revoke the stored source fact.
+pub(super) fn require_module_event_source_provenance(
+    db: &Connection,
+    project_id: &str,
+    owner_manager_id: &str,
+    event: &crate::automation::intake::ObservedEvent,
+) -> Result<DescriptorModuleEventScope> {
+    let module_client_id = event
+        .source_id
+        .strip_prefix("module:")
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            Error::new(
+                "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
+                "Module event source has no registered module identity",
+            )
+        })?;
+    let observation: Option<(
+        String,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+        String,
+        i64,
+    )> = db
+        .query_row(
+            "SELECT source_stream_id,source_event_key,binding_id,binding_generation,\
+                    operation_id,kind,recorded_at_ms \
+             FROM observations WHERE observation_id=?1",
+            [event.observation_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        source_stream_id,
+        source_event_key,
+        binding_id,
+        binding_generation,
+        observation_operation_id,
+        kind,
+        recorded_at_ms,
+    )) = observation
+    else {
+        return Err(Error::new(
+            "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
+            "Module event observation is unavailable",
+        ));
+    };
+    let source_event_key = source_event_key
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            Error::new(
+                "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
+                "Module event observation has no retained source key",
+            )
+        })?;
+    if source_stream_id != event.source_id
+        || observation_operation_id.as_deref() != event.operation_id.as_deref()
+        || kind != event.event_kind
+        || recorded_at_ms != event.recorded_at_ms
+    {
+        return Err(Error::new(
+            "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
+            "Module event observation identity no longer matches its source",
+        ));
+    }
+    let binding_id = binding_id
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            Error::new(
+                "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
+                "Module event observation has no retained binding scope",
+            )
+        })?;
+    let binding_generation = binding_generation
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            Error::new(
+                "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
+                "Module event observation has no retained binding generation",
+            )
+        })?;
+    let binding = crate::store::operations::get_binding(db, &binding_id, binding_generation)?;
+    if binding["route"]["runtime"].as_str() != Some("module")
+        || binding["observation"]["module_client_id"].as_str() != Some(module_client_id)
+    {
+        return Err(Error::new(
+            "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
+            "Module event binding is not owned by the recorded module",
+        ));
+    }
+    let artifact_id = binding["module_artifact_id"].as_str().ok_or_else(|| {
+        Error::new(
+            "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
+            "Module event binding has no immutable artifact identity",
+        )
+    })?;
+    let selector = binding["observation"]
+        .get("module_contract_selector")
+        .ok_or_else(|| {
+            Error::new(
+                "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
+                "Module event binding has no retained descriptor selector",
+            )
+        })?;
+    let descriptor_selector_digest = model::digest(model::canonical(selector)?.as_bytes());
+    let registered_revision = selector["registered_revision"].as_u64();
+    let selected_revision = selector["selected_revision"].as_u64();
+    if selector["schema_version"] != 1
+        || registered_revision.is_none_or(|revision| revision == 0)
+        || selected_revision
+            .is_none_or(|revision| revision < registered_revision.unwrap_or_default())
+        || selector["artifact"]["artifact_id"].as_str() != Some(artifact_id)
+    {
+        return Err(Error::new(
+            "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
+            "Module event binding has no valid retained descriptor identity",
+        ));
+    }
+    let descriptor_event_schema_digest = module_event_contract_digest(db, selector, artifact_id)?;
+
+    let mut statement = db.prepare(
+        "SELECT operation_id,caller_id,task_id,attempt_id FROM operations \
+         WHERE method='agent.open' AND binding_id=?1 AND binding_generation=?2 \
+         ORDER BY created_at_ms,operation_id LIMIT 2",
+    )?;
+    let opens = statement
+        .query_map(params![binding_id, binding_generation], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if opens.len() != 1 {
+        return Err(Error::new(
+            "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
+            "Module event binding has no unique retained agent.open source",
+        ));
+    }
+    let (agent_open_operation_id, caller_id, binding_task_id, binding_attempt_id) = &opens[0];
+    if caller_id != owner_manager_id {
+        return Err(Error::new(
+            "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
+            "Module event binding was opened by another Manager",
+        ));
+    }
+    let (agent_open_origin, _) = module_event_task_scopes(
+        db,
+        project_id,
+        owner_manager_id,
+        &binding_id,
+        binding_generation,
+        binding_task_id.as_deref(),
+        binding_attempt_id.as_deref(),
+    )?;
+
+    let (source_scope, action_scope) = if let Some(operation_id) = event.operation_id.as_deref() {
+        let operation: Option<(
+            String,
+            String,
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+        )> = db
+            .query_row(
+                "SELECT operation_id,caller_id,binding_id,binding_generation,task_id,attempt_id \
+                 FROM operations WHERE operation_id=?1",
+                [operation_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            retained_operation_id,
+            operation_caller_id,
+            operation_binding_id,
+            operation_binding_generation,
+            operation_task_id,
+            operation_attempt_id,
+        )) = operation
+        else {
+            return Err(Error::new(
+                "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
+                "Module event Operation is unavailable",
+            ));
+        };
+        if retained_operation_id != operation_id
+            || operation_caller_id != owner_manager_id
+            || operation_binding_id.as_deref() != Some(binding_id.as_str())
+            || operation_binding_generation != Some(binding_generation)
+        {
+            return Err(Error::new(
+                "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
+                "Module event Operation is outside its retained Manager binding",
+            ));
+        }
+        module_event_task_scopes(
+            db,
+            project_id,
+            owner_manager_id,
+            &binding_id,
+            binding_generation,
+            operation_task_id.as_deref(),
+            operation_attempt_id.as_deref(),
+        )?
+    } else {
+        (agent_open_origin.clone(), ModuleEventTaskScope::default())
+    };
+
+    Ok(DescriptorModuleEventScope {
+        binding_id,
+        binding_generation,
+        source_event_key,
+        module_client_id: module_client_id.to_owned(),
+        module_artifact_id: artifact_id.to_owned(),
+        descriptor_selector_digest,
+        descriptor_event_schema_digest,
+        agent_open_operation_id: agent_open_operation_id.to_owned(),
+        agent_open_task_id: binding_task_id.clone(),
+        agent_open_task_revision: agent_open_origin.task_revision,
+        agent_open_attempt_id: binding_attempt_id.clone(),
+        source_task_id: source_scope.task_id,
+        source_task_revision: source_scope.task_revision,
+        source_attempt_id: source_scope.attempt_id,
+        task_id: action_scope.task_id,
+        task_revision: action_scope.task_revision,
+        attempt_id: action_scope.attempt_id,
+    })
+}
+
+/// Seal the Module source facts that made the current admission valid into
+/// the retained cause. This runs only after the normal current source gate;
+/// the proof is later used without reopening Manager, registration, Task or
+/// descriptor liveness state.
+pub(super) fn seal_retained_module_event_source(
+    db: &Connection,
+    entry: &AutomationEntry,
+    event: &crate::automation::intake::ObservedEvent,
+    cause: &mut Value,
+) -> Result<()> {
+    if !event.source_id.starts_with("module:") {
+        return Ok(());
+    }
+    let scope = require_module_event_source_provenance(
+        db,
+        &entry.project_id,
+        &entry.owner_manager_id,
+        event,
+    )?;
+    cause["module_source"] = json!({
+        "schema_version": 1,
+        "source_stream_id": event.source_id,
+        "source_event_key": scope.source_event_key,
+        "observation_id": event.observation_id,
+        "event_kind": event.event_kind,
+        "recorded_at_ms": event.recorded_at_ms,
+        "operation_id": event.operation_id,
+        "binding_id": scope.binding_id,
+        "binding_generation": scope.binding_generation,
+        "module_client_id": scope.module_client_id,
+        "module_artifact_id": scope.module_artifact_id,
+        "descriptor_selector_digest": scope.descriptor_selector_digest,
+        "descriptor_event_schema_digest": scope.descriptor_event_schema_digest,
+        "agent_open_operation_id": scope.agent_open_operation_id,
+        "agent_open_task_id": scope.agent_open_task_id,
+        "agent_open_task_revision": scope.agent_open_task_revision,
+        "agent_open_attempt_id": scope.agent_open_attempt_id,
+        "source_task_id": scope.source_task_id,
+        "source_task_revision": scope.source_task_revision,
+        "source_attempt_id": scope.source_attempt_id,
+        "owner_manager_id": entry.owner_manager_id,
+        "project_id": entry.project_id,
+        "task_id": scope.task_id,
+        "task_revision": scope.task_revision,
+        "attempt_id": scope.attempt_id,
+    });
+    Ok(())
+}
+
+fn retained_module_source_corrupt(message: &str) -> Error {
+    Error::new("AUTOMATION_LINK_CORRUPT", message)
+}
+
+/// Re-read only immutable source identity for a retained Module event. Current
+/// binding release, registration, descriptor enablement, Task state and
+/// Manager session are deliberately absent: an admitted ScriptRun may finish
+/// after any of those current facts change.
+pub(super) fn validate_retained_module_event_source(
+    db: &Connection,
+    project_id: &str,
+    owner_manager_id: &str,
+    event: &crate::automation::intake::ObservedEvent,
+    cause: &Value,
+) -> Result<DescriptorModuleEventScope> {
+    let module_client_id = event
+        .source_id
+        .strip_prefix("module:")
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            retained_module_source_corrupt("retained Module event has no module identity")
+        })?;
+    let proof = cause.get("module_source").ok_or_else(|| {
+        retained_module_source_corrupt("retained Module event has no sealed source proof")
+    })?;
+    let proof_text = |field: &str, description: &str| {
+        proof[field]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| retained_module_source_corrupt(description))
+    };
+    let source_stream_id = proof_text(
+        "source_stream_id",
+        "retained Module proof has no source stream",
+    )?;
+    let source_event_key = proof_text(
+        "source_event_key",
+        "retained Module proof has no source key",
+    )?;
+    let binding_id = proof_text("binding_id", "retained Module proof has no binding")?;
+    let proof_module_client_id = proof_text(
+        "module_client_id",
+        "retained Module proof has no module client",
+    )?;
+    let module_artifact_id = proof_text(
+        "module_artifact_id",
+        "retained Module proof has no artifact",
+    )?;
+    let descriptor_selector_digest = proof_text(
+        "descriptor_selector_digest",
+        "retained Module proof has no descriptor selector identity",
+    )?;
+    let descriptor_event_schema_digest = proof_text(
+        "descriptor_event_schema_digest",
+        "retained Module proof has no descriptor event contract identity",
+    )?;
+    let agent_open_operation_id = proof_text(
+        "agent_open_operation_id",
+        "retained Module proof has no agent.open identity",
+    )?;
+    let binding_generation = proof["binding_generation"]
+        .as_i64()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            retained_module_source_corrupt("retained Module proof has no binding generation")
+        })?;
+    let proof_agent_open_task_id = proof["agent_open_task_id"].as_str().map(str::to_owned);
+    let proof_agent_open_task_revision = proof["agent_open_task_revision"].as_i64();
+    let proof_agent_open_attempt_id = proof["agent_open_attempt_id"].as_str().map(str::to_owned);
+    let proof_source_task_id = proof["source_task_id"].as_str().map(str::to_owned);
+    let proof_source_task_revision = proof["source_task_revision"].as_i64();
+    let proof_source_attempt_id = proof["source_attempt_id"].as_str().map(str::to_owned);
+    let proof_task_id = proof["task_id"].as_str().map(str::to_owned);
+    let proof_task_revision = proof["task_revision"].as_i64();
+    let proof_attempt_id = proof["attempt_id"].as_str().map(str::to_owned);
+    let proof_owner_manager_id =
+        proof_text("owner_manager_id", "retained Module proof has no owner")?;
+    let proof_project_id = proof_text("project_id", "retained Module proof has no project")?;
+    let proof_observation_id = proof["observation_id"].as_i64().filter(|value| *value > 0);
+    let proof_recorded_at_ms = proof["recorded_at_ms"].as_i64();
+    let proof_agent_open_scope_valid = match (
+        &proof_agent_open_task_id,
+        proof_agent_open_task_revision,
+        &proof_agent_open_attempt_id,
+    ) {
+        (None, None, None) | (Some(_), None, None) => true,
+        (Some(_), Some(revision), Some(_)) => revision > 0,
+        _ => false,
+    };
+    let proof_source_scope_valid = match (
+        &proof_source_task_id,
+        proof_source_task_revision,
+        &proof_source_attempt_id,
+    ) {
+        (None, None, None) | (Some(_), None, None) => true,
+        (Some(_), Some(revision), Some(_)) => revision > 0,
+        _ => false,
+    };
+    let proof_action_scope_valid = match (&proof_task_id, proof_task_revision, &proof_attempt_id) {
+        (None, None, None) => true,
+        (Some(_), Some(revision), Some(_)) => revision > 0,
+        _ => false,
+    };
+    if proof["schema_version"] != 1
+        || source_stream_id != event.source_id
+        || source_event_key.is_empty()
+        || proof_observation_id != Some(event.observation_id)
+        || proof["event_kind"] != event.event_kind
+        || proof_recorded_at_ms != Some(event.recorded_at_ms)
+        || proof["operation_id"].as_str() != event.operation_id.as_deref()
+        || proof_module_client_id != module_client_id
+        || proof_owner_manager_id != owner_manager_id
+        || proof_project_id != project_id
+        || !proof_agent_open_scope_valid
+        || !proof_source_scope_valid
+        || !proof_action_scope_valid
+        || cause["task_id"] != proof["task_id"]
+        || cause["task_revision"] != proof["task_revision"]
+        || cause["attempt_id"] != proof["attempt_id"]
+    {
+        return Err(retained_module_source_corrupt(
+            "retained Module source proof does not match its event scope",
+        ));
+    }
+
+    let observation: Option<(
+        String,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+        String,
+        i64,
+    )> = db
+        .query_row(
+            "SELECT source_stream_id,source_event_key,binding_id,binding_generation,\
+                    operation_id,kind,recorded_at_ms \
+             FROM observations WHERE observation_id=?1",
+            [event.observation_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        observed_source_stream_id,
+        observed_source_event_key,
+        observed_binding_id,
+        observed_binding_generation,
+        observed_operation_id,
+        observed_kind,
+        observed_recorded_at_ms,
+    )) = observation
+    else {
+        return Err(retained_module_source_corrupt(
+            "retained Module event observation is missing",
+        ));
+    };
+    if observed_source_stream_id != source_stream_id
+        || observed_source_event_key.as_deref() != Some(source_event_key)
+        || observed_binding_id.as_deref() != Some(binding_id)
+        || observed_binding_generation != Some(binding_generation)
+        || observed_operation_id.as_deref() != event.operation_id.as_deref()
+        || observed_kind != event.event_kind
+        || observed_recorded_at_ms != event.recorded_at_ms
+    {
+        return Err(retained_module_source_corrupt(
+            "retained Module event observation identity changed",
+        ));
+    }
+
+    let binding = crate::store::operations::get_binding(db, binding_id, binding_generation)
+        .map_err(|_| retained_module_source_corrupt("retained Module binding is missing"))?;
+    let selector = binding["observation"]
+        .get("module_contract_selector")
+        .ok_or_else(|| {
+            retained_module_source_corrupt("retained Module binding has no descriptor selector")
+        })?;
+    let selector_digest = model::digest(
+        model::canonical(selector)
+            .map_err(|_| {
+                retained_module_source_corrupt("retained Module descriptor selector is malformed")
+            })?
+            .as_bytes(),
+    );
+    if binding["route"]["runtime"] != "module"
+        || binding["observation"]["module_client_id"].as_str() != Some(module_client_id)
+        || binding["module_artifact_id"].as_str() != Some(module_artifact_id)
+        || binding["route"]["module_artifact_id"].as_str() != Some(module_artifact_id)
+        || selector["artifact"]["artifact_id"].as_str() != Some(module_artifact_id)
+        || selector_digest != descriptor_selector_digest
+    {
+        return Err(retained_module_source_corrupt(
+            "retained Module binding identity changed",
+        ));
+    }
+    let retained_event_schema_digest =
+        module_event_contract_digest(db, selector, module_artifact_id).map_err(|_| {
+            retained_module_source_corrupt("retained Module event contract is unavailable")
+        })?;
+    if retained_event_schema_digest != descriptor_event_schema_digest {
+        return Err(retained_module_source_corrupt(
+            "retained Module event contract identity changed",
+        ));
+    }
+
+    let open: Option<(
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+    )> = db
+        .query_row(
+            "SELECT operation_id,caller_id,task_id,attempt_id,binding_id,binding_generation \
+             FROM operations WHERE operation_id=?1 AND method='agent.open'",
+            [agent_open_operation_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        retained_open_operation_id,
+        caller_id,
+        open_task_id,
+        open_attempt_id,
+        open_binding_id,
+        open_binding_generation,
+    )) = open
+    else {
+        return Err(retained_module_source_corrupt(
+            "retained Module agent.open source is missing",
+        ));
+    };
+    if retained_open_operation_id != agent_open_operation_id
+        || caller_id != owner_manager_id
+        || open_binding_id.as_deref() != Some(binding_id)
+        || open_binding_generation != Some(binding_generation)
+        || open_task_id.as_ref() != proof_agent_open_task_id.as_ref()
+        || open_attempt_id.as_ref() != proof_agent_open_attempt_id.as_ref()
+    {
+        return Err(retained_module_source_corrupt(
+            "retained Module agent.open source identity changed",
+        ));
+    }
+    let (open_origin, _) = module_event_task_scopes(
+        db,
+        project_id,
+        owner_manager_id,
+        binding_id,
+        binding_generation,
+        open_task_id.as_deref(),
+        open_attempt_id.as_deref(),
+    )
+    .map_err(|_| retained_module_source_corrupt("retained Module agent.open Task scope changed"))?;
+    if open_origin.task_revision != proof_agent_open_task_revision {
+        return Err(retained_module_source_corrupt(
+            "retained Module agent.open Attempt revision changed",
+        ));
+    }
+
+    let source_origin = if let Some(operation_id) = event.operation_id.as_deref() {
+        let operation: Option<(
+            String,
+            String,
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+        )> = db
+            .query_row(
+                "SELECT operation_id,caller_id,binding_id,binding_generation,task_id,attempt_id \
+                 FROM operations WHERE operation_id=?1",
+                [operation_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            retained_operation_id,
+            operation_caller_id,
+            operation_binding_id,
+            operation_binding_generation,
+            operation_task_id,
+            operation_attempt_id,
+        )) = operation
+        else {
+            return Err(retained_module_source_corrupt(
+                "retained Module event Operation is missing",
+            ));
+        };
+        if retained_operation_id != operation_id
+            || operation_caller_id != owner_manager_id
+            || operation_binding_id.as_deref() != Some(binding_id)
+            || operation_binding_generation != Some(binding_generation)
+        {
+            return Err(retained_module_source_corrupt(
+                "retained Module event Operation binding identity changed",
+            ));
+        }
+        module_event_task_scopes(
+            db,
+            project_id,
+            owner_manager_id,
+            binding_id,
+            binding_generation,
+            operation_task_id.as_deref(),
+            operation_attempt_id.as_deref(),
+        )
+        .map_err(|_| retained_module_source_corrupt("retained Module event Task scope changed"))?
+        .0
+    } else {
+        open_origin.clone()
+    };
+    if source_origin.task_id != proof_source_task_id
+        || source_origin.task_revision != proof_source_task_revision
+        || source_origin.attempt_id != proof_source_attempt_id
+    {
+        return Err(retained_module_source_corrupt(
+            "retained Module event source Task/Attempt identity changed",
+        ));
+    }
+    if proof_task_id.is_some()
+        && (proof_task_id != source_origin.task_id
+            || proof_task_revision != source_origin.task_revision
+            || proof_attempt_id != source_origin.attempt_id)
+    {
+        return Err(retained_module_source_corrupt(
+            "retained Module action scope differs from its immutable source Attempt",
+        ));
+    }
+
+    Ok(DescriptorModuleEventScope {
+        binding_id: binding_id.to_owned(),
+        binding_generation,
+        source_event_key: source_event_key.to_owned(),
+        module_client_id: module_client_id.to_owned(),
+        module_artifact_id: module_artifact_id.to_owned(),
+        descriptor_selector_digest: descriptor_selector_digest.to_owned(),
+        descriptor_event_schema_digest: descriptor_event_schema_digest.to_owned(),
+        agent_open_operation_id: agent_open_operation_id.to_owned(),
+        agent_open_task_id: proof_agent_open_task_id,
+        agent_open_task_revision: proof_agent_open_task_revision,
+        agent_open_attempt_id: proof_agent_open_attempt_id,
+        source_task_id: proof_source_task_id,
+        source_task_revision: proof_source_task_revision,
+        source_attempt_id: proof_source_attempt_id,
+        task_id: proof_task_id,
+        task_revision: proof_task_revision,
+        attempt_id: proof_attempt_id,
+    })
 }
 
 pub(super) fn script_event_invocation_context_for_consumer(
@@ -1045,6 +1941,16 @@ pub(super) fn script_event_invocation_context_for_consumer(
         require_module_lifecycle_binding_source(db, entry, owner_manager_id, fact)?;
     }
 
+    let module_event_scope = if event.source_id.starts_with("module:") {
+        Some(require_module_event_source_provenance(
+            db,
+            &entry.project_id,
+            owner_manager_id,
+            &event,
+        )?)
+    } else {
+        None
+    };
     let mut task_id = None;
     let mut task_revision = None;
     let mut attempt_id = None;
@@ -1053,13 +1959,29 @@ pub(super) fn script_event_invocation_context_for_consumer(
     if let Some(event_operation_id) = event.operation_id.as_deref() {
         let operation_scope: Option<ConsumerEventOperationRow> = db
             .query_row(
-                "SELECT task_id,attempt_id,effective_request_json,caller_id FROM operations WHERE operation_id=?1",
+                "SELECT task_id,attempt_id,effective_request_json,caller_id,binding_id,binding_generation \
+                 FROM operations WHERE operation_id=?1",
                 [event_operation_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
             )
             .optional()?;
-        let Some((operation_task_id, operation_attempt_id, effective_json, caller_id)) =
-            operation_scope
+        let Some((
+            operation_task_id,
+            operation_attempt_id,
+            effective_json,
+            caller_id,
+            operation_binding_id,
+            operation_binding_generation,
+        )) = operation_scope
         else {
             return Err(Error::new(
                 "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
@@ -1067,6 +1989,25 @@ pub(super) fn script_event_invocation_context_for_consumer(
             ));
         };
         require_manager_event_scope(db, &event, event_operation_id, entry, &caller_id)?;
+        let module_operation_has_taskless_action_scope =
+            if let Some(module_scope) = module_event_scope.as_ref() {
+                let source_scope_matches = operation_task_id.as_deref()
+                    == module_scope.source_task_id.as_deref()
+                    && operation_attempt_id.as_deref() == module_scope.source_attempt_id.as_deref();
+                if operation_binding_id.as_deref() != Some(module_scope.binding_id.as_str())
+                    || operation_binding_generation != Some(module_scope.binding_generation)
+                    || !source_scope_matches
+                    || caller_id != owner_manager_id
+                {
+                    return Err(Error::new(
+                        "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
+                        "Module event Operation is outside its retained binding scope",
+                    ));
+                }
+                module_scope.task_id.is_none()
+            } else {
+                false
+            };
         if super::event_is_script_feedback_from_same_automation(
             db,
             event_operation_id,
@@ -1078,64 +2019,66 @@ pub(super) fn script_event_invocation_context_for_consumer(
                 "same automation cannot recursively trigger from its own invocation effect",
             ));
         }
-        match (operation_task_id, operation_attempt_id) {
-            (Some(operation_task), Some(operation_attempt)) => {
-                let attempt = super::tasks::get_attempt(db, &operation_attempt)?;
-                let derived_task = model::text(&attempt, "task_id")?;
-                let task = super::tasks::get_task(db, derived_task)?;
-                let revision = model::positive(&attempt, "task_revision")?;
-                if operation_task != derived_task
-                    || task["project_id"] != entry.project_id
-                    || task["state"] != "open"
-                    || task["current_attempt_id"] != operation_attempt
-                    || task["revision"] != revision
-                    || !attempt["released_at_ms"].is_null()
-                    || !consumer_owner_has_current_attempt(
-                        db,
-                        owner_manager_id,
-                        &operation_task,
-                        revision,
-                        &operation_attempt,
-                        &entry.project_id,
-                    )?
-                {
+        if !module_operation_has_taskless_action_scope {
+            match (operation_task_id, operation_attempt_id) {
+                (Some(operation_task), Some(operation_attempt)) => {
+                    let attempt = super::tasks::get_attempt(db, &operation_attempt)?;
+                    let derived_task = model::text(&attempt, "task_id")?;
+                    let task = super::tasks::get_task(db, derived_task)?;
+                    let revision = model::positive(&attempt, "task_revision")?;
+                    if operation_task != derived_task
+                        || task["project_id"] != entry.project_id
+                        || task["state"] != "open"
+                        || task["current_attempt_id"] != operation_attempt
+                        || task["revision"] != revision
+                        || !attempt["released_at_ms"].is_null()
+                        || !consumer_owner_has_current_attempt(
+                            db,
+                            owner_manager_id,
+                            &operation_task,
+                            revision,
+                            &operation_attempt,
+                            &entry.project_id,
+                        )?
+                    {
+                        return Err(Error::new(
+                            "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
+                            "linked Operation is outside the Manager's exact current Task scope",
+                        ));
+                    }
+                    task_id = Some(operation_task);
+                    task_revision = Some(revision);
+                    attempt_id = Some(operation_attempt);
+                }
+                (None, Some(_)) => {
                     return Err(Error::new(
                         "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
-                        "linked Operation is outside the Manager's exact current Task scope",
+                        "linked Operation has an Attempt without its Task",
                     ));
                 }
-                task_id = Some(operation_task);
-                task_revision = Some(revision);
-                attempt_id = Some(operation_attempt);
-            }
-            (None, Some(_)) => {
-                return Err(Error::new(
-                    "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
-                    "linked Operation has an Attempt without its Task",
-                ));
-            }
-            (Some(operation_task), None) if caller_id == owner_manager_id => {
-                let task = super::tasks::get_task(db, &operation_task)?;
-                if task["project_id"] != entry.project_id || task["state"] != "open" {
+                (Some(operation_task), None) if caller_id == owner_manager_id => {
+                    let task = super::tasks::get_task(db, &operation_task)?;
+                    if task["project_id"] != entry.project_id || task["state"] != "open" {
+                        return Err(Error::new(
+                            "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
+                            "linked Operation Task is outside the Manager's current project scope",
+                        ));
+                    }
+                    task_id = Some(operation_task);
+                }
+                (Some(_), None) => {
                     return Err(Error::new(
                         "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
-                        "linked Operation Task is outside the Manager's current project scope",
+                        "task-only Operation is not owned by the retained Manager",
                     ));
                 }
-                task_id = Some(operation_task);
-            }
-            (Some(_), None) => {
-                return Err(Error::new(
-                    "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
-                    "task-only Operation is not owned by the retained Manager",
-                ));
-            }
-            (None, None) if caller_id == owner_manager_id => {}
-            (None, None) => {
-                return Err(Error::new(
-                    "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
-                    "taskless Operation is outside the retained Manager's own source scope",
-                ));
+                (None, None) if caller_id == owner_manager_id => {}
+                (None, None) => {
+                    return Err(Error::new(
+                        "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
+                        "taskless Operation is outside the retained Manager's own source scope",
+                    ));
+                }
             }
         }
         operation_id = Some(event_operation_id.to_owned());
@@ -1177,6 +2120,10 @@ pub(super) fn script_event_invocation_context_for_consumer(
     } else if module_lifecycle_fact.is_some() {
         // The exact binding and Manager-owned agent.open source were checked
         // above, independently of any optional Operation correlation.
+    } else if let Some(module_scope) = module_event_scope.as_ref() {
+        task_id = module_scope.task_id.clone();
+        task_revision = module_scope.task_revision;
+        attempt_id = module_scope.attempt_id.clone();
     } else if event.source_id == "controller:host-lifecycle"
         && ((matches!(event.event_kind.as_str(), "host.exit" | "host.interrupted")
             && projection.occurrence_phase.as_deref() == Some("host_interruption_observed"))
@@ -1187,32 +2134,44 @@ pub(super) fn script_event_invocation_context_for_consumer(
     } else {
         return Err(Error::new(
             "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
-            "event has no scoped Operation, verified HookSource, or typed host ACL",
+            "event has no scoped Operation, verified Module/HookSource, or typed host ACL",
         ));
     }
 
-    for (field, observed) in [
-        ("task_id", task_id.as_deref()),
-        ("attempt_id", attempt_id.as_deref()),
-    ] {
-        if cause.get(field).is_some_and(|value| !value.is_null())
-            && cause[field].as_str() != observed
+    if module_event_scope.is_some() && cause.get("module_source").is_some() {
+        if cause["task_id"] != cause["module_source"]["task_id"]
+            || cause["task_revision"] != cause["module_source"]["task_revision"]
+            || cause["attempt_id"] != cause["module_source"]["attempt_id"]
         {
             return Err(Error::new(
                 "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
-                "retained event Task/Attempt references differ from current source scope",
+                "retained Module action snapshot differs from its sealed source proof",
             ));
         }
-    }
-    if cause
-        .get("task_revision")
-        .is_some_and(|value| !value.is_null())
-        && cause["task_revision"].as_i64() != task_revision
-    {
-        return Err(Error::new(
-            "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
-            "retained event Task revision differs from current source scope",
-        ));
+    } else {
+        for (field, observed) in [
+            ("task_id", task_id.as_deref()),
+            ("attempt_id", attempt_id.as_deref()),
+        ] {
+            if cause.get(field).is_some_and(|value| !value.is_null())
+                && cause[field].as_str() != observed
+            {
+                return Err(Error::new(
+                    "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
+                    "retained event Task/Attempt references differ from current source scope",
+                ));
+            }
+        }
+        if cause
+            .get("task_revision")
+            .is_some_and(|value| !value.is_null())
+            && cause["task_revision"].as_i64() != task_revision
+        {
+            return Err(Error::new(
+                "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
+                "retained event Task revision differs from current source scope",
+            ));
+        }
     }
     let mut input = json!({
         "kind":"system.event",

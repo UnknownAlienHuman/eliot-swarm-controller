@@ -1004,6 +1004,7 @@ fn process_system_event_script_projection(
     let consumer_context = script_trigger_authority::ScriptRunConsumerContext::from_entry(entry)?;
     match consumer_context.require_current_source(tx, app_config, entry, &cause) {
         Ok(context) => {
+            bus_kernel::seal_retained_module_event_source(tx, entry, event, &mut cause)?;
             mark_observed_script_selectors(state, entry, event, projection.status)?;
             attach_event_task_scope(&mut cause, &context)?;
             if let Some(operation_id) =
@@ -1614,8 +1615,10 @@ pub(crate) struct ScriptEventInvocationContext {
 
 /// Validate an immutable event cause during operation-link readback. Current
 /// Manager/source rights are checked at admission and the start gate; this
-/// historical check proves only that the retained request still names the
-/// same safe observation and exact Task scope.
+/// historical check re-reads only the sealed immutable source proof for a
+/// Module event and the existing immutable Manager-owned `event.emit` scope
+/// before reconstructing safe input. Current source liveness is checked only
+/// by the admission/start gates.
 pub(crate) fn validate_retained_script_event_cause(
     db: &Connection,
     project_id: &str,
@@ -1692,75 +1695,177 @@ pub(crate) fn validate_retained_script_event_cause(
             "retained ScriptRun event Task/Attempt scope is incomplete",
         ));
     }
+    let module_event_scope = if event.source_id.starts_with("module:") {
+        let owner_manager_id = cause["automation_consumer"]["owner_manager_id"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                Error::new(
+                    "AUTOMATION_LINK_CORRUPT",
+                    "retained Module ScriptRun event has no owner attribution",
+                )
+            })?;
+        Some(bus_kernel::validate_retained_module_event_source(
+            db,
+            project_id,
+            owner_manager_id,
+            &event,
+            cause,
+        )?)
+    } else {
+        None
+    };
     if let Some(operation_id) = event.operation_id.as_deref() {
-        let operation_scope: Option<(Option<String>, Option<String>)> = db
+        let operation_scope: Option<(
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            String,
+        )> = db
             .query_row(
-                "SELECT task_id,attempt_id FROM operations WHERE operation_id=?1",
+                "SELECT task_id,attempt_id,binding_id,binding_generation,caller_id \
+                 FROM operations WHERE operation_id=?1",
                 [operation_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .optional()?;
-        let Some((operation_task, operation_attempt)) = operation_scope else {
+        let Some((
+            operation_task,
+            operation_attempt,
+            operation_binding_id,
+            operation_binding_generation,
+            caller_id,
+        )) = operation_scope
+        else {
             return Err(Error::new(
                 "AUTOMATION_LINK_CORRUPT",
                 "retained ScriptRun event Operation is missing",
             ));
         };
-        match (
-            operation_task.as_deref(),
-            operation_attempt.as_deref(),
-            task_id.as_deref(),
-            task_revision,
-            attempt_id.as_deref(),
-        ) {
-            (
-                Some(operation_task),
-                Some(operation_attempt),
-                Some(task_id),
-                Some(task_revision),
-                Some(attempt_id),
-            ) if operation_task == task_id && operation_attempt == attempt_id => {
-                let scope: Option<(String, i64, String)> = db
-                    .query_row(
-                        "SELECT a.task_id,a.task_revision,t.project_id FROM attempts a \
-                         JOIN tasks t ON t.task_id=a.task_id WHERE a.attempt_id=?1",
-                        [attempt_id],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                    )
-                    .optional()?;
-                if !scope.is_some_and(|(attempt_task, attempt_revision, task_project)| {
-                    attempt_task == operation_task
-                        && attempt_revision == task_revision
-                        && task_project == project_id
-                }) {
-                    return Err(Error::new(
+        if event.source_id == crate::store::MANAGER_EVENT_SOURCE_STREAM {
+            let owner_manager_id = cause["automation_consumer"]["owner_manager_id"]
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    Error::new(
                         "AUTOMATION_LINK_CORRUPT",
-                        "retained ScriptRun event Task/Attempt no longer matches its project scope",
-                    ));
-                }
-            }
-            (None, None, None, None, None) => {}
-            (Some(operation_task), None, None, None, None) => {
-                let task_project: Option<String> = db
-                    .query_row(
-                        "SELECT project_id FROM tasks WHERE task_id=?1",
-                        [operation_task],
-                        |row| row.get(0),
+                        "retained Manager event ScriptRun has no owner attribution",
                     )
-                    .optional()?;
-                if task_project.as_deref() != Some(project_id) {
-                    return Err(Error::new(
-                        "AUTOMATION_LINK_CORRUPT",
-                        "retained event-only ScriptRun Task reference is outside its project",
-                    ));
-                }
-            }
-            _ => {
-                return Err(Error::new(
+                })?;
+            bus_kernel::require_manager_event_scope_for_retained(
+                db,
+                &event,
+                operation_id,
+                project_id,
+                owner_manager_id,
+                &caller_id,
+            )
+            .map_err(|_| {
+                Error::new(
                     "AUTOMATION_LINK_CORRUPT",
-                    "retained ScriptRun event Task/Attempt differs from its Operation",
-                ));
+                    "retained Manager event no longer matches its immutable scope",
+                )
+            })?;
+        }
+        let module_operation_has_retained_source_scope =
+            if let Some(module_scope) = module_event_scope.as_ref() {
+                let source_scope_matches = operation_task.as_deref()
+                    == module_scope.source_task_id.as_deref()
+                    && operation_attempt.as_deref() == module_scope.source_attempt_id.as_deref();
+                let action_scope_matches = task_id.as_deref() == module_scope.task_id.as_deref()
+                    && task_revision == module_scope.task_revision
+                    && attempt_id.as_deref() == module_scope.attempt_id.as_deref();
+                if operation_binding_id.as_deref() != Some(module_scope.binding_id.as_str())
+                    || operation_binding_generation != Some(module_scope.binding_generation)
+                    || !source_scope_matches
+                    || !action_scope_matches
+                    || caller_id != owner_manager_id
+                {
+                    return Err(Error::new(
+                        "AUTOMATION_LINK_CORRUPT",
+                        "retained Module event Operation is outside its binding scope",
+                    ));
+                }
+                true
+            } else {
+                false
+            };
+        if !module_operation_has_retained_source_scope {
+            match (
+                operation_task.as_deref(),
+                operation_attempt.as_deref(),
+                task_id.as_deref(),
+                task_revision,
+                attempt_id.as_deref(),
+            ) {
+                (
+                    Some(operation_task),
+                    Some(operation_attempt),
+                    Some(task_id),
+                    Some(task_revision),
+                    Some(attempt_id),
+                ) if operation_task == task_id && operation_attempt == attempt_id => {
+                    let scope: Option<(String, i64, String)> = db
+                        .query_row(
+                            "SELECT a.task_id,a.task_revision,t.project_id FROM attempts a \
+                         JOIN tasks t ON t.task_id=a.task_id WHERE a.attempt_id=?1",
+                            [attempt_id],
+                            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                        )
+                        .optional()?;
+                    if !scope.is_some_and(|(attempt_task, attempt_revision, task_project)| {
+                        attempt_task == operation_task
+                            && attempt_revision == task_revision
+                            && task_project == project_id
+                    }) {
+                        return Err(Error::new(
+                            "AUTOMATION_LINK_CORRUPT",
+                            "retained ScriptRun event Task/Attempt no longer matches its project scope",
+                        ));
+                    }
+                }
+                (None, None, None, None, None) => {}
+                (Some(operation_task), None, None, None, None) => {
+                    let task_project: Option<String> = db
+                        .query_row(
+                            "SELECT project_id FROM tasks WHERE task_id=?1",
+                            [operation_task],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    if task_project.as_deref() != Some(project_id) {
+                        return Err(Error::new(
+                            "AUTOMATION_LINK_CORRUPT",
+                            "retained event-only ScriptRun Task reference is outside its project",
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(Error::new(
+                        "AUTOMATION_LINK_CORRUPT",
+                        "retained ScriptRun event Task/Attempt differs from its Operation",
+                    ));
+                }
             }
+        }
+    } else if let Some(module_scope) = module_event_scope.as_ref() {
+        if task_id.as_deref() != module_scope.task_id.as_deref()
+            || task_revision != module_scope.task_revision
+            || attempt_id.as_deref() != module_scope.attempt_id.as_deref()
+        {
+            return Err(Error::new(
+                "AUTOMATION_LINK_CORRUPT",
+                "retained Module event Task/Attempt differs from its binding scope",
+            ));
         }
     } else if event.source_id == "controller:hooks" && event.event_kind == "git.post_commit" {
         let fact = automation_intake::hook_commit_fact_by_observation(db, observation_id)?
